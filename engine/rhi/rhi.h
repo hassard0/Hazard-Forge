@@ -50,9 +50,18 @@ struct GraphicsPipelineDesc {
     bool depthTest = true;
     Format depthFormat = Format::D32_Float;
     uint32_t pushConstantSize = 0;   // bytes, vertex stage
+    bool usesTexture = false;        // when true, layout includes set 0 (combined sampler)
 };
 
 enum class BufferUsage { Vertex, Index };
+
+struct TextureDesc {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    Format format = Format::RGBA8_UNorm;
+    const void* data = nullptr;   // tightly packed pixels
+    uint64_t dataSize = 0;        // bytes
+};
 
 struct BufferDesc {
     uint64_t size = 0;          // bytes
@@ -65,6 +74,7 @@ struct BufferDesc {
 class IShaderModule { public: virtual ~IShaderModule() = default; };
 class IPipeline     { public: virtual ~IPipeline() = default; };
 class IBuffer       { public: virtual ~IBuffer() = default; };
+class ITexture      { public: virtual ~ITexture() = default; };
 
 // Records draw commands for one frame's swapchain image.
 class ICommandBuffer {
@@ -74,6 +84,7 @@ public:
     virtual void BindPipeline(IPipeline& pipeline) = 0;
     virtual void BindVertexBuffer(IBuffer& buffer) = 0;
     virtual void BindIndexBuffer(IBuffer& buffer) = 0;
+    virtual void BindTexture(ITexture& texture) = 0;
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0) = 0;
     virtual void PushConstants(const void* data, uint32_t size) = 0;
@@ -102,6 +113,7 @@ public:
     virtual std::unique_ptr<IShaderModule> CreateShaderModule(const ShaderModuleDesc&) = 0;
     virtual std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) = 0;
     virtual std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) = 0;
+    virtual std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) = 0;
 
     // Acquire next swapchain image + begin command recording.
     // Returns FrameContext{nullptr} when the frame must be skipped this tick.

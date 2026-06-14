@@ -19,6 +19,7 @@ public:
     void BindPipeline(IPipeline& pipeline) override;
     void BindVertexBuffer(IBuffer& buffer) override;
     void BindIndexBuffer(IBuffer& buffer) override;
+    void BindTexture(ITexture& texture) override;
     void Draw(uint32_t vertexCount, uint32_t firstVertex) override;
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex) override;
     void PushConstants(const void* data, uint32_t size) override;

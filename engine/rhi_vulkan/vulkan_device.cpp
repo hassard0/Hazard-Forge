@@ -4,6 +4,8 @@
 #include "rhi_vulkan/vulkan_shader.h"
 #include "rhi_vulkan/vulkan_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
+#include "rhi_vulkan/vulkan_texture.h"
+#include <cstring>
 
 #define VMA_IMPLEMENTATION
 #ifdef _MSC_VER
@@ -15,6 +17,25 @@
 #endif
 
 namespace hf::rhi::vk {
+
+namespace {
+void TransitionImage(VkCommandBuffer cmd, VkImage image,
+                     VkImageLayout oldLayout, VkImageLayout newLayout,
+                     VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+                     VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
+                     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = srcStage;  b.srcAccessMask = srcAccess;
+    b.dstStageMask = dstStage;  b.dstAccessMask = dstAccess;
+    b.oldLayout = oldLayout;    b.newLayout = newLayout;
+    b.image = image;
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+} // namespace
 
 VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     // --- Instance ---
@@ -74,6 +95,7 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
         device_, vkbDevice_, allocator_,
         window_.FramebufferWidth(), window_.FramebufferHeight());
 
+    CreateTextureResources();
     CreateSyncObjects();
     recorder_ = std::make_unique<VulkanCommandBuffer>(*this);
 }
@@ -83,6 +105,7 @@ VulkanDevice::~VulkanDevice() {
     recorder_.reset();
     DestroySyncObjects();
     swapchain_.reset();
+    DestroyTextureResources();
     if (allocator_) vmaDestroyAllocator(allocator_);
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
     if (device_) vkb::destroy_device(vkbDevice_);
@@ -122,6 +145,136 @@ void VulkanDevice::DestroySyncObjects() {
     }
 }
 
+void VulkanDevice::CreateTextureResources() {
+    // Default sampler: linear filtering, repeat addressing.
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = VK_LOD_CLAMP_NONE;
+    Check(vkCreateSampler(device_, &sci, nullptr, &defaultSampler_), "vkCreateSampler");
+
+    // Set layout: set 0 — binding 0 = sampled image, binding 1 = sampler, fragment stage.
+    // (DXC emits Texture2D/SamplerState as two separate descriptors, not one combined.)
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 2;
+    lci.pBindings = bindings;
+    Check(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &texturedSetLayout_),
+          "vkCreateDescriptorSetLayout");
+
+    // Pool: allow individual set frees (VulkanTexture frees its set in its dtor).
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    poolSizes[0].descriptorCount = 64;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    poolSizes[1].descriptorCount = 64;
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pci.maxSets = 64;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = poolSizes;
+    Check(vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_),
+          "vkCreateDescriptorPool");
+}
+
+void VulkanDevice::DestroyTextureResources() {
+    if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
+    if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
+    if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
+    descriptorPool_ = VK_NULL_HANDLE;
+    texturedSetLayout_ = VK_NULL_HANDLE;
+    defaultSampler_ = VK_NULL_HANDLE;
+}
+
+void VulkanDevice::UploadToImage(VkImage image, uint32_t w, uint32_t h,
+                                 const void* data, uint64_t size) {
+    // 1. Host-visible staging buffer.
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    VmaAllocationInfo info{};
+    Check(vmaCreateBuffer(allocator_, &bci, &aci, &staging, &stagingAlloc, &info),
+          "vmaCreateBuffer(staging)");
+    std::memcpy(info.pMappedData, data, size);
+    vmaFlushAllocation(allocator_, stagingAlloc, 0, size);
+
+    // 2. Transient one-time command buffer.
+    VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cpci.queueFamilyIndex = graphicsQueueFamily_;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    Check(vkCreateCommandPool(device_, &cpci, nullptr, &pool), "vkCreateCommandPool(transient)");
+
+    VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbi.commandPool = pool;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    Check(vkAllocateCommandBuffers(device_, &cbi, &cmd), "vkAllocateCommandBuffers(transient)");
+
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(transient)");
+
+    // 3. UNDEFINED -> TRANSFER_DST_OPTIMAL.
+    TransitionImage(cmd, image,
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+    // 4. Copy buffer -> image.
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &region);
+
+    // 5. TRANSFER_DST -> SHADER_READ_ONLY_OPTIMAL.
+    TransitionImage(cmd, image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+
+    Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(transient)");
+
+    // 6. Submit (sync2) and wait.
+    VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmdSub.commandBuffer = cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdSub;
+    Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(upload)");
+    Check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(upload)");
+
+    // 7. Cleanup.
+    vkDestroyCommandPool(device_, pool, nullptr);
+    vmaDestroyBuffer(allocator_, staging, stagingAlloc);
+}
+
 void VulkanDevice::WaitIdle() { if (device_) vkDeviceWaitIdle(device_); }
 
 // --- Resource creation ---
@@ -129,32 +282,16 @@ std::unique_ptr<IShaderModule> VulkanDevice::CreateShaderModule(const ShaderModu
     return std::make_unique<VulkanShaderModule>(device_, d.spirv);
 }
 std::unique_ptr<IPipeline> VulkanDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc& d) {
-    return std::make_unique<VulkanPipeline>(device_, d);
+    return std::make_unique<VulkanPipeline>(*this, d);
 }
 std::unique_ptr<IBuffer> VulkanDevice::CreateBuffer(const BufferDesc& d) {
     return std::make_unique<VulkanBuffer>(allocator_, d);
 }
+std::unique_ptr<ITexture> VulkanDevice::CreateTexture(const TextureDesc& d) {
+    return std::make_unique<VulkanTexture>(*this, d);
+}
 
 // --- Frame loop ---
-namespace {
-void TransitionImage(VkCommandBuffer cmd, VkImage image,
-                     VkImageLayout oldLayout, VkImageLayout newLayout,
-                     VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-                     VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
-                     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
-    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    b.srcStageMask = srcStage;  b.srcAccessMask = srcAccess;
-    b.dstStageMask = dstStage;  b.dstAccessMask = dstAccess;
-    b.oldLayout = oldLayout;    b.newLayout = newLayout;
-    b.image = image;
-    b.subresourceRange = {aspect, 0, 1, 0, 1};
-    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-    di.imageMemoryBarrierCount = 1;
-    di.pImageMemoryBarriers = &b;
-    vkCmdPipelineBarrier2(cmd, &di);
-}
-} // namespace
-
 FrameContext VulkanDevice::BeginFrame() {
     FrameSync& fr = frames_[frameIndex_];
     vkWaitForFences(device_, 1, &fr.inFlight, VK_TRUE, UINT64_MAX);

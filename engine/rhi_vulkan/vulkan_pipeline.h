@@ -4,9 +4,11 @@
 
 namespace hf::rhi::vk {
 
+class VulkanDevice;
+
 class VulkanPipeline final : public IPipeline {
 public:
-    VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc);
+    VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc);
     ~VulkanPipeline() override;
     VkPipeline handle() const { return pipeline_; }
     VkPipelineLayout layout() const { return layout_; }

@@ -2,6 +2,7 @@
 #include "rhi_vulkan/vulkan_device.h"
 #include "rhi_vulkan/vulkan_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
+#include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vk_common.h"
 
 namespace hf::rhi::vk {
@@ -62,6 +63,13 @@ void VulkanCommandBuffer::BindVertexBuffer(IBuffer& buffer) {
 void VulkanCommandBuffer::BindIndexBuffer(IBuffer& buffer) {
     auto& b = static_cast<VulkanBuffer&>(buffer);
     vkCmdBindIndexBuffer(cmd_, b.handle(), 0, VK_INDEX_TYPE_UINT32);
+}
+
+void VulkanCommandBuffer::BindTexture(ITexture& texture) {
+    auto& vt = static_cast<VulkanTexture&>(texture);
+    VkDescriptorSet s = vt.descriptorSet();
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            0, 1, &s, 0, nullptr);
 }
 
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {

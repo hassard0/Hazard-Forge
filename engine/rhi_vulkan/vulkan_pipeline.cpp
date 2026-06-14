@@ -1,12 +1,13 @@
 #include "rhi_vulkan/vulkan_pipeline.h"
 #include "rhi_vulkan/vulkan_shader.h"
+#include "rhi_vulkan/vulkan_device.h"
 #include "rhi_vulkan/vk_common.h"
 #include <vector>
 
 namespace hf::rhi::vk {
 
-VulkanPipeline::VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc)
-    : device_(device) {
+VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc)
+    : device_(device.device()) {
     auto* vs = static_cast<VulkanShaderModule*>(desc.vertex);
     auto* fs = static_cast<VulkanShaderModule*>(desc.fragment);
 
@@ -86,6 +87,11 @@ VulkanPipeline::VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc
     if (desc.pushConstantSize > 0) {
         lci.pushConstantRangeCount = 1;
         lci.pPushConstantRanges = &pushRange;
+    }
+    VkDescriptorSetLayout setLayout = device.texturedSetLayout();
+    if (desc.usesTexture) {
+        lci.setLayoutCount = 1;
+        lci.pSetLayouts = &setLayout;
     }
     Check(vkCreatePipelineLayout(device_, &lci, nullptr, &layout_), "vkCreatePipelineLayout");
 

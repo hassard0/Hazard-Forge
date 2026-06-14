@@ -23,18 +23,49 @@ std::vector<uint32_t> LoadSpirv(const std::string& path) {
     return words;
 }
 
-struct Vertex { float pos[3]; float color[3]; };
+struct Vertex { float pos[3]; float color[3]; float uv[2]; };
+
+// Procedural 256x256 RGBA8 checkerboard: 8x8 tiles alternating two colors, with the
+// base color also shifted by tile position so the grid is clearly readable.
+std::vector<uint8_t> MakeCheckerboard() {
+    const uint32_t kSize = 256;
+    const uint32_t kTiles = 8;
+    const uint32_t kTilePx = kSize / kTiles;  // 32px per tile
+    std::vector<uint8_t> pixels(static_cast<size_t>(kSize) * kSize * 4);
+    for (uint32_t y = 0; y < kSize; ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            uint32_t tx = x / kTilePx;
+            uint32_t ty = y / kTilePx;
+            bool dark = ((tx + ty) & 1) != 0;
+            // Position-varying tint so neighbouring tiles differ even within one parity.
+            uint8_t px = static_cast<uint8_t>(40 + tx * (215 / (kTiles - 1)));
+            uint8_t py = static_cast<uint8_t>(40 + ty * (215 / (kTiles - 1)));
+            size_t idx = (static_cast<size_t>(y) * kSize + x) * 4;
+            if (dark) {
+                pixels[idx + 0] = static_cast<uint8_t>(px / 4);
+                pixels[idx + 1] = static_cast<uint8_t>(py / 4);
+                pixels[idx + 2] = 60;
+            } else {
+                pixels[idx + 0] = px;
+                pixels[idx + 1] = py;
+                pixels[idx + 2] = 230;
+            }
+            pixels[idx + 3] = 255;
+        }
+    }
+    return pixels;
+}
 
 } // namespace
 
 int main() {
     using namespace hf;
     try {
-        hal::Window window({"Hazard Forge — Hello Cube", 1280, 720});
+        hal::Window window({"Hazard Forge — Textured Cube", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
 
-        auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cube.vert.hlsl.spv");
-        auto fsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cube.frag.hlsl.spv");
+        auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cube_tex.vert.hlsl.spv");
+        auto fsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cube_tex.frag.hlsl.spv");
         auto vs = device->CreateShaderModule({std::span<const uint32_t>(vsWords)});
         auto fs = device->CreateShaderModule({std::span<const uint32_t>(fsWords)});
 
@@ -43,6 +74,7 @@ int main() {
         layout.attributes = {
             {0, rhi::Format::RGB32_Float, offsetof(Vertex, pos)},
             {1, rhi::Format::RGB32_Float, offsetof(Vertex, color)},
+            {2, rhi::Format::RG32_Float,  offsetof(Vertex, uv)},
         };
 
         rhi::GraphicsPipelineDesc pdesc;
@@ -51,36 +83,59 @@ int main() {
         pdesc.vertexLayout = layout;
         pdesc.colorFormat = device->Swapchain().ColorFormat();
         pdesc.depthTest = true;
+        pdesc.usesTexture = true;
         pdesc.pushConstantSize = sizeof(float) * 16;
         auto pipeline = device->CreateGraphicsPipeline(pdesc);
 
-        // 8 corners at +/-0.5 per axis; color = (pos + 0.5) so each corner is distinct.
-        // Index encodes sign bits: bit0=x, bit1=y, bit2=z (0 => -0.5, 1 => +0.5).
-        //   0:(-,-,-) 1:(+,-,-) 2:(-,+,-) 3:(+,+,-)
-        //   4:(-,-,+) 5:(+,-,+) 6:(-,+,+) 7:(+,+,+)
-        Vertex verts[8];
-        for (int i = 0; i < 8; ++i) {
-            float x = (i & 1) ? 0.5f : -0.5f;
-            float y = (i & 2) ? 0.5f : -0.5f;
-            float z = (i & 4) ? 0.5f : -0.5f;
-            verts[i] = {{x, y, z}, {x + 0.5f, y + 0.5f, z + 0.5f}};
+        // 24 vertices (4 per face) so each face carries its own UV square + tint.
+        // Faces wound CCW outward (RH); UVs per face: (0,0)(1,0)(1,1)(0,1).
+        const float n = -0.5f, p = 0.5f;
+        const Vertex verts[24] = {
+            // -Z (back), tint red
+            {{p, n, n}, {1.0f, 0.4f, 0.4f}, {0, 0}},
+            {{n, n, n}, {1.0f, 0.4f, 0.4f}, {1, 0}},
+            {{n, p, n}, {1.0f, 0.4f, 0.4f}, {1, 1}},
+            {{p, p, n}, {1.0f, 0.4f, 0.4f}, {0, 1}},
+            // +Z (front), tint green
+            {{n, n, p}, {0.4f, 1.0f, 0.4f}, {0, 0}},
+            {{p, n, p}, {0.4f, 1.0f, 0.4f}, {1, 0}},
+            {{p, p, p}, {0.4f, 1.0f, 0.4f}, {1, 1}},
+            {{n, p, p}, {0.4f, 1.0f, 0.4f}, {0, 1}},
+            // -X (left), tint blue
+            {{n, n, n}, {0.4f, 0.4f, 1.0f}, {0, 0}},
+            {{n, n, p}, {0.4f, 0.4f, 1.0f}, {1, 0}},
+            {{n, p, p}, {0.4f, 0.4f, 1.0f}, {1, 1}},
+            {{n, p, n}, {0.4f, 0.4f, 1.0f}, {0, 1}},
+            // +X (right), tint yellow
+            {{p, n, p}, {1.0f, 1.0f, 0.4f}, {0, 0}},
+            {{p, n, n}, {1.0f, 1.0f, 0.4f}, {1, 0}},
+            {{p, p, n}, {1.0f, 1.0f, 0.4f}, {1, 1}},
+            {{p, p, p}, {1.0f, 1.0f, 0.4f}, {0, 1}},
+            // -Y (bottom), tint magenta
+            {{n, n, n}, {1.0f, 0.4f, 1.0f}, {0, 0}},
+            {{p, n, n}, {1.0f, 0.4f, 1.0f}, {1, 0}},
+            {{p, n, p}, {1.0f, 0.4f, 1.0f}, {1, 1}},
+            {{n, n, p}, {1.0f, 0.4f, 1.0f}, {0, 1}},
+            // +Y (top), tint cyan
+            {{n, p, p}, {0.4f, 1.0f, 1.0f}, {0, 0}},
+            {{p, p, p}, {0.4f, 1.0f, 1.0f}, {1, 0}},
+            {{p, p, n}, {0.4f, 1.0f, 1.0f}, {1, 1}},
+            {{n, p, n}, {0.4f, 1.0f, 1.0f}, {0, 1}},
+        };
+
+        // 36 indices: 2 triangles per face over its 4 vertices, CCW outward.
+        uint32_t indices[36];
+        for (uint32_t f = 0; f < 6; ++f) {
+            uint32_t base = f * 4;
+            uint32_t* tri = &indices[f * 6];
+            tri[0] = base + 0; tri[1] = base + 1; tri[2] = base + 2;
+            tri[3] = base + 0; tri[4] = base + 2; tri[5] = base + 3;
         }
 
-        // 36 indices, 2 triangles per face, wound CCW when viewed from outside (RH).
-        const uint32_t indices[36] = {
-            // -Z (back), outward normal -Z: CCW seen from -Z
-            0, 2, 3,  0, 3, 1,
-            // +Z (front), outward normal +Z: CCW seen from +Z
-            4, 5, 7,  4, 7, 6,
-            // -X (left), outward normal -X
-            0, 4, 6,  0, 6, 2,
-            // +X (right), outward normal +X
-            1, 3, 7,  1, 7, 5,
-            // -Y (bottom), outward normal -Y
-            0, 1, 5,  0, 5, 4,
-            // +Y (top), outward normal +Y
-            2, 6, 7,  2, 7, 3,
-        };
+        // Procedural checkerboard texture (256x256 RGBA8).
+        std::vector<uint8_t> pixels = MakeCheckerboard();
+        auto texture = device->CreateTexture(
+            {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
         rhi::BufferDesc vbdesc;
         vbdesc.size = sizeof(verts);
@@ -124,6 +179,7 @@ int main() {
                 frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
                 frame.cmd->BindPipeline(*pipeline);
                 frame.cmd->PushConstants(mvp.m, sizeof(float) * 16);
+                frame.cmd->BindTexture(*texture);
                 frame.cmd->BindVertexBuffer(*vbuffer);
                 frame.cmd->BindIndexBuffer(*ibuffer);
                 frame.cmd->DrawIndexed(36);

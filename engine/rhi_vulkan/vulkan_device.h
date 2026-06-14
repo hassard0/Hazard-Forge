@@ -22,6 +22,7 @@ public:
     std::unique_ptr<IShaderModule> CreateShaderModule(const ShaderModuleDesc&) override;
     std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) override;
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
+    std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
 
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
@@ -30,10 +31,19 @@ public:
     // Accessors used by sibling Vulkan objects.
     VkDevice device() const { return device_; }
     VmaAllocator allocator() const { return allocator_; }
+    VkSampler defaultSampler() const { return defaultSampler_; }
+    VkDescriptorSetLayout texturedSetLayout() const { return texturedSetLayout_; }
+    VkDescriptorPool descriptorPool() const { return descriptorPool_; }
+
+    // Stage host pixel data into a device-local image (synchronous; see vulkan_texture).
+    void UploadToImage(VkImage image, uint32_t w, uint32_t h,
+                       const void* data, uint64_t size);
 
 private:
     void CreateSyncObjects();
     void DestroySyncObjects();
+    void CreateTextureResources();
+    void DestroyTextureResources();
 
     hf::hal::Window& window_;
 
@@ -46,6 +56,11 @@ private:
     VkQueue       graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t      graphicsQueueFamily_ = 0;
     VmaAllocator  allocator_ = VK_NULL_HANDLE;
+
+    // Texture support: one default sampler + a shared combined-image-sampler set layout + pool.
+    VkSampler             defaultSampler_    = VK_NULL_HANDLE;
+    VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     std::unique_ptr<VulkanSwapchain> swapchain_;
 
