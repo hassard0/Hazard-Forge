@@ -201,9 +201,46 @@ void VulkanDevice::CreateTextureResources() {
     ssci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     Check(vkCreateSampler(device_, &ssci, nullptr, &shadowSampler_), "vkCreateSampler(shadow)");
 
-    // Material set layout (used at set 1): binding 0 = sampled image, binding 1 = sampler,
-    // fragment stage. (DXC emits Texture2D/SamplerState as two separate descriptors.)
-    VkDescriptorSetLayoutBinding bindings[2]{};
+    // --- Default flat normal map: a 1x1 RGBA8 image encoding the tangent-space normal (0,0,1) as
+    // (128,128,255). Bound at material set binding 3 when a renderable has no normal map, so the lit
+    // shader always samples a valid normal map (perturbation = identity). ---
+    {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.extent = {1, 1, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO;
+        Check(vmaCreateImage(allocator_, &ici, &aci, &defaultNormalImage_, &defaultNormalAlloc_,
+                             nullptr), "vmaCreateImage(defaultNormal)");
+        const uint8_t flatNormal[4] = {128, 128, 255, 255};
+        UploadToImage(defaultNormalImage_, 1, 1, flatNormal, sizeof(flatNormal));
+
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image = defaultNormalImage_;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        Check(vkCreateImageView(device_, &vci, nullptr, &defaultNormalView_),
+              "vkCreateImageView(defaultNormal)");
+    }
+
+    // Material set layout (used at set 1), fragment stage. (DXC emits Texture2D/SamplerState as two
+    // separate descriptors.) Four bindings now that materials carry a normal map:
+    //   binding 0 = base-color sampled image   (gTex,        set1 b0)
+    //   binding 1 = base-color sampler         (gSmp,        set1 b1)
+    //   binding 3 = normal-map sampled image   (gNormalMap,  set1 b3)
+    //   binding 4 = normal-map sampler         (gNormalSmp,  set1 b4)
+    // (Bindings 3/4 match the lit.frag HLSL [[vk::binding(3,1)]]/[[vk::binding(4,1)]] so spirv-cross
+    // maps them to Metal texture(3)/sampler(4). Binding 2 is intentionally unused on Vulkan.)
+    VkDescriptorSetLayoutBinding bindings[4]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[0].descriptorCount = 1;
@@ -212,8 +249,16 @@ void VulkanDevice::CreateTextureResources() {
     bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[2].binding = 3;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[3].binding = 4;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 2;
+    lci.bindingCount = 4;
     lci.pBindings = bindings;
     Check(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &texturedSetLayout_),
           "vkCreateDescriptorSetLayout");
@@ -222,11 +267,13 @@ void VulkanDevice::CreateTextureResources() {
     // a UNIFORM_BUFFER capacity for the per-frame UBO sets (set 0).
     // SAMPLED_IMAGE/SAMPLER counts cover material sets (set 1) plus the per-frame sets' shadow-map
     // image + sampler bindings (set 0, bindings 1+2): +kFramesInFlight each.
+    // Each material set now binds TWO sampled images + TWO samplers (base-color + normal map), so
+    // double the per-set image/sampler capacity vs. the old single-texture material set.
     VkDescriptorPoolSize poolSizes[3]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    poolSizes[0].descriptorCount = 64 + kFramesInFlight;
+    poolSizes[0].descriptorCount = 128 + kFramesInFlight;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    poolSizes[1].descriptorCount = 64 + kFramesInFlight;
+    poolSizes[1].descriptorCount = 128 + kFramesInFlight;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -309,6 +356,12 @@ void VulkanDevice::DestroyTextureResources() {
     }
     if (frameSetLayout_) vkDestroyDescriptorSetLayout(device_, frameSetLayout_, nullptr);
     frameSetLayout_ = VK_NULL_HANDLE;
+
+    if (defaultNormalView_) vkDestroyImageView(device_, defaultNormalView_, nullptr);
+    if (defaultNormalImage_) vmaDestroyImage(allocator_, defaultNormalImage_, defaultNormalAlloc_);
+    defaultNormalView_ = VK_NULL_HANDLE;
+    defaultNormalImage_ = VK_NULL_HANDLE;
+    defaultNormalAlloc_ = VK_NULL_HANDLE;
 
     if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);

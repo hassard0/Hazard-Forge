@@ -10,6 +10,7 @@
 #define STBI_NO_STDIO   // we only ever decode from memory (embedded glb buffer_view)
 #include "stb/stb_image.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -38,6 +39,7 @@ scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const cha
         throw std::runtime_error(std::string("glTF primitive has no POSITION: ") + path);
     const cgltf_accessor* nrmAcc = FindAttr(prim, cgltf_attribute_type_normal);
     const cgltf_accessor* uvAcc  = FindAttr(prim, cgltf_attribute_type_texcoord);
+    const cgltf_accessor* tanAcc = FindAttr(prim, cgltf_attribute_type_tangent);
 
     const cgltf_size vertCount = posAcc->count;
 
@@ -59,6 +61,7 @@ scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const cha
         // Defaults; overwritten below if the accessors exist.
         v.uv[0] = 0.0f; v.uv[1] = 0.0f;
         v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
     }
 
     const float center[3] = {0.5f * (bbMin[0] + bbMax[0]),
@@ -95,6 +98,54 @@ scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const cha
     } else {
         indices.resize(vertCount);
         for (cgltf_size i = 0; i < vertCount; ++i) indices[i] = static_cast<uint32_t>(i);
+    }
+
+    // --- Tangents (location 4). Prefer the authored TANGENT accessor (VEC4: xyz + w handedness);
+    // otherwise accumulate per-triangle tangents from positions+UVs (Lengyel's method) and
+    // Gram-Schmidt orthonormalize against the vertex normal. If neither path yields a usable
+    // tangent the default (1,0,0) set above is kept so the lit shader's TBN stays finite. ---
+    if (tanAcc) {
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float tg[4] = {1, 0, 0, 1};
+            cgltf_accessor_read_float(tanAcc, i, tg, 4);
+            // w is +/-1 handedness; the engine's lit shader bakes B = cross(N,T)*handedness, but the
+            // scene::Vertex carries only xyz. Fold a -1 handedness into the stored tangent direction
+            // so cross(N,T) yields the correct bitangent without a separate handedness channel.
+            float s = (tg[3] < 0.0f) ? -1.0f : 1.0f;
+            verts[i].tangent[0] = tg[0] * s;
+            verts[i].tangent[1] = tg[1] * s;
+            verts[i].tangent[2] = tg[2] * s;
+        }
+    } else if (uvAcc) {
+        std::vector<float> tan(vertCount * 3, 0.0f);
+        for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+            uint32_t i0 = indices[t], i1 = indices[t + 1], i2 = indices[t + 2];
+            const float* p0 = verts[i0].pos; const float* p1 = verts[i1].pos; const float* p2 = verts[i2].pos;
+            const float* w0 = verts[i0].uv;  const float* w1 = verts[i1].uv;  const float* w2 = verts[i2].uv;
+            float e1[3] = {p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]};
+            float e2[3] = {p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]};
+            float du1 = w1[0]-w0[0], dv1 = w1[1]-w0[1];
+            float du2 = w2[0]-w0[0], dv2 = w2[1]-w0[1];
+            float det = du1*dv2 - du2*dv1;
+            float r = (std::fabs(det) > 1e-8f) ? (1.0f / det) : 0.0f;
+            float tx = (dv2*e1[0] - dv1*e2[0]) * r;
+            float ty = (dv2*e1[1] - dv1*e2[1]) * r;
+            float tz = (dv2*e1[2] - dv1*e2[2]) * r;
+            for (uint32_t vi : {i0, i1, i2}) {
+                tan[vi*3+0] += tx; tan[vi*3+1] += ty; tan[vi*3+2] += tz;
+            }
+        }
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            const float* n = verts[i].normal;
+            float t[3] = {tan[i*3+0], tan[i*3+1], tan[i*3+2]};
+            // Gram-Schmidt: T = normalize(T - N*dot(N,T)).
+            float ndt = n[0]*t[0] + n[1]*t[1] + n[2]*t[2];
+            t[0] -= n[0]*ndt; t[1] -= n[1]*ndt; t[2] -= n[2]*ndt;
+            float len = std::sqrt(t[0]*t[0] + t[1]*t[1] + t[2]*t[2]);
+            if (len > 1e-6f) {
+                verts[i].tangent[0] = t[0]/len; verts[i].tangent[1] = t[1]/len; verts[i].tangent[2] = t[2]/len;
+            }
+        }
     }
 
     // --- Upload to GPU buffers via the RHI. ---

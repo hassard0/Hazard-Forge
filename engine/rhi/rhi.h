@@ -109,6 +109,11 @@ public:
     virtual void BindVertexBuffer(IBuffer& buffer) = 0;
     virtual void BindIndexBuffer(IBuffer& buffer) = 0;
     virtual void BindTexture(ITexture& texture) = 0;
+    // Bind a material: base-color texture at the material slot AND a tangent-space normal map at the
+    // second material slot (material set binding 2/3 on Vulkan; Metal texture(3)/sampler(4)). The lit
+    // pass uses this so a normal map can perturb the shading normal. Default forwards to BindTexture
+    // (base only) for backends/passes that do not implement the normal-map slot.
+    virtual void BindMaterial(ITexture& base, ITexture& normalMap) { (void)normalMap; BindTexture(base); }
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0) = 0;
     virtual void PushConstants(const void* data, uint32_t size) = 0;

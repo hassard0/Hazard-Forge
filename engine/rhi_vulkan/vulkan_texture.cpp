@@ -45,8 +45,10 @@ VulkanTexture::VulkanTexture(VulkanDevice& device, const TextureDesc& desc)
     dai.pSetLayouts = &layout;
     Check(vkAllocateDescriptorSets(device_.device(), &dai, &set_), "vkAllocateDescriptorSets");
 
-    // binding 0 = sampled image (the view), binding 1 = sampler. DXC emits the
-    // Texture2D and SamplerState as two separate descriptors, not one combined.
+    // binding 0 = base-color sampled image (the view), binding 1 = base sampler. DXC emits the
+    // Texture2D and SamplerState as two separate descriptors, not one combined. binding 3/4 =
+    // normal-map image + sampler, defaulted to the device's flat (0,0,1) normal so the set is
+    // complete; BindMaterial(attachNormalMap) overrides binding 3 with a real normal map.
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = view_;
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -54,7 +56,14 @@ VulkanTexture::VulkanTexture(VulkanDevice& device, const TextureDesc& desc)
     VkDescriptorImageInfo samplerInfo{};
     samplerInfo.sampler = device_.defaultSampler();
 
-    VkWriteDescriptorSet writes[2]{};
+    VkDescriptorImageInfo normalImageInfo{};
+    normalImageInfo.imageView = device_.defaultNormalView();
+    normalImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorImageInfo normalSamplerInfo{};
+    normalSamplerInfo.sampler = device_.defaultSampler();
+
+    VkWriteDescriptorSet writes[4]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set_;
     writes[0].dstBinding = 0;
@@ -71,7 +80,43 @@ VulkanTexture::VulkanTexture(VulkanDevice& device, const TextureDesc& desc)
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     writes[1].pImageInfo = &samplerInfo;
 
-    vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = set_;
+    writes[2].dstBinding = 3;
+    writes[2].dstArrayElement = 0;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[2].pImageInfo = &normalImageInfo;
+
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = set_;
+    writes[3].dstBinding = 4;
+    writes[3].dstArrayElement = 0;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[3].pImageInfo = &normalSamplerInfo;
+
+    vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
+    boundNormalView_ = device_.defaultNormalView();
+}
+
+void VulkanTexture::attachNormalMap(VkImageView normalView) {
+    VkImageView target = normalView ? normalView : device_.defaultNormalView();
+    if (target == boundNormalView_) return;  // already pointing here — skip the redundant update
+
+    VkDescriptorImageInfo normalImageInfo{};
+    normalImageInfo.imageView = target;
+    normalImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set_;
+    write.dstBinding = 3;
+    write.dstArrayElement = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &normalImageInfo;
+    vkUpdateDescriptorSets(device_.device(), 1, &write, 0, nullptr);
+    boundNormalView_ = target;
 }
 
 VulkanTexture::~VulkanTexture() {

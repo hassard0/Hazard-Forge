@@ -79,6 +79,46 @@ std::vector<uint8_t> MakeCheckerboard() {
     return pixels;
 }
 
+// Procedural 256x256 RGBA8 tangent-space normal map: an 8x8 grid of radial domes (one per
+// checkerboard tile). Each tile's height is a smooth dome h(r) = cos(pi/2 * r/R)^2 falling to 0 at
+// the tile edge; the tangent-space normal is derived from the height gradient and encoded 0..1
+// (flat = (128,128,255)). Tiling makes the bumps read clearly across the cube faces / ground plane.
+std::vector<uint8_t> MakeBumpyNormalMap() {
+    const uint32_t kSize = 256;
+    const uint32_t kTiles = 8;
+    const float kTilePx = (float)kSize / (float)kTiles;  // 32px per tile
+    const float kBump = 4.0f;  // gradient strength -> bump steepness (visibly domed tiles)
+    auto height = [&](float x, float y) {
+        // Local coords within the tile, centered; radius normalized to the half-tile.
+        float lx = std::fmod(x, kTilePx) / kTilePx - 0.5f;
+        float ly = std::fmod(y, kTilePx) / kTilePx - 0.5f;
+        float r = std::sqrt(lx * lx + ly * ly) / 0.5f;  // 0 at center, ~1 at edge
+        if (r >= 1.0f) return 0.0f;
+        float c = std::cos(1.5707963f * r);
+        return c * c;  // smooth dome
+    };
+    std::vector<uint8_t> px(static_cast<size_t>(kSize) * kSize * 4);
+    for (uint32_t y = 0; y < kSize; ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            // Central-difference height gradient (wraps at the texture edge for seamless tiling).
+            float xl = (float)((x + kSize - 1) % kSize), xr = (float)((x + 1) % kSize);
+            float yd = (float)((y + kSize - 1) % kSize), yu = (float)((y + 1) % kSize);
+            float dhdx = (height(xr, (float)y) - height(xl, (float)y)) * 0.5f;
+            float dhdy = (height((float)x, yu) - height((float)x, yd)) * 0.5f;
+            // Tangent-space normal from the height field: N = normalize(-dh/dx, -dh/dy, 1).
+            float nx = -dhdx * kBump, ny = -dhdy * kBump, nz = 1.0f;
+            float inv = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+            nx *= inv; ny *= inv; nz *= inv;
+            size_t idx = (static_cast<size_t>(y) * kSize + x) * 4;
+            px[idx + 0] = (uint8_t)std::lround((nx * 0.5f + 0.5f) * 255.0f);
+            px[idx + 1] = (uint8_t)std::lround((ny * 0.5f + 0.5f) * 255.0f);
+            px[idx + 2] = (uint8_t)std::lround((nz * 0.5f + 0.5f) * 255.0f);
+            px[idx + 3] = 255;
+        }
+    }
+    return px;
+}
+
 static bool WriteBMP(const char* path, const std::vector<uint8_t>& bgra,
                      uint32_t w, uint32_t h) {
     // 32bpp BI_RGB, bottom-up. Captured data is top-row-first BGRA; BMP wants bottom-up.
@@ -283,6 +323,16 @@ int main(int argc, char** argv) {
         auto texture = device->CreateTexture(
             {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
+        // Procedural tangent-space normal map (256x256 RGBA8, domed tiles) for the dielectric
+        // surfaces, plus a 1x1 flat normal (0,0,1) for surfaces that should stay smooth (metals,
+        // duck). Every renderable binds a normal map so the lit shader's gNormalMap is uniform.
+        std::vector<uint8_t> normalPixels = MakeBumpyNormalMap();
+        auto bumpNormal = device->CreateTexture(
+            {256, 256, rhi::Format::RGBA8_UNorm, normalPixels.data(), normalPixels.size()});
+        const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+        auto flatNormal = device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
         // Two primitive meshes from the scene layer.
         scene::Mesh cube = scene::Mesh::Cube(*device);
         scene::Mesh plane = scene::Mesh::Plane(*device);
@@ -300,8 +350,9 @@ int main(int argc, char** argv) {
             scene::Transform planeT;
             planeT.position = {0.0f, 0.0f, 0.0f};
             planeT.scale = {6.0f, 1.0f, 6.0f};
-            // Ground plane: rough dielectric.
-            sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f});
+            // Ground plane: rough dielectric, bumped by the procedural normal map.
+            sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f,
+                                    bumpNormal.get()});
 
             for (int gx = -1; gx <= 1; ++gx) {
                 for (int gz = -1; gz <= 1; ++gz) {
@@ -314,14 +365,16 @@ int main(int argc, char** argv) {
                     if (useSphere) {
                         t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
                         t.scale = {0.55f, 0.55f, 0.55f};
-                        // Shiny metal spheres.
-                        sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f});
+                        // Shiny metal spheres: keep a flat (smooth) normal.
+                        sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f,
+                                                flatNormal.get()});
                     } else {
                         t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
                         t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
                         t.scale = {0.5f, 0.5f, 0.5f};
-                        // Matte dielectric cubes.
-                        sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f});
+                        // Matte dielectric cubes: bumped by the procedural normal map.
+                        sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f,
+                                                bumpNormal.get()});
                     }
                 }
             }
@@ -336,7 +389,7 @@ int main(int argc, char** argv) {
             duckT.scale = {0.022f, 0.022f, 0.022f};
             float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
             sceneObjects.push_back({&duck, duckModel.baseColor.get(), duckT,
-                                    duckModel.metallic, duckRough});
+                                    duckModel.metallic, duckRough, flatNormal.get()});
         }
 
         using math::Mat4;
@@ -408,7 +461,9 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
                 pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
                 cmd->PushConstants(pc, sizeof(pc));
-                cmd->BindTexture(*r.texture);
+                // Bind base-color + normal map together (every renderable has a normal map: the
+                // procedural bump for dielectrics, the flat default for metals/duck).
+                cmd->BindMaterial(*r.texture, *r.normalMap);
                 cmd->BindVertexBuffer(r.mesh->vertices());
                 cmd->BindIndexBuffer(r.mesh->indices());
                 cmd->DrawIndexed(r.mesh->indexCount());

@@ -93,6 +93,40 @@ static std::vector<uint8_t> MakeCheckerboard() {
     return px;
 }
 
+// Procedural 256x256 RGBA8 tangent-space normal map: an 8x8 grid of radial domes (one per
+// checkerboard tile), encoded 0..1 (flat = (128,128,255)). Identical generator to the Vulkan
+// sample so both backends bump the dielectric surfaces the same way.
+static std::vector<uint8_t> MakeBumpyNormalMap() {
+    const uint32_t kSize = 256, kTiles = 8;
+    const float kTilePx = (float)kSize / (float)kTiles;
+    const float kBump = 4.0f;  // visibly domed tiles (matches the Vulkan sample)
+    auto height = [&](float x, float y) {
+        float lx = std::fmod(x, kTilePx) / kTilePx - 0.5f;
+        float ly = std::fmod(y, kTilePx) / kTilePx - 0.5f;
+        float r = std::sqrt(lx * lx + ly * ly) / 0.5f;
+        if (r >= 1.0f) return 0.0f;
+        float c = std::cos(1.5707963f * r);
+        return c * c;
+    };
+    std::vector<uint8_t> px(static_cast<size_t>(kSize) * kSize * 4);
+    for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+            float xl = (float)((x + kSize - 1) % kSize), xr = (float)((x + 1) % kSize);
+            float yd = (float)((y + kSize - 1) % kSize), yu = (float)((y + 1) % kSize);
+            float dhdx = (height(xr, (float)y) - height(xl, (float)y)) * 0.5f;
+            float dhdy = (height((float)x, yu) - height((float)x, yd)) * 0.5f;
+            float nx = -dhdx * kBump, ny = -dhdy * kBump, nz = 1.0f;
+            float inv = 1.0f / std::sqrt(nx * nx + ny * ny + nz * nz);
+            nx *= inv; ny *= inv; nz *= inv;
+            size_t idx = (static_cast<size_t>(y) * kSize + x) * 4;
+            px[idx + 0] = (uint8_t)std::lround((nx * 0.5f + 0.5f) * 255.0f);
+            px[idx + 1] = (uint8_t)std::lround((ny * 0.5f + 0.5f) * 255.0f);
+            px[idx + 2] = (uint8_t)std::lround((nz * 0.5f + 0.5f) * 255.0f);
+            px[idx + 3] = 255;
+        }
+    return px;
+}
+
 static bool WritePNG(const char* outPath, const std::vector<uint8_t>& bgra,
                      uint32_t W, uint32_t H) {
     // Captured pixels are tightly-packed BGRA8, top row first. Swap to RGBA for ImageIO.
@@ -278,6 +312,16 @@ int main(int argc, char** argv) {
             auto texture = device->CreateTexture(
                 {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
+            // Procedural tangent-space normal map (domed tiles) for the dielectric surfaces + a 1x1
+            // flat normal (0,0,1) for smooth surfaces. Same generators as the Vulkan sample so both
+            // backends bump identically; every renderable binds a normal map (uniform gNormalMap).
+            std::vector<uint8_t> normalPixels = MakeBumpyNormalMap();
+            auto bumpNormal = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, normalPixels.data(), normalPixels.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
             // ---- Primitive meshes from the scene layer. ----
             scene::Mesh cube = scene::Mesh::Cube(*device);
             scene::Mesh plane = scene::Mesh::Plane(*device);
@@ -298,7 +342,8 @@ int main(int argc, char** argv) {
                 scene::Transform planeT;
                 planeT.position = {0.0f, 0.0f, 0.0f};
                 planeT.scale = {6.0f, 1.0f, 6.0f};
-                sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f});
+                sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f,
+                                        bumpNormal.get()});
 
                 for (int gx = -1; gx <= 1; ++gx)
                     for (int gz = -1; gz <= 1; ++gz) {
@@ -309,14 +354,16 @@ int main(int argc, char** argv) {
                         if (useSphere) {
                             t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
                             t.scale = {0.55f, 0.55f, 0.55f};
-                            // Shiny metal spheres.
-                            sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f});
+                            // Shiny metal spheres: keep a flat (smooth) normal.
+                            sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f,
+                                                    flatNormal.get()});
                         } else {
                             t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
                             t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
                             t.scale = {0.5f, 0.5f, 0.5f};
-                            // Matte dielectric cubes.
-                            sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f});
+                            // Matte dielectric cubes: bumped by the procedural normal map.
+                            sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f,
+                                                    bumpNormal.get()});
                         }
                     }
 
@@ -329,7 +376,7 @@ int main(int argc, char** argv) {
                 duckT.scale = {0.022f, 0.022f, 0.022f};
                 float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
                 sceneObjects.push_back({&duck, duckModel.baseColor.get(), duckT,
-                                        duckModel.metallic, duckRough});
+                                        duckModel.metallic, duckRough, flatNormal.get()});
             }
 
             // ---- Frame uniforms: same camera + light as the Vulkan Slice-F sample. ----
@@ -432,7 +479,7 @@ int main(int argc, char** argv) {
                     for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
                     pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
                     rtc.cmd->PushConstants(pc, sizeof(pc));
-                    rtc.cmd->BindTexture(*r.texture);
+                    rtc.cmd->BindMaterial(*r.texture, *r.normalMap);
                     rtc.cmd->BindVertexBuffer(r.mesh->vertices());
                     rtc.cmd->BindIndexBuffer(r.mesh->indices());
                     rtc.cmd->DrawIndexed(r.mesh->indexCount());

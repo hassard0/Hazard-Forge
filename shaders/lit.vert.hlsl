@@ -1,8 +1,9 @@
 struct VSInput {
-    [[vk::location(0)]] float3 pos    : POSITION;
-    [[vk::location(1)]] float3 color  : COLOR;
-    [[vk::location(2)]] float2 uv     : TEXCOORD0;
-    [[vk::location(3)]] float3 normal : NORMAL;
+    [[vk::location(0)]] float3 pos     : POSITION;
+    [[vk::location(1)]] float3 color   : COLOR;
+    [[vk::location(2)]] float2 uv      : TEXCOORD0;
+    [[vk::location(3)]] float3 normal  : NORMAL;
+    [[vk::location(4)]] float3 tangent : TANGENT;
 };
 struct VSOutput {
     float4 clip      : SV_Position;
@@ -13,6 +14,9 @@ struct VSOutput {
     // Per-draw material, constant across the primitive. nointerpolation keeps it exact
     // (no perspective division) since metallic/roughness come straight from the push constant.
     [[vk::location(4)]] nointerpolation float2 material : TEXCOORD1; // x=metallic, y=roughness
+    // World-space tangent (location 5); the fragment shader builds the TBN basis from this + the
+    // interpolated world normal (B = cross(N,T)). Interpolated like the normal.
+    [[vk::location(5)]] float3 wtangent : TANGENT;
 };
 struct FrameData {
     float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
@@ -50,6 +54,9 @@ VSOutput main(VSInput i) {
     // (float3x3)model is correct for rotation + uniform scale only. Non-uniform scale needs the
     // inverse-transpose normal matrix (pass it separately when scaled geometry is introduced).
     o.wnormal = normalize(mul((float3x3)HF_MODEL, i.normal));
+    // World-space tangent (rotation + uniform scale only, same caveat as the normal). Not yet
+    // re-orthonormalized; the fragment shader Gram-Schmidts it against the interpolated normal.
+    o.wtangent = mul((float3x3)HF_MODEL, i.tangent);
     o.color = i.color; o.uv = i.uv;
     o.material = HF_MATERIAL.xy;  // pass metallic+roughness through to the fragment
     return o;

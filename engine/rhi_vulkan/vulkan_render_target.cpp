@@ -90,7 +90,16 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     VkDescriptorImageInfo samplerInfo{};
     samplerInfo.sampler = device_.defaultSampler();
 
-    VkWriteDescriptorSet writes[2]{};
+    // Material set layout now has 4 bindings (base 0/1 + normal-map 3/4). The post pass only samples
+    // the color image (binding 0/1), but populate binding 3/4 with the device's flat default normal
+    // so the set is fully written (no incomplete-descriptor validation warnings when bound).
+    VkDescriptorImageInfo normalImageInfo{};
+    normalImageInfo.imageView = device_.defaultNormalView();
+    normalImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo normalSamplerInfo{};
+    normalSamplerInfo.sampler = device_.defaultSampler();
+
+    VkWriteDescriptorSet writes[4]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = set_;
     writes[0].dstBinding = 0;
@@ -105,7 +114,21 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     writes[1].pImageInfo = &samplerInfo;
 
-    vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = set_;
+    writes[2].dstBinding = 3;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[2].pImageInfo = &normalImageInfo;
+
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = set_;
+    writes[3].dstBinding = 4;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[3].pImageInfo = &normalSamplerInfo;
+
+    vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
 }
 
 VulkanRenderTarget::~VulkanRenderTarget() {

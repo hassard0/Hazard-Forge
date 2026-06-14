@@ -111,6 +111,18 @@ void MetalCommandBuffer::BindTexture(ITexture& texture) {
     [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragSampler];
 }
 
+void MetalCommandBuffer::BindMaterial(ITexture& base, ITexture& normalMap) {
+    // Base-color at texture(0)/sampler(1) (same as BindTexture); the tangent-space normal map at
+    // texture(3)/sampler(4), matching the generated lit.frag MSL (gNormalMap/gNormalSmp).
+    auto* b = dynamic_cast<IMetalSampled*>(&base);
+    auto* n = dynamic_cast<IMetalSampled*>(&normalMap);
+    if (!b || !n) Fail("BindMaterial: texture is not an IMetalSampled");
+    [encoder_ setFragmentTexture:b->sampledTexture() atIndex:kFragTexture];
+    [encoder_ setFragmentSamplerState:b->sampledSampler() atIndex:kFragSampler];
+    [encoder_ setFragmentTexture:n->sampledTexture() atIndex:kFragNormalTex];
+    [encoder_ setFragmentSamplerState:n->sampledSampler() atIndex:kFragNormalSmp];
+}
+
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     // Point list (GPU particles) vs the default triangle list (geometry / fullscreen tris).
     MTLPrimitiveType prim = boundPointList_ ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle;

@@ -90,6 +90,19 @@ void VulkanCommandBuffer::BindTexture(ITexture& texture) {
                             boundMaterialSet_, 1, &s, 0, nullptr);
 }
 
+void VulkanCommandBuffer::BindMaterial(ITexture& base, ITexture& normalMap) {
+    // The base texture owns the material descriptor set (binding 0/1 = base-color). Point its
+    // normal-map slot (binding 3/4) at `normalMap`'s view, then bind the single combined set. The
+    // attach is cached, so re-binding the same (base, normalMap) pair each frame issues no update.
+    auto& baseTex = static_cast<VulkanTexture&>(base);
+    auto& normalTex = static_cast<VulkanTexture&>(normalMap);
+    baseTex.attachNormalMap(normalTex.view());
+
+    VkDescriptorSet s = baseTex.vkDescriptorSet();
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundMaterialSet_, 1, &s, 0, nullptr);
+}
+
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     vkCmdDraw(cmd_, vertexCount, 1, firstVertex, 0);
 }

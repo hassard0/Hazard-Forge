@@ -19,6 +19,7 @@ namespace hf::rhi::mtl {
 //   fragment: buffer(0) = per-frame UBO (FrameData)   <- Frame at vk::binding(0,0)
 //             texture(0) = material (gTex, set1 b0);   sampler(1) = material sampler (gSmp, set1 b1)
 //             texture(1) = shadow map (gShadow, b1);   sampler(2) = shadow sampler (gShadowSmp, b2)
+//             texture(3) = normal map (gNormalMap, set1 b3); sampler(4) = normal sampler (gNormalSmp, set1 b4)
 // Textures map 1:1 to their binding; samplers carry the binding number too, so the material sampler
 // lands at 1 and the shadow sampler at 2 (one higher than the hand-written MSL used). The engine
 // binds at these indices; the generated MSL declares them.
@@ -30,6 +31,8 @@ constexpr uint32_t kFragTexture   = 0;
 constexpr uint32_t kFragSampler   = 1;
 constexpr uint32_t kFragShadowTex = 1;
 constexpr uint32_t kFragShadowSmp = 2;
+constexpr uint32_t kFragNormalTex = 3;  // gNormalMap (set1 b3 -> texture(3))
+constexpr uint32_t kFragNormalSmp = 4;  // gNormalSmp (set1 b4 -> sampler(4))
 
 // Compute (kernel) binding indices. The particle compute MSL is generated from particles.comp.hlsl
 // via spirv-cross --msl-decoration-binding: the storage buffer (binding 0) -> buffer(0), and the

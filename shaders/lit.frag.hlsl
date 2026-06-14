@@ -9,6 +9,11 @@ struct FrameData {
 [[vk::binding(2, 0)]] SamplerState gShadowSmp : register(s1);
 [[vk::binding(0, 1)]] Texture2D    gTex : register(t0);
 [[vk::binding(1, 1)]] SamplerState gSmp : register(s0);
+// Tangent-space normal map (binding 2/3 of the material set). Encoded 0..1; flat regions store
+// (0.5,0.5,1) which decodes to (0,0,1) = no perturbation. spirv-cross --msl-decoration-binding maps
+// these SPIR-V bindings straight to Metal texture(3)/sampler(4) (see engine/rhi_metal/metal_common.h).
+[[vk::binding(3, 1)]] Texture2D    gNormalMap : register(t3);
+[[vk::binding(4, 1)]] SamplerState gNormalSmp : register(s3);
 struct PSInput {
     float4 clip      : SV_Position;
     [[vk::location(0)]] float3 color  : COLOR;
@@ -16,6 +21,7 @@ struct PSInput {
     [[vk::location(2)]] float3 wnormal: NORMAL;
     [[vk::location(3)]] float3 wpos    : POSITION0;
     [[vk::location(4)]] nointerpolation float2 material : TEXCOORD1; // x=metallic, y=roughness
+    [[vk::location(5)]] float3 wtangent : TANGENT;
 };
 static const float HF_PI = 3.14159265358979323846;
 
@@ -83,7 +89,20 @@ float3 hfCookTorrance(float3 N, float3 V, float3 L, float3 radiance,
 }
 
 float4 main(PSInput i) : SV_Target {
-    float3 N = normalize(i.wnormal);
+    // Geometric (interpolated) world normal.
+    float3 Ng = normalize(i.wnormal);
+
+    // --- Tangent-space normal mapping. Build an orthonormal TBN from the interpolated world normal
+    // and tangent (Gram-Schmidt so a non-orthogonal interpolated tangent stays well-conditioned),
+    // sample the tangent-space normal (0..1 -> -1..1), and rotate it into world space. A flat normal
+    // map (0.5,0.5,1)->(0,0,1) leaves N == Ng, so untextured surfaces are unaffected. ---
+    float3 T = normalize(i.wtangent - Ng * dot(Ng, i.wtangent));
+    float3 B = cross(Ng, T);                       // handedness baked into T at authoring time
+    float3x3 TBN = float3x3(T, B, Ng);             // rows = T,B,N
+    float3 nTS = gNormalMap.Sample(gNormalSmp, i.uv).xyz * 2.0 - 1.0;
+    // mul(nTS, TBN) = nTS.x*T + nTS.y*B + nTS.z*N (row-vector * row-matrix), the standard
+    // tangent->world transform for this row-major TBN.
+    float3 N = normalize(mul(nTS, TBN));
     float3 V = normalize(f.viewPos.xyz - i.wpos);
     float3 tex = gTex.Sample(gSmp, i.uv).rgb * i.color;
 

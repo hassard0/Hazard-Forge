@@ -46,6 +46,9 @@ public:
     VkDevice device() const { return device_; }
     VmaAllocator allocator() const { return allocator_; }
     VkSampler defaultSampler() const { return defaultSampler_; }
+    // 1x1 flat tangent-space normal (0.5,0.5,1)->(0,0,1): the default normal map bound at material
+    // set binding 3/4 so every material set is complete even without an explicit normal map.
+    VkImageView defaultNormalView() const { return defaultNormalView_; }
     VkDescriptorSetLayout texturedSetLayout() const { return texturedSetLayout_; }
     // The material set layout logically lives at set 1 (set index decided by the pipeline
     // layout array); the layout object is identical to the Slice C textured set layout.
@@ -91,6 +94,12 @@ private:
     VkSampler             shadowSampler_     = VK_NULL_HANDLE;  // clamp-to-edge linear (shadow map)
     VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
+
+    // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the
+    // default normal map when a material has none, so the lit shader's TBN perturbation is a no-op.
+    VkImage         defaultNormalImage_ = VK_NULL_HANDLE;
+    VmaAllocation   defaultNormalAlloc_ = VK_NULL_HANDLE;
+    VkImageView     defaultNormalView_  = VK_NULL_HANDLE;
 
     // Per-frame uniform buffers (set 0): one host-visible mapped UBO + descriptor set per
     // frame-in-flight, so the CPU never writes a UBO the GPU is still reading.

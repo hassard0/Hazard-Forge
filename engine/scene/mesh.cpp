@@ -32,38 +32,41 @@ Mesh BuildMesh(rhi::IRHIDevice& device,
 Mesh Mesh::Cube(rhi::IRHIDevice& device) {
     // 24 vertices (4 per face) so each face carries its own UV square + tint.
     // Faces wound CCW outward (RH); UVs per face: (0,0)(1,0)(1,1)(0,1).
+    // tangent (location 4) = object-space dP/du, i.e. the direction of increasing U along the
+    // face (v0->v1, the first UV edge). Orthogonal to the face normal; handedness +1 so the lit
+    // fragment shader's B = cross(N,T) gives the +V direction. (Per-face from the known UV layout.)
     const float n = -0.5f, p = 0.5f;
     const Vertex verts[24] = {
-        // -Z (back), tint red, normal (0,0,-1)
-        {{p, n, n}, {1.0f, 0.4f, 0.4f}, {0, 0}, {0, 0, -1}},
-        {{n, n, n}, {1.0f, 0.4f, 0.4f}, {1, 0}, {0, 0, -1}},
-        {{n, p, n}, {1.0f, 0.4f, 0.4f}, {1, 1}, {0, 0, -1}},
-        {{p, p, n}, {1.0f, 0.4f, 0.4f}, {0, 1}, {0, 0, -1}},
-        // +Z (front), tint green, normal (0,0,1)
-        {{n, n, p}, {0.4f, 1.0f, 0.4f}, {0, 0}, {0, 0, 1}},
-        {{p, n, p}, {0.4f, 1.0f, 0.4f}, {1, 0}, {0, 0, 1}},
-        {{p, p, p}, {0.4f, 1.0f, 0.4f}, {1, 1}, {0, 0, 1}},
-        {{n, p, p}, {0.4f, 1.0f, 0.4f}, {0, 1}, {0, 0, 1}},
-        // -X (left), tint blue, normal (-1,0,0)
-        {{n, n, n}, {0.4f, 0.4f, 1.0f}, {0, 0}, {-1, 0, 0}},
-        {{n, n, p}, {0.4f, 0.4f, 1.0f}, {1, 0}, {-1, 0, 0}},
-        {{n, p, p}, {0.4f, 0.4f, 1.0f}, {1, 1}, {-1, 0, 0}},
-        {{n, p, n}, {0.4f, 0.4f, 1.0f}, {0, 1}, {-1, 0, 0}},
-        // +X (right), tint yellow, normal (1,0,0)
-        {{p, n, p}, {1.0f, 1.0f, 0.4f}, {0, 0}, {1, 0, 0}},
-        {{p, n, n}, {1.0f, 1.0f, 0.4f}, {1, 0}, {1, 0, 0}},
-        {{p, p, n}, {1.0f, 1.0f, 0.4f}, {1, 1}, {1, 0, 0}},
-        {{p, p, p}, {1.0f, 1.0f, 0.4f}, {0, 1}, {1, 0, 0}},
-        // -Y (bottom), tint magenta, normal (0,-1,0)
-        {{n, n, n}, {1.0f, 0.4f, 1.0f}, {0, 0}, {0, -1, 0}},
-        {{p, n, n}, {1.0f, 0.4f, 1.0f}, {1, 0}, {0, -1, 0}},
-        {{p, n, p}, {1.0f, 0.4f, 1.0f}, {1, 1}, {0, -1, 0}},
-        {{n, n, p}, {1.0f, 0.4f, 1.0f}, {0, 1}, {0, -1, 0}},
-        // +Y (top), tint cyan, normal (0,1,0)
-        {{n, p, p}, {0.4f, 1.0f, 1.0f}, {0, 0}, {0, 1, 0}},
-        {{p, p, p}, {0.4f, 1.0f, 1.0f}, {1, 0}, {0, 1, 0}},
-        {{p, p, n}, {0.4f, 1.0f, 1.0f}, {1, 1}, {0, 1, 0}},
-        {{n, p, n}, {0.4f, 1.0f, 1.0f}, {0, 1}, {0, 1, 0}},
+        // -Z (back), tint red, normal (0,0,-1), tangent (-1,0,0)
+        {{p, n, n}, {1.0f, 0.4f, 0.4f}, {0, 0}, {0, 0, -1}, {-1, 0, 0}},
+        {{n, n, n}, {1.0f, 0.4f, 0.4f}, {1, 0}, {0, 0, -1}, {-1, 0, 0}},
+        {{n, p, n}, {1.0f, 0.4f, 0.4f}, {1, 1}, {0, 0, -1}, {-1, 0, 0}},
+        {{p, p, n}, {1.0f, 0.4f, 0.4f}, {0, 1}, {0, 0, -1}, {-1, 0, 0}},
+        // +Z (front), tint green, normal (0,0,1), tangent (1,0,0)
+        {{n, n, p}, {0.4f, 1.0f, 0.4f}, {0, 0}, {0, 0, 1}, {1, 0, 0}},
+        {{p, n, p}, {0.4f, 1.0f, 0.4f}, {1, 0}, {0, 0, 1}, {1, 0, 0}},
+        {{p, p, p}, {0.4f, 1.0f, 0.4f}, {1, 1}, {0, 0, 1}, {1, 0, 0}},
+        {{n, p, p}, {0.4f, 1.0f, 0.4f}, {0, 1}, {0, 0, 1}, {1, 0, 0}},
+        // -X (left), tint blue, normal (-1,0,0), tangent (0,0,1)
+        {{n, n, n}, {0.4f, 0.4f, 1.0f}, {0, 0}, {-1, 0, 0}, {0, 0, 1}},
+        {{n, n, p}, {0.4f, 0.4f, 1.0f}, {1, 0}, {-1, 0, 0}, {0, 0, 1}},
+        {{n, p, p}, {0.4f, 0.4f, 1.0f}, {1, 1}, {-1, 0, 0}, {0, 0, 1}},
+        {{n, p, n}, {0.4f, 0.4f, 1.0f}, {0, 1}, {-1, 0, 0}, {0, 0, 1}},
+        // +X (right), tint yellow, normal (1,0,0), tangent (0,0,-1)
+        {{p, n, p}, {1.0f, 1.0f, 0.4f}, {0, 0}, {1, 0, 0}, {0, 0, -1}},
+        {{p, n, n}, {1.0f, 1.0f, 0.4f}, {1, 0}, {1, 0, 0}, {0, 0, -1}},
+        {{p, p, n}, {1.0f, 1.0f, 0.4f}, {1, 1}, {1, 0, 0}, {0, 0, -1}},
+        {{p, p, p}, {1.0f, 1.0f, 0.4f}, {0, 1}, {1, 0, 0}, {0, 0, -1}},
+        // -Y (bottom), tint magenta, normal (0,-1,0), tangent (1,0,0)
+        {{n, n, n}, {1.0f, 0.4f, 1.0f}, {0, 0}, {0, -1, 0}, {1, 0, 0}},
+        {{p, n, n}, {1.0f, 0.4f, 1.0f}, {1, 0}, {0, -1, 0}, {1, 0, 0}},
+        {{p, n, p}, {1.0f, 0.4f, 1.0f}, {1, 1}, {0, -1, 0}, {1, 0, 0}},
+        {{n, n, p}, {1.0f, 0.4f, 1.0f}, {0, 1}, {0, -1, 0}, {1, 0, 0}},
+        // +Y (top), tint cyan, normal (0,1,0), tangent (1,0,0)
+        {{n, p, p}, {0.4f, 1.0f, 1.0f}, {0, 0}, {0, 1, 0}, {1, 0, 0}},
+        {{p, p, p}, {0.4f, 1.0f, 1.0f}, {1, 0}, {0, 1, 0}, {1, 0, 0}},
+        {{p, p, n}, {0.4f, 1.0f, 1.0f}, {1, 1}, {0, 1, 0}, {1, 0, 0}},
+        {{n, p, n}, {0.4f, 1.0f, 1.0f}, {0, 1}, {0, 1, 0}, {1, 0, 0}},
     };
 
     // 36 indices: 2 triangles per face over its 4 vertices, CCW outward.
@@ -85,11 +88,12 @@ Mesh Mesh::Plane(rhi::IRHIDevice& device) {
     const float t = 4.0f;          // uv tiling range
     // Winding matches the cube's +Y (top) face exactly: (-x,+z)(+x,+z)(+x,-z)(-x,-z),
     // which is the engine's outward/up-facing front-face order under back-face culling.
+    // tangent = +X (direction of increasing U across the quad, v0->v1); normal +Y, handedness +1.
     const Vertex verts[4] = {
-        {{-h, 0.0f,  h}, {1.0f, 1.0f, 1.0f}, {0, t}, {0, 1, 0}},
-        {{ h, 0.0f,  h}, {1.0f, 1.0f, 1.0f}, {t, t}, {0, 1, 0}},
-        {{ h, 0.0f, -h}, {1.0f, 1.0f, 1.0f}, {t, 0}, {0, 1, 0}},
-        {{-h, 0.0f, -h}, {1.0f, 1.0f, 1.0f}, {0, 0}, {0, 1, 0}},
+        {{-h, 0.0f,  h}, {1.0f, 1.0f, 1.0f}, {0, t}, {0, 1, 0}, {1, 0, 0}},
+        {{ h, 0.0f,  h}, {1.0f, 1.0f, 1.0f}, {t, t}, {0, 1, 0}, {1, 0, 0}},
+        {{ h, 0.0f, -h}, {1.0f, 1.0f, 1.0f}, {t, 0}, {0, 1, 0}, {1, 0, 0}},
+        {{-h, 0.0f, -h}, {1.0f, 1.0f, 1.0f}, {0, 0}, {0, 1, 0}, {1, 0, 0}},
     };
     const uint32_t indices[6] = {0, 1, 2, 0, 2, 3};
 
@@ -126,6 +130,14 @@ Mesh Mesh::Sphere(rhi::IRHIDevice& device, uint32_t segments, uint32_t rings) {
             vert.color[0] = 0.85f; vert.color[1] = 0.85f; vert.color[2] = 0.9f;
             vert.uv[0] = u; vert.uv[1] = v;
             vert.normal[0] = nx; vert.normal[1] = ny; vert.normal[2] = nz;
+            // Tangent = normalize(dP/du). P = r*(sinφcosθ, cosφ, sinφsinθ), u->θ=2πu, so
+            // dP/du = r*2π*sinφ*(-sinθ, 0, cosθ); normalized -> (-sinθ, 0, cosθ). At the poles
+            // (sinφ==0) the tangent degenerates; fall back to +X so it stays finite.
+            if (sinPhi > 1e-6f) {
+                vert.tangent[0] = -sinTheta; vert.tangent[1] = 0.0f; vert.tangent[2] = cosTheta;
+            } else {
+                vert.tangent[0] = 1.0f; vert.tangent[1] = 0.0f; vert.tangent[2] = 0.0f;
+            }
             verts.push_back(vert);
         }
     }
