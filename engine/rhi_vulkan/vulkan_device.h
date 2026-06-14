@@ -28,6 +28,9 @@ public:
     void EndFrame(const FrameContext&) override;
     void SetFrameUniforms(const void* data, uint32_t size) override;
     void WaitIdle() override;
+    void CaptureNextFrame() override { captureArmed_ = true; }
+    bool GetCapturedPixels(std::vector<uint8_t>& outBGRA,
+                           uint32_t& width, uint32_t& height) override;
 
     // Accessors used by sibling Vulkan objects.
     VkDevice device() const { return device_; }
@@ -91,6 +94,12 @@ private:
     FrameSync frames_[kFramesInFlight];
     uint32_t  frameIndex_ = 0;
     uint32_t  acquiredImage_ = 0;
+
+    // Headless capture state. When captureArmed_ is set, EndFrame copies the rendered
+    // swapchain image back to host memory (capturedBGRA_) instead of presenting.
+    bool                 captureArmed_ = false;
+    std::vector<uint8_t> capturedBGRA_;
+    uint32_t             capW_ = 0, capH_ = 0;
 
     std::unique_ptr<class VulkanCommandBuffer> recorder_;
 };

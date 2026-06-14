@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
@@ -64,10 +65,41 @@ std::vector<uint8_t> MakeCheckerboard() {
     return pixels;
 }
 
+static bool WriteBMP(const char* path, const std::vector<uint8_t>& bgra,
+                     uint32_t w, uint32_t h) {
+    // 32bpp BI_RGB, bottom-up. Captured data is top-row-first BGRA; BMP wants bottom-up.
+    uint32_t imgSize = w * h * 4;
+    uint32_t fileSize = 54 + imgSize;
+    uint8_t fh[14] = {0}; uint8_t ih[40] = {0};
+    fh[0]='B'; fh[1]='M';
+    fh[2]=fileSize; fh[3]=fileSize>>8; fh[4]=fileSize>>16; fh[5]=fileSize>>24;
+    fh[10]=54;
+    ih[0]=40;
+    ih[4]=w; ih[5]=w>>8; ih[6]=w>>16; ih[7]=w>>24;
+    ih[8]=h; ih[9]=h>>8; ih[10]=h>>16; ih[11]=h>>24;
+    ih[12]=1; ih[14]=32;            // planes=1, bpp=32
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    std::fwrite(fh, 1, 14, f); std::fwrite(ih, 1, 40, f);
+    for (int y = (int)h - 1; y >= 0; --y)
+        std::fwrite(&bgra[(size_t)y * w * 4], 1, w * 4, f);
+    std::fclose(f);
+    return true;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     using namespace hf;
+
+    // --shot <path>: render one frame headless, write a BMP, and exit (no present loop).
+    const char* shotPath = nullptr;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
+            shotPath = argv[i + 1];
+            break;
+        }
+    }
     try {
         hal::Window window({"Hazard Forge — Lit Cube", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
@@ -158,6 +190,68 @@ int main() {
         ibdesc.initialData = indices;
         ibdesc.usage = rhi::BufferUsage::Index;
         auto ibuffer = device->CreateBuffer(ibdesc);
+
+        // --- Headless capture mode: render exactly one frame and write it to a BMP. ---
+        if (shotPath) {
+            using math::Mat4;
+            using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            const Vec3 eye{2.5f, 2.5f, 4.0f};
+            // Fixed model rotation (t=0.6f) so three faces are visible.
+            Mat4 model = Mat4::RotateY(0.6f) * Mat4::RotateX(0.3f);
+            Mat4 view  = Mat4::LookAt(eye, {0, 0, 0}, {0, 1, 0});
+            Mat4 proj  = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
+            Mat4 vp    = proj * view;
+
+            FrameData fd{};
+            for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+            fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0.0f;
+            fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+            fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+
+            device->CaptureNextFrame();
+            auto frame = device->BeginFrame();
+            if (!frame.cmd) {
+                // A fresh swapchain may report out-of-date on the first acquire; retry once.
+                device->CaptureNextFrame();
+                frame = device->BeginFrame();
+            }
+            if (!frame.cmd) {
+                std::fprintf(stderr, "FATAL: could not acquire a frame for capture "
+                                     "(swapchain out-of-date)\n");
+                return 1;
+            }
+            device->SetFrameUniforms(&fd, sizeof(FrameData));
+            frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+            frame.cmd->BindPipeline(*pipeline);
+            frame.cmd->PushConstants(model.m, sizeof(float) * 16);
+            frame.cmd->BindTexture(*texture);
+            frame.cmd->BindVertexBuffer(*vbuffer);
+            frame.cmd->BindIndexBuffer(*ibuffer);
+            frame.cmd->DrawIndexed(36);
+            frame.cmd->EndRenderPass();
+            device->EndFrame(frame);
+
+            std::vector<uint8_t> px;
+            uint32_t cw = 0, ch = 0;
+            if (device->GetCapturedPixels(px, cw, ch)) {
+                if (!WriteBMP(shotPath, px, cw, ch)) {
+                    std::fprintf(stderr, "FATAL: could not write BMP to %s\n", shotPath);
+                    device->WaitIdle();
+                    return 1;
+                }
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle();
+                return 1;
+            }
+            device->WaitIdle();
+            std::printf("wrote %s (%ux%u)\n", shotPath, cw, ch);
+            return 0;
+        }
 
         const auto start = std::chrono::steady_clock::now();
 

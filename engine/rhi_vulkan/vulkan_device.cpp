@@ -353,6 +353,16 @@ void VulkanDevice::SetFrameUniforms(const void* data, uint32_t size) {
 
 void VulkanDevice::WaitIdle() { if (device_) vkDeviceWaitIdle(device_); }
 
+bool VulkanDevice::GetCapturedPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) {
+    if (capturedBGRA_.empty()) return false;
+    out = std::move(capturedBGRA_);
+    w = capW_;
+    h = capH_;
+    capturedBGRA_.clear();
+    capW_ = capH_ = 0;
+    return true;
+}
+
 // --- Resource creation ---
 std::unique_ptr<IShaderModule> VulkanDevice::CreateShaderModule(const ShaderModuleDesc& d) {
     return std::make_unique<VulkanShaderModule>(device_, d.spirv);
@@ -412,6 +422,79 @@ FrameContext VulkanDevice::BeginFrame() {
 void VulkanDevice::EndFrame(const FrameContext& frame) {
     if (!frame.cmd) return;  // skipped frame
     FrameSync& fr = frames_[frameIndex_];
+
+    // --- Headless capture branch: copy the rendered image back to host memory, skip present. ---
+    if (captureArmed_) {
+        VkExtent2D extent = swapchain_->extent();
+        VkImage srcImage = swapchain_->image(acquiredImage_);
+
+        // COLOR_ATTACHMENT_OPTIMAL -> TRANSFER_SRC_OPTIMAL
+        TransitionImage(fr.cmd, srcImage,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+        // Host-visible MAPPED staging buffer (TRANSFER_DST), HOST_COHERENT required.
+        const VkDeviceSize bufSize =
+            (VkDeviceSize)extent.width * extent.height * 4;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = bufSize;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO;
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingInfo{};
+        Check(vmaCreateBuffer(allocator_, &bci, &aci, &staging, &stagingAlloc, &stagingInfo),
+              "vmaCreateBuffer(capture)");
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {extent.width, extent.height, 1};
+        vkCmdCopyImageToBuffer(fr.cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               staging, 1, &region);
+
+        Check(vkEndCommandBuffer(fr.cmd), "vkEndCommandBuffer(capture)");
+
+        // Submit: wait on imageAvailable (so the copy follows acquire/render), signal the
+        // in-flight fence. Do NOT signal renderFinished — present is skipped, so nobody waits
+        // on it (avoids a signaled-but-unwaited semaphore).
+        VkSemaphoreSubmitInfo waitSem{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        waitSem.semaphore = fr.imageAvailable;
+        waitSem.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cmdSub.commandBuffer = fr.cmd;
+        VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        submit.waitSemaphoreInfoCount = 1;
+        submit.pWaitSemaphoreInfos = &waitSem;
+        submit.commandBufferInfoCount = 1;
+        submit.pCommandBufferInfos = &cmdSub;
+        Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, fr.inFlight), "vkQueueSubmit2(capture)");
+        Check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(capture)");
+
+        // Map staging and copy out (top-row-first BGRA8, tightly packed).
+        capW_ = extent.width;
+        capH_ = extent.height;
+        capturedBGRA_.resize((size_t)capW_ * capH_ * 4);
+        std::memcpy(capturedBGRA_.data(), stagingInfo.pMappedData, capturedBGRA_.size());
+
+        vmaDestroyBuffer(allocator_, staging, stagingAlloc);
+
+        // Skip present. Advance frame index (consistent with the normal path) and disarm.
+        frameIndex_ = (frameIndex_ + 1) % kFramesInFlight;
+        captureArmed_ = false;
+        return;
+    }
 
     // COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC
     TransitionImage(fr.cmd, swapchain_->image(acquiredImage_),

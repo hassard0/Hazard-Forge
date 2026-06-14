@@ -129,6 +129,12 @@ public:
 
     // Block until the GPU is idle (call before destroying GPU resources).
     virtual void WaitIdle() = 0;
+
+    // Headless capture: arm before BeginFrame; after EndFrame, retrieve via GetCapturedPixels.
+    virtual void CaptureNextFrame() = 0;
+    // Returns the last captured frame as tightly-packed BGRA8 (top row first); false if none.
+    virtual bool GetCapturedPixels(std::vector<uint8_t>& outBGRA,
+                                   uint32_t& width, uint32_t& height) = 0;
 };
 
 } // namespace hf::rhi
