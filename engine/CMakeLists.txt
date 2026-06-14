@@ -4,6 +4,7 @@ set(HF_ENGINE_COMMON_SOURCES
   hal/window.cpp
   rhi/rhi_factory.cpp
   scene/mesh.cpp
+  asset/gltf_loader.cpp
 )
 
 if(APPLE)
@@ -38,6 +39,9 @@ add_library(hf_engine STATIC
   ${HF_ENGINE_BACKEND_SOURCES}
 )
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# Header-only third-party (cgltf): CGLTF_IMPLEMENTATION is defined in exactly one TU
+# (engine/asset/gltf_loader.cpp).
+target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
 
 if(APPLE)
   # ARC for all Obj-C++ TUs in this target.

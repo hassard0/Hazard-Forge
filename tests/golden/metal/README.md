@@ -32,6 +32,15 @@ PCF shadow sampling.
 > shading change (DIFF 3.4854 vs the previous golden). One shared HLSL change hits both backends;
 > two Metal runs diff to `0.0000`, and Vulkan renders the same reflective metals.
 
+> **Re-bake (glTF model):** re-baked again when real glTF model loading landed
+> (`engine/asset/gltf_loader.cpp`, header-only `cgltf`). The centre cell of the 3×3 grid is now a
+> **real 3D model loaded from `assets/models/Duck.glb`** (Khronos glTF-Sample-Assets, CC0) instead of
+> a procedural sphere, rendered through the *same* `scene::Vertex` layout and lit PBR pipeline as a
+> fixed metallic material (metallic=1.0, roughness=0.2) so it reflects the procedural sky via IBL —
+> polished chrome. Geometry only (POSITION/NORMAL/TEXCOORD_0 + indices); glTF materials/textures
+> deferred. One shared loader feeds both backends; two Metal runs diff to `0.0000`, and Vulkan
+> renders the same model identically.
+
 ## Shaders are generated, not hand-written
 
 The Metal shaders are **generated from the shared HLSL sources** at build time — there is no

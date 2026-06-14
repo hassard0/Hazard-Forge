@@ -30,6 +30,7 @@
 #include "scene/mesh.h"
 #include "scene/transform.h"
 #include "scene/renderable.h"
+#include "asset/gltf_loader.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -195,10 +196,21 @@ int main(int argc, char** argv) {
             auto texture = device->CreateTexture(
                 {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
+            // Flat white 1x1 texture for the glTF model: keeps its metallic F0 (= albedo) neutral
+            // so it reads as polished chrome reflecting the sky, not a checkerboard. (Matches Vulkan.)
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTexture = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+
             // ---- Primitive meshes from the scene layer. ----
             scene::Mesh cube = scene::Mesh::Cube(*device);
             scene::Mesh plane = scene::Mesh::Plane(*device);
             scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // ---- Real 3D model loaded from glTF (recentred to the origin by the loader),
+            // rendered as polished metal so it reflects the procedural sky via IBL. Same loader,
+            // same scene::Vertex layout, same lit pipeline as the Vulkan sample. ----
+            scene::Mesh duck = hf::asset::LoadGltfMesh(*device, HF_MODEL_PATH);
 
             // ---- Build the scene: a rough-dielectric ground plane + a 3x3 grid mixing shiny metal
             // spheres (on the main diagonal) with matte dielectric cubes — the canonical PBR
@@ -213,6 +225,8 @@ int main(int argc, char** argv) {
 
                 for (int gx = -1; gx <= 1; ++gx)
                     for (int gz = -1; gz <= 1; ++gz) {
+                        // Centre cell is reserved for the glTF model (added below); skip it.
+                        if (gx == 0 && gz == 0) continue;
                         bool useSphere = (gx == gz);
                         scene::Transform t;
                         if (useSphere) {
@@ -228,6 +242,14 @@ int main(int argc, char** argv) {
                             sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f});
                         }
                     }
+
+                // The glTF model as the centrepiece: one large polished-metal Duck. Matches the
+                // Vulkan sample's placement exactly so both backends render the same scene.
+                scene::Transform duckT;
+                duckT.position = {0.0f, 1.7f, 0.0f};
+                duckT.eulerRadians = {0.0f, 2.3f, 0.0f};
+                duckT.scale = {0.028f, 0.028f, 0.028f};
+                sceneObjects.push_back({&duck, whiteTexture.get(), duckT, /*metallic*/ 1.0f, /*roughness*/ 0.2f});
             }
 
             // ---- Frame uniforms: same camera + light as the Vulkan Slice-F sample. ----

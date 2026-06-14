@@ -17,3 +17,6 @@ hf_compile_shaders(
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")
+# Absolute path to the glTF showcase model, baked at configure time (repo asset).
+target_compile_definitions(hello_triangle PRIVATE
+  "HF_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/Duck.glb\"")

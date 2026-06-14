@@ -84,6 +84,8 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_buffer.mm
     # Scene layer (plain C++): builds Mesh::Cube / Mesh::Plane through the RHI.
     ${HF_ROOT}/engine/scene/mesh.cpp
+    # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.
+    ${HF_ROOT}/engine/asset/gltf_loader.cpp
 )
 
 # The generated MSL must exist before the executable's shaders are loaded at runtime; make the
@@ -93,15 +95,18 @@ add_dependencies(visual_test hf_gen_shaders)
 # Compile all Obj-C++ with ARC.
 target_compile_options(visual_test PRIVATE -fobjc-arc)
 
-# Include roots so #include "rhi/rhi.h", "rhi_metal/...", "scene/...", "math/..." resolve.
+# Include roots so #include "rhi/rhi.h", "rhi_metal/...", "scene/...", "asset/...", "math/..."
+# and the header-only "cgltf/cgltf.h" resolve.
 target_include_directories(visual_test PRIVATE
     ${HF_ROOT}/engine
+    ${HF_ROOT}/third_party
 )
 
 # Path to the GENERATED MSL shaders (HLSL->SPIR-V->MSL), baked in as a compile definition.
 target_compile_definitions(visual_test PRIVATE
     HF_SHADER_DIR="${HF_ROOT}/shaders"
     HF_GEN_SHADER_DIR="${HF_GEN_SHADER_DIR}"
+    HF_MODEL_PATH="${HF_ROOT}/assets/models/Duck.glb"
 )
 
 target_link_libraries(visual_test PRIVATE
