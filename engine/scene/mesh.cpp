@@ -1,6 +1,9 @@
 #include "scene/mesh.h"
 #include "scene/vertex.h"
 
+#include <cmath>
+#include <vector>
+
 namespace hf::scene {
 
 namespace {
@@ -91,6 +94,62 @@ Mesh Mesh::Plane(rhi::IRHIDevice& device) {
     const uint32_t indices[6] = {0, 1, 2, 0, 2, 3};
 
     return BuildMesh(device, verts, sizeof(verts), indices, sizeof(indices), 6);
+}
+
+Mesh Mesh::Sphere(rhi::IRHIDevice& device, uint32_t segments, uint32_t rings) {
+    // UV sphere of radius 0.5 centered at the origin.
+    //   ring  (latitude)  0..rings    : 0 = +Y pole, rings = -Y pole
+    //   seg   (longitude) 0..segments : wraps around, with a duplicated seam
+    //                                    column (seg == segments) so UVs are seamless.
+    // Smooth normals: normal == normalize(position) == position*2 (since |pos|==0.5).
+    const float radius = 0.5f;
+    const float kPi = 3.14159265358979323846f;
+
+    std::vector<Vertex> verts;
+    verts.reserve((rings + 1) * (segments + 1));
+    for (uint32_t r = 0; r <= rings; ++r) {
+        float v = static_cast<float>(r) / static_cast<float>(rings);
+        float phi = v * kPi;                 // 0 at +Y pole -> pi at -Y pole
+        float sinPhi = std::sin(phi);
+        float cosPhi = std::cos(phi);
+        for (uint32_t s = 0; s <= segments; ++s) {
+            float u = static_cast<float>(s) / static_cast<float>(segments);
+            float theta = u * 2.0f * kPi;
+            float sinTheta = std::sin(theta);
+            float cosTheta = std::cos(theta);
+            // Unit-sphere direction (also the smooth normal).
+            float nx = sinPhi * cosTheta;
+            float ny = cosPhi;
+            float nz = sinPhi * sinTheta;
+            Vertex vert{};
+            vert.pos[0] = nx * radius; vert.pos[1] = ny * radius; vert.pos[2] = nz * radius;
+            vert.color[0] = 0.85f; vert.color[1] = 0.85f; vert.color[2] = 0.9f;
+            vert.uv[0] = u; vert.uv[1] = v;
+            vert.normal[0] = nx; vert.normal[1] = ny; vert.normal[2] = nz;
+            verts.push_back(vert);
+        }
+    }
+
+    // Two triangles per quad. Wound CCW when viewed from outside so the front
+    // (outer) face survives back-face culling, matching the cube's outward winding.
+    const uint32_t stride = segments + 1;
+    std::vector<uint32_t> indices;
+    indices.reserve(rings * segments * 6);
+    for (uint32_t r = 0; r < rings; ++r) {
+        for (uint32_t s = 0; s < segments; ++s) {
+            uint32_t a = r * stride + s;          // (r,   s)
+            uint32_t b = (r + 1) * stride + s;    // (r+1, s)
+            uint32_t c = (r + 1) * stride + s + 1;// (r+1, s+1)
+            uint32_t d = r * stride + s + 1;      // (r,   s+1)
+            indices.push_back(a); indices.push_back(b); indices.push_back(c);
+            indices.push_back(a); indices.push_back(c); indices.push_back(d);
+        }
+    }
+
+    return BuildMesh(device,
+                     verts.data(), verts.size() * sizeof(Vertex),
+                     indices.data(), indices.size() * sizeof(uint32_t),
+                     static_cast<uint32_t>(indices.size()));
 }
 
 } // namespace hf::scene

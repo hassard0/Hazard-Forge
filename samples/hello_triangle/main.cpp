@@ -198,6 +198,7 @@ int main(int argc, char** argv) {
         // Two primitive meshes from the scene layer.
         scene::Mesh cube = scene::Mesh::Cube(*device);
         scene::Mesh plane = scene::Mesh::Plane(*device);
+        scene::Mesh sphere = scene::Mesh::Sphere(*device);
 
         // Build the scene: a large ground plane + a 3x3 grid of lit cubes.
         std::vector<scene::Renderable> sceneObjects;
@@ -209,11 +210,20 @@ int main(int argc, char** argv) {
 
             for (int gx = -1; gx <= 1; ++gx) {
                 for (int gz = -1; gz <= 1; ++gz) {
+                    // Replace the three cells on the main diagonal with spheres so
+                    // the scene shows smooth curved geometry alongside the cubes.
+                    bool useSphere = (gx == gz);
                     scene::Transform t;
-                    t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
-                    t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
-                    t.scale = {0.5f, 0.5f, 0.5f};
-                    sceneObjects.push_back({&cube, texture.get(), t});
+                    if (useSphere) {
+                        t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
+                        t.scale = {0.55f, 0.55f, 0.55f};
+                        sceneObjects.push_back({&sphere, texture.get(), t});
+                    } else {
+                        t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
+                        t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
+                        t.scale = {0.5f, 0.5f, 0.5f};
+                        sceneObjects.push_back({&cube, texture.get(), t});
+                    }
                 }
             }
         }
