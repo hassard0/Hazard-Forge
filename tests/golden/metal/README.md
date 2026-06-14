@@ -1,71 +1,63 @@
 # Metal golden-image test
 
-Golden references, all produced by the **real** Metal RHI backend running headless on an
-Apple M4 (`metal_headless/visual_test`), rendering the full Slice-F scene (ground checkerboard
-plane + a 3x3 grid of 9 lit, textured cubes). All are deterministic: fixed camera, fixed light,
-static transforms, offscreen MTLTexture target, byte-exact readback. Two runs diff to 0.0000.
+`scene_shadow.png` is the golden reference produced by the **real** Metal RHI backend running
+headless on an Apple M4 (`metal_headless/visual_test`), rendering the full scene (ground
+checkerboard plane + a 3×3 grid of 9 lit, textured cubes) through the complete frame pipeline:
+**directional shadow pass → scene into an offscreen render target → fullscreen post (FXAA + glow +
+ACES tonemap + cinematic grade + film grain + vignette)**. Deterministic — fixed camera, fixed
+light, static transforms, offscreen `MTLTexture` target, byte-exact readback; two runs diff to
+`0.0000`.
 
-- **`scene_shadow.png` — current `visual_test` output.** Adds the directional shadow-mapping
-  parity path on top of the RT+post flow: a depth-only pass from the light (`CreateShadowMap` /
-  `BeginShadowPass` / `EndShadowPass`, `shaders/shadow.metal`) renders the scene into a 2048²
-  Depth32Float sampleable shadow map; the lit pass (`shaders/lit.metal`) then projects each
-  fragment into the light's clip space and does a 3×3 PCF compare to darken shadowed surfaces. The
-  cubes cast shadows on the ground and each other. **This is what `visual_test` writes today** —
-  validate against it.
-- **`scene_post.png` — RT+post reference (no shadows).** Scene rendered into an offscreen
-  `MetalRenderTarget` (BGRA8 color + D32 depth), then a fullscreen post pass (ACES tonemap + gamma
-  + cinematic grade + vignette, `shaders/post.metal`) samples the RT into the captured output. This
-  exercises the Metal render-target + post-processing parity path
-  (`CreateRenderTarget` / `BeginRenderTargetFrame` / `EndRenderTargetFrame` + the `fullscreen`
-  pipeline). Retained as the pre-shadow reference.
-- **`scene.png` — historical no-post reference.** The earlier direct scene→swapchain render with no
-  render target and no post pass. Retained for comparison; `visual_test` no longer produces it
-  (the render flow now always goes scene→RT→post). To regenerate it you would have to revert the
-  RT+post wiring in `visual_test.mm`.
+It exercises the full Metal parity surface through the `IRHIDevice` / `ICommandBuffer` seam — the
+same calls the Vulkan `hello_triangle` sample makes: `CreateShadowMap` / `BeginShadowPass` /
+`EndShadowPass`, `CreateRenderTarget` / `BeginRenderTargetFrame` / `EndRenderTargetFrame`, the
+`fullscreen` post pipeline, per-frame UBO, push-constant model matrices, and PCF shadow sampling.
+
+## Shaders are generated, not hand-written
+
+The Metal shaders are **generated from the shared HLSL sources** at build time — there is no
+hand-written MSL to drift from the canonical shaders. The `metal_headless` build runs, for each
+shader: HLSL → SPIR-V (`glslc -x hlsl`) → MSL (`spirv-cross --msl --msl-decoration-binding`),
+emitting `*.gen.metal`, which `visual_test` compiles at runtime via `newLibraryWithSource:`. The
+`--msl-decoration-binding` flag maps each resource's SPIR-V binding directly to its Metal
+`[[buffer/texture/sampler(n)]]` index; the engine's Metal binding constants
+(`engine/rhi_metal/metal_common.h`) are chosen to match.
+
+> **Re-bake history:** this golden was re-baked from the unified pipeline when the toolchain
+> landed. The previous golden had been produced from hand-written MSL that had silently *drifted*
+> from the HLSL (it used `ambient 0.15` vs the HLSL's `0.12`, and its post pass omitted the FXAA,
+> glow, and film grain that the canonical `post.frag.hlsl` — and the Vulkan backend — apply). The
+> generated MSL faithfully reproduces the canonical HLSL, so this golden now matches what Vulkan
+> renders semantically. Eliminating exactly that kind of drift is the point of the toolchain.
 
 ## How it is produced
 
 ```sh
-# On the Mac (Command Line Tools only, runtime MSL compile — no Xcode/metal CLI):
+# On the Mac (Command Line Tools only — runtime MSL compile, no Xcode/metal CLI):
 source ~/mac-remote-rig/env.sh
 cd ~/hazard-forge
 cmake -S metal_headless -B build-metal -G Ninja
-cmake --build build-metal
-./build-metal/visual_test /tmp/metal_post.png
+cmake --build build-metal          # also generates *.gen.metal from the HLSL
+./build-metal/visual_test /tmp/out.png
 ```
 
-`visual_test` constructs the real `MetalDevice` in **headless** mode
-(`rhi::mtl::CreateMetalDeviceHeadless(W, H)` -> offscreen BGRA8 color + D32 depth texture, no
-window / CAMetalLayer / present), builds the scene from the engine `scene/` layer, creates a lit
-pipeline from `shaders/lit.metal` (runtime-compiled MSL), creates a `MetalRenderTarget`, renders
-the scene into it (`BeginRenderTargetFrame` -> draws -> `EndRenderTargetFrame`), then runs a
-fullscreen post pipeline (`shaders/post.metal`, runtime-compiled MSL) that binds the RT and draws
-3 vertices into the captured swapchain output. It reads the result back via `CaptureNextFrame()` +
-`GetCapturedPixels()` and writes a PNG. All through the `IRHIDevice` / `ICommandBuffer` seam — the
-same calls the Vulkan `hello_triangle` sample makes for its scene→RT→post path.
-
-## How to validate a future run (visual regression)
+## Validate a future run (visual regression)
 
 ```sh
-# Render a candidate, then compare to this golden. Deterministic => DIFF 0.0000.
 ./build-metal/visual_test /tmp/out.png
 ~/mac-remote-rig/compare.sh tests/golden/metal/scene_shadow.png /tmp/out.png 0.0
-# prints: DIFF 0.0000 (threshold 0.0)   and exits 0 on a match.
+# -> DIFF 0.0000 (threshold 0.0), exit 0 on a match.
 ```
 
-`compare.sh` is the rig's stdlib-only mean-per-pixel PNG diff. A non-zero DIFF means the Metal
-render changed — investigate before updating this golden.
+A non-zero DIFF means the Metal render changed — investigate before re-baking this golden.
 
-## NDC-Y note
+## NDC-Y convention (handled CPU-side)
 
-`math::Perspective` bakes the Vulkan clip-space Y flip (+Y down). Metal NDC is +Y up (like GL), so
-the Metal backend undoes the flip in `shaders/lit.metal` (`out.clip.y = -out.clip.y`). The fix
-lives entirely in the Metal path; the shared engine math and the Vulkan backend are untouched.
-
-The shadow map follows the same convention: `math::Ortho` (used for `lightViewProj`) bakes the
-same Vulkan Y-flip, so `shaders/shadow.metal` undoes it on the depth-pass output the same way
-(`out.clip.y = -out.clip.y`). The render flip and the lit-pass sample formula
-(`smUV = proj.xy*0.5+0.5`) are self-consistent — the flip cancels — so the shadow UV math is byte-
-identical to the Vulkan backend (`shaders/lit.frag.hlsl`). Light-space depth is [0,1] (Ortho), so
-`curDepth = proj.z` compares directly. A modest depth bias (encoder `setDepthBias 1.25 / slope
-1.75`, matching Vulkan) plus a 0.0025 shader bias fight shadow acne.
+`math::Perspective` / `math::Ortho` bake the Vulkan clip-space Y-flip (+Y down). Metal NDC is +Y up.
+Rather than flip in the shader (which would diverge from the shared HLSL), `visual_test` flips the
+projection's and ortho's Y row on the **CPU** before composing view-proj / lightViewProj, so the
+shared HLSL→MSL needs no Metal-specific clip flip. The only remaining Metal-specific adjustments are
+two *texture-origin* V-flips (Metal stores row 0 = top): the fullscreen-post sample UV and the
+shadow-map sample UV — both guarded by `#ifdef HF_MSL_GEN` so the Vulkan SPIR-V is byte-identical.
+The shadow render and the lit-pass sampling both derive from the same CPU-flipped `lightViewProj`,
+so they stay self-consistent.
