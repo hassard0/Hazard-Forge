@@ -38,13 +38,51 @@ float3 Fxaa(float2 uv, float2 texel) {
     return (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
 }
 
+// ACES filmic tonemapping (Narkowicz approximation). Richer, more cinematic
+// roll-off in the highlights than Reinhard, with a gentle toe in the shadows.
+float3 ACES(float3 x) {
+    float a = 2.51, b = 0.03, c2 = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c2 * x + d) + e));
+}
+
+// Screen-space glow / cheap bloom: bright-pass a ring kernel around the texel,
+// keeping only luma above a threshold, then average into a soft bloom color.
+float3 Glow(float2 uv, float2 texel) {
+    const float threshold = 0.8;   // bright-pass cutoff
+    // 24 taps: 8 directions across 3 radii (in texels). Inner taps weighted
+    // a touch higher so the bloom falls off softly with distance.
+    const int   kDirs   = 8;
+    const float radii[3] = { 2.0, 4.0, 7.0 };
+    const float rw[3]    = { 1.0, 0.65, 0.35 };
+
+    float3 sum = 0.0.xxx;
+    float  wsum = 0.0;
+    for (int r = 0; r < 3; ++r) {
+        for (int s = 0; s < kDirs; ++s) {
+            float ang = (6.2831853 / kDirs) * (float)s;
+            float2 off = float2(cos(ang), sin(ang)) * radii[r] * texel;
+            float3 tap = gTex.Sample(gSmp, uv + off).rgb;
+            float  luma = dot(tap, kLuma);
+            float3 bright = tap * max(luma - threshold, 0.0);  // keep only the bright excess
+            sum  += bright * rw[r];
+            wsum += rw[r];
+        }
+    }
+    return sum / max(wsum, 1e-4);
+}
+
 float4 main(PSInput i) : SV_Target {
     float w, h;
     gTex.GetDimensions(w, h);
     float2 texel = 1.0 / float2(w, h);
 
-    float3 c = Fxaa(i.uv, texel);              // anti-alias
-    c = c / (c + 1.0);                         // Reinhard tonemap
+    float3 c = Fxaa(i.uv, texel);              // anti-alias base scene (linear/HDR-ish)
+
+    const float glowStrength = 0.65;
+    float3 glow = Glow(i.uv, texel);
+    c += glow * glowStrength;                  // add bloom before tonemapping
+
+    c = ACES(c);                               // ACES filmic tonemap
     c = pow(c, 1.0 / 2.2);                     // gamma
     float2 d = i.uv - 0.5;
     float vig = smoothstep(0.8, 0.35, length(d));  // darken corners
