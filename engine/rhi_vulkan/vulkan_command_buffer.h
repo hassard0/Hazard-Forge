@@ -25,6 +25,12 @@ public:
     void PushConstants(const void* data, uint32_t size) override;
     void EndRenderPass() override;
 
+    void BindComputePipeline(IComputePipeline& pipeline) override;
+    void BindStorageBuffer(IBuffer& buffer, uint32_t index) override;
+    void ComputePushConstants(const void* data, uint32_t size) override;
+    void DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) override;
+    void ComputeToVertexBarrier() override;
+
 private:
     VulkanDevice& device_;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
@@ -33,6 +39,7 @@ private:
     VkExtent2D extent_{};
     VkPipelineLayout boundLayout_ = VK_NULL_HANDLE;
     uint32_t boundMaterialSet_ = 0;  // set index for BindTexture; from the bound pipeline
+    VkPipelineLayout boundComputeLayout_ = VK_NULL_HANDLE;  // for compute push-constants/descriptors
 };
 
 } // namespace hf::rhi::vk

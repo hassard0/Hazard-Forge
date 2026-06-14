@@ -46,7 +46,8 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
 
     VkPipelineInputAssemblyStateCreateInfo ia{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = desc.pointList ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                                 : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
     VkPipelineViewportStateCreateInfo vp{
         VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
@@ -76,6 +77,16 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     VkPipelineColorBlendAttachmentState blendAtt{};
     blendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (desc.additiveBlend) {
+        // src*1 + dst*1: glowing particles accumulate over the scene.
+        blendAtt.blendEnable = VK_TRUE;
+        blendAtt.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAtt.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo cb{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     // Depth-only pass has no color attachment.

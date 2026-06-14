@@ -21,6 +21,7 @@ public:
 
     std::unique_ptr<IShaderModule> CreateShaderModule(const ShaderModuleDesc&) override;
     std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) override;
+    std::unique_ptr<IComputePipeline> CreateComputePipeline(const ComputePipelineDesc&) override;
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
     std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) override;
@@ -56,6 +57,10 @@ public:
     // Swapchain color format — render targets match it so the lit pipeline renders in unchanged.
     VkFormat swapchainFormat() const { return swapchain_->vkFormat(); }
 
+    // vkCmdPushDescriptorSetKHR loader (VK_KHR_push_descriptor). Used by the compute command path
+    // to bind storage buffers inline. Null if the extension was unavailable.
+    PFN_vkCmdPushDescriptorSetKHR pushDescriptorFn() const { return vkCmdPushDescriptorSetKHR_; }
+
     // Stage host pixel data into a device-local image (synchronous; see vulkan_texture).
     void UploadToImage(VkImage image, uint32_t w, uint32_t h,
                        const void* data, uint64_t size);
@@ -77,6 +82,9 @@ private:
     VkQueue       graphicsQueue_ = VK_NULL_HANDLE;
     uint32_t      graphicsQueueFamily_ = 0;
     VmaAllocator  allocator_ = VK_NULL_HANDLE;
+
+    // Loaded from the device (VK_KHR_push_descriptor); used to bind compute storage buffers inline.
+    PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR_ = nullptr;
 
     // Texture support: one default sampler + a shared image+sampler set layout (set 1) + pool.
     VkSampler             defaultSampler_    = VK_NULL_HANDLE;

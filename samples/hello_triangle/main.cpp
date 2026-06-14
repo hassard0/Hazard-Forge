@@ -8,7 +8,9 @@
 #include "scene/renderable.h"
 #include "asset/gltf_loader.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -187,6 +189,91 @@ int main(int argc, char** argv) {
         skyDesc.fullscreen = true;           // 3 verts from SV_VertexID; cull NONE
         auto skyPipeline = device->CreateGraphicsPipeline(skyDesc);
 
+        // --- GPU particle system (compute shader animates a storage buffer; drawn as points). ---
+        // Particle layout: { float4 posLife; float4 velSeed; } = 32 bytes, matches
+        // particles.comp.hlsl / particle.vert.hlsl.
+        constexpr uint32_t kParticleCount = 50000;
+        constexpr uint32_t kParticleStride = 32;  // 2x float4
+        struct GpuParticle { float posLife[4]; float velSeed[4]; };
+        static_assert(sizeof(GpuParticle) == kParticleStride, "particle stride");
+
+        // Seed the buffer deterministically so headless capture is golden-stable: spread initial
+        // life across [0,4) so particles emit continuously rather than all at once.
+        std::vector<GpuParticle> initParticles(kParticleCount);
+        for (uint32_t i = 0; i < kParticleCount; ++i) {
+            float s = (float)i / (float)kParticleCount;          // stable per-index seed
+            float a = s * 6.2831853f;
+            float r = 0.25f * (0.5f + 0.5f * std::sin(s * 12.9898f));
+            initParticles[i].posLife[0] = std::cos(a) * r;
+            initParticles[i].posLife[1] = 0.05f + 2.0f * s;       // staggered heights
+            initParticles[i].posLife[2] = std::sin(a) * r;
+            initParticles[i].posLife[3] = 0.5f + 3.5f * s;        // staggered remaining life
+            float outR = 0.5f + 2.8f * std::fabs(std::sin(s * 7.13f));
+            float aVel = s * 9.41f;
+            initParticles[i].velSeed[0] = std::cos(aVel) * outR;
+            initParticles[i].velSeed[1] = 3.5f + 3.5f * s;
+            initParticles[i].velSeed[2] = std::sin(aVel) * outR;
+            initParticles[i].velSeed[3] = s;                      // seed
+        }
+        rhi::BufferDesc particleBufDesc;
+        particleBufDesc.size = (uint64_t)kParticleCount * kParticleStride;
+        particleBufDesc.initialData = initParticles.data();
+        particleBufDesc.usage = rhi::BufferUsage::Storage;
+        auto particleBuffer = device->CreateBuffer(particleBufDesc);
+
+        // Compute pipeline: one storage buffer + a {dt,time,count,_pad} push constant.
+        auto partCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/particles.comp.hlsl.spv");
+        auto partCs = device->CreateShaderModule({std::span<const uint32_t>(partCsWords)});
+        rhi::ComputePipelineDesc cdesc;
+        cdesc.compute = partCs.get();
+        cdesc.storageBufferCount = 1;
+        cdesc.pushConstantSize = sizeof(float) * 2 + sizeof(uint32_t) * 2;  // dt,time,count,_pad
+        auto particleCompute = device->CreateComputePipeline(cdesc);
+
+        // Particle graphics pipeline: point list, additive blend, reads the storage buffer as a
+        // vertex stream (pos at offset 0, vel at offset 16). Uses the per-frame UBO for viewProj.
+        auto partVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/particle.vert.hlsl.spv");
+        auto partFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/particle.frag.hlsl.spv");
+        auto partVs = device->CreateShaderModule({std::span<const uint32_t>(partVsWords)});
+        auto partFs = device->CreateShaderModule({std::span<const uint32_t>(partFsWords)});
+        rhi::GraphicsPipelineDesc partDesc;
+        partDesc.vertex = partVs.get();
+        partDesc.fragment = partFs.get();
+        partDesc.vertexLayout.stride = kParticleStride;
+        partDesc.vertexLayout.attributes = {
+            {0, rhi::Format::RGB32_Float, 0},   // position (posLife.xyz)
+            {1, rhi::Format::RGB32_Float, 16},  // velocity (velSeed.xyz)
+        };
+        partDesc.colorFormat = device->Swapchain().ColorFormat();
+        partDesc.depthTest = false;          // particles are emissive points over the scene
+        partDesc.usesFrameUniforms = true;   // viewProj from the frame UBO (set 0 b0)
+        partDesc.usesTexture = false;
+        partDesc.pointList = true;
+        partDesc.additiveBlend = true;
+        auto particlePipeline = device->CreateGraphicsPipeline(partDesc);
+
+        // Push-constant block for the compute dispatch.
+        struct ParticleParams { float dt; float time; uint32_t count; uint32_t pad; };
+        const uint32_t kParticleGroups = (kParticleCount + 63) / 64;  // [numthreads(64,1,1)]
+
+        // Dispatch the compute sim into `cmd`, then barrier compute->vertex. Records BEFORE
+        // BeginRenderPass (compute must run outside a render pass).
+        auto simulateParticles = [&](rhi::ICommandBuffer* cmd, float dt, float time) {
+            ParticleParams pp{dt, time, kParticleCount, 0};
+            cmd->BindComputePipeline(*particleCompute);
+            cmd->BindStorageBuffer(*particleBuffer, 0);
+            cmd->ComputePushConstants(&pp, sizeof(pp));
+            cmd->DispatchCompute(kParticleGroups);
+            cmd->ComputeToVertexBarrier();
+        };
+
+        // Draw the particles as additive points (inside the render pass, after the scene).
+        auto drawParticles = [&](rhi::ICommandBuffer* cmd) {
+            cmd->BindPipeline(*particlePipeline);
+            cmd->BindVertexBuffer(*particleBuffer);
+            cmd->Draw(kParticleCount);
+        };
+
         // Offscreen render target sized to the framebuffer; recreated on resize.
         auto rt = device->CreateRenderTarget(window.FramebufferWidth(),
                                              window.FramebufferHeight());
@@ -361,11 +448,16 @@ int main(int argc, char** argv) {
             {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
+                // Compute: advance the GPU particle sim several fixed steps so the fountain has
+                // developed by the captured frame (deterministic -> golden-stable).
+                for (int step = 0; step < 100; ++step)
+                    simulateParticles(rtc.cmd, 1.0f / 60.0f, step / 60.0f);
                 rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
                 // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
                 rtc.cmd->BindPipeline(*skyPipeline);
                 rtc.cmd->Draw(3);
                 drawScene(rtc.cmd);
+                drawParticles(rtc.cmd);  // additive GPU particles over the scene
                 rtc.cmd->EndRenderPass();
                 device->EndRenderTargetFrame(rtc);
             }
@@ -415,6 +507,7 @@ int main(int argc, char** argv) {
             baseYaw[i] = sceneObjects[i].transform.eulerRadians.y;
 
         const auto start = std::chrono::steady_clock::now();
+        float lastT = 0.0f;  // previous frame time, for the particle sim dt
 
         bool running = true;
         while (running) {
@@ -454,14 +547,19 @@ int main(int argc, char** argv) {
             {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
+                // Compute: advance the GPU particle sim one frame-step (clamped dt for stability).
+                float dt = std::min(t - lastT, 1.0f / 30.0f);
+                simulateParticles(rtc.cmd, dt, t);
                 rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
                 // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
                 rtc.cmd->BindPipeline(*skyPipeline);
                 rtc.cmd->Draw(3);
                 drawScene(rtc.cmd);
+                drawParticles(rtc.cmd);  // additive GPU particles over the scene
                 rtc.cmd->EndRenderPass();
                 device->EndRenderTargetFrame(rtc);
             }
+            lastT = t;
 
             // Pass 2: fullscreen post pass samples the RT into the swapchain.
             auto frame = device->BeginFrame();

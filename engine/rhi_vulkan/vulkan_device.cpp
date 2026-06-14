@@ -3,6 +3,7 @@
 #include "rhi_vulkan/vulkan_command_buffer.h"
 #include "rhi_vulkan/vulkan_shader.h"
 #include "rhi_vulkan/vulkan_pipeline.h"
+#include "rhi_vulkan/vulkan_compute_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_render_target.h"
@@ -73,7 +74,12 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
         .select();
     if (!physRet) throw std::runtime_error("GPU select failed: " + physRet.error().message());
 
-    vkb::DeviceBuilder db{physRet.value()};
+    // VK_KHR_push_descriptor lets the compute path bind its storage buffer(s) inline via
+    // vkCmdPushDescriptorSetKHR — no descriptor pool/set lifetime to manage per frame.
+    vkb::PhysicalDevice physForDevice = physRet.value();
+    physForDevice.enable_extension_if_present(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+
+    vkb::DeviceBuilder db{physForDevice};
     auto devRet = db.build();
     if (!devRet) throw std::runtime_error("Device build failed: " + devRet.error().message());
     vkbDevice_ = devRet.value();
@@ -82,6 +88,10 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
 
     graphicsQueue_ = vkbDevice_.get_queue(vkb::QueueType::graphics).value();
     graphicsQueueFamily_ = vkbDevice_.get_queue_index(vkb::QueueType::graphics).value();
+
+    // Load the push-descriptor entry point (used by the compute path to bind storage buffers).
+    vkCmdPushDescriptorSetKHR_ = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
+        vkGetDeviceProcAddr(device_, "vkCmdPushDescriptorSetKHR"));
 
     // --- VMA ---
     VmaAllocatorCreateInfo aci{};
@@ -417,6 +427,9 @@ std::unique_ptr<IShaderModule> VulkanDevice::CreateShaderModule(const ShaderModu
 }
 std::unique_ptr<IPipeline> VulkanDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc& d) {
     return std::make_unique<VulkanPipeline>(*this, d);
+}
+std::unique_ptr<IComputePipeline> VulkanDevice::CreateComputePipeline(const ComputePipelineDesc& d) {
+    return std::make_unique<VulkanComputePipeline>(*this, d);
 }
 std::unique_ptr<IBuffer> VulkanDevice::CreateBuffer(const BufferDesc& d) {
     return std::make_unique<VulkanBuffer>(allocator_, d);

@@ -54,9 +54,21 @@ struct GraphicsPipelineDesc {
     bool usesTexture = false;        // when true, layout includes the material set (set 1)
     bool fullscreen = false;         // when true: no vertex input (fullscreen triangle from SV_VertexID)
     bool depthOnly = false;          // when true: no color attachment; depth write + bias (shadow pass)
+    bool pointList = false;          // when true: POINT_LIST topology (GPU particles drawn as points)
+    bool additiveBlend = false;      // when true: additive color blend (glowing particles over scene)
 };
 
-enum class BufferUsage { Vertex, Index, Uniform };
+// Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a
+// graphics pass can draw the compute-written data without a copy).
+enum class BufferUsage { Vertex, Index, Uniform, Storage };
+
+// Compute pipeline: a single compute shader that reads+writes storageBufferCount storage buffers
+// bound at successive bindings (0..N-1), driven by an optional push-constant block (e.g. dt/time).
+struct ComputePipelineDesc {
+    class IShaderModule* compute = nullptr;
+    uint32_t storageBufferCount = 1;  // SSBOs bound at binding 0..count-1
+    uint32_t pushConstantSize = 0;    // bytes, compute stage (params like dt/time/count)
+};
 
 struct TextureDesc {
     uint32_t width = 0;
@@ -74,10 +86,11 @@ struct BufferDesc {
 
 // --- Resource interfaces -----------------------------------------------------
 
-class IShaderModule { public: virtual ~IShaderModule() = default; };
-class IPipeline     { public: virtual ~IPipeline() = default; };
-class IBuffer       { public: virtual ~IBuffer() = default; };
-class ITexture      { public: virtual ~ITexture() = default; };
+class IShaderModule    { public: virtual ~IShaderModule() = default; };
+class IPipeline        { public: virtual ~IPipeline() = default; };
+class IComputePipeline { public: virtual ~IComputePipeline() = default; };
+class IBuffer          { public: virtual ~IBuffer() = default; };
+class ITexture         { public: virtual ~ITexture() = default; };
 
 // A sampleable offscreen color image (+ its own depth) you render into. Inheriting ITexture
 // lets the post pass bind it via the existing ICommandBuffer::BindTexture.
@@ -100,6 +113,19 @@ public:
     virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0) = 0;
     virtual void PushConstants(const void* data, uint32_t size) = 0;
     virtual void EndRenderPass() = 0;
+
+    // --- Compute recording (must be OUTSIDE a render pass) -------------------
+    // Bind a compute pipeline; subsequent BindStorageBuffer / ComputePushConstants / DispatchCompute
+    // target it. Default no-op so backends that lack compute do not need to override.
+    virtual void BindComputePipeline(IComputePipeline& /*pipeline*/) {}
+    // Bind a Storage buffer at the compute pipeline's binding `index` (0-based).
+    virtual void BindStorageBuffer(IBuffer& /*buffer*/, uint32_t /*index*/ = 0) {}
+    // Push constants for the bound compute pipeline (compute stage).
+    virtual void ComputePushConstants(const void* /*data*/, uint32_t /*size*/) {}
+    // Dispatch `groupsX*groupsY*groupsZ` workgroups of the bound compute pipeline.
+    virtual void DispatchCompute(uint32_t /*groupsX*/, uint32_t groupsY = 1, uint32_t groupsZ = 1) {}
+    // Barrier so a later vertex stage reads the storage buffer the compute stage just wrote.
+    virtual void ComputeToVertexBarrier() {}
 };
 
 class ISwapchain {
@@ -123,6 +149,11 @@ public:
 
     virtual std::unique_ptr<IShaderModule> CreateShaderModule(const ShaderModuleDesc&) = 0;
     virtual std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) = 0;
+    // Compute pipeline for GPU-driven work (e.g. a particle simulation). Backends without compute
+    // support return nullptr by default.
+    virtual std::unique_ptr<IComputePipeline> CreateComputePipeline(const ComputePipelineDesc&) {
+        return nullptr;
+    }
     virtual std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) = 0;
     virtual std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) = 0;
 

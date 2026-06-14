@@ -14,6 +14,9 @@ hf_compile_shaders(
     "shaders/post.frag.hlsl:ps"
     "shaders/sky.vert.hlsl:vs"
     "shaders/sky.frag.hlsl:ps"
+    "shaders/particles.comp.hlsl:cs"
+    "shaders/particle.vert.hlsl:vs"
+    "shaders/particle.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

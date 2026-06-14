@@ -1,6 +1,7 @@
 #include "rhi_vulkan/vulkan_command_buffer.h"
 #include "rhi_vulkan/vulkan_device.h"
 #include "rhi_vulkan/vulkan_pipeline.h"
+#include "rhi_vulkan/vulkan_compute_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_sampled.h"
@@ -103,6 +104,49 @@ void VulkanCommandBuffer::PushConstants(const void* data, uint32_t size) {
 
 void VulkanCommandBuffer::EndRenderPass() {
     vkCmdEndRendering(cmd_);
+}
+
+// --- Compute recording (outside any render pass) -----------------------------
+
+void VulkanCommandBuffer::BindComputePipeline(IComputePipeline& pipeline) {
+    auto& p = static_cast<VulkanComputePipeline&>(pipeline);
+    boundComputeLayout_ = p.layout();
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, p.handle());
+}
+
+void VulkanCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {
+    auto& b = static_cast<VulkanBuffer&>(buffer);
+    // Push-descriptor: write the storage buffer into binding `index` of the compute set (set 0).
+    VkDescriptorBufferInfo info{b.handle(), 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstBinding = index;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+    device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
+                               /*set=*/0, 1, &write);
+}
+
+void VulkanCommandBuffer::ComputePushConstants(const void* data, uint32_t size) {
+    vkCmdPushConstants(cmd_, boundComputeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data);
+}
+
+void VulkanCommandBuffer::DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) {
+    vkCmdDispatch(cmd_, groupsX, groupsY, groupsZ);
+}
+
+void VulkanCommandBuffer::ComputeToVertexBarrier() {
+    // Compute writes (SHADER_WRITE) -> vertex-input reads (VERTEX_ATTRIBUTE_READ): the draw consumes
+    // the particle buffer as a vertex stream. sync2 buffer memory barrier on the whole pipeline.
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd_, &di);
 }
 
 } // namespace hf::rhi::vk

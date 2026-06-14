@@ -11,6 +11,12 @@ VulkanBuffer::VulkanBuffer(VmaAllocator allocator, const BufferDesc& desc)
         case BufferUsage::Vertex:  usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;  break;
         case BufferUsage::Index:   usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;   break;
         case BufferUsage::Uniform: usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT; break;
+        // A storage (SSBO) buffer is also bindable as a vertex stream, so the graphics pass can draw
+        // the compute-written particle data directly (no copy). TRANSFER_DST allows an init upload.
+        case BufferUsage::Storage:
+            usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            break;
     }
 
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};

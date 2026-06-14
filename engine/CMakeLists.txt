@@ -27,6 +27,7 @@ else()
     rhi_vulkan/vulkan_swapchain.cpp
     rhi_vulkan/vulkan_shader.cpp
     rhi_vulkan/vulkan_pipeline.cpp
+    rhi_vulkan/vulkan_compute_pipeline.cpp
     rhi_vulkan/vulkan_buffer.cpp
     rhi_vulkan/vulkan_command_buffer.cpp
     rhi_vulkan/vulkan_texture.cpp
