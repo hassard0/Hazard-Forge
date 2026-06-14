@@ -1,4 +1,5 @@
 add_library(hf_engine STATIC
+  hal/window.cpp
   rhi/rhi_factory.cpp
 )
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
