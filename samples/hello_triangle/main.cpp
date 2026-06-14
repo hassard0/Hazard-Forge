@@ -12,6 +12,12 @@
 #include "asset/gltf_loader.h"
 #include "render/render_graph.h"
 
+#ifdef HF_HAS_EDITOR
+#include "imgui.h"
+#include "editor/imgui_renderer.h"
+#include "editor/editor_panels.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -155,11 +161,16 @@ int main(int argc, char** argv) {
     //               no render — lets an agent inspect the machine-readable scene state).
     const char* shotPath = nullptr;
     bool dumpScene = false;
+    bool editor = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
             dumpScene = true;
+        } else if (std::strcmp(argv[i], "--editor") == 0) {
+            // Overlay the Dear ImGui editor (hierarchy/inspector/stats) on the viewport, rendered
+            // through the engine RHI. Works in interactive mode and in the --shot capture.
+            editor = true;
         }
     }
     try {
@@ -379,6 +390,47 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+#ifdef HF_HAS_EDITOR
+        // --- Editor shell (Dear ImGui through the RHI). Created only when --editor is set so the
+        // normal render path is byte-identical when the editor is off. The ImGui context is given a
+        // fixed display size so panels build identically in headless capture and interactive mode. ---
+        std::unique_ptr<editor::ImGuiRenderer> uiRenderer;
+        editor::EditorState editorState;
+        bool imguiInited = false;
+        auto ensureEditor = [&]() {
+            if (!editor) return;
+            if (!imguiInited) {
+                IMGUI_CHECKVERSION();
+                ImGui::CreateContext();
+                ImGuiIO& io = ImGui::GetIO();
+                io.IniFilename = nullptr;   // headless: no imgui.ini side-effects
+                io.LogFilename = nullptr;
+                io.DisplaySize = ImVec2((float)window.FramebufferWidth(),
+                                        (float)window.FramebufferHeight());
+                ImGui::StyleColorsDark();
+                imguiInited = true;
+            }
+            if (!uiRenderer) {
+                uiRenderer = std::make_unique<editor::ImGuiRenderer>(
+                    *device, device->Swapchain().ColorFormat(), HF_SHADER_DIR);
+            }
+        };
+        // Record the editor UI into the swapchain pass (after the fullscreen post triangle). Builds a
+        // fresh ImGui frame from the live ECS scene, then draws it over the swapchain via the RHI.
+        auto recordEditorOverlay = [&](rhi::ICommandBuffer& cmd) {
+            if (!editor || !uiRenderer) return;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            ImGuiIO& io = ImGui::GetIO();
+            io.DisplaySize = ImVec2((float)w, (float)h);
+            ImGui::NewFrame();
+            editor::BuildEditorUI(registry, resources, editorState, w, h);
+            ImGui::Render();
+            uiRenderer->RenderDrawData(ImGui::GetDrawData(), cmd, w, h);
+        };
+        ensureEditor();
+#endif
+
         // Grid + duck entities spin in the interactive loop (the ground plane, file index 0, does
         // not — mirroring the old "skip index 0" behaviour).
         std::vector<ecs::Entity> cubeSpinEntities;
@@ -523,13 +575,18 @@ int main(int argc, char** argv) {
                     cmd.EndRenderPass();
                 });
 
-            // Post pass: READS sceneColor, WRITES swapchain (fullscreen post; then captured).
+            // Post pass: READS sceneColor, WRITES swapchain (fullscreen post; then captured). When
+            // the editor is enabled, the ImGui panels are drawn over the swapchain in this same pass,
+            // after the fullscreen post triangle, so the capture includes the editor UI.
             graph.AddPass("post", /*reads*/{rgScene}, /*writes*/{rgSwap},
                 [&](rhi::IRHIDevice& /*dev*/, rhi::ICommandBuffer& cmd) {
                     cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
                     cmd.BindPipeline(*postPipeline);
                     cmd.BindTexture(*rt);
                     cmd.Draw(3);
+#ifdef HF_HAS_EDITOR
+                    recordEditorOverlay(cmd);
+#endif
                     cmd.EndRenderPass();
                 });
 
@@ -553,6 +610,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             device->WaitIdle();
+#ifdef HF_HAS_EDITOR
+            uiRenderer.reset();  // free UI RHI resources before the device is torn down
+            if (imguiInited) ImGui::DestroyContext();
+#endif
             std::printf("wrote %s (%ux%u)\n", shotPath, cw, ch);
             return 0;
         }
@@ -638,6 +699,9 @@ int main(int argc, char** argv) {
                     cmd.BindPipeline(*postPipeline);
                     cmd.BindTexture(*rt);
                     cmd.Draw(3);
+#ifdef HF_HAS_EDITOR
+                    recordEditorOverlay(cmd);
+#endif
                     cmd.EndRenderPass();
                 });
 
@@ -645,6 +709,10 @@ int main(int argc, char** argv) {
         }
 
         device->WaitIdle();
+#ifdef HF_HAS_EDITOR
+        uiRenderer.reset();  // free UI RHI resources before the device is torn down
+        if (imguiInited) ImGui::DestroyContext();
+#endif
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FATAL: %s\n", e.what());

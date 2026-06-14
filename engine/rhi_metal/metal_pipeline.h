@@ -20,6 +20,8 @@ public:
     bool fullscreen() const { return fullscreen_; }
     bool depthOnly() const { return depthOnly_; }
     bool pointList() const { return pointList_; }
+    // No back-face culling (fullscreen passes, or UI quads which are clockwise-wound).
+    bool cullNone() const { return fullscreen_ || cullNone_; }
 
 private:
     id<MTLRenderPipelineState> pipelineState_ = nil;
@@ -29,6 +31,7 @@ private:
     bool fullscreen_        = false;
     bool depthOnly_         = false;
     bool pointList_         = false;
+    bool cullNone_          = false;
 };
 
 } // namespace hf::rhi::mtl

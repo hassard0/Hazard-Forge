@@ -34,5 +34,10 @@ endif()
 enable_testing()
 
 add_subdirectory(engine)
+# Editor shell (Dear ImGui through the RHI) is Windows/Vulkan-only — never added on Apple, so the
+# metal_headless path is unaffected.
+if(NOT APPLE)
+  add_subdirectory(engine/editor)
+endif()
 add_subdirectory(samples/hello_triangle)
 add_subdirectory(tests)

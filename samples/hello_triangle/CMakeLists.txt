@@ -1,7 +1,12 @@
 add_executable(hello_triangle main.cpp)
-target_link_libraries(hello_triangle PRIVATE hf_engine)
+# Vulkan/Windows sample links the editor shell (Dear ImGui through the RHI); the editor is gated to
+# non-Apple in the root CMakeLists, so this link only happens on the Vulkan path.
+target_link_libraries(hello_triangle PRIVATE hf_engine hf_editor)
+target_compile_definitions(hello_triangle PRIVATE HF_HAS_EDITOR=1)
 
 set(SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+# The ui.vert/frag shaders are Vulkan-only (editor) — added only to the Vulkan sample's compile list,
+# never to the metal_headless gen list, so the Metal shader generation is untouched.
 hf_compile_shaders(
   TARGET hello_triangle
   OUTPUT_DIR "${SHADER_OUT}"
@@ -17,6 +22,8 @@ hf_compile_shaders(
     "shaders/particles.comp.hlsl:cs"
     "shaders/particle.vert.hlsl:vs"
     "shaders/particle.frag.hlsl:ps"
+    "shaders/ui.vert.hlsl:vs"
+    "shaders/ui.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

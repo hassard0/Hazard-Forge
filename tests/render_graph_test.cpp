@@ -35,8 +35,9 @@ public:
     void BindIndexBuffer(rhi::IBuffer&) override {}
     void BindTexture(rhi::ITexture&) override {}
     void Draw(uint32_t, uint32_t) override {}
-    void DrawIndexed(uint32_t, uint32_t) override {}
+    void DrawIndexed(uint32_t, uint32_t, int32_t) override {}
     void PushConstants(const void*, uint32_t) override {}
+    void SetScissor(int32_t, int32_t, uint32_t, uint32_t) override {}
     void EndRenderPass() override {}
 };
 

@@ -66,7 +66,7 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
     // Fullscreen post pass: the [[vertex_id]]-generated triangle's winding depends on the clip
     // convention; disable culling so it is never back-face culled to black (mirrors Vulkan, which
     // sets cullMode NONE for fullscreen pipelines). BeginRenderPass defaults to cull-back.
-    [encoder_ setCullMode:(p.fullscreen() ? MTLCullModeNone : MTLCullModeBack)];
+    [encoder_ setCullMode:(p.cullNone() ? MTLCullModeNone : MTLCullModeBack)];
 
     // Bind the device's current per-frame UBO (set 0) to both stages, matching the Vulkan path
     // where BindPipeline auto-binds the frame set.
@@ -129,19 +129,35 @@ void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     [encoder_ drawPrimitives:prim vertexStart:firstVertex vertexCount:vertexCount];
 }
 
-void MetalCommandBuffer::DrawIndexed(uint32_t indexCount, uint32_t firstIndex) {
+void MetalCommandBuffer::DrawIndexed(uint32_t indexCount, uint32_t firstIndex,
+                                     int32_t vertexOffset) {
     // RHI index buffers are uint32 (Vulkan binds VK_INDEX_TYPE_UINT32).
     const NSUInteger indexBytes = (NSUInteger)firstIndex * sizeof(uint32_t);
     [encoder_ drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                          indexCount:indexCount
                           indexType:MTLIndexTypeUInt32
                         indexBuffer:indexBuffer_
-                  indexBufferOffset:indexBytes];
+                  indexBufferOffset:indexBytes
+                      instanceCount:1
+                         baseVertex:vertexOffset
+                       baseInstance:0];
 }
 
 void MetalCommandBuffer::PushConstants(const void* data, uint32_t size) {
     // Vertex push constants (model matrix) -> inline setVertexBytes at the push-constant slot.
     [encoder_ setVertexBytes:data length:size atIndex:kVbPushConst];
+}
+
+void MetalCommandBuffer::SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    // Override the render pass's full-extent scissor (the editor isn't used on Metal, but the seam
+    // stays complete so the Metal build compiles + the golden is unaffected). Clamp to the attachment.
+    int32_t cx = x < 0 ? 0 : x;
+    int32_t cy = y < 0 ? 0 : y;
+    uint32_t cw = width, ch = height;
+    if ((uint32_t)cx + cw > width_)  cw = (cx < (int32_t)width_)  ? (width_  - (uint32_t)cx) : 0;
+    if ((uint32_t)cy + ch > height_) ch = (cy < (int32_t)height_) ? (height_ - (uint32_t)cy) : 0;
+    MTLScissorRect r{(NSUInteger)cx, (NSUInteger)cy, (NSUInteger)cw, (NSUInteger)ch};
+    [encoder_ setScissorRect:r];
 }
 
 void MetalCommandBuffer::EndRenderPass() {

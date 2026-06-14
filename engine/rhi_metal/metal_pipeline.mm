@@ -7,7 +7,8 @@ namespace hf::rhi::mtl {
 
 MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& desc)
     : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
-      fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly), pointList_(desc.pointList) {
+      fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly), pointList_(desc.pointList),
+      cullNone_(desc.cullNone) {
     id<MTLDevice> dev = device.device();
 
     auto* vs = static_cast<MetalShaderModule*>(desc.vertex);
@@ -48,6 +49,15 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
             rpd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
             rpd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
             rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+        } else if (desc.alphaBlend) {
+            // Standard alpha blend (ImGui/UI): src*srcAlpha + dst*(1-srcAlpha). Mirrors Vulkan.
+            rpd.colorAttachments[0].blendingEnabled = YES;
+            rpd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            rpd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+            rpd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+            rpd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            rpd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+            rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         }
     }
     if (desc.depthTest || desc.depthOnly) {

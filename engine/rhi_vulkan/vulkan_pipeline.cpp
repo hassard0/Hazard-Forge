@@ -59,7 +59,7 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     // Fullscreen passes generate a single triangle from SV_VertexID whose winding depends on the
     // clip-space convention; disable culling so it is never back-face culled to black.
-    rs.cullMode = desc.fullscreen ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+    rs.cullMode = (desc.fullscreen || desc.cullNone) ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
     // Depth-only shadow pass: enable depth bias to push shadow-caster depths away from the light
@@ -85,6 +85,15 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
         blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
         blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
+    } else if (desc.alphaBlend) {
+        // Standard alpha blend (ImGui/UI): src*srcAlpha + dst*(1-srcAlpha).
+        blendAtt.blendEnable = VK_TRUE;
+        blendAtt.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blendAtt.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
     }
     VkPipelineColorBlendStateCreateInfo cb{

@@ -56,6 +56,8 @@ struct GraphicsPipelineDesc {
     bool depthOnly = false;          // when true: no color attachment; depth write + bias (shadow pass)
     bool pointList = false;          // when true: POINT_LIST topology (GPU particles drawn as points)
     bool additiveBlend = false;      // when true: additive color blend (glowing particles over scene)
+    bool alphaBlend = false;         // when true: standard src_alpha/one_minus_src_alpha blend (UI/ImGui)
+    bool cullNone = false;           // when true: no back-face culling (ImGui draws CW-wound quads)
 };
 
 // Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a
@@ -115,8 +117,14 @@ public:
     // (base only) for backends/passes that do not implement the normal-map slot.
     virtual void BindMaterial(ITexture& base, ITexture& normalMap) { (void)normalMap; BindTexture(base); }
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
-    virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0) = 0;
+    // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
+    // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.
+    virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0,
+                             int32_t vertexOffset = 0) = 0;
     virtual void PushConstants(const void* data, uint32_t size) = 0;
+    // Override the render pass's full-extent scissor for the following draw(s). ImGui needs a
+    // per-draw scissor (clip rect). Coordinates are in framebuffer pixels (top-left origin).
+    virtual void SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) = 0;
     virtual void EndRenderPass() = 0;
 
     // --- Compute recording (must be OUTSIDE a render pass) -------------------
