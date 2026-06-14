@@ -4,12 +4,14 @@
 
 namespace hf::rhi::vk {
 
-VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uint32_t height)
-    : device_(device), width_(width), height_(height) {
+VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uint32_t height,
+                                       bool depthOnly)
+    : device_(device), width_(width), height_(height), depthOnly_(depthOnly) {
     // Color image: same format as the swapchain so the existing lit pipeline renders into it
     // unchanged. Usage: render target + sampled (so the post pass can read it).
+    // Skipped entirely for a depth-only shadow map.
     const VkFormat colorFormat = device_.swapchainFormat();
-    {
+    if (!depthOnly_) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.imageType = VK_IMAGE_TYPE_2D;
         ici.format = colorFormat;
@@ -46,7 +48,9 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        // Shadow map needs SAMPLED so the lit pass can read it via the frame set.
+        ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                    (depthOnly_ ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -63,6 +67,10 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
         Check(vkCreateImageView(device_.device(), &vci, nullptr, &depthView_),
               "vkCreateImageView(rt depth)");
     }
+
+    // Depth-only shadow map: no color image and no per-RT descriptor set. The per-frame set
+    // (set 0) samples depthView() directly via VulkanDevice::SetShadowMap.
+    if (depthOnly_) return;
 
     // Descriptor set on the material set layout (set 1) so the post pass can BindTexture(*this).
     // Same two-write pattern as VulkanTexture: binding 0 sampled image, binding 1 sampler.

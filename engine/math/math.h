@@ -44,6 +44,19 @@ struct Mat4 {
         return r;
     }
 
+    // Orthographic projection, depth range [0,1] (Vulkan), Y flipped to match Perspective.
+    static Mat4 Ortho(float l, float r, float b, float t, float zn, float zf) {
+        Mat4 m;  // zeros; column-major
+        m.m[0]  = 2.0f / (r - l);
+        m.m[5]  = -2.0f / (t - b);                 // Y-flip (matches Perspective's -1/tan)
+        m.m[10] = -1.0f / (zf - zn);
+        m.m[12] = -(r + l) / (r - l);
+        m.m[13] = (t + b) / (t - b);               // sign paired with the Y-flip
+        m.m[14] = -zn / (zf - zn);
+        m.m[15] = 1.0f;
+        return m;
+    }
+
     static Mat4 LookAt(const Vec3& eye, const Vec3& center, const Vec3& up) {
         Vec3 f = normalize(center - eye);
         Vec3 s = normalize(cross(f, up));

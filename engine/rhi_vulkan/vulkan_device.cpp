@@ -180,6 +180,17 @@ void VulkanDevice::CreateTextureResources() {
     sci.maxLod = VK_LOD_CLAMP_NONE;
     Check(vkCreateSampler(device_, &sci, nullptr, &defaultSampler_), "vkCreateSampler");
 
+    // Shadow sampler: linear, clamp-to-edge (so out-of-bounds UVs read the border depth, not
+    // wrapped geometry). No comparison — the shader does the manual depth compare + PCF.
+    VkSamplerCreateInfo ssci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    ssci.magFilter = VK_FILTER_LINEAR;
+    ssci.minFilter = VK_FILTER_LINEAR;
+    ssci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    ssci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    ssci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    ssci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    Check(vkCreateSampler(device_, &ssci, nullptr, &shadowSampler_), "vkCreateSampler(shadow)");
+
     // Material set layout (used at set 1): binding 0 = sampled image, binding 1 = sampler,
     // fragment stage. (DXC emits Texture2D/SamplerState as two separate descriptors.)
     VkDescriptorSetLayoutBinding bindings[2]{};
@@ -199,11 +210,13 @@ void VulkanDevice::CreateTextureResources() {
 
     // Pool: allow individual set frees (VulkanTexture frees its set in its dtor). Includes
     // a UNIFORM_BUFFER capacity for the per-frame UBO sets (set 0).
+    // SAMPLED_IMAGE/SAMPLER counts cover material sets (set 1) plus the per-frame sets' shadow-map
+    // image + sampler bindings (set 0, bindings 1+2): +kFramesInFlight each.
     VkDescriptorPoolSize poolSizes[3]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    poolSizes[0].descriptorCount = 64;
+    poolSizes[0].descriptorCount = 64 + kFramesInFlight;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    poolSizes[1].descriptorCount = 64;
+    poolSizes[1].descriptorCount = 64 + kFramesInFlight;
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -214,15 +227,25 @@ void VulkanDevice::CreateTextureResources() {
     Check(vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_),
           "vkCreateDescriptorPool");
 
-    // --- Per-frame UBO set layout (set 0): binding 0 = uniform buffer, vertex+fragment. ---
-    VkDescriptorSetLayoutBinding frameBinding{};
-    frameBinding.binding = 0;
-    frameBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    frameBinding.descriptorCount = 1;
-    frameBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // --- Per-frame set layout (set 0): binding 0 = uniform buffer (vertex+fragment), binding 1 =
+    // shadow-map sampled image (fragment), binding 2 = shadow sampler (fragment). The shadow
+    // bindings are populated by SetShadowMap; the lit pipeline samples them for shadowing. ---
+    VkDescriptorSetLayoutBinding frameBindings[3]{};
+    frameBindings[0].binding = 0;
+    frameBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    frameBindings[0].descriptorCount = 1;
+    frameBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    frameBindings[1].binding = 1;
+    frameBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    frameBindings[1].descriptorCount = 1;
+    frameBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    frameBindings[2].binding = 2;
+    frameBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    frameBindings[2].descriptorCount = 1;
+    frameBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo fci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    fci.bindingCount = 1;
-    fci.pBindings = &frameBinding;
+    fci.bindingCount = 3;
+    fci.pBindings = frameBindings;
     Check(vkCreateDescriptorSetLayout(device_, &fci, nullptr, &frameSetLayout_),
           "vkCreateDescriptorSetLayout(frame)");
 
@@ -280,9 +303,11 @@ void VulkanDevice::DestroyTextureResources() {
     if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
+    if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     descriptorPool_ = VK_NULL_HANDLE;
     texturedSetLayout_ = VK_NULL_HANDLE;
     defaultSampler_ = VK_NULL_HANDLE;
+    shadowSampler_ = VK_NULL_HANDLE;
 }
 
 void VulkanDevice::UploadToImage(VkImage image, uint32_t w, uint32_t h,
@@ -401,6 +426,96 @@ std::unique_ptr<ITexture> VulkanDevice::CreateTexture(const TextureDesc& d) {
 }
 std::unique_ptr<IRenderTarget> VulkanDevice::CreateRenderTarget(uint32_t w, uint32_t h) {
     return std::make_unique<VulkanRenderTarget>(*this, w, h);
+}
+std::unique_ptr<IRenderTarget> VulkanDevice::CreateShadowMap(uint32_t size) {
+    return std::make_unique<VulkanRenderTarget>(*this, size, size, /*depthOnly=*/true);
+}
+
+// Point each per-frame set's shadow bindings (set 0, binding 1 = sampled depth, binding 2 =
+// shadow sampler) at this shadow map. Call once after CreateShadowMap.
+void VulkanDevice::SetShadowMap(IRenderTarget& smBase) {
+    auto& sm = static_cast<VulkanRenderTarget&>(smBase);
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        VkDescriptorImageInfo imageInfo{};
+        imageInfo.imageView = sm.depthView();
+        // Sampled while the shadow map is in SHADER_READ_ONLY (after EndShadowPass).
+        imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo samplerInfo{};
+        samplerInfo.sampler = shadowSampler_;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = frameSet_[i];
+        writes[0].dstBinding = 1;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[0].pImageInfo = &imageInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = frameSet_[i];
+        writes[1].dstBinding = 2;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[1].pImageInfo = &samplerInfo;
+
+        vkUpdateDescriptorSets(device_, 2, writes, 0, nullptr);
+    }
+}
+
+// --- Shadow (depth-only) pass — reuses the dedicated rt command buffer/fence/recorder. ---
+FrameContext VulkanDevice::BeginShadowPass(IRenderTarget& smBase) {
+    auto& sm = static_cast<VulkanRenderTarget&>(smBase);
+    shadowInFlight_ = &sm;
+
+    Check(vkResetCommandBuffer(rtCmd_, 0), "vkResetCommandBuffer(shadow)");
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(rtCmd_, &bi), "vkBeginCommandBuffer(shadow)");
+
+    // Transition the shadow depth from its current layout -> DEPTH_ATTACHMENT_OPTIMAL (cleared).
+    TransitionImage(rtCmd_, sm.depthImage(),
+                    sm.depthLayout(), VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+    sm.setDepthLayout(VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+
+    // Depth-only recorder: null color view -> BeginRenderPass emits no color attachment.
+    rtRecorder_->Begin(rtCmd_, VK_NULL_HANDLE, sm.depthView(), {sm.width(), sm.height()});
+    return FrameContext{rtRecorder_.get()};
+}
+
+void VulkanDevice::EndShadowPass(const FrameContext& frame) {
+    if (!frame.cmd || !shadowInFlight_) return;
+    VulkanRenderTarget& sm = *shadowInFlight_;
+
+    // The sample already called EndRenderPass() (vkCmdEndRendering). Transition the depth image
+    // DEPTH_ATTACHMENT -> SHADER_READ_ONLY so the lit pass can sample it.
+    TransitionImage(rtCmd_, sm.depthImage(),
+                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+    sm.setDepthLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    Check(vkEndCommandBuffer(rtCmd_), "vkEndCommandBuffer(shadow)");
+
+    VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmdSub.commandBuffer = rtCmd_;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdSub;
+    Check(vkResetFences(device_, 1, &rtFence_), "vkResetFences(shadow)");
+    Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, rtFence_), "vkQueueSubmit2(shadow)");
+    Check(vkWaitForFences(device_, 1, &rtFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(shadow)");
+
+    shadowInFlight_ = nullptr;
 }
 
 // --- Offscreen render-target pass ---

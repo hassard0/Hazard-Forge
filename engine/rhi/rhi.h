@@ -53,6 +53,7 @@ struct GraphicsPipelineDesc {
     bool usesFrameUniforms = false;  // when true, layout includes the per-frame UBO set (set 0)
     bool usesTexture = false;        // when true, layout includes the material set (set 1)
     bool fullscreen = false;         // when true: no vertex input (fullscreen triangle from SV_VertexID)
+    bool depthOnly = false;          // when true: no color attachment; depth write + bias (shadow pass)
 };
 
 enum class BufferUsage { Vertex, Index, Uniform };
@@ -127,6 +128,21 @@ public:
 
     // Offscreen render target: a sampleable color image (swapchain format) + its own depth.
     virtual std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) = 0;
+
+    // Depth-only sampleable shadow map (size x size, D32, DEPTH_STENCIL_ATTACHMENT | SAMPLED).
+    // Rendered into via Begin/EndShadowPass; sampled by the lit pass via the per-frame set (set 0).
+    virtual std::unique_ptr<IRenderTarget> CreateShadowMap(uint32_t size) = 0;
+
+    // Begin recording a depth-only pass from the light into the shadow map (dynamic rendering,
+    // no color attachment). Returns a FrameContext whose cmd records depth-only draws.
+    virtual FrameContext BeginShadowPass(IRenderTarget& shadowMap) = 0;
+    // End recording, submit, and transition the shadow map depth to SHADER_READ_ONLY so the lit
+    // pass can sample it. Blocks until the shadow pass completes.
+    virtual void EndShadowPass(const FrameContext&) = 0;
+
+    // Point the per-frame sets' shadow-map binding (set 0, bindings 1+2) at this shadow map.
+    // Call once after CreateShadowMap; the lit pipeline then samples it every frame.
+    virtual void SetShadowMap(IRenderTarget& shadowMap) = 0;
 
     // Begin recording the scene into the render target's color+depth (dynamic rendering).
     // Returns a FrameContext whose cmd records into the RT; pair with EndRenderTargetFrame.

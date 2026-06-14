@@ -28,15 +28,16 @@ std::vector<uint32_t> LoadSpirv(const std::string& path) {
     return words;
 }
 
-// Per-frame uniform block — must match shaders/lit.*.hlsl FrameData (224 bytes).
+// Per-frame uniform block — must match shaders/lit.*.hlsl + shadow.vert.hlsl FrameData (288 bytes).
 struct FrameData {
     float vp[16];
     float lightDir[4];
     float lightColor[4];
     float viewPos[4];
-    float ptCount[4];     // x = number of active point lights
-    float ptPos[3][4];    // xyz = world position, w = radius
-    float ptColor[3][4];  // rgb = color, w = intensity
+    float ptCount[4];          // x = number of active point lights
+    float ptPos[3][4];         // xyz = world position, w = radius
+    float ptColor[3][4];       // rgb = color, w = intensity
+    float lightViewProj[16];   // directional light's view*ortho (for shadow mapping)
 };
 
 // Procedural 256x256 RGBA8 checkerboard: 8x8 tiles alternating two colors, with the
@@ -106,7 +107,7 @@ int main(int argc, char** argv) {
         }
     }
     try {
-        hal::Window window({"Hazard Forge — Post", 1280, 720});
+        hal::Window window({"Hazard Forge — Shadows", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
 
         auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
@@ -124,6 +125,28 @@ int main(int argc, char** argv) {
         pdesc.usesTexture = true;
         pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
         auto pipeline = device->CreateGraphicsPipeline(pdesc);
+
+        // Depth-only shadow pipeline: renders the scene from the light into the shadow map.
+        // Needs lightViewProj from the frame UBO (set 0 b0); no texture, no color attachment.
+        auto shadowVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+        auto shadowFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+        auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsWords)});
+        auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsWords)});
+
+        rhi::GraphicsPipelineDesc shadowDesc;
+        shadowDesc.vertex = shadowVs.get();
+        shadowDesc.fragment = shadowFs.get();
+        shadowDesc.vertexLayout = scene::MeshVertexLayout();
+        shadowDesc.depthTest = true;
+        shadowDesc.depthOnly = true;
+        shadowDesc.usesFrameUniforms = true;   // lightViewProj lives in the frame UBO
+        shadowDesc.usesTexture = false;
+        shadowDesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
+        auto shadowPipeline = device->CreateGraphicsPipeline(shadowDesc);
+
+        // 2048^2 depth-only shadow map; point the per-frame sets at it once.
+        auto shadowMap = device->CreateShadowMap(2048);
+        device->SetShadowMap(*shadowMap);
 
         // Fullscreen post pipeline: samples the offscreen RT, tonemaps + vignettes -> swapchain.
         auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
@@ -207,6 +230,16 @@ int main(int argc, char** argv) {
                 fd.ptColor[li][2] = colors[li][2];
                 fd.ptColor[li][3] = kInt;
             }
+
+            // Directional light's view*projection for shadow mapping. Light looks from
+            // sceneCenter - lightDir*12 toward sceneCenter; an ortho box covers the scene.
+            Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            Vec3 sceneCenter{0.0f, 0.5f, 0.0f};
+            Vec3 lightEye = sceneCenter - lightDir * 12.0f;
+            Mat4 lightView = Mat4::LookAt(lightEye, sceneCenter, {0, 1, 0});
+            Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 25.0f);
+            Mat4 lightVP = lightOrtho * lightView;
+            for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
             return fd;
         };
 
@@ -223,6 +256,18 @@ int main(int argc, char** argv) {
             }
         };
 
+        // Depth-only shadow draw: geometry only (no texture), light-space via the shadow pipeline.
+        auto drawDepthOnly = [&](rhi::ICommandBuffer* cmd) {
+            cmd->BindPipeline(*shadowPipeline);
+            for (scene::Renderable& r : sceneObjects) {
+                Mat4 m = r.transform.Matrix();
+                cmd->PushConstants(m.m, sizeof(float) * 16);
+                cmd->BindVertexBuffer(r.mesh->vertices());
+                cmd->BindIndexBuffer(r.mesh->indices());
+                cmd->DrawIndexed(r.mesh->indexCount());
+            }
+        };
+
         // --- Headless capture mode: render exactly one frame and write it to a BMP. ---
         if (shotPath) {
             uint32_t w = window.FramebufferWidth();
@@ -230,7 +275,17 @@ int main(int argc, char** argv) {
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
             FrameData fd = makeFrameData(aspect, 0.6f);  // fixed camera; cubes + lights static
 
-            // Pass 1: render the scene into the offscreen render target.
+            // Pass 0: depth-only shadow pass from the light into the shadow map.
+            {
+                auto sc = device->BeginShadowPass(*shadowMap);
+                device->SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
+                sc.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                drawDepthOnly(sc.cmd);
+                sc.cmd->EndRenderPass();
+                device->EndShadowPass(sc);
+            }
+
+            // Pass 1: render the scene into the offscreen render target (lit, samples shadow map).
             {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
@@ -310,7 +365,17 @@ int main(int argc, char** argv) {
             for (size_t i = 1; i < sceneObjects.size(); ++i)
                 sceneObjects[i].transform.eulerRadians.y = baseYaw[i] + t;
 
-            // Pass 1: render the scene into the offscreen render target.
+            // Pass 0: depth-only shadow pass from the light into the shadow map.
+            {
+                auto sc = device->BeginShadowPass(*shadowMap);
+                device->SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
+                sc.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                drawDepthOnly(sc.cmd);
+                sc.cmd->EndRenderPass();
+                device->EndShadowPass(sc);
+            }
+
+            // Pass 1: render the scene into the offscreen render target (lit, samples shadow map).
             {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 device->SetFrameUniforms(&fd, sizeof(FrameData));

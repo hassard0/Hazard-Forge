@@ -8,6 +8,8 @@ hf_compile_shaders(
   SHADERS
     "shaders/lit.vert.hlsl:vs"
     "shaders/lit.frag.hlsl:ps"
+    "shaders/shadow.vert.hlsl:vs"
+    "shaders/shadow.frag.hlsl:ps"
     "shaders/post.vert.hlsl:vs"
     "shaders/post.frag.hlsl:ps"
 )

@@ -24,9 +24,14 @@ public:
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
     std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) override;
+    std::unique_ptr<IRenderTarget> CreateShadowMap(uint32_t size) override;
 
     FrameContext BeginRenderTargetFrame(IRenderTarget& rt) override;
     void EndRenderTargetFrame(const FrameContext&) override;
+
+    FrameContext BeginShadowPass(IRenderTarget& shadowMap) override;
+    void EndShadowPass(const FrameContext&) override;
+    void SetShadowMap(IRenderTarget& shadowMap) override;
 
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
@@ -75,12 +80,13 @@ private:
 
     // Texture support: one default sampler + a shared image+sampler set layout (set 1) + pool.
     VkSampler             defaultSampler_    = VK_NULL_HANDLE;
+    VkSampler             shadowSampler_     = VK_NULL_HANDLE;  // clamp-to-edge linear (shadow map)
     VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // Per-frame uniform buffers (set 0): one host-visible mapped UBO + descriptor set per
     // frame-in-flight, so the CPU never writes a UBO the GPU is still reading.
-    static constexpr uint32_t kFrameUboSize = 256;  // >= sizeof(FrameData) (112B), aligned
+    static constexpr uint32_t kFrameUboSize = 512;  // >= sizeof(FrameData) (288B w/ lightViewProj)
     VkDescriptorSetLayout frameSetLayout_ = VK_NULL_HANDLE;
     VkBuffer        uboBuffer_[kFramesInFlight]{};
     VmaAllocation   uboAlloc_[kFramesInFlight]{};
@@ -117,6 +123,10 @@ private:
     VkFence         rtFence_ = VK_NULL_HANDLE;
     std::unique_ptr<class VulkanCommandBuffer> rtRecorder_;
     class VulkanRenderTarget* rtInFlight_ = nullptr;  // RT being recorded between Begin/End
+
+    // The shadow (depth-only) pass reuses the dedicated rt command buffer/fence/recorder: the
+    // shadow pass runs, waits on rtFence_, then the RT pass runs — they never overlap.
+    class VulkanRenderTarget* shadowInFlight_ = nullptr;  // shadow map recorded between Begin/End
 };
 
 } // namespace hf::rhi::vk

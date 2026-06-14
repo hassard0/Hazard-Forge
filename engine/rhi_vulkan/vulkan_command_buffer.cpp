@@ -32,14 +32,18 @@ void VulkanCommandBuffer::BeginRenderPass(const ClearColor& clear) {
     depth.imageView = depthView_;
     depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    // Depth-only (shadow) pass must STORE depth so the lit pass can sample it; the color passes
+    // never read depth back, so DONT_CARE there.
+    depth.storeOp = (colorView_ == VK_NULL_HANDLE) ? VK_ATTACHMENT_STORE_OP_STORE
+                                                   : VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.clearValue.depthStencil = {1.0f, 0};
 
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, extent_};
     ri.layerCount = 1;
-    ri.colorAttachmentCount = 1;
-    ri.pColorAttachments = &color;
+    // Depth-only pass (shadow map): colorView_ is null -> no color attachment.
+    ri.colorAttachmentCount = (colorView_ == VK_NULL_HANDLE) ? 0 : 1;
+    ri.pColorAttachments = (colorView_ == VK_NULL_HANDLE) ? nullptr : &color;
     ri.pDepthAttachment = &depth;
     vkCmdBeginRendering(cmd_, &ri);
 

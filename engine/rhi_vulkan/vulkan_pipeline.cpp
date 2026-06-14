@@ -61,6 +61,13 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     rs.cullMode = desc.fullscreen ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
+    // Depth-only shadow pass: enable depth bias to push shadow-caster depths away from the light
+    // and fight shadow acne. Keep back-face culling (the shader bias does the rest).
+    if (desc.depthOnly) {
+        rs.depthBiasEnable = VK_TRUE;
+        rs.depthBiasConstantFactor = 1.25f;
+        rs.depthBiasSlopeFactor = 1.75f;
+    }
 
     VkPipelineMultisampleStateCreateInfo ms{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -71,8 +78,9 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     VkPipelineColorBlendStateCreateInfo cb{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    cb.attachmentCount = 1;
-    cb.pAttachments = &blendAtt;
+    // Depth-only pass has no color attachment.
+    cb.attachmentCount = desc.depthOnly ? 0 : 1;
+    cb.pAttachments = desc.depthOnly ? nullptr : &blendAtt;
 
     VkPipelineDepthStencilStateCreateInfo ds{
         VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -109,8 +117,9 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     VkFormat colorFormat = ToVk(desc.colorFormat);
     VkPipelineRenderingCreateInfo rendering{
         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &colorFormat;
+    // Depth-only pass: no color attachment format, only the D32 depth target.
+    rendering.colorAttachmentCount = desc.depthOnly ? 0 : 1;
+    rendering.pColorAttachmentFormats = desc.depthOnly ? nullptr : &colorFormat;
     rendering.depthAttachmentFormat = ToVk(desc.depthFormat);
 
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};

@@ -37,8 +37,18 @@ int main() {
             }
         }  // rt destroyed here (frees its descriptor set) before WaitIdle.
 
-        // Exercise the per-frame UBO copy path (112-byte FrameData-sized payload).
-        float dummy[28] = {0};
+        // Exercise the depth-only shadow map create + frame-set wiring path.
+        {
+            auto sm = device->CreateShadowMap(256);
+            if (!sm) {
+                std::fprintf(stderr, "CreateShadowMap returned null\n");
+                return 1;
+            }
+            device->SetShadowMap(*sm);
+        }  // sm destroyed here before WaitIdle.
+
+        // Exercise the per-frame UBO copy path (288-byte FrameData-sized payload).
+        float dummy[72] = {0};
         device->SetFrameUniforms(dummy, sizeof(dummy));
 
         device->WaitIdle();
