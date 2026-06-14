@@ -111,6 +111,12 @@ float4 main(PSInput i) : SV_Target {
 
     float3 c = Fxaa(i.uv, texel);              // anti-alias base scene (linear/HDR-ish)
 
+    // Exposure: lift the linear scene before tonemapping. PBR's energy-conserving
+    // BRDF (diffuse/PI, Fresnel) is darker than ad-hoc Blinn-Phong, so a modest
+    // exposure restores punch; ACES then rolls off the highlights.
+    const float kExposure = 1.7;
+    c *= kExposure;
+
     const float glowStrength = 0.65;
     float3 glow = Glow(i.uv, texel);
     c += glow * glowStrength;                  // add bloom before tonemapping
