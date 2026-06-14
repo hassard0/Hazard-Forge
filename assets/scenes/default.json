@@ -1,0 +1,102 @@
+[
+  {
+    "mesh": "plane",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.8,
+    "position": [0, 0, 0],
+    "euler": [0, 0, 0],
+    "scale": [6, 1, 6]
+  },
+  {
+    "mesh": "sphere",
+    "baseColor": "checker",
+    "normalMap": "flat_normal",
+    "metallic": 1,
+    "roughness": 0.15,
+    "position": [-1.8, 0.55, -1.8],
+    "euler": [0, 0, 0],
+    "scale": [0.55, 0.55, 0.55]
+  },
+  {
+    "mesh": "cube",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [-1.8, 0.6, 0],
+    "euler": [0, -0.5, 0],
+    "scale": [0.5, 0.5, 0.5]
+  },
+  {
+    "mesh": "cube",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [-1.8, 0.6, 1.8],
+    "euler": [0, 0, 0],
+    "scale": [0.5, 0.5, 0.5]
+  },
+  {
+    "mesh": "cube",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [0, 0.6, -1.8],
+    "euler": [0, -0.5, 0],
+    "scale": [0.5, 0.5, 0.5]
+  },
+  {
+    "mesh": "cube",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [0, 0.6, 1.8],
+    "euler": [0, 0.5, 0],
+    "scale": [0.5, 0.5, 0.5]
+  },
+  {
+    "mesh": "cube",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [1.8, 0.6, -1.8],
+    "euler": [0, 0, 0],
+    "scale": [0.5, 0.5, 0.5]
+  },
+  {
+    "mesh": "cube",
+    "baseColor": "checker",
+    "normalMap": "normalmap",
+    "metallic": 0,
+    "roughness": 0.5,
+    "position": [1.8, 0.6, 0],
+    "euler": [0, 0.5, 0],
+    "scale": [0.5, 0.5, 0.5]
+  },
+  {
+    "mesh": "sphere",
+    "baseColor": "checker",
+    "normalMap": "flat_normal",
+    "metallic": 1,
+    "roughness": 0.15,
+    "position": [1.8, 0.55, 1.8],
+    "euler": [0, 0, 0],
+    "scale": [0.55, 0.55, 0.55]
+  },
+  {
+    "mesh": "duck",
+    "baseColor": "duck_basecolor",
+    "normalMap": "flat_normal",
+    "metallic": 0,
+    "roughness": 1,
+    "position": [0, 1.35, 0],
+    "euler": [0, 2.3, 0],
+    "scale": [0.022, 0.022, 0.022]
+  }
+]

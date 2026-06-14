@@ -13,3 +13,7 @@ add_test(NAME render_graph_test COMMAND render_graph_test)
 add_executable(ecs_test ecs_test.cpp)
 target_link_libraries(ecs_test PRIVATE hf_engine)
 add_test(NAME ecs_test COMMAND ecs_test)
+
+add_executable(scene_io_test scene_io_test.cpp)
+target_link_libraries(scene_io_test PRIVATE hf_engine)
+add_test(NAME scene_io_test COMMAND scene_io_test)

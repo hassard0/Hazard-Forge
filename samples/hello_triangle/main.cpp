@@ -7,6 +7,7 @@
 #include "scene/transform.h"
 #include "scene/renderable.h"
 #include "scene/components.h"
+#include "scene/scene_io.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "render/render_graph.h"
@@ -150,11 +151,15 @@ int main(int argc, char** argv) {
     using namespace hf;
 
     // --shot <path>: render one frame headless, write a BMP, and exit (no present loop).
+    // --dump-scene: load the scene from data, print DumpScene(...) JSON to stdout, exit 0 (headless,
+    //               no render — lets an agent inspect the machine-readable scene state).
     const char* shotPath = nullptr;
+    bool dumpScene = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
-            break;
+        } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
+            dumpScene = true;
         }
     }
     try {
@@ -347,66 +352,38 @@ int main(int argc, char** argv) {
         hf::asset::GltfModel duckModel = hf::asset::LoadGltfModel(*device, HF_MODEL_PATH);
         scene::Mesh& duck = duckModel.mesh;
 
-        // Build the scene as ECS entities: a large ground plane + a 3x3 grid of lit cubes/spheres
-        // + the glTF duck. Each drawable is an entity with TransformC + MeshC + MaterialC — the
-        // SAME data the old scene::Renderable vector held. Entities are created in the SAME order
-        // as the previous vector (plane, then the grid in gx/gz order, then the duck) and views
+        // The scene is now DATA: register the named GPU resources the scene file refers to, then
+        // LoadScene parses assets/scenes/default.json and creates one ECS entity per object IN FILE
+        // ORDER (TransformC + MeshC + MaterialC resolved by name). The default scene reproduces the
+        // old hardcoded scene exactly (plane, the 3x3 grid in gx/gz order, then the duck), and views
         // iterate the pools in dense (creation) order, so the draw order is byte-identical.
+        scene::SceneResources resources;
+        resources.AddMesh("cube", &cube);
+        resources.AddMesh("plane", &plane);
+        resources.AddMesh("sphere", &sphere);
+        resources.AddMesh("duck", &duck);
+        resources.AddTexture("checker", texture.get());
+        resources.AddTexture("normalmap", bumpNormal.get());
+        resources.AddTexture("duck_basecolor", duckModel.baseColor.get());
+        resources.AddTexture("flat_normal", flatNormal.get());
+
         ecs::Registry registry;
-        std::vector<ecs::Entity> cubeSpinEntities;  // grid entities that spin in the interactive loop
-        auto addObject = [&](scene::Mesh* mesh, const scene::Transform& t, rhi::ITexture* base,
-                             rhi::ITexture* normal, float metallic, float roughness) {
-            ecs::Entity e = registry.create();
-            registry.add<scene::TransformC>(e, {t});
-            registry.add<scene::MeshC>(e, {mesh});
-            registry.add<scene::MaterialC>(e, {base, normal, metallic, roughness});
-            return e;
-        };
-        {
-            scene::Transform planeT;
-            planeT.position = {0.0f, 0.0f, 0.0f};
-            planeT.scale = {6.0f, 1.0f, 6.0f};
-            // Ground plane: rough dielectric, bumped by the procedural normal map.
-            addObject(&plane, planeT, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.8f);
+        std::vector<ecs::Entity> sceneEntities =
+            scene::LoadScene(registry, resources, HF_SCENE_PATH);
 
-            for (int gx = -1; gx <= 1; ++gx) {
-                for (int gz = -1; gz <= 1; ++gz) {
-                    // Centre cell is reserved for the glTF model (added below); skip it.
-                    if (gx == 0 && gz == 0) continue;
-                    // Replace the three cells on the main diagonal with spheres so
-                    // the scene shows smooth curved geometry alongside the cubes.
-                    bool useSphere = (gx == gz);
-                    scene::Transform t;
-                    ecs::Entity e;
-                    if (useSphere) {
-                        t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
-                        t.scale = {0.55f, 0.55f, 0.55f};
-                        // Shiny metal spheres: keep a flat (smooth) normal.
-                        e = addObject(&sphere, t, texture.get(), flatNormal.get(), /*metallic*/ 1.0f, /*roughness*/ 0.15f);
-                    } else {
-                        t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
-                        t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
-                        t.scale = {0.5f, 0.5f, 0.5f};
-                        // Matte dielectric cubes: bumped by the procedural normal map.
-                        e = addObject(&cube, t, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.5f);
-                    }
-                    cubeSpinEntities.push_back(e);  // every grid object spins (matches old index>=1)
-                }
-            }
-
-            // The glTF model as the centrepiece: a textured rubber Duck. The loader recentred it
-            // on the origin (~165 model units across); a modest scale sits it nicely among the
-            // cubes. Material comes from the glTF: dielectric (metallic ~0), so it reads as a
-            // lit/shadowed textured duck rather than chrome. Base-color texture from the asset.
-            scene::Transform duckT;
-            duckT.position = {0.0f, 1.35f, 0.0f};
-            duckT.eulerRadians = {0.0f, 2.3f, 0.0f};  // turn the bill toward the camera
-            duckT.scale = {0.022f, 0.022f, 0.022f};
-            float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
-            ecs::Entity duckE = addObject(&duck, duckT, duckModel.baseColor.get(), flatNormal.get(),
-                                          duckModel.metallic, duckRough);
-            cubeSpinEntities.push_back(duckE);  // the duck also spun in the old loop (index>=1)
+        // --dump-scene: print the machine-readable scene state and exit (no render).
+        if (dumpScene) {
+            std::string json = scene::DumpScene(registry, resources);
+            std::fputs(json.c_str(), stdout);
+            device->WaitIdle();
+            return 0;
         }
+
+        // Grid + duck entities spin in the interactive loop (the ground plane, file index 0, does
+        // not — mirroring the old "skip index 0" behaviour).
+        std::vector<ecs::Entity> cubeSpinEntities;
+        for (size_t i = 1; i < sceneEntities.size(); ++i)
+            cubeSpinEntities.push_back(sceneEntities[i]);
 
         using math::Mat4;
         using math::Vec3;

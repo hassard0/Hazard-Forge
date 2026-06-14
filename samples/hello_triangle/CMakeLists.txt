@@ -23,3 +23,6 @@ target_compile_definitions(hello_triangle PRIVATE
 # Absolute path to the glTF showcase model, baked at configure time (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/Duck.glb\"")
+# Absolute path to the default data-driven scene description (repo asset).
+target_compile_definitions(hello_triangle PRIVATE
+  "HF_SCENE_PATH=\"${CMAKE_SOURCE_DIR}/assets/scenes/default.json\"")

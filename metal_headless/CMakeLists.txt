@@ -96,6 +96,8 @@ add_executable(visual_test
     ${HF_ROOT}/engine/render/render_graph.cpp
     # Scene layer (plain C++): builds Mesh::Cube / Mesh::Plane through the RHI.
     ${HF_ROOT}/engine/scene/mesh.cpp
+    # Data-driven scene load/dump (plain C++, vendored single-header JSON parser).
+    ${HF_ROOT}/engine/scene/scene_io.cpp
     # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.
     ${HF_ROOT}/engine/asset/gltf_loader.cpp
 )
@@ -119,6 +121,7 @@ target_compile_definitions(visual_test PRIVATE
     HF_SHADER_DIR="${HF_ROOT}/shaders"
     HF_GEN_SHADER_DIR="${HF_GEN_SHADER_DIR}"
     HF_MODEL_PATH="${HF_ROOT}/assets/models/Duck.glb"
+    HF_SCENE_PATH="${HF_ROOT}/assets/scenes/default.json"
 )
 
 target_link_libraries(visual_test PRIVATE

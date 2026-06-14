@@ -31,6 +31,7 @@
 #include "scene/transform.h"
 #include "scene/renderable.h"
 #include "scene/components.h"
+#include "scene/scene_io.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "render/render_graph.h"
@@ -336,61 +337,26 @@ int main(int argc, char** argv) {
             hf::asset::GltfModel duckModel = hf::asset::LoadGltfModel(*device, HF_MODEL_PATH);
             scene::Mesh& duck = duckModel.mesh;
 
-            // ---- Build the scene: a rough-dielectric ground plane + a 3x3 grid mixing shiny metal
-            // spheres (on the main diagonal) with matte dielectric cubes — the canonical PBR
-            // material showcase, matching the Vulkan hello_triangle scene so both backends render
-            // the same material variety (metal spheres next to dielectric cubes). ----
-            // The scene is expressed as ECS entities: each drawable is an entity with TransformC +
-            // MeshC + MaterialC — the SAME data the old scene::Renderable vector held. Entities are
-            // created in the SAME order as the previous vector (plane, then the grid in gx/gz order,
-            // then the duck); the render-graph passes query view<TransformC, MeshC, MaterialC>(),
-            // which iterates the pools in dense (creation) order, so the draws are byte-identical
-            // (golden DIFF 0.0000).
+            // ---- The scene is now DATA: register the named GPU resources the scene file refers to,
+            // then LoadScene parses assets/scenes/default.json into the ECS. The default scene
+            // reproduces the old hardcoded scene exactly — a rough-dielectric ground plane + a 3x3
+            // grid mixing shiny metal spheres (main diagonal) with matte dielectric cubes + the
+            // glTF duck — created IN FILE ORDER (plane, the grid in gx/gz order, then the duck).
+            // The render-graph passes query view<TransformC, MeshC, MaterialC>(), which iterates the
+            // pools in dense (creation) order, so the draws are byte-identical (golden DIFF 0.0000)
+            // and match the Vulkan sample, which loads the SAME scene file. ----
+            scene::SceneResources resources;
+            resources.AddMesh("cube", &cube);
+            resources.AddMesh("plane", &plane);
+            resources.AddMesh("sphere", &sphere);
+            resources.AddMesh("duck", &duck);
+            resources.AddTexture("checker", texture.get());
+            resources.AddTexture("normalmap", bumpNormal.get());
+            resources.AddTexture("duck_basecolor", duckModel.baseColor.get());
+            resources.AddTexture("flat_normal", flatNormal.get());
+
             ecs::Registry registry;
-            auto addObject = [&](scene::Mesh* mesh, const scene::Transform& t, rhi::ITexture* base,
-                                 rhi::ITexture* normal, float metallic, float roughness) {
-                ecs::Entity e = registry.create();
-                registry.add<scene::TransformC>(e, {t});
-                registry.add<scene::MeshC>(e, {mesh});
-                registry.add<scene::MaterialC>(e, {base, normal, metallic, roughness});
-            };
-            {
-                scene::Transform planeT;
-                planeT.position = {0.0f, 0.0f, 0.0f};
-                planeT.scale = {6.0f, 1.0f, 6.0f};
-                addObject(&plane, planeT, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.8f);
-
-                for (int gx = -1; gx <= 1; ++gx)
-                    for (int gz = -1; gz <= 1; ++gz) {
-                        // Centre cell is reserved for the glTF model (added below); skip it.
-                        if (gx == 0 && gz == 0) continue;
-                        bool useSphere = (gx == gz);
-                        scene::Transform t;
-                        if (useSphere) {
-                            t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
-                            t.scale = {0.55f, 0.55f, 0.55f};
-                            // Shiny metal spheres: keep a flat (smooth) normal.
-                            addObject(&sphere, t, texture.get(), flatNormal.get(), /*metallic*/ 1.0f, /*roughness*/ 0.15f);
-                        } else {
-                            t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
-                            t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
-                            t.scale = {0.5f, 0.5f, 0.5f};
-                            // Matte dielectric cubes: bumped by the procedural normal map.
-                            addObject(&cube, t, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.5f);
-                        }
-                    }
-
-                // The glTF model as the centrepiece: a textured rubber Duck. Material from the
-                // glTF (dielectric, base-color texture). Placement matches the Vulkan sample so
-                // both backends render the same scene.
-                scene::Transform duckT;
-                duckT.position = {0.0f, 1.35f, 0.0f};
-                duckT.eulerRadians = {0.0f, 2.3f, 0.0f};
-                duckT.scale = {0.022f, 0.022f, 0.022f};
-                float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
-                addObject(&duck, duckT, duckModel.baseColor.get(), flatNormal.get(),
-                          duckModel.metallic, duckRough);
-            }
+            scene::LoadScene(registry, resources, HF_SCENE_PATH);
 
             // ---- Frame uniforms: same camera + light as the Vulkan Slice-F sample. ----
             using math::Mat4; using math::Vec3;

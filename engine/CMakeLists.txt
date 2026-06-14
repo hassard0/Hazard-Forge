@@ -5,6 +5,7 @@ set(HF_ENGINE_COMMON_SOURCES
   rhi/rhi_factory.cpp
   render/render_graph.cpp
   scene/mesh.cpp
+  scene/scene_io.cpp
   asset/gltf_loader.cpp
 )
 
