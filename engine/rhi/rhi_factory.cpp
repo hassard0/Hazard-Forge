@@ -1,2 +1,2 @@
-// Temporary stub — replaced in Task 9.
+#include "rhi/rhi.h"
 namespace hf::rhi { void _link_placeholder() {} }
