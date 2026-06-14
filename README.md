@@ -2,7 +2,7 @@
 
 A C++20 cross-platform game engine built around a thin, explicit **Rendering Hardware Interface (RHI) seam** that renders natively on **Vulkan (Windows)** and **Apple Metal (macOS, Apple Silicon)** from one codebase. The design is Apple-native and Metal-first in philosophy, with Vulkan as the primary shipping platform while Metal parity is being completed.
 
-> **Status:** Active development — in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a multi-pass lit scene on a Vulkan RTX GPU (Windows) and Apple Metal (M4, macOS), verified by deterministic golden-image regression tests. Approximately 10 feature slices have shipped.
+> **Status:** Active development — in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a multi-pass lit scene on a Vulkan RTX GPU (Windows) and Apple Metal (M4, macOS), verified by deterministic golden-image regression tests. Approximately 14 feature slices have shipped, and the Metal backend has reached parity on offscreen render targets, post-processing, and directional shadow mapping.
 
 ---
 
@@ -30,7 +30,7 @@ The central bet: **one engine layer above a clean seam, two GPU backends below i
 - **Procedural skybox** — gradient sky + sun disk drawn first in the scene pass via camera-ray reconstruction from the per-frame UBO. No matrix inverse; no extra textures.
 - **Headless GPU capture** — `CaptureNextFrame()` / `GetCapturedPixels()`: renders a frame, reads pixels back from the GPU, and writes a BMP. No visible desktop required. The primary verification and regression-testing path.
 
-**Metal status:** The Metal backend implements rendering through the scene layer (Slice F parity — lit multi-object scene, headless, golden tested). Offscreen render targets, shadow mapping, and the skybox/post pipeline are not yet implemented on Metal (those methods throw). Metal parity is the next major work stream.
+**Metal status:** The Metal backend renders the full multi-object scene headless on Apple Silicon (M4), golden-tested, and has reached parity on **offscreen render targets**, **post-processing** (ACES tonemap + vignette), and **directional shadow mapping (PCF)** — each verified against a committed M4 golden at `DIFF 0.0000`. Remaining gaps: the skybox and point-light passes (sample-level, not yet wired into the Metal entry point) and a unified HLSL→MSL shader toolchain (Metal currently uses hand-written MSL alongside the HLSL).
 
 ---
 
