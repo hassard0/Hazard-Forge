@@ -7,7 +7,7 @@ namespace hf::rhi::mtl {
 
 MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& desc)
     : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
-      fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly) {
+      fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly), pointList_(desc.pointList) {
     id<MTLDevice> dev = device.device();
 
     auto* vs = static_cast<MetalShaderModule*>(desc.vertex);
@@ -39,6 +39,16 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
     rpd.vertexDescriptor = vd;
     if (!desc.depthOnly) {
         rpd.colorAttachments[0].pixelFormat = ToMetalPixelFormat(desc.colorFormat);
+        if (desc.additiveBlend) {
+            // src*1 + dst*1: glowing particles accumulate over the scene (mirrors Vulkan).
+            rpd.colorAttachments[0].blendingEnabled = YES;
+            rpd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            rpd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+            rpd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+            rpd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOne;
+            rpd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+            rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOne;
+        }
     }
     if (desc.depthTest || desc.depthOnly) {
         rpd.depthAttachmentPixelFormat = ToMetalPixelFormat(desc.depthFormat);

@@ -28,6 +28,12 @@ public:
     void PushConstants(const void* data, uint32_t size) override;
     void EndRenderPass() override;
 
+    void BindComputePipeline(IComputePipeline& pipeline) override;
+    void BindStorageBuffer(IBuffer& buffer, uint32_t index) override;
+    void ComputePushConstants(const void* data, uint32_t size) override;
+    void DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) override;
+    void ComputeToVertexBarrier() override;
+
     id<MTLRenderCommandEncoder> encoder() const { return encoder_; }
 
 private:
@@ -36,8 +42,11 @@ private:
     id<MTLTexture>             colorTex_ = nil;
     id<MTLTexture>             depthTex_ = nil;
     id<MTLRenderCommandEncoder> encoder_ = nil;
+    id<MTLComputeCommandEncoder> computeEncoder_ = nil;  // open between BindComputePipeline..Dispatch
     id<MTLBuffer>              indexBuffer_ = nil;  // stored by BindIndexBuffer; used by DrawIndexed
     bool boundFrameUniforms_ = false;  // current pipeline declares the per-frame UBO
+    bool boundPointList_ = false;      // current graphics pipeline draws points (particles)
+    uint32_t computeThreadsPerGroup_ = 64;  // [numthreads(64,1,1)] in particles.comp.hlsl
     uint32_t width_ = 0;
     uint32_t height_ = 0;
 };

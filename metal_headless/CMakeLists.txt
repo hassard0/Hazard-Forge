@@ -45,6 +45,9 @@ function(hf_gen_msl base src stage entry)
   if(stage STREQUAL "vert")
     set(glslc_stage "vert")
     set(sc_stage "vert")
+  elseif(stage STREQUAL "comp")
+    set(glslc_stage "compute")  # glslc compute stage flag
+    set(sc_stage "comp")        # spirv-cross --rename-entry-point execution model
   else()
     set(glslc_stage "frag")
     set(sc_stage "frag")
@@ -69,6 +72,10 @@ hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
 hf_gen_msl(sky.vert    sky.vert.hlsl    vert sky_vertex)
 hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)
+# GPU particle system: compute kernel + point-sprite vertex/fragment.
+hf_gen_msl(particles.comp particles.comp.hlsl comp particles_main)
+hf_gen_msl(particle.vert   particle.vert.hlsl  vert particle_vertex)
+hf_gen_msl(particle.frag   particle.frag.hlsl  frag particle_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 
@@ -79,6 +86,7 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_swapchain.mm
     ${HF_ROOT}/engine/rhi_metal/metal_command_buffer.mm
     ${HF_ROOT}/engine/rhi_metal/metal_pipeline.mm
+    ${HF_ROOT}/engine/rhi_metal/metal_compute_pipeline.mm
     ${HF_ROOT}/engine/rhi_metal/metal_texture.mm
     ${HF_ROOT}/engine/rhi_metal/metal_render_target.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader.mm

@@ -41,6 +41,14 @@ PCF shadow sampling.
 > deferred. One shared loader feeds both backends; two Metal runs diff to `0.0000`, and Vulkan
 > renders the same model identically.
 
+> **Re-bake (GPU particles):** re-baked again when the compute-shader GPU particle system landed
+> (`shaders/particles.comp.hlsl` + `particle.vert/frag.hlsl`). A compute kernel animates a 50k-particle
+> storage buffer each frame (gravity + swirl fountain, deterministic respawn from a stable per-index
+> seed), and the particles are drawn as **additive points** over the scene. `visual_test` advances the
+> sim a fixed 100 steps at a fixed `dt` before the captured frame, so the fountain is golden-stable —
+> two Metal runs diff to `0.0000`. The compute MSL is generated from the shared HLSL exactly like the
+> graphics shaders (HLSL → SPIR-V → `kernel` MSL via spirv-cross); Vulkan renders the same fountain.
+
 ## Shaders are generated, not hand-written
 
 The Metal shaders are **generated from the shared HLSL sources** at build time — there is no

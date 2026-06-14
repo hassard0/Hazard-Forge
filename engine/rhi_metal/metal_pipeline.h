@@ -19,6 +19,7 @@ public:
     bool usesTexture() const { return usesTexture_; }
     bool fullscreen() const { return fullscreen_; }
     bool depthOnly() const { return depthOnly_; }
+    bool pointList() const { return pointList_; }
 
 private:
     id<MTLRenderPipelineState> pipelineState_ = nil;
@@ -27,6 +28,7 @@ private:
     bool usesTexture_       = false;
     bool fullscreen_        = false;
     bool depthOnly_         = false;
+    bool pointList_         = false;
 };
 
 } // namespace hf::rhi::mtl

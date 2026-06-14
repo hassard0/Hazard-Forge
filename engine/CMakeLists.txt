@@ -15,6 +15,7 @@ if(APPLE)
     rhi_metal/metal_swapchain.mm
     rhi_metal/metal_shader.mm
     rhi_metal/metal_pipeline.mm
+    rhi_metal/metal_compute_pipeline.mm
     rhi_metal/metal_buffer.mm
     rhi_metal/metal_command_buffer.mm
     rhi_metal/metal_texture.mm

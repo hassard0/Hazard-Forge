@@ -1,6 +1,7 @@
 #include "rhi_metal/metal_command_buffer.h"
 #include "rhi_metal/metal_device.h"
 #include "rhi_metal/metal_pipeline.h"
+#include "rhi_metal/metal_compute_pipeline.h"
 #include "rhi_metal/metal_buffer.h"
 #include "rhi_metal/metal_texture.h"
 #include "rhi_metal/metal_sampled.h"
@@ -19,8 +20,10 @@ void MetalCommandBuffer::Begin(id<MTLCommandBuffer> cmd, id<MTLTexture> colorTex
     width_ = width;
     height_ = height;
     encoder_ = nil;
+    computeEncoder_ = nil;
     indexBuffer_ = nil;
     boundFrameUniforms_ = false;
+    boundPointList_ = false;
 }
 
 void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear) {
@@ -58,6 +61,7 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
     [encoder_ setRenderPipelineState:p.pipelineState()];
     [encoder_ setDepthStencilState:p.depthState()];
     boundFrameUniforms_ = p.usesFrameUniforms();
+    boundPointList_ = p.pointList();
 
     // Fullscreen post pass: the [[vertex_id]]-generated triangle's winding depends on the clip
     // convention; disable culling so it is never back-face culled to black (mirrors Vulkan, which
@@ -108,9 +112,9 @@ void MetalCommandBuffer::BindTexture(ITexture& texture) {
 }
 
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
-    [encoder_ drawPrimitives:MTLPrimitiveTypeTriangle
-                 vertexStart:firstVertex
-                 vertexCount:vertexCount];
+    // Point list (GPU particles) vs the default triangle list (geometry / fullscreen tris).
+    MTLPrimitiveType prim = boundPointList_ ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle;
+    [encoder_ drawPrimitives:prim vertexStart:firstVertex vertexCount:vertexCount];
 }
 
 void MetalCommandBuffer::DrawIndexed(uint32_t indexCount, uint32_t firstIndex) {
@@ -131,6 +135,47 @@ void MetalCommandBuffer::PushConstants(const void* data, uint32_t size) {
 void MetalCommandBuffer::EndRenderPass() {
     [encoder_ endEncoding];
     encoder_ = nil;
+}
+
+// --- Compute recording. Metal forbids an open compute encoder and render encoder simultaneously,
+// so the compute encoder is opened on BindComputePipeline and closed on ComputeToVertexBarrier
+// (before BeginRenderPass opens the render encoder). Metal auto-tracks the hazard between the
+// compute encoder's storage-buffer writes and the render encoder's vertex reads of the same buffer,
+// so no explicit barrier object is needed — closing the encoder is the ordering point. ---
+
+void MetalCommandBuffer::BindComputePipeline(IComputePipeline& pipeline) {
+    auto& p = static_cast<MetalComputePipeline&>(pipeline);
+    if (!computeEncoder_) {
+        computeEncoder_ = [cmd_ computeCommandEncoder];
+        if (!computeEncoder_) Fail("computeCommandEncoder failed");
+    }
+    [computeEncoder_ setComputePipelineState:p.state()];
+}
+
+void MetalCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {
+    auto& b = static_cast<MetalBuffer&>(buffer);
+    // Storage buffers bind at kCsStorage + index (the particle SSBO is at buffer(0)).
+    [computeEncoder_ setBuffer:b.handle() offset:0 atIndex:kCsStorage + index];
+}
+
+void MetalCommandBuffer::ComputePushConstants(const void* data, uint32_t size) {
+    // Compute params (dt/time/count) -> inline setBytes at the params buffer slot.
+    [computeEncoder_ setBytes:data length:size atIndex:kCsPushConst];
+}
+
+void MetalCommandBuffer::DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) {
+    MTLSize groups = MTLSizeMake(groupsX, groupsY, groupsZ);
+    MTLSize perGroup = MTLSizeMake(computeThreadsPerGroup_, 1, 1);  // [numthreads(64,1,1)]
+    [computeEncoder_ dispatchThreadgroups:groups threadsPerThreadgroup:perGroup];
+}
+
+void MetalCommandBuffer::ComputeToVertexBarrier() {
+    // Close the compute encoder; the next render encoder (BeginRenderPass) reads the written buffer,
+    // and Metal's automatic hazard tracking orders the dependency across encoders.
+    if (computeEncoder_) {
+        [computeEncoder_ endEncoding];
+        computeEncoder_ = nil;
+    }
 }
 
 } // namespace hf::rhi::mtl

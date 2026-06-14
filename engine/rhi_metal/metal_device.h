@@ -36,6 +36,7 @@ public:
     // CreateShaderModuleMSL() below; this throws to make the misuse loud.
     std::unique_ptr<IShaderModule> CreateShaderModule(const ShaderModuleDesc&) override;
     std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) override;
+    std::unique_ptr<IComputePipeline> CreateComputePipeline(const ComputePipelineDesc&) override;
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
 

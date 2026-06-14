@@ -31,6 +31,12 @@ constexpr uint32_t kFragSampler   = 1;
 constexpr uint32_t kFragShadowTex = 1;
 constexpr uint32_t kFragShadowSmp = 2;
 
+// Compute (kernel) binding indices. The particle compute MSL is generated from particles.comp.hlsl
+// via spirv-cross --msl-decoration-binding: the storage buffer (binding 0) -> buffer(0), and the
+// HF_MSL_GEN params cbuffer (binding 1) -> buffer(1).
+constexpr uint32_t kCsStorage   = 0;  // RWStructuredBuffer (particle SSBO)
+constexpr uint32_t kCsPushConst = 1;  // params cbuffer (dt/time/count)
+
 // Map an RHI vertex-attribute / color / depth format to a Metal pixel/vertex format.
 inline MTLPixelFormat ToMetalPixelFormat(Format f) {
     switch (f) {

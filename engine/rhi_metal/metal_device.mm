@@ -2,6 +2,7 @@
 #include "rhi_metal/metal_command_buffer.h"
 #include "rhi_metal/metal_shader.h"
 #include "rhi_metal/metal_pipeline.h"
+#include "rhi_metal/metal_compute_pipeline.h"
 #include "rhi_metal/metal_buffer.h"
 #include "rhi_metal/metal_texture.h"
 #include "rhi_metal/metal_render_target.h"
@@ -62,6 +63,10 @@ MetalDevice::CreateShaderModuleMSL(const std::string& source, const std::string&
 
 std::unique_ptr<IPipeline> MetalDevice::CreateGraphicsPipeline(const GraphicsPipelineDesc& d) {
     return std::make_unique<MetalPipeline>(*this, d);
+}
+
+std::unique_ptr<IComputePipeline> MetalDevice::CreateComputePipeline(const ComputePipelineDesc& d) {
+    return std::make_unique<MetalComputePipeline>(*this, d);
 }
 
 std::unique_ptr<IBuffer> MetalDevice::CreateBuffer(const BufferDesc& d) {

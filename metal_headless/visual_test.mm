@@ -204,6 +204,67 @@ int main(int argc, char** argv) {
             skyDesc.fullscreen = true;           // 3 verts from [[vertex_id]]; no vertex input
             auto skyPipeline = device->CreateGraphicsPipeline(skyDesc);
 
+            // ---- GPU particle system: a compute kernel (generated from particles.comp.hlsl)
+            // animates a storage buffer of 50k particles each frame; particle.vert/frag draw them
+            // as additive points over the scene. Mirrors the Vulkan hello_triangle integration. ----
+            constexpr uint32_t kParticleCount = 50000;
+            constexpr uint32_t kParticleStride = 32;  // { float4 posLife; float4 velSeed; }
+            struct GpuParticle { float posLife[4]; float velSeed[4]; };
+            static_assert(sizeof(GpuParticle) == kParticleStride, "particle stride");
+
+            std::vector<GpuParticle> initParticles(kParticleCount);
+            for (uint32_t i = 0; i < kParticleCount; ++i) {
+                float s = (float)i / (float)kParticleCount;
+                float a = s * 6.2831853f;
+                float r = 0.25f * (0.5f + 0.5f * std::sin(s * 12.9898f));
+                initParticles[i].posLife[0] = std::cos(a) * r;
+                initParticles[i].posLife[1] = 0.05f + 2.0f * s;
+                initParticles[i].posLife[2] = std::sin(a) * r;
+                initParticles[i].posLife[3] = 0.5f + 3.5f * s;
+                float outR = 0.5f + 2.8f * std::fabs(std::sin(s * 7.13f));
+                float aVel = s * 9.41f;
+                initParticles[i].velSeed[0] = std::cos(aVel) * outR;
+                initParticles[i].velSeed[1] = 3.5f + 3.5f * s;
+                initParticles[i].velSeed[2] = std::sin(aVel) * outR;
+                initParticles[i].velSeed[3] = s;
+            }
+            rhi::BufferDesc particleBufDesc;
+            particleBufDesc.size = (uint64_t)kParticleCount * kParticleStride;
+            particleBufDesc.initialData = initParticles.data();
+            particleBufDesc.usage = rhi::BufferUsage::Storage;
+            auto particleBuffer = device->CreateBuffer(particleBufDesc);
+
+            std::string partCsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/particles.comp.gen.metal");
+            auto partCs = rhi::mtl::MakeShaderModuleFromMSL(*device, partCsMsl, "particles_main");
+            rhi::ComputePipelineDesc cdesc;
+            cdesc.compute = partCs.get();
+            cdesc.storageBufferCount = 1;
+            cdesc.pushConstantSize = sizeof(float) * 2 + sizeof(uint32_t) * 2;
+            auto particleCompute = device->CreateComputePipeline(cdesc);
+
+            std::string partVsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/particle.vert.gen.metal");
+            std::string partFsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/particle.frag.gen.metal");
+            auto partVs = rhi::mtl::MakeShaderModuleFromMSL(*device, partVsMsl, "particle_vertex");
+            auto partFs = rhi::mtl::MakeShaderModuleFromMSL(*device, partFsMsl, "particle_fragment");
+            rhi::GraphicsPipelineDesc partDesc;
+            partDesc.vertex = partVs.get();
+            partDesc.fragment = partFs.get();
+            partDesc.vertexLayout.stride = kParticleStride;
+            partDesc.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {1, rhi::Format::RGB32_Float, 16},
+            };
+            partDesc.colorFormat = device->Swapchain().ColorFormat();
+            partDesc.depthTest = false;
+            partDesc.usesFrameUniforms = true;
+            partDesc.usesTexture = false;
+            partDesc.pointList = true;
+            partDesc.additiveBlend = true;
+            auto particlePipeline = device->CreateGraphicsPipeline(partDesc);
+
+            struct ParticleParams { float dt; float time; uint32_t count; uint32_t pad; };
+            const uint32_t kParticleGroups = (kParticleCount + 63) / 64;
+
             // ---- Offscreen render target (scene -> RT -> post -> output), at output size. ----
             auto rt = device->CreateRenderTarget(W, H);
 
@@ -348,6 +409,16 @@ int main(int argc, char** argv) {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 if (!rtc.cmd) return fail("BeginRenderTargetFrame returned no command buffer");
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
+                // Compute: advance the GPU particle sim a fixed number of deterministic steps so the
+                // fountain has developed by the captured frame (golden-stable: fixed dt + step count).
+                for (int step = 0; step < 100; ++step) {
+                    ParticleParams pp{1.0f / 60.0f, step / 60.0f, kParticleCount, 0};
+                    rtc.cmd->BindComputePipeline(*particleCompute);
+                    rtc.cmd->BindStorageBuffer(*particleBuffer, 0);
+                    rtc.cmd->ComputePushConstants(&pp, sizeof(pp));
+                    rtc.cmd->DispatchCompute(kParticleGroups);
+                    rtc.cmd->ComputeToVertexBarrier();
+                }
                 rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
                 // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
                 // Mirrors the Vulkan sample so the Metal background shows the gradient sky.
@@ -366,6 +437,10 @@ int main(int argc, char** argv) {
                     rtc.cmd->BindIndexBuffer(r.mesh->indices());
                     rtc.cmd->DrawIndexed(r.mesh->indexCount());
                 }
+                // Additive GPU particles over the scene.
+                rtc.cmd->BindPipeline(*particlePipeline);
+                rtc.cmd->BindVertexBuffer(*particleBuffer);
+                rtc.cmd->Draw(kParticleCount);
                 rtc.cmd->EndRenderPass();
                 device->EndRenderTargetFrame(rtc);
             }

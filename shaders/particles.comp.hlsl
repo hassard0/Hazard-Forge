@@ -11,11 +11,20 @@ struct Particle {
     float4 velSeed;
 };
 
-RWStructuredBuffer<Particle> gParticles : register(u0);
+// Storage buffer at binding 0. With spirv-cross --msl-decoration-binding this lands at Metal
+// buffer(0) for the compute kernel; on Vulkan/DXC it is the SSBO at descriptor binding 0.
+[[vk::binding(0, 0)]] RWStructuredBuffer<Particle> gParticles : register(u0);
 
-// Push constant: dt (seconds since last frame), time (absolute), particleCount, _pad.
+// Params: dt (seconds since last frame), time (absolute), particleCount, _pad.
+// DXC/Vulkan path: a real push constant. MSL-gen path: glslang ignores [[vk::push_constant]], so
+// declare an explicit cbuffer at binding 1 -> spirv-cross emits Metal buffer(1) (mirrors the
+// vertex shaders' HF_MSL_GEN trick; see lit.vert.hlsl).
 struct Params { float dt; float time; uint count; uint _pad; };
+#ifdef HF_MSL_GEN
+[[vk::binding(1, 0)]] cbuffer ParamsCB { Params gp; };
+#else
 [[vk::push_constant]] Params gp;
+#endif
 
 // Cheap hash -> [0,1).
 float hash11(float n) { return frac(sin(n) * 43758.5453123); }
