@@ -9,3 +9,7 @@ add_test(NAME math_test COMMAND math_test)
 add_executable(render_graph_test render_graph_test.cpp)
 target_link_libraries(render_graph_test PRIVATE hf_engine)
 add_test(NAME render_graph_test COMMAND render_graph_test)
+
+add_executable(ecs_test ecs_test.cpp)
+target_link_libraries(ecs_test PRIVATE hf_engine)
+add_test(NAME ecs_test COMMAND ecs_test)

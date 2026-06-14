@@ -6,6 +6,8 @@
 #include "scene/mesh.h"
 #include "scene/transform.h"
 #include "scene/renderable.h"
+#include "scene/components.h"
+#include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "render/render_graph.h"
 
@@ -345,15 +347,27 @@ int main(int argc, char** argv) {
         hf::asset::GltfModel duckModel = hf::asset::LoadGltfModel(*device, HF_MODEL_PATH);
         scene::Mesh& duck = duckModel.mesh;
 
-        // Build the scene: a large ground plane + a 3x3 grid of lit cubes.
-        std::vector<scene::Renderable> sceneObjects;
+        // Build the scene as ECS entities: a large ground plane + a 3x3 grid of lit cubes/spheres
+        // + the glTF duck. Each drawable is an entity with TransformC + MeshC + MaterialC — the
+        // SAME data the old scene::Renderable vector held. Entities are created in the SAME order
+        // as the previous vector (plane, then the grid in gx/gz order, then the duck) and views
+        // iterate the pools in dense (creation) order, so the draw order is byte-identical.
+        ecs::Registry registry;
+        std::vector<ecs::Entity> cubeSpinEntities;  // grid entities that spin in the interactive loop
+        auto addObject = [&](scene::Mesh* mesh, const scene::Transform& t, rhi::ITexture* base,
+                             rhi::ITexture* normal, float metallic, float roughness) {
+            ecs::Entity e = registry.create();
+            registry.add<scene::TransformC>(e, {t});
+            registry.add<scene::MeshC>(e, {mesh});
+            registry.add<scene::MaterialC>(e, {base, normal, metallic, roughness});
+            return e;
+        };
         {
             scene::Transform planeT;
             planeT.position = {0.0f, 0.0f, 0.0f};
             planeT.scale = {6.0f, 1.0f, 6.0f};
             // Ground plane: rough dielectric, bumped by the procedural normal map.
-            sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f,
-                                    bumpNormal.get()});
+            addObject(&plane, planeT, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.8f);
 
             for (int gx = -1; gx <= 1; ++gx) {
                 for (int gz = -1; gz <= 1; ++gz) {
@@ -363,20 +377,20 @@ int main(int argc, char** argv) {
                     // the scene shows smooth curved geometry alongside the cubes.
                     bool useSphere = (gx == gz);
                     scene::Transform t;
+                    ecs::Entity e;
                     if (useSphere) {
                         t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
                         t.scale = {0.55f, 0.55f, 0.55f};
                         // Shiny metal spheres: keep a flat (smooth) normal.
-                        sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f,
-                                                flatNormal.get()});
+                        e = addObject(&sphere, t, texture.get(), flatNormal.get(), /*metallic*/ 1.0f, /*roughness*/ 0.15f);
                     } else {
                         t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
                         t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
                         t.scale = {0.5f, 0.5f, 0.5f};
                         // Matte dielectric cubes: bumped by the procedural normal map.
-                        sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f,
-                                                bumpNormal.get()});
+                        e = addObject(&cube, t, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.5f);
                     }
+                    cubeSpinEntities.push_back(e);  // every grid object spins (matches old index>=1)
                 }
             }
 
@@ -389,8 +403,9 @@ int main(int argc, char** argv) {
             duckT.eulerRadians = {0.0f, 2.3f, 0.0f};  // turn the bill toward the camera
             duckT.scale = {0.022f, 0.022f, 0.022f};
             float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
-            sceneObjects.push_back({&duck, duckModel.baseColor.get(), duckT,
-                                    duckModel.metallic, duckRough, flatNormal.get()});
+            ecs::Entity duckE = addObject(&duck, duckT, duckModel.baseColor.get(), flatNormal.get(),
+                                          duckModel.metallic, duckRough);
+            cubeSpinEntities.push_back(duckE);  // the duck also spun in the old loop (index>=1)
         }
 
         using math::Mat4;
@@ -452,34 +467,38 @@ int main(int argc, char** argv) {
             return fd;
         };
 
-        // Record every renderable in the scene into the command buffer.
+        // Record every renderable in the scene into the command buffer. Queries the ECS:
+        // view<TransformC, MeshC, MaterialC>() yields each drawable entity in creation order,
+        // recording the identical draws the old Renderable loop did.
         auto drawScene = [&](rhi::ICommandBuffer* cmd) {
             cmd->BindPipeline(*pipeline);
-            for (scene::Renderable& r : sceneObjects) {
-                Mat4 m = r.transform.Matrix();
+            for (auto [e, tc, mc, mat] : registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
+                (void)e;
+                Mat4 m = tc.t.Matrix();
                 // Push { float4x4 model; float4 material(metallic,roughness,0,0) } = 80 bytes.
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
-                pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                pc[16] = mat.metallic; pc[17] = mat.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
                 cmd->PushConstants(pc, sizeof(pc));
                 // Bind base-color + normal map together (every renderable has a normal map: the
                 // procedural bump for dielectrics, the flat default for metals/duck).
-                cmd->BindMaterial(*r.texture, *r.normalMap);
-                cmd->BindVertexBuffer(r.mesh->vertices());
-                cmd->BindIndexBuffer(r.mesh->indices());
-                cmd->DrawIndexed(r.mesh->indexCount());
+                cmd->BindMaterial(*mat.base, *mat.normal);
+                cmd->BindVertexBuffer(mc.mesh->vertices());
+                cmd->BindIndexBuffer(mc.mesh->indices());
+                cmd->DrawIndexed(mc.mesh->indexCount());
             }
         };
 
         // Depth-only shadow draw: geometry only (no texture), light-space via the shadow pipeline.
         auto drawDepthOnly = [&](rhi::ICommandBuffer* cmd) {
             cmd->BindPipeline(*shadowPipeline);
-            for (scene::Renderable& r : sceneObjects) {
-                Mat4 m = r.transform.Matrix();
+            for (auto [e, tc, mc, mat] : registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
+                (void)e; (void)mat;
+                Mat4 m = tc.t.Matrix();
                 cmd->PushConstants(m.m, sizeof(float) * 16);
-                cmd->BindVertexBuffer(r.mesh->vertices());
-                cmd->BindIndexBuffer(r.mesh->indices());
-                cmd->DrawIndexed(r.mesh->indexCount());
+                cmd->BindVertexBuffer(mc.mesh->vertices());
+                cmd->BindIndexBuffer(mc.mesh->indices());
+                cmd->DrawIndexed(mc.mesh->indexCount());
             }
         };
 
@@ -561,11 +580,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // Capture each renderable's authored base yaw so the interactive loop can spin
-        // the cubes by adding elapsed time on top without drifting.
-        std::vector<float> baseYaw(sceneObjects.size());
-        for (size_t i = 0; i < sceneObjects.size(); ++i)
-            baseYaw[i] = sceneObjects[i].transform.eulerRadians.y;
+        // Capture each spinning entity's authored base yaw so the interactive loop can spin
+        // the cubes/duck by adding elapsed time on top without drifting. (The ground plane is
+        // excluded from cubeSpinEntities, mirroring the old "skip index 0" behaviour.)
+        std::vector<float> baseYaw(cubeSpinEntities.size());
+        for (size_t i = 0; i < cubeSpinEntities.size(); ++i)
+            baseYaw[i] = registry.get<scene::TransformC>(cubeSpinEntities[i]).t.eulerRadians.y;
 
         const auto start = std::chrono::steady_clock::now();
         float lastT = 0.0f;  // previous frame time, for the particle sim dt
@@ -590,9 +610,10 @@ int main(int argc, char** argv) {
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
             FrameData fd = makeFrameData(aspect, t);
 
-            // Spin each cube about its yaw over time (skip index 0: the ground plane).
-            for (size_t i = 1; i < sceneObjects.size(); ++i)
-                sceneObjects[i].transform.eulerRadians.y = baseYaw[i] + t;
+            // Spin each cube/duck about its yaw over time (the ground plane is not in the list).
+            // Query + mutate the TransformC of each spinning entity each frame.
+            for (size_t i = 0; i < cubeSpinEntities.size(); ++i)
+                registry.get<scene::TransformC>(cubeSpinEntities[i]).t.eulerRadians.y = baseYaw[i] + t;
 
             // Compute the particle sim dt up front; the scene pass closure consumes it.
             float dt = std::min(t - lastT, 1.0f / 30.0f);

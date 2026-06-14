@@ -30,6 +30,8 @@
 #include "scene/mesh.h"
 #include "scene/transform.h"
 #include "scene/renderable.h"
+#include "scene/components.h"
+#include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "render/render_graph.h"
 
@@ -338,13 +340,25 @@ int main(int argc, char** argv) {
             // spheres (on the main diagonal) with matte dielectric cubes — the canonical PBR
             // material showcase, matching the Vulkan hello_triangle scene so both backends render
             // the same material variety (metal spheres next to dielectric cubes). ----
-            std::vector<scene::Renderable> sceneObjects;
+            // The scene is expressed as ECS entities: each drawable is an entity with TransformC +
+            // MeshC + MaterialC — the SAME data the old scene::Renderable vector held. Entities are
+            // created in the SAME order as the previous vector (plane, then the grid in gx/gz order,
+            // then the duck); the render-graph passes query view<TransformC, MeshC, MaterialC>(),
+            // which iterates the pools in dense (creation) order, so the draws are byte-identical
+            // (golden DIFF 0.0000).
+            ecs::Registry registry;
+            auto addObject = [&](scene::Mesh* mesh, const scene::Transform& t, rhi::ITexture* base,
+                                 rhi::ITexture* normal, float metallic, float roughness) {
+                ecs::Entity e = registry.create();
+                registry.add<scene::TransformC>(e, {t});
+                registry.add<scene::MeshC>(e, {mesh});
+                registry.add<scene::MaterialC>(e, {base, normal, metallic, roughness});
+            };
             {
                 scene::Transform planeT;
                 planeT.position = {0.0f, 0.0f, 0.0f};
                 planeT.scale = {6.0f, 1.0f, 6.0f};
-                sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f,
-                                        bumpNormal.get()});
+                addObject(&plane, planeT, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.8f);
 
                 for (int gx = -1; gx <= 1; ++gx)
                     for (int gz = -1; gz <= 1; ++gz) {
@@ -356,15 +370,13 @@ int main(int argc, char** argv) {
                             t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
                             t.scale = {0.55f, 0.55f, 0.55f};
                             // Shiny metal spheres: keep a flat (smooth) normal.
-                            sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f,
-                                                    flatNormal.get()});
+                            addObject(&sphere, t, texture.get(), flatNormal.get(), /*metallic*/ 1.0f, /*roughness*/ 0.15f);
                         } else {
                             t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
                             t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
                             t.scale = {0.5f, 0.5f, 0.5f};
                             // Matte dielectric cubes: bumped by the procedural normal map.
-                            sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f,
-                                                    bumpNormal.get()});
+                            addObject(&cube, t, texture.get(), bumpNormal.get(), /*metallic*/ 0.0f, /*roughness*/ 0.5f);
                         }
                     }
 
@@ -376,8 +388,8 @@ int main(int argc, char** argv) {
                 duckT.eulerRadians = {0.0f, 2.3f, 0.0f};
                 duckT.scale = {0.022f, 0.022f, 0.022f};
                 float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
-                sceneObjects.push_back({&duck, duckModel.baseColor.get(), duckT,
-                                        duckModel.metallic, duckRough, flatNormal.get()});
+                addObject(&duck, duckT, duckModel.baseColor.get(), flatNormal.get(),
+                          duckModel.metallic, duckRough);
             }
 
             // ---- Frame uniforms: same camera + light as the Vulkan Slice-F sample. ----
@@ -450,12 +462,14 @@ int main(int argc, char** argv) {
                     dev.SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
                     cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
                     cmd.BindPipeline(*shadowPipeline);
-                    for (scene::Renderable& r : sceneObjects) {
-                        Mat4 m = r.transform.Matrix();
+                    for (auto [e, tc, mc, mat] :
+                         registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
+                        (void)e; (void)mat;
+                        Mat4 m = tc.t.Matrix();
                         cmd.PushConstants(m.m, sizeof(float) * 16);
-                        cmd.BindVertexBuffer(r.mesh->vertices());
-                        cmd.BindIndexBuffer(r.mesh->indices());
-                        cmd.DrawIndexed(r.mesh->indexCount());
+                        cmd.BindVertexBuffer(mc.mesh->vertices());
+                        cmd.BindIndexBuffer(mc.mesh->indices());
+                        cmd.DrawIndexed(mc.mesh->indexCount());
                     }
                     cmd.EndRenderPass();
                 });
@@ -480,17 +494,19 @@ int main(int argc, char** argv) {
                     cmd.BindPipeline(*skyPipeline);
                     cmd.Draw(3);
                     cmd.BindPipeline(*pipeline);
-                    for (scene::Renderable& r : sceneObjects) {
-                        Mat4 m = r.transform.Matrix();
+                    for (auto [e, tc, mc, mat] :
+                         registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
+                        (void)e;
+                        Mat4 m = tc.t.Matrix();
                         // Push { float4x4 model; float4 material(metallic,roughness,0,0) } = 80 bytes.
                         float pc[20];
                         for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
-                        pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                        pc[16] = mat.metallic; pc[17] = mat.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
                         cmd.PushConstants(pc, sizeof(pc));
-                        cmd.BindMaterial(*r.texture, *r.normalMap);
-                        cmd.BindVertexBuffer(r.mesh->vertices());
-                        cmd.BindIndexBuffer(r.mesh->indices());
-                        cmd.DrawIndexed(r.mesh->indexCount());
+                        cmd.BindMaterial(*mat.base, *mat.normal);
+                        cmd.BindVertexBuffer(mc.mesh->vertices());
+                        cmd.BindIndexBuffer(mc.mesh->indices());
+                        cmd.DrawIndexed(mc.mesh->indexCount());
                     }
                     // Additive GPU particles over the scene.
                     cmd.BindPipeline(*particlePipeline);
