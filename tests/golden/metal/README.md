@@ -49,6 +49,18 @@ PCF shadow sampling.
 > two Metal runs diff to `0.0000`. The compute MSL is generated from the shared HLSL exactly like the
 > graphics shaders (HLSL → SPIR-V → `kernel` MSL via spirv-cross); Vulkan renders the same fountain.
 
+> **Re-bake (tangent-space normal mapping):** re-baked again when normal mapping landed. The lit
+> shader (`shaders/lit.{vert,frag}.hlsl`) now builds a TBN basis from a per-vertex tangent (new
+> `scene::Vertex.tangent` at location 4, stride 56) and the interpolated world normal, samples a
+> tangent-space normal map, and perturbs the shading normal used by **all** the PBR/IBL/shadow
+> lighting. The material descriptor set gained a second sampled image + sampler for the normal map
+> (Vulkan set 1 binding 3/4; generated MSL maps it to `gNormalMap [[texture(3)]]` /
+> `gNormalSmp [[sampler(4)]]` via `--msl-decoration-binding`, matching `metal_common.h`'s
+> `kFragNormalTex`/`kFragNormalSmp`). A procedural domed-tile normal map bumps the dielectric cubes
+> + ground plane; the metal spheres and the duck keep a flat (0,0,1) normal. Legitimate shading
+> change: **DIFF 0.3283** vs the previous golden. One shared HLSL change hits both backends; two
+> Metal runs diff to `0.0000`, and Vulkan renders the same bumps.
+
 ## Shaders are generated, not hand-written
 
 The Metal shaders are **generated from the shared HLSL sources** at build time — there is no
