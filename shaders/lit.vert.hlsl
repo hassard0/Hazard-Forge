@@ -11,7 +11,10 @@ struct VSOutput {
     [[vk::location(2)]] float3 wnormal: NORMAL;
     [[vk::location(3)]] float3 wpos    : POSITION0;
 };
-struct FrameData { float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos; };
+struct FrameData {
+    float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
+    float4 ptCount; float4 ptPos[3]; float4 ptColor[3];
+};
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 [[vk::push_constant]] struct { float4x4 model; } pc;
 

@@ -28,12 +28,15 @@ std::vector<uint32_t> LoadSpirv(const std::string& path) {
     return words;
 }
 
-// Per-frame uniform block — must match shaders/lit.*.hlsl FrameData (112 bytes).
+// Per-frame uniform block — must match shaders/lit.*.hlsl FrameData (224 bytes).
 struct FrameData {
     float vp[16];
     float lightDir[4];
     float lightColor[4];
     float viewPos[4];
+    float ptCount[4];     // x = number of active point lights
+    float ptPos[3][4];    // xyz = world position, w = radius
+    float ptColor[3][4];  // rgb = color, w = intensity
 };
 
 // Procedural 256x256 RGBA8 checkerboard: 8x8 tiles alternating two colors, with the
@@ -176,15 +179,34 @@ int main(int argc, char** argv) {
         const Vec3 center{0.0f, 0.5f, 0.0f};
 
         // Fill FrameData (viewProj + directional light + camera pos) for a given aspect.
-        auto makeFrameData = [&](float aspect) {
+        auto makeFrameData = [&](float aspect, float t) {
             Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
             Mat4 proj = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
             Mat4 vp = proj * view;
             FrameData fd{};
             for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+            // Dim, cool directional fill so the colored point lights read clearly.
             fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0.0f;
-            fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+            fd.lightColor[0] = 0.32f; fd.lightColor[1] = 0.34f; fd.lightColor[2] = 0.42f; fd.lightColor[3] = 1.0f;
             fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+
+            // Three colored point lights orbiting the scene just above the cubes.
+            fd.ptCount[0] = 3.0f;
+            const float kR = 3.0f, kH = 1.3f, kRadius = 4.5f, kInt = 1.8f;
+            const float colors[3][3] = {{1.0f, 0.25f, 0.2f},   // warm red
+                                        {0.2f, 1.0f, 0.35f},   // green
+                                        {0.3f, 0.45f, 1.0f}};  // blue
+            for (int li = 0; li < 3; ++li) {
+                float a = t * 0.9f + (float)li * 2.0943951f;  // 120deg apart
+                fd.ptPos[li][0] = std::cos(a) * kR;
+                fd.ptPos[li][1] = kH;
+                fd.ptPos[li][2] = std::sin(a) * kR;
+                fd.ptPos[li][3] = kRadius;
+                fd.ptColor[li][0] = colors[li][0];
+                fd.ptColor[li][1] = colors[li][1];
+                fd.ptColor[li][2] = colors[li][2];
+                fd.ptColor[li][3] = kInt;
+            }
             return fd;
         };
 
@@ -206,7 +228,7 @@ int main(int argc, char** argv) {
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
-            FrameData fd = makeFrameData(aspect);  // fixed camera; cubes static
+            FrameData fd = makeFrameData(aspect, 0.6f);  // fixed camera; cubes + lights static
 
             // Pass 1: render the scene into the offscreen render target.
             {
@@ -282,7 +304,7 @@ int main(int argc, char** argv) {
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
-            FrameData fd = makeFrameData(aspect);
+            FrameData fd = makeFrameData(aspect, t);
 
             // Spin each cube about its yaw over time (skip index 0: the ground plane).
             for (size_t i = 1; i < sceneObjects.size(); ++i)
