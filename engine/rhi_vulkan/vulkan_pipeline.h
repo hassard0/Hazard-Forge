@@ -12,11 +12,14 @@ public:
     ~VulkanPipeline() override;
     VkPipeline handle() const { return pipeline_; }
     VkPipelineLayout layout() const { return layout_; }
+    // True when the pipeline layout has the per-frame UBO set (set 0); BindPipeline binds it.
+    bool hasFrameSet() const { return hasFrameSet_; }
 
 private:
     VkDevice device_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    bool hasFrameSet_ = false;
 };
 
 } // namespace hf::rhi::vk

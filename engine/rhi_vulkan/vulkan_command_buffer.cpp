@@ -51,6 +51,13 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     auto& p = static_cast<VulkanPipeline&>(pipeline);
     boundLayout_ = p.layout();
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
+    // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
+    // (frameIndex_ matches the UBO SetFrameUniforms wrote this frame — see VulkanDevice.)
+    if (p.hasFrameSet()) {
+        VkDescriptorSet fs = device_.currentFrameSet();
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                                0, 1, &fs, 0, nullptr);
+    }
 }
 
 void VulkanCommandBuffer::BindVertexBuffer(IBuffer& buffer) {
@@ -68,8 +75,9 @@ void VulkanCommandBuffer::BindIndexBuffer(IBuffer& buffer) {
 void VulkanCommandBuffer::BindTexture(ITexture& texture) {
     auto& vt = static_cast<VulkanTexture&>(texture);
     VkDescriptorSet s = vt.descriptorSet();
+    // Material set lives at set index 1 (set 0 is the per-frame UBO).
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
-                            0, 1, &s, 0, nullptr);
+                            1, 1, &s, 0, nullptr);
 }
 
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {

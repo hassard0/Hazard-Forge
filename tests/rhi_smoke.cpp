@@ -28,6 +28,10 @@ int main() {
             }
         }  // tex destroyed here (frees its descriptor set) before WaitIdle.
 
+        // Exercise the per-frame UBO copy path (112-byte FrameData-sized payload).
+        float dummy[28] = {0};
+        device->SetFrameUniforms(dummy, sizeof(dummy));
+
         device->WaitIdle();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "smoke FAILED: %s\n", e.what());

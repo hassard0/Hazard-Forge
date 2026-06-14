@@ -50,10 +50,11 @@ struct GraphicsPipelineDesc {
     bool depthTest = true;
     Format depthFormat = Format::D32_Float;
     uint32_t pushConstantSize = 0;   // bytes, vertex stage
-    bool usesTexture = false;        // when true, layout includes set 0 (combined sampler)
+    bool usesFrameUniforms = false;  // when true, layout includes the per-frame UBO set (set 0)
+    bool usesTexture = false;        // when true, layout includes the material set (set 1)
 };
 
-enum class BufferUsage { Vertex, Index };
+enum class BufferUsage { Vertex, Index, Uniform };
 
 struct TextureDesc {
     uint32_t width = 0;
@@ -120,6 +121,11 @@ public:
     virtual FrameContext BeginFrame() = 0;
     // Submit recorded commands and present.
     virtual void EndFrame(const FrameContext&) = 0;
+
+    // Copy per-frame uniform data into the current frame-in-flight's UBO. Call after
+    // BeginFrame (so the current frame index is set) and before recording draws; the
+    // matching per-frame descriptor set (set 0) is auto-bound on BindPipeline.
+    virtual void SetFrameUniforms(const void* data, uint32_t size) = 0;
 
     // Block until the GPU is idle (call before destroying GPU resources).
     virtual void WaitIdle() = 0;

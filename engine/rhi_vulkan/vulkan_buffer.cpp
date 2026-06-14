@@ -6,11 +6,16 @@ namespace hf::rhi::vk {
 
 VulkanBuffer::VulkanBuffer(VmaAllocator allocator, const BufferDesc& desc)
     : allocator_(allocator) {
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    switch (desc.usage) {
+        case BufferUsage::Vertex:  usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;  break;
+        case BufferUsage::Index:   usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;   break;
+        case BufferUsage::Uniform: usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT; break;
+    }
+
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = desc.size;
-    bci.usage = (desc.usage == BufferUsage::Index)
-                    ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT
-                    : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bci.usage = usage;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VmaAllocationCreateInfo aci{};

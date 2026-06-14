@@ -157,8 +157,8 @@ void VulkanDevice::CreateTextureResources() {
     sci.maxLod = VK_LOD_CLAMP_NONE;
     Check(vkCreateSampler(device_, &sci, nullptr, &defaultSampler_), "vkCreateSampler");
 
-    // Set layout: set 0 — binding 0 = sampled image, binding 1 = sampler, fragment stage.
-    // (DXC emits Texture2D/SamplerState as two separate descriptors, not one combined.)
+    // Material set layout (used at set 1): binding 0 = sampled image, binding 1 = sampler,
+    // fragment stage. (DXC emits Texture2D/SamplerState as two separate descriptors.)
     VkDescriptorSetLayoutBinding bindings[2]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -174,22 +174,84 @@ void VulkanDevice::CreateTextureResources() {
     Check(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &texturedSetLayout_),
           "vkCreateDescriptorSetLayout");
 
-    // Pool: allow individual set frees (VulkanTexture frees its set in its dtor).
-    VkDescriptorPoolSize poolSizes[2]{};
+    // Pool: allow individual set frees (VulkanTexture frees its set in its dtor). Includes
+    // a UNIFORM_BUFFER capacity for the per-frame UBO sets (set 0).
+    VkDescriptorPoolSize poolSizes[3]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     poolSizes[0].descriptorCount = 64;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
     poolSizes[1].descriptorCount = 64;
+    poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     pci.maxSets = 64;
-    pci.poolSizeCount = 2;
+    pci.poolSizeCount = 3;
     pci.pPoolSizes = poolSizes;
     Check(vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_),
           "vkCreateDescriptorPool");
+
+    // --- Per-frame UBO set layout (set 0): binding 0 = uniform buffer, vertex+fragment. ---
+    VkDescriptorSetLayoutBinding frameBinding{};
+    frameBinding.binding = 0;
+    frameBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    frameBinding.descriptorCount = 1;
+    frameBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo fci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    fci.bindingCount = 1;
+    fci.pBindings = &frameBinding;
+    Check(vkCreateDescriptorSetLayout(device_, &fci, nullptr, &frameSetLayout_),
+          "vkCreateDescriptorSetLayout(frame)");
+
+    // One host-visible MAPPED uniform buffer + descriptor set per frame-in-flight; each set
+    // is pre-updated to point at its persistent buffer (SetFrameUniforms only writes memory).
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = kFrameUboSize;
+        bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO;
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
+        aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VmaAllocationInfo info{};
+        Check(vmaCreateBuffer(allocator_, &bci, &aci, &uboBuffer_[i], &uboAlloc_[i], &info),
+              "vmaCreateBuffer(ubo)");
+        uboMapped_[i] = info.pMappedData;
+
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = descriptorPool_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &frameSetLayout_;
+        Check(vkAllocateDescriptorSets(device_, &dai, &frameSet_[i]),
+              "vkAllocateDescriptorSets(frame)");
+
+        VkDescriptorBufferInfo bufInfo{uboBuffer_[i], 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = frameSet_[i];
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        write.pBufferInfo = &bufInfo;
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    }
 }
 
 void VulkanDevice::DestroyTextureResources() {
+    // Per-frame UBOs + layout. Frame sets are freed when the pool below is destroyed.
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        if (uboBuffer_[i]) vmaDestroyBuffer(allocator_, uboBuffer_[i], uboAlloc_[i]);
+        uboBuffer_[i] = VK_NULL_HANDLE;
+        uboAlloc_[i] = VK_NULL_HANDLE;
+        uboMapped_[i] = nullptr;
+        frameSet_[i] = VK_NULL_HANDLE;
+    }
+    if (frameSetLayout_) vkDestroyDescriptorSetLayout(device_, frameSetLayout_, nullptr);
+    frameSetLayout_ = VK_NULL_HANDLE;
+
     if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
@@ -273,6 +335,18 @@ void VulkanDevice::UploadToImage(VkImage image, uint32_t w, uint32_t h,
     // 7. Cleanup.
     vkDestroyCommandPool(device_, pool, nullptr);
     vmaDestroyBuffer(allocator_, staging, stagingAlloc);
+}
+
+void VulkanDevice::SetFrameUniforms(const void* data, uint32_t size) {
+    // Writes the UBO for the frame currently being recorded (frameIndex_). currentFrameSet()
+    // returns frameSet_[frameIndex_], whose descriptor points at uboBuffer_[frameIndex_] — the
+    // same buffer mapped at uboMapped_[frameIndex_]. EndFrame advances frameIndex_, so calling
+    // this after BeginFrame and before the draw targets the correct double-buffered UBO.
+    if (size > kFrameUboSize) throw std::runtime_error("SetFrameUniforms: size exceeds UBO");
+    std::memcpy(uboMapped_[frameIndex_], data, size);
+    // Allocation is HOST_COHERENT; flush is a no-op safeguard against non-coherent fallback.
+    Check(vmaFlushAllocation(allocator_, uboAlloc_[frameIndex_], 0, size),
+          "vmaFlushAllocation(ubo)");
 }
 
 void VulkanDevice::WaitIdle() { if (device_) vkDeviceWaitIdle(device_); }

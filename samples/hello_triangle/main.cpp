@@ -23,7 +23,15 @@ std::vector<uint32_t> LoadSpirv(const std::string& path) {
     return words;
 }
 
-struct Vertex { float pos[3]; float color[3]; float uv[2]; };
+struct Vertex { float pos[3]; float color[3]; float uv[2]; float normal[3]; };
+
+// Per-frame uniform block — must match shaders/lit.*.hlsl FrameData (112 bytes).
+struct FrameData {
+    float vp[16];
+    float lightDir[4];
+    float lightColor[4];
+    float viewPos[4];
+};
 
 // Procedural 256x256 RGBA8 checkerboard: 8x8 tiles alternating two colors, with the
 // base color also shifted by tile position so the grid is clearly readable.
@@ -61,11 +69,11 @@ std::vector<uint8_t> MakeCheckerboard() {
 int main() {
     using namespace hf;
     try {
-        hal::Window window({"Hazard Forge — Textured Cube", 1280, 720});
+        hal::Window window({"Hazard Forge — Lit Cube", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
 
-        auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cube_tex.vert.hlsl.spv");
-        auto fsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cube_tex.frag.hlsl.spv");
+        auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+        auto fsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
         auto vs = device->CreateShaderModule({std::span<const uint32_t>(vsWords)});
         auto fs = device->CreateShaderModule({std::span<const uint32_t>(fsWords)});
 
@@ -75,6 +83,7 @@ int main() {
             {0, rhi::Format::RGB32_Float, offsetof(Vertex, pos)},
             {1, rhi::Format::RGB32_Float, offsetof(Vertex, color)},
             {2, rhi::Format::RG32_Float,  offsetof(Vertex, uv)},
+            {3, rhi::Format::RGB32_Float, offsetof(Vertex, normal)},
         };
 
         rhi::GraphicsPipelineDesc pdesc;
@@ -83,44 +92,45 @@ int main() {
         pdesc.vertexLayout = layout;
         pdesc.colorFormat = device->Swapchain().ColorFormat();
         pdesc.depthTest = true;
+        pdesc.usesFrameUniforms = true;
         pdesc.usesTexture = true;
-        pdesc.pushConstantSize = sizeof(float) * 16;
+        pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
         auto pipeline = device->CreateGraphicsPipeline(pdesc);
 
         // 24 vertices (4 per face) so each face carries its own UV square + tint.
         // Faces wound CCW outward (RH); UVs per face: (0,0)(1,0)(1,1)(0,1).
         const float n = -0.5f, p = 0.5f;
         const Vertex verts[24] = {
-            // -Z (back), tint red
-            {{p, n, n}, {1.0f, 0.4f, 0.4f}, {0, 0}},
-            {{n, n, n}, {1.0f, 0.4f, 0.4f}, {1, 0}},
-            {{n, p, n}, {1.0f, 0.4f, 0.4f}, {1, 1}},
-            {{p, p, n}, {1.0f, 0.4f, 0.4f}, {0, 1}},
-            // +Z (front), tint green
-            {{n, n, p}, {0.4f, 1.0f, 0.4f}, {0, 0}},
-            {{p, n, p}, {0.4f, 1.0f, 0.4f}, {1, 0}},
-            {{p, p, p}, {0.4f, 1.0f, 0.4f}, {1, 1}},
-            {{n, p, p}, {0.4f, 1.0f, 0.4f}, {0, 1}},
-            // -X (left), tint blue
-            {{n, n, n}, {0.4f, 0.4f, 1.0f}, {0, 0}},
-            {{n, n, p}, {0.4f, 0.4f, 1.0f}, {1, 0}},
-            {{n, p, p}, {0.4f, 0.4f, 1.0f}, {1, 1}},
-            {{n, p, n}, {0.4f, 0.4f, 1.0f}, {0, 1}},
-            // +X (right), tint yellow
-            {{p, n, p}, {1.0f, 1.0f, 0.4f}, {0, 0}},
-            {{p, n, n}, {1.0f, 1.0f, 0.4f}, {1, 0}},
-            {{p, p, n}, {1.0f, 1.0f, 0.4f}, {1, 1}},
-            {{p, p, p}, {1.0f, 1.0f, 0.4f}, {0, 1}},
-            // -Y (bottom), tint magenta
-            {{n, n, n}, {1.0f, 0.4f, 1.0f}, {0, 0}},
-            {{p, n, n}, {1.0f, 0.4f, 1.0f}, {1, 0}},
-            {{p, n, p}, {1.0f, 0.4f, 1.0f}, {1, 1}},
-            {{n, n, p}, {1.0f, 0.4f, 1.0f}, {0, 1}},
-            // +Y (top), tint cyan
-            {{n, p, p}, {0.4f, 1.0f, 1.0f}, {0, 0}},
-            {{p, p, p}, {0.4f, 1.0f, 1.0f}, {1, 0}},
-            {{p, p, n}, {0.4f, 1.0f, 1.0f}, {1, 1}},
-            {{n, p, n}, {0.4f, 1.0f, 1.0f}, {0, 1}},
+            // -Z (back), tint red, normal (0,0,-1)
+            {{p, n, n}, {1.0f, 0.4f, 0.4f}, {0, 0}, {0, 0, -1}},
+            {{n, n, n}, {1.0f, 0.4f, 0.4f}, {1, 0}, {0, 0, -1}},
+            {{n, p, n}, {1.0f, 0.4f, 0.4f}, {1, 1}, {0, 0, -1}},
+            {{p, p, n}, {1.0f, 0.4f, 0.4f}, {0, 1}, {0, 0, -1}},
+            // +Z (front), tint green, normal (0,0,1)
+            {{n, n, p}, {0.4f, 1.0f, 0.4f}, {0, 0}, {0, 0, 1}},
+            {{p, n, p}, {0.4f, 1.0f, 0.4f}, {1, 0}, {0, 0, 1}},
+            {{p, p, p}, {0.4f, 1.0f, 0.4f}, {1, 1}, {0, 0, 1}},
+            {{n, p, p}, {0.4f, 1.0f, 0.4f}, {0, 1}, {0, 0, 1}},
+            // -X (left), tint blue, normal (-1,0,0)
+            {{n, n, n}, {0.4f, 0.4f, 1.0f}, {0, 0}, {-1, 0, 0}},
+            {{n, n, p}, {0.4f, 0.4f, 1.0f}, {1, 0}, {-1, 0, 0}},
+            {{n, p, p}, {0.4f, 0.4f, 1.0f}, {1, 1}, {-1, 0, 0}},
+            {{n, p, n}, {0.4f, 0.4f, 1.0f}, {0, 1}, {-1, 0, 0}},
+            // +X (right), tint yellow, normal (1,0,0)
+            {{p, n, p}, {1.0f, 1.0f, 0.4f}, {0, 0}, {1, 0, 0}},
+            {{p, n, n}, {1.0f, 1.0f, 0.4f}, {1, 0}, {1, 0, 0}},
+            {{p, p, n}, {1.0f, 1.0f, 0.4f}, {1, 1}, {1, 0, 0}},
+            {{p, p, p}, {1.0f, 1.0f, 0.4f}, {0, 1}, {1, 0, 0}},
+            // -Y (bottom), tint magenta, normal (0,-1,0)
+            {{n, n, n}, {1.0f, 0.4f, 1.0f}, {0, 0}, {0, -1, 0}},
+            {{p, n, n}, {1.0f, 0.4f, 1.0f}, {1, 0}, {0, -1, 0}},
+            {{p, n, p}, {1.0f, 0.4f, 1.0f}, {1, 1}, {0, -1, 0}},
+            {{n, n, p}, {1.0f, 0.4f, 1.0f}, {0, 1}, {0, -1, 0}},
+            // +Y (top), tint cyan, normal (0,1,0)
+            {{n, p, p}, {0.4f, 1.0f, 1.0f}, {0, 0}, {0, 1, 0}},
+            {{p, p, p}, {0.4f, 1.0f, 1.0f}, {1, 0}, {0, 1, 0}},
+            {{p, p, n}, {0.4f, 1.0f, 1.0f}, {1, 1}, {0, 1, 0}},
+            {{n, p, n}, {0.4f, 1.0f, 1.0f}, {0, 1}, {0, 1, 0}},
         };
 
         // 36 indices: 2 triangles per face over its 4 vertices, CCW outward.
@@ -169,16 +179,26 @@ int main() {
 
             using math::Mat4;
             using math::Vec3;
+            const Vec3 eye{2.5f, 2.5f, 4.0f};
             Mat4 model = Mat4::RotateY(t) * Mat4::RotateX(t * 0.5f);
-            Mat4 view  = Mat4::LookAt({2, 2, 4}, {0, 0, 0}, {0, 1, 0});
+            Mat4 view  = Mat4::LookAt(eye, {0, 0, 0}, {0, 1, 0});
             Mat4 proj  = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
-            Mat4 mvp   = proj * view * model;
+            Mat4 vp    = proj * view;
+
+            // Per-frame uniforms: viewProj + a fixed world-space directional light + camera pos.
+            FrameData fd{};
+            for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+            fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0.0f;
+            fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+            fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
 
             auto frame = device->BeginFrame();
             if (frame.cmd) {
+                // After BeginFrame (frame index current), before recording draws.
+                device->SetFrameUniforms(&fd, sizeof(FrameData));
                 frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
                 frame.cmd->BindPipeline(*pipeline);
-                frame.cmd->PushConstants(mvp.m, sizeof(float) * 16);
+                frame.cmd->PushConstants(model.m, sizeof(float) * 16);
                 frame.cmd->BindTexture(*texture);
                 frame.cmd->BindVertexBuffer(*vbuffer);
                 frame.cmd->BindIndexBuffer(*ibuffer);

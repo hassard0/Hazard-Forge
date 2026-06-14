@@ -7,7 +7,7 @@
 namespace hf::rhi::vk {
 
 VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc)
-    : device_(device.device()) {
+    : device_(device.device()), hasFrameSet_(desc.usesFrameUniforms) {
     auto* vs = static_cast<VulkanShaderModule*>(desc.vertex);
     auto* fs = static_cast<VulkanShaderModule*>(desc.fragment);
 
@@ -88,10 +88,13 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
         lci.pushConstantRangeCount = 1;
         lci.pPushConstantRanges = &pushRange;
     }
-    VkDescriptorSetLayout setLayout = device.texturedSetLayout();
-    if (desc.usesTexture) {
-        lci.setLayoutCount = 1;
-        lci.pSetLayouts = &setLayout;
+    // Set-layout array. Push order = set index: frame (set 0) first, material (set 1) second.
+    std::vector<VkDescriptorSetLayout> setLayouts;
+    if (desc.usesFrameUniforms) setLayouts.push_back(device.frameSetLayout());   // set 0
+    if (desc.usesTexture)       setLayouts.push_back(device.materialSetLayout()); // set 1
+    if (!setLayouts.empty()) {
+        lci.setLayoutCount = (uint32_t)setLayouts.size();
+        lci.pSetLayouts = setLayouts.data();
     }
     Check(vkCreatePipelineLayout(device_, &lci, nullptr, &layout_), "vkCreatePipelineLayout");
 

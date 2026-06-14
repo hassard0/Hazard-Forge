@@ -26,6 +26,7 @@ public:
 
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
+    void SetFrameUniforms(const void* data, uint32_t size) override;
     void WaitIdle() override;
 
     // Accessors used by sibling Vulkan objects.
@@ -33,7 +34,13 @@ public:
     VmaAllocator allocator() const { return allocator_; }
     VkSampler defaultSampler() const { return defaultSampler_; }
     VkDescriptorSetLayout texturedSetLayout() const { return texturedSetLayout_; }
+    // The material set layout logically lives at set 1 (set index decided by the pipeline
+    // layout array); the layout object is identical to the Slice C textured set layout.
+    VkDescriptorSetLayout materialSetLayout() const { return texturedSetLayout_; }
     VkDescriptorPool descriptorPool() const { return descriptorPool_; }
+    // Per-frame UBO set (set 0). currentFrameSet() returns the set for the frame being recorded.
+    VkDescriptorSetLayout frameSetLayout() const { return frameSetLayout_; }
+    VkDescriptorSet currentFrameSet() const { return frameSet_[frameIndex_]; }
 
     // Stage host pixel data into a device-local image (synchronous; see vulkan_texture).
     void UploadToImage(VkImage image, uint32_t w, uint32_t h,
@@ -57,10 +64,19 @@ private:
     uint32_t      graphicsQueueFamily_ = 0;
     VmaAllocator  allocator_ = VK_NULL_HANDLE;
 
-    // Texture support: one default sampler + a shared combined-image-sampler set layout + pool.
+    // Texture support: one default sampler + a shared image+sampler set layout (set 1) + pool.
     VkSampler             defaultSampler_    = VK_NULL_HANDLE;
     VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
+
+    // Per-frame uniform buffers (set 0): one host-visible mapped UBO + descriptor set per
+    // frame-in-flight, so the CPU never writes a UBO the GPU is still reading.
+    static constexpr uint32_t kFrameUboSize = 256;  // >= sizeof(FrameData) (112B), aligned
+    VkDescriptorSetLayout frameSetLayout_ = VK_NULL_HANDLE;
+    VkBuffer        uboBuffer_[kFramesInFlight]{};
+    VmaAllocation   uboAlloc_[kFramesInFlight]{};
+    void*           uboMapped_[kFramesInFlight]{};
+    VkDescriptorSet frameSet_[kFramesInFlight]{};
 
     std::unique_ptr<VulkanSwapchain> swapchain_;
 
