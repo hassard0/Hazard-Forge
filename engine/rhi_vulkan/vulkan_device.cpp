@@ -69,9 +69,10 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     aci.vulkanApiVersion = VK_API_VERSION_1_3;
     Check(vmaCreateAllocator(&aci, &allocator_), "vmaCreateAllocator");
 
-    // --- Swapchain ---
+    // --- Swapchain (owns the depth attachment; needs the VMA allocator) ---
     swapchain_ = std::make_unique<VulkanSwapchain>(
-        device_, vkbDevice_, window_.FramebufferWidth(), window_.FramebufferHeight());
+        device_, vkbDevice_, allocator_,
+        window_.FramebufferWidth(), window_.FramebufferHeight());
 
     CreateSyncObjects();
     recorder_ = std::make_unique<VulkanCommandBuffer>(*this);
@@ -139,13 +140,14 @@ namespace {
 void TransitionImage(VkCommandBuffer cmd, VkImage image,
                      VkImageLayout oldLayout, VkImageLayout newLayout,
                      VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
-                     VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+                     VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
+                     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT) {
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = srcStage;  b.srcAccessMask = srcAccess;
     b.dstStageMask = dstStage;  b.dstAccessMask = dstAccess;
     b.oldLayout = oldLayout;    b.newLayout = newLayout;
     b.image = image;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.subresourceRange = {aspect, 0, 1, 0, 1};
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.imageMemoryBarrierCount = 1;
     di.pImageMemoryBarriers = &b;
@@ -179,7 +181,18 @@ FrameContext VulkanDevice::BeginFrame() {
                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 
-    recorder_->Begin(fr.cmd, swapchain_->view(acquiredImage_), swapchain_->extent());
+    // UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL (no transition back: depth isn't presented)
+    TransitionImage(fr.cmd, swapchain_->depthImage(),
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    recorder_->Begin(fr.cmd, swapchain_->view(acquiredImage_),
+                     swapchain_->depthView(), swapchain_->extent());
     return FrameContext{recorder_.get()};
 }
 

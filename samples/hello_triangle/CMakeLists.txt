@@ -6,8 +6,8 @@ hf_compile_shaders(
   TARGET hello_triangle
   OUTPUT_DIR "${SHADER_OUT}"
   SHADERS
-    "shaders/triangle.vert.hlsl:vs"
-    "shaders/triangle.frag.hlsl:ps"
+    "shaders/cube.vert.hlsl:vs"
+    "shaders/cube.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

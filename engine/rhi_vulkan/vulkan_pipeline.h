@@ -9,6 +9,7 @@ public:
     VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc);
     ~VulkanPipeline() override;
     VkPipeline handle() const { return pipeline_; }
+    VkPipelineLayout layout() const { return layout_; }
 
 private:
     VkDevice device_;

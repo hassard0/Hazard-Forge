@@ -20,6 +20,7 @@ enum class Format {
     BGRA8_UNorm,
     RG32_Float,    // vec2 vertex attribute
     RGB32_Float,   // vec3 vertex attribute
+    D32_Float,     // depth attachment
 };
 
 struct ClearColor { float r = 0, g = 0, b = 0, a = 1; };
@@ -46,11 +47,17 @@ struct GraphicsPipelineDesc {
     class IShaderModule* fragment = nullptr;
     VertexLayout vertexLayout;
     Format colorFormat = Format::BGRA8_UNorm;  // must match swapchain format
+    bool depthTest = true;
+    Format depthFormat = Format::D32_Float;
+    uint32_t pushConstantSize = 0;   // bytes, vertex stage
 };
+
+enum class BufferUsage { Vertex, Index };
 
 struct BufferDesc {
     uint64_t size = 0;          // bytes
     const void* initialData = nullptr;  // optional upload-on-create
+    BufferUsage usage = BufferUsage::Vertex;
 };
 
 // --- Resource interfaces -----------------------------------------------------
@@ -66,7 +73,10 @@ public:
     virtual void BeginRenderPass(const ClearColor& clear) = 0;
     virtual void BindPipeline(IPipeline& pipeline) = 0;
     virtual void BindVertexBuffer(IBuffer& buffer) = 0;
+    virtual void BindIndexBuffer(IBuffer& buffer) = 0;
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
+    virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0) = 0;
+    virtual void PushConstants(const void* data, uint32_t size) = 0;
     virtual void EndRenderPass() = 0;
 };
 

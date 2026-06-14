@@ -19,6 +19,7 @@ inline VkFormat ToVk(Format f) {
         case Format::BGRA8_UNorm: return VK_FORMAT_B8G8R8A8_UNORM;
         case Format::RG32_Float:  return VK_FORMAT_R32G32_SFLOAT;
         case Format::RGB32_Float: return VK_FORMAT_R32G32B32_SFLOAT;
+        case Format::D32_Float:   return VK_FORMAT_D32_SFLOAT;
         default:                  return VK_FORMAT_UNDEFINED;
     }
 }

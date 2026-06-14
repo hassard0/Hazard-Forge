@@ -49,7 +49,7 @@ VulkanPipeline::VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc
     VkPipelineRasterizationStateCreateInfo rs{
         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.cullMode = VK_CULL_MODE_BACK_BIT;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 
@@ -65,13 +65,28 @@ VulkanPipeline::VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc
     cb.attachmentCount = 1;
     cb.pAttachments = &blendAtt;
 
+    VkPipelineDepthStencilStateCreateInfo ds{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = desc.depthTest ? VK_TRUE : VK_FALSE;
+    ds.depthWriteEnable = desc.depthTest ? VK_TRUE : VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+
     VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dyn{
         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
 
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushRange.offset = 0;
+    pushRange.size = desc.pushConstantSize;
+
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    if (desc.pushConstantSize > 0) {
+        lci.pushConstantRangeCount = 1;
+        lci.pPushConstantRanges = &pushRange;
+    }
     Check(vkCreatePipelineLayout(device_, &lci, nullptr, &layout_), "vkCreatePipelineLayout");
 
     VkFormat colorFormat = ToVk(desc.colorFormat);
@@ -79,6 +94,7 @@ VulkanPipeline::VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc
         VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachmentFormats = &colorFormat;
+    rendering.depthAttachmentFormat = ToVk(desc.depthFormat);
 
     VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     pci.pNext = &rendering;
@@ -89,6 +105,7 @@ VulkanPipeline::VulkanPipeline(VkDevice device, const GraphicsPipelineDesc& desc
     pci.pViewportState = &vp;
     pci.pRasterizationState = &rs;
     pci.pMultisampleState = &ms;
+    pci.pDepthStencilState = &ds;
     pci.pColorBlendState = &cb;
     pci.pDynamicState = &dyn;
     pci.layout = layout_;

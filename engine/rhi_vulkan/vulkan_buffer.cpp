@@ -8,7 +8,9 @@ VulkanBuffer::VulkanBuffer(VmaAllocator allocator, const BufferDesc& desc)
     : allocator_(allocator) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = desc.size;
-    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bci.usage = (desc.usage == BufferUsage::Index)
+                    ? VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+                    : VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VmaAllocationCreateInfo aci{};
