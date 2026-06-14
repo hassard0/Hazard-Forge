@@ -1,7 +1,15 @@
 # Build output
 /build/
 /out/
+/build-metal/
 *.spv
+
+# Render outputs (PNGs are build artifacts; the only tracked PNGs are intentional goldens
+# under tests/golden/). Keep stray bring-up captures out of git.
+*.png
+!tests/golden/**/*.png
+/metal_cube.png
+/metal_scene.png
 
 # Conan
 /CMakeUserPresets.json

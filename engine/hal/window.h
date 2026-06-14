@@ -35,6 +35,13 @@ public:
     // Create a Vulkan surface for this window on the given instance.
     VkSurfaceKHR CreateVulkanSurface(VkInstance instance) const;
 
+#ifdef __APPLE__
+    // Create (once) an SDL Metal view over this window and return its CAMetalLayer as a void*.
+    // Caller (MetalDevice) casts to CAMetalLayer*. Returns the same layer on repeat calls.
+    // Kept as void* so this header stays free of Metal/QuartzCore types.
+    void* CreateMetalLayer();
+#endif
+
     int FramebufferWidth() const;
     int FramebufferHeight() const;
     SDL_Window* Raw() const { return window_; }
@@ -42,6 +49,9 @@ public:
 private:
     SDL_Window* window_ = nullptr;
     bool resized_ = false;
+#ifdef __APPLE__
+    void* metalView_ = nullptr;  // SDL_MetalView (opaque); created lazily by CreateMetalLayer()
+#endif
 };
 
 } // namespace hf::hal

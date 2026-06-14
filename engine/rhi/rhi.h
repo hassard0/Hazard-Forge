@@ -12,7 +12,7 @@ namespace hf::hal { class Window; }
 
 namespace hf::rhi {
 
-enum class Backend { Vulkan };
+enum class Backend { Vulkan, Metal };
 
 enum class Format {
     Undefined,

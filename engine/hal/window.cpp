@@ -2,6 +2,9 @@
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#ifdef __APPLE__
+#include <SDL3/SDL_metal.h>
+#endif
 #include <stdexcept>
 
 namespace hf::hal {
@@ -10,8 +13,14 @@ Window::Window(const WindowConfig& cfg) {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         throw std::runtime_error(std::string("SDL_Init failed: ") + SDL_GetError());
     }
+#ifdef __APPLE__
+    // Metal-backed window on Apple; the Vulkan flag would force the Vulkan loader.
+    const SDL_WindowFlags gpuFlag = SDL_WINDOW_METAL;
+#else
+    const SDL_WindowFlags gpuFlag = SDL_WINDOW_VULKAN;
+#endif
     window_ = SDL_CreateWindow(cfg.title.c_str(), cfg.width, cfg.height,
-                               SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                               gpuFlag | SDL_WINDOW_RESIZABLE);
     if (!window_) {
         std::string err = std::string("SDL_CreateWindow failed: ") + SDL_GetError();
         SDL_Quit();  // constructor failed: dtor won't run, so undo SDL_Init here
@@ -20,6 +29,9 @@ Window::Window(const WindowConfig& cfg) {
 }
 
 Window::~Window() {
+#ifdef __APPLE__
+    if (metalView_) SDL_Metal_DestroyView(static_cast<SDL_MetalView>(metalView_));
+#endif
     if (window_) SDL_DestroyWindow(window_);
     SDL_Quit();
 }
@@ -60,6 +72,24 @@ VkSurfaceKHR Window::CreateVulkanSurface(VkInstance instance) const {
     }
     return surface;
 }
+
+#ifdef __APPLE__
+void* Window::CreateMetalLayer() {
+    if (!metalView_) {
+        metalView_ = SDL_Metal_CreateView(window_);
+        if (!metalView_) {
+            throw std::runtime_error(std::string("SDL_Metal_CreateView failed: ") +
+                                     SDL_GetError());
+        }
+    }
+    // Returns a CAMetalLayer* (as void*); MetalDevice casts it back.
+    void* layer = SDL_Metal_GetLayer(static_cast<SDL_MetalView>(metalView_));
+    if (!layer) {
+        throw std::runtime_error(std::string("SDL_Metal_GetLayer failed: ") + SDL_GetError());
+    }
+    return layer;
+}
+#endif
 
 int Window::FramebufferWidth() const {
     int w = 0, h = 0;
