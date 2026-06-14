@@ -8,21 +8,28 @@
 
 namespace hf::rhi::mtl {
 
-// Binding-index convention (must match the hand-written MSL in shaders/lit.metal):
-//   vertex:   buffer(0) = vertex data
-//             buffer(1) = per-frame UBO (FrameData)
-//             buffer(2) = push constants (model matrix), via setVertexBytes
-//   fragment: buffer(0) = per-frame UBO (FrameData)
-//             texture(0)/sampler(0) = material
-//             texture(1)/sampler(1) = shadow map (depth) + its clamp-to-edge sampler
+// Binding-index convention. These flat Metal [[buffer/texture/sampler(n)]] indices are produced by
+// `spirv-cross --msl --msl-decoration-binding` from the shared HLSL sources (HLSL -> SPIR-V ->
+// MSL); with --msl-decoration-binding each resource's Metal index == its SPIR-V binding number, so
+// the HLSL [[vk::binding]] / register() values (and, for the MSL-gen path, the HF_MSL_GEN-guarded
+// overrides) are chosen to land here:
+//   vertex:   buffer(0) = vertex data (stage_in)
+//             buffer(1) = per-frame UBO (FrameData)   <- HF_MSL_GEN Frame at vk::binding(1,0)
+//             buffer(2) = push constants (model matrix) <- HF_MSL_GEN PushC at vk::binding(2,0)
+//   fragment: buffer(0) = per-frame UBO (FrameData)   <- Frame at vk::binding(0,0)
+//             texture(0) = material (gTex, set1 b0);   sampler(1) = material sampler (gSmp, set1 b1)
+//             texture(1) = shadow map (gShadow, b1);   sampler(2) = shadow sampler (gShadowSmp, b2)
+// Textures map 1:1 to their binding; samplers carry the binding number too, so the material sampler
+// lands at 1 and the shadow sampler at 2 (one higher than the hand-written MSL used). The engine
+// binds at these indices; the generated MSL declares them.
 constexpr uint32_t kVbVertex      = 0;
 constexpr uint32_t kVbFrameUbo    = 1;
 constexpr uint32_t kVbPushConst   = 2;
 constexpr uint32_t kFbFrameUbo    = 0;
 constexpr uint32_t kFragTexture   = 0;
-constexpr uint32_t kFragSampler   = 0;
+constexpr uint32_t kFragSampler   = 1;
 constexpr uint32_t kFragShadowTex = 1;
-constexpr uint32_t kFragShadowSmp = 1;
+constexpr uint32_t kFragShadowSmp = 2;
 
 // Map an RHI vertex-attribute / color / depth format to a Metal pixel/vertex format.
 inline MTLPixelFormat ToMetalPixelFormat(Format f) {

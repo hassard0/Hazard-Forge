@@ -18,6 +18,58 @@ set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 # Repo root is one level up from this dir.
 get_filename_component(HF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
+# ---------------------------------------------------------------------------
+# Unified shader toolchain: GENERATE the Metal MSL from the SHARED HLSL sources
+# (the same HLSL the Vulkan/DXC backend compiles) so there is no hand-written
+# MSL to drift. Pipeline per shader: HLSL --glslc--> SPIR-V --spirv-cross--> MSL.
+#
+#   * glslc compiles HLSL with -DHF_MSL_GEN so the vertex shaders declare the
+#     model matrix as an explicit cbuffer (glslang ignores [[vk::push_constant]]);
+#     the bindings are chosen so that --msl-decoration-binding yields the engine's
+#     flat Metal indices (see engine/rhi_metal/metal_common.h).
+#   * spirv-cross --msl --msl-decoration-binding maps SPIR-V binding -> MSL index,
+#     and --rename-entry-point gives stable entry names the loader expects.
+# ---------------------------------------------------------------------------
+find_program(GLSLC_EXECUTABLE NAMES glslc REQUIRED)
+find_program(SPIRV_CROSS_EXECUTABLE NAMES spirv-cross REQUIRED)
+
+set(HF_SHADER_SRC "${HF_ROOT}/shaders")
+set(HF_GEN_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen_shaders")
+file(MAKE_DIRECTORY "${HF_GEN_SHADER_DIR}")
+
+set(HF_GENERATED_MSL "")
+# hf_gen_msl(<basename> <hlsl-file> <vert|frag> <new-entry-point>)
+function(hf_gen_msl base src stage entry)
+  set(spv "${HF_GEN_SHADER_DIR}/${base}.spv")
+  set(msl "${HF_GEN_SHADER_DIR}/${base}.gen.metal")
+  if(stage STREQUAL "vert")
+    set(glslc_stage "vert")
+    set(sc_stage "vert")
+  else()
+    set(glslc_stage "frag")
+    set(sc_stage "frag")
+  endif()
+  add_custom_command(
+    OUTPUT "${msl}"
+    COMMAND "${GLSLC_EXECUTABLE}" -DHF_MSL_GEN -fshader-stage=${glslc_stage}
+            -x hlsl -fentry-point=main "${HF_SHADER_SRC}/${src}" -o "${spv}"
+    COMMAND "${SPIRV_CROSS_EXECUTABLE}" --msl --msl-decoration-binding
+            --rename-entry-point main ${entry} ${sc_stage}
+            "${spv}" --output "${msl}"
+    DEPENDS "${HF_SHADER_SRC}/${src}"
+    COMMENT "Gen MSL ${src} -> ${base}.gen.metal"
+    VERBATIM)
+  set(HF_GENERATED_MSL ${HF_GENERATED_MSL} "${msl}" PARENT_SCOPE)
+endfunction()
+
+hf_gen_msl(lit.vert    lit.vert.hlsl    vert vertex_main)
+hf_gen_msl(lit.frag    lit.frag.hlsl    frag fragment_main)
+hf_gen_msl(post.vert   post.vert.hlsl   vert post_vertex)
+hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
+hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
+
+add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
+
 add_executable(visual_test
     visual_test.mm
     # The REAL Metal RHI backend, built headless (no hal/window.h needed for the offscreen path).
@@ -34,6 +86,10 @@ add_executable(visual_test
     ${HF_ROOT}/engine/scene/mesh.cpp
 )
 
+# The generated MSL must exist before the executable's shaders are loaded at runtime; make the
+# build depend on the generation target so it always runs first.
+add_dependencies(visual_test hf_gen_shaders)
+
 # Compile all Obj-C++ with ARC.
 target_compile_options(visual_test PRIVATE -fobjc-arc)
 
@@ -42,9 +98,10 @@ target_include_directories(visual_test PRIVATE
     ${HF_ROOT}/engine
 )
 
-# Path to the hand-written MSL shader, baked in as a compile definition.
+# Path to the GENERATED MSL shaders (HLSL->SPIR-V->MSL), baked in as a compile definition.
 target_compile_definitions(visual_test PRIVATE
     HF_SHADER_DIR="${HF_ROOT}/shaders"
+    HF_GEN_SHADER_DIR="${HF_GEN_SHADER_DIR}"
 )
 
 target_link_libraries(visual_test PRIVATE

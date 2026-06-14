@@ -4,9 +4,10 @@
 // MetalDevice in HEADLESS mode (offscreen MTLTexture color + D32 depth, no window/CAMetalLayer),
 // builds the full Slice-F scene from the engine's scene layer (Mesh::Cube + Mesh::Plane: a ground
 // plane + a 3x3 grid of lit cubes, a procedural checkerboard texture), a lit graphics pipeline
-// from the hand-written MSL (shaders/lit.metal), a per-frame UBO with a directional light, and
-// per-object push-constant model matrices. It renders ONE frame, reads the offscreen texture back
-// via the RHI's CaptureNextFrame()/GetCapturedPixels() path, and writes a PNG via ImageIO.
+// from GENERATED MSL (the *.gen.metal produced at build time from the shared HLSL sources via
+// HLSL -> SPIR-V -> spirv-cross; see the sibling CMakeLists.txt), a per-frame UBO with a
+// directional light, and per-object push-constant model matrices. It renders ONE frame, reads the
+// offscreen texture back via CaptureNextFrame()/GetCapturedPixels() and writes a PNG via ImageIO.
 //
 // Unlike the first bring-up cut, this exercises MetalDevice/MetalSwapchain/MetalCommandBuffer/
 // MetalPipeline/MetalTexture/MetalBuffer through the IRHIDevice/ICommandBuffer interfaces — no
@@ -125,10 +126,15 @@ int main(int argc, char** argv) {
             // ---- Real Metal RHI device, headless (offscreen color + depth, no window). ----
             auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
 
-            // ---- Shaders: compile the hand-written MSL at runtime through the RHI. ----
-            std::string msl = LoadText(std::string(HF_SHADER_DIR) + "/lit.metal");
+            // ---- Shaders: compile GENERATED MSL at runtime through the RHI. The MSL is produced
+            // at build time from the SHARED HLSL sources (HLSL -> SPIR-V via glslc -> MSL via
+            // spirv-cross), so there is no hand-written MSL to drift. HF_GEN_SHADER_DIR points at
+            // the build dir where the .gen.metal files were emitted; entry points were renamed by
+            // spirv-cross to the stable names used here. ----
+            std::string msl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/lit.vert.gen.metal");
+            std::string mslF = LoadText(std::string(HF_GEN_SHADER_DIR) + "/lit.frag.gen.metal");
             auto vs = rhi::mtl::MakeShaderModuleFromMSL(*device, msl, "vertex_main");
-            auto fs = rhi::mtl::MakeShaderModuleFromMSL(*device, msl, "fragment_main");
+            auto fs = rhi::mtl::MakeShaderModuleFromMSL(*device, mslF, "fragment_main");
 
             // ---- Lit graphics pipeline (color = swapchain BGRA, depth test on). ----
             rhi::GraphicsPipelineDesc pdesc;
@@ -144,9 +150,10 @@ int main(int argc, char** argv) {
 
             // ---- Fullscreen post pipeline: samples the offscreen RT, applies ACES tonemap +
             // gamma + grade + vignette, writes the swapchain output (which gets captured). ----
-            std::string postMsl = LoadText(std::string(HF_SHADER_DIR) + "/post.metal");
-            auto postVs = rhi::mtl::MakeShaderModuleFromMSL(*device, postMsl, "post_vertex");
-            auto postFs = rhi::mtl::MakeShaderModuleFromMSL(*device, postMsl, "post_fragment");
+            std::string postVsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/post.vert.gen.metal");
+            std::string postFsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/post.frag.gen.metal");
+            auto postVs = rhi::mtl::MakeShaderModuleFromMSL(*device, postVsMsl, "post_vertex");
+            auto postFs = rhi::mtl::MakeShaderModuleFromMSL(*device, postFsMsl, "post_fragment");
 
             rhi::GraphicsPipelineDesc postDesc;
             postDesc.vertex = postVs.get();
@@ -161,7 +168,7 @@ int main(int argc, char** argv) {
             // ---- Depth-only shadow pipeline: transforms geometry into the light's clip space and
             // writes only depth (no fragment stage, no color attachment). Needs lightViewProj from
             // the per-frame UBO; no texture. ----
-            std::string shadowMsl = LoadText(std::string(HF_SHADER_DIR) + "/shadow.metal");
+            std::string shadowMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/shadow.vert.gen.metal");
             auto shadowVs = rhi::mtl::MakeShaderModuleFromMSL(*device, shadowMsl, "shadow_vertex");
 
             rhi::GraphicsPipelineDesc shadowDesc;
@@ -216,10 +223,14 @@ int main(int argc, char** argv) {
             const Vec3 center{0.0f, 0.5f, 0.0f};
             const float aspect = (float)W / (float)H;
             Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
-            // NOTE: math::Perspective bakes the Vulkan clip-space Y flip; the Metal backend undoes
-            // it in shaders/lit.metal (out.clip.y = -out.clip.y), so the SAME view-proj used by the
-            // Vulkan sample is passed here unchanged.
-            Mat4 proj = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
+            // NDC-Y convention, owned by the Metal BACKEND (CPU-side), not the shaders. math::
+            // Perspective/Ortho bake the Vulkan clip-space Y flip (+Y down). Metal NDC is +Y up, so
+            // we undo the flip here by negating the projection's Y row (column-major rows are m[1],
+            // m[5], m[9], m[13]) BEFORE composing the view-proj. This means the SHARED HLSL->MSL
+            // shaders need NO Metal-specific clip.y flip, so the generated MSL works unchanged.
+            auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                          p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+            Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f));
             Mat4 vp = proj * view;
 
             FrameData fd{};
@@ -235,7 +246,11 @@ int main(int argc, char** argv) {
             Vec3 sceneCenter{0.0f, 0.5f, 0.0f};
             Vec3 lightEye = sceneCenter - lightDir * 12.0f;
             Mat4 lightView = Mat4::LookAt(lightEye, sceneCenter, {0, 1, 0});
-            Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 25.0f);
+            // Same CPU-side Y-flip for the shadow light's ortho projection: the shadow-map render
+            // (generated shadow.vert MSL, no clip.y flip) and the lit pass's sample formula
+            // (smUV = proj.xy*0.5+0.5) stay self-consistent because BOTH derive from this flipped
+            // lightViewProj — exactly as before, just with the flip moved CPU-side.
+            Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 25.0f));
             Mat4 lightVP = lightOrtho * lightView;
             for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
 

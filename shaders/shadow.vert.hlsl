@@ -11,10 +11,18 @@ struct FrameData {
     float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
     float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
 };
+// See shaders/lit.vert.hlsl for the HF_MSL_GEN rationale (glslang ignores [[vk::push_constant]]).
+#ifdef HF_MSL_GEN
+[[vk::binding(1, 0)]] cbuffer Frame { FrameData f; };
+[[vk::binding(2, 0)]] cbuffer PushC { float4x4 model; };
+#define HF_MODEL model
+#else
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 [[vk::push_constant]] struct { float4x4 model; } pc;
+#define HF_MODEL pc.model
+#endif
 
 float4 main(VSInput i) : SV_Position {
-    float4 world = mul(pc.model, float4(i.pos, 1.0));
+    float4 world = mul(HF_MODEL, float4(i.pos, 1.0));
     return mul(f.lightViewProj, world);
 }

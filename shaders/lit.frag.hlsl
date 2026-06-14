@@ -34,6 +34,14 @@ float4 main(PSInput i) : SV_Target {
         float4 lp = mul(f.lightViewProj, float4(i.wpos, 1.0));
         float3 proj = lp.xyz / lp.w;
         float2 smUV = proj.xy * 0.5 + 0.5;
+        // Shadow-map texture-origin flip (Metal only). On the Metal path lightViewProj has its NDC
+        // Y-flip baked in CPU-side, so proj.y is +Y-up; the shadow map texture stores row 0 = top
+        // (V down), so V must be flipped to sample the matching texel. The shadow-map RENDER and
+        // this SAMPLE both derive from the same CPU-flipped lightViewProj, so they stay
+        // self-consistent. Vulkan keeps the original mapping (unflipped lightViewProj, V down).
+#ifdef HF_MSL_GEN
+        smUV.y = 1.0 - smUV.y;
+#endif
         float  curDepth = proj.z;
         if (smUV.x >= 0.0 && smUV.x <= 1.0 && smUV.y >= 0.0 && smUV.y <= 1.0 &&
             curDepth >= 0.0 && curDepth <= 1.0) {
