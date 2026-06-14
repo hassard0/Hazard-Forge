@@ -26,6 +26,7 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_command_buffer.mm
     ${HF_ROOT}/engine/rhi_metal/metal_pipeline.mm
     ${HF_ROOT}/engine/rhi_metal/metal_texture.mm
+    ${HF_ROOT}/engine/rhi_metal/metal_render_target.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader_load.mm
     ${HF_ROOT}/engine/rhi_metal/metal_buffer.mm

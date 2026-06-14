@@ -17,12 +17,14 @@ public:
     id<MTLDepthStencilState>   depthState() const { return depthState_; }
     bool usesFrameUniforms() const { return usesFrameUniforms_; }
     bool usesTexture() const { return usesTexture_; }
+    bool fullscreen() const { return fullscreen_; }
 
 private:
     id<MTLRenderPipelineState> pipelineState_ = nil;
     id<MTLDepthStencilState>   depthState_    = nil;
     bool usesFrameUniforms_ = false;
     bool usesTexture_       = false;
+    bool fullscreen_        = false;
 };
 
 } // namespace hf::rhi::mtl

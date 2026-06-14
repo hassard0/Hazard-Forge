@@ -4,6 +4,7 @@
 #include "rhi_metal/metal_pipeline.h"
 #include "rhi_metal/metal_buffer.h"
 #include "rhi_metal/metal_texture.h"
+#include "rhi_metal/metal_render_target.h"
 #include "rhi_metal/metal_common.h"
 #import <QuartzCore/CAMetalLayer.h>
 #include <cstring>
@@ -31,11 +32,13 @@ void MetalDevice::Init() {
     inFlight_ = dispatch_semaphore_create(kFramesInFlight);
     CreateFrameResources();
     recorder_ = std::make_unique<MetalCommandBuffer>(*this);
+    rtRecorder_ = std::make_unique<MetalCommandBuffer>(*this);
 }
 
 MetalDevice::~MetalDevice() {
     WaitIdle();
     recorder_.reset();
+    rtRecorder_.reset();
     swapchain_.reset();
     // ARC releases device_/queue_/uboBuffer_. inFlight_ is an ObjC object under ARC too.
 }
@@ -69,14 +72,39 @@ std::unique_ptr<ITexture> MetalDevice::CreateTexture(const TextureDesc& d) {
     return std::make_unique<MetalTexture>(*this, d);
 }
 
-// --- Render-targets + shadows: not yet implemented on Metal (stubs) ----------------------------
-// Master's IRHIDevice requires these (render-targets/shadows slices). The headless Slice-F scene
-// path does not exercise them, so the existing lit-cube/scene render is unaffected. They throw so
-// any future caller that needs them fails loudly rather than silently mis-rendering.
+// --- Offscreen render targets (implemented). Mirrors the Vulkan RT pass: render the scene into
+// an offscreen color+depth, then commit+wait so a later fullscreen post pass can sample the color
+// image. Metal tracks hazards automatically, so there is no explicit layout-transition bookkeeping
+// like Vulkan's — commit+waitUntilCompleted is the simplest correct fence for this headless,
+// one-shot path. -----------------------------------------------------------------------------
 
-std::unique_ptr<IRenderTarget> MetalDevice::CreateRenderTarget(uint32_t, uint32_t) {
-    throw std::runtime_error("CreateRenderTarget not implemented on Metal yet");
+std::unique_ptr<IRenderTarget> MetalDevice::CreateRenderTarget(uint32_t width, uint32_t height) {
+    return std::make_unique<MetalRenderTarget>(*this, width, height);
 }
+
+FrameContext MetalDevice::BeginRenderTargetFrame(IRenderTarget& rtBase) {
+    auto& rt = static_cast<MetalRenderTarget&>(rtBase);
+
+    // Fresh command buffer for the offscreen pass; the rtRecorder targets the RT's color+depth.
+    rtCmd_ = [queue_ commandBuffer];
+    if (!rtCmd_) Fail("BeginRenderTargetFrame: commandBuffer failed");
+
+    rtRecorder_->Begin(rtCmd_, rt.colorTexture(), rt.depthTexture(),
+                       rt.width(), rt.height());
+    return FrameContext{rtRecorder_.get()};
+}
+
+void MetalDevice::EndRenderTargetFrame(const FrameContext& frame) {
+    if (!frame.cmd || !rtCmd_) return;
+    // The caller already issued EndRenderPass() (endEncoding). Commit + wait so the RT color
+    // texture is fully written before the swapchain/post pass samples it.
+    [rtCmd_ commit];
+    [rtCmd_ waitUntilCompleted];
+    rtCmd_ = nil;
+}
+
+// --- Shadows: not yet implemented on Metal (stubs). The headless RT+post path does not exercise
+// them. They throw so any future caller fails loudly rather than silently mis-rendering. ---------
 
 std::unique_ptr<IRenderTarget> MetalDevice::CreateShadowMap(uint32_t) {
     throw std::runtime_error("CreateShadowMap not implemented on Metal yet");
@@ -92,14 +120,6 @@ void MetalDevice::EndShadowPass(const FrameContext&) {
 
 void MetalDevice::SetShadowMap(IRenderTarget&) {
     throw std::runtime_error("SetShadowMap not implemented on Metal yet");
-}
-
-FrameContext MetalDevice::BeginRenderTargetFrame(IRenderTarget&) {
-    throw std::runtime_error("BeginRenderTargetFrame not implemented on Metal yet");
-}
-
-void MetalDevice::EndRenderTargetFrame(const FrameContext&) {
-    throw std::runtime_error("EndRenderTargetFrame not implemented on Metal yet");
 }
 
 void MetalDevice::SetFrameUniforms(const void* data, uint32_t size) {

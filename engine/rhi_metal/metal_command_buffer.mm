@@ -3,6 +3,7 @@
 #include "rhi_metal/metal_pipeline.h"
 #include "rhi_metal/metal_buffer.h"
 #include "rhi_metal/metal_texture.h"
+#include "rhi_metal/metal_sampled.h"
 #include "rhi_metal/metal_common.h"
 
 namespace hf::rhi::mtl {
@@ -50,6 +51,11 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
     [encoder_ setDepthStencilState:p.depthState()];
     boundFrameUniforms_ = p.usesFrameUniforms();
 
+    // Fullscreen post pass: the [[vertex_id]]-generated triangle's winding depends on the clip
+    // convention; disable culling so it is never back-face culled to black (mirrors Vulkan, which
+    // sets cullMode NONE for fullscreen pipelines). BeginRenderPass defaults to cull-back.
+    [encoder_ setCullMode:(p.fullscreen() ? MTLCullModeNone : MTLCullModeBack)];
+
     // Bind the device's current per-frame UBO (set 0) to both stages, matching the Vulkan path
     // where BindPipeline auto-binds the frame set.
     if (boundFrameUniforms_) {
@@ -70,9 +76,12 @@ void MetalCommandBuffer::BindIndexBuffer(IBuffer& buffer) {
 }
 
 void MetalCommandBuffer::BindTexture(ITexture& texture) {
-    auto& t = static_cast<MetalTexture&>(texture);
-    [encoder_ setFragmentTexture:t.texture() atIndex:kFragTexture];
-    [encoder_ setFragmentSamplerState:t.sampler() atIndex:kFragSampler];
+    // Works for both a MetalTexture (material) and a MetalRenderTarget (offscreen color image):
+    // both implement IMetalSampled, so the post pass binds the RT exactly like a material.
+    auto* s = dynamic_cast<IMetalSampled*>(&texture);
+    if (!s) Fail("BindTexture: texture is not an IMetalSampled");
+    [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragTexture];
+    [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragSampler];
 }
 
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {

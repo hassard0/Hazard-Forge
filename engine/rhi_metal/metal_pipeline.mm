@@ -6,7 +6,8 @@
 namespace hf::rhi::mtl {
 
 MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& desc)
-    : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture) {
+    : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
+      fullscreen_(desc.fullscreen) {
     id<MTLDevice> dev = device.device();
 
     auto* vs = static_cast<MetalShaderModule*>(desc.vertex);
@@ -14,15 +15,20 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
 
     // --- Vertex descriptor from the RHI vertex layout. ---
     // Attribute shader index == RHI location. Buffer slot for vertex data == kVbVertex (0).
-    MTLVertexDescriptor* vd = [[MTLVertexDescriptor alloc] init];
-    for (const auto& a : desc.vertexLayout.attributes) {
-        vd.attributes[a.location].format = ToMetalVertexFormat(a.format);
-        vd.attributes[a.location].offset = a.offset;
-        vd.attributes[a.location].bufferIndex = kVbVertex;
+    // Fullscreen post pass: no vertex input — the MSL post vertex shader generates the triangle
+    // from [[vertex_id]], so leave the vertex descriptor nil (matches Vulkan's empty vertex input).
+    MTLVertexDescriptor* vd = nil;
+    if (!desc.fullscreen) {
+        vd = [[MTLVertexDescriptor alloc] init];
+        for (const auto& a : desc.vertexLayout.attributes) {
+            vd.attributes[a.location].format = ToMetalVertexFormat(a.format);
+            vd.attributes[a.location].offset = a.offset;
+            vd.attributes[a.location].bufferIndex = kVbVertex;
+        }
+        vd.layouts[kVbVertex].stride = desc.vertexLayout.stride;
+        vd.layouts[kVbVertex].stepFunction = MTLVertexStepFunctionPerVertex;
+        vd.layouts[kVbVertex].stepRate = 1;
     }
-    vd.layouts[kVbVertex].stride = desc.vertexLayout.stride;
-    vd.layouts[kVbVertex].stepFunction = MTLVertexStepFunctionPerVertex;
-    vd.layouts[kVbVertex].stepRate = 1;
 
     // --- Render pipeline state. ---
     MTLRenderPipelineDescriptor* rpd = [[MTLRenderPipelineDescriptor alloc] init];

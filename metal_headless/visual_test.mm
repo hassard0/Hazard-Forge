@@ -133,6 +133,25 @@ int main(int argc, char** argv) {
             pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
             auto pipeline = device->CreateGraphicsPipeline(pdesc);
 
+            // ---- Fullscreen post pipeline: samples the offscreen RT, applies ACES tonemap +
+            // gamma + grade + vignette, writes the swapchain output (which gets captured). ----
+            std::string postMsl = LoadText(std::string(HF_SHADER_DIR) + "/post.metal");
+            auto postVs = rhi::mtl::MakeShaderModuleFromMSL(*device, postMsl, "post_vertex");
+            auto postFs = rhi::mtl::MakeShaderModuleFromMSL(*device, postMsl, "post_fragment");
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get();
+            postDesc.fragment = postFs.get();
+            postDesc.colorFormat = device->Swapchain().ColorFormat();
+            postDesc.depthTest = false;          // fullscreen pass, no depth
+            postDesc.usesFrameUniforms = false;  // no per-frame UBO
+            postDesc.usesTexture = true;         // samples the RT color image
+            postDesc.fullscreen = true;          // no vertex input; 3 verts from [[vertex_id]]
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // ---- Offscreen render target (scene -> RT -> post -> output), at output size. ----
+            auto rt = device->CreateRenderTarget(W, H);
+
             // ---- Procedural checkerboard texture (256x256 RGBA8), shared by all renderables. ----
             std::vector<uint8_t> pixels = MakeCheckerboard();
             auto texture = device->CreateTexture(
@@ -178,22 +197,34 @@ int main(int argc, char** argv) {
             fd.lightColor[0] = fd.lightColor[1] = fd.lightColor[2] = fd.lightColor[3] = 1.0f;
             fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
 
-            // ---- Render one frame through the RHI and capture it. ----
+            // ---- Pass 1: render the scene into the offscreen render target (lit, textured). ----
+            {
+                auto rtc = device->BeginRenderTargetFrame(*rt);
+                if (!rtc.cmd) return fail("BeginRenderTargetFrame returned no command buffer");
+                device->SetFrameUniforms(&fd, sizeof(FrameData));
+                rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                rtc.cmd->BindPipeline(*pipeline);
+                for (scene::Renderable& r : sceneObjects) {
+                    Mat4 m = r.transform.Matrix();
+                    rtc.cmd->PushConstants(m.m, sizeof(float) * 16);
+                    rtc.cmd->BindTexture(*r.texture);
+                    rtc.cmd->BindVertexBuffer(r.mesh->vertices());
+                    rtc.cmd->BindIndexBuffer(r.mesh->indices());
+                    rtc.cmd->DrawIndexed(r.mesh->indexCount());
+                }
+                rtc.cmd->EndRenderPass();
+                device->EndRenderTargetFrame(rtc);
+            }
+
+            // ---- Pass 2: fullscreen post pass samples the RT into the swapchain output, captured.
             device->CaptureNextFrame();
             auto frame = device->BeginFrame();
             if (!frame.cmd) return fail("BeginFrame returned no command buffer (headless)");
 
-            device->SetFrameUniforms(&fd, sizeof(FrameData));
-            frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-            frame.cmd->BindPipeline(*pipeline);
-            for (scene::Renderable& r : sceneObjects) {
-                Mat4 m = r.transform.Matrix();
-                frame.cmd->PushConstants(m.m, sizeof(float) * 16);
-                frame.cmd->BindTexture(*r.texture);
-                frame.cmd->BindVertexBuffer(r.mesh->vertices());
-                frame.cmd->BindIndexBuffer(r.mesh->indices());
-                frame.cmd->DrawIndexed(r.mesh->indexCount());
-            }
+            frame.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+            frame.cmd->BindPipeline(*postPipeline);
+            frame.cmd->BindTexture(*rt);
+            frame.cmd->Draw(3);
             frame.cmd->EndRenderPass();
             device->EndFrame(frame);
 

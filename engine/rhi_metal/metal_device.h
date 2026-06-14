@@ -79,6 +79,10 @@ private:
 
     std::unique_ptr<MetalSwapchain> swapchain_;
     std::unique_ptr<MetalCommandBuffer> recorder_;
+    // Separate recorder for offscreen render-target passes (its own MTLCommandBuffer, committed +
+    // waited in EndRenderTargetFrame) so it never clobbers the swapchain recorder's frame state.
+    std::unique_ptr<MetalCommandBuffer> rtRecorder_;
+    id<MTLCommandBuffer> rtCmd_ = nil;  // in-flight render-target command buffer
 
     // Per-frame uniform buffers (shared storage), one per frame-in-flight.
     static constexpr uint32_t kFrameUboSize = 256;  // >= sizeof(FrameData) (112B), aligned
