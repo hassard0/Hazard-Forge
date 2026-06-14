@@ -32,6 +32,7 @@
 #include "scene/renderable.h"
 #include "asset/gltf_loader.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -183,6 +184,26 @@ int main(int argc, char** argv) {
             shadowDesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
             auto shadowPipeline = device->CreateGraphicsPipeline(shadowDesc);
 
+            // ---- Procedural sky pipeline: a fullscreen triangle drawn FIRST in the scene->RT
+            // pass as the background. Reads the camera basis (camFwd/Right/Up + skyParams) from the
+            // per-frame UBO; writes no depth so the scene geometry draws over it. Built from the
+            // GENERATED sky MSL (sky.vert/sky.frag .gen.metal), mirroring the Vulkan sample so the
+            // Metal background shows the same gradient sky instead of a flat clear color. ----
+            std::string skyVsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/sky.vert.gen.metal");
+            std::string skyFsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/sky.frag.gen.metal");
+            auto skyVs = rhi::mtl::MakeShaderModuleFromMSL(*device, skyVsMsl, "sky_vertex");
+            auto skyFs = rhi::mtl::MakeShaderModuleFromMSL(*device, skyFsMsl, "sky_fragment");
+
+            rhi::GraphicsPipelineDesc skyDesc;
+            skyDesc.vertex = skyVs.get();
+            skyDesc.fragment = skyFs.get();
+            skyDesc.colorFormat = device->Swapchain().ColorFormat();
+            skyDesc.depthTest = false;           // background fill: no depth test, no depth write
+            skyDesc.usesFrameUniforms = true;    // camera basis lives in the frame UBO
+            skyDesc.usesTexture = false;
+            skyDesc.fullscreen = true;           // 3 verts from [[vertex_id]]; no vertex input
+            auto skyPipeline = device->CreateGraphicsPipeline(skyDesc);
+
             // ---- Offscreen render target (scene -> RT -> post -> output), at output size. ----
             auto rt = device->CreateRenderTarget(W, H);
 
@@ -196,21 +217,16 @@ int main(int argc, char** argv) {
             auto texture = device->CreateTexture(
                 {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
-            // Flat white 1x1 texture for the glTF model: keeps its metallic F0 (= albedo) neutral
-            // so it reads as polished chrome reflecting the sky, not a checkerboard. (Matches Vulkan.)
-            const uint8_t whitePx[4] = {255, 255, 255, 255};
-            auto whiteTexture = device->CreateTexture(
-                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
-
             // ---- Primitive meshes from the scene layer. ----
             scene::Mesh cube = scene::Mesh::Cube(*device);
             scene::Mesh plane = scene::Mesh::Plane(*device);
             scene::Mesh sphere = scene::Mesh::Sphere(*device);
 
-            // ---- Real 3D model loaded from glTF (recentred to the origin by the loader),
-            // rendered as polished metal so it reflects the procedural sky via IBL. Same loader,
-            // same scene::Vertex layout, same lit pipeline as the Vulkan sample. ----
-            scene::Mesh duck = hf::asset::LoadGltfMesh(*device, HF_MODEL_PATH);
+            // ---- Real 3D model loaded from glTF: geometry + base-color texture + PBR factors.
+            // Duck.glb embeds a base-color image (decoded via stb) and a dielectric material, so
+            // it renders as a textured rubber duck. Same loader/layout/pipeline as Vulkan. ----
+            hf::asset::GltfModel duckModel = hf::asset::LoadGltfModel(*device, HF_MODEL_PATH);
+            scene::Mesh& duck = duckModel.mesh;
 
             // ---- Build the scene: a rough-dielectric ground plane + a 3x3 grid mixing shiny metal
             // spheres (on the main diagonal) with matte dielectric cubes — the canonical PBR
@@ -243,13 +259,16 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                // The glTF model as the centrepiece: one large polished-metal Duck. Matches the
-                // Vulkan sample's placement exactly so both backends render the same scene.
+                // The glTF model as the centrepiece: a textured rubber Duck. Material from the
+                // glTF (dielectric, base-color texture). Placement matches the Vulkan sample so
+                // both backends render the same scene.
                 scene::Transform duckT;
-                duckT.position = {0.0f, 1.7f, 0.0f};
+                duckT.position = {0.0f, 1.35f, 0.0f};
                 duckT.eulerRadians = {0.0f, 2.3f, 0.0f};
-                duckT.scale = {0.028f, 0.028f, 0.028f};
-                sceneObjects.push_back({&duck, whiteTexture.get(), duckT, /*metallic*/ 1.0f, /*roughness*/ 0.2f});
+                duckT.scale = {0.022f, 0.022f, 0.022f};
+                float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
+                sceneObjects.push_back({&duck, duckModel.baseColor.get(), duckT,
+                                        duckModel.metallic, duckRough});
             }
 
             // ---- Frame uniforms: same camera + light as the Vulkan Slice-F sample. ----
@@ -289,6 +308,21 @@ int main(int argc, char** argv) {
             Mat4 lightVP = lightOrtho * lightView;
             for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
 
+            // ---- Camera basis (world space) for the sky shader's view-ray reconstruction (no
+            // matrix inverse). Mirrors the Vulkan sample: fwd toward center, right = fwd x worldUp,
+            // up = right x fwd. The sky.frag MSL maps NDC -> ray using these + skyParams. Note the
+            // Metal projection Y was flipped CPU-side (+Y up); the sky shader already negates
+            // ndc.y, and reconstructs the ray from the world-space basis, so it stays consistent. ----
+            Vec3 fwd = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0.0f, 1.0f, 0.0f}));
+            Vec3 up = math::cross(right, fwd);
+            fd.camFwd[0] = fwd.x;     fd.camFwd[1] = fwd.y;     fd.camFwd[2] = fwd.z;     fd.camFwd[3] = 0.0f;
+            fd.camRight[0] = right.x; fd.camRight[1] = right.y; fd.camRight[2] = right.z; fd.camRight[3] = 0.0f;
+            fd.camUp[0] = up.x;       fd.camUp[1] = up.y;       fd.camUp[2] = up.z;       fd.camUp[3] = 0.0f;
+            fd.skyParams[0] = std::tan(0.5f * 1.04719755f);  // tan(half of 60deg fovY)
+            fd.skyParams[1] = aspect;
+            fd.skyParams[2] = 0.0f; fd.skyParams[3] = 0.0f;
+
             // ---- Pass 0: depth-only shadow pass from the light into the shadow map. Renders the
             // scene geometry (no textures) through the depth-only pipeline; the lit pass samples the
             // resulting depth for PCF shadows. ----
@@ -315,6 +349,10 @@ int main(int argc, char** argv) {
                 if (!rtc.cmd) return fail("BeginRenderTargetFrame returned no command buffer");
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
                 rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
+                // Mirrors the Vulkan sample so the Metal background shows the gradient sky.
+                rtc.cmd->BindPipeline(*skyPipeline);
+                rtc.cmd->Draw(3);
                 rtc.cmd->BindPipeline(*pipeline);
                 for (scene::Renderable& r : sceneObjects) {
                     Mat4 m = r.transform.Matrix();

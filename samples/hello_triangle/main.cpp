@@ -196,20 +196,16 @@ int main(int argc, char** argv) {
         auto texture = device->CreateTexture(
             {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
-        // Flat white 1x1 texture: used for the glTF model so its metallic F0 (= albedo) is a
-        // neutral, untinted reflector (polished chrome), rather than picking up the checkerboard.
-        const uint8_t whitePx[4] = {255, 255, 255, 255};
-        auto whiteTexture = device->CreateTexture(
-            {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
-
         // Two primitive meshes from the scene layer.
         scene::Mesh cube = scene::Mesh::Cube(*device);
         scene::Mesh plane = scene::Mesh::Plane(*device);
         scene::Mesh sphere = scene::Mesh::Sphere(*device);
 
-        // Real 3D model loaded from glTF (recentred to the origin by the loader). Rendered as
-        // polished metal so it reflects the procedural sky via IBL — the showcase for this slice.
-        scene::Mesh duck = hf::asset::LoadGltfMesh(*device, HF_MODEL_PATH);
+        // Real 3D model loaded from glTF: geometry + base-color texture + PBR material factors.
+        // The Duck.glb carries an embedded base-color image (decoded via stb) and a dielectric
+        // metallic-roughness material, so it renders as a proper textured yellow rubber duck.
+        hf::asset::GltfModel duckModel = hf::asset::LoadGltfModel(*device, HF_MODEL_PATH);
+        scene::Mesh& duck = duckModel.mesh;
 
         // Build the scene: a large ground plane + a 3x3 grid of lit cubes.
         std::vector<scene::Renderable> sceneObjects;
@@ -243,14 +239,17 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // The glTF model as the centrepiece: one large polished-metal Duck. The loader
-            // recentred it on the origin and it spans ~165 model units, so ~0.018 scale brings
-            // it to ~3 units tall; lift it so its base rests on the ground plane.
+            // The glTF model as the centrepiece: a textured rubber Duck. The loader recentred it
+            // on the origin (~165 model units across); a modest scale sits it nicely among the
+            // cubes. Material comes from the glTF: dielectric (metallic ~0), so it reads as a
+            // lit/shadowed textured duck rather than chrome. Base-color texture from the asset.
             scene::Transform duckT;
-            duckT.position = {0.0f, 1.7f, 0.0f};
+            duckT.position = {0.0f, 1.35f, 0.0f};
             duckT.eulerRadians = {0.0f, 2.3f, 0.0f};  // turn the bill toward the camera
-            duckT.scale = {0.028f, 0.028f, 0.028f};
-            sceneObjects.push_back({&duck, whiteTexture.get(), duckT, /*metallic*/ 1.0f, /*roughness*/ 0.2f});
+            duckT.scale = {0.022f, 0.022f, 0.022f};
+            float duckRough = duckModel.roughness > 0.0f ? duckModel.roughness : 0.5f;
+            sceneObjects.push_back({&duck, duckModel.baseColor.get(), duckT,
+                                    duckModel.metallic, duckRough});
         }
 
         using math::Mat4;

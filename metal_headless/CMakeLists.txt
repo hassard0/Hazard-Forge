@@ -67,6 +67,8 @@ hf_gen_msl(lit.frag    lit.frag.hlsl    frag fragment_main)
 hf_gen_msl(post.vert   post.vert.hlsl   vert post_vertex)
 hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
+hf_gen_msl(sky.vert    sky.vert.hlsl    vert sky_vertex)
+hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 
