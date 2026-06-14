@@ -208,14 +208,14 @@ int main(int argc, char** argv) {
             Mat4 vp = proj * view;
             FrameData fd{};
             for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
-            // Dim, cool directional fill so the colored point lights read clearly.
+            // Strong key directional (warm white) so cast shadows read clearly.
             fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0.0f;
-            fd.lightColor[0] = 0.32f; fd.lightColor[1] = 0.34f; fd.lightColor[2] = 0.42f; fd.lightColor[3] = 1.0f;
+            fd.lightColor[0] = 0.95f; fd.lightColor[1] = 0.93f; fd.lightColor[2] = 0.85f; fd.lightColor[3] = 1.0f;
             fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
 
-            // Three colored point lights orbiting the scene just above the cubes.
+            // Three colored point lights as tight accents (kept modest so shadows stay visible).
             fd.ptCount[0] = 3.0f;
-            const float kR = 3.0f, kH = 1.3f, kRadius = 4.5f, kInt = 1.8f;
+            const float kR = 3.0f, kH = 1.1f, kRadius = 3.2f, kInt = 1.0f;
             const float colors[3][3] = {{1.0f, 0.25f, 0.2f},   // warm red
                                         {0.2f, 1.0f, 0.35f},   // green
                                         {0.3f, 0.45f, 1.0f}};  // blue
