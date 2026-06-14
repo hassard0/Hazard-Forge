@@ -10,6 +10,9 @@ struct VSOutput {
     [[vk::location(1)]] float2 uv     : TEXCOORD0;
     [[vk::location(2)]] float3 wnormal: NORMAL;
     [[vk::location(3)]] float3 wpos    : POSITION0;
+    // Per-draw material, constant across the primitive. nointerpolation keeps it exact
+    // (no perspective division) since metallic/roughness come straight from the push constant.
+    [[vk::location(4)]] nointerpolation float2 material : TEXCOORD1; // x=metallic, y=roughness
 };
 struct FrameData {
     float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
@@ -23,14 +26,20 @@ struct FrameData {
 // `spirv-cross --msl-decoration-binding` emits exactly the engine's flat Metal buffer indices
 // (vertex: buffer0 = vertex stream, buffer1 = FrameData, buffer2 = model). The Vulkan/DXC path is
 // untouched: it keeps the real push constant and the original [[vk::binding(0,0)]] Frame.
+// The push constant now carries the per-draw material (material.x=metallic, material.y=roughness)
+// alongside the model matrix: { float4x4 model; float4 material; } = 80 bytes. BOTH the real
+// push_constant (DXC/Vulkan) and the HF_MSL_GEN cbuffer (glslc->spirv-cross->Metal) are extended
+// identically so the single HLSL source feeds both backends.
 #ifdef HF_MSL_GEN
 [[vk::binding(1, 0)]] cbuffer Frame { FrameData f; };
-[[vk::binding(2, 0)]] cbuffer PushC { float4x4 model; };
+[[vk::binding(2, 0)]] cbuffer PushC { float4x4 model; float4 material; };
 #define HF_MODEL model
+#define HF_MATERIAL material
 #else
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
-[[vk::push_constant]] struct { float4x4 model; } pc;
+[[vk::push_constant]] struct { float4x4 model; float4 material; } pc;
 #define HF_MODEL pc.model
+#define HF_MATERIAL pc.material
 #endif
 
 VSOutput main(VSInput i) {
@@ -42,5 +51,6 @@ VSOutput main(VSInput i) {
     // inverse-transpose normal matrix (pass it separately when scaled geometry is introduced).
     o.wnormal = normalize(mul((float3x3)HF_MODEL, i.normal));
     o.color = i.color; o.uv = i.uv;
+    o.material = HF_MATERIAL.xy;  // pass metallic+roughness through to the fragment
     return o;
 }

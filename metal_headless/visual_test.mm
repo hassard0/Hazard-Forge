@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
             pdesc.depthTest = true;
             pdesc.usesFrameUniforms = true;
             pdesc.usesTexture = true;
-            pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
+            pdesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material (metallic,roughness)
             auto pipeline = device->CreateGraphicsPipeline(pdesc);
 
             // ---- Fullscreen post pipeline: samples the offscreen RT, applies ACES tonemap +
@@ -195,25 +195,38 @@ int main(int argc, char** argv) {
             auto texture = device->CreateTexture(
                 {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
-            // ---- Two primitive meshes from the scene layer. ----
+            // ---- Primitive meshes from the scene layer. ----
             scene::Mesh cube = scene::Mesh::Cube(*device);
             scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
 
-            // ---- Build the Slice-F scene: a large ground plane + a 3x3 grid of lit cubes. ----
+            // ---- Build the scene: a rough-dielectric ground plane + a 3x3 grid mixing shiny metal
+            // spheres (on the main diagonal) with matte dielectric cubes — the canonical PBR
+            // material showcase, matching the Vulkan hello_triangle scene so both backends render
+            // the same material variety (metal spheres next to dielectric cubes). ----
             std::vector<scene::Renderable> sceneObjects;
             {
                 scene::Transform planeT;
                 planeT.position = {0.0f, 0.0f, 0.0f};
                 planeT.scale = {6.0f, 1.0f, 6.0f};
-                sceneObjects.push_back({&plane, texture.get(), planeT});
+                sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f});
 
                 for (int gx = -1; gx <= 1; ++gx)
                     for (int gz = -1; gz <= 1; ++gz) {
+                        bool useSphere = (gx == gz);
                         scene::Transform t;
-                        t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
-                        t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
-                        t.scale = {0.5f, 0.5f, 0.5f};
-                        sceneObjects.push_back({&cube, texture.get(), t});
+                        if (useSphere) {
+                            t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
+                            t.scale = {0.55f, 0.55f, 0.55f};
+                            // Shiny metal spheres.
+                            sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f});
+                        } else {
+                            t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
+                            t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
+                            t.scale = {0.5f, 0.5f, 0.5f};
+                            // Matte dielectric cubes.
+                            sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f});
+                        }
                     }
             }
 
@@ -283,7 +296,11 @@ int main(int argc, char** argv) {
                 rtc.cmd->BindPipeline(*pipeline);
                 for (scene::Renderable& r : sceneObjects) {
                     Mat4 m = r.transform.Matrix();
-                    rtc.cmd->PushConstants(m.m, sizeof(float) * 16);
+                    // Push { float4x4 model; float4 material(metallic,roughness,0,0) } = 80 bytes.
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                    pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                    rtc.cmd->PushConstants(pc, sizeof(pc));
                     rtc.cmd->BindTexture(*r.texture);
                     rtc.cmd->BindVertexBuffer(r.mesh->vertices());
                     rtc.cmd->BindIndexBuffer(r.mesh->indices());

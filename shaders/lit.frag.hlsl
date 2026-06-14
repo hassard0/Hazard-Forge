@@ -15,6 +15,7 @@ struct PSInput {
     [[vk::location(1)]] float2 uv     : TEXCOORD0;
     [[vk::location(2)]] float3 wnormal: NORMAL;
     [[vk::location(3)]] float3 wpos    : POSITION0;
+    [[vk::location(4)]] nointerpolation float2 material : TEXCOORD1; // x=metallic, y=roughness
 };
 static const float HF_PI = 3.14159265358979323846;
 
@@ -63,15 +64,14 @@ float4 main(PSInput i) : SV_Target {
     float3 V = normalize(f.viewPos.xyz - i.wpos);
     float3 tex = gTex.Sample(gSmp, i.uv).rgb * i.color;
 
-    // --- Fixed material params (first-cut: no per-object material system yet). ---
-    // metallic = 0.0 (all dielectric). Roughness centred at 0.45 with a subtle
-    // procedural variation from world position so neighbouring objects show varied
-    // specular highlights (purely cosmetic; a real material system is a later slice).
+    // --- Per-material PBR: metallic + roughness arrive per-draw via the push constant,
+    // passed through as flat (nointerpolation) interpolants. metallic selects between a
+    // dielectric F0 (0.04) and a metallic F0 (= albedo); roughness drives the GGX alpha and
+    // the diffuse fraction (handled inside hfCookTorrance via the (1-metallic) kd term). ---
     float3 albedo   = tex;
-    float  metallic = 0.0;
-    float  roughVar = sin(i.wpos.x * 1.7) * cos(i.wpos.z * 1.7) * 0.12;
-    float  roughness = clamp(0.45 + roughVar, 0.05, 1.0);
-    float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic); // dielectric base reflectance
+    float  metallic = saturate(i.material.x);
+    float  roughness = clamp(i.material.y, 0.05, 1.0);
+    float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic); // dielectric vs. metal base reflectance
 
     // --- Directional shadow: project world pos into the light's clip space, compare depth. ---
     // lightViewProj uses Ortho (same Y-flip as Perspective), so smUV = proj.xy*0.5+0.5 matches

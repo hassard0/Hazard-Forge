@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         pdesc.depthTest = true;
         pdesc.usesFrameUniforms = true;
         pdesc.usesTexture = true;
-        pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
+        pdesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material (metallic,roughness)
         auto pipeline = device->CreateGraphicsPipeline(pdesc);
 
         // Depth-only shadow pipeline: renders the scene from the light into the shadow map.
@@ -206,7 +206,8 @@ int main(int argc, char** argv) {
             scene::Transform planeT;
             planeT.position = {0.0f, 0.0f, 0.0f};
             planeT.scale = {6.0f, 1.0f, 6.0f};
-            sceneObjects.push_back({&plane, texture.get(), planeT});
+            // Ground plane: rough dielectric.
+            sceneObjects.push_back({&plane, texture.get(), planeT, /*metallic*/ 0.0f, /*roughness*/ 0.8f});
 
             for (int gx = -1; gx <= 1; ++gx) {
                 for (int gz = -1; gz <= 1; ++gz) {
@@ -217,12 +218,14 @@ int main(int argc, char** argv) {
                     if (useSphere) {
                         t.position = {gx * 1.8f, 0.55f, gz * 1.8f};
                         t.scale = {0.55f, 0.55f, 0.55f};
-                        sceneObjects.push_back({&sphere, texture.get(), t});
+                        // Shiny metal spheres.
+                        sceneObjects.push_back({&sphere, texture.get(), t, /*metallic*/ 1.0f, /*roughness*/ 0.15f});
                     } else {
                         t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
                         t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
                         t.scale = {0.5f, 0.5f, 0.5f};
-                        sceneObjects.push_back({&cube, texture.get(), t});
+                        // Matte dielectric cubes.
+                        sceneObjects.push_back({&cube, texture.get(), t, /*metallic*/ 0.0f, /*roughness*/ 0.5f});
                     }
                 }
             }
@@ -292,7 +295,11 @@ int main(int argc, char** argv) {
             cmd->BindPipeline(*pipeline);
             for (scene::Renderable& r : sceneObjects) {
                 Mat4 m = r.transform.Matrix();
-                cmd->PushConstants(m.m, sizeof(float) * 16);
+                // Push { float4x4 model; float4 material(metallic,roughness,0,0) } = 80 bytes.
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd->PushConstants(pc, sizeof(pc));
                 cmd->BindTexture(*r.texture);
                 cmd->BindVertexBuffer(r.mesh->vertices());
                 cmd->BindIndexBuffer(r.mesh->indices());

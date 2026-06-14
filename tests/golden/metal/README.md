@@ -2,7 +2,9 @@
 
 `scene_shadow.png` is the golden reference produced by the **real** Metal RHI backend running
 headless on an Apple M4 (`metal_headless/visual_test`), rendering the full scene (ground
-checkerboard plane + a 3×3 grid of 9 lit, textured cubes) through the complete frame pipeline:
+checkerboard plane + a 3×3 grid mixing 3 shiny metal spheres on the main diagonal with 6 matte
+dielectric cubes — the per-material PBR showcase, matching the Vulkan `hello_triangle` scene)
+through the complete frame pipeline:
 **directional shadow pass → scene into an offscreen render target → fullscreen post (FXAA + glow +
 ACES tonemap + cinematic grade + film grain + vignette)**. Deterministic — fixed camera, fixed
 light, static transforms, offscreen `MTLTexture` target, byte-exact readback; two runs diff to
@@ -11,7 +13,15 @@ light, static transforms, offscreen `MTLTexture` target, byte-exact readback; tw
 It exercises the full Metal parity surface through the `IRHIDevice` / `ICommandBuffer` seam — the
 same calls the Vulkan `hello_triangle` sample makes: `CreateShadowMap` / `BeginShadowPass` /
 `EndShadowPass`, `CreateRenderTarget` / `BeginRenderTargetFrame` / `EndRenderTargetFrame`, the
-`fullscreen` post pipeline, per-frame UBO, push-constant model matrices, and PCF shadow sampling.
+`fullscreen` post pipeline, per-frame UBO, push-constant model matrix **plus per-material
+metallic/roughness** (80-byte vertex push constant: `{ float4x4 model; float4 material; }`), and
+PCF shadow sampling.
+
+> **Re-bake (per-material PBR):** this golden was re-baked when per-object metallic/roughness
+> landed. The lit shaders now read metallic/roughness from the push constant (passed vertex→fragment
+> as a flat `nointerpolation` interpolant) instead of fixed values, so the metal spheres render
+> dark/specular-reflective (no diffuse, no env map yet) next to the bright dielectric cubes — a
+> legitimate material-driven change. Two runs diff to `0.0000`; Vulkan renders the same variety.
 
 ## Shaders are generated, not hand-written
 
