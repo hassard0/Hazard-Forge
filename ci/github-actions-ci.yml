@@ -1,0 +1,142 @@
+# Hazard Forge CI
+#
+# IMPORTANT: This file lives at ci/github-actions-ci.yml on purpose. The repo's GitHub token
+# currently LACKS the `workflow` scope, so committing a file under .github/workflows/ would make
+# `git push` fail. To ENABLE CI, move this file to .github/workflows/ci.yml with a token that has
+# the workflow scope (see ci/README.md).
+#
+# What it does:
+#   * windows-vulkan : conan install (cppstd=17 + Ninja) -> cmake configure -> build -> ctest.
+#                      This is the same pipeline scripts/verify.ps1 runs locally for Windows.
+#   * windows-asan   : the AddressSanitizer build (HF_SANITIZE=address) of the pure-C++ tests,
+#                      then ctest under ASan.
+#   * macos-metal    : documented below. GitHub-hosted macOS runners are x86_64/ARM cloud VMs that
+#                      CANNOT reach the LAN bench Mac, and they have no Metal GPU for an offscreen
+#                      golden compare that matches the bench. Run it on a SELF-HOSTED runner on the
+#                      bench Mac, or manually via scripts/verify.ps1 (which drives the bench Mac
+#                      over SSH). The job below is gated to self-hosted and is a no-op otherwise.
+
+name: ci
+
+on:
+  push:
+    branches: [master, "p3-*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-vulkan:
+    name: Windows / Vulkan (build + ctest)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (for Conan)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Conan
+        run: pip install "conan>=2.0"
+
+      - name: Conan profile
+        run: conan profile detect --force
+
+      - name: Conan install (cppstd=17 + Ninja generator)
+        run: >
+          conan install . -of build/windows-msvc-debug
+          -s build_type=Debug -s compiler.cppstd=17
+          -c tools.cmake.cmaketoolchain:generator=Ninja
+          --build=missing
+
+      # The MSVC dev environment (cl, ninja on PATH) for the configure/build steps.
+      - name: Enable MSVC dev shell
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: CMake configure
+        run: cmake --preset windows-msvc-debug
+
+      - name: Build
+        run: cmake --build --preset windows-msvc-debug
+
+      - name: Test (ctest)
+        run: ctest --preset windows-msvc-debug --output-on-failure
+
+  windows-asan:
+    name: Windows / AddressSanitizer (pure tests)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (for Conan)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Conan
+        run: pip install "conan>=2.0"
+
+      - name: Conan profile
+        run: conan profile detect --force
+
+      - name: Conan install (asan output dir)
+        run: >
+          conan install . -of build/windows-msvc-asan
+          -s build_type=Debug -s compiler.cppstd=17
+          -c tools.cmake.cmaketoolchain:generator=Ninja
+          --build=missing
+
+      - name: Enable MSVC dev shell
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      # The conan-generated CMakeUserPresets.json may include both debug and asan conan presets,
+      # which collide on the auto-named "conan-debug" preset. Pin it to the asan include only.
+      - name: Pin CMakeUserPresets to the asan build
+        shell: pwsh
+        run: |
+          @'
+          {
+            "version": 4,
+            "vendor": { "conan": {} },
+            "include": [ "build/windows-msvc-asan/build/Debug/generators/CMakePresets.json" ]
+          }
+          '@ | Set-Content -Encoding UTF8 CMakeUserPresets.json
+
+      - name: CMake configure (HF_SANITIZE=address)
+        run: cmake --preset windows-msvc-asan
+
+      - name: Build (ASan)
+        run: cmake --build --preset windows-msvc-asan
+
+      - name: Test under ASan (ctest)
+        run: ctest --preset windows-msvc-asan --output-on-failure
+
+  # ---------------------------------------------------------------------------------------------------
+  # Mac / Metal golden. GitHub-hosted runners cannot reach the LAN bench Mac and have no matching
+  # Metal GPU, so this job ONLY runs on a self-hosted runner labelled 'metal' (set one up on the
+  # bench Mac). On hosted infra the job is skipped. For day-to-day verification, run the Metal half
+  # via scripts/verify.ps1 from the Windows dev box (it SSHes into the bench Mac and compares the
+  # offscreen render to tests/golden/metal/scene_shadow.png at threshold 0.0).
+  # ---------------------------------------------------------------------------------------------------
+  macos-metal:
+    name: Mac / Metal (golden DIFF 0.0) [self-hosted only]
+    runs-on: [self-hosted, macos, metal]
+    if: ${{ contains(github.event.repository.topics, 'enable-self-hosted-metal') || github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Source the Metal/MoltenVK env, build headless, render
+        run: |
+          source ~/mac-remote-rig/env.sh
+          cmake -S metal_headless -B build-metal -G Ninja
+          cmake --build build-metal
+          ./build-metal/visual_test /tmp/verify.png
+
+      - name: Compare to golden (must be DIFF 0.0000)
+        run: |
+          source ~/mac-remote-rig/env.sh
+          ~/mac-remote-rig/compare.sh tests/golden/metal/scene_shadow.png /tmp/verify.png 0.0

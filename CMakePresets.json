@@ -22,6 +22,16 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
     },
     {
+      "name": "windows-msvc-asan",
+      "inherits": "conan-base",
+      "binaryDir": "${sourceDir}/build/windows-msvc-asan",
+      "toolchainFile": "${sourceDir}/build/windows-msvc-asan/build/Debug/generators/conan_toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "HF_SANITIZE": "address"
+      }
+    },
+    {
       "name": "macos-arm64-debug",
       "inherits": "conan-base",
       "binaryDir": "${sourceDir}/build/macos-arm64-debug",
@@ -40,12 +50,18 @@
   "buildPresets": [
     { "name": "windows-msvc-debug", "configurePreset": "windows-msvc-debug" },
     { "name": "windows-msvc-release", "configurePreset": "windows-msvc-release" },
+    { "name": "windows-msvc-asan", "configurePreset": "windows-msvc-asan" },
     { "name": "macos-arm64-debug", "configurePreset": "macos-arm64-debug" }
   ],
   "testPresets": [
     {
       "name": "windows-msvc-debug",
       "configurePreset": "windows-msvc-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "windows-msvc-asan",
+      "configurePreset": "windows-msvc-asan",
       "output": { "outputOnFailure": true }
     },
     {

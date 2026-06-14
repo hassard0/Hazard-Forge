@@ -43,10 +43,36 @@ add_library(hf_engine STATIC
   ${HF_ENGINE_COMMON_SOURCES}
   ${HF_ENGINE_BACKEND_SOURCES}
 )
+# NOTE: hf_engine is intentionally NOT sanitized. It links ASan-hostile third-party binaries
+# (vk-bootstrap, SDL) built without ASan, and is consumed by the non-sanitized sample/editor;
+# instrumenting it would cause MSVC ASan container-annotation (annotate_string/vector) link
+# mismatches. ASan is scoped to the pure-C++ core (hf_core, below) + the pure test executables.
+
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # Header-only third-party (cgltf): CGLTF_IMPLEMENTATION is defined in exactly one TU
 # (engine/asset/gltf_loader.cpp).
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
+
+# ---------------------------------------------------------------------------------------------------
+# hf_core: the backend-agnostic engine core (render graph + scene/mesh + scene_io + commands +
+# gltf loader). Depends ONLY on the abstract RHI interface header and the C++ stdlib — NO Vulkan/
+# SDL/Metal binaries. This is the AddressSanitizer-friendly slice: the pure-C++ unit tests link
+# hf_core (not hf_engine) so they can be built+run under MSVC /fsanitize=address without dragging
+# in the ASan-incompatible third-party libraries. The same .cpp are also compiled (non-ASan) inside
+# hf_engine for the live Vulkan/Metal builds; this duplicate compilation of a handful of small TUs
+# is deliberate and keeps the sanitizer scoping clean.
+add_library(hf_core STATIC
+  render/render_graph.cpp
+  scene/mesh.cpp
+  scene/scene_io.cpp
+  scene/commands.cpp
+  asset/gltf_loader.cpp
+)
+target_include_directories(hf_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../third_party
+)
+hf_apply_sanitizer(hf_core)
 
 if(APPLE)
   # ARC for all Obj-C++ TUs in this target.

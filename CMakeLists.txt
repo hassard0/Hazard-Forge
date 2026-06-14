@@ -15,6 +15,42 @@ if(MSVC)
   add_compile_options(/W4 /permissive-)
 endif()
 
+# ---------------------------------------------------------------------------------------------------
+# HF_SANITIZE: opt-in sanitizer build. off (default) | address | undefined.
+#   - The DEFAULT build is byte-for-byte unaffected (this is fully opt-in via the windows-msvc-asan
+#     preset / -DHF_SANITIZE=address).
+#   - On MSVC, address -> /fsanitize=address (UBSan is not supported by MSVC, so 'undefined' is a
+#     no-op there with a warning; it maps to -fsanitize=undefined on Clang/GCC for portability).
+#   - Applied selectively via hf_apply_sanitizer(<target>) so we can scope it to the engine + the
+#     pure-C++ test targets (which don't drag in ASan-hostile third-party binaries).
+# ---------------------------------------------------------------------------------------------------
+set(HF_SANITIZE "off" CACHE STRING "Sanitizer: off | address | undefined")
+set_property(CACHE HF_SANITIZE PROPERTY STRINGS off address undefined)
+
+function(hf_apply_sanitizer target)
+  if(HF_SANITIZE STREQUAL "off")
+    return()
+  endif()
+  if(HF_SANITIZE STREQUAL "address")
+    if(MSVC)
+      target_compile_options(${target} PRIVATE /fsanitize=address)
+      # MSVC links the ASan runtime automatically from the compile flag; nothing extra to link.
+      # Edit-and-continue / incremental + ASan are incompatible: keep debug info but no /INCREMENTAL.
+      target_link_options(${target} PRIVATE /INCREMENTAL:NO)
+    else()
+      target_compile_options(${target} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+      target_link_options(${target} PRIVATE -fsanitize=address)
+    endif()
+  elseif(HF_SANITIZE STREQUAL "undefined")
+    if(MSVC)
+      message(WARNING "HF_SANITIZE=undefined: MSVC has no UBSan; building without a sanitizer.")
+    else()
+      target_compile_options(${target} PRIVATE -fsanitize=undefined -fno-omit-frame-pointer)
+      target_link_options(${target} PRIVATE -fsanitize=undefined)
+    endif()
+  endif()
+endfunction()
+
 find_package(SDL3 REQUIRED)
 # Vulkan dependencies are only needed for the Vulkan backend (non-Apple).
 if(NOT APPLE)

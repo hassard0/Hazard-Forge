@@ -124,6 +124,53 @@ int main() {
         check(r.get<Position>(c).x == 5.0f, "view mutation applied to c");
     }
 
+    // --- re-add overwrites in place (keeps the dense slot stable) -----------
+    {
+        Registry r;
+        Entity e = r.create();
+        r.add<Position>(e, {1, 1, 1});
+        Position* first = &r.get<Position>(e);
+        r.add<Position>(e, {2, 2, 2});                  // overwrite branch in ComponentPool::Add
+        check(r.get<Position>(e).x == 2.0f, "re-add overwrites the stored value");
+        check(&r.get<Position>(e) == first, "re-add keeps the same dense slot (stable reference)");
+    }
+
+    // --- remove from the MIDDLE of a multi-element pool (swap-pop + owner fixup) --------------------
+    {
+        Registry r;
+        Entity a = r.create(), b = r.create(), c = r.create();
+        r.add<Position>(a, {10, 0, 0});
+        r.add<Position>(b, {20, 0, 0});
+        r.add<Position>(c, {30, 0, 0});
+        // Remove the middle entity: the pool must swap the last (c) into b's slot and fix c's
+        // sparse mapping so c is still reachable. (This is the ASan-relevant swap-pop path.)
+        r.remove<Position>(b);
+        check(!r.has<Position>(b), "removed middle entity has no component");
+        check(r.has<Position>(a) && r.has<Position>(c), "neighbors keep their components");
+        check(r.get<Position>(a).x == 10.0f, "entity a value intact after middle removal");
+        check(r.get<Position>(c).x == 30.0f, "entity c value intact after swap-pop relocation");
+        // Iterate: exactly a and c remain, values correct.
+        int n = 0; float sum = 0;
+        for (auto [e, pos] : r.view<Position>()) { (void)e; sum += pos.x; ++n; }
+        check(n == 2, "view yields exactly 2 after middle removal");
+        check(sum == 40.0f, "view sees a(10)+c(30) after swap-pop");
+    }
+
+    // --- destroying an entity with MULTIPLE component types drops all of them -----------------------
+    {
+        Registry r;
+        Entity e = r.create();
+        r.add<Position>(e, {1, 2, 3});
+        r.add<Velocity>(e, {4, 5, 6});
+        r.add<Tag>(e, {99});
+        check(r.has<Position>(e) && r.has<Velocity>(e) && r.has<Tag>(e), "all three components added");
+        r.destroy(e);
+        Entity e2 = r.create();  // recycles the slot
+        check(e2.index == e.index, "slot recycled after multi-component destroy");
+        check(!r.has<Position>(e2) && !r.has<Velocity>(e2) && !r.has<Tag>(e2),
+              "recycled entity inherits none of the destroyed components");
+    }
+
     // --- view picks the smallest pool as driver (rare component) ------------
     {
         Registry r;

@@ -66,6 +66,58 @@ int main() {
     Mat4 id = Mat4::Identity();
     for (int k = 0; k < 16; ++k) check(approx(rz0.m[k], id.m[k]), "RotateZ(0)==Identity");
 
+    // --- Perspective known values ------------------------------------------------------------------
+    // fov=90deg (tan(45)=1), aspect=2 -> m[0]=1/(2*1)=0.5, m[5]=-1/1=-1.
+    // zn=1, zf=11 -> m[10]=zf/(zn-zf)=11/-10=-1.1; m[14]=(zn*zf)/(zn-zf)=11/-10=-1.1.
+    {
+        Mat4 pk = Mat4::Perspective(1.5707963f /*90deg*/, 2.0f, 1.0f, 11.0f);
+        check(approx(pk.m[0], 0.5f), "persp m[0]=1/(aspect*tan) known value");
+        check(approx(pk.m[5], -1.0f), "persp m[5]=-1/tan known value");
+        check(approx(pk.m[10], -1.1f), "persp m[10] known value");
+        check(approx(pk.m[14], -1.1f), "persp m[14] known value");
+        // A point on the far plane (view z = -zf) maps to clip z/w = 1 (Vulkan [0,1] depth).
+        float zf = 11.0f;
+        float clipZ = pk.m[10] * (-zf) + pk.m[14];
+        float clipW = pk.m[11] * (-zf);
+        check(approx(clipZ / clipW, 1.0f), "persp far plane -> NDC z 1");
+        // Near plane (view z = -zn) maps to clip z/w = 0.
+        float zn = 1.0f;
+        float nClipZ = pk.m[10] * (-zn) + pk.m[14];
+        float nClipW = pk.m[11] * (-zn);
+        check(approx(nClipZ / nClipW, 0.0f), "persp near plane -> NDC z 0");
+    }
+
+    // --- Vec3 ops (cross / dot / normalize) — previously untested ----------------------------------
+    {
+        Vec3 x{1, 0, 0}, y{0, 1, 0};
+        Vec3 z = cross(x, y);                 // right-handed: x cross y = +z
+        check(approx(z.x, 0) && approx(z.y, 0) && approx(z.z, 1), "cross(x,y)=z (right-handed)");
+        check(approx(dot(x, y), 0.0f), "dot of orthogonal axes is 0");
+        check(approx(dot(x, x), 1.0f), "dot of unit axis with itself is 1");
+        Vec3 n = normalize(Vec3{0, 3, 4});    // length 5 -> (0, 0.6, 0.8)
+        check(approx(n.x, 0) && approx(n.y, 0.6f) && approx(n.z, 0.8f), "normalize(3-4-5) -> unit");
+        check(approx(std::sqrt(dot(n, n)), 1.0f), "normalized vector has unit length");
+        Vec3 zero = normalize(Vec3{0, 0, 0}); // degenerate: returns input unchanged, no NaN/div0
+        check(approx(zero.x, 0) && approx(zero.y, 0) && approx(zero.z, 0), "normalize(0) is safe");
+    }
+
+    // --- RotateX / RotateZ rotate basis vectors by 90deg correctly ---------------------------------
+    {
+        // RotateX(90): +y -> +z. Column-major apply: out.row = sum_k m[k*4+row]*v[k].
+        Mat4 rx = Mat4::RotateX(1.5707963f);
+        auto applyRow = [](const Mat4& M, const Vec3& v, int row) {
+            return M.m[0*4+row]*v.x + M.m[1*4+row]*v.y + M.m[2*4+row]*v.z;
+        };
+        Vec3 yA{0, 1, 0};
+        check(approx(applyRow(rx, yA, 0), 0.0f) && approx(applyRow(rx, yA, 1), 0.0f) &&
+              approx(applyRow(rx, yA, 2), 1.0f), "RotateX(90) maps +y to +z");
+        // RotateZ(90): +x -> +y.
+        Mat4 rz = Mat4::RotateZ(1.5707963f);
+        Vec3 xA{1, 0, 0};
+        check(approx(applyRow(rz, xA, 0), 0.0f) && approx(applyRow(rz, xA, 1), 1.0f) &&
+              approx(applyRow(rz, xA, 2), 0.0f), "RotateZ(90) maps +x to +y");
+    }
+
     if (g_fail == 0) { std::printf("math_test OK\n"); return 0; }
     std::printf("math_test: %d failures\n", g_fail);
     return 1;
