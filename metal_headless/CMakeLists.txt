@@ -92,6 +92,8 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_shader.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader_load.mm
     ${HF_ROOT}/engine/rhi_metal/metal_buffer.mm
+    # Declarative render graph (backend-agnostic; depends only on rhi/ + scene/ + std).
+    ${HF_ROOT}/engine/render/render_graph.cpp
     # Scene layer (plain C++): builds Mesh::Cube / Mesh::Plane through the RHI.
     ${HF_ROOT}/engine/scene/mesh.cpp
     # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.

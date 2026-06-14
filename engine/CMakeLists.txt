@@ -3,6 +3,7 @@
 set(HF_ENGINE_COMMON_SOURCES
   hal/window.cpp
   rhi/rhi_factory.cpp
+  render/render_graph.cpp
   scene/mesh.cpp
   asset/gltf_loader.cpp
 )

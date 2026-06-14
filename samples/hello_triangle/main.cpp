@@ -7,6 +7,7 @@
 #include "scene/transform.h"
 #include "scene/renderable.h"
 #include "asset/gltf_loader.h"
+#include "render/render_graph.h"
 
 #include <algorithm>
 #include <chrono>
@@ -489,53 +490,58 @@ int main(int argc, char** argv) {
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
             FrameData fd = makeFrameData(aspect, 0.6f);  // fixed camera; cubes + lights static
 
-            // Pass 0: depth-only shadow pass from the light into the shadow map.
-            {
-                auto sc = device->BeginShadowPass(*shadowMap);
-                device->SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
-                sc.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
-                drawDepthOnly(sc.cmd);
-                sc.cmd->EndRenderPass();
-                device->EndShadowPass(sc);
-            }
+            // --- Build the frame as a declarative render graph. The three passes (shadow -> scene
+            // -> post) become graph nodes that DECLARE their resource reads/writes; the graph topo-
+            // sorts them by dependency and drives the matching RHI Begin/End scaffolding. Same draws,
+            // same order, identical output — just expressed declaratively. ---
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
 
-            // Pass 1: render the scene into the offscreen render target (lit, samples shadow map).
-            {
-                auto rtc = device->BeginRenderTargetFrame(*rt);
-                device->SetFrameUniforms(&fd, sizeof(FrameData));
-                // Compute: advance the GPU particle sim several fixed steps so the fountain has
-                // developed by the captured frame (deterministic -> golden-stable).
-                for (int step = 0; step < 100; ++step)
-                    simulateParticles(rtc.cmd, 1.0f / 60.0f, step / 60.0f);
-                rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-                // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
-                rtc.cmd->BindPipeline(*skyPipeline);
-                rtc.cmd->Draw(3);
-                drawScene(rtc.cmd);
-                drawParticles(rtc.cmd);  // additive GPU particles over the scene
-                rtc.cmd->EndRenderPass();
-                device->EndRenderTargetFrame(rtc);
-            }
+            // Shadow pass: WRITES shadowMap (depth-only draws from the light).
+            graph.AddPass("shadow", /*reads*/{}, /*writes*/{rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
+                    cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                    drawDepthOnly(&cmd);
+                    cmd.EndRenderPass();
+                });
 
-            // Pass 2: fullscreen post pass samples the RT into the swapchain (then captured).
+            // Scene pass: READS shadowMap, WRITES sceneColor (lit scene into the offscreen RT).
+            graph.AddPass("scene", /*reads*/{rgShadow}, /*writes*/{rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    // Compute: advance the GPU particle sim several fixed steps so the fountain has
+                    // developed by the captured frame (deterministic -> golden-stable).
+                    for (int step = 0; step < 100; ++step)
+                        simulateParticles(&cmd, 1.0f / 60.0f, step / 60.0f);
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                    // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
+                    cmd.BindPipeline(*skyPipeline);
+                    cmd.Draw(3);
+                    drawScene(&cmd);
+                    drawParticles(&cmd);  // additive GPU particles over the scene
+                    cmd.EndRenderPass();
+                });
+
+            // Post pass: READS sceneColor, WRITES swapchain (fullscreen post; then captured).
+            graph.AddPass("post", /*reads*/{rgScene}, /*writes*/{rgSwap},
+                [&](rhi::IRHIDevice& /*dev*/, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                    cmd.BindPipeline(*postPipeline);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            // Arm headless capture before the graph runs the swapchain pass; re-arm on a fresh-
+            // swapchain out-of-date acquire (matches the previous inline retry exactly).
             device->CaptureNextFrame();
-            auto frame = device->BeginFrame();
-            if (!frame.cmd) {
-                // A fresh swapchain may report out-of-date on the first acquire; retry once.
-                device->CaptureNextFrame();
-                frame = device->BeginFrame();
-            }
-            if (!frame.cmd) {
-                std::fprintf(stderr, "FATAL: could not acquire a frame for capture "
-                                     "(swapchain out-of-date)\n");
-                return 1;
-            }
-            frame.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
-            frame.cmd->BindPipeline(*postPipeline);
-            frame.cmd->BindTexture(*rt);
-            frame.cmd->Draw(3);
-            frame.cmd->EndRenderPass();
-            device->EndFrame(frame);
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
 
             std::vector<uint8_t> px;
             uint32_t cw = 0, ch = 0;
@@ -588,44 +594,56 @@ int main(int argc, char** argv) {
             for (size_t i = 1; i < sceneObjects.size(); ++i)
                 sceneObjects[i].transform.eulerRadians.y = baseYaw[i] + t;
 
-            // Pass 0: depth-only shadow pass from the light into the shadow map.
-            {
-                auto sc = device->BeginShadowPass(*shadowMap);
-                device->SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
-                sc.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
-                drawDepthOnly(sc.cmd);
-                sc.cmd->EndRenderPass();
-                device->EndShadowPass(sc);
-            }
-
-            // Pass 1: render the scene into the offscreen render target (lit, samples shadow map).
-            {
-                auto rtc = device->BeginRenderTargetFrame(*rt);
-                device->SetFrameUniforms(&fd, sizeof(FrameData));
-                // Compute: advance the GPU particle sim one frame-step (clamped dt for stability).
-                float dt = std::min(t - lastT, 1.0f / 30.0f);
-                simulateParticles(rtc.cmd, dt, t);
-                rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-                // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
-                rtc.cmd->BindPipeline(*skyPipeline);
-                rtc.cmd->Draw(3);
-                drawScene(rtc.cmd);
-                drawParticles(rtc.cmd);  // additive GPU particles over the scene
-                rtc.cmd->EndRenderPass();
-                device->EndRenderTargetFrame(rtc);
-            }
+            // Compute the particle sim dt up front; the scene pass closure consumes it.
+            float dt = std::min(t - lastT, 1.0f / 30.0f);
             lastT = t;
 
-            // Pass 2: fullscreen post pass samples the RT into the swapchain.
-            auto frame = device->BeginFrame();
-            if (frame.cmd) {
-                frame.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
-                frame.cmd->BindPipeline(*postPipeline);
-                frame.cmd->BindTexture(*rt);
-                frame.cmd->Draw(3);
-                frame.cmd->EndRenderPass();
-            }
-            device->EndFrame(frame);
+            // --- Same declarative render graph as the headless path, rebuilt each frame so the
+            // per-frame closures capture this frame's `fd`, transforms and dt. shadow -> scene ->
+            // post, ordered by their declared resource dependencies. ---
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // Shadow pass: WRITES shadowMap.
+            graph.AddPass("shadow", /*reads*/{}, /*writes*/{rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
+                    cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                    drawDepthOnly(&cmd);
+                    cmd.EndRenderPass();
+                });
+
+            // Scene pass: READS shadowMap, WRITES sceneColor.
+            graph.AddPass("scene", /*reads*/{rgShadow}, /*writes*/{rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    // Compute: advance the GPU particle sim one frame-step (clamped dt for stability).
+                    simulateParticles(&cmd, dt, t);
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                    // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
+                    cmd.BindPipeline(*skyPipeline);
+                    cmd.Draw(3);
+                    drawScene(&cmd);
+                    drawParticles(&cmd);  // additive GPU particles over the scene
+                    cmd.EndRenderPass();
+                });
+
+            // Post pass: READS sceneColor, WRITES swapchain (the post pass tolerates a skipped frame
+            // via the graph's null-cmd guard, exactly as the inline `if (frame.cmd)` did).
+            graph.AddPass("post", /*reads*/{rgScene}, /*writes*/{rgSwap},
+                [&](rhi::IRHIDevice& /*dev*/, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                    cmd.BindPipeline(*postPipeline);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            graph.Execute(*device);
         }
 
         device->WaitIdle();

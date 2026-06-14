@@ -31,6 +31,7 @@
 #include "scene/transform.h"
 #include "scene/renderable.h"
 #include "asset/gltf_loader.h"
+#include "render/render_graph.h"
 
 #include <cmath>
 #include <cstdio>
@@ -431,78 +432,87 @@ int main(int argc, char** argv) {
             fd.skyParams[1] = aspect;
             fd.skyParams[2] = 0.0f; fd.skyParams[3] = 0.0f;
 
-            // ---- Pass 0: depth-only shadow pass from the light into the shadow map. Renders the
-            // scene geometry (no textures) through the depth-only pipeline; the lit pass samples the
-            // resulting depth for PCF shadows. ----
-            {
-                auto sc = device->BeginShadowPass(*shadowMap);
-                if (!sc.cmd) return fail("BeginShadowPass returned no command buffer");
-                device->SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
-                sc.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
-                sc.cmd->BindPipeline(*shadowPipeline);
-                for (scene::Renderable& r : sceneObjects) {
-                    Mat4 m = r.transform.Matrix();
-                    sc.cmd->PushConstants(m.m, sizeof(float) * 16);
-                    sc.cmd->BindVertexBuffer(r.mesh->vertices());
-                    sc.cmd->BindIndexBuffer(r.mesh->indices());
-                    sc.cmd->DrawIndexed(r.mesh->indexCount());
-                }
-                sc.cmd->EndRenderPass();
-                device->EndShadowPass(sc);
-            }
+            // ---- Build the frame as a declarative render graph. The three passes (shadow -> scene
+            // -> post) become graph nodes that DECLARE their resource reads/writes; the graph topo-
+            // sorts them by dependency and drives the matching RHI Begin/End scaffolding. Same draws,
+            // same order as before — the rendered output is byte-identical (golden DIFF 0.0000). ----
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
 
-            // ---- Pass 1: render the scene into the offscreen render target (lit, textured). ----
-            {
-                auto rtc = device->BeginRenderTargetFrame(*rt);
-                if (!rtc.cmd) return fail("BeginRenderTargetFrame returned no command buffer");
-                device->SetFrameUniforms(&fd, sizeof(FrameData));
-                // Compute: advance the GPU particle sim a fixed number of deterministic steps so the
-                // fountain has developed by the captured frame (golden-stable: fixed dt + step count).
-                for (int step = 0; step < 100; ++step) {
-                    ParticleParams pp{1.0f / 60.0f, step / 60.0f, kParticleCount, 0};
-                    rtc.cmd->BindComputePipeline(*particleCompute);
-                    rtc.cmd->BindStorageBuffer(*particleBuffer, 0);
-                    rtc.cmd->ComputePushConstants(&pp, sizeof(pp));
-                    rtc.cmd->DispatchCompute(kParticleGroups);
-                    rtc.cmd->ComputeToVertexBarrier();
-                }
-                rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-                // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
-                // Mirrors the Vulkan sample so the Metal background shows the gradient sky.
-                rtc.cmd->BindPipeline(*skyPipeline);
-                rtc.cmd->Draw(3);
-                rtc.cmd->BindPipeline(*pipeline);
-                for (scene::Renderable& r : sceneObjects) {
-                    Mat4 m = r.transform.Matrix();
-                    // Push { float4x4 model; float4 material(metallic,roughness,0,0) } = 80 bytes.
-                    float pc[20];
-                    for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
-                    pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
-                    rtc.cmd->PushConstants(pc, sizeof(pc));
-                    rtc.cmd->BindMaterial(*r.texture, *r.normalMap);
-                    rtc.cmd->BindVertexBuffer(r.mesh->vertices());
-                    rtc.cmd->BindIndexBuffer(r.mesh->indices());
-                    rtc.cmd->DrawIndexed(r.mesh->indexCount());
-                }
-                // Additive GPU particles over the scene.
-                rtc.cmd->BindPipeline(*particlePipeline);
-                rtc.cmd->BindVertexBuffer(*particleBuffer);
-                rtc.cmd->Draw(kParticleCount);
-                rtc.cmd->EndRenderPass();
-                device->EndRenderTargetFrame(rtc);
-            }
+            // ---- Pass 0 (shadow): WRITES shadowMap. Depth-only draws from the light; the lit pass
+            // samples the resulting depth for PCF shadows. ----
+            graph.AddPass("shadow", /*reads*/{}, /*writes*/{rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
+                    cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                    cmd.BindPipeline(*shadowPipeline);
+                    for (scene::Renderable& r : sceneObjects) {
+                        Mat4 m = r.transform.Matrix();
+                        cmd.PushConstants(m.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(r.mesh->vertices());
+                        cmd.BindIndexBuffer(r.mesh->indices());
+                        cmd.DrawIndexed(r.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
 
-            // ---- Pass 2: fullscreen post pass samples the RT into the swapchain output, captured.
+            // ---- Pass 1 (scene): READS shadowMap, WRITES sceneColor. Lit, textured scene into the
+            // offscreen RT (sky + geometry + additive GPU particles). ----
+            graph.AddPass("scene", /*reads*/{rgShadow}, /*writes*/{rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    // Compute: advance the GPU particle sim a fixed number of deterministic steps so
+                    // the fountain has developed by the captured frame (golden-stable).
+                    for (int step = 0; step < 100; ++step) {
+                        ParticleParams pp{1.0f / 60.0f, step / 60.0f, kParticleCount, 0};
+                        cmd.BindComputePipeline(*particleCompute);
+                        cmd.BindStorageBuffer(*particleBuffer, 0);
+                        cmd.ComputePushConstants(&pp, sizeof(pp));
+                        cmd.DispatchCompute(kParticleGroups);
+                        cmd.ComputeToVertexBarrier();
+                    }
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                    // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
+                    cmd.BindPipeline(*skyPipeline);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*pipeline);
+                    for (scene::Renderable& r : sceneObjects) {
+                        Mat4 m = r.transform.Matrix();
+                        // Push { float4x4 model; float4 material(metallic,roughness,0,0) } = 80 bytes.
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                        pc[16] = r.metallic; pc[17] = r.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*r.texture, *r.normalMap);
+                        cmd.BindVertexBuffer(r.mesh->vertices());
+                        cmd.BindIndexBuffer(r.mesh->indices());
+                        cmd.DrawIndexed(r.mesh->indexCount());
+                    }
+                    // Additive GPU particles over the scene.
+                    cmd.BindPipeline(*particlePipeline);
+                    cmd.BindVertexBuffer(*particleBuffer);
+                    cmd.Draw(kParticleCount);
+                    cmd.EndRenderPass();
+                });
+
+            // ---- Pass 2 (post): READS sceneColor, WRITES swapchain. Fullscreen post samples the RT
+            // into the swapchain output, which is then captured. ----
+            graph.AddPass("post", /*reads*/{rgScene}, /*writes*/{rgSwap},
+                [&](rhi::IRHIDevice& /*dev*/, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                    cmd.BindPipeline(*postPipeline);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            // Arm headless capture before the graph runs the swapchain pass, then execute.
             device->CaptureNextFrame();
-            auto frame = device->BeginFrame();
-            if (!frame.cmd) return fail("BeginFrame returned no command buffer (headless)");
-
-            frame.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
-            frame.cmd->BindPipeline(*postPipeline);
-            frame.cmd->BindTexture(*rt);
-            frame.cmd->Draw(3);
-            frame.cmd->EndRenderPass();
-            device->EndFrame(frame);
+            graph.Execute(*device);
 
             std::vector<uint8_t> bgra;
             uint32_t cw = 0, ch = 0;
