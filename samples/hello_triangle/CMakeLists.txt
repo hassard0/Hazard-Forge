@@ -8,6 +8,8 @@ hf_compile_shaders(
   SHADERS
     "shaders/lit.vert.hlsl:vs"
     "shaders/lit.frag.hlsl:ps"
+    "shaders/post.vert.hlsl:vs"
+    "shaders/post.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

@@ -2,17 +2,19 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include "rhi/rhi.h"
+#include "rhi_vulkan/vulkan_sampled.h"
 
 namespace hf::rhi::vk {
 
 class VulkanDevice;
 
 // Device-local sampled image + view + a pre-baked descriptor set (combined image sampler).
-class VulkanTexture final : public ITexture {
+class VulkanTexture final : public ITexture, public ISampledVk {
 public:
     VulkanTexture(VulkanDevice& device, const TextureDesc& desc);
     ~VulkanTexture() override;
     VkDescriptorSet descriptorSet() const { return set_; }
+    VkDescriptorSet vkDescriptorSet() const override { return set_; }
 
 private:
     VulkanDevice& device_;

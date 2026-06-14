@@ -23,6 +23,10 @@ public:
     std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) override;
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
+    std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) override;
+
+    FrameContext BeginRenderTargetFrame(IRenderTarget& rt) override;
+    void EndRenderTargetFrame(const FrameContext&) override;
 
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
@@ -44,6 +48,8 @@ public:
     // Per-frame UBO set (set 0). currentFrameSet() returns the set for the frame being recorded.
     VkDescriptorSetLayout frameSetLayout() const { return frameSetLayout_; }
     VkDescriptorSet currentFrameSet() const { return frameSet_[frameIndex_]; }
+    // Swapchain color format — render targets match it so the lit pipeline renders in unchanged.
+    VkFormat swapchainFormat() const { return swapchain_->vkFormat(); }
 
     // Stage host pixel data into a device-local image (synchronous; see vulkan_texture).
     void UploadToImage(VkImage image, uint32_t w, uint32_t h,
@@ -102,6 +108,15 @@ private:
     uint32_t             capW_ = 0, capH_ = 0;
 
     std::unique_ptr<class VulkanCommandBuffer> recorder_;
+
+    // Dedicated command resources for the offscreen render-target pass. Independent of the
+    // per-frame swapchain sync: BeginRenderTargetFrame records here, EndRenderTargetFrame
+    // submits + waits on rtFence_ before the swapchain pass samples the RT.
+    VkCommandPool   rtPool_  = VK_NULL_HANDLE;
+    VkCommandBuffer rtCmd_   = VK_NULL_HANDLE;
+    VkFence         rtFence_ = VK_NULL_HANDLE;
+    std::unique_ptr<class VulkanCommandBuffer> rtRecorder_;
+    class VulkanRenderTarget* rtInFlight_ = nullptr;  // RT being recorded between Begin/End
 };
 
 } // namespace hf::rhi::vk

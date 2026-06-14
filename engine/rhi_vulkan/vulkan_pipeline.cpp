@@ -33,10 +33,16 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
 
     VkPipelineVertexInputStateCreateInfo vi{
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = &binding;
-    vi.vertexAttributeDescriptionCount = (uint32_t)attrs.size();
-    vi.pVertexAttributeDescriptions = attrs.data();
+    if (desc.fullscreen) {
+        // Fullscreen pass: vertices are generated in the shader from SV_VertexID — no inputs.
+        vi.vertexBindingDescriptionCount = 0;
+        vi.vertexAttributeDescriptionCount = 0;
+    } else {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &binding;
+        vi.vertexAttributeDescriptionCount = (uint32_t)attrs.size();
+        vi.pVertexAttributeDescriptions = attrs.data();
+    }
 
     VkPipelineInputAssemblyStateCreateInfo ia{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -50,7 +56,9 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     VkPipelineRasterizationStateCreateInfo rs{
         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     rs.polygonMode = VK_POLYGON_MODE_FILL;
-    rs.cullMode = VK_CULL_MODE_BACK_BIT;
+    // Fullscreen passes generate a single triangle from SV_VertexID whose winding depends on the
+    // clip-space convention; disable culling so it is never back-face culled to black.
+    rs.cullMode = desc.fullscreen ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
 

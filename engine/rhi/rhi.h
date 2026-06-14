@@ -52,6 +52,7 @@ struct GraphicsPipelineDesc {
     uint32_t pushConstantSize = 0;   // bytes, vertex stage
     bool usesFrameUniforms = false;  // when true, layout includes the per-frame UBO set (set 0)
     bool usesTexture = false;        // when true, layout includes the material set (set 1)
+    bool fullscreen = false;         // when true: no vertex input (fullscreen triangle from SV_VertexID)
 };
 
 enum class BufferUsage { Vertex, Index, Uniform };
@@ -76,6 +77,14 @@ class IShaderModule { public: virtual ~IShaderModule() = default; };
 class IPipeline     { public: virtual ~IPipeline() = default; };
 class IBuffer       { public: virtual ~IBuffer() = default; };
 class ITexture      { public: virtual ~ITexture() = default; };
+
+// A sampleable offscreen color image (+ its own depth) you render into. Inheriting ITexture
+// lets the post pass bind it via the existing ICommandBuffer::BindTexture.
+class IRenderTarget : public ITexture {
+public:
+    virtual uint32_t width() const = 0;
+    virtual uint32_t height() const = 0;
+};
 
 // Records draw commands for one frame's swapchain image.
 class ICommandBuffer {
@@ -115,6 +124,16 @@ public:
     virtual std::unique_ptr<IPipeline> CreateGraphicsPipeline(const GraphicsPipelineDesc&) = 0;
     virtual std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) = 0;
     virtual std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) = 0;
+
+    // Offscreen render target: a sampleable color image (swapchain format) + its own depth.
+    virtual std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) = 0;
+
+    // Begin recording the scene into the render target's color+depth (dynamic rendering).
+    // Returns a FrameContext whose cmd records into the RT; pair with EndRenderTargetFrame.
+    virtual FrameContext BeginRenderTargetFrame(IRenderTarget& rt) = 0;
+    // End recording, submit, and transition the RT color to SHADER_READ_ONLY so a later pass
+    // can sample it. Blocks until the RT pass completes (so the swapchain pass sees the result).
+    virtual void EndRenderTargetFrame(const FrameContext&) = 0;
 
     // Acquire next swapchain image + begin command recording.
     // Returns FrameContext{nullptr} when the frame must be skipped this tick.

@@ -28,6 +28,15 @@ int main() {
             }
         }  // tex destroyed here (frees its descriptor set) before WaitIdle.
 
+        // Exercise the offscreen render-target create/destroy path (image+depth+set alloc/free).
+        {
+            auto rt = device->CreateRenderTarget(64, 64);
+            if (!rt) {
+                std::fprintf(stderr, "CreateRenderTarget returned null\n");
+                return 1;
+            }
+        }  // rt destroyed here (frees its descriptor set) before WaitIdle.
+
         // Exercise the per-frame UBO copy path (112-byte FrameData-sized payload).
         float dummy[28] = {0};
         device->SetFrameUniforms(dummy, sizeof(dummy));

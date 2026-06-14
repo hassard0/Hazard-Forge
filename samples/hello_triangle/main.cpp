@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
         }
     }
     try {
-        hal::Window window({"Hazard Forge — Scene", 1280, 720});
+        hal::Window window({"Hazard Forge — Post", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
 
         auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
@@ -121,6 +121,26 @@ int main(int argc, char** argv) {
         pdesc.usesTexture = true;
         pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
         auto pipeline = device->CreateGraphicsPipeline(pdesc);
+
+        // Fullscreen post pipeline: samples the offscreen RT, tonemaps + vignettes -> swapchain.
+        auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+        auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+        auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+        auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+        rhi::GraphicsPipelineDesc postDesc;
+        postDesc.vertex = postVs.get();
+        postDesc.fragment = postFs.get();
+        postDesc.colorFormat = device->Swapchain().ColorFormat();
+        postDesc.depthTest = false;          // fullscreen pass, no depth
+        postDesc.usesFrameUniforms = false;  // no per-frame UBO -> material set is set 0
+        postDesc.usesTexture = true;         // samples the RT
+        postDesc.fullscreen = true;          // no vertex input; 3 verts from SV_VertexID
+        auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+        // Offscreen render target sized to the framebuffer; recreated on resize.
+        auto rt = device->CreateRenderTarget(window.FramebufferWidth(),
+                                             window.FramebufferHeight());
 
         // Procedural checkerboard texture (256x256 RGBA8), shared by all renderables.
         std::vector<uint8_t> pixels = MakeCheckerboard();
@@ -188,6 +208,17 @@ int main(int argc, char** argv) {
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
             FrameData fd = makeFrameData(aspect);  // fixed camera; cubes static
 
+            // Pass 1: render the scene into the offscreen render target.
+            {
+                auto rtc = device->BeginRenderTargetFrame(*rt);
+                device->SetFrameUniforms(&fd, sizeof(FrameData));
+                rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                drawScene(rtc.cmd);
+                rtc.cmd->EndRenderPass();
+                device->EndRenderTargetFrame(rtc);
+            }
+
+            // Pass 2: fullscreen post pass samples the RT into the swapchain (then captured).
             device->CaptureNextFrame();
             auto frame = device->BeginFrame();
             if (!frame.cmd) {
@@ -200,9 +231,10 @@ int main(int argc, char** argv) {
                                      "(swapchain out-of-date)\n");
                 return 1;
             }
-            device->SetFrameUniforms(&fd, sizeof(FrameData));
-            frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-            drawScene(frame.cmd);
+            frame.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+            frame.cmd->BindPipeline(*postPipeline);
+            frame.cmd->BindTexture(*rt);
+            frame.cmd->Draw(3);
             frame.cmd->EndRenderPass();
             device->EndFrame(frame);
 
@@ -239,6 +271,9 @@ int main(int argc, char** argv) {
                 device->WaitIdle();
                 device->Swapchain().Recreate(window.FramebufferWidth(),
                                              window.FramebufferHeight());
+                // Recreate the offscreen RT to match the new framebuffer size.
+                rt = device->CreateRenderTarget(window.FramebufferWidth(),
+                                                window.FramebufferHeight());
             }
 
             float t = std::chrono::duration<float>(
@@ -253,12 +288,23 @@ int main(int argc, char** argv) {
             for (size_t i = 1; i < sceneObjects.size(); ++i)
                 sceneObjects[i].transform.eulerRadians.y = baseYaw[i] + t;
 
+            // Pass 1: render the scene into the offscreen render target.
+            {
+                auto rtc = device->BeginRenderTargetFrame(*rt);
+                device->SetFrameUniforms(&fd, sizeof(FrameData));
+                rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                drawScene(rtc.cmd);
+                rtc.cmd->EndRenderPass();
+                device->EndRenderTargetFrame(rtc);
+            }
+
+            // Pass 2: fullscreen post pass samples the RT into the swapchain.
             auto frame = device->BeginFrame();
             if (frame.cmd) {
-                // After BeginFrame (frame index current), before recording draws.
-                device->SetFrameUniforms(&fd, sizeof(FrameData));
-                frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-                drawScene(frame.cmd);
+                frame.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                frame.cmd->BindPipeline(*postPipeline);
+                frame.cmd->BindTexture(*rt);
+                frame.cmd->Draw(3);
                 frame.cmd->EndRenderPass();
             }
             device->EndFrame(frame);

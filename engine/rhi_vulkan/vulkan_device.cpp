@@ -5,6 +5,7 @@
 #include "rhi_vulkan/vulkan_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
+#include "rhi_vulkan/vulkan_render_target.h"
 #include <cstring>
 
 #define VMA_IMPLEMENTATION
@@ -98,10 +99,32 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     CreateTextureResources();
     CreateSyncObjects();
     recorder_ = std::make_unique<VulkanCommandBuffer>(*this);
+
+    // Dedicated command pool/buffer/fence + recorder for the offscreen render-target pass.
+    {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = graphicsQueueFamily_;
+        Check(vkCreateCommandPool(device_, &pci, nullptr, &rtPool_), "vkCreateCommandPool(rt)");
+
+        VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbi.commandPool = rtPool_;
+        cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbi.commandBufferCount = 1;
+        Check(vkAllocateCommandBuffers(device_, &cbi, &rtCmd_), "vkAllocateCommandBuffers(rt)");
+
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};  // unsignaled
+        Check(vkCreateFence(device_, &fi, nullptr, &rtFence_), "vkCreateFence(rt)");
+
+        rtRecorder_ = std::make_unique<VulkanCommandBuffer>(*this);
+    }
 }
 
 VulkanDevice::~VulkanDevice() {
     if (device_) vkDeviceWaitIdle(device_);
+    rtRecorder_.reset();
+    if (rtFence_) vkDestroyFence(device_, rtFence_, nullptr);
+    if (rtPool_) vkDestroyCommandPool(device_, rtPool_, nullptr);  // frees rtCmd_
     recorder_.reset();
     DestroySyncObjects();
     swapchain_.reset();
@@ -375,6 +398,71 @@ std::unique_ptr<IBuffer> VulkanDevice::CreateBuffer(const BufferDesc& d) {
 }
 std::unique_ptr<ITexture> VulkanDevice::CreateTexture(const TextureDesc& d) {
     return std::make_unique<VulkanTexture>(*this, d);
+}
+std::unique_ptr<IRenderTarget> VulkanDevice::CreateRenderTarget(uint32_t w, uint32_t h) {
+    return std::make_unique<VulkanRenderTarget>(*this, w, h);
+}
+
+// --- Offscreen render-target pass ---
+FrameContext VulkanDevice::BeginRenderTargetFrame(IRenderTarget& rtBase) {
+    auto& rt = static_cast<VulkanRenderTarget&>(rtBase);
+    rtInFlight_ = &rt;
+
+    Check(vkResetCommandBuffer(rtCmd_, 0), "vkResetCommandBuffer(rt)");
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(rtCmd_, &bi), "vkBeginCommandBuffer(rt)");
+
+    // Transition the RT color from its current layout -> COLOR_ATTACHMENT_OPTIMAL.
+    TransitionImage(rtCmd_, rt.colorImage(),
+                    rt.colorLayout(), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    rt.setColorLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    // Transition the RT depth UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL (cleared each frame).
+    TransitionImage(rtCmd_, rt.depthImage(),
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    rtRecorder_->Begin(rtCmd_, rt.colorView(), rt.depthView(),
+                       {rt.width(), rt.height()});
+    return FrameContext{rtRecorder_.get()};
+}
+
+void VulkanDevice::EndRenderTargetFrame(const FrameContext& frame) {
+    if (!frame.cmd || !rtInFlight_) return;
+    VulkanRenderTarget& rt = *rtInFlight_;
+
+    // The sample already called EndRenderPass() (vkCmdEndRendering). Transition the color image
+    // COLOR_ATTACHMENT -> SHADER_READ_ONLY so the later swapchain pass can sample it.
+    TransitionImage(rtCmd_, rt.colorImage(),
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    rt.setColorLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    Check(vkEndCommandBuffer(rtCmd_), "vkEndCommandBuffer(rt)");
+
+    // Submit with no semaphores; signal rtFence_ and wait so the swapchain pass sees the result.
+    VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmdSub.commandBuffer = rtCmd_;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdSub;
+    Check(vkResetFences(device_, 1, &rtFence_), "vkResetFences(rt)");
+    Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, rtFence_), "vkQueueSubmit2(rt)");
+    Check(vkWaitForFences(device_, 1, &rtFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(rt)");
+
+    rtInFlight_ = nullptr;
 }
 
 // --- Frame loop ---

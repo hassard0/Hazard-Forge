@@ -3,6 +3,7 @@
 #include "rhi_vulkan/vulkan_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
+#include "rhi_vulkan/vulkan_sampled.h"
 #include "rhi_vulkan/vk_common.h"
 
 namespace hf::rhi::vk {
@@ -75,8 +76,10 @@ void VulkanCommandBuffer::BindIndexBuffer(IBuffer& buffer) {
 }
 
 void VulkanCommandBuffer::BindTexture(ITexture& texture) {
-    auto& vt = static_cast<VulkanTexture&>(texture);
-    VkDescriptorSet s = vt.descriptorSet();
+    // Resolve the material descriptor set via the backend-internal ISampledVk interface so this
+    // works for both VulkanTexture and VulkanRenderTarget (a sampled offscreen color).
+    auto* sampled = dynamic_cast<ISampledVk*>(&texture);
+    VkDescriptorSet s = sampled ? sampled->vkDescriptorSet() : VK_NULL_HANDLE;
     // Material set index is whatever the bound pipeline put it at (1 behind a frame set, else 0).
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                             boundMaterialSet_, 1, &s, 0, nullptr);
