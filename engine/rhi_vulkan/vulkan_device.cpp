@@ -7,6 +7,7 @@
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_render_target.h"
+#include "rhi_vulkan/vulkan_pbr_material.h"
 #include <cstring>
 
 #define VMA_IMPLEMENTATION
@@ -263,6 +264,38 @@ void VulkanDevice::CreateTextureResources() {
     Check(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &texturedSetLayout_),
           "vkCreateDescriptorSetLayout");
 
+    // --- Full-PBR material set layout (set 1 for the lit-PBR pipeline only). A SEPARATE, WIDER
+    // layout so the existing 2-texture material set / lit pipeline stays byte-for-byte unchanged.
+    // Ten bindings (five sampled images + five samplers), fragment stage. The binding numbers are
+    // chosen so spirv-cross --msl-decoration-binding maps each to the flat fragment index the PBR
+    // backend binds (base 0/1, normal 3/4, metalRough 5/6, emissive 7/8, occlusion 9/10):
+    //   b0  base-color image            b1  base-color sampler
+    //   b3  normal-map image            b4  normal-map sampler
+    //   b5  metallic-roughness image    b6  metallic-roughness sampler
+    //   b7  emissive image              b8  emissive sampler
+    //   b9  occlusion image             b10 occlusion sampler
+    // (Binding 2 stays unused, matching the existing material set's gap.)
+    {
+        const uint32_t imgBindings[5] = {0, 3, 5, 7, 9};
+        const uint32_t smpBindings[5] = {1, 4, 6, 8, 10};
+        VkDescriptorSetLayoutBinding pbrBindings[10]{};
+        for (int k = 0; k < 5; ++k) {
+            pbrBindings[k * 2].binding = imgBindings[k];
+            pbrBindings[k * 2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            pbrBindings[k * 2].descriptorCount = 1;
+            pbrBindings[k * 2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            pbrBindings[k * 2 + 1].binding = smpBindings[k];
+            pbrBindings[k * 2 + 1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            pbrBindings[k * 2 + 1].descriptorCount = 1;
+            pbrBindings[k * 2 + 1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo plci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        plci.bindingCount = 10;
+        plci.pBindings = pbrBindings;
+        Check(vkCreateDescriptorSetLayout(device_, &plci, nullptr, &pbrMaterialSetLayout_),
+              "vkCreateDescriptorSetLayout(pbr)");
+    }
+
     // Pool: allow individual set frees (VulkanTexture frees its set in its dtor). Includes
     // a UNIFORM_BUFFER capacity for the per-frame UBO sets (set 0).
     // SAMPLED_IMAGE/SAMPLER counts cover material sets (set 1) plus the per-frame sets' shadow-map
@@ -271,9 +304,9 @@ void VulkanDevice::CreateTextureResources() {
     // double the per-set image/sampler capacity vs. the old single-texture material set.
     VkDescriptorPoolSize poolSizes[3]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    poolSizes[0].descriptorCount = 128 + kFramesInFlight;
+    poolSizes[0].descriptorCount = 256 + kFramesInFlight;  // +full-PBR sets (5 images each)
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    poolSizes[1].descriptorCount = 128 + kFramesInFlight;
+    poolSizes[1].descriptorCount = 256 + kFramesInFlight;  // +full-PBR sets (5 samplers each)
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -391,7 +424,22 @@ void VulkanDevice::CreateTextureResources() {
     }
 }
 
+VkDescriptorSet VulkanDevice::pbrMaterialSet(ITexture& base, ITexture& metalRough,
+                                             ITexture& normalMap, ITexture& emissive,
+                                             ITexture& occlusion) {
+    auto it = pbrMaterials_.find(&base);
+    if (it == pbrMaterials_.end()) {
+        auto mat = std::make_unique<VulkanPbrMaterial>(*this, base, metalRough, normalMap,
+                                                       emissive, occlusion);
+        it = pbrMaterials_.emplace(&base, std::move(mat)).first;
+    }
+    return it->second->descriptorSet();
+}
+
 void VulkanDevice::DestroyTextureResources() {
+    // Free the cached PBR material descriptor sets before the pool that owns them is destroyed.
+    pbrMaterials_.clear();
+
     // Per-frame UBOs + layout. Frame sets are freed when the pool below is destroyed.
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
         if (uboBuffer_[i]) vmaDestroyBuffer(allocator_, uboBuffer_[i], uboAlloc_[i]);
@@ -422,10 +470,12 @@ void VulkanDevice::DestroyTextureResources() {
 
     if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
+    if (pbrMaterialSetLayout_) vkDestroyDescriptorSetLayout(device_, pbrMaterialSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     descriptorPool_ = VK_NULL_HANDLE;
     texturedSetLayout_ = VK_NULL_HANDLE;
+    pbrMaterialSetLayout_ = VK_NULL_HANDLE;
     defaultSampler_ = VK_NULL_HANDLE;
     shadowSampler_ = VK_NULL_HANDLE;
 }

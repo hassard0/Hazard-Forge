@@ -36,6 +36,15 @@ constexpr uint32_t kFragShadowTex = 1;
 constexpr uint32_t kFragShadowSmp = 2;
 constexpr uint32_t kFragNormalTex = 3;  // gNormalMap (set1 b3 -> texture(3))
 constexpr uint32_t kFragNormalSmp = 4;  // gNormalSmp (set1 b4 -> sampler(4))
+// Full-PBR material set (Slice P): metallic-roughness / emissive / occlusion at the next flat
+// fragment indices. The lit_pbr.frag HLSL declares these at set1 b5..b10, so
+// spirv-cross --msl-decoration-binding lands them on texture(5/7/9) / sampler(6/8/10).
+constexpr uint32_t kFragMetalRoughTex = 5;  // gMetalRough  (set1 b5  -> texture(5))
+constexpr uint32_t kFragMetalRoughSmp = 6;  // gMetalRoughSmp (set1 b6 -> sampler(6))
+constexpr uint32_t kFragEmissiveTex   = 7;  // gEmissive    (set1 b7  -> texture(7))
+constexpr uint32_t kFragEmissiveSmp   = 8;  // gEmissiveSmp (set1 b8  -> sampler(8))
+constexpr uint32_t kFragOcclusionTex  = 9;  // gOcclusion   (set1 b9  -> texture(9))
+constexpr uint32_t kFragOcclusionSmp  = 10; // gOcclusionSmp (set1 b10 -> sampler(10))
 
 // Compute (kernel) binding indices. The particle compute MSL is generated from particles.comp.hlsl
 // via spirv-cross --msl-decoration-binding: the storage buffer (binding 0) -> buffer(0), and the

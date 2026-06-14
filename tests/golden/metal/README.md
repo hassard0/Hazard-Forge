@@ -1,5 +1,30 @@
 # Metal golden-image test
 
+## `pbr_helmet.png` — full glTF PBR material (Slice P)
+
+`pbr_helmet.png` is a SEPARATE golden produced by `visual_test --pbr`: a minimal full-PBR showcase
+(ground checkerboard plane + procedural sky + the **DamagedHelmet** glTF model, lit + shadowed,
+fixed camera/light). The helmet renders the complete glTF metallic-roughness material set — base
+color (sRGB), metallic-roughness (G=roughness, B=metallic), tangent-space normal map, emissive, and
+ambient occlusion — through a dedicated **lit-PBR pipeline** (`shaders/lit_pbr.frag.hlsl`, shared
+`lit.vert`) and a wider 5-texture material set bound via `ICommandBuffer::BindMaterialPBR`. The
+material textures are decoded from the embedded `.glb` images by the shared
+`asset::LoadPbrGltfModel`; tangents are computed from POSITION/UV/NORMAL (the asset has no TANGENT).
+The MSL is generated from the same HLSL by the build toolchain (`lit_pbr.frag.gen.metal`, entry
+`pbr_fragment`); the PBR map indices come from `metal_common.h` (`kFragMetalRoughTex=5`,
+`kFragEmissiveTex=7`, `kFragOcclusionTex=9`, + their samplers). Deterministic — two runs diff to
+`0.0000`. This golden is INDEPENDENT of `scene_shadow.png` / `skinning.png`, which are unchanged
+(both still diff `0.0000`) because the PBR path is an additive separate pipeline + material set.
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --pbr /tmp/pbr.png
+~/mac-remote-rig/compare.sh tests/golden/metal/pbr_helmet.png /tmp/pbr.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 `scene_shadow.png` is the golden reference produced by the **real** Metal RHI backend running
 headless on an Apple M4 (`metal_headless/visual_test`), rendering the full scene (ground
 checkerboard plane + a 3×3 grid mixing 3 shiny metal spheres on the main diagonal with 6 matte

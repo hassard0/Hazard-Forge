@@ -110,6 +110,15 @@ void VulkanCommandBuffer::BindMaterial(ITexture& base, ITexture& normalMap) {
                             boundMaterialSet_, 1, &s, 0, nullptr);
 }
 
+void VulkanCommandBuffer::BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
+                                          ITexture& emissive, ITexture& occlusion) {
+    // The device builds (once) + caches the wider full-PBR descriptor set pointing at all five
+    // textures, then we bind it at the bound pipeline's material set index.
+    VkDescriptorSet s = device_.pbrMaterialSet(base, metalRough, normalMap, emissive, occlusion);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundMaterialSet_, 1, &s, 0, nullptr);
+}
+
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     vkCmdDraw(cmd_, vertexCount, 1, firstVertex, 0);
 }

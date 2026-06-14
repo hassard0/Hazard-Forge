@@ -67,6 +67,8 @@ endfunction()
 
 hf_gen_msl(lit.vert    lit.vert.hlsl    vert vertex_main)
 hf_gen_msl(lit.frag    lit.frag.hlsl    frag fragment_main)
+# Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
+hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
 # Skinned-animation variants (Slice O): GPU skinning vertex shader (reuses lit.frag) + skinned
 # depth-only shadow vertex shader. Same HLSL->SPIR-V->MSL toolchain as the others.
 hf_gen_msl(lit_skinned.vert    lit_skinned.vert.hlsl    vert skinned_vertex)
@@ -129,6 +131,7 @@ target_compile_definitions(visual_test PRIVATE
     HF_GEN_SHADER_DIR="${HF_GEN_SHADER_DIR}"
     HF_MODEL_PATH="${HF_ROOT}/assets/models/Duck.glb"
     HF_FOX_MODEL_PATH="${HF_ROOT}/assets/models/Fox.glb"
+    HF_HELMET_MODEL_PATH="${HF_ROOT}/assets/models/DamagedHelmet.glb"
     HF_SCENE_PATH="${HF_ROOT}/assets/scenes/default.json"
 )
 

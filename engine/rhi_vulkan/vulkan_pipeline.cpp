@@ -131,10 +131,13 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     // is filled with the material layout as a harmless placeholder to keep set 2 at index 2.
     std::vector<VkDescriptorSetLayout> setLayouts;
     if (desc.usesFrameUniforms) setLayouts.push_back(device.frameSetLayout());   // set 0
+    // set 1: the lit-PBR pipeline uses the WIDER full-PBR material set layout; everything else uses
+    // the existing 2-texture material set (also the joint-set placeholder).
     if (desc.usesJointPalette && !desc.usesTexture)
         setLayouts.push_back(device.materialSetLayout());                        // set 1 placeholder
     else if (desc.usesTexture)
-        setLayouts.push_back(device.materialSetLayout());                        // set 1
+        setLayouts.push_back(desc.pbrMaterial ? device.pbrMaterialSetLayout()
+                                              : device.materialSetLayout());     // set 1
     if (desc.usesJointPalette) setLayouts.push_back(device.jointPaletteSetLayout()); // set 2
     if (!setLayouts.empty()) {
         lci.setLayoutCount = (uint32_t)setLayouts.size();

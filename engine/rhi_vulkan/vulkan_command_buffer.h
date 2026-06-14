@@ -21,6 +21,8 @@ public:
     void BindIndexBuffer(IBuffer& buffer) override;
     void BindTexture(ITexture& texture) override;
     void BindMaterial(ITexture& base, ITexture& normalMap) override;
+    void BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
+                         ITexture& emissive, ITexture& occlusion) override;
     void Draw(uint32_t vertexCount, uint32_t firstVertex) override;
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset) override;
     void PushConstants(const void* data, uint32_t size) override;

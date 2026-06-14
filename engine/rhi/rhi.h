@@ -60,6 +60,10 @@ struct GraphicsPipelineDesc {
     bool additiveBlend = false;      // when true: additive color blend (glowing particles over scene)
     bool alphaBlend = false;         // when true: standard src_alpha/one_minus_src_alpha blend (UI/ImGui)
     bool cullNone = false;           // when true: no back-face culling (ImGui draws CW-wound quads)
+    bool pbrMaterial = false;        // when true: set 1 is the WIDER full-PBR material set (5 textures:
+                                     // base/metalRough/normal/emissive/occlusion) instead of the 2-texture
+                                     // material set. Only the lit-PBR pipeline sets this; all other
+                                     // material pipelines keep the unchanged 2-texture set.
 };
 
 // Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a
@@ -118,6 +122,15 @@ public:
     // pass uses this so a normal map can perturb the shading normal. Default forwards to BindTexture
     // (base only) for backends/passes that do not implement the normal-map slot.
     virtual void BindMaterial(ITexture& base, ITexture& normalMap) { (void)normalMap; BindTexture(base); }
+    // Bind a full glTF metallic-roughness PBR material: five textures bound as one material set —
+    // base-color, metallic-roughness (G=roughness, B=metallic), tangent-space normal, emissive, and
+    // ambient-occlusion (R). The lit-PBR pass uses this. Default forwards to BindMaterial(base,
+    // normal) so passes/backends without the wider set still bind the base + normal.
+    virtual void BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
+                                 ITexture& emissive, ITexture& occlusion) {
+        (void)metalRough; (void)emissive; (void)occlusion;
+        BindMaterial(base, normalMap);
+    }
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.

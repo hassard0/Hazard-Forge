@@ -175,11 +175,20 @@ std::unique_ptr<rhi::ITexture> MakeWhiteTexture(rhi::IRHIDevice& device) {
     return device.CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
 }
 
-// Decode the material's base-color image (embedded glb buffer_view, or external/data: URI)
-// into an RGBA8 rhi::ITexture. Returns a white fallback on any failure.
-std::unique_ptr<rhi::ITexture> LoadBaseColorTexture(rhi::IRHIDevice& device,
-                                                    const cgltf_image* image) {
-    if (!image) return MakeWhiteTexture(device);
+// A 1x1 RGBA8 texture of a single constant color: used as a fallback for any absent PBR map so the
+// lit-PBR shader can always bind five textures. (r,g,b,a) each 0..255.
+std::unique_ptr<rhi::ITexture> MakeSolidTexture(rhi::IRHIDevice& device,
+                                                uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    const uint8_t px[4] = {r, g, b, a};
+    return device.CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+}
+
+// Decode a glTF image (embedded glb buffer_view, or external/data: URI) into an RGBA8 rhi::ITexture.
+// Returns nullptr if the image is absent or cannot be reached/decoded; callers substitute a sensible
+// fallback. `label` names the map in diagnostics.
+std::unique_ptr<rhi::ITexture> DecodeImage(rhi::IRHIDevice& device, const cgltf_image* image,
+                                           const char* label) {
+    if (!image) return nullptr;
 
     const stbi_uc* srcBytes = nullptr;
     int srcLen = 0;
@@ -188,33 +197,31 @@ std::unique_ptr<rhi::ITexture> LoadBaseColorTexture(rhi::IRHIDevice& device,
         // .glb: the image bytes live inside a buffer_view of an embedded buffer.
         const cgltf_buffer_view* bv = image->buffer_view;
         if (!bv->buffer || !bv->buffer->data) {
-            std::fprintf(stderr,
-                "[gltf] base-color image buffer_view has no data; using white fallback\n");
-            return MakeWhiteTexture(device);
+            std::fprintf(stderr, "[gltf] %s image buffer_view has no data; using fallback\n", label);
+            return nullptr;
         }
         srcBytes = static_cast<const stbi_uc*>(bv->buffer->data) + bv->offset;
         srcLen = static_cast<int>(bv->size);
     } else if (image->uri) {
         // External or data: URI. cgltf_load_buffers decodes data: URIs into a synthesized
         // buffer; if the loader didn't materialise it into a buffer_view we can't reach the
-        // bytes here, so fall back gracefully (the showcase asset is an embedded glb).
+        // bytes here, so fall back gracefully (the showcase assets are embedded glb).
         std::fprintf(stderr,
-            "[gltf] base-color image is a URI ('%s') without an embedded buffer_view; "
-            "using white fallback\n", image->uri);
-        return MakeWhiteTexture(device);
+            "[gltf] %s image is a URI ('%s') without an embedded buffer_view; using fallback\n",
+            label, image->uri);
+        return nullptr;
     } else {
-        return MakeWhiteTexture(device);
+        return nullptr;
     }
 
     int w = 0, h = 0, comp = 0;
     // Force 4 channels (RGBA8) to match rhi::Format::RGBA8_UNorm and the tight upload path.
     stbi_uc* pixels = stbi_load_from_memory(srcBytes, srcLen, &w, &h, &comp, 4);
     if (!pixels || w <= 0 || h <= 0) {
-        std::fprintf(stderr,
-            "[gltf] stbi_load_from_memory failed (%s); using white fallback\n",
-            stbi_failure_reason() ? stbi_failure_reason() : "unknown");
+        std::fprintf(stderr, "[gltf] %s stbi_load_from_memory failed (%s); using fallback\n", label,
+                     stbi_failure_reason() ? stbi_failure_reason() : "unknown");
         if (pixels) stbi_image_free(pixels);
-        return MakeWhiteTexture(device);
+        return nullptr;
     }
 
     rhi::TextureDesc td;
@@ -227,6 +234,18 @@ std::unique_ptr<rhi::ITexture> LoadBaseColorTexture(rhi::IRHIDevice& device,
 
     stbi_image_free(pixels);
     return tex;
+}
+
+// Decode the material's base-color image into an RGBA8 texture; white fallback on any failure.
+std::unique_ptr<rhi::ITexture> LoadBaseColorTexture(rhi::IRHIDevice& device,
+                                                    const cgltf_image* image) {
+    auto tex = DecodeImage(device, image, "base-color");
+    return tex ? std::move(tex) : MakeWhiteTexture(device);
+}
+
+// Pull the image pointer out of a glTF texture-view (texture -> image), or null if absent.
+const cgltf_image* ImageOf(const cgltf_texture_view& view) {
+    return (view.texture && view.texture->image) ? view.texture->image : nullptr;
 }
 
 // Open + parse + load buffers + validate a glTF/glb file. Returns the cgltf_data*; the
@@ -286,6 +305,60 @@ GltfModel LoadGltfModel(rhi::IRHIDevice& device, const char* path) {
     }
     auto baseColor = LoadBaseColorTexture(device, baseImg);
     return GltfModel(std::move(mesh), std::move(baseColor), metallic, roughness);
+}
+
+PbrModel LoadPbrGltfModel(rhi::IRHIDevice& device, const char* path) {
+    cgltf_data* data = OpenGltf(path);
+    struct Guard { cgltf_data* d; ~Guard() { if (d) cgltf_free(d); } } guard{data};
+
+    scene::Mesh mesh = BuildMesh(device, data, path);
+
+    // First primitive's material: metallic-roughness factors + emissive factor + the five textures.
+    const cgltf_primitive& prim = data->meshes[0].primitives[0];
+    const cgltf_material* mat = prim.material;
+
+    float metallic = 1.0f, roughness = 1.0f;
+    float emissiveF[3] = {0.0f, 0.0f, 0.0f};
+    const cgltf_image* baseImg = nullptr;
+    const cgltf_image* mrImg = nullptr;
+    const cgltf_image* normalImg = nullptr;
+    const cgltf_image* emissiveImg = nullptr;
+    const cgltf_image* occlusionImg = nullptr;
+
+    if (mat) {
+        if (mat->has_pbr_metallic_roughness) {
+            const cgltf_pbr_metallic_roughness& pbr = mat->pbr_metallic_roughness;
+            metallic = pbr.metallic_factor;
+            roughness = pbr.roughness_factor;
+            baseImg = ImageOf(pbr.base_color_texture);
+            mrImg = ImageOf(pbr.metallic_roughness_texture);
+        }
+        normalImg = ImageOf(mat->normal_texture);
+        emissiveImg = ImageOf(mat->emissive_texture);
+        occlusionImg = ImageOf(mat->occlusion_texture);
+        for (int k = 0; k < 3; ++k) emissiveF[k] = mat->emissive_factor[k];
+    }
+
+    // Decode each present texture; substitute a sensible 1x1 fallback for any absent map so the
+    // lit-PBR shader always binds five textures with neutral semantics:
+    //   base       -> white            (albedo unchanged)
+    //   metalRough -> (255,255,0,255)  G=rough=1, B=metallic=0 (then scaled by the factors)
+    //   normal     -> (128,128,255)    decodes to (0,0,1): no TBN perturbation
+    //   emissive   -> black            (adds nothing)
+    //   occlusion  -> white            R=1: no ambient occlusion
+    auto baseColor = LoadBaseColorTexture(device, baseImg);
+    auto metalRough = DecodeImage(device, mrImg, "metallic-roughness");
+    if (!metalRough) metalRough = MakeSolidTexture(device, 255, 255, 0, 255);
+    auto normalMap = DecodeImage(device, normalImg, "normal");
+    if (!normalMap) normalMap = MakeSolidTexture(device, 128, 128, 255, 255);
+    auto emissive = DecodeImage(device, emissiveImg, "emissive");
+    if (!emissive) emissive = MakeSolidTexture(device, 0, 0, 0, 255);
+    auto occlusion = DecodeImage(device, occlusionImg, "occlusion");
+    if (!occlusion) occlusion = MakeWhiteTexture(device);
+
+    return PbrModel(std::move(mesh), std::move(baseColor), std::move(metalRough),
+                    std::move(normalMap), std::move(emissive), std::move(occlusion),
+                    metallic, roughness, emissiveF);
 }
 
 // ============================== Skinned model loading ==========================================

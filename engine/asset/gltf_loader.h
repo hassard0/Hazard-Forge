@@ -88,4 +88,44 @@ struct SkinnedModel {
 // Throws std::runtime_error on parse/load/validation failure, missing POSITION, or missing skin.
 SkinnedModel LoadSkinnedGltfModel(rhi::IRHIDevice& device, const char* path);
 
+// Geometry + a FULL glTF metallic-roughness PBR material loaded from a glTF/glb file.
+//
+//  * mesh       — same geometry as LoadGltfMesh (first primitive, recentred to origin). Tangents are
+//                 the authored TANGENT if present, else computed from POSITION/UV/NORMAL.
+//  * baseColor  — sRGB albedo (RGBA8). White 1x1 fallback when absent.
+//  * metalRough — glTF packing: G channel = roughness, B channel = metallic (linear). A 1x1
+//                 (255,255,0,255) neutral fallback (rough=1, metallic=0) when absent.
+//  * normalMap  — tangent-space normal (linear). Flat (128,128,255,255) -> (0,0,1) fallback.
+//  * emissive   — sRGB emissive. Black 1x1 fallback (adds nothing) when absent.
+//  * occlusion  — R channel = ambient occlusion (linear). White 1x1 fallback (no occlusion).
+//  * metallicFactor / roughnessFactor — pbr_metallic_roughness factors (default 1.0).
+//  * emissiveFactor[3] — material emissive_factor (default 0,0,0).
+//
+// Every texture is non-null so the lit-PBR shader can always bind five textures.
+struct PbrModel {
+    scene::Mesh mesh;
+    std::unique_ptr<rhi::ITexture> baseColor;
+    std::unique_ptr<rhi::ITexture> metalRough;
+    std::unique_ptr<rhi::ITexture> normalMap;
+    std::unique_ptr<rhi::ITexture> emissive;
+    std::unique_ptr<rhi::ITexture> occlusion;
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    float emissiveFactor[3] = {0.0f, 0.0f, 0.0f};
+
+    PbrModel(scene::Mesh m,
+             std::unique_ptr<rhi::ITexture> base, std::unique_ptr<rhi::ITexture> mr,
+             std::unique_ptr<rhi::ITexture> nrm, std::unique_ptr<rhi::ITexture> emis,
+             std::unique_ptr<rhi::ITexture> occ, float met, float rough, const float emisF[3])
+        : mesh(std::move(m)), baseColor(std::move(base)), metalRough(std::move(mr)),
+          normalMap(std::move(nrm)), emissive(std::move(emis)), occlusion(std::move(occ)),
+          metallicFactor(met), roughnessFactor(rough) {
+        for (int k = 0; k < 3; ++k) emissiveFactor[k] = emisF[k];
+    }
+};
+
+// Load geometry + the full glTF metallic-roughness PBR material (5 textures + factors). See PbrModel.
+// Throws std::runtime_error on parse/load/validation failure or missing POSITION.
+PbrModel LoadPbrGltfModel(rhi::IRHIDevice& device, const char* path);
+
 } // namespace hf::asset

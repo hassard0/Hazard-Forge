@@ -5,6 +5,7 @@
 #include "rhi/rhi.h"
 #include "rhi_vulkan/vulkan_swapchain.h"
 #include "hal/window.h"
+#include <map>
 #include <memory>
 
 namespace hf::rhi::vk {
@@ -54,6 +55,10 @@ public:
     // The material set layout logically lives at set 1 (set index decided by the pipeline
     // layout array); the layout object is identical to the Slice C textured set layout.
     VkDescriptorSetLayout materialSetLayout() const { return texturedSetLayout_; }
+    // The wider full-PBR material set layout (set 1 for the lit-PBR pipeline only): 5 sampled
+    // images + 5 samplers (base/normal/metalRough/emissive/occlusion). Separate from the 2-texture
+    // material set so the existing lit pipeline is unaffected.
+    VkDescriptorSetLayout pbrMaterialSetLayout() const { return pbrMaterialSetLayout_; }
     VkDescriptorPool descriptorPool() const { return descriptorPool_; }
     // Per-frame UBO set (set 0). currentFrameSet() returns the set for the frame being recorded.
     VkDescriptorSetLayout frameSetLayout() const { return frameSetLayout_; }
@@ -71,6 +76,13 @@ public:
     // Stage host pixel data into a device-local image (synchronous; see vulkan_texture).
     void UploadToImage(VkImage image, uint32_t w, uint32_t h,
                        const void* data, uint64_t size);
+
+    // Return (building + caching on first use) the descriptor set for a full-PBR material — the
+    // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
+    // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
+    // already-built set without re-issuing descriptor writes each frame. Lives until device teardown.
+    VkDescriptorSet pbrMaterialSet(ITexture& base, ITexture& metalRough, ITexture& normalMap,
+                                   ITexture& emissive, ITexture& occlusion);
 
 private:
     void CreateSyncObjects();
@@ -97,6 +109,7 @@ private:
     VkSampler             defaultSampler_    = VK_NULL_HANDLE;
     VkSampler             shadowSampler_     = VK_NULL_HANDLE;  // clamp-to-edge linear (shadow map)
     VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout pbrMaterialSetLayout_ = VK_NULL_HANDLE;  // wider set 1 for lit-PBR
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the
@@ -123,6 +136,10 @@ private:
     VmaAllocation   jointAlloc_[kFramesInFlight]{};
     void*           jointMapped_[kFramesInFlight]{};
     VkDescriptorSet jointSet_[kFramesInFlight]{};
+
+    // Cache of built full-PBR material descriptor sets, keyed on the base-texture pointer. Owns the
+    // VulkanPbrMaterial objects for the device's lifetime (freed on teardown before the pool dies).
+    std::map<ITexture*, std::unique_ptr<class VulkanPbrMaterial>> pbrMaterials_;
 
     std::unique_ptr<VulkanSwapchain> swapchain_;
 

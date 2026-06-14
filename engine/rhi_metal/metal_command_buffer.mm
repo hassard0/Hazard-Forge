@@ -129,6 +129,24 @@ void MetalCommandBuffer::BindMaterial(ITexture& base, ITexture& normalMap) {
     [encoder_ setFragmentSamplerState:n->sampledSampler() atIndex:kFragNormalSmp];
 }
 
+void MetalCommandBuffer::BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
+                                         ITexture& emissive, ITexture& occlusion) {
+    // Full glTF metallic-roughness material: bind all five image+sampler pairs at the flat fragment
+    // indices the generated lit_pbr.frag MSL declares (base 0/1, normal 3/4, metalRough 5/6,
+    // emissive 7/8, occlusion 9/10).
+    auto bind = [&](ITexture& t, uint32_t tex, uint32_t smp) {
+        auto* s = dynamic_cast<IMetalSampled*>(&t);
+        if (!s) Fail("BindMaterialPBR: texture is not an IMetalSampled");
+        [encoder_ setFragmentTexture:s->sampledTexture() atIndex:tex];
+        [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:smp];
+    };
+    bind(base,       kFragTexture,        kFragSampler);
+    bind(normalMap,  kFragNormalTex,      kFragNormalSmp);
+    bind(metalRough, kFragMetalRoughTex,  kFragMetalRoughSmp);
+    bind(emissive,   kFragEmissiveTex,    kFragEmissiveSmp);
+    bind(occlusion,  kFragOcclusionTex,   kFragOcclusionSmp);
+}
+
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     // Point list (GPU particles) vs the default triangle list (geometry / fullscreen tris).
     MTLPrimitiveType prim = boundPointList_ ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle;
