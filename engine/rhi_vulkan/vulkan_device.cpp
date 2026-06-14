@@ -215,7 +215,7 @@ void VulkanDevice::UploadToImage(VkImage image, uint32_t w, uint32_t h,
     Check(vmaCreateBuffer(allocator_, &bci, &aci, &staging, &stagingAlloc, &info),
           "vmaCreateBuffer(staging)");
     std::memcpy(info.pMappedData, data, size);
-    vmaFlushAllocation(allocator_, stagingAlloc, 0, size);
+    Check(vmaFlushAllocation(allocator_, stagingAlloc, 0, size), "vmaFlushAllocation(staging)");
 
     // 2. Transient one-time command buffer.
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
