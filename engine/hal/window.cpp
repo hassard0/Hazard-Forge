@@ -13,7 +13,9 @@ Window::Window(const WindowConfig& cfg) {
     window_ = SDL_CreateWindow(cfg.title.c_str(), cfg.width, cfg.height,
                                SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window_) {
-        throw std::runtime_error(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
+        std::string err = std::string("SDL_CreateWindow failed: ") + SDL_GetError();
+        SDL_Quit();  // constructor failed: dtor won't run, so undo SDL_Init here
+        throw std::runtime_error(err);
     }
 }
 
