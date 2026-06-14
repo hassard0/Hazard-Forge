@@ -14,6 +14,8 @@ public:
     VkPipelineLayout layout() const { return layout_; }
     // True when the pipeline layout has the per-frame UBO set (set 0); BindPipeline binds it.
     bool hasFrameSet() const { return hasFrameSet_; }
+    // Set index the material (texture) descriptor occupies: 1 if a frame set precedes it, else 0.
+    uint32_t materialSetIndex() const { return hasFrameSet_ ? 1u : 0u; }
 
 private:
     VkDevice device_;

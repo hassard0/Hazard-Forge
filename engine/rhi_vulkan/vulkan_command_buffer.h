@@ -32,6 +32,7 @@ private:
     VkImageView depthView_ = VK_NULL_HANDLE;
     VkExtent2D extent_{};
     VkPipelineLayout boundLayout_ = VK_NULL_HANDLE;
+    uint32_t boundMaterialSet_ = 0;  // set index for BindTexture; from the bound pipeline
 };
 
 } // namespace hf::rhi::vk

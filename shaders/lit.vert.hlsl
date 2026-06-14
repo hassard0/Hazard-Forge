@@ -20,6 +20,8 @@ VSOutput main(VSInput i) {
     float4 world = mul(pc.model, float4(i.pos, 1.0));
     o.wpos = world.xyz;
     o.clip = mul(f.viewProj, world);
+    // (float3x3)model is correct for rotation + uniform scale only. Non-uniform scale needs the
+    // inverse-transpose normal matrix (pass it separately when scaled geometry is introduced).
     o.wnormal = normalize(mul((float3x3)pc.model, i.normal));
     o.color = i.color; o.uv = i.uv;
     return o;

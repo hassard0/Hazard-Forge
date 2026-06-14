@@ -213,8 +213,10 @@ void VulkanDevice::CreateTextureResources() {
         VmaAllocationCreateInfo aci{};
         aci.usage = VMA_MEMORY_USAGE_AUTO;
         aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                    VMA_ALLOCATION_CREATE_MAPPED_BIT |
-                    VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT;
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        // HOST_COHERENT is required (not preferred): guarantees host-visible mapped memory, so
+        // uboMapped_ is always non-null and SetFrameUniforms needs no flush. Do not relax this
+        // without also handling a possibly-null mapped pointer.
         aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         VmaAllocationInfo info{};
         Check(vmaCreateBuffer(allocator_, &bci, &aci, &uboBuffer_[i], &uboAlloc_[i], &info),
