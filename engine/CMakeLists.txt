@@ -6,6 +6,7 @@ set(HF_ENGINE_COMMON_SOURCES
   render/render_graph.cpp
   scene/mesh.cpp
   scene/scene_io.cpp
+  scene/commands.cpp
   asset/gltf_loader.cpp
 )
 

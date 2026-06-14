@@ -1,0 +1,18 @@
+[
+  { "op": "dump" },
+
+  { "op": "list" },
+
+  { "op": "set_transform", "entity": 9, "position": [0, 3.0, 0] },
+
+  { "op": "set_material", "entity": 2, "metallic": 1.0, "roughness": 0.2 },
+
+  { "op": "add", "mesh": "sphere", "baseColor": "checker", "normalMap": "flat_normal",
+    "metallic": 1.0, "roughness": 0.15, "position": [0, 0.6, 0], "scale": [0.6, 0.6, 0.6] },
+
+  { "op": "remove", "entity": 3 },
+
+  { "op": "list" },
+
+  { "op": "capture", "path": "hf_commands.bmp" }
+]

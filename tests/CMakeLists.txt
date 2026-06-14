@@ -17,3 +17,7 @@ add_test(NAME ecs_test COMMAND ecs_test)
 add_executable(scene_io_test scene_io_test.cpp)
 target_link_libraries(scene_io_test PRIVATE hf_engine)
 add_test(NAME scene_io_test COMMAND scene_io_test)
+
+add_executable(commands_test commands_test.cpp)
+target_link_libraries(commands_test PRIVATE hf_engine)
+add_test(NAME commands_test COMMAND commands_test)

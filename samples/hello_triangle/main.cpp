@@ -8,6 +8,7 @@
 #include "scene/renderable.h"
 #include "scene/components.h"
 #include "scene/scene_io.h"
+#include "scene/commands.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "render/render_graph.h"
@@ -159,12 +160,19 @@ int main(int argc, char** argv) {
     // --shot <path>: render one frame headless, write a BMP, and exit (no present loop).
     // --dump-scene: load the scene from data, print DumpScene(...) JSON to stdout, exit 0 (headless,
     //               no render — lets an agent inspect the machine-readable scene state).
+    // --commands <file.json>: build the default scene, then apply the JSON command script (mutate the
+    //               live ECS, dump/list to stdout, capture renders via the offscreen --shot path),
+    //               then exit 0. This is the agentic command channel — an AI agent/CI drives the
+    //               engine headlessly from a script. Separate from --editor / interactive.
     const char* shotPath = nullptr;
+    const char* commandsPath = nullptr;
     bool dumpScene = false;
     bool editor = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
+            commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
             dumpScene = true;
         } else if (std::strcmp(argv[i], "--editor") == 0) {
@@ -531,8 +539,12 @@ int main(int argc, char** argv) {
             }
         };
 
-        // --- Headless capture mode: render exactly one frame and write it to a BMP. ---
-        if (shotPath) {
+        // --- Render exactly one frame of the CURRENT scene and write it to a BMP at `path`. This is
+        // the shared headless capture: --shot calls it once; the --commands "capture" op calls it per
+        // capture command (so a script's captures reflect whatever mutations preceded them). It reads
+        // the live ECS via drawScene/drawDepthOnly, so the duck-moved / sphere-added / cube-removed
+        // scene is exactly what lands in the file. Returns false on a write/capture failure. ---
+        auto captureToFile = [&](const char* path) -> bool {
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
@@ -599,23 +611,47 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> px;
             uint32_t cw = 0, ch = 0;
             if (device->GetCapturedPixels(px, cw, ch)) {
-                if (!WriteBMP(shotPath, px, cw, ch)) {
-                    std::fprintf(stderr, "FATAL: could not write BMP to %s\n", shotPath);
+                if (!WriteBMP(path, px, cw, ch)) {
+                    std::fprintf(stderr, "FATAL: could not write BMP to %s\n", path);
                     device->WaitIdle();
-                    return 1;
+                    return false;
                 }
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
                 device->WaitIdle();
-                return 1;
+                return false;
             }
             device->WaitIdle();
+            std::printf("wrote %s (%ux%u)\n", path, cw, ch);
+            return true;
+        };
+
+        // Free the editor UI RHI + ImGui context before the device is torn down (the headless
+        // capture/command paths exit here; the interactive loop frees these at the bottom).
+        auto teardownEditor = [&]() {
 #ifdef HF_HAS_EDITOR
-            uiRenderer.reset();  // free UI RHI resources before the device is torn down
+            uiRenderer.reset();
             if (imguiInited) ImGui::DestroyContext();
 #endif
-            std::printf("wrote %s (%ux%u)\n", shotPath, cw, ch);
-            return 0;
+        };
+
+        // --- Headless capture mode: render one frame of the default scene, write a BMP, exit. ---
+        if (shotPath) {
+            bool ok = captureToFile(shotPath);
+            teardownEditor();
+            return ok ? 0 : 1;
+        }
+
+        // --- Agentic command mode: apply the JSON command script to the live ECS (mutate / dump /
+        // capture), then exit. The "capture" op renders the CURRENT (mutated) scene via the shared
+        // captureToFile path, so a script's captures reflect everything that ran before them. ---
+        if (commandsPath) {
+            scene::CaptureFn capture = [&](const char* path) { return captureToFile(path); };
+            bool ok = scene::RunCommands(registry, resources, commandsPath, capture);
+            device->WaitIdle();
+            teardownEditor();
+            if (!ok) std::fprintf(stderr, "one or more commands failed\n");
+            return ok ? 0 : 1;
         }
 
         // Capture each spinning entity's authored base yaw so the interactive loop can spin
