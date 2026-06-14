@@ -16,15 +16,62 @@ struct PSInput {
     [[vk::location(2)]] float3 wnormal: NORMAL;
     [[vk::location(3)]] float3 wpos    : POSITION0;
 };
+static const float HF_PI = 3.14159265358979323846;
+
+// GGX / Trowbridge-Reitz normal distribution. alpha = roughness^2.
+float hfDistributionGGX(float NoH, float alpha) {
+    float a2 = alpha * alpha;
+    float d  = (NoH * NoH) * (a2 - 1.0) + 1.0;
+    return a2 / max(HF_PI * d * d, 1e-7);
+}
+// Smith geometry with Schlick-GGX (direct-lighting k = (r+1)^2 / 8).
+float hfGeometrySchlickGGX(float NoX, float k) {
+    return NoX / (NoX * (1.0 - k) + k);
+}
+float hfGeometrySmith(float NoV, float NoL, float roughness) {
+    float r = roughness + 1.0;
+    float k = (r * r) / 8.0;
+    return hfGeometrySchlickGGX(NoV, k) * hfGeometrySchlickGGX(NoL, k);
+}
+// Fresnel-Schlick.
+float3 hfFresnelSchlick(float cosTheta, float3 F0) {
+    return F0 + (float3(1.0, 1.0, 1.0) - F0) * pow(saturate(1.0 - cosTheta), 5.0);
+}
+// Cook-Torrance contribution for a single light of given radiance.
+float3 hfCookTorrance(float3 N, float3 V, float3 L, float3 radiance,
+                      float3 albedo, float metallic, float roughness, float3 F0) {
+    float3 H   = normalize(L + V);
+    float  NoV = max(dot(N, V), 1e-4);
+    float  NoL = max(dot(N, L), 0.0);
+    float  NoH = max(dot(N, H), 0.0);
+    float  VoH = max(dot(V, H), 0.0);
+    float  alpha = roughness * roughness;
+
+    float  D = hfDistributionGGX(NoH, alpha);
+    float  G = hfGeometrySmith(NoV, NoL, roughness);
+    float3 F = hfFresnelSchlick(VoH, F0);
+
+    float3 spec = (D * G) * F / max(4.0 * NoV * NoL, 1e-4);
+    // Energy conservation: diffuse only from the non-reflected, non-metallic fraction.
+    float3 kd = (float3(1.0, 1.0, 1.0) - F) * (1.0 - metallic);
+    float3 diff = kd * albedo / HF_PI;
+    return (diff + spec) * radiance * NoL;
+}
+
 float4 main(PSInput i) : SV_Target {
     float3 N = normalize(i.wnormal);
-    float3 L = normalize(-f.lightDir.xyz);
-    float  diff = max(dot(N, L), 0.0);
     float3 V = normalize(f.viewPos.xyz - i.wpos);
-    float3 H = normalize(L + V);
-    float  spec = pow(max(dot(N, H), 0.0), 32.0);
-    float  ambient = 0.12;
     float3 tex = gTex.Sample(gSmp, i.uv).rgb * i.color;
+
+    // --- Fixed material params (first-cut: no per-object material system yet). ---
+    // metallic = 0.0 (all dielectric). Roughness centred at 0.45 with a subtle
+    // procedural variation from world position so neighbouring objects show varied
+    // specular highlights (purely cosmetic; a real material system is a later slice).
+    float3 albedo   = tex;
+    float  metallic = 0.0;
+    float  roughVar = sin(i.wpos.x * 1.7) * cos(i.wpos.z * 1.7) * 0.12;
+    float  roughness = clamp(0.45 + roughVar, 0.05, 1.0);
+    float3 F0 = lerp(float3(0.04, 0.04, 0.04), albedo, metallic); // dielectric base reflectance
 
     // --- Directional shadow: project world pos into the light's clip space, compare depth. ---
     // lightViewProj uses Ortho (same Y-flip as Perspective), so smUV = proj.xy*0.5+0.5 matches
@@ -57,9 +104,16 @@ float4 main(PSInput i) : SV_Target {
         }
     }
 
-    // Ambient is unshadowed; the directional diffuse+spec is multiplied by the shadow factor.
-    float3 rgb = tex * (ambient * f.lightColor.rgb)
-               + shadow * (tex * (diff * f.lightColor.rgb) + spec * f.lightColor.rgb * 0.4);
+    // Small ambient term (unshadowed) so unlit areas aren't pure black.
+    float3 rgb = albedo * 0.03;
+
+    // Directional light: Cook-Torrance, with the directional radiance attenuated by the
+    // PCF shadow factor (KEEP shadow applied to the directional light only).
+    {
+        float3 L = normalize(-f.lightDir.xyz);
+        float3 radiance = f.lightColor.rgb * shadow;
+        rgb += hfCookTorrance(N, V, L, radiance, albedo, metallic, roughness, F0);
+    }
 
     // Accumulate colored point lights with smooth radius-based attenuation.
     int n = (int)f.ptCount.x;
@@ -73,10 +127,8 @@ float4 main(PSInput i) : SV_Target {
         float3 Ld = Lv / max(dist, 1e-4);
         float  att = saturate(1.0 - dist / radius);
         att *= att;                              // smooth falloff to the radius
-        float  d2 = max(dot(N, Ld), 0.0);
-        float3 H2 = normalize(Ld + V);
-        float  s2 = pow(max(dot(N, H2), 0.0), 32.0);
-        rgb += (tex * d2 + s2 * 0.4) * lc * intensity * att;
+        float3 radiance = lc * intensity * att;
+        rgb += hfCookTorrance(N, V, Ld, radiance, albedo, metallic, roughness, F0);
     }
     return float4(rgb, 1.0);
 }
