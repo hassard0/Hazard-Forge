@@ -2,6 +2,10 @@
 #include "rhi/rhi.h"
 #include "rhi/rhi_factory.h"
 #include "math/math.h"
+#include "scene/vertex.h"
+#include "scene/mesh.h"
+#include "scene/transform.h"
+#include "scene/renderable.h"
 
 #include <chrono>
 #include <cstdint>
@@ -23,8 +27,6 @@ std::vector<uint32_t> LoadSpirv(const std::string& path) {
     f.read(reinterpret_cast<char*>(words.data()), size);
     return words;
 }
-
-struct Vertex { float pos[3]; float color[3]; float uv[2]; float normal[3]; };
 
 // Per-frame uniform block — must match shaders/lit.*.hlsl FrameData (112 bytes).
 struct FrameData {
@@ -101,7 +103,7 @@ int main(int argc, char** argv) {
         }
     }
     try {
-        hal::Window window({"Hazard Forge — Lit Cube", 1280, 720});
+        hal::Window window({"Hazard Forge — Scene", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
 
         auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
@@ -109,19 +111,10 @@ int main(int argc, char** argv) {
         auto vs = device->CreateShaderModule({std::span<const uint32_t>(vsWords)});
         auto fs = device->CreateShaderModule({std::span<const uint32_t>(fsWords)});
 
-        rhi::VertexLayout layout;
-        layout.stride = sizeof(Vertex);
-        layout.attributes = {
-            {0, rhi::Format::RGB32_Float, offsetof(Vertex, pos)},
-            {1, rhi::Format::RGB32_Float, offsetof(Vertex, color)},
-            {2, rhi::Format::RG32_Float,  offsetof(Vertex, uv)},
-            {3, rhi::Format::RGB32_Float, offsetof(Vertex, normal)},
-        };
-
         rhi::GraphicsPipelineDesc pdesc;
         pdesc.vertex = vs.get();
         pdesc.fragment = fs.get();
-        pdesc.vertexLayout = layout;
+        pdesc.vertexLayout = scene::MeshVertexLayout();
         pdesc.colorFormat = device->Swapchain().ColorFormat();
         pdesc.depthTest = true;
         pdesc.usesFrameUniforms = true;
@@ -129,88 +122,71 @@ int main(int argc, char** argv) {
         pdesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
         auto pipeline = device->CreateGraphicsPipeline(pdesc);
 
-        // 24 vertices (4 per face) so each face carries its own UV square + tint.
-        // Faces wound CCW outward (RH); UVs per face: (0,0)(1,0)(1,1)(0,1).
-        const float n = -0.5f, p = 0.5f;
-        const Vertex verts[24] = {
-            // -Z (back), tint red, normal (0,0,-1)
-            {{p, n, n}, {1.0f, 0.4f, 0.4f}, {0, 0}, {0, 0, -1}},
-            {{n, n, n}, {1.0f, 0.4f, 0.4f}, {1, 0}, {0, 0, -1}},
-            {{n, p, n}, {1.0f, 0.4f, 0.4f}, {1, 1}, {0, 0, -1}},
-            {{p, p, n}, {1.0f, 0.4f, 0.4f}, {0, 1}, {0, 0, -1}},
-            // +Z (front), tint green, normal (0,0,1)
-            {{n, n, p}, {0.4f, 1.0f, 0.4f}, {0, 0}, {0, 0, 1}},
-            {{p, n, p}, {0.4f, 1.0f, 0.4f}, {1, 0}, {0, 0, 1}},
-            {{p, p, p}, {0.4f, 1.0f, 0.4f}, {1, 1}, {0, 0, 1}},
-            {{n, p, p}, {0.4f, 1.0f, 0.4f}, {0, 1}, {0, 0, 1}},
-            // -X (left), tint blue, normal (-1,0,0)
-            {{n, n, n}, {0.4f, 0.4f, 1.0f}, {0, 0}, {-1, 0, 0}},
-            {{n, n, p}, {0.4f, 0.4f, 1.0f}, {1, 0}, {-1, 0, 0}},
-            {{n, p, p}, {0.4f, 0.4f, 1.0f}, {1, 1}, {-1, 0, 0}},
-            {{n, p, n}, {0.4f, 0.4f, 1.0f}, {0, 1}, {-1, 0, 0}},
-            // +X (right), tint yellow, normal (1,0,0)
-            {{p, n, p}, {1.0f, 1.0f, 0.4f}, {0, 0}, {1, 0, 0}},
-            {{p, n, n}, {1.0f, 1.0f, 0.4f}, {1, 0}, {1, 0, 0}},
-            {{p, p, n}, {1.0f, 1.0f, 0.4f}, {1, 1}, {1, 0, 0}},
-            {{p, p, p}, {1.0f, 1.0f, 0.4f}, {0, 1}, {1, 0, 0}},
-            // -Y (bottom), tint magenta, normal (0,-1,0)
-            {{n, n, n}, {1.0f, 0.4f, 1.0f}, {0, 0}, {0, -1, 0}},
-            {{p, n, n}, {1.0f, 0.4f, 1.0f}, {1, 0}, {0, -1, 0}},
-            {{p, n, p}, {1.0f, 0.4f, 1.0f}, {1, 1}, {0, -1, 0}},
-            {{n, n, p}, {1.0f, 0.4f, 1.0f}, {0, 1}, {0, -1, 0}},
-            // +Y (top), tint cyan, normal (0,1,0)
-            {{n, p, p}, {0.4f, 1.0f, 1.0f}, {0, 0}, {0, 1, 0}},
-            {{p, p, p}, {0.4f, 1.0f, 1.0f}, {1, 0}, {0, 1, 0}},
-            {{p, p, n}, {0.4f, 1.0f, 1.0f}, {1, 1}, {0, 1, 0}},
-            {{n, p, n}, {0.4f, 1.0f, 1.0f}, {0, 1}, {0, 1, 0}},
-        };
-
-        // 36 indices: 2 triangles per face over its 4 vertices, CCW outward.
-        uint32_t indices[36];
-        for (uint32_t f = 0; f < 6; ++f) {
-            uint32_t base = f * 4;
-            uint32_t* tri = &indices[f * 6];
-            tri[0] = base + 0; tri[1] = base + 1; tri[2] = base + 2;
-            tri[3] = base + 0; tri[4] = base + 2; tri[5] = base + 3;
-        }
-
-        // Procedural checkerboard texture (256x256 RGBA8).
+        // Procedural checkerboard texture (256x256 RGBA8), shared by all renderables.
         std::vector<uint8_t> pixels = MakeCheckerboard();
         auto texture = device->CreateTexture(
             {256, 256, rhi::Format::RGBA8_UNorm, pixels.data(), pixels.size()});
 
-        rhi::BufferDesc vbdesc;
-        vbdesc.size = sizeof(verts);
-        vbdesc.initialData = verts;
-        vbdesc.usage = rhi::BufferUsage::Vertex;
-        auto vbuffer = device->CreateBuffer(vbdesc);
+        // Two primitive meshes from the scene layer.
+        scene::Mesh cube = scene::Mesh::Cube(*device);
+        scene::Mesh plane = scene::Mesh::Plane(*device);
 
-        rhi::BufferDesc ibdesc;
-        ibdesc.size = sizeof(indices);
-        ibdesc.initialData = indices;
-        ibdesc.usage = rhi::BufferUsage::Index;
-        auto ibuffer = device->CreateBuffer(ibdesc);
+        // Build the scene: a large ground plane + a 3x3 grid of lit cubes.
+        std::vector<scene::Renderable> sceneObjects;
+        {
+            scene::Transform planeT;
+            planeT.position = {0.0f, 0.0f, 0.0f};
+            planeT.scale = {6.0f, 1.0f, 6.0f};
+            sceneObjects.push_back({&plane, texture.get(), planeT});
 
-        // --- Headless capture mode: render exactly one frame and write it to a BMP. ---
-        if (shotPath) {
-            using math::Mat4;
-            using math::Vec3;
-            uint32_t w = window.FramebufferWidth();
-            uint32_t h = window.FramebufferHeight();
-            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            for (int gx = -1; gx <= 1; ++gx) {
+                for (int gz = -1; gz <= 1; ++gz) {
+                    scene::Transform t;
+                    t.position = {gx * 1.8f, 0.6f, gz * 1.8f};
+                    t.eulerRadians = {0.0f, (gx + gz) * 0.5f, 0.0f};
+                    t.scale = {0.5f, 0.5f, 0.5f};
+                    sceneObjects.push_back({&cube, texture.get(), t});
+                }
+            }
+        }
 
-            const Vec3 eye{2.5f, 2.5f, 4.0f};
-            // Fixed model rotation (t=0.6f) so three faces are visible.
-            Mat4 model = Mat4::RotateY(0.6f) * Mat4::RotateX(0.3f);
-            Mat4 view  = Mat4::LookAt(eye, {0, 0, 0}, {0, 1, 0});
-            Mat4 proj  = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
-            Mat4 vp    = proj * view;
+        using math::Mat4;
+        using math::Vec3;
+        const Vec3 eye{4.5f, 4.0f, 6.5f};
+        const Vec3 center{0.0f, 0.5f, 0.0f};
 
+        // Fill FrameData (viewProj + directional light + camera pos) for a given aspect.
+        auto makeFrameData = [&](float aspect) {
+            Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
+            Mat4 vp = proj * view;
             FrameData fd{};
             for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
             fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0.0f;
             fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
             fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+            return fd;
+        };
+
+        // Record every renderable in the scene into the command buffer.
+        auto drawScene = [&](rhi::ICommandBuffer* cmd) {
+            cmd->BindPipeline(*pipeline);
+            for (scene::Renderable& r : sceneObjects) {
+                Mat4 m = r.transform.Matrix();
+                cmd->PushConstants(m.m, sizeof(float) * 16);
+                cmd->BindTexture(*r.texture);
+                cmd->BindVertexBuffer(r.mesh->vertices());
+                cmd->BindIndexBuffer(r.mesh->indices());
+                cmd->DrawIndexed(r.mesh->indexCount());
+            }
+        };
+
+        // --- Headless capture mode: render exactly one frame and write it to a BMP. ---
+        if (shotPath) {
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            FrameData fd = makeFrameData(aspect);  // fixed camera; cubes static
 
             device->CaptureNextFrame();
             auto frame = device->BeginFrame();
@@ -226,12 +202,7 @@ int main(int argc, char** argv) {
             }
             device->SetFrameUniforms(&fd, sizeof(FrameData));
             frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-            frame.cmd->BindPipeline(*pipeline);
-            frame.cmd->PushConstants(model.m, sizeof(float) * 16);
-            frame.cmd->BindTexture(*texture);
-            frame.cmd->BindVertexBuffer(*vbuffer);
-            frame.cmd->BindIndexBuffer(*ibuffer);
-            frame.cmd->DrawIndexed(36);
+            drawScene(frame.cmd);
             frame.cmd->EndRenderPass();
             device->EndFrame(frame);
 
@@ -253,6 +224,12 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // Capture each renderable's authored base yaw so the interactive loop can spin
+        // the cubes by adding elapsed time on top without drifting.
+        std::vector<float> baseYaw(sceneObjects.size());
+        for (size_t i = 0; i < sceneObjects.size(); ++i)
+            baseYaw[i] = sceneObjects[i].transform.eulerRadians.y;
+
         const auto start = std::chrono::steady_clock::now();
 
         bool running = true;
@@ -270,33 +247,18 @@ int main(int argc, char** argv) {
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            FrameData fd = makeFrameData(aspect);
 
-            using math::Mat4;
-            using math::Vec3;
-            const Vec3 eye{2.5f, 2.5f, 4.0f};
-            Mat4 model = Mat4::RotateY(t) * Mat4::RotateX(t * 0.5f);
-            Mat4 view  = Mat4::LookAt(eye, {0, 0, 0}, {0, 1, 0});
-            Mat4 proj  = Mat4::Perspective(1.04719755f /*60deg*/, aspect, 0.1f, 100.0f);
-            Mat4 vp    = proj * view;
-
-            // Per-frame uniforms: viewProj + a fixed world-space directional light + camera pos.
-            FrameData fd{};
-            for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
-            fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0.0f;
-            fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
-            fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+            // Spin each cube about its yaw over time (skip index 0: the ground plane).
+            for (size_t i = 1; i < sceneObjects.size(); ++i)
+                sceneObjects[i].transform.eulerRadians.y = baseYaw[i] + t;
 
             auto frame = device->BeginFrame();
             if (frame.cmd) {
                 // After BeginFrame (frame index current), before recording draws.
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
                 frame.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
-                frame.cmd->BindPipeline(*pipeline);
-                frame.cmd->PushConstants(model.m, sizeof(float) * 16);
-                frame.cmd->BindTexture(*texture);
-                frame.cmd->BindVertexBuffer(*vbuffer);
-                frame.cmd->BindIndexBuffer(*ibuffer);
-                frame.cmd->DrawIndexed(36);
+                drawScene(frame.cmd);
                 frame.cmd->EndRenderPass();
             }
             device->EndFrame(frame);
