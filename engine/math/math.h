@@ -79,6 +79,20 @@ struct Mat4 {
         r.m[6] = s;  r.m[10] = c;
         return r;
     }
+
+    static Mat4 RotateZ(float rad) {
+        float c = std::cos(rad), s = std::sin(rad);
+        Mat4 r = Identity();
+        r.m[0] = c;  r.m[4] = -s;   // element(0,0)=c, element(0,1)=-s
+        r.m[1] = s;  r.m[5] = c;    // element(1,0)=s, element(1,1)=c
+        return r;
+    }
+
+    static Mat4 Scale(const Vec3& s) {
+        Mat4 r = Identity();
+        r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+        return r;
+    }
 };
 
 // C = A * B  (standard matrix product; C(row,col) = sum_k A(row,k)*B(k,col)).

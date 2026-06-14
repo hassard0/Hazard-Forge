@@ -37,6 +37,16 @@ int main() {
     Mat4 rhs = p * (v * m);
     for (int k = 0; k < 16; ++k) check(approx(lhs.m[k], rhs.m[k], 1e-3f), "assoc");
 
+    // Scale: diagonal s.x,s.y,s.z; m[15]==1.
+    Mat4 sc = Mat4::Scale({2, 3, 4});
+    check(approx(sc.m[0], 2) && approx(sc.m[5], 3) && approx(sc.m[10], 4), "scale diagonal");
+    check(approx(sc.m[15], 1), "scale m[15]==1");
+
+    // RotateZ(0) == Identity (all 16).
+    Mat4 rz0 = Mat4::RotateZ(0.0f);
+    Mat4 id = Mat4::Identity();
+    for (int k = 0; k < 16; ++k) check(approx(rz0.m[k], id.m[k]), "RotateZ(0)==Identity");
+
     if (g_fail == 0) { std::printf("math_test OK\n"); return 0; }
     std::printf("math_test: %d failures\n", g_fail);
     return 1;
