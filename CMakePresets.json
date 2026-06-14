@@ -1,0 +1,36 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "conan-base",
+      "hidden": true,
+      "generator": "Ninja"
+    },
+    {
+      "name": "windows-msvc-debug",
+      "inherits": "conan-base",
+      "binaryDir": "${sourceDir}/build/windows-msvc-debug",
+      "toolchainFile": "${sourceDir}/build/windows-msvc-debug/build/Debug/generators/conan_toolchain.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "windows-msvc-release",
+      "inherits": "conan-base",
+      "binaryDir": "${sourceDir}/build/windows-msvc-release",
+      "toolchainFile": "${sourceDir}/build/windows-msvc-release/build/Release/generators/conan_toolchain.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-msvc-debug", "configurePreset": "windows-msvc-debug" },
+    { "name": "windows-msvc-release", "configurePreset": "windows-msvc-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc-debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
