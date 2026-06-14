@@ -34,6 +34,8 @@
 #include "scene/scene_io.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
+#include "anim/animation.h"
+#include "anim/skeleton.h"
 #include "render/render_graph.h"
 
 #include <cmath>
@@ -157,8 +159,230 @@ static bool WritePNG(const char* outPath, const std::vector<uint8_t>& bgra,
     return ok;
 }
 
+// --- Skeletal-animation showcase (Slice O). Mirrors the Vulkan --skinning-shot path: ground plane
+// + procedural sky + the GPU-skinned Fox sampled at animation "Survey", time 0.5s, lit + shadowed.
+// One offscreen frame -> PNG. The MSL is generated from the shared HLSL (lit_skinned/shadow_skinned)
+// by the sibling CMake gen rules; the joint palette binds at vertex buffer(3) (set 2). ----------
+static int RunSkinningShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // Same CPU-side Y-flip convention as the main showcase (Metal NDC +Y up).
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Skinned lit pipeline (reuses lit.frag).
+    auto skVs = loadMSL("lit_skinned.vert.gen.metal", "skinned_vertex");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc skDesc;
+    skDesc.vertex = skVs.get(); skDesc.fragment = litFs.get();
+    skDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+    skDesc.colorFormat = device->Swapchain().ColorFormat();
+    skDesc.depthTest = true; skDesc.usesFrameUniforms = true;
+    skDesc.usesTexture = true; skDesc.usesJointPalette = true;
+    skDesc.pushConstantSize = sizeof(float) * 20;
+    auto skinnedPipeline = device->CreateGraphicsPipeline(skDesc);
+
+    // Static lit pipeline (ground plane).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Skinned + static depth-only shadow pipelines.
+    auto skShadowVs = loadMSL("shadow_skinned.vert.gen.metal", "skinned_shadow_vertex");
+    rhi::GraphicsPipelineDesc skShDesc;
+    skShDesc.vertex = skShadowVs.get(); skShDesc.fragment = nullptr;
+    skShDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+    skShDesc.depthTest = true; skShDesc.depthOnly = true;
+    skShDesc.usesFrameUniforms = true; skShDesc.usesJointPalette = true;
+    skShDesc.pushConstantSize = sizeof(float) * 16;
+    auto skinnedShadowPipeline = device->CreateGraphicsPipeline(skShDesc);
+
+    auto staticShadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc stShDesc;
+    stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = nullptr;
+    stShDesc.vertexLayout = scene::MeshVertexLayout();
+    stShDesc.depthTest = true; stShDesc.depthOnly = true;
+    stShDesc.usesFrameUniforms = true; stShDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+    // Sky + post.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+
+    hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
+    const anim::Animation* survey = fox.FindAnimation("Survey");
+    if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
+    std::vector<Mat4> palette = survey
+        ? anim::SampleAnimation(fox.skeleton, *survey, 0.5f)
+        : std::vector<Mat4>(fox.skeleton.joints.size(), Mat4::Identity());
+    std::vector<float> paletteData(64 * 16);
+    for (int j = 0; j < 64; ++j) {
+        Mat4 mm = (j < (int)palette.size()) ? palette[j] : Mat4::Identity();
+        for (int k = 0; k < 16; ++k) paletteData[j * 16 + k] = mm.m[k];
+    }
+
+    float foxH = fox.bbMax[1] - fox.bbMin[1];
+    float scaleS = (foxH > 1e-4f) ? (2.5f / foxH) : 0.05f;
+    float cx = 0.5f * (fox.bbMin[0] + fox.bbMax[0]);
+    float cz = 0.5f * (fox.bbMin[2] + fox.bbMax[2]);
+    Mat4 foxModel = Mat4::Translate({-cx * scaleS, -fox.bbMin[1] * scaleS, -cz * scaleS})
+                  * Mat4::Scale({scaleS, scaleS, scaleS});
+    Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+    const Vec3 eye{3.5f, 2.6f, 4.5f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 0.98f; fd.lightColor[1] = 0.95f; fd.lightColor[2] = 0.88f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 12.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 25.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.BindPipeline(*skinnedShadowPipeline);
+            cmd.PushConstants(foxModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(fox.mesh.vertices());
+            cmd.BindIndexBuffer(fox.mesh.indices());
+            cmd.DrawIndexed(fox.mesh.indexCount());
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindPipeline(*skinnedPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = foxModel.m[k];
+                pc[16] = fox.metallic; pc[17] = fox.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*fox.baseColor, *flatNormal);
+                cmd.BindVertexBuffer(fox.mesh.vertices());
+                cmd.BindIndexBuffer(fox.mesh.indices());
+                cmd.DrawIndexed(fox.mesh.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u)\n", outPath, cw, ch);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
+        // --skinning <out.png>: render the skeletal-animation showcase (Slice O) instead of the
+        // default Slice-F scene.
+        if (argc > 1 && std::strcmp(argv[1], "--skinning") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_skinning.png";
+            try { return RunSkinningShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
         const char* outPath = argc > 1 ? argv[1] : "metal_scene.png";
         const uint32_t W = 1280, H = 720;
 

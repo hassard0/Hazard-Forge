@@ -20,6 +20,7 @@ enum class Format {
     BGRA8_UNorm,
     RG32_Float,    // vec2 vertex attribute
     RGB32_Float,   // vec3 vertex attribute
+    RGBA32_Float,  // vec4 vertex attribute (skinned joints/weights)
     D32_Float,     // depth attachment
 };
 
@@ -52,6 +53,7 @@ struct GraphicsPipelineDesc {
     uint32_t pushConstantSize = 0;   // bytes, vertex stage
     bool usesFrameUniforms = false;  // when true, layout includes the per-frame UBO set (set 0)
     bool usesTexture = false;        // when true, layout includes the material set (set 1)
+    bool usesJointPalette = false;   // when true, layout includes the skinning joint-palette set (set 2)
     bool fullscreen = false;         // when true: no vertex input (fullscreen triangle from SV_VertexID)
     bool depthOnly = false;          // when true: no color attachment; depth write + bias (shadow pass)
     bool pointList = false;          // when true: POINT_LIST topology (GPU particles drawn as points)
@@ -205,6 +207,14 @@ public:
     // BeginFrame (so the current frame index is set) and before recording draws; the
     // matching per-frame descriptor set (set 0) is auto-bound on BindPipeline.
     virtual void SetFrameUniforms(const void* data, uint32_t size) = 0;
+
+    // Copy the joint-matrix palette into the current frame-in-flight's palette UBO. Call after
+    // BeginFrame (so the current frame index is set) and before recording skinned draws; the
+    // matching joint-palette descriptor set (set 2) is auto-bound on BindPipeline when the bound
+    // pipeline declared usesJointPalette. `data` is a tightly-packed array of column-major
+    // float4x4 (<= 64 matrices = 4096 bytes). Default no-op so non-skinning backends/passes are
+    // unaffected; both shipping backends override it.
+    virtual void SetJointPalette(const void* /*data*/, size_t /*size*/) {}
 
     // Block until the GPU is idle (call before destroying GPU resources).
     virtual void WaitIdle() = 0;

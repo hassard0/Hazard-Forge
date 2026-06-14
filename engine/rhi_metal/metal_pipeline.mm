@@ -7,6 +7,7 @@ namespace hf::rhi::mtl {
 
 MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& desc)
     : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
+      usesJointPalette_(desc.usesJointPalette),
       fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly), pointList_(desc.pointList),
       cullNone_(desc.cullNone) {
     id<MTLDevice> dev = device.device();

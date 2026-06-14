@@ -1,7 +1,10 @@
 #pragma once
 #include "scene/mesh.h"
 #include "rhi/rhi.h"
+#include "anim/skeleton.h"
+#include "anim/animation.h"
 #include <memory>
+#include <vector>
 
 namespace hf::asset {
 
@@ -42,5 +45,47 @@ struct GltfModel {
 // Load geometry + base-color texture + metallic/roughness factors. See GltfModel.
 // Throws std::runtime_error on parse/load/validation failure or missing POSITION.
 GltfModel LoadGltfModel(rhi::IRHIDevice& device, const char* path);
+
+// A skinned glTF model: skinned-vertex geometry + base-color material + a skeleton + animations.
+//
+//  * mesh       — first primitive uploaded with the scene::SkinnedVertex layout (stride 88). Reads
+//                 POSITION / TEXCOORD_0 / JOINTS_0 / WEIGHTS_0. JOINTS_0 (u8/u16) is widened to
+//                 float and REMAPPED from glTF skin-joint order to the skeleton's topologically
+//                 sorted order. WEIGHTS_0 is renormalized so each vertex's four weights sum to 1.
+//                 NORMAL is computed as smooth per-vertex normals from the indexed positions when
+//                 absent (the Fox has none); tangent defaults to (1,0,0). NOT recentred — the skin's
+//                 inverse-bind matrices define the bind-space origin, so the caller places the mesh
+//                 with an explicit model matrix (see `bbMin`/`bbMax`).
+//  * baseColor  — RGBA8 base-color texture (same decode path as GltfModel; white fallback).
+//  * metallic / roughness — material factors.
+//  * skeleton   — joints (parent, inverse-bind, rest TRS) in topologically sorted order.
+//  * animations — every animation clip in the file, channels remapped to skeleton joint indices.
+//  * bbMin / bbMax — model-space bounding box of the (un-recentred) bind-pose positions, so the
+//                 caller can ground-align + scale the placement.
+struct SkinnedModel {
+    scene::Mesh mesh;
+    std::unique_ptr<rhi::ITexture> baseColor;
+    float metallic = 1.0f;
+    float roughness = 1.0f;
+    anim::Skeleton skeleton;
+    std::vector<anim::Animation> animations;
+    float bbMin[3] = {0, 0, 0};
+    float bbMax[3] = {0, 0, 0};
+
+    SkinnedModel(scene::Mesh m, std::unique_ptr<rhi::ITexture> tex, float met, float rough,
+                 anim::Skeleton skel, std::vector<anim::Animation> anims,
+                 const float bbmin[3], const float bbmax[3])
+        : mesh(std::move(m)), baseColor(std::move(tex)), metallic(met), roughness(rough),
+          skeleton(std::move(skel)), animations(std::move(anims)) {
+        for (int k = 0; k < 3; ++k) { bbMin[k] = bbmin[k]; bbMax[k] = bbmax[k]; }
+    }
+
+    // Find an animation by name; returns nullptr if not present.
+    const anim::Animation* FindAnimation(const char* name) const;
+};
+
+// Load a skinned glTF/glb model (skin + first animation set). See SkinnedModel.
+// Throws std::runtime_error on parse/load/validation failure, missing POSITION, or missing skin.
+SkinnedModel LoadSkinnedGltfModel(rhi::IRHIDevice& device, const char* path);
 
 } // namespace hf::asset

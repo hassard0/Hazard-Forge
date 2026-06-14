@@ -66,6 +66,13 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                                 0, 1, &fs, 0, nullptr);
     }
+    // If the pipeline declares the joint-palette set, bind the device's current palette UBO at
+    // set 2 (mirrors the frame-set auto-bind; the UBO was written by SetJointPalette this frame).
+    if (p.hasJointSet()) {
+        VkDescriptorSet js = device_.currentJointPaletteSet();
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                                2, 1, &js, 0, nullptr);
+    }
 }
 
 void VulkanCommandBuffer::BindVertexBuffer(IBuffer& buffer) {

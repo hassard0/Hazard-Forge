@@ -16,12 +16,15 @@ public:
     bool hasFrameSet() const { return hasFrameSet_; }
     // Set index the material (texture) descriptor occupies: 1 if a frame set precedes it, else 0.
     uint32_t materialSetIndex() const { return hasFrameSet_ ? 1u : 0u; }
+    // True when the pipeline declares the joint-palette set (set 2); BindPipeline binds it there.
+    bool hasJointSet() const { return hasJointSet_; }
 
 private:
     VkDevice device_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     bool hasFrameSet_ = false;
+    bool hasJointSet_ = false;
 };
 
 } // namespace hf::rhi::vk

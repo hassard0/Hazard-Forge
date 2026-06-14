@@ -17,6 +17,7 @@ public:
     id<MTLDepthStencilState>   depthState() const { return depthState_; }
     bool usesFrameUniforms() const { return usesFrameUniforms_; }
     bool usesTexture() const { return usesTexture_; }
+    bool usesJointPalette() const { return usesJointPalette_; }
     bool fullscreen() const { return fullscreen_; }
     bool depthOnly() const { return depthOnly_; }
     bool pointList() const { return pointList_; }
@@ -28,6 +29,7 @@ private:
     id<MTLDepthStencilState>   depthState_    = nil;
     bool usesFrameUniforms_ = false;
     bool usesTexture_       = false;
+    bool usesJointPalette_  = false;
     bool fullscreen_        = false;
     bool depthOnly_         = false;
     bool pointList_         = false;

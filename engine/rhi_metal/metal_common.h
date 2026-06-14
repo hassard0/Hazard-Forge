@@ -26,6 +26,9 @@ namespace hf::rhi::mtl {
 constexpr uint32_t kVbVertex      = 0;
 constexpr uint32_t kVbFrameUbo    = 1;
 constexpr uint32_t kVbPushConst   = 2;
+// Skinning joint-palette UBO (set 2 b0 in HLSL -> [[vk::binding(3,2)]] so spirv-cross
+// --msl-decoration-binding lands it at vertex buffer(3), past the vertex/frame/pushconst slots).
+constexpr uint32_t kVbJointPalette = 3;
 constexpr uint32_t kFbFrameUbo    = 0;
 constexpr uint32_t kFragTexture   = 0;
 constexpr uint32_t kFragSampler   = 1;
@@ -52,9 +55,10 @@ inline MTLPixelFormat ToMetalPixelFormat(Format f) {
 
 inline MTLVertexFormat ToMetalVertexFormat(Format f) {
     switch (f) {
-        case Format::RG32_Float:  return MTLVertexFormatFloat2;
-        case Format::RGB32_Float: return MTLVertexFormatFloat3;
-        case Format::RGBA8_UNorm: return MTLVertexFormatUChar4Normalized;
+        case Format::RG32_Float:   return MTLVertexFormatFloat2;
+        case Format::RGB32_Float:  return MTLVertexFormatFloat3;
+        case Format::RGBA32_Float: return MTLVertexFormatFloat4;
+        case Format::RGBA8_UNorm:  return MTLVertexFormatUChar4Normalized;
         default:                  return MTLVertexFormatInvalid;
     }
 }

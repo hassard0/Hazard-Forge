@@ -1,5 +1,8 @@
 #include "asset/gltf_loader.h"
 #include "scene/vertex.h"
+#include "anim/skeleton.h"
+#include "anim/animation.h"
+#include "math/math.h"
 
 #define CGLTF_IMPLEMENTATION
 #include "cgltf/cgltf.h"
@@ -283,6 +286,337 @@ GltfModel LoadGltfModel(rhi::IRHIDevice& device, const char* path) {
     }
     auto baseColor = LoadBaseColorTexture(device, baseImg);
     return GltfModel(std::move(mesh), std::move(baseColor), metallic, roughness);
+}
+
+// ============================== Skinned model loading ==========================================
+
+namespace {
+
+// Node index within data->nodes (pointer arithmetic). -1 if null/foreign.
+int NodeIndex(const cgltf_data* data, const cgltf_node* node) {
+    if (!node) return -1;
+    ptrdiff_t idx = node - data->nodes;
+    if (idx < 0 || (cgltf_size)idx >= data->nodes_count) return -1;
+    return static_cast<int>(idx);
+}
+
+// Build the skeleton from a skin: collect the skin's joint nodes, topologically sort them so every
+// parent precedes its children, and fill each Joint's parent index, inverse-bind matrix and rest
+// TRS. Also produces nodeIndex -> jointIndex (skeleton order) and the glTF-skin-order -> jointIndex
+// remap (so JOINTS_0 indices and animation channels can be remapped).
+struct SkeletonBuild {
+    anim::Skeleton skeleton;
+    std::vector<int> nodeToJoint;     // size data->nodes_count; -1 if not a joint
+    std::vector<int> skinOrderToJoint; // size skin->joints_count
+};
+
+SkeletonBuild BuildSkeleton(const cgltf_data* data, const cgltf_skin* skin) {
+    SkeletonBuild out;
+    out.nodeToJoint.assign(data->nodes_count, -1);
+
+    const cgltf_size n = skin->joints_count;
+
+    // Map each skin-joint slot to its node index, and mark which nodes are joints.
+    std::vector<int> skinNode(n, -1);
+    std::vector<bool> isJointNode(data->nodes_count, false);
+    for (cgltf_size i = 0; i < n; ++i) {
+        int ni = NodeIndex(data, skin->joints[i]);
+        skinNode[i] = ni;
+        if (ni >= 0) isJointNode[ni] = true;
+    }
+
+    // Topological sort over the joint set: a joint's effective parent is its nearest ancestor that
+    // is also in the joint set (glTF allows non-joint intermediate nodes, though Fox has none).
+    // We emit roots first, then children, via a simple repeated-pass / visited approach.
+    std::vector<int> nodeParentJointNode(data->nodes_count, -1);  // nearest joint-ancestor node
+    for (cgltf_size i = 0; i < n; ++i) {
+        int ni = skinNode[i];
+        if (ni < 0) continue;
+        const cgltf_node* p = data->nodes[ni].parent;
+        int pj = -1;
+        while (p) {
+            int pi = NodeIndex(data, p);
+            if (pi >= 0 && isJointNode[pi]) { pj = pi; break; }
+            p = p->parent;
+        }
+        nodeParentJointNode[ni] = pj;
+    }
+
+    // Emit in topological order: a joint can be emitted once its parent-joint-node has been emitted
+    // (or it has none). Iterate until all joints are placed.
+    std::vector<bool> emitted(data->nodes_count, false);
+    out.skeleton.joints.reserve(n);
+    bool progress = true;
+    cgltf_size placed = 0;
+    while (placed < n && progress) {
+        progress = false;
+        for (cgltf_size i = 0; i < n; ++i) {
+            int ni = skinNode[i];
+            if (ni < 0 || emitted[ni]) continue;
+            int pj = nodeParentJointNode[ni];
+            if (pj >= 0 && !emitted[pj]) continue;  // parent not emitted yet
+            // Place this joint.
+            out.nodeToJoint[ni] = static_cast<int>(out.skeleton.joints.size());
+            anim::Joint joint;
+            joint.parent = (pj >= 0) ? out.nodeToJoint[pj] : -1;
+            const cgltf_node& nd = data->nodes[ni];
+            if (nd.has_translation) joint.t = math::Vec3{nd.translation[0], nd.translation[1], nd.translation[2]};
+            if (nd.has_rotation)    joint.r = math::Quat{nd.rotation[0], nd.rotation[1], nd.rotation[2], nd.rotation[3]};
+            if (nd.has_scale)       joint.s = math::Vec3{nd.scale[0], nd.scale[1], nd.scale[2]};
+            out.skeleton.joints.push_back(joint);
+            emitted[ni] = true;
+            ++placed;
+            progress = true;
+        }
+    }
+
+    // Inverse-bind matrices (column-major float4x4 per skin-joint slot). Map slot -> emitted joint.
+    out.skinOrderToJoint.assign(n, -1);
+    for (cgltf_size i = 0; i < n; ++i) {
+        int ni = skinNode[i];
+        int ji = (ni >= 0) ? out.nodeToJoint[ni] : -1;
+        out.skinOrderToJoint[i] = ji;
+        if (ji < 0) continue;
+        math::Mat4 ib = math::Mat4::Identity();
+        if (skin->inverse_bind_matrices)
+            cgltf_accessor_read_float(skin->inverse_bind_matrices, i, ib.m, 16);
+        out.skeleton.joints[ji].inverseBind = ib;
+    }
+
+    return out;
+}
+
+// Parse all animations, remapping each channel's target node to a skeleton joint index.
+std::vector<anim::Animation> BuildAnimations(const cgltf_data* data,
+                                             const std::vector<int>& nodeToJoint) {
+    std::vector<anim::Animation> anims;
+    anims.reserve(data->animations_count);
+    for (cgltf_size a = 0; a < data->animations_count; ++a) {
+        const cgltf_animation& ga = data->animations[a];
+        anim::Animation out;
+        if (ga.name) out.name = ga.name;
+        out.channels.reserve(ga.channels_count);
+        float duration = 0.0f;
+        for (cgltf_size c = 0; c < ga.channels_count; ++c) {
+            const cgltf_animation_channel& gc = ga.channels[c];
+            if (gc.target_path == cgltf_animation_path_type_weights ||
+                gc.target_path == cgltf_animation_path_type_invalid) continue;  // YAGNI: morph
+            int ni = NodeIndex(data, gc.target_node);
+            if (ni < 0 || (size_t)ni >= nodeToJoint.size() || nodeToJoint[ni] < 0) continue;
+
+            anim::Channel ch;
+            ch.jointIndex = nodeToJoint[ni];
+            switch (gc.target_path) {
+                case cgltf_animation_path_type_translation: ch.path = anim::Channel::Path::Translation; break;
+                case cgltf_animation_path_type_rotation:    ch.path = anim::Channel::Path::Rotation; break;
+                case cgltf_animation_path_type_scale:       ch.path = anim::Channel::Path::Scale; break;
+                default: continue;
+            }
+            // Cubic-spline keyframes carry in/out tangents; we sample only the value (treat as
+            // linear). The Fox uses LINEAR/STEP, so this is exact for the showcase.
+            ch.interp = (gc.sampler->interpolation == cgltf_interpolation_type_step)
+                            ? anim::Channel::Interp::Step : anim::Channel::Interp::Linear;
+
+            const cgltf_accessor* in = gc.sampler->input;
+            const cgltf_accessor* outAcc = gc.sampler->output;
+            const cgltf_size keys = in->count;
+            ch.times.resize(keys);
+            for (cgltf_size k = 0; k < keys; ++k) {
+                float tval = 0.0f;
+                cgltf_accessor_read_float(in, k, &tval, 1);
+                ch.times[k] = tval;
+                if (tval > duration) duration = tval;
+            }
+            const int comp = (ch.path == anim::Channel::Path::Rotation) ? 4 : 3;
+            // For cubic-spline, output has 3 entries per key (in-tangent, value, out-tangent); read
+            // the middle (value) one. Otherwise one entry per key.
+            const bool cubic = (gc.sampler->interpolation == cgltf_interpolation_type_cubic_spline);
+            ch.values.resize(keys * comp);
+            for (cgltf_size k = 0; k < keys; ++k) {
+                cgltf_size srcKey = cubic ? (k * 3 + 1) : k;
+                cgltf_accessor_read_float(outAcc, srcKey, &ch.values[k * comp], comp);
+            }
+            out.channels.push_back(std::move(ch));
+        }
+        out.duration = duration;
+        anims.push_back(std::move(out));
+    }
+    return anims;
+}
+
+// Build the skinned mesh from the first primitive: positions, UVs, JOINTS_0 (remapped to skeleton
+// joint order), WEIGHTS_0 (renormalized), smooth normals when NORMAL is absent. NOT recentred.
+scene::Mesh BuildSkinnedMesh(rhi::IRHIDevice& device, const cgltf_data* data,
+                             const std::vector<int>& skinOrderToJoint,
+                             float bbMin[3], float bbMax[3], const char* path) {
+    const cgltf_primitive& prim = data->meshes[0].primitives[0];
+
+    const cgltf_accessor* posAcc = FindAttr(prim, cgltf_attribute_type_position);
+    if (!posAcc)
+        throw std::runtime_error(std::string("skinned glTF primitive has no POSITION: ") + path);
+    const cgltf_accessor* nrmAcc = FindAttr(prim, cgltf_attribute_type_normal);
+    const cgltf_accessor* uvAcc  = FindAttr(prim, cgltf_attribute_type_texcoord);
+    const cgltf_accessor* jntAcc = FindAttr(prim, cgltf_attribute_type_joints);
+    const cgltf_accessor* wgtAcc = FindAttr(prim, cgltf_attribute_type_weights);
+
+    const cgltf_size vertCount = posAcc->count;
+    std::vector<scene::SkinnedVertex> verts(vertCount);
+    bbMin[0] = bbMin[1] = bbMin[2] =  1e30f;
+    bbMax[0] = bbMax[1] = bbMax[2] = -1e30f;
+
+    for (cgltf_size i = 0; i < vertCount; ++i) {
+        float p[3] = {0, 0, 0};
+        cgltf_accessor_read_float(posAcc, i, p, 3);
+        scene::SkinnedVertex& v = verts[i];
+        v.pos[0] = p[0]; v.pos[1] = p[1]; v.pos[2] = p[2];
+        for (int k = 0; k < 3; ++k) {
+            if (p[k] < bbMin[k]) bbMin[k] = p[k];
+            if (p[k] > bbMax[k]) bbMax[k] = p[k];
+        }
+        v.color[0] = v.color[1] = v.color[2] = 1.0f;
+        v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+        v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        v.joints[0] = v.joints[1] = v.joints[2] = v.joints[3] = 0.0f;
+        v.weights[0] = 1.0f; v.weights[1] = v.weights[2] = v.weights[3] = 0.0f;
+    }
+
+    if (uvAcc) {
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float uv[2] = {0, 0};
+            cgltf_accessor_read_float(uvAcc, i, uv, 2);
+            verts[i].uv[0] = uv[0]; verts[i].uv[1] = uv[1];
+        }
+    }
+
+    // JOINTS_0: read as four floats (cgltf widens u8/u16 -> float), then remap each glTF-skin-order
+    // joint index to the skeleton's topologically-sorted joint index.
+    if (jntAcc) {
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float j[4] = {0, 0, 0, 0};
+            cgltf_accessor_read_float(jntAcc, i, j, 4);
+            for (int k = 0; k < 4; ++k) {
+                int slot = static_cast<int>(j[k] + 0.5f);
+                int mapped = (slot >= 0 && (size_t)slot < skinOrderToJoint.size())
+                                 ? skinOrderToJoint[slot] : 0;
+                verts[i].joints[k] = static_cast<float>(mapped < 0 ? 0 : mapped);
+            }
+        }
+    }
+
+    // WEIGHTS_0: read + renormalize so the four weights sum to 1 (guards against quantization drift).
+    if (wgtAcc) {
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float w[4] = {0, 0, 0, 0};
+            cgltf_accessor_read_float(wgtAcc, i, w, 4);
+            float sum = w[0] + w[1] + w[2] + w[3];
+            if (sum > 1e-8f) {
+                float inv = 1.0f / sum;
+                for (int k = 0; k < 4; ++k) w[k] *= inv;
+            } else {
+                w[0] = 1.0f; w[1] = w[2] = w[3] = 0.0f;
+            }
+            for (int k = 0; k < 4; ++k) verts[i].weights[k] = w[k];
+        }
+    }
+
+    // Indices (u16/u32 -> u32). Non-indexed primitives get a trivial list.
+    std::vector<uint32_t> indices;
+    if (prim.indices) {
+        const cgltf_size nn = prim.indices->count;
+        indices.resize(nn);
+        for (cgltf_size i = 0; i < nn; ++i)
+            indices[i] = static_cast<uint32_t>(cgltf_accessor_read_index(prim.indices, i));
+    } else {
+        indices.resize(vertCount);
+        for (cgltf_size i = 0; i < vertCount; ++i) indices[i] = static_cast<uint32_t>(i);
+    }
+
+    // Smooth normals from the indexed positions when NORMAL is absent (the Fox has none). Accumulate
+    // per-triangle face normals into each vertex, then normalize.
+    if (nrmAcc) {
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float n[3] = {0, 1, 0};
+            cgltf_accessor_read_float(nrmAcc, i, n, 3);
+            verts[i].normal[0] = n[0]; verts[i].normal[1] = n[1]; verts[i].normal[2] = n[2];
+        }
+    } else {
+        std::vector<float> acc(vertCount * 3, 0.0f);
+        for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+            uint32_t i0 = indices[t], i1 = indices[t + 1], i2 = indices[t + 2];
+            const float* p0 = verts[i0].pos; const float* p1 = verts[i1].pos; const float* p2 = verts[i2].pos;
+            float e1[3] = {p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]};
+            float e2[3] = {p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]};
+            float fn[3] = {e1[1]*e2[2] - e1[2]*e2[1],
+                           e1[2]*e2[0] - e1[0]*e2[2],
+                           e1[0]*e2[1] - e1[1]*e2[0]};
+            for (uint32_t vi : {i0, i1, i2}) {
+                acc[vi*3+0] += fn[0]; acc[vi*3+1] += fn[1]; acc[vi*3+2] += fn[2];
+            }
+        }
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            float n[3] = {acc[i*3+0], acc[i*3+1], acc[i*3+2]};
+            float len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+            if (len > 1e-8f) {
+                verts[i].normal[0] = n[0]/len; verts[i].normal[1] = n[1]/len; verts[i].normal[2] = n[2]/len;
+            }
+        }
+    }
+
+    rhi::BufferDesc vbdesc;
+    vbdesc.size = verts.size() * sizeof(scene::SkinnedVertex);
+    vbdesc.initialData = verts.data();
+    vbdesc.usage = rhi::BufferUsage::Vertex;
+    auto vbuffer = device.CreateBuffer(vbdesc);
+
+    rhi::BufferDesc ibdesc;
+    ibdesc.size = indices.size() * sizeof(uint32_t);
+    ibdesc.initialData = indices.data();
+    ibdesc.usage = rhi::BufferUsage::Index;
+    auto ibuffer = device.CreateBuffer(ibdesc);
+
+    return scene::Mesh{std::move(vbuffer), std::move(ibuffer),
+                       static_cast<uint32_t>(indices.size())};
+}
+
+} // namespace
+
+const anim::Animation* SkinnedModel::FindAnimation(const char* name) const {
+    for (const auto& a : animations)
+        if (a.name == name) return &a;
+    return nullptr;
+}
+
+SkinnedModel LoadSkinnedGltfModel(rhi::IRHIDevice& device, const char* path) {
+    cgltf_data* data = OpenGltf(path);
+    struct Guard { cgltf_data* d; ~Guard() { if (d) cgltf_free(d); } } guard{data};
+
+    if (data->skins_count == 0)
+        throw std::runtime_error(std::string("glTF has no skin: ") + path);
+    const cgltf_skin* skin = &data->skins[0];
+
+    SkeletonBuild sb = BuildSkeleton(data, skin);
+    std::vector<anim::Animation> animations = BuildAnimations(data, sb.nodeToJoint);
+
+    float bbMin[3], bbMax[3];
+    scene::Mesh mesh = BuildSkinnedMesh(device, data, sb.skinOrderToJoint, bbMin, bbMax, path);
+
+    // Material: first primitive's PBR factors + base-color texture (same path as GltfModel).
+    const cgltf_primitive& prim = data->meshes[0].primitives[0];
+    const cgltf_material* mat = prim.material;
+    const cgltf_image* baseImg = nullptr;
+    float metallic = 1.0f, roughness = 1.0f;
+    if (mat && mat->has_pbr_metallic_roughness) {
+        const cgltf_pbr_metallic_roughness& pbr = mat->pbr_metallic_roughness;
+        metallic = pbr.metallic_factor;
+        roughness = pbr.roughness_factor;
+        if (pbr.base_color_texture.texture && pbr.base_color_texture.texture->image)
+            baseImg = pbr.base_color_texture.texture->image;
+    }
+    auto baseColor = LoadBaseColorTexture(device, baseImg);
+
+    return SkinnedModel(std::move(mesh), std::move(baseColor), metallic, roughness,
+                        std::move(sb.skeleton), std::move(animations), bbMin, bbMax);
 }
 
 } // namespace hf::asset

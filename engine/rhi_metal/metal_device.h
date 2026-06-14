@@ -59,6 +59,7 @@ public:
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
     void SetFrameUniforms(const void* data, uint32_t size) override;
+    void SetJointPalette(const void* data, size_t size) override;
     void WaitIdle() override;
     void CaptureNextFrame() override { captureArmed_ = true; }
     bool GetCapturedPixels(std::vector<uint8_t>& outBGRA,
@@ -67,6 +68,9 @@ public:
     // Accessors used by sibling Metal objects.
     id<MTLDevice> device() const { return device_; }
     id<MTLBuffer> currentFrameUbo() const { return uboBuffer_[frameIndex_]; }
+    // Current frame-in-flight's joint-palette UBO (set 2); BindPipeline binds it at the skinning
+    // vertex-buffer slot when the bound pipeline declares usesJointPalette.
+    id<MTLBuffer> currentJointPalette() const { return jointBuffer_[frameIndex_]; }
     // The shadow map most recently passed to SetShadowMap (null until set). The command buffer
     // binds its depth texture + sampler to the lit pass's fragment shadow slots in BindPipeline.
     MetalRenderTarget* currentShadowMap() const { return shadowMap_; }
@@ -98,6 +102,11 @@ private:
     // lightViewProj) and future-proofs UBO growth.
     static constexpr uint32_t kFrameUboSize = 512;
     id<MTLBuffer> uboBuffer_[kFramesInFlight] = {nil, nil};
+
+    // Joint-palette UBO (set 2): JointPalette { float4x4 joints[64]; } = 4096 B, one per
+    // frame-in-flight (mirrors the per-frame UBO). Written by SetJointPalette.
+    static constexpr uint32_t kJointPaletteSize = 64 * 64;  // 64 mat4 = 4096 B
+    id<MTLBuffer> jointBuffer_[kFramesInFlight] = {nil, nil};
 
     // In-flight CPU/GPU pacing: block BeginFrame until the frame N-kFramesInFlight ago finished,
     // so SetFrameUniforms never overwrites a UBO the GPU is still reading.

@@ -18,4 +18,28 @@ inline rhi::VertexLayout MeshVertexLayout() {
     };
     return l;
 }
+
+// Skinned vertex: the static Vertex (pos/color/uv/normal/tangent = 56B) plus a joint-index quad
+// and a joint-weight quad for GPU skinning. Joint *indices* are stored as floats (the shader reads
+// them as floats and casts to int) so the whole vertex is a single float vertex format — no integer
+// attribute plumbing in the RHI. Locations 5 (joints) + 6 (weights), both RGBA32_Float.
+// Layout: pos(12)+color(12)+uv(8)+normal(12)+tangent(12)+joints(16)+weights(16) = stride 88.
+struct SkinnedVertex {
+    float pos[3]; float color[3]; float uv[2]; float normal[3]; float tangent[3];
+    float joints[4]; float weights[4];
+};
+inline rhi::VertexLayout SkinnedMeshVertexLayout() {
+    rhi::VertexLayout l;
+    l.stride = sizeof(SkinnedVertex);
+    l.attributes = {
+        {0, rhi::Format::RGB32_Float,  0},
+        {1, rhi::Format::RGB32_Float,  12},
+        {2, rhi::Format::RG32_Float,   24},
+        {3, rhi::Format::RGB32_Float,  32},
+        {4, rhi::Format::RGB32_Float,  44},
+        {5, rhi::Format::RGBA32_Float, 56},   // joint indices (as floats)
+        {6, rhi::Format::RGBA32_Float, 72},   // joint weights
+    };
+    return l;
+}
 } // namespace

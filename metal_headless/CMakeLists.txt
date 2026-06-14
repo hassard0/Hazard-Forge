@@ -67,6 +67,10 @@ endfunction()
 
 hf_gen_msl(lit.vert    lit.vert.hlsl    vert vertex_main)
 hf_gen_msl(lit.frag    lit.frag.hlsl    frag fragment_main)
+# Skinned-animation variants (Slice O): GPU skinning vertex shader (reuses lit.frag) + skinned
+# depth-only shadow vertex shader. Same HLSL->SPIR-V->MSL toolchain as the others.
+hf_gen_msl(lit_skinned.vert    lit_skinned.vert.hlsl    vert skinned_vertex)
+hf_gen_msl(shadow_skinned.vert shadow_skinned.vert.hlsl vert skinned_shadow_vertex)
 hf_gen_msl(post.vert   post.vert.hlsl   vert post_vertex)
 hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
@@ -100,6 +104,9 @@ add_executable(visual_test
     ${HF_ROOT}/engine/scene/scene_io.cpp
     # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.
     ${HF_ROOT}/engine/asset/gltf_loader.cpp
+    # Skeletal-animation sampling (plain C++): Quat/Slerp/FromTRS live in math.h; this is the
+    # SampleAnimation palette builder (Slice O).
+    ${HF_ROOT}/engine/anim/animation.cpp
 )
 
 # The generated MSL must exist before the executable's shaders are loaded at runtime; make the
@@ -121,6 +128,7 @@ target_compile_definitions(visual_test PRIVATE
     HF_SHADER_DIR="${HF_ROOT}/shaders"
     HF_GEN_SHADER_DIR="${HF_GEN_SHADER_DIR}"
     HF_MODEL_PATH="${HF_ROOT}/assets/models/Duck.glb"
+    HF_FOX_MODEL_PATH="${HF_ROOT}/assets/models/Fox.glb"
     HF_SCENE_PATH="${HF_ROOT}/assets/scenes/default.json"
 )
 

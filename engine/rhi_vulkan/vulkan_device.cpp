@@ -343,6 +343,52 @@ void VulkanDevice::CreateTextureResources() {
         write.pBufferInfo = &bufInfo;
         vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
     }
+
+    // --- Joint-palette set layout (set 2): binding 0 = uniform buffer (vertex stage), the
+    // JointPalette { float4x4 joints[64]; } skinning matrix array. One host-visible mapped UBO +
+    // descriptor set per frame-in-flight, pre-wired to its buffer (SetJointPalette only memcpys). ---
+    VkDescriptorSetLayoutBinding jointBinding{};
+    jointBinding.binding = 0;
+    jointBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    jointBinding.descriptorCount = 1;
+    jointBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    VkDescriptorSetLayoutCreateInfo jci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    jci.bindingCount = 1;
+    jci.pBindings = &jointBinding;
+    Check(vkCreateDescriptorSetLayout(device_, &jci, nullptr, &jointSetLayout_),
+          "vkCreateDescriptorSetLayout(joint)");
+
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = kJointPaletteSize;
+        bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VmaAllocationCreateInfo aci{};
+        aci.usage = VMA_MEMORY_USAGE_AUTO;
+        aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VmaAllocationInfo info{};
+        Check(vmaCreateBuffer(allocator_, &bci, &aci, &jointBuffer_[i], &jointAlloc_[i], &info),
+              "vmaCreateBuffer(joint)");
+        jointMapped_[i] = info.pMappedData;
+
+        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dai.descriptorPool = descriptorPool_;
+        dai.descriptorSetCount = 1;
+        dai.pSetLayouts = &jointSetLayout_;
+        Check(vkAllocateDescriptorSets(device_, &dai, &jointSet_[i]),
+              "vkAllocateDescriptorSets(joint)");
+
+        VkDescriptorBufferInfo bufInfo{jointBuffer_[i], 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = jointSet_[i];
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        write.pBufferInfo = &bufInfo;
+        vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+    }
 }
 
 void VulkanDevice::DestroyTextureResources() {
@@ -356,6 +402,17 @@ void VulkanDevice::DestroyTextureResources() {
     }
     if (frameSetLayout_) vkDestroyDescriptorSetLayout(device_, frameSetLayout_, nullptr);
     frameSetLayout_ = VK_NULL_HANDLE;
+
+    // Joint-palette UBOs + layout. Joint sets are freed when the pool below is destroyed.
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        if (jointBuffer_[i]) vmaDestroyBuffer(allocator_, jointBuffer_[i], jointAlloc_[i]);
+        jointBuffer_[i] = VK_NULL_HANDLE;
+        jointAlloc_[i] = VK_NULL_HANDLE;
+        jointMapped_[i] = nullptr;
+        jointSet_[i] = VK_NULL_HANDLE;
+    }
+    if (jointSetLayout_) vkDestroyDescriptorSetLayout(device_, jointSetLayout_, nullptr);
+    jointSetLayout_ = VK_NULL_HANDLE;
 
     if (defaultNormalView_) vkDestroyImageView(device_, defaultNormalView_, nullptr);
     if (defaultNormalImage_) vmaDestroyImage(allocator_, defaultNormalImage_, defaultNormalAlloc_);
@@ -460,6 +517,16 @@ void VulkanDevice::SetFrameUniforms(const void* data, uint32_t size) {
     // Allocation is HOST_COHERENT; flush is a no-op safeguard against non-coherent fallback.
     Check(vmaFlushAllocation(allocator_, uboAlloc_[frameIndex_], 0, size),
           "vmaFlushAllocation(ubo)");
+}
+
+void VulkanDevice::SetJointPalette(const void* data, size_t size) {
+    // Writes the joint-palette UBO for the frame currently being recorded (frameIndex_), mirroring
+    // SetFrameUniforms. currentJointPaletteSet() returns jointSet_[frameIndex_], whose descriptor
+    // points at jointBuffer_[frameIndex_] (mapped at jointMapped_[frameIndex_]).
+    if (size > kJointPaletteSize) throw std::runtime_error("SetJointPalette: size exceeds UBO");
+    std::memcpy(jointMapped_[frameIndex_], data, size);
+    Check(vmaFlushAllocation(allocator_, jointAlloc_[frameIndex_], 0, size),
+          "vmaFlushAllocation(joint)");
 }
 
 void VulkanDevice::WaitIdle() { if (device_) vkDeviceWaitIdle(device_); }

@@ -24,6 +24,9 @@ hf_add_pure_test(render_graph_test)
 hf_add_pure_test(ecs_test)
 hf_add_pure_test(scene_io_test)
 hf_add_pure_test(commands_test)
+# Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
+# ASan-eligible like the others.
+hf_add_pure_test(anim_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

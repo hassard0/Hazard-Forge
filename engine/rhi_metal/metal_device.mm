@@ -49,6 +49,9 @@ void MetalDevice::CreateFrameResources() {
         uboBuffer_[i] = [device_ newBufferWithLength:kFrameUboSize
                                              options:MTLResourceStorageModeShared];
         if (!uboBuffer_[i]) Fail("UBO newBuffer failed");
+        jointBuffer_[i] = [device_ newBufferWithLength:kJointPaletteSize
+                                               options:MTLResourceStorageModeShared];
+        if (!jointBuffer_[i]) Fail("joint-palette newBuffer failed");
     }
 }
 
@@ -156,6 +159,13 @@ void MetalDevice::SetFrameUniforms(const void* data, uint32_t size) {
     // Shared-storage buffer: contents() is host-visible; the in-flight semaphore guarantees the
     // GPU is no longer reading uboBuffer_[frameIndex_] (see BeginFrame).
     std::memcpy([uboBuffer_[frameIndex_] contents], data, size);
+}
+
+void MetalDevice::SetJointPalette(const void* data, size_t size) {
+    if (size > kJointPaletteSize) Fail("SetJointPalette: size exceeds UBO");
+    // Shared-storage buffer; the in-flight semaphore guarantees the GPU is no longer reading this
+    // frame's palette buffer (same pacing as SetFrameUniforms).
+    std::memcpy([jointBuffer_[frameIndex_] contents], data, size);
 }
 
 void MetalDevice::WaitIdle() {

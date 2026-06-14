@@ -11,6 +11,8 @@
 #include "scene/commands.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
+#include "anim/animation.h"
+#include "anim/skeleton.h"
 #include "render/render_graph.h"
 
 #ifdef HF_HAS_EDITOR
@@ -165,12 +167,17 @@ int main(int argc, char** argv) {
     //               then exit 0. This is the agentic command channel — an AI agent/CI drives the
     //               engine headlessly from a script. Separate from --editor / interactive.
     const char* shotPath = nullptr;
+    const char* skinningShotPath = nullptr;
     const char* commandsPath = nullptr;
     bool dumpScene = false;
     bool editor = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--skinning-shot") == 0 && i + 1 < argc) {
+            // Render one frame of the skinned-Fox showcase (ground + skybox + GPU-skinned Fox at
+            // animation "Survey" t=0.5s, lit + shadowed), write a BMP, exit.
+            skinningShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
@@ -184,6 +191,253 @@ int main(int argc, char** argv) {
     try {
         hal::Window window({"Hazard Forge — Shadows", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
+
+        // --- Skeletal-animation showcase (--skinning-shot): a self-contained capture path that does
+        // NOT touch the default scene. Ground plane + procedural sky + the GPU-skinned Fox sampled at
+        // animation "Survey", time 0.5s, lit + shadowed. One frame -> BMP -> exit. ----------------
+        if (skinningShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Skinned lit pipeline (set 2 joint palette; reuses lit.frag).
+            auto skVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_skinned.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto skVs = device->CreateShaderModule({std::span<const uint32_t>(skVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc skDesc;
+            skDesc.vertex = skVs.get();
+            skDesc.fragment = litFs.get();
+            skDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skDesc.colorFormat = device->Swapchain().ColorFormat();
+            skDesc.depthTest = true;
+            skDesc.usesFrameUniforms = true;
+            skDesc.usesTexture = true;
+            skDesc.usesJointPalette = true;
+            skDesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material
+            auto skinnedPipeline = device->CreateGraphicsPipeline(skDesc);
+
+            // Static lit pipeline (for the ground plane).
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Skinned + static depth-only shadow pipelines.
+            auto skShadowWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_skinned.vert.hlsl.spv");
+            auto shadowFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto skShadowVs = device->CreateShaderModule({std::span<const uint32_t>(skShadowWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsWords)});
+            rhi::GraphicsPipelineDesc skShDesc;
+            skShDesc.vertex = skShadowVs.get();
+            skShDesc.fragment = shadowFs.get();
+            skShDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skShDesc.depthTest = true;
+            skShDesc.depthOnly = true;
+            skShDesc.usesFrameUniforms = true;
+            skShDesc.usesJointPalette = true;
+            skShDesc.pushConstantSize = sizeof(float) * 16;
+            auto skinnedShadowPipeline = device->CreateGraphicsPipeline(skShDesc);
+
+            auto staticShadowWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShadowVs = device->CreateShaderModule({std::span<const uint32_t>(staticShadowWords)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShadowVs.get();
+            stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true;
+            stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // Sky + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground plane: a flat checkerboard-textured dielectric. Normal maps default to flat.
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+
+            // Load the skinned Fox + sample the Survey animation at t=0.5s -> joint palette.
+            hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
+            const anim::Animation* survey = fox.FindAnimation("Survey");
+            if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
+            std::vector<Mat4> palette;
+            if (survey) palette = anim::SampleAnimation(fox.skeleton, *survey, 0.5f);
+            else palette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+            // Pad to 64 identity matrices for the fixed-size JointPalette UBO.
+            std::vector<float> paletteData(64 * 16);
+            for (int j = 0; j < 64; ++j) {
+                Mat4 mm = (j < (int)palette.size()) ? palette[j] : Mat4::Identity();
+                for (int k = 0; k < 16; ++k) paletteData[j * 16 + k] = mm.m[k];
+            }
+
+            // Place the fox: uniform scale so it's a sensible size, ground-aligned via its bbox, and
+            // translated to the origin. The Fox is authored ~70 units tall in +Y, facing +Z.
+            float foxH = fox.bbMax[1] - fox.bbMin[1];
+            float scaleS = (foxH > 1e-4f) ? (2.5f / foxH) : 0.05f;  // ~2.5 world units tall
+            float cx = 0.5f * (fox.bbMin[0] + fox.bbMax[0]);
+            float cz = 0.5f * (fox.bbMin[2] + fox.bbMax[2]);
+            // model = Translate(-cx*s, -bbMin.y*s, -cz*s) * Scale(s): centre x/z, sit feet on y=0.
+            Mat4 foxModel = Mat4::Translate({-cx * scaleS, -fox.bbMin[1] * scaleS, -cz * scaleS})
+                          * Mat4::Scale({scaleS, scaleS, scaleS});
+
+            // Camera + light + sky frame data (fixed, deterministic).
+            const Vec3 eye{3.5f, 2.6f, 4.5f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 0.98f; fd.lightColor[1] = 0.95f; fd.lightColor[2] = 0.88f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;  // no point lights in the showcase
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 25.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            // Ground plane transform: wide flat platform under the fox.
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    // Ground (static) caster.
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    // Fox (skinned) caster.
+                    cmd.BindPipeline(*skinnedShadowPipeline);
+                    cmd.PushConstants(foxModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(fox.mesh.vertices());
+                    cmd.BindIndexBuffer(fox.mesh.indices());
+                    cmd.DrawIndexed(fox.mesh.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // Ground plane (static lit).
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Fox (skinned lit).
+                    cmd.BindPipeline(*skinnedPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = foxModel.m[k];
+                        pc[16] = fox.metallic; pc[17] = fox.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*fox.baseColor, *flatNormal);
+                        cmd.BindVertexBuffer(fox.mesh.vertices());
+                        cmd.BindIndexBuffer(fox.mesh.indices());
+                        cmd.DrawIndexed(fox.mesh.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(skinningShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u)\n", skinningShotPath, cw, ch2);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", skinningShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
 
         auto vsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
         auto fsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");

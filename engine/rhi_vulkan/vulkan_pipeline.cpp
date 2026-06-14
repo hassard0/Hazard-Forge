@@ -7,7 +7,8 @@
 namespace hf::rhi::vk {
 
 VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc)
-    : device_(device.device()), hasFrameSet_(desc.usesFrameUniforms) {
+    : device_(device.device()), hasFrameSet_(desc.usesFrameUniforms),
+      hasJointSet_(desc.usesJointPalette) {
     auto* vs = static_cast<VulkanShaderModule*>(desc.vertex);
     auto* fs = static_cast<VulkanShaderModule*>(desc.fragment);
 
@@ -124,10 +125,17 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
         lci.pushConstantRangeCount = 1;
         lci.pPushConstantRanges = &pushRange;
     }
-    // Set-layout array. Push order = set index: frame (set 0) first, material (set 1) second.
+    // Set-layout array. Push order = set index: frame (set 0), material (set 1), joint palette
+    // (set 2). Descriptor sets must occupy consecutive indices, so when the joint set (set 2) is
+    // present without a material set (set 1) — e.g. the skinned depth-only shadow pipeline — set 1
+    // is filled with the material layout as a harmless placeholder to keep set 2 at index 2.
     std::vector<VkDescriptorSetLayout> setLayouts;
     if (desc.usesFrameUniforms) setLayouts.push_back(device.frameSetLayout());   // set 0
-    if (desc.usesTexture)       setLayouts.push_back(device.materialSetLayout()); // set 1
+    if (desc.usesJointPalette && !desc.usesTexture)
+        setLayouts.push_back(device.materialSetLayout());                        // set 1 placeholder
+    else if (desc.usesTexture)
+        setLayouts.push_back(device.materialSetLayout());                        // set 1
+    if (desc.usesJointPalette) setLayouts.push_back(device.jointPaletteSetLayout()); // set 2
     if (!setLayouts.empty()) {
         lci.setLayoutCount = (uint32_t)setLayouts.size();
         lci.pSetLayouts = setLayouts.data();

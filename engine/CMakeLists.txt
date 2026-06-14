@@ -8,6 +8,7 @@ set(HF_ENGINE_COMMON_SOURCES
   scene/scene_io.cpp
   scene/commands.cpp
   asset/gltf_loader.cpp
+  anim/animation.cpp
 )
 
 if(APPLE)
@@ -67,6 +68,7 @@ add_library(hf_core STATIC
   scene/scene_io.cpp
   scene/commands.cpp
   asset/gltf_loader.cpp
+  anim/animation.cpp
 )
 target_include_directories(hf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}

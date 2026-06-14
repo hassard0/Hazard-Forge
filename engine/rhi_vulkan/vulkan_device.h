@@ -37,6 +37,7 @@ public:
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
     void SetFrameUniforms(const void* data, uint32_t size) override;
+    void SetJointPalette(const void* data, size_t size) override;
     void WaitIdle() override;
     void CaptureNextFrame() override { captureArmed_ = true; }
     bool GetCapturedPixels(std::vector<uint8_t>& outBGRA,
@@ -57,6 +58,9 @@ public:
     // Per-frame UBO set (set 0). currentFrameSet() returns the set for the frame being recorded.
     VkDescriptorSetLayout frameSetLayout() const { return frameSetLayout_; }
     VkDescriptorSet currentFrameSet() const { return frameSet_[frameIndex_]; }
+    // Joint-palette UBO set (set 2). currentJointPaletteSet() returns the set for the recording frame.
+    VkDescriptorSetLayout jointPaletteSetLayout() const { return jointSetLayout_; }
+    VkDescriptorSet currentJointPaletteSet() const { return jointSet_[frameIndex_]; }
     // Swapchain color format — render targets match it so the lit pipeline renders in unchanged.
     VkFormat swapchainFormat() const { return swapchain_->vkFormat(); }
 
@@ -109,6 +113,16 @@ private:
     VmaAllocation   uboAlloc_[kFramesInFlight]{};
     void*           uboMapped_[kFramesInFlight]{};
     VkDescriptorSet frameSet_[kFramesInFlight]{};
+
+    // Joint-palette UBO (set 2): JointPalette { float4x4 joints[64]; } = 4096 B. One host-visible
+    // mapped UBO + descriptor set per frame-in-flight, mirroring the per-frame UBO above. Written by
+    // SetJointPalette; auto-bound at set 2 on BindPipeline when the pipeline declares usesJointPalette.
+    static constexpr uint32_t kJointPaletteSize = 64 * 64;  // 64 mat4 (64B each) = 4096 B
+    VkDescriptorSetLayout jointSetLayout_ = VK_NULL_HANDLE;
+    VkBuffer        jointBuffer_[kFramesInFlight]{};
+    VmaAllocation   jointAlloc_[kFramesInFlight]{};
+    void*           jointMapped_[kFramesInFlight]{};
+    VkDescriptorSet jointSet_[kFramesInFlight]{};
 
     std::unique_ptr<VulkanSwapchain> swapchain_;
 

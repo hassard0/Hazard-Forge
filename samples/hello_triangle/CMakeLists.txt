@@ -13,6 +13,8 @@ hf_compile_shaders(
   SHADERS
     "shaders/lit.vert.hlsl:vs"
     "shaders/lit.frag.hlsl:ps"
+    "shaders/lit_skinned.vert.hlsl:vs"
+    "shaders/shadow_skinned.vert.hlsl:vs"
     "shaders/shadow.vert.hlsl:vs"
     "shaders/shadow.frag.hlsl:ps"
     "shaders/post.vert.hlsl:vs"
@@ -30,6 +32,9 @@ target_compile_definitions(hello_triangle PRIVATE
 # Absolute path to the glTF showcase model, baked at configure time (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/Duck.glb\"")
+# Absolute path to the skinned-animation showcase model (Fox.glb: 24-joint skin + animations).
+target_compile_definitions(hello_triangle PRIVATE
+  "HF_FOX_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/Fox.glb\"")
 # Absolute path to the default data-driven scene description (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SCENE_PATH=\"${CMAKE_SOURCE_DIR}/assets/scenes/default.json\"")

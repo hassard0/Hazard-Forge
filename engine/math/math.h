@@ -121,4 +121,69 @@ inline Mat4 operator*(const Mat4& a, const Mat4& b) {
     return c;
 }
 
+// --- Quaternion (x,y,z,w), used for skeletal-animation rotation channels. ----------------------
+// Identity = (0,0,0,1). Stored the same way glTF stores ROTATION channels (xyzw), so the loader
+// copies the four floats straight in. Slerp is implemented as normalized-lerp (nlerp): for the
+// small per-frame angular deltas of a sampled animation it is visually indistinguishable from true
+// slerp, is branch-light, and preserves the shortest-arc behaviour via the dot-sign flip. (See the
+// design spec — nlerp is the documented, accepted choice for this slice.)
+struct Quat {
+    float x = 0, y = 0, z = 0, w = 1;
+    Quat() = default;
+    Quat(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
+    static Quat Identity() { return Quat{0, 0, 0, 1}; }
+};
+
+inline Quat Normalize(const Quat& q) {
+    float len = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    if (len <= 0.0f) return Quat::Identity();
+    float inv = 1.0f / len;
+    return Quat{q.x*inv, q.y*inv, q.z*inv, q.w*inv};
+}
+
+// Normalized-lerp between two unit quaternions, taking the shortest arc (flip b if dot < 0).
+// t is clamped to [0,1] by the caller (the sampler clamps the keyframe fraction).
+inline Quat Slerp(const Quat& a, Quat b, float t) {
+    float d = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+    if (d < 0.0f) { b.x = -b.x; b.y = -b.y; b.z = -b.z; b.w = -b.w; }
+    Quat r{a.x + (b.x - a.x) * t,
+           a.y + (b.y - a.y) * t,
+           a.z + (b.z - a.z) * t,
+           a.w + (b.w - a.w) * t};
+    return Normalize(r);
+}
+
+// Column-major rotation matrix from a (assumed-normalized) quaternion. Matches the RH convention
+// used elsewhere: element(row,col) == m[col*4 + row].
+inline Mat4 QuatToMat4(const Quat& q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    float xx = x*x, yy = y*y, zz = z*z;
+    float xy = x*y, xz = x*z, yz = y*z;
+    float wx = w*x, wy = w*y, wz = w*z;
+    Mat4 r = Mat4::Identity();
+    r.m[0]  = 1.0f - 2.0f*(yy + zz);  // col0,row0
+    r.m[1]  = 2.0f*(xy + wz);         // col0,row1
+    r.m[2]  = 2.0f*(xz - wy);         // col0,row2
+    r.m[4]  = 2.0f*(xy - wz);         // col1,row0
+    r.m[5]  = 1.0f - 2.0f*(xx + zz);  // col1,row1
+    r.m[6]  = 2.0f*(yz + wx);         // col1,row2
+    r.m[8]  = 2.0f*(xz + wy);         // col2,row0
+    r.m[9]  = 2.0f*(yz - wx);         // col2,row1
+    r.m[10] = 1.0f - 2.0f*(xx + yy);  // col2,row2
+    return r;
+}
+
+// Compose a local transform from translation, rotation (quaternion) and scale: T * R * S.
+// (Scale applied first, then rotate, then translate — the standard glTF node-TRS order.)
+inline Mat4 FromTRS(const Vec3& t, const Quat& r, const Vec3& s) {
+    Mat4 m = QuatToMat4(r);
+    // Fold the scale into the rotation columns (column c is scaled by s[c]).
+    m.m[0] *= s.x; m.m[1] *= s.x; m.m[2] *= s.x;
+    m.m[4] *= s.y; m.m[5] *= s.y; m.m[6] *= s.y;
+    m.m[8] *= s.z; m.m[9] *= s.z; m.m[10] *= s.z;
+    // Translation in the last column.
+    m.m[12] = t.x; m.m[13] = t.y; m.m[14] = t.z;
+    return m;
+}
+
 } // namespace hf::math

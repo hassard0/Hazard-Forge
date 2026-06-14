@@ -63,6 +63,12 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
     boundFrameUniforms_ = p.usesFrameUniforms();
     boundPointList_ = p.pointList();
 
+    // Joint-palette skinning set (set 2): bind the device's current palette UBO at the skinning
+    // vertex-buffer slot, mirroring the Vulkan set-2 auto-bind. Only the skinned pipelines set this.
+    if (p.usesJointPalette()) {
+        [encoder_ setVertexBuffer:device_.currentJointPalette() offset:0 atIndex:kVbJointPalette];
+    }
+
     // Fullscreen post pass: the [[vertex_id]]-generated triangle's winding depends on the clip
     // convention; disable culling so it is never back-face culled to black (mirrors Vulkan, which
     // sets cullMode NONE for fullscreen pipelines). BeginRenderPass defaults to cull-back.
