@@ -31,6 +31,20 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
         vd.layouts[kVbVertex].stride = desc.vertexLayout.stride;
         vd.layouts[kVbVertex].stepFunction = MTLVertexStepFunctionPerVertex;
         vd.layouts[kVbVertex].stepRate = 1;
+
+        // Optional per-instance stream (binding 1 -> Metal vertex buffer slot kVbInstance). Its
+        // attributes (a mat4 transform at locations 7-10) advance once per instance, mirroring
+        // Vulkan's VK_VERTEX_INPUT_RATE_INSTANCE on binding 1.
+        if (!desc.instanceLayout.attributes.empty()) {
+            for (const auto& a : desc.instanceLayout.attributes) {
+                vd.attributes[a.location].format = ToMetalVertexFormat(a.format);
+                vd.attributes[a.location].offset = a.offset;
+                vd.attributes[a.location].bufferIndex = kVbInstance;
+            }
+            vd.layouts[kVbInstance].stride = desc.instanceLayout.stride;
+            vd.layouts[kVbInstance].stepFunction = MTLVertexStepFunctionPerInstance;
+            vd.layouts[kVbInstance].stepRate = 1;
+        }
     }
 
     // --- Render pipeline state. ---

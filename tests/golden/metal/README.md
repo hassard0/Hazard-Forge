@@ -1,5 +1,33 @@
 # Metal golden-image test
 
+## `instanced.png` — GPU instanced rendering (Slice Q)
+
+`instanced.png` is a SEPARATE golden produced by `visual_test --instanced`: a minimal GPU-instancing
+showcase (ground checkerboard plane + procedural sky + a **12×12 = 144 field of spheres** drawn in a
+single `ICommandBuffer::DrawIndexedInstanced` call, lit + shadowed, fixed elevated camera/light).
+Each instance is placed by its own per-instance model matrix supplied through a SECOND, per-instance
+vertex stream (RHI binding 1): four `RGBA32_Float` attributes at locations 7–10 carry the columns of
+a column-major `float4x4` (`scene::InstanceTransformLayout`, stride 64), bound via
+`BindInstanceBuffer`. The transforms come from the deterministic `scene::BuildInstanceGrid` (NO RNG —
+a pure function of the instance index: grid x/z + a per-index sin height bob + a per-index Y spin), so
+the frame is golden-stable — two runs diff to `0.0000`. The instanced MSL is generated from the
+shared HLSL (`shaders/lit_instanced.vert.hlsl` + the unchanged `lit.frag`; the field's shadows use
+`shaders/shadow_instanced.vert.hlsl`) by the build toolchain (`lit_instanced.vert.gen.metal`, entry
+`instanced_vertex`); the per-instance attributes bind at Metal vertex buffer slot `kVbInstance = 4`
+(`metal_common.h`), past vertex(0)/frameUbo(1)/pushConst(2)/jointPalette(3), with the vertex
+descriptor's `kVbInstance` layout set to `MTLVertexStepFunctionPerInstance`. This golden is
+INDEPENDENT of `scene_shadow.png` / `skinning.png` / `pbr_helmet.png`, which are unchanged (all still
+diff `0.0000`) because instancing is an additive separate pipeline + vertex binding.
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --instanced /tmp/inst.png
+~/mac-remote-rig/compare.sh tests/golden/metal/instanced.png /tmp/inst.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `pbr_helmet.png` — full glTF PBR material (Slice P)
 
 `pbr_helmet.png` is a SEPARATE golden produced by `visual_test --pbr`: a minimal full-PBR showcase

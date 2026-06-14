@@ -42,4 +42,21 @@ inline rhi::VertexLayout SkinnedMeshVertexLayout() {
     };
     return l;
 }
+// Per-instance vertex layout (Slice Q): a single mat4 model transform supplied through the SECOND,
+// per-instance vertex binding (binding 1). Four RGBA32_Float attributes at locations 7,8,9,10 carry
+// the four COLUMNS of a column-major float4x4 (offsets 0/16/32/48, stride 64), matching math::Mat4's
+// byte layout. Locations 5/6 are reserved by the skinned vertex layout, so 7-10 never collide. The
+// instanced lit/shadow vertex shaders reassemble these four columns into the model matrix.
+struct InstanceData { float model[16]; };  // column-major mat4 == math::Mat4::m
+inline rhi::VertexLayout InstanceTransformLayout() {
+    rhi::VertexLayout l;
+    l.stride = sizeof(InstanceData);  // 64
+    l.attributes = {
+        {7,  rhi::Format::RGBA32_Float, 0},
+        {8,  rhi::Format::RGBA32_Float, 16},
+        {9,  rhi::Format::RGBA32_Float, 32},
+        {10, rhi::Format::RGBA32_Float, 48},
+    };
+    return l;
+}
 } // namespace

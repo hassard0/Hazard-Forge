@@ -47,6 +47,12 @@ struct GraphicsPipelineDesc {
     class IShaderModule* vertex = nullptr;
     class IShaderModule* fragment = nullptr;
     VertexLayout vertexLayout;
+    // Optional SECOND, per-instance vertex stream (binding 1, input rate = per-instance). When its
+    // `attributes` is non-empty the pipeline declares a second vertex binding fed by
+    // BindInstanceBuffer; binding 0 stays the per-vertex `vertexLayout`. Empty (the default) means
+    // no instancing — identical to all existing pipelines. The instanced lit pipeline puts a mat4
+    // per-instance transform here (4x RGBA32_Float at locations 7-10, stride 64).
+    VertexLayout instanceLayout;
     Format colorFormat = Format::BGRA8_UNorm;  // must match swapchain format
     bool depthTest = true;
     Format depthFormat = Format::D32_Float;
@@ -115,6 +121,10 @@ public:
     virtual void BeginRenderPass(const ClearColor& clear) = 0;
     virtual void BindPipeline(IPipeline& pipeline) = 0;
     virtual void BindVertexBuffer(IBuffer& buffer) = 0;
+    // Bind a per-instance vertex stream to binding 1 (paired with a pipeline whose instanceLayout is
+    // non-empty). Default no-op so non-instancing backends/passes are unaffected; both shipping
+    // backends override it. Must be called before DrawIndexedInstanced.
+    virtual void BindInstanceBuffer(IBuffer& /*buffer*/) {}
     virtual void BindIndexBuffer(IBuffer& buffer) = 0;
     virtual void BindTexture(ITexture& texture) = 0;
     // Bind a material: base-color texture at the material slot AND a tangent-space normal map at the
@@ -136,6 +146,17 @@ public:
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.
     virtual void DrawIndexed(uint32_t indexCount, uint32_t firstIndex = 0,
                              int32_t vertexOffset = 0) = 0;
+    // Instanced indexed draw: draws `instanceCount` copies of the indexed geometry, each fed a
+    // distinct per-instance attribute set from the buffer bound via BindInstanceBuffer (binding 1).
+    // gl_InstanceIndex/[[instance_id]] selects the per-instance record. Default forwards to a single
+    // DrawIndexed (instanceCount ignored) so backends that do not implement instancing still link;
+    // both shipping backends override it.
+    virtual void DrawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount,
+                                      uint32_t firstIndex = 0, int32_t vertexOffset = 0,
+                                      uint32_t firstInstance = 0) {
+        (void)instanceCount; (void)firstInstance;
+        DrawIndexed(indexCount, firstIndex, vertexOffset);
+    }
     virtual void PushConstants(const void* data, uint32_t size) = 0;
     // Override the render pass's full-extent scissor for the following draw(s). ImGui needs a
     // per-draw scissor (clip rect). Coordinates are in framebuffer pixels (top-left origin).

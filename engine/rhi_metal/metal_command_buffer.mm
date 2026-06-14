@@ -103,6 +103,13 @@ void MetalCommandBuffer::BindVertexBuffer(IBuffer& buffer) {
     [encoder_ setVertexBuffer:b.handle() offset:0 atIndex:kVbVertex];
 }
 
+void MetalCommandBuffer::BindInstanceBuffer(IBuffer& buffer) {
+    auto& b = static_cast<MetalBuffer&>(buffer);
+    // Per-instance stream at the flat vertex-buffer slot kVbInstance (the pipeline's vertex
+    // descriptor marks this slot per-instance). Mirrors Vulkan binding 1.
+    [encoder_ setVertexBuffer:b.handle() offset:0 atIndex:kVbInstance];
+}
+
 void MetalCommandBuffer::BindIndexBuffer(IBuffer& buffer) {
     auto& b = static_cast<MetalBuffer&>(buffer);
     indexBuffer_ = b.handle();
@@ -165,6 +172,20 @@ void MetalCommandBuffer::DrawIndexed(uint32_t indexCount, uint32_t firstIndex,
                       instanceCount:1
                          baseVertex:vertexOffset
                        baseInstance:0];
+}
+
+void MetalCommandBuffer::DrawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount,
+                                              uint32_t firstIndex, int32_t vertexOffset,
+                                              uint32_t firstInstance) {
+    const NSUInteger indexBytes = (NSUInteger)firstIndex * sizeof(uint32_t);
+    [encoder_ drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                         indexCount:indexCount
+                          indexType:MTLIndexTypeUInt32
+                        indexBuffer:indexBuffer_
+                  indexBufferOffset:indexBytes
+                      instanceCount:instanceCount
+                         baseVertex:vertexOffset
+                       baseInstance:firstInstance];
 }
 
 void MetalCommandBuffer::PushConstants(const void* data, uint32_t size) {

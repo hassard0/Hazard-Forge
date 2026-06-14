@@ -29,6 +29,10 @@ constexpr uint32_t kVbPushConst   = 2;
 // Skinning joint-palette UBO (set 2 b0 in HLSL -> [[vk::binding(3,2)]] so spirv-cross
 // --msl-decoration-binding lands it at vertex buffer(3), past the vertex/frame/pushconst slots).
 constexpr uint32_t kVbJointPalette = 3;
+// Per-instance vertex stream (binding 1 in the RHI / Vulkan). Flat Metal vertex-buffer slot 4, past
+// vertex(0)/frameUbo(1)/pushConst(2)/jointPalette(3). The instanced lit MSL reads its mat4 transform
+// attributes (locations 7-10) from this stage_in buffer with a per-instance step function.
+constexpr uint32_t kVbInstance    = 4;
 constexpr uint32_t kFbFrameUbo    = 0;
 constexpr uint32_t kFragTexture   = 0;
 constexpr uint32_t kFragSampler   = 1;

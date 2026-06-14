@@ -82,6 +82,14 @@ void VulkanCommandBuffer::BindVertexBuffer(IBuffer& buffer) {
     vkCmdBindVertexBuffers(cmd_, 0, 1, &vb, &offset);
 }
 
+void VulkanCommandBuffer::BindInstanceBuffer(IBuffer& buffer) {
+    auto& b = static_cast<VulkanBuffer&>(buffer);
+    VkBuffer vb = b.handle();
+    VkDeviceSize offset = 0;
+    // Per-instance stream at binding 1 (binding 0 is the per-vertex stream).
+    vkCmdBindVertexBuffers(cmd_, 1, 1, &vb, &offset);
+}
+
 void VulkanCommandBuffer::BindIndexBuffer(IBuffer& buffer) {
     auto& b = static_cast<VulkanBuffer&>(buffer);
     vkCmdBindIndexBuffer(cmd_, b.handle(), 0, VK_INDEX_TYPE_UINT32);
@@ -126,6 +134,12 @@ void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
 void VulkanCommandBuffer::DrawIndexed(uint32_t indexCount, uint32_t firstIndex,
                                       int32_t vertexOffset) {
     vkCmdDrawIndexed(cmd_, indexCount, 1, firstIndex, vertexOffset, 0);
+}
+
+void VulkanCommandBuffer::DrawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount,
+                                               uint32_t firstIndex, int32_t vertexOffset,
+                                               uint32_t firstInstance) {
+    vkCmdDrawIndexed(cmd_, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
 void VulkanCommandBuffer::PushConstants(const void* data, uint32_t size) {

@@ -73,6 +73,10 @@ hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
 # depth-only shadow vertex shader. Same HLSL->SPIR-V->MSL toolchain as the others.
 hf_gen_msl(lit_skinned.vert    lit_skinned.vert.hlsl    vert skinned_vertex)
 hf_gen_msl(shadow_skinned.vert shadow_skinned.vert.hlsl vert skinned_shadow_vertex)
+# Instanced variants (Slice Q): per-instance model-matrix vertex stream (binding 1). The lit
+# variant reuses lit.frag; the shadow variant is depth-only. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(lit_instanced.vert    lit_instanced.vert.hlsl    vert instanced_vertex)
+hf_gen_msl(shadow_instanced.vert shadow_instanced.vert.hlsl vert instanced_shadow_vertex)
 hf_gen_msl(post.vert   post.vert.hlsl   vert post_vertex)
 hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)

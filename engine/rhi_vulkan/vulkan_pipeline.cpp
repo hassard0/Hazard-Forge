@@ -22,14 +22,23 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     stages[1].module = fs->handle();
     stages[1].pName = "main";
 
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = desc.vertexLayout.stride;
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    // Binding 0 = per-vertex stream. Binding 1 (optional) = per-instance stream, present when the
+    // desc carries a non-empty instanceLayout (e.g. the instanced lit pipeline's mat4 transform).
+    const bool hasInstance = !desc.instanceLayout.attributes.empty();
+    std::vector<VkVertexInputBindingDescription> bindings;
+    bindings.push_back({0, desc.vertexLayout.stride, VK_VERTEX_INPUT_RATE_VERTEX});
+    if (hasInstance) {
+        bindings.push_back({1, desc.instanceLayout.stride, VK_VERTEX_INPUT_RATE_INSTANCE});
+    }
 
     std::vector<VkVertexInputAttributeDescription> attrs;
     for (const auto& a : desc.vertexLayout.attributes) {
         attrs.push_back({a.location, 0, ToVk(a.format), a.offset});
+    }
+    if (hasInstance) {
+        for (const auto& a : desc.instanceLayout.attributes) {
+            attrs.push_back({a.location, 1, ToVk(a.format), a.offset});
+        }
     }
 
     VkPipelineVertexInputStateCreateInfo vi{
@@ -39,8 +48,8 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
         vi.vertexBindingDescriptionCount = 0;
         vi.vertexAttributeDescriptionCount = 0;
     } else {
-        vi.vertexBindingDescriptionCount = 1;
-        vi.pVertexBindingDescriptions = &binding;
+        vi.vertexBindingDescriptionCount = (uint32_t)bindings.size();
+        vi.pVertexBindingDescriptions = bindings.data();
         vi.vertexAttributeDescriptionCount = (uint32_t)attrs.size();
         vi.pVertexAttributeDescriptions = attrs.data();
     }
