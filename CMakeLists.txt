@@ -16,6 +16,7 @@ find_package(VulkanHeaders REQUIRED)
 find_package(VulkanLoader REQUIRED)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+include(CompileShaders)
 
 enable_testing()
 
