@@ -14,12 +14,15 @@ namespace hf::rhi::mtl {
 //             buffer(2) = push constants (model matrix), via setVertexBytes
 //   fragment: buffer(0) = per-frame UBO (FrameData)
 //             texture(0)/sampler(0) = material
+//             texture(1)/sampler(1) = shadow map (depth) + its clamp-to-edge sampler
 constexpr uint32_t kVbVertex      = 0;
 constexpr uint32_t kVbFrameUbo    = 1;
 constexpr uint32_t kVbPushConst   = 2;
 constexpr uint32_t kFbFrameUbo    = 0;
 constexpr uint32_t kFragTexture   = 0;
 constexpr uint32_t kFragSampler   = 0;
+constexpr uint32_t kFragShadowTex = 1;
+constexpr uint32_t kFragShadowSmp = 1;
 
 // Map an RHI vertex-attribute / color / depth format to a Metal pixel/vertex format.
 inline MTLPixelFormat ToMetalPixelFormat(Format f) {

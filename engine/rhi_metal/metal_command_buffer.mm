@@ -4,6 +4,7 @@
 #include "rhi_metal/metal_buffer.h"
 #include "rhi_metal/metal_texture.h"
 #include "rhi_metal/metal_sampled.h"
+#include "rhi_metal/metal_render_target.h"
 #include "rhi_metal/metal_common.h"
 
 namespace hf::rhi::mtl {
@@ -24,14 +25,21 @@ void MetalCommandBuffer::Begin(id<MTLCommandBuffer> cmd, id<MTLTexture> colorTex
 
 void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear) {
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-    rpd.colorAttachments[0].texture = colorTex_;
-    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
-    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rpd.colorAttachments[0].clearColor = MTLClearColorMake(clear.r, clear.g, clear.b, clear.a);
+
+    // Depth-only (shadow) pass: colorTex_ is nil -> no color attachment, and the depth must be
+    // STORED so the lit pass can sample it. The scene/post passes have a color attachment and only
+    // need depth transiently (store = DontCare).
+    const bool depthOnly = (colorTex_ == nil);
+    if (!depthOnly) {
+        rpd.colorAttachments[0].texture = colorTex_;
+        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rpd.colorAttachments[0].clearColor = MTLClearColorMake(clear.r, clear.g, clear.b, clear.a);
+    }
 
     rpd.depthAttachment.texture = depthTex_;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
-    rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+    rpd.depthAttachment.storeAction = depthOnly ? MTLStoreActionStore : MTLStoreActionDontCare;
     rpd.depthAttachment.clearDepth = 1.0;
 
     encoder_ = [cmd_ renderCommandEncoderWithDescriptor:rpd];
@@ -62,6 +70,21 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
         id<MTLBuffer> ubo = device_.currentFrameUbo();
         [encoder_ setVertexBuffer:ubo offset:0 atIndex:kVbFrameUbo];
         [encoder_ setFragmentBuffer:ubo offset:0 atIndex:kFbFrameUbo];
+
+        // Auto-bind the shadow map (depth texture + clamp-to-edge sampler) to the lit fragment
+        // shader's shadow slots, mirroring the Vulkan per-frame set (set 0, bindings 1+2). Only
+        // matters for the lit pass; the depth-only shadow pipeline has no fragment stage so the
+        // binding is harmless there. Skip when no shadow map has been set (e.g. the plain RT path).
+        if (MetalRenderTarget* sm = device_.currentShadowMap()) {
+            [encoder_ setFragmentTexture:sm->sampledTexture() atIndex:kFragShadowTex];
+            [encoder_ setFragmentSamplerState:sm->sampledSampler() atIndex:kFragShadowSmp];
+        }
+    }
+
+    // Depth-only (shadow) pipeline: a modest depth bias pushes caster depths away from the light to
+    // fight shadow acne (Metal's encoder-level equivalent of Vulkan's rasterization depthBias).
+    if (p.depthOnly()) {
+        [encoder_ setDepthBias:1.25f slopeScale:1.75f clamp:0.0f];
     }
 }
 

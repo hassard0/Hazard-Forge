@@ -45,12 +45,21 @@ static int fail(const std::string& msg) {
     return 1;
 }
 
-// ---- Per-frame uniform block — must match shaders/lit.metal FrameData (112 bytes). ----
+// ---- Per-frame uniform block — must match shaders/lit.metal + shaders/shadow.metal FrameData
+// (288 bytes) byte-for-byte. Layout mirrors the Vulkan sample (samples/hello_triangle/main.cpp). ----
 struct FrameData {
     float vp[16];
     float lightDir[4];
     float lightColor[4];
     float viewPos[4];
+    float ptCount[4];          // x = number of active point lights (unused here)
+    float ptPos[3][4];
+    float ptColor[3][4];
+    float lightViewProj[16];   // directional light's view*ortho (for shadow mapping)
+    float camFwd[4];           // sky/camera-basis fields (unused here; layout parity)
+    float camRight[4];
+    float camUp[4];
+    float skyParams[4];
 };
 
 static std::string LoadText(const std::string& path) {
@@ -149,8 +158,30 @@ int main(int argc, char** argv) {
             postDesc.fullscreen = true;          // no vertex input; 3 verts from [[vertex_id]]
             auto postPipeline = device->CreateGraphicsPipeline(postDesc);
 
+            // ---- Depth-only shadow pipeline: transforms geometry into the light's clip space and
+            // writes only depth (no fragment stage, no color attachment). Needs lightViewProj from
+            // the per-frame UBO; no texture. ----
+            std::string shadowMsl = LoadText(std::string(HF_SHADER_DIR) + "/shadow.metal");
+            auto shadowVs = rhi::mtl::MakeShaderModuleFromMSL(*device, shadowMsl, "shadow_vertex");
+
+            rhi::GraphicsPipelineDesc shadowDesc;
+            shadowDesc.vertex = shadowVs.get();
+            shadowDesc.fragment = nullptr;                // depth-only: no fragment stage
+            shadowDesc.vertexLayout = scene::MeshVertexLayout();
+            shadowDesc.depthTest = true;
+            shadowDesc.depthOnly = true;                  // no color attachment, depth write + bias
+            shadowDesc.usesFrameUniforms = true;          // lightViewProj lives in the frame UBO
+            shadowDesc.usesTexture = false;
+            shadowDesc.pushConstantSize = sizeof(float) * 16;  // mat4 model
+            auto shadowPipeline = device->CreateGraphicsPipeline(shadowDesc);
+
             // ---- Offscreen render target (scene -> RT -> post -> output), at output size. ----
             auto rt = device->CreateRenderTarget(W, H);
+
+            // ---- Shadow map: a 2048x2048 depth-only sampleable target. SetShadowMap points the lit
+            // pass's fragment shadow slots (texture/sampler index 1) at it. ----
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
 
             // ---- Procedural checkerboard texture (256x256 RGBA8), shared by all renderables. ----
             std::vector<uint8_t> pixels = MakeCheckerboard();
@@ -196,6 +227,37 @@ int main(int argc, char** argv) {
             fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f; fd.lightDir[3] = 0;
             fd.lightColor[0] = fd.lightColor[1] = fd.lightColor[2] = fd.lightColor[3] = 1.0f;
             fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+
+            // ---- Directional light's view*projection for shadow mapping. Same construction as the
+            // Vulkan Slice-I sample: the light looks from sceneCenter - lightDir*12 toward the
+            // scene center; an ortho box covers the 3x3 cube grid + ground plane. ----
+            Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            Vec3 sceneCenter{0.0f, 0.5f, 0.0f};
+            Vec3 lightEye = sceneCenter - lightDir * 12.0f;
+            Mat4 lightView = Mat4::LookAt(lightEye, sceneCenter, {0, 1, 0});
+            Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 25.0f);
+            Mat4 lightVP = lightOrtho * lightView;
+            for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+
+            // ---- Pass 0: depth-only shadow pass from the light into the shadow map. Renders the
+            // scene geometry (no textures) through the depth-only pipeline; the lit pass samples the
+            // resulting depth for PCF shadows. ----
+            {
+                auto sc = device->BeginShadowPass(*shadowMap);
+                if (!sc.cmd) return fail("BeginShadowPass returned no command buffer");
+                device->SetFrameUniforms(&fd, sizeof(FrameData));  // fd has lightViewProj
+                sc.cmd->BeginRenderPass(rhi::ClearColor{0.0f, 0.0f, 0.0f, 1.0f});
+                sc.cmd->BindPipeline(*shadowPipeline);
+                for (scene::Renderable& r : sceneObjects) {
+                    Mat4 m = r.transform.Matrix();
+                    sc.cmd->PushConstants(m.m, sizeof(float) * 16);
+                    sc.cmd->BindVertexBuffer(r.mesh->vertices());
+                    sc.cmd->BindIndexBuffer(r.mesh->indices());
+                    sc.cmd->DrawIndexed(r.mesh->indexCount());
+                }
+                sc.cmd->EndRenderPass();
+                device->EndShadowPass(sc);
+            }
 
             // ---- Pass 1: render the scene into the offscreen render target (lit, textured). ----
             {

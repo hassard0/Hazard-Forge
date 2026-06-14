@@ -7,10 +7,11 @@ namespace hf::rhi::mtl {
 
 MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& desc)
     : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
-      fullscreen_(desc.fullscreen) {
+      fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly) {
     id<MTLDevice> dev = device.device();
 
     auto* vs = static_cast<MetalShaderModule*>(desc.vertex);
+    // Depth-only shadow pipeline: no fragment stage (writes only depth). desc.fragment may be null.
     auto* fs = static_cast<MetalShaderModule*>(desc.fragment);
 
     // --- Vertex descriptor from the RHI vertex layout. ---
@@ -33,10 +34,13 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
     // --- Render pipeline state. ---
     MTLRenderPipelineDescriptor* rpd = [[MTLRenderPipelineDescriptor alloc] init];
     rpd.vertexFunction = vs->function();
-    rpd.fragmentFunction = fs->function();
+    // Depth-only (shadow) pipeline: no fragment function, no color attachment — just depth.
+    rpd.fragmentFunction = desc.depthOnly ? nil : fs->function();
     rpd.vertexDescriptor = vd;
-    rpd.colorAttachments[0].pixelFormat = ToMetalPixelFormat(desc.colorFormat);
-    if (desc.depthTest) {
+    if (!desc.depthOnly) {
+        rpd.colorAttachments[0].pixelFormat = ToMetalPixelFormat(desc.colorFormat);
+    }
+    if (desc.depthTest || desc.depthOnly) {
         rpd.depthAttachmentPixelFormat = ToMetalPixelFormat(desc.depthFormat);
     }
 
@@ -50,7 +54,7 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
 
     // --- Depth-stencil state (LESS + write, matching the Vulkan pipeline). ---
     MTLDepthStencilDescriptor* dsd = [[MTLDepthStencilDescriptor alloc] init];
-    if (desc.depthTest) {
+    if (desc.depthTest || desc.depthOnly) {
         dsd.depthCompareFunction = MTLCompareFunctionLess;
         dsd.depthWriteEnabled = YES;
     } else {

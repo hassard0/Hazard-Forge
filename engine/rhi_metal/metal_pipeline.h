@@ -18,6 +18,7 @@ public:
     bool usesFrameUniforms() const { return usesFrameUniforms_; }
     bool usesTexture() const { return usesTexture_; }
     bool fullscreen() const { return fullscreen_; }
+    bool depthOnly() const { return depthOnly_; }
 
 private:
     id<MTLRenderPipelineState> pipelineState_ = nil;
@@ -25,6 +26,7 @@ private:
     bool usesFrameUniforms_ = false;
     bool usesTexture_       = false;
     bool fullscreen_        = false;
+    bool depthOnly_         = false;
 };
 
 } // namespace hf::rhi::mtl

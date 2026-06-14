@@ -19,6 +19,7 @@ namespace hf::rhi::mtl {
 constexpr uint32_t kFramesInFlight = 2;
 
 class MetalCommandBuffer;
+class MetalRenderTarget;
 
 class MetalDevice final : public IRHIDevice {
 public:
@@ -65,6 +66,9 @@ public:
     // Accessors used by sibling Metal objects.
     id<MTLDevice> device() const { return device_; }
     id<MTLBuffer> currentFrameUbo() const { return uboBuffer_[frameIndex_]; }
+    // The shadow map most recently passed to SetShadowMap (null until set). The command buffer
+    // binds its depth texture + sampler to the lit pass's fragment shadow slots in BindPipeline.
+    MetalRenderTarget* currentShadowMap() const { return shadowMap_; }
 
 private:
     void Init();              // shared device/queue/UBO/recorder setup
@@ -83,9 +87,15 @@ private:
     // waited in EndRenderTargetFrame) so it never clobbers the swapchain recorder's frame state.
     std::unique_ptr<MetalCommandBuffer> rtRecorder_;
     id<MTLCommandBuffer> rtCmd_ = nil;  // in-flight render-target command buffer
+    id<MTLCommandBuffer> shadowCmd_ = nil;  // in-flight depth-only shadow command buffer
+
+    // Shadow map currently bound for sampling by the lit pass (set via SetShadowMap). Not owned.
+    MetalRenderTarget* shadowMap_ = nil;
 
     // Per-frame uniform buffers (shared storage), one per frame-in-flight.
-    static constexpr uint32_t kFrameUboSize = 256;  // >= sizeof(FrameData) (112B), aligned
+    // 512B matches the Vulkan backend's kFrameUboSize: >= sizeof(FrameData) (288B with the added
+    // lightViewProj) and future-proofs UBO growth.
+    static constexpr uint32_t kFrameUboSize = 512;
     id<MTLBuffer> uboBuffer_[kFramesInFlight] = {nil, nil};
 
     // In-flight CPU/GPU pacing: block BeginFrame until the frame N-kFramesInFlight ago finished,

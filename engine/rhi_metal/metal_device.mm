@@ -103,23 +103,47 @@ void MetalDevice::EndRenderTargetFrame(const FrameContext& frame) {
     rtCmd_ = nil;
 }
 
-// --- Shadows: not yet implemented on Metal (stubs). The headless RT+post path does not exercise
-// them. They throw so any future caller fails loudly rather than silently mis-rendering. ---------
+// --- Directional shadow mapping. Mirrors the Vulkan backend: a depth-only sampleable shadow map
+// (Depth32Float, RenderTarget|ShaderRead), an offscreen depth-only pass from the light that
+// commit+waits so the depth is fully written before the lit pass samples it, and a SetShadowMap
+// that records which map the lit pass binds. Metal tracks hazards automatically, so there is no
+// explicit layout bookkeeping like Vulkan's. ---------------------------------------------------
 
-std::unique_ptr<IRenderTarget> MetalDevice::CreateShadowMap(uint32_t) {
-    throw std::runtime_error("CreateShadowMap not implemented on Metal yet");
+std::unique_ptr<IRenderTarget> MetalDevice::CreateShadowMap(uint32_t size) {
+    return std::make_unique<MetalRenderTarget>(*this, size, size, /*depthOnly=*/true);
 }
 
-FrameContext MetalDevice::BeginShadowPass(IRenderTarget&) {
-    throw std::runtime_error("BeginShadowPass not implemented on Metal yet");
+// Record which shadow map the lit pass samples. MetalCommandBuffer::BindPipeline binds this map's
+// depth texture + clamp-to-edge sampler to the lit fragment shader's shadow slots (texture/sampler
+// index 1). Call once after CreateShadowMap.
+void MetalDevice::SetShadowMap(IRenderTarget& smBase) {
+    shadowMap_ = static_cast<MetalRenderTarget*>(&smBase);
 }
 
-void MetalDevice::EndShadowPass(const FrameContext&) {
-    throw std::runtime_error("EndShadowPass not implemented on Metal yet");
+// Begin a depth-only pass from the light into the shadow map: a fresh command buffer + an encoder
+// with NO color attachment, depth store=store, clear depth=1.0. The depth-only MetalPipeline (built
+// with desc.depthOnly) has no fragment function and writes only depth; a modest depth bias on the
+// encoder fights shadow acne.
+FrameContext MetalDevice::BeginShadowPass(IRenderTarget& smBase) {
+    auto& sm = static_cast<MetalRenderTarget&>(smBase);
+    shadowCmd_ = [queue_ commandBuffer];
+    if (!shadowCmd_) Fail("BeginShadowPass: commandBuffer failed");
+
+    // Depth-only: no color texture (nil) -> MetalCommandBuffer::BeginRenderPass skips the color
+    // attachment and stores depth. The recorder samples sm.depthTexture() as the depth attachment.
+    rtRecorder_->Begin(shadowCmd_, /*colorTex=*/nil, sm.depthTexture(),
+                       sm.width(), sm.height());
+    return FrameContext{rtRecorder_.get()};
 }
 
-void MetalDevice::SetShadowMap(IRenderTarget&) {
-    throw std::runtime_error("SetShadowMap not implemented on Metal yet");
+void MetalDevice::EndShadowPass(const FrameContext& frame) {
+    if (!frame.cmd || !shadowCmd_) return;
+    // The caller already issued EndRenderPass() (endEncoding). Commit + wait so the shadow depth
+    // is fully written before the lit pass samples it (Metal's equivalent of the Vulkan fence +
+    // DEPTH_ATTACHMENT -> SHADER_READ_ONLY transition).
+    [shadowCmd_ commit];
+    [shadowCmd_ waitUntilCompleted];
+    shadowCmd_ = nil;
 }
 
 void MetalDevice::SetFrameUniforms(const void* data, uint32_t size) {
