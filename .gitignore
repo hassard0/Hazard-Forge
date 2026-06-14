@@ -1,0 +1,17 @@
+# Build output
+/build/
+/out/
+*.spv
+
+# Conan
+/CMakeUserPresets.json
+conan/
+.conan2/
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
