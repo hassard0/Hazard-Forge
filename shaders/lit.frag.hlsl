@@ -1,6 +1,7 @@
 struct FrameData {
     float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
     float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
+    float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
 };
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
 // Shadow map lives in the per-frame set (set 0): binding 1 = depth image, binding 2 = sampler.

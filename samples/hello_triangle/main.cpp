@@ -28,7 +28,8 @@ std::vector<uint32_t> LoadSpirv(const std::string& path) {
     return words;
 }
 
-// Per-frame uniform block — must match shaders/lit.*.hlsl + shadow.vert.hlsl FrameData (288 bytes).
+// Per-frame uniform block — must match shaders/lit.*.hlsl + shadow.vert.hlsl + sky.frag.hlsl
+// FrameData (352 bytes; kFrameUboSize is 512 so it fits).
 struct FrameData {
     float vp[16];
     float lightDir[4];
@@ -38,6 +39,10 @@ struct FrameData {
     float ptPos[3][4];         // xyz = world position, w = radius
     float ptColor[3][4];       // rgb = color, w = intensity
     float lightViewProj[16];   // directional light's view*ortho (for shadow mapping)
+    float camFwd[4];           // camera basis (world space) for sky view-ray reconstruction
+    float camRight[4];
+    float camUp[4];
+    float skyParams[4];        // x = tan(0.5*fovY), y = aspect
 };
 
 // Procedural 256x256 RGBA8 checkerboard: 8x8 tiles alternating two colors, with the
@@ -164,6 +169,23 @@ int main(int argc, char** argv) {
         postDesc.fullscreen = true;          // no vertex input; 3 verts from SV_VertexID
         auto postPipeline = device->CreateGraphicsPipeline(postDesc);
 
+        // Procedural sky pipeline: fullscreen triangle drawn FIRST in the scene->RT pass. Reads the
+        // camera basis from the per-frame UBO (set 0 b0); writes no depth so geometry draws over it.
+        auto skyVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+        auto skyFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+        auto skyVs = device->CreateShaderModule({std::span<const uint32_t>(skyVsWords)});
+        auto skyFs = device->CreateShaderModule({std::span<const uint32_t>(skyFsWords)});
+
+        rhi::GraphicsPipelineDesc skyDesc;
+        skyDesc.vertex = skyVs.get();
+        skyDesc.fragment = skyFs.get();
+        skyDesc.colorFormat = device->Swapchain().ColorFormat();
+        skyDesc.depthTest = false;           // background fill: no depth test, no depth write
+        skyDesc.usesFrameUniforms = true;    // camera basis lives in the frame UBO (set 0 b0)
+        skyDesc.usesTexture = false;
+        skyDesc.fullscreen = true;           // 3 verts from SV_VertexID; cull NONE
+        auto skyPipeline = device->CreateGraphicsPipeline(skyDesc);
+
         // Offscreen render target sized to the framebuffer; recreated on resize.
         auto rt = device->CreateRenderTarget(window.FramebufferWidth(),
                                              window.FramebufferHeight());
@@ -240,6 +262,18 @@ int main(int argc, char** argv) {
             Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 25.0f);
             Mat4 lightVP = lightOrtho * lightView;
             for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+
+            // Camera basis (world space) so the sky shader reconstructs view rays without a
+            // matrix inverse. Mirrors LookAt: fwd toward center, right = fwd x worldUp, up = right x fwd.
+            Vec3 fwd = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0.0f, 1.0f, 0.0f}));
+            Vec3 up = math::cross(right, fwd);
+            fd.camFwd[0] = fwd.x;   fd.camFwd[1] = fwd.y;   fd.camFwd[2] = fwd.z;   fd.camFwd[3] = 0.0f;
+            fd.camRight[0] = right.x; fd.camRight[1] = right.y; fd.camRight[2] = right.z; fd.camRight[3] = 0.0f;
+            fd.camUp[0] = up.x;     fd.camUp[1] = up.y;     fd.camUp[2] = up.z;     fd.camUp[3] = 0.0f;
+            fd.skyParams[0] = std::tan(0.5f * 1.04719755f);  // tan(half of 60deg fovY)
+            fd.skyParams[1] = aspect;
+            fd.skyParams[2] = 0.0f; fd.skyParams[3] = 0.0f;
             return fd;
         };
 
@@ -290,6 +324,9 @@ int main(int argc, char** argv) {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
                 rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
+                rtc.cmd->BindPipeline(*skyPipeline);
+                rtc.cmd->Draw(3);
                 drawScene(rtc.cmd);
                 rtc.cmd->EndRenderPass();
                 device->EndRenderTargetFrame(rtc);
@@ -380,6 +417,9 @@ int main(int argc, char** argv) {
                 auto rtc = device->BeginRenderTargetFrame(*rt);
                 device->SetFrameUniforms(&fd, sizeof(FrameData));
                 rtc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1.0f});
+                // Sky first: fullscreen gradient + sun, no depth write, behind the geometry.
+                rtc.cmd->BindPipeline(*skyPipeline);
+                rtc.cmd->Draw(3);
                 drawScene(rtc.cmd);
                 rtc.cmd->EndRenderPass();
                 device->EndRenderTargetFrame(rtc);
