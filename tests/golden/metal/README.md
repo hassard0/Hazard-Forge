@@ -23,6 +23,15 @@ PCF shadow sampling.
 > dark/specular-reflective (no diffuse, no env map yet) next to the bright dielectric cubes — a
 > legitimate material-driven change. Two runs diff to `0.0000`; Vulkan renders the same variety.
 
+> **Re-bake (procedural IBL):** re-baked again when lightweight image-based lighting landed
+> (`lit.frag.hlsl` gained a `SkyColor()` that replicates `sky.frag.hlsl`'s gradient + sun glow, plus
+> an environment specular reflection term: roughness-aware Fresnel-Schlick over `reflect(-V, N)`,
+> roughness-blurred toward the up-sky, multiplied by F, additive to the direct lights, with a small
+> sky-tinted ambient diffuse for dielectrics). The metal spheres now **reflect the procedural sky**
+> (shiny) instead of rendering dark, and dielectrics gain a subtle Fresnel sky sheen — a legitimate
+> shading change (DIFF 3.4854 vs the previous golden). One shared HLSL change hits both backends;
+> two Metal runs diff to `0.0000`, and Vulkan renders the same reflective metals.
+
 ## Shaders are generated, not hand-written
 
 The Metal shaders are **generated from the shared HLSL sources** at build time — there is no

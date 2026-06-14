@@ -38,6 +38,29 @@ float hfGeometrySmith(float NoV, float NoL, float roughness) {
 float3 hfFresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (float3(1.0, 1.0, 1.0) - F0) * pow(saturate(1.0 - cosTheta), 5.0);
 }
+// Procedural sky color for a world-space direction. Replicates the gradient + sun glow from
+// sky.frag.hlsl (same zenith/horizon/ground colors and the same sun term keyed off the directional
+// light). Used for image-based lighting: metals reflect this in the reflection direction.
+float3 SkyColor(float3 dir) {
+    float3 d = normalize(dir);
+    // Horizon -> zenith gradient.
+    float  h       = saturate(d.y * 0.5 + 0.5);
+    float3 zenith  = float3(0.18, 0.30, 0.62);
+    float3 horizon = float3(0.65, 0.72, 0.82);
+    float3 sky     = lerp(horizon, zenith, pow(h, 0.8));
+    // Dim ground haze for the lower hemisphere.
+    float3 ground = float3(0.12, 0.11, 0.10);
+    if (d.y < 0.0) {
+        float g = saturate(-d.y * 2.0);
+        sky = lerp(sky, ground, g);
+    }
+    // Sun glow toward the (incoming) directional light direction.
+    float3 sunDir = normalize(-f.lightDir.xyz);
+    float  s = pow(max(dot(d, sunDir), 0.0), 256.0);
+    sky += float3(1.0, 0.95, 0.8) * s * 2.0;
+    return sky;
+}
+
 // Cook-Torrance contribution for a single light of given radiance.
 float3 hfCookTorrance(float3 N, float3 V, float3 L, float3 radiance,
                       float3 albedo, float metallic, float roughness, float3 F0) {
@@ -130,5 +153,26 @@ float4 main(PSInput i) : SV_Target {
         float3 radiance = lc * intensity * att;
         rgb += hfCookTorrance(N, V, Ld, radiance, albedo, metallic, roughness, F0);
     }
+
+    // --- Procedural image-based lighting (environment reflection). Metals have no diffuse and no
+    // direct environment to reflect, so they render dark; here they reflect the procedural sky in
+    // the mirror direction R. Dielectrics pick up a subtle Fresnel-rim sky sheen. This is the
+    // *environment* reflection, additive to the direct lights (standard for this lite approach). ---
+    {
+        float3 R = reflect(-V, N);
+        // Roughness-aware Fresnel-Schlick (uses N.V, not VoH): grazing angles reflect more, and a
+        // rough surface caps the rim brightness at (1-roughness).
+        float  NoV = max(dot(N, V), 0.0);
+        float3 F   = F0 + (max((1.0 - roughness).xxx, F0) - F0) * pow(1.0 - NoV, 5.0);
+        // Sharp mirror reflection, blurred toward the up-sky average as roughness rises.
+        float3 envColor = SkyColor(R);
+        envColor = lerp(envColor, SkyColor(float3(0.0, 1.0, 0.0)), roughness * 0.7);
+        float3 iblSpecular = envColor * F;
+        rgb += iblSpecular;
+        // Subtle sky-tinted ambient diffuse for dielectrics: shadowed/unlit dielectric areas pick up
+        // sky color from the surface-normal direction (scales with the non-metallic fraction).
+        rgb += (1.0 - metallic) * albedo * SkyColor(N) * 0.15;
+    }
+
     return float4(rgb, 1.0);
 }
