@@ -24,6 +24,7 @@
 #include "render/probe.h"
 #include "render/clustered.h"
 #include "render/taa.h"
+#include "render/frustum.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -217,6 +218,7 @@ int main(int argc, char** argv) {
     const char* volumetricShotPath = nullptr; // --volumetric-shot <out.bmp> (Slice AJ: light shafts)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
+    const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -375,6 +377,14 @@ int main(int argc, char** argv) {
             // scene/camera/jitter => two runs are bit-identical (golden). One BMP -> exit. New golden;
             // existing paths/shaders/image goldens untouched.
             taaShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--cull-shot") == 0 && i + 1 < argc) {
+            // Slice AQ: frustum-culling visualization. Renders a deterministic multi-object scene from
+            // a pulled-back OVERVIEW camera, draws the actual (narrower) RENDER camera's frustum as
+            // debug lines, and draws each object's bounding sphere GREEN (the render camera keeps it)
+            // or RED (the render camera culls it). Prints a {drawn, culled, total} stat. The cull
+            // partition is the conservative bounding-sphere test (engine/render/frustum.h) the render
+            // submission path uses — render-invariant. One BMP -> exit. New golden (cull.png).
+            cullShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -3600,6 +3610,298 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %u bodies, %u debug-line vertices\n",
                                     debugShotPath, cw, ch2, kInstanceCount, kLineVertCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", debugShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Frustum-culling visualization showcase (--cull-shot, Slice AQ): a deterministic scene of
+        // a ground plane + a wide row of cubes/spheres spread across X. A pulled-back OVERVIEW camera
+        // renders everything; we then draw (a) the actual, NARROWER RENDER camera's view frustum as
+        // wireframe LINES (its 8 corners un-projected through inverse(viewProj)) and (b) each object's
+        // world bounding SPHERE colored GREEN if the render camera KEEPS it / RED if it CULLS it. The
+        // cull decision is the conservative bounding-sphere test in engine/render/frustum.h — exactly
+        // the test the render submission path uses — so this is the render-invariant proof made
+        // visible. A {drawn, culled, total} stat line is printed. One BMP -> exit. New golden cull.png;
+        // existing image goldens untouched (culling removes nothing on-screen in the normal scenes). --
+        if (cullShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace fr = render::frustum;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+            scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+            // --- The objects the RENDER camera will cull against: a wide row across X at z=-6, far
+            // enough left/right to fall outside the narrow render frustum. Alternating cube/sphere. --
+            struct CullObj { const scene::Mesh* mesh; scene::Transform xform; };
+            std::vector<CullObj> objs;
+            for (int k = -6; k <= 6; ++k) {
+                scene::Transform t;
+                t.position = {(float)k * 2.2f, 0.8f, -6.0f};
+                t.scale = {0.7f, 0.7f, 0.7f};
+                objs.push_back({(k & 1) ? &sphereMesh : &cubeMesh, t});
+            }
+
+            // --- The actual RENDER camera (narrow): at the origin-ish, looking down -Z, 50deg FOV. It
+            // sees only the central few cubes; the wings fall outside its frustum. ---
+            runtime::Camera renderCam;
+            renderCam.position = {0.0f, 0.8f, 2.0f};
+            renderCam.yaw = 0.0f; renderCam.SetPitch(0.0f);
+            renderCam.fovY = 0.8726646f;  // 50 degrees
+            renderCam.aspect = aspect;
+            renderCam.znear = 0.5f; renderCam.zfar = 12.0f;
+            Mat4 renderVP = renderCam.ViewProj();   // UNJITTERED (no TAA here) — the cull frustum.
+            fr::Frustum cullFrustum = fr::FromViewProj(renderVP);
+
+            // --- World bounding sphere per object + the keep/cull partition. worldCenter = model*
+            // localCenter; worldRadius = localRadius * maxAbsScale(model) (uniform-scale-safe; our
+            // scenes are uniform). Conservative: a straddling sphere is KEPT. ---
+            struct ObjBound { Vec3 center; float radius; bool kept; };
+            std::vector<ObjBound> bounds;
+            int drawn = 0, culled = 0;
+            for (const auto& ob : objs) {
+                const scene::MeshBounds& mb = ob.mesh->bounds();
+                Vec3 localCenter{(mb.min.x + mb.max.x) * 0.5f,
+                                 (mb.min.y + mb.max.y) * 0.5f,
+                                 (mb.min.z + mb.max.z) * 0.5f};
+                Vec3 ext{(mb.max.x - mb.min.x) * 0.5f, (mb.max.y - mb.min.y) * 0.5f,
+                         (mb.max.z - mb.min.z) * 0.5f};
+                float localRadius = math::length(ext);
+                Mat4 model = ob.xform.Matrix();
+                Vec3 worldCenter = math::MulPoint(model, localCenter);
+                const Vec3& s = ob.xform.scale;
+                float maxAbsScale = std::max({std::fabs(s.x), std::fabs(s.y), std::fabs(s.z)});
+                float worldRadius = localRadius * maxAbsScale;
+                bool cull = fr::SphereOutside(cullFrustum, worldCenter, worldRadius);
+                bounds.push_back({worldCenter, worldRadius, !cull});
+                if (cull) ++culled; else ++drawn;
+            }
+            const int total = (int)objs.size();
+
+            // --- Pipelines: static lit + static shadow + sky + post + debug-line. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto dbgVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.vert.hlsl.spv");
+            auto dbgFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.frag.hlsl.spv");
+            auto dbgVs = device->CreateShaderModule({std::span<const uint32_t>(dbgVsW)});
+            auto dbgFs = device->CreateShaderModule({std::span<const uint32_t>(dbgFsW)});
+            rhi::GraphicsPipelineDesc dbgD;
+            dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+            dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+            dbgD.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {1, rhi::Format::RGB32_Float, 12},
+            };
+            dbgD.colorFormat = device->Swapchain().ColorFormat();
+            dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+            dbgD.usesFrameUniforms = true;
+            auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            scene::Transform groundXform; groundXform.scale = {16.0f, 1.0f, 16.0f};
+            Mat4 groundModel = groundXform.Matrix();
+
+            // --- Build the debug overlay: the render frustum (white wireframe) + each object's bound
+            // sphere green(kept)/red(culled). Deterministic order -> byte-identical vertex stream. ---
+            debug::DebugDraw dd;
+            {
+                const Vec3 kFrustumColor{0.95f, 0.95f, 0.98f};
+                Vec3 corners[8];
+                fr::Corners(renderVP, corners);
+                // corner index: bit0=x(-/+), bit1=y(-/+), bit2=z(near/far). Near face = 0..3, far 4..7.
+                auto edge = [&](int a, int b) { dd.Line(corners[a], corners[b], kFrustumColor); };
+                // near quad (z=near): 0-1,1-3,3-2,2-0
+                edge(0, 1); edge(1, 3); edge(3, 2); edge(2, 0);
+                // far quad (z=far): 4-5,5-7,7-6,6-4
+                edge(4, 5); edge(5, 7); edge(7, 6); edge(6, 4);
+                // connecting edges near->far
+                edge(0, 4); edge(1, 5); edge(2, 6); edge(3, 7);
+                // Per-object bound spheres, colored by keep/cull.
+                const Vec3 kKeep{0.15f, 0.95f, 0.25f};   // green
+                const Vec3 kCull{0.95f, 0.18f, 0.15f};   // red
+                for (const auto& bnd : bounds)
+                    dd.WireSphere(bnd.center, bnd.radius, bnd.kept ? kKeep : kCull, 16);
+            }
+            const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+            rhi::BufferDesc lineBufDesc;
+            lineBufDesc.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+            lineBufDesc.initialData = dd.Vertices().data();
+            lineBufDesc.usage = rhi::BufferUsage::Vertex;
+            auto lineBuffer = device->CreateBuffer(lineBufDesc);
+
+            // --- The OVERVIEW camera: pulled back + up + to the side so the whole row + the render
+            // frustum are in view. Distinct from the render camera (this is what we actually render). --
+            runtime::Camera overviewCam;
+            overviewCam.position = {6.0f, 11.0f, 16.0f};
+            overviewCam.yaw = -0.32f; overviewCam.SetPitch(-0.52f);
+            overviewCam.fovY = 1.04719755f;  // 60 degrees
+            overviewCam.aspect = aspect;
+            overviewCam.znear = 0.1f; overviewCam.zfar = 100.0f;
+
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            FrameData fd{};
+            {
+                Mat4 vp = overviewCam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = overviewCam.position.x; fd.viewPos[1] = overviewCam.position.y;
+                fd.viewPos[2] = overviewCam.position.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, -4.0f};
+                Vec3 lightEye = sc - lightDirVec * 24.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-16.0f, 16.0f, -16.0f, 16.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                runtime::CameraBasis cb = overviewCam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(planeMesh.vertices());
+                    cmd.BindIndexBuffer(planeMesh.indices());
+                    cmd.DrawIndexed(planeMesh.indexCount());
+                    for (const auto& ob : objs) {
+                        Mat4 m = ob.xform.Matrix();
+                        cmd.PushConstants(m.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(ob.mesh->vertices());
+                        cmd.BindIndexBuffer(ob.mesh->indices());
+                        cmd.DrawIndexed(ob.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.8f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(planeMesh.vertices());
+                        cmd.BindIndexBuffer(planeMesh.indices());
+                        cmd.DrawIndexed(planeMesh.indexCount());
+                    }
+                    for (const auto& ob : objs) {
+                        Mat4 m = ob.xform.Matrix();
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(ob.mesh->vertices());
+                        cmd.BindIndexBuffer(ob.mesh->indices());
+                        cmd.DrawIndexed(ob.mesh->indexCount());
+                    }
+                    if (kLineVertCount > 0) {
+                        cmd.BindPipeline(*debugPipeline);
+                        cmd.BindVertexBuffer(*lineBuffer);
+                        cmd.Draw(kLineVertCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("cull-shot: {drawn: %d, culled: %d, total: %d}\n", drawn, culled, total);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(cullShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %d drawn / %d culled of %d, %u debug-line vertices\n",
+                                    cullShotPath, cw, ch2, drawn, culled, total, kLineVertCount);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cullShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

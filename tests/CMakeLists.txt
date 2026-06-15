@@ -100,6 +100,13 @@ hf_add_pure_test(live_editor_test)
 # (render/taa.h, header-only), ASan-eligible.
 hf_add_pure_test(taa_test)
 
+# Frustum culling (Slice AQ): Gribb-Hartmann plane extraction from the column-major Vulkan-clip
+# view-proj (hand-checked near/far/side planes), SphereOutside/Inside + AabbOutside p/n-vertex hand
+# cases, and a cull-partition cross-checked against an independent brute-force NDC-clip reference
+# over random spheres (the render-invariance contract: never false-cull a visible point). Pure C++
+# (render/frustum.h, header-only), ASan-eligible.
+hf_add_pure_test(frustum_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

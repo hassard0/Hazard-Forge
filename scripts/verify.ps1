@@ -85,6 +85,7 @@ $Goldens = @(
     @{ Name = 'volumetric';    Flag = '--volumetric' }          # Slice AJ (volumetric fog / light shafts)
     @{ Name = 'probe';         Flag = '--probe' }                # Slice AK (reflection + irradiance probes)
     @{ Name = 'taa';           Flag = '--taa' }                  # Slice AP (temporal anti-aliasing)
+    @{ Name = 'cull';          Flag = '--cull' }                 # Slice AQ (frustum-culling visualization)
 )
 
 $winResult = 'SKIP'
