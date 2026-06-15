@@ -15,6 +15,9 @@ hf_compile_shaders(
     "shaders/lit.frag.hlsl:ps"
     "shaders/lit_csm.frag.hlsl:ps"
     "shaders/shadow_csm.vert.hlsl:vs"
+    # Spot light + perspective spot-light shadow (Slice AE): cone-cut lit fragment + reuse the CSM
+    # depth-only caster (spotViewProj in the push constant).
+    "shaders/lit_spot.frag.hlsl:ps"
     "shaders/lit_pbr.frag.hlsl:ps"
     "shaders/lit_pbr_ibl.frag.hlsl:ps"
     "shaders/sky_hdr.frag.hlsl:ps"

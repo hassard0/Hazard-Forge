@@ -47,6 +47,10 @@ hf_add_pure_test(editor_test)
 # per-cascade ortho fit (all 8 slice corners land inside the cascade clip volume). Pure C++
 # (render/csm.h, header-only), ASan-eligible.
 hf_add_pure_test(csm_test)
+# Spot light + perspective spot-light shadow (Slice AE): spotViewProj projection (on-axis center
+# projects to clip center + [0,1] depth; off-axis projects outside the frustum) + cone attenuation
+# smoothstep (1 on-axis, 0 past outer). Pure C++ (render/spot.h, header-only), ASan-eligible.
+hf_add_pure_test(spot_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

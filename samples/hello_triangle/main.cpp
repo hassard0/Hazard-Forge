@@ -19,6 +19,7 @@
 #include "physics/body.h"
 #include "render/render_graph.h"
 #include "render/csm.h"
+#include "render/spot.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -197,6 +198,7 @@ int main(int argc, char** argv) {
     const char* ssaoDebugPath = nullptr;
     const char* capstoneShotPath = nullptr;
     const char* csmShotPath = nullptr;       // --csm-shot <out.bmp> (Slice AD: cascaded shadows)
+    const char* spotShotPath = nullptr;      // --spot-shot <out.bmp> (Slice AE: spot-light shadows)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -291,6 +293,14 @@ int main(int argc, char** argv) {
             // then the scene with lit_csm (per-fragment cascade selection + atlas PCF). One BMP ->
             // exit. New golden; the single-shadow path/shaders/goldens are untouched.
             csmShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--spot-shot") == 0 && i + 1 < argc) {
+            // Slice AE: spot-light shadow showcase. A ground plane + a few cubes/spheres lit
+            // primarily by ONE spot light angled down so it casts a clear cone of light with SHARP
+            // shadows of the objects within the cone (darkness outside the cone). A single 2048
+            // PERSPECTIVE shadow map (FOV = 2*outerCone) is rendered, then the scene shaded by
+            // lit_spot (cone smoothstep + distance falloff + 3x3 PCF spot shadow). One BMP -> exit.
+            // New golden; the single-shadow/CSM paths/shaders/goldens are untouched.
+            spotShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -608,6 +618,221 @@ int main(int argc, char** argv) {
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", csmShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels (CSM)\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Spot-light shadow showcase (--spot-shot, Slice AE). A ground plane + a few cubes and a
+        // sphere lit primarily by ONE spot light mounted above and angled down at the cluster, so it
+        // casts a clear cone of light with SHARP shadows of the objects within the cone, and darkness
+        // outside the cone. The spot's shadow is a single 2048 PERSPECTIVE map (FOV = 2*outerCone),
+        // rendered via the reused CSM depth-only caster (spotViewProj in the push constant), then the
+        // scene is shaded by lit_spot: cone smoothstep + distance falloff + 3x3 PCF spot shadow. The
+        // directional light is DIM so the spot dominates. One BMP -> exit. The single-shadow/CSM
+        // paths/shaders/goldens are entirely untouched. ----------------------------------------------
+        if (spotShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace spotns = hf::render::spot;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- Spot FrameData layout (matches shaders/lit_spot.frag). 304 bytes < kFrameUboSize. ---
+            struct SpotFrameData {
+                float viewProj[16];     //   0
+                float lightDir[4];      //  64
+                float lightColor[4];    //  80
+                float viewPos[4];       //  96
+                float spotViewProj[16]; // 112 -> ends 176
+                float spotPos[4];       // 176
+                float spotDir[4];       // 192
+                float spotColor[4];     // 208
+                float spotParams[4];    // 224  x=cosInner,y=cosOuter,z=range,w=intensity
+                float camFwd[4];        // 240
+                float camRight[4];      // 256
+                float camUp[4];         // 272
+                float skyParams[4];     // 288
+            };
+            static_assert(sizeof(SpotFrameData) == 304, "Spot FrameData layout");
+
+            // === Spot config. ===
+            const uint32_t kShadowSize = 2048;
+            const float kInnerCone = 0.28f;     // ~16deg half-angle (full brightness)
+            const float kOuterCone = 0.40f;     // ~23deg half-angle (cone edge)
+            const float kSpotNear  = 0.5f;
+            const float kSpotRange  = 34.0f;
+            const Vec3  kSpotPos{0.0f, 13.0f, 5.0f};
+            const Vec3  kSpotTarget{0.0f, 0.0f, -2.0f};
+            const Vec3  kSpotDir = math::normalize(kSpotTarget - kSpotPos);
+
+            // === Shaders. Reuse lit.vert + the CSM depth-only caster (spotViewProj in push const). ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto spotFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_spot.frag.hlsl.spv");
+            auto shVsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_csm.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto litVs    = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto spotFs   = device->CreateShaderModule({std::span<const uint32_t>(spotFsWords)});
+            auto shVs     = device->CreateShaderModule({std::span<const uint32_t>(shVsWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = spotFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kSwap;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model mat4 + material(metallic,rough)
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shVs.get(); shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 32;   // spotViewProj(16) + model(16)
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // === Shadow map + meshes + textures. ===
+            auto shadowMap = device->CreateShadowMap(kShadowSize);
+            device->SetShadowMap(*shadowMap);
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // === Scene layout: ground + a small cluster of casters under the cone. ===
+            const Mat4 groundModel = Mat4::Scale({40.0f, 1.0f, 40.0f});
+            struct Caster { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+            std::vector<Caster> casters;
+            auto box = [&](float x, float z, float s, float rot) {
+                casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::RotateY(rot)
+                                   * Mat4::Scale({s, s, s}), &cube, 0.0f, 0.8f});
+            };
+            auto ball = [&](float x, float z, float s) {
+                casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s}),
+                                   &sphere, 0.05f, 0.45f});
+            };
+            box(-2.6f,  0.0f, 2.0f,  0.5f);
+            ball( 2.4f, -1.0f, 2.2f);
+            box( 0.2f, -4.0f, 2.4f, -0.3f);
+            ball(-1.4f,  2.6f, 1.6f);
+
+            // === Fixed deterministic camera. ===
+            const Vec3 eye{0.0f, 7.0f, 16.0f};
+            const Vec3 center{0.0f, 0.8f, -2.0f};
+            const float fovY = 1.04719755f;  // 60deg
+            Vec3 fwd   = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+            Vec3 up3   = math::cross(right, fwd);
+            const float tanHalf = std::tan(0.5f * fovY);
+
+            // Spot perspective light matrix (Vulkan clip space; the shader's V-flip is MSL-only).
+            Mat4 spotVP = spotns::SpotViewProj(kSpotPos, kSpotDir, kOuterCone, kSpotNear, kSpotRange);
+
+            SpotFrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int k = 0; k < 16; ++k) fd.spotViewProj[k] = spotVP.m[k];
+                // DIM directional fill (the spot is the dominant light).
+                Vec3 ld = math::normalize(Vec3{-0.4f, -0.85f, -0.3f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+                fd.lightColor[0]=0.20f; fd.lightColor[1]=0.21f; fd.lightColor[2]=0.24f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.spotPos[0]=kSpotPos.x; fd.spotPos[1]=kSpotPos.y; fd.spotPos[2]=kSpotPos.z; fd.spotPos[3]=1.0f;
+                fd.spotDir[0]=kSpotDir.x; fd.spotDir[1]=kSpotDir.y; fd.spotDir[2]=kSpotDir.z;
+                fd.spotColor[0]=1.0f; fd.spotColor[1]=0.96f; fd.spotColor[2]=0.85f; fd.spotColor[3]=1.0f;
+                fd.spotParams[0]=std::cos(kInnerCone); fd.spotParams[1]=std::cos(kOuterCone);
+                fd.spotParams[2]=kSpotRange; fd.spotParams[3]=9.0f;   // intensity
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                fd.skyParams[0]=tanHalf; fd.skyParams[1]=aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "spotShadow", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // --- Shadow pass: render every caster + the ground into the perspective spot map. ---
+            graph.AddPass("spotShadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(SpotFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    {
+                        float pc[32];
+                        for (int k=0;k<16;++k) pc[k] = spotVP.m[k];
+                        for (int k=0;k<16;++k) pc[16+k] = groundModel.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (const auto& ca : casters) {
+                        float pc[32];
+                        for (int k=0;k<16;++k) pc[k] = spotVP.m[k];
+                        for (int k=0;k<16;++k) pc[16+k] = ca.model.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(ca.mesh->vertices());
+                        cmd.BindIndexBuffer(ca.mesh->indices());
+                        cmd.DrawIndexed(ca.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // --- Scene pass straight to the swapchain: ground + casters, shaded by lit_spot. ---
+            graph.AddPass("spotScene", {rgShadow}, {rgSwap},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(SpotFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.04f, 0.05f, 0.07f, 1});  // dim night sky
+                    cmd.BindPipeline(*litPipeline);
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    {
+                        float pc[20];
+                        for (int k=0;k<16;++k) pc[k] = groundModel.m[k];
+                        pc[16]=0.0f; pc[17]=0.9f; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (const auto& ca : casters) {
+                        float pc[20];
+                        for (int k=0;k<16;++k) pc[k] = ca.model.m[k];
+                        pc[16]=ca.metallic; pc[17]=ca.rough; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(ca.mesh->vertices());
+                        cmd.BindIndexBuffer(ca.mesh->indices());
+                        cmd.DrawIndexed(ca.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(spotShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — spot light: 1 perspective %ux%u shadow map, "
+                                    "%zu casters\n", spotShotPath, cw, ch2, kShadowSize, kShadowSize,
+                                    casters.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", spotShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels (spot)\n");
             }
             device->WaitIdle();
             return ok ? 0 : 1;
