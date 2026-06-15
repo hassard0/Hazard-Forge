@@ -1,12 +1,32 @@
 #include "scene/mesh.h"
 #include "scene/vertex.h"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace hf::scene {
 
 namespace {
+
+// Object-space AABB over the vertex positions (recorded so the debug-draw overlay can fit a
+// wireframe box around a posed mesh; Slice W).
+MeshBounds ComputeBounds(const Vertex* verts, uint64_t vertBytes) {
+    const size_t count = (size_t)(vertBytes / sizeof(Vertex));
+    if (count == 0) return {};
+    float mn[3] = {std::numeric_limits<float>::max(), std::numeric_limits<float>::max(),
+                   std::numeric_limits<float>::max()};
+    float mx[3] = {-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(),
+                   -std::numeric_limits<float>::max()};
+    for (size_t i = 0; i < count; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            mn[k] = std::min(mn[k], verts[i].pos[k]);
+            mx[k] = std::max(mx[k], verts[i].pos[k]);
+        }
+    }
+    return MeshBounds{{mn[0], mn[1], mn[2]}, {mx[0], mx[1], mx[2]}};
+}
 
 Mesh BuildMesh(rhi::IRHIDevice& device,
                const Vertex* verts, uint64_t vertBytes,
@@ -24,7 +44,8 @@ Mesh BuildMesh(rhi::IRHIDevice& device,
     ibdesc.usage = rhi::BufferUsage::Index;
     auto ibuffer = device.CreateBuffer(ibdesc);
 
-    return Mesh{std::move(vbuffer), std::move(ibuffer), indexCount};
+    return Mesh{std::move(vbuffer), std::move(ibuffer), indexCount,
+                ComputeBounds(verts, vertBytes)};
 }
 
 } // namespace

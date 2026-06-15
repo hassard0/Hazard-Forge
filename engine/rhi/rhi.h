@@ -77,6 +77,12 @@ struct GraphicsPipelineDesc {
                                      // is byte-for-byte unchanged.
     bool depthOnly = false;          // when true: no color attachment; depth write + bias (shadow pass)
     bool pointList = false;          // when true: POINT_LIST topology (GPU particles drawn as points)
+    bool lineList = false;           // when true: LINE_LIST topology (immediate-mode debug-draw —
+                                     // grids, AABB/OBB wireframes, gizmos, normals; Slice W). Each
+                                     // pair of vertices is one line segment. Default false keeps the
+                                     // existing point/triangle selection so every golden-locked
+                                     // pipeline is byte-for-byte unchanged. Mutually exclusive with
+                                     // pointList (line wins if both are somehow set).
     bool additiveBlend = false;      // when true: additive color blend (glowing particles over scene)
     bool alphaBlend = false;         // when true: standard src_alpha/one_minus_src_alpha blend (UI/ImGui)
     bool cullNone = false;           // when true: no back-face culling (ImGui draws CW-wound quads)

@@ -102,6 +102,10 @@ hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)
 hf_gen_msl(particles.comp particles.comp.hlsl comp particles_main)
 hf_gen_msl(particle.vert   particle.vert.hlsl  vert particle_vertex)
 hf_gen_msl(particle.frag   particle.frag.hlsl  frag particle_fragment)
+# Immediate-mode debug-draw line pipeline (Slice W): world-space line verts projected by
+# FrameData.viewProj, flat per-vertex color. LINE_LIST topology. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(debug_line.vert debug_line.vert.hlsl vert debug_line_vertex)
+hf_gen_msl(debug_line.frag debug_line.frag.hlsl frag debug_line_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 
@@ -133,6 +137,10 @@ add_executable(visual_test
     ${HF_ROOT}/engine/anim/animation.cpp
     # Impulse-based rigid-body world (Slice S): pure C++ physics core (no Metal/RHI deps).
     ${HF_ROOT}/engine/physics/world.cpp
+    # Immediate-mode debug-draw collector + engine-object emitters (Slice W): pure C++ (math +
+    # scene + physics), no Metal/RHI deps. Drives the LINE_LIST debug overlay.
+    ${HF_ROOT}/engine/debug/debug_draw.cpp
+    ${HF_ROOT}/engine/debug/debug_emitters.cpp
 )
 
 # The generated MSL must exist before the executable's shaders are loaded at runtime; make the

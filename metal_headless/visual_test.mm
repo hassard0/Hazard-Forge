@@ -41,6 +41,8 @@
 #include "physics/world.h"
 #include "physics/body.h"
 #include "render/render_graph.h"
+#include "debug/debug_draw.h"
+#include "debug/debug_emitters.h"
 
 #include <cmath>
 #include <cstdio>
@@ -1719,6 +1721,275 @@ static int RunPhysicsShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Debug-visualization showcase (Slice W). Mirrors the Vulkan --debug-shot path: the SAME settled
+// physics sphere-pyramid scene (ground + sky + lit/shadowed resting bodies), then an immediate-mode
+// DebugDraw overlay (ground grid + per-body wireframe AABB + per-body wire sphere + light-direction
+// arrow + physics contact markers) rendered as ONE LINE_LIST draw via the new debug-line pipeline
+// (lineList=true, usesFrameUniforms=true, depthTest=true, depthWrite=false), drawn AFTER opaque
+// geometry so the lines are occluded where they pass behind the shaded spheres. One PNG -> exit. ----
+static int RunDebugShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    physics::World world;
+    {
+        const float R = 0.5f;
+        const int kLayers = 4;
+        const float d = 2.0f * R;
+        const float dy = R * 1.41421356f;
+        for (int k = 0; k < kLayers; ++k) {
+            int m = kLayers - k;
+            float off = 0.5f * (float)(m - 1) * d;
+            float y = R + (float)k * dy;
+            for (int gx = 0; gx < m; ++gx)
+                for (int gz = 0; gz < m; ++gz) {
+                    float x = (float)gx * d - off;
+                    float z = (float)gz * d - off;
+                    world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                }
+        }
+    }
+    const float dtP = 1.0f / 120.0f;
+    for (int s = 0; s < 240; ++s) world.Step(dtP);
+
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(world.bodies.size());
+    for (const auto& b : world.bodies) {
+        Mat4 m = b.Transform();
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    // NEW debug-line pipeline (LINE_LIST topology; frame uniforms; depth-test on / write off).
+    auto dbgVs = loadMSL("debug_line.vert.gen.metal", "debug_line_vertex");
+    auto dbgFs = loadMSL("debug_line.frag.gen.metal", "debug_line_fragment");
+    rhi::GraphicsPipelineDesc dbgD;
+    dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+    dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+    dbgD.vertexLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {1, rhi::Format::RGB32_Float, 12},
+    };
+    dbgD.colorFormat = device->Swapchain().ColorFormat();
+    dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+    dbgD.usesFrameUniforms = true;
+    auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    rhi::BufferDesc instBufDesc;
+    instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+    instBufDesc.initialData = instances.data();
+    instBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    // Build the debug overlay (identical construction to the Vulkan --debug-shot path).
+    debug::DebugDraw dd;
+    const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+    dd.Grid(8.0f, 1.0f, {0.30f, 0.32f, 0.38f});
+    const scene::MeshBounds& sb = sphere.bounds();
+    for (const auto& b : world.bodies) {
+        Mat4 m = b.Transform();
+        debug::AabbWorld(dd, sb.min, sb.max, m, {1.0f, 0.85f, 0.1f});
+        dd.WireSphere(b.position, b.radius, {0.1f, 0.9f, 0.95f}, 16);
+    }
+    debug::LightArrow(dd, {3.5f, 4.5f, 3.5f}, lightDirVec, 2.5f, {1.0f, 0.55f, 0.1f});
+    debug::PhysicsContacts(dd, world, {1.0f, 0.2f, 0.8f}, {0.2f, 1.0f, 0.3f});
+
+    const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+    rhi::BufferDesc lineBufDesc;
+    lineBufDesc.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+    lineBufDesc.initialData = dd.Vertices().data();
+    lineBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto lineBuffer = device->CreateBuffer(lineBufDesc);
+
+    const Vec3 eye{6.5f, 4.5f, 7.0f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDirVec * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.BindPipeline(*instShadowPipeline);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindInstanceBuffer(*instanceBuffer);
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindPipeline(*instPipeline);
+            {
+                float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            // Debug overlay: one LINE_LIST draw, after opaque geometry (depth-tested, no depth write).
+            if (kLineVertCount > 0) {
+                cmd.BindPipeline(*debugPipeline);
+                cmd.BindVertexBuffer(*lineBuffer);
+                cmd.Draw(kLineVertCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — %u bodies, %u debug-line vertices\n",
+                outPath, cw, ch, kInstanceCount, kLineVertCount);
+    return 0;
+}
+
 // --- Alpha-blended transparency showcase (Slice T). Mirrors the Vulkan --transparency-shot path:
 // checkerboard ground + procedural sky + a few OPAQUE lit cubes (two behind the glass, one in front
 // as an occluder), then 4 overlapping tinted GLASS spheres at different depths rendered in a SORTED
@@ -1957,6 +2228,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--physics") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_physics.png";
             try { return RunPhysicsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --debug <out.png>: render the debug-visualization showcase (Slice W) — the settled physics
+        // pyramid plus an immediate-mode DebugDraw line overlay (grid + AABBs + wire spheres + light
+        // arrow + contact markers) through the new LINE_LIST debug pipeline.
+        if (argc > 1 && std::strcmp(argv[1], "--debug") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_debug_viz.png";
+            try { return RunDebugShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --skinning <out.png>: render the skeletal-animation showcase (Slice O) instead of the

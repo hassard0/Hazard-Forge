@@ -62,6 +62,7 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
     [encoder_ setDepthStencilState:p.depthState()];
     boundFrameUniforms_ = p.usesFrameUniforms();
     boundPointList_ = p.pointList();
+    boundLineList_ = p.lineList();
     boundFragmentPushConst_ = p.fragmentPushConstants();
 
     // Joint-palette skinning set (set 2): bind the device's current palette UBO at the skinning
@@ -177,8 +178,11 @@ void MetalCommandBuffer::BindEnvironment(ITexture& env) {
 }
 
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
-    // Point list (GPU particles) vs the default triangle list (geometry / fullscreen tris).
-    MTLPrimitiveType prim = boundPointList_ ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle;
+    // Line list (debug-draw, Slice W) > point list (GPU particles) > the default triangle list
+    // (geometry / fullscreen tris).
+    MTLPrimitiveType prim = boundLineList_  ? MTLPrimitiveTypeLine
+                          : boundPointList_ ? MTLPrimitiveTypePoint
+                                            : MTLPrimitiveTypeTriangle;
     [encoder_ drawPrimitives:prim vertexStart:firstVertex vertexCount:vertexCount];
 }
 

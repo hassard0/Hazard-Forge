@@ -55,6 +55,7 @@ private:
     id<MTLBuffer>              indexBuffer_ = nil;  // stored by BindIndexBuffer; used by DrawIndexed
     bool boundFrameUniforms_ = false;  // current pipeline declares the per-frame UBO
     bool boundPointList_ = false;      // current graphics pipeline draws points (particles)
+    bool boundLineList_ = false;       // current graphics pipeline draws lines (debug-draw, Slice W)
     bool boundFragmentPushConst_ = false;  // current pipeline reads push constants in fragment (bloom)
     uint32_t computeThreadsPerGroup_ = 64;  // [numthreads(64,1,1)] in particles.comp.hlsl
     uint32_t width_ = 0;

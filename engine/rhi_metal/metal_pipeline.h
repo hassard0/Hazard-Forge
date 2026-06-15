@@ -21,6 +21,9 @@ public:
     bool fullscreen() const { return fullscreen_; }
     bool depthOnly() const { return depthOnly_; }
     bool pointList() const { return pointList_; }
+    // LINE_LIST topology (immediate-mode debug-draw, Slice W). The backend selects the primitive
+    // type at draw time, so the command buffer reads this on BindPipeline.
+    bool lineList() const { return lineList_; }
     // No back-face culling (fullscreen passes, or UI quads which are clockwise-wound).
     bool cullNone() const { return fullscreen_ || cullNone_; }
     // True when push constants must also reach the FRAGMENT stage (bloom fullscreen passes).
@@ -35,6 +38,7 @@ private:
     bool fullscreen_        = false;
     bool depthOnly_         = false;
     bool pointList_         = false;
+    bool lineList_          = false;
     bool cullNone_          = false;
     bool fragmentPushConstants_ = false;
 };

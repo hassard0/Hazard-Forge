@@ -1,5 +1,34 @@
 # Metal golden-image test
 
+## `debug_viz.png` — immediate-mode debug visualization (Slice W)
+
+`debug_viz.png` is a SEPARATE golden produced by `visual_test --debug`: the SAME settled physics
+sphere-pyramid scene as `--physics` (ground checkerboard + procedural sky + the 30-body pile, lit +
+shadowed), with an immediate-mode **debug-draw overlay** rendered on top — a ground grid, a colored
+wireframe **AABB** hugging each settled body, a per-body **wire sphere**, a directional-**light
+arrow**, and **physics contact** markers (crosses + normal stubs). The overlay is built CPU-side by
+the pure-C++ `hf::debug::DebugDraw` collector (each shape decomposes to LINE_LIST segments) and drawn
+as ONE non-indexed `Draw` through a new debug-line pipeline.
+
+New RHI: `GraphicsPipelineDesc.lineList` (default false) → `VK_PRIMITIVE_TOPOLOGY_LINE_LIST` on
+Vulkan / `MTLPrimitiveTypeLine` selected at draw time on Metal. The debug pipeline is
+`lineList=true, usesFrameUniforms=true, depthTest=true, depthWrite=false`, so the lines are correctly
+**occluded** by opaque geometry in front but never fight the depth buffer; it draws AFTER the opaque
+spheres in the scene pass. The line MSL is generated from the shared HLSL (`shaders/debug_line.{vert,
+frag}.hlsl`) by the build toolchain (`debug_line.vert.gen.metal` entry `debug_line_vertex`,
+`debug_line.frag.gen.metal` entry `debug_line_fragment`). `lineList` defaults false so every
+pre-existing pipeline is byte-for-byte unchanged: all nine other goldens still diff `0.0000`.
+Deterministic — two `--debug` runs diff `0.0000`. This golden is INDEPENDENT of all the others.
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --debug /tmp/dbg.png
+~/mac-remote-rig/compare.sh tests/golden/metal/debug_viz.png /tmp/dbg.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `bloom.png` — HDR bloom (Slice U)
 
 `bloom.png` is a SEPARATE golden produced by `visual_test --bloom`: the same HDR-IBL helmet scene as

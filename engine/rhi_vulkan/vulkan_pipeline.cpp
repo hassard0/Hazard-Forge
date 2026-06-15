@@ -56,7 +56,9 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
 
     VkPipelineInputAssemblyStateCreateInfo ia{
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    ia.topology = desc.pointList ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+    // Topology: line list (debug-draw, Slice W) > point list (particles) > triangle list (default).
+    ia.topology = desc.lineList  ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                : desc.pointList ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
                                  : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
     VkPipelineViewportStateCreateInfo vp{

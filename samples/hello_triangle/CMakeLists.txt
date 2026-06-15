@@ -37,6 +37,10 @@ hf_compile_shaders(
     "shaders/particle.frag.hlsl:ps"
     "shaders/ui.vert.hlsl:vs"
     "shaders/ui.frag.hlsl:ps"
+    # Immediate-mode debug-draw line pipeline (Slice W): world-space line verts projected by
+    # FrameData.viewProj, flat per-vertex color. LINE_LIST topology.
+    "shaders/debug_line.vert.hlsl:vs"
+    "shaders/debug_line.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

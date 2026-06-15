@@ -9,6 +9,7 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
     : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
       usesJointPalette_(desc.usesJointPalette),
       fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly), pointList_(desc.pointList),
+      lineList_(desc.lineList),
       cullNone_(desc.cullNone), fragmentPushConstants_(desc.fragmentPushConstants) {
     id<MTLDevice> dev = device.device();
 

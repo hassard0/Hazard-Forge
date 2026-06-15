@@ -18,6 +18,8 @@
 #include "physics/world.h"
 #include "physics/body.h"
 #include "render/render_graph.h"
+#include "debug/debug_draw.h"
+#include "debug/debug_emitters.h"
 
 #ifdef HF_HAS_EDITOR
 #include "imgui.h"
@@ -178,6 +180,7 @@ int main(int argc, char** argv) {
     const char* bloomShotPath = nullptr;
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
+    const char* debugShotPath = nullptr;
     const char* transparencyShotPath = nullptr;
     const char* commandsPath = nullptr;
     bool dumpScene = false;
@@ -216,6 +219,14 @@ int main(int argc, char** argv) {
             // fixed number of times until it settles, then render the RESTING bodies via the existing
             // instanced pipeline (one instance transform per body), lit + shadowed. One BMP -> exit.
             physicsShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--debug-shot") == 0 && i + 1 < argc) {
+            // Slice W: the SAME settled physics sphere-pyramid scene (lit + shadowed over the
+            // checkerboard ground + sky) PLUS an immediate-mode DEBUG OVERLAY drawn via DebugDraw —
+            // a ground grid, a colored wireframe AABB hugging each settled body, per-body wire
+            // spheres, a light-direction arrow, and physics contact markers — rendered through the
+            // new LINE_LIST debug pipeline, depth-tested (occluded by opaque geometry) but not
+            // depth-writing. One BMP -> exit. New golden; existing pipelines/shaders untouched.
+            debugShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--transparency-shot") == 0 && i + 1 < argc) {
             // Slice T: opaque scene (checkerboard ground + skybox + a couple of opaque lit objects)
             // plus a handful of overlapping tinted GLASS objects rendered in a sorted, alpha-blended
@@ -243,6 +254,297 @@ int main(int argc, char** argv) {
         // EXISTING instanced lit + instanced shadow pipelines over the ground plane + skybox. One
         // frame -> BMP -> exit. Reuses the Slice-Q instanced pipeline; golden-locked pipelines and the
         // physics core (pure C++, hf_core) are untouched. ----------------------------------------------
+        // --- Debug-visualization showcase (--debug-shot, Slice W): build the SAME settled physics
+        // sphere-pyramid scene as --physics-shot (ground + sky + lit/shadowed resting bodies), then
+        // overlay an immediate-mode DebugDraw layer: a ground grid, a wireframe AABB hugging each
+        // body, per-body wire spheres, a directional-light arrow, and physics contact markers. The
+        // overlay is one LINE_LIST draw (a per-frame CPU-built line vertex buffer, the ImGui dynamic-
+        // geometry pattern) using a NEW debug-line pipeline (lineList=true, usesFrameUniforms=true,
+        // depthTest=true, depthWrite=false), drawn in the scene RT pass AFTER opaque geometry so the
+        // lines are correctly occluded where they pass behind the shaded spheres. One BMP -> exit. ---
+        if (debugShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Settled physics pyramid (identical construction to --physics-shot).
+            physics::World world;
+            {
+                const float R = 0.5f;
+                const int kLayers = 4;
+                const float d = 2.0f * R;
+                const float dy = R * 1.41421356f;
+                for (int k = 0; k < kLayers; ++k) {
+                    int m = kLayers - k;
+                    float off = 0.5f * (float)(m - 1) * d;
+                    float y = R + (float)k * dy;
+                    for (int gx = 0; gx < m; ++gx)
+                        for (int gz = 0; gz < m; ++gz) {
+                            float x = (float)gx * d - off;
+                            float z = (float)gz * d - off;
+                            world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                        }
+                }
+            }
+            const float dtP = 1.0f / 120.0f;
+            for (int s = 0; s < 240; ++s) world.Step(dtP);
+
+            std::vector<scene::InstanceData> instances;
+            instances.reserve(world.bodies.size());
+            for (const auto& b : world.bodies) {
+                Mat4 m = b.Transform();
+                scene::InstanceData di;
+                for (int k = 0; k < 16; ++k) di.model[k] = m.m[k];
+                instances.push_back(di);
+            }
+            const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+            // --- Instanced lit + static lit + shadow + sky + post pipelines (same as physics shot). ---
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = device->Swapchain().ColorFormat();
+            instDesc.depthTest = true; instDesc.usesFrameUniforms = true; instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto instShWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_instanced.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto instShVs = device->CreateShaderModule({std::span<const uint32_t>(instShWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc instShDesc;
+            instShDesc.vertex = instShVs.get(); instShDesc.fragment = shadowFs.get();
+            instShDesc.vertexLayout = scene::MeshVertexLayout();
+            instShDesc.instanceLayout = scene::InstanceTransformLayout();
+            instShDesc.depthTest = true; instShDesc.depthOnly = true; instShDesc.usesFrameUniforms = true;
+            auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // --- NEW: debug-line pipeline (LINE_LIST, frame uniforms, depth-test on / write off). ---
+            auto dbgVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.vert.hlsl.spv");
+            auto dbgFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.frag.hlsl.spv");
+            auto dbgVs = device->CreateShaderModule({std::span<const uint32_t>(dbgVsW)});
+            auto dbgFs = device->CreateShaderModule({std::span<const uint32_t>(dbgFsW)});
+            rhi::GraphicsPipelineDesc dbgD;
+            dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+            dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+            dbgD.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {1, rhi::Format::RGB32_Float, 12},
+            };
+            dbgD.colorFormat = device->Swapchain().ColorFormat();
+            dbgD.lineList = true;
+            dbgD.depthTest = true;
+            dbgD.depthWrite = false;
+            dbgD.usesFrameUniforms = true;
+            auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            rhi::BufferDesc instBufDesc;
+            instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+            instBufDesc.initialData = instances.data();
+            instBufDesc.usage = rhi::BufferUsage::Vertex;
+            auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // --- Build the debug overlay (CPU-side, then upload once). ---
+            debug::DebugDraw dd;
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            dd.Grid(8.0f, 1.0f, {0.30f, 0.32f, 0.38f});           // ground grid (XZ, y=0)
+            // Per-body wireframe AABB (yellow) + wire sphere (cyan) hugging each settled sphere.
+            const scene::MeshBounds& sb = sphere.bounds();         // unit sphere ±0.5
+            for (const auto& b : world.bodies) {
+                Mat4 m = b.Transform();
+                debug::AabbWorld(dd, sb.min, sb.max, m, {1.0f, 0.85f, 0.1f});
+                dd.WireSphere(b.position, b.radius, {0.1f, 0.9f, 0.95f}, 16);
+            }
+            // Directional-light arrow (orange), anchored above the pile pointing along the light.
+            debug::LightArrow(dd, {3.5f, 4.5f, 3.5f}, lightDirVec, 2.5f, {1.0f, 0.55f, 0.1f});
+            // Physics contact markers (magenta crosses + green normals) at the settled contacts.
+            debug::PhysicsContacts(dd, world, {1.0f, 0.2f, 0.8f}, {0.2f, 1.0f, 0.3f});
+
+            const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+            rhi::BufferDesc lineBufDesc;
+            lineBufDesc.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+            lineBufDesc.initialData = dd.Vertices().data();
+            lineBufDesc.usage = rhi::BufferUsage::Vertex;
+            auto lineBuffer = device->CreateBuffer(lineBufDesc);
+
+            // Camera (same framing as the physics shot).
+            const Vec3 eye{6.5f, 4.5f, 7.0f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDirVec * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.BindPipeline(*instShadowPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindInstanceBuffer(*instanceBuffer);
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    cmd.BindPipeline(*instPipeline);
+                    {
+                        float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+                        cmd.PushConstants(material, sizeof(material));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*instanceBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    // --- Debug overlay: one LINE_LIST draw, AFTER opaque geometry (depth-tested
+                    // so lines behind the spheres are occluded; depth-write off so they never fight). ---
+                    if (kLineVertCount > 0) {
+                        cmd.BindPipeline(*debugPipeline);
+                        cmd.BindVertexBuffer(*lineBuffer);
+                        cmd.Draw(kLineVertCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(debugShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %u bodies, %u debug-line vertices\n",
+                                    debugShotPath, cw, ch2, kInstanceCount, kLineVertCount);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", debugShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         if (physicsShotPath) {
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
