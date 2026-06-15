@@ -33,6 +33,14 @@ hf_add_pure_test(commands_test)
 # Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
 # ASan-eligible like the others.
 hf_add_pure_test(anim_test)
+# Animation state machine / cross-fade blend (Slice BL): the parameter-driven FSM over the existing
+# SampleAnimation/BlendAnimations. Asserts transition conditions (speed>0.3 fires at 0.5 not 0.1;
+# first-satisfied in fixed order), the cross-fade timing (BlendWeight ramps 0->1 linearly over
+# duration; IsTransitioning until transitionTime>=duration then current=target), any-state (from==-1)
+# transitions, scripted-timeline determinism (two runs -> identical {current,transitioning,blend}),
+# and Evaluate endpoints (blend==0 palette == SampleAnimation(from); transitioning palette ==
+# BlendAnimations(from,to,weight)). Pure CPU (hf_core), ZERO backend symbols, ASan-eligible.
+hf_add_pure_test(anim_fsm_test)
 # Instanced-rendering layout + grid builder (Slice Q). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(instance_grid_test)
 # Impulse-based rigid-body world (Slice S). Pure C++ (hf_core), ASan-eligible.

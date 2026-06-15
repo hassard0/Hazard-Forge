@@ -16,6 +16,7 @@ set(HF_ENGINE_COMMON_SOURCES
   asset/gltf_loader.cpp
   asset/env_loader.cpp
   anim/animation.cpp
+  anim/state_machine.cpp
   physics/world.cpp
   terrain/heightmap.cpp
   terrain/terrain_stream.cpp
@@ -124,6 +125,7 @@ add_library(hf_core STATIC
   asset/gltf_loader.cpp
   asset/env_loader.cpp
   anim/animation.cpp
+  anim/state_machine.cpp
   physics/world.cpp
   terrain/heightmap.cpp
   terrain/terrain_stream.cpp

@@ -16,6 +16,7 @@
 #include "asset/env_loader.h"
 #include "anim/animation.h"
 #include "anim/skeleton.h"
+#include "anim/state_machine.h"
 #include "physics/world.h"
 #include "physics/body.h"
 #include "terrain/heightmap.h"
@@ -285,6 +286,10 @@ int main(int argc, char** argv) {
     const char* shotPath = nullptr;
     const char* skinningShotPath = nullptr;
     const char* blendShotPath = nullptr;
+    // Slice BL (animation state machine): drive the Fox with an idle/walk/run FSM + cross-fade and
+    // capture a FIXED mid-transition (walk->run) frame. Same render path as --skinning/--blend-shot;
+    // the palette comes from anim::StateMachine::Evaluate at a scripted step.
+    const char* animFsmShotPath = nullptr;
     const char* pbrShotPath = nullptr;
     const char* materialShotPath = nullptr;
     // Slice AW (live runtime material authoring): render the material showcase via the RUNTIME path
@@ -412,6 +417,11 @@ int main(int argc, char** argv) {
             // as --skinning-shot, but the joint palette is a 50/50 cross-clip blend of "Walk" t=0.3s
             // and "Run" t=0.2s via anim::BlendAnimations), lit + shadowed, write a BMP, exit.
             blendShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--anim-fsm-shot") == 0 && i + 1 < argc) {
+            // Slice BL: render one frame of the animation STATE-MACHINE showcase (same scene/camera/
+            // light as --skinning-shot, but the joint palette comes from an idle/walk/run FSM with
+            // cross-fade, scripted to a FIXED mid walk->run transition), lit + shadowed. BMP -> exit.
+            animFsmShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--instanced-shot") == 0 && i + 1 < argc) {
             // Render one frame of the GPU-instanced showcase (ground + skybox + a 12x12 field of
             // instanced spheres drawn in ONE DrawIndexedInstanced, lit + shadowed), write a BMP, exit.
@@ -10675,9 +10685,11 @@ int main(int argc, char** argv) {
         // differ ONLY in how the joint palette is computed (single-clip sample vs. cross-clip blend)
         // and which file they write to. Everything else (scene/camera/light/pipelines) is shared so
         // the two BMPs are directly comparable.
-        const char* skinOrBlendPath = skinningShotPath ? skinningShotPath : blendShotPath;
+        const char* skinOrBlendPath = skinningShotPath ? skinningShotPath
+                                    : (blendShotPath ? blendShotPath : animFsmShotPath);
         if (skinOrBlendPath) {
             const bool isBlend = (blendShotPath != nullptr);
+            const bool isFsm   = (animFsmShotPath != nullptr);
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
@@ -10785,7 +10797,66 @@ int main(int argc, char** argv) {
             //                    either pure clip (Survey is near-static and would dominate a blend).
             hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
             std::vector<Mat4> palette;
-            if (isBlend) {
+            if (isFsm) {
+                // --- Animation state machine (Slice BL). Build an idle/walk/run FSM over the Fox's
+                // Survey/Walk/Run clips, drive it with a SCRIPTED speed timeline at a fixed dt, and
+                // capture the palette at a FIXED step where it is MID walk->run cross-fade (blend≈0.5).
+                //
+                // Determinism: the FSM output is a pure function of (graph, scripted speed[], dt). No
+                // input/RNG/clock. Cross-fade weight = transitionTime/duration. Fixed eval order.
+                //
+                // Graph: idle --(speed>0.3)--> walk --(speed>0.7)--> run, with reverse edges
+                // (run--(speed<0.7)-->walk, walk--(speed<0.3)-->idle). Cross-fade duration 0.25s.
+                // Timeline: speed accelerates 0 -> 1 over 40 steps of dt=1/60 (~0.667s). The FSM
+                // leaves idle->walk early, settles into walk, then begins walk->run once speed>0.7.
+                // We step until walk->run is ~half-faded and capture there (documented step below).
+                const anim::Animation* survey = fox.FindAnimation("Survey");
+                const anim::Animation* walk   = fox.FindAnimation("Walk");
+                const anim::Animation* run    = fox.FindAnimation("Run");
+                if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
+                if (!walk) walk = survey;
+                if (!run)  run  = walk;
+                if (survey && walk && run) {
+                    // Map the three found clips into a local clip vector the FSM indexes (0/1/2).
+                    std::vector<anim::Animation> clips = {*survey, *walk, *run};
+                    anim::StateMachine fsm;
+                    int sIdle = fsm.AddState({"idle", 0, true, 1.0f});
+                    int sWalk = fsm.AddState({"walk", 1, true, 1.0f});
+                    int sRun  = fsm.AddState({"run",  2, true, 1.0f});
+                    int sp = fsm.AddParam("speed", 0.0f);
+                    const float kDur = 0.25f;
+                    fsm.AddTransition({sIdle, sWalk, sp, anim::Transition::Cmp::Greater, 0.3f, kDur});
+                    fsm.AddTransition({sWalk, sRun,  sp, anim::Transition::Cmp::Greater, 0.7f, kDur});
+                    fsm.AddTransition({sRun,  sWalk, sp, anim::Transition::Cmp::Less,    0.7f, kDur});
+                    fsm.AddTransition({sWalk, sIdle, sp, anim::Transition::Cmp::Less,    0.3f, kDur});
+                    fsm.SetInitialState(sIdle);
+
+                    const float kDt = 1.0f / 60.0f;
+                    // Scripted speed ramp: 0 -> 1 linearly over 40 steps, then hold at 1.
+                    auto scriptedSpeed = [](int step) {
+                        float s = step / 40.0f;
+                        return s < 1.0f ? s : 1.0f;
+                    };
+                    // The FIXED capture step. Found by stepping the deterministic timeline: the
+                    // walk->run transition begins when speed crosses 0.7 (step 29: speed=0.725) and a
+                    // half cross-fade (0.125s ≈ 7.5 steps) lands ~step 37. We capture at step 37, where
+                    // the FSM is transitioning walk->run with BlendWeight ≈ 0.5 (printed below).
+                    const int kCaptureStep = 37;
+                    float capSpeed = 0.0f;
+                    for (int step = 0; step <= kCaptureStep; ++step) {
+                        capSpeed = scriptedSpeed(step);
+                        fsm.SetParam(sp, capSpeed);
+                        fsm.Update(kDt);
+                    }
+                    palette = fsm.Evaluate(fox.skeleton, clips);
+                    std::printf("anim-fsm: {state:%s->%s, blend:%.2f, speed:%.3f, step:%d}\n",
+                                fsm.CurrentStateName().c_str(),
+                                fsm.IsTransitioning() ? fsm.TransitioningToName().c_str() : "-",
+                                fsm.BlendWeight(), capSpeed, kCaptureStep);
+                } else {
+                    palette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+                }
+            } else if (isBlend) {
                 const anim::Animation* walk = fox.FindAnimation("Walk");
                 const anim::Animation* run  = fox.FindAnimation("Run");
                 if (!walk && !fox.animations.empty()) walk = &fox.animations.front();

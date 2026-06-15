@@ -39,6 +39,7 @@
 #include "asset/env_loader.h"
 #include "anim/animation.h"
 #include "anim/skeleton.h"
+#include "anim/state_machine.h"  // Slice BL: animation state machine + cross-fade (--anim-fsm)
 #include "physics/world.h"
 #include "physics/body.h"
 #include "terrain/heightmap.h"      // Slice BF: deterministic procedural terrain / heightmap (pure CPU)
@@ -188,10 +189,13 @@ static bool WritePNG(const char* outPath, const std::vector<uint8_t>& bgra,
 // + procedural sky + the GPU-skinned Fox sampled at animation "Survey", time 0.5s, lit + shadowed.
 // One offscreen frame -> PNG. The MSL is generated from the shared HLSL (lit_skinned/shadow_skinned)
 // by the sibling CMake gen rules; the joint palette binds at vertex buffer(3) (set 2). ----------
-// `blend` selects the palette source: false = single-clip sample of "Survey" t=0.5s (Slice O);
-// true (Slice X) = 50/50 cross-clip blend of "Walk" t=0.3s and "Run" t=0.2s via BlendAnimations.
-// Everything else (scene/camera/light/pipelines) is shared so the two PNGs are directly comparable.
-static int RunSkinningShowcase(const char* outPath, bool blend = false) {
+// `blend`/`fsm` select the palette source: both false = single-clip sample of "Survey" t=0.5s
+// (Slice O); blend (Slice X) = 50/50 cross-clip blend of "Walk" t=0.3s and "Run" t=0.2s via
+// BlendAnimations; fsm (Slice BL) = an idle/walk/run StateMachine cross-fade scripted to a FIXED mid
+// walk->run transition (the IDENTICAL FSM + timeline + capture step as the Vulkan --anim-fsm-shot,
+// so the FSM-produced palette is bit-identical cross-backend). Everything else (scene/camera/light/
+// pipelines) is shared so the PNGs are directly comparable.
+static int RunSkinningShowcase(const char* outPath, bool blend = false, bool fsm = false) {
     using math::Mat4; using math::Vec3;
     const uint32_t W = 1280, H = 720;
     auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
@@ -277,7 +281,49 @@ static int RunSkinningShowcase(const char* outPath, bool blend = false) {
 
     hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
     std::vector<Mat4> palette;
-    if (blend) {
+    if (fsm) {
+        // Animation state machine (Slice BL). IDENTICAL graph + scripted speed timeline + capture
+        // step as the Vulkan --anim-fsm-shot, so the FSM-produced palette is bit-identical across
+        // backends. idle--(speed>0.3)-->walk--(speed>0.7)-->run + reverse edges, cross-fade 0.25s.
+        // Scripted speed ramps 0->1 over 40 steps of dt=1/60; captured at the FIXED step 37 where the
+        // FSM is mid walk->run cross-fade (BlendWeight ~ 0.53, printed). Deterministic (no input/RNG).
+        const anim::Animation* survey = fox.FindAnimation("Survey");
+        const anim::Animation* walk   = fox.FindAnimation("Walk");
+        const anim::Animation* run    = fox.FindAnimation("Run");
+        if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
+        if (!walk) walk = survey;
+        if (!run)  run  = walk;
+        if (survey && walk && run) {
+            std::vector<anim::Animation> clips = {*survey, *walk, *run};
+            anim::StateMachine sm;
+            int sIdle = sm.AddState({"idle", 0, true, 1.0f});
+            int sWalk = sm.AddState({"walk", 1, true, 1.0f});
+            int sRun  = sm.AddState({"run",  2, true, 1.0f});
+            int sp = sm.AddParam("speed", 0.0f);
+            const float kDur = 0.25f;
+            sm.AddTransition({sIdle, sWalk, sp, anim::Transition::Cmp::Greater, 0.3f, kDur});
+            sm.AddTransition({sWalk, sRun,  sp, anim::Transition::Cmp::Greater, 0.7f, kDur});
+            sm.AddTransition({sRun,  sWalk, sp, anim::Transition::Cmp::Less,    0.7f, kDur});
+            sm.AddTransition({sWalk, sIdle, sp, anim::Transition::Cmp::Less,    0.3f, kDur});
+            sm.SetInitialState(sIdle);
+            const float kDt = 1.0f / 60.0f;
+            auto scriptedSpeed = [](int step) { float s = step / 40.0f; return s < 1.0f ? s : 1.0f; };
+            const int kCaptureStep = 37;
+            float capSpeed = 0.0f;
+            for (int step = 0; step <= kCaptureStep; ++step) {
+                capSpeed = scriptedSpeed(step);
+                sm.SetParam(sp, capSpeed);
+                sm.Update(kDt);
+            }
+            palette = sm.Evaluate(fox.skeleton, clips);
+            std::printf("anim-fsm: {state:%s->%s, blend:%.2f, speed:%.3f, step:%d}\n",
+                        sm.CurrentStateName().c_str(),
+                        sm.IsTransitioning() ? sm.TransitioningToName().c_str() : "-",
+                        sm.BlendWeight(), capSpeed, kCaptureStep);
+        } else {
+            palette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+        }
+    } else if (blend) {
         const anim::Animation* walk = fox.FindAnimation("Walk");
         const anim::Animation* run  = fox.FindAnimation("Run");
         if (!walk && !fox.animations.empty()) walk = &fox.animations.front();
@@ -8133,6 +8179,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--blend") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_anim_blend.png";
             try { return RunSkinningShowcase(out, /*blend=*/true); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --anim-fsm <out.png>: render the animation STATE-MACHINE showcase (Slice BL) — same scene as
+        // --skinning but the joint palette comes from an idle/walk/run FSM scripted to a FIXED mid
+        // walk->run cross-fade. New golden tests/golden/metal/anim_fsm.png.
+        if (argc > 1 && std::strcmp(argv[1], "--anim-fsm") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_anim_fsm.png";
+            try { return RunSkinningShowcase(out, /*blend=*/false, /*fsm=*/true); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --pbr <out.png>: render the full-PBR DamagedHelmet showcase (Slice P).

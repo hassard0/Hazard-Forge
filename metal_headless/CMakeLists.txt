@@ -221,6 +221,10 @@ add_executable(visual_test
     # Skeletal-animation sampling (plain C++): Quat/Slerp/FromTRS live in math.h; this is the
     # SampleAnimation palette builder (Slice O).
     ${HF_ROOT}/engine/anim/animation.cpp
+    # Animation state machine / cross-fade (Slice BL): the SAME pure-C++ StateMachine TU the Windows
+    # engine compiles, so the FSM-produced joint palette is BIT-IDENTICAL across backends (the
+    # cross-backend golden contract). No Metal/RHI deps. Drives the --anim-fsm showcase.
+    ${HF_ROOT}/engine/anim/state_machine.cpp
     # Impulse-based rigid-body world (Slice S): pure C++ physics core (no Metal/RHI deps).
     ${HF_ROOT}/engine/physics/world.cpp
     # Procedural terrain / heightmap (Slice BF): the SAME pure-C++ Height + BuildTerrain TU the
