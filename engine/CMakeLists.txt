@@ -21,6 +21,9 @@ set(HF_ENGINE_COMMON_SOURCES
   editor/picking.cpp
   editor/gizmo.cpp
   editor/introspect.cpp
+  material/shader_graph.cpp
+  material/codegen.cpp
+  material/material_loader.cpp
 )
 
 if(APPLE)
@@ -99,6 +102,9 @@ add_library(hf_core STATIC
   editor/picking.cpp
   editor/gizmo.cpp
   editor/introspect.cpp
+  material/shader_graph.cpp
+  material/codegen.cpp
+  material/material_loader.cpp
 )
 target_include_directories(hf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}

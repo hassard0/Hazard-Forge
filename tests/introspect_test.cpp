@@ -140,6 +140,8 @@ int main() {
             bool sawBarriersFeature = false;
             // Slice AU: the multithreaded-recording capability is advertised in the feature manifest.
             bool sawMtFeature = false;
+            // Slice AV: the data-driven material-graph capability is advertised in the feature manifest.
+            bool sawMatGraphFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -147,12 +149,14 @@ int main() {
                     if (AsString(el->value) == "gpu-driven-culling") sawGpuCullFeature = true;
                     if (AsString(el->value) == "automatic-barriers") sawBarriersFeature = true;
                     if (AsString(el->value) == "multithreaded-recording") sawMtFeature = true;
+                    if (AsString(el->value) == "material-graph") sawMatGraphFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
             check(sawGpuCullFeature, "engine.features includes gpu-driven-culling");
             check(sawBarriersFeature, "engine.features includes automatic-barriers");
             check(sawMtFeature, "engine.features includes multithreaded-recording");
+            check(sawMatGraphFeature, "engine.features includes material-graph");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -182,6 +186,8 @@ int main() {
         bool sawGpuCullShot = false;
         // Slice AU: the --mt-shot showcase flag is listed in the showcase manifest.
         bool sawMtShot = false;
+        // Slice AV: the --material-shot showcase flag is listed in the showcase manifest.
+        bool sawMaterialShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -189,11 +195,13 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--cull-shot") sawCullShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gpu-cull-shot") sawGpuCullShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mt-shot") sawMtShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--material-shot") sawMaterialShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
         check(sawGpuCullShot, "showcases manifest includes --gpu-cull-shot");
         check(sawMtShot, "showcases manifest includes --mt-shot");
+        check(sawMaterialShot, "showcases manifest includes --material-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

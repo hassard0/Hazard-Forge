@@ -1,0 +1,23 @@
+{
+  "name": "showcase",
+  "_comment": "Slice AV material-graph showcase. baseColor = Lerp(TextureSample(checker), Constant(tint), Fresnel(power=3)) so the sphere shows a textured base that blends toward the warm tint at grazing angles (a fresnel rim). metallic/roughness are constants. Build-time codegen -> shaders/generated/mat_showcase.frag.hlsl -> the same HLSL->SPIR-V->MSL toolchain.",
+  "nodes": [
+    { "id": 1, "type": "UV" },
+    { "id": 2, "type": "TextureSample", "texture": "checker" },
+    { "id": 3, "type": "Constant", "value": [0.95, 0.45, 0.15, 1.0], "outType": "float4" },
+    { "id": 4, "type": "Fresnel", "power": 3.0 },
+    { "id": 5, "type": "Lerp" },
+    { "id": 6, "type": "Constant", "value": [0.0, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 7, "type": "Constant", "value": [0.35, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 99, "type": "PBROutput" }
+  ],
+  "edges": [
+    { "from": 1, "to": 2, "port": "uv" },
+    { "from": 2, "to": 5, "port": "a" },
+    { "from": 3, "to": 5, "port": "b" },
+    { "from": 4, "to": 5, "port": "t" },
+    { "from": 5, "to": 99, "port": "baseColor" },
+    { "from": 6, "to": 99, "port": "metallic" },
+    { "from": 7, "to": 99, "port": "roughness" }
+  ]
+}

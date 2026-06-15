@@ -75,5 +75,8 @@ add_subdirectory(engine)
 if(NOT APPLE)
   add_subdirectory(engine/editor)
 endif()
+# Material-graph codegen host tool (Slice AV): turns assets/materials/*.mat.json into a generated
+# HLSL fragment at build time. Pure-CPU (links hf_core); built on every platform.
+add_subdirectory(tools/material_codegen)
 add_subdirectory(samples/hello_triangle)
 add_subdirectory(tests)

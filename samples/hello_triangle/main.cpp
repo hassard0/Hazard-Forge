@@ -201,6 +201,7 @@ int main(int argc, char** argv) {
     const char* skinningShotPath = nullptr;
     const char* blendShotPath = nullptr;
     const char* pbrShotPath = nullptr;
+    const char* materialShotPath = nullptr;
     const char* sceneShotPath = nullptr;
     const char* iblShotPath = nullptr;
     const char* bloomShotPath = nullptr;
@@ -248,6 +249,11 @@ int main(int argc, char** argv) {
             // Render one frame of the full-PBR showcase (ground + skybox + DamagedHelmet with the
             // full glTF metallic-roughness material set, lit + shadowed), write a BMP, exit.
             pbrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--material-shot") == 0 && i + 1 < argc) {
+            // Slice AV: render one frame of the data-driven material-graph showcase (ground + skybox
+            // + a sphere shaded by the build-time-generated fragment from showcase.mat.json: a
+            // textured base with a fresnel rim), lit + shadowed, write a BMP, exit.
+            materialShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--scene-shot") == 0 && i + 1 < argc) {
             // Slice V: render one frame of the full glTF scene-graph import showcase (ground + skybox
             // + the CesiumMilkTruck imported as a node hierarchy: body + two wheel sets, each
@@ -7384,6 +7390,231 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — env %dx%d, %d mips\n",
                                     iblShotPath, cw, ch2, env.width, env.height, env.mipLevels);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", iblShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Data-driven material-graph showcase (--material-shot, Slice AV): a self-contained
+        // capture path that does NOT touch the default scene. Ground plane + procedural sky + a sphere
+        // shaded by the BUILD-TIME-GENERATED fragment shader (shaders/generated/mat_showcase.frag.hlsl,
+        // codegen'd from assets/materials/showcase.mat.json). The material pipeline REUSES the existing
+        // lit.vert + the wider PBR material set/descriptor layout (pbrMaterial=true, BindMaterialPBR) —
+        // NO new RHI seam. The graph computes baseColor = Lerp(TextureSample(checker), tint,
+        // Fresnel(power=3)) so the sphere shows a textured base with a warm fresnel rim. One frame ->
+        // BMP -> exit. -------------------------------------------------------------------------------
+        if (materialShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Material pipeline: shared lit.vert + the GENERATED material fragment; wider PBR material
+            // set (pbrMaterial=true) so BindMaterialPBR binds the textures (only the base-color slot
+            // is read by the showcase graph, but the layout is the existing PBR one).
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto matFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/mat_showcase.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto matFs = device->CreateShaderModule({std::span<const uint32_t>(matFsWords)});
+            rhi::GraphicsPipelineDesc matDesc;
+            matDesc.vertex = litVs.get();
+            matDesc.fragment = matFs.get();
+            matDesc.vertexLayout = scene::MeshVertexLayout();
+            matDesc.colorFormat = device->Swapchain().ColorFormat();
+            matDesc.depthTest = true;
+            matDesc.usesFrameUniforms = true;
+            matDesc.usesTexture = true;
+            matDesc.pbrMaterial = true;               // reuse the existing 5-texture material set
+            matDesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material
+            auto matPipeline = device->CreateGraphicsPipeline(matDesc);
+
+            // Static lit pipeline for the ground plane (2-texture material set, untouched lit.frag).
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Static depth-only shadow pipeline (ground + sphere casters).
+            auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shadowVs.get();
+            shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // Sky + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Checkerboard base-color texture (read by the graph's TextureSample(checker) node) + the
+            // flat dummies for the rest of the PBR material slots (unused by the showcase graph).
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto checkerTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t blackPx[4] = {0, 0, 0, 255};
+            auto blackTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, blackPx, sizeof(blackPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // Sphere placement: sit a unit sphere on the ground (radius 1, scaled to ~1.0 tall).
+            const float sphereR = 1.0f;
+            Mat4 sphereModel = Mat4::Translate({0.0f, sphereR, 0.0f}) * Mat4::Scale({sphereR, sphereR, sphereR});
+
+            const Vec3 eye{2.0f, 1.7f, 2.8f};
+            const Vec3 center{0.0f, 0.95f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 25.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.PushConstants(sphereModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.DrawIndexed(sphere.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // Ground plane (lit, dielectric).
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Sphere (data-driven material graph). The checker is bound at the base-color slot
+                    // (the graph's TextureSample(checker) reads it); the other slots get neutral dummies.
+                    cmd.BindPipeline(*matPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = sphereModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.35f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*checkerTex, *whiteTex, *flatNormal, *blackTex, *whiteTex);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(materialShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u)\n", materialShotPath, cw, ch2);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", materialShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

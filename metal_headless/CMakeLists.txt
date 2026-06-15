@@ -83,6 +83,11 @@ hf_gen_msl(lit_point.frag  lit_point.frag.hlsl  frag point_fragment)
 hf_gen_msl(lit_clustered.frag  lit_clustered.frag.hlsl  frag clustered_fragment)
 # Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
 hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
+# Data-driven material graph (Slice AV): the COMMITTED build-time-generated fragment shader
+# (shaders/generated/mat_showcase.frag.hlsl, codegen'd from assets/materials/showcase.mat.json on the
+# Windows build). It #includes ../pbr_core.hlsli and reuses lit.vert + the existing PBR material set,
+# so it flows through the SAME HLSL->SPIR-V->MSL toolchain as every other shader (no hand-written MSL).
+hf_gen_msl(mat_showcase.frag generated/mat_showcase.frag.hlsl frag material_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same
 # HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
 hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)

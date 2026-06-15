@@ -65,6 +65,7 @@ $Goldens = @(
     @{ Name = 'scene_shadow';  Flag = '' }                       # default visual_test <out>
     @{ Name = 'skinning';      Flag = '--skinning' }             # Slice O
     @{ Name = 'pbr_helmet';    Flag = '--pbr' }                  # Slice P
+    @{ Name = 'mat_graph';     Flag = '--material' }             # Slice AV (data-driven material graph)
     @{ Name = 'instanced';     Flag = '--instanced' }            # Slice Q
     @{ Name = 'ibl_helmet';    Flag = '--ibl' }                  # Slice R
     @{ Name = 'physics';       Flag = '--physics' }              # Slice S

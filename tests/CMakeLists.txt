@@ -129,6 +129,13 @@ hf_add_pure_test(gpu_cull_test)
 # hf_core) with REAL std::thread workers — must stay clean under MSVC /fsanitize=address.
 hf_add_pure_test(parallel_record_test)
 
+# Data-driven material / shader graph (Slice AV): graph validation (cycle detection, missing
+# PBROutput, edge type-mismatch, unconnected-input defaults), CPU-interpreter parity (the per-node
+# math matches hand-computed values — pins node SEMANTICS shared with the HLSL codegen), codegen
+# determinism/structure (GenerateHlsl deterministic + topologically-ordered temporaries feeding the
+# shared PBR core), and a .mat.json loader round-trip. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(shader_graph_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

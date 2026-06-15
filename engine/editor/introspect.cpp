@@ -73,6 +73,7 @@ struct Showcase { const char* flag; const char* desc; };
 const Showcase kShowcases[] = {
     {"--shot",              "Default lit + shadowed scene (ground + grid + duck)."},
     {"--pbr-shot",          "Full PBR showcase (DamagedHelmet, metallic-roughness)."},
+    {"--material-shot",     "Data-driven material graph (sphere shaded by showcase.mat.json)."},
     {"--ibl-shot",          "HDR image-based lighting (equirect skybox reflections)."},
     {"--scene-shot",        "glTF scene-graph import (CesiumMilkTruck node hierarchy)."},
     {"--bloom-shot",        "HDR bloom post-process."},
@@ -128,6 +129,7 @@ const char* kFeatures[] = {
     "interactive-runtime",
     "editor-selection-gizmos",
     "automatic-barriers",
+    "material-graph",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to
