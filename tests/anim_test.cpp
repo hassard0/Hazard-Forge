@@ -144,6 +144,66 @@ int main() {
               "child global = parent * local = translate(5,2,0)");
     }
 
+    // ---- BlendAnimations: weight 0 == pure A, weight 1 == pure B ------------------------------
+    // Two single-joint clips that translate the (identity-rest, identity-inverseBind) root to two
+    // different positions. The blended palette at w=0 must equal A's palette, at w=1 equal B's.
+    {
+        anim::Skeleton sk;
+        sk.joints = {anim::Joint{}};  // one root, identity rest + inverseBind
+
+        auto makeTransClip = [](float x, float y, float z) {
+            anim::Animation a; a.duration = 1.0f;
+            anim::Channel ch;
+            ch.jointIndex = 0;
+            ch.path = anim::Channel::Path::Translation;
+            ch.times = {0.0f};
+            ch.values = {x, y, z};
+            a.channels.push_back(ch);
+            return a;
+        };
+        anim::Animation A = makeTransClip(2, 0, 0);
+        anim::Animation B = makeTransClip(0, 6, 0);
+
+        std::vector<Mat4> palA = anim::SampleAnimation(sk, A, 0.0f);
+        std::vector<Mat4> palB = anim::SampleAnimation(sk, B, 0.0f);
+
+        std::vector<Mat4> b0 = anim::BlendAnimations(sk, A, 0.0f, B, 0.0f, 0.0f);
+        std::vector<Mat4> b1 = anim::BlendAnimations(sk, A, 0.0f, B, 0.0f, 1.0f);
+        check(b0.size() == 1 && b1.size() == 1, "blend palette size 1");
+        for (int k = 0; k < 16; ++k) check(approx(b0[0].m[k], palA[0].m[k]), "blend w=0 == pure A");
+        for (int k = 0; k < 16; ++k) check(approx(b1[0].m[k], palB[0].m[k]), "blend w=1 == pure B");
+
+        // ---- weight 0.5 of a single-joint translation channel -> hand-checked midpoint ---------
+        // A translates to (2,0,0), B to (0,6,0); the 0.5 blend translation is (1,3,0).
+        std::vector<Mat4> bMid = anim::BlendAnimations(sk, A, 0.0f, B, 0.0f, 0.5f);
+        check(approx(bMid[0].m[12], 1.0f) && approx(bMid[0].m[13], 3.0f) && approx(bMid[0].m[14], 0.0f),
+              "blend w=0.5 translation midpoint == (1,3,0)");
+    }
+
+    // ---- BlendLocalPoses: slerp of two rotations at 0.5 is normalized (unit length) ------------
+    {
+        anim::JointPose pa; pa.r = Quat::Identity();        // identity
+        anim::JointPose pb;
+        float s = std::sin(0.7853981634f), c = std::cos(0.7853981634f);
+        pb.r = Quat{0, 0, s, c};                            // 90deg about z
+        std::vector<anim::JointPose> a = {pa};
+        std::vector<anim::JointPose> b = {pb};
+        std::vector<anim::JointPose> mid = anim::BlendLocalPoses(a, b, 0.5f);
+        check(mid.size() == 1, "BlendLocalPoses size 1");
+        const Quat& r = mid[0].r;
+        check(approx(r.x*r.x + r.y*r.y + r.z*r.z + r.w*r.w, 1.0f, 1e-3f),
+              "BlendLocalPoses rotation is unit-length");
+        // t/s default to rest (identity), so the midpoint t is the lerp of (0,0,0) -> (0,0,0).
+        check(approx(mid[0].t.x, 0) && approx(mid[0].t.y, 0) && approx(mid[0].t.z, 0),
+              "BlendLocalPoses rest translation stays origin");
+
+        // weight 0 returns A's pose exactly, weight 1 returns B's pose exactly (per-component).
+        std::vector<anim::JointPose> m0 = anim::BlendLocalPoses(a, b, 0.0f);
+        std::vector<anim::JointPose> m1 = anim::BlendLocalPoses(a, b, 1.0f);
+        check(approx(m0[0].r.w, pa.r.w) && approx(m0[0].r.z, pa.r.z), "BlendLocalPoses w=0 == A rot");
+        check(approx(m1[0].r.z, pb.r.z) && approx(m1[0].r.w, pb.r.w), "BlendLocalPoses w=1 == B rot");
+    }
+
     if (g_fail == 0) { std::printf("anim_test OK\n"); return 0; }
     std::printf("anim_test: %d failures\n", g_fail);
     return 1;

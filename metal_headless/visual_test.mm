@@ -169,7 +169,10 @@ static bool WritePNG(const char* outPath, const std::vector<uint8_t>& bgra,
 // + procedural sky + the GPU-skinned Fox sampled at animation "Survey", time 0.5s, lit + shadowed.
 // One offscreen frame -> PNG. The MSL is generated from the shared HLSL (lit_skinned/shadow_skinned)
 // by the sibling CMake gen rules; the joint palette binds at vertex buffer(3) (set 2). ----------
-static int RunSkinningShowcase(const char* outPath) {
+// `blend` selects the palette source: false = single-clip sample of "Survey" t=0.5s (Slice O);
+// true (Slice X) = 50/50 cross-clip blend of "Walk" t=0.3s and "Run" t=0.2s via BlendAnimations.
+// Everything else (scene/camera/light/pipelines) is shared so the two PNGs are directly comparable.
+static int RunSkinningShowcase(const char* outPath, bool blend = false) {
     using math::Mat4; using math::Vec3;
     const uint32_t W = 1280, H = 720;
     auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
@@ -254,11 +257,22 @@ static int RunSkinningShowcase(const char* outPath) {
     scene::Mesh plane = scene::Mesh::Plane(*device);
 
     hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
-    const anim::Animation* survey = fox.FindAnimation("Survey");
-    if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
-    std::vector<Mat4> palette = survey
-        ? anim::SampleAnimation(fox.skeleton, *survey, 0.5f)
-        : std::vector<Mat4>(fox.skeleton.joints.size(), Mat4::Identity());
+    std::vector<Mat4> palette;
+    if (blend) {
+        const anim::Animation* walk = fox.FindAnimation("Walk");
+        const anim::Animation* run  = fox.FindAnimation("Run");
+        if (!walk && !fox.animations.empty()) walk = &fox.animations.front();
+        if (!run) run = walk;
+        palette = (walk && run)
+            ? anim::BlendAnimations(fox.skeleton, *walk, 0.3f, *run, 0.2f, 0.5f)
+            : std::vector<Mat4>(fox.skeleton.joints.size(), Mat4::Identity());
+    } else {
+        const anim::Animation* survey = fox.FindAnimation("Survey");
+        if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
+        palette = survey
+            ? anim::SampleAnimation(fox.skeleton, *survey, 0.5f)
+            : std::vector<Mat4>(fox.skeleton.joints.size(), Mat4::Identity());
+    }
     std::vector<float> paletteData(64 * 16);
     for (int j = 0; j < 64; ++j) {
         Mat4 mm = (j < (int)palette.size()) ? palette[j] : Mat4::Identity();
@@ -2243,6 +2257,13 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--skinning") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_skinning.png";
             try { return RunSkinningShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --blend <out.png>: render the animation-BLENDING showcase (Slice X) — same scene as
+        // --skinning but the joint palette is a 50/50 cross-clip blend of "Walk" and "Run".
+        if (argc > 1 && std::strcmp(argv[1], "--blend") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_anim_blend.png";
+            try { return RunSkinningShowcase(out, /*blend=*/true); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --pbr <out.png>: render the full-PBR DamagedHelmet showcase (Slice P).

@@ -28,18 +28,16 @@ KeyLerp FindKey(const std::vector<float>& times, float time) {
 
 } // namespace
 
-std::vector<math::Mat4> SampleAnimation(const Skeleton& skeleton, const Animation& animation,
-                                        float time) {
+std::vector<JointPose> SampleLocalPose(const Skeleton& skeleton, const Animation& animation,
+                                       float time) {
     const size_t jointCount = skeleton.joints.size();
 
     // Start from each joint's REST local TRS, then let channels override components.
-    std::vector<math::Vec3> locT(jointCount);
-    std::vector<math::Quat> locR(jointCount);
-    std::vector<math::Vec3> locS(jointCount);
+    std::vector<JointPose> pose(jointCount);
     for (size_t j = 0; j < jointCount; ++j) {
-        locT[j] = skeleton.joints[j].t;
-        locR[j] = skeleton.joints[j].r;
-        locS[j] = skeleton.joints[j].s;
+        pose[j].t = skeleton.joints[j].t;
+        pose[j].r = skeleton.joints[j].r;
+        pose[j].s = skeleton.joints[j].s;
     }
 
     // Clamp the sample time into the clip's range (no looping here; the showcase samples a fixed t).
@@ -56,7 +54,7 @@ std::vector<math::Mat4> SampleAnimation(const Skeleton& skeleton, const Animatio
             case Channel::Path::Translation: {
                 const float* a = &ch.values[k.i0 * 3];
                 const float* b = &ch.values[k.i1 * 3];
-                locT[ch.jointIndex] = math::Vec3{
+                pose[ch.jointIndex].t = math::Vec3{
                     a[0] + (b[0] - a[0]) * frac,
                     a[1] + (b[1] - a[1]) * frac,
                     a[2] + (b[2] - a[2]) * frac};
@@ -65,7 +63,7 @@ std::vector<math::Mat4> SampleAnimation(const Skeleton& skeleton, const Animatio
             case Channel::Path::Scale: {
                 const float* a = &ch.values[k.i0 * 3];
                 const float* b = &ch.values[k.i1 * 3];
-                locS[ch.jointIndex] = math::Vec3{
+                pose[ch.jointIndex].s = math::Vec3{
                     a[0] + (b[0] - a[0]) * frac,
                     a[1] + (b[1] - a[1]) * frac,
                     a[2] + (b[2] - a[2]) * frac};
@@ -76,17 +74,23 @@ std::vector<math::Mat4> SampleAnimation(const Skeleton& skeleton, const Animatio
                 const float* b = &ch.values[k.i1 * 4];
                 math::Quat qa{a[0], a[1], a[2], a[3]};
                 math::Quat qb{b[0], b[1], b[2], b[3]};
-                locR[ch.jointIndex] = step ? qa : math::Slerp(qa, qb, frac);
+                pose[ch.jointIndex].r = step ? qa : math::Slerp(qa, qb, frac);
                 break;
             }
         }
     }
+    return pose;
+}
+
+std::vector<math::Mat4> PaletteFromLocalPose(const Skeleton& skeleton,
+                                             const std::vector<JointPose>& pose) {
+    const size_t jointCount = skeleton.joints.size();
 
     // Single forward pass: joints are topologically sorted (parent before child), so the parent's
     // global transform is already computed when we reach a child.
     std::vector<math::Mat4> global(jointCount);
     for (size_t j = 0; j < jointCount; ++j) {
-        math::Mat4 local = math::FromTRS(locT[j], locR[j], locS[j]);
+        math::Mat4 local = math::FromTRS(pose[j].t, pose[j].r, pose[j].s);
         int parent = skeleton.joints[j].parent;
         global[j] = (parent >= 0) ? (global[parent] * local) : local;
     }
@@ -96,6 +100,32 @@ std::vector<math::Mat4> SampleAnimation(const Skeleton& skeleton, const Animatio
     for (size_t j = 0; j < jointCount; ++j)
         palette[j] = global[j] * skeleton.joints[j].inverseBind;
     return palette;
+}
+
+std::vector<JointPose> BlendLocalPoses(const std::vector<JointPose>& a,
+                                       const std::vector<JointPose>& b, float weight) {
+    const float w = std::clamp(weight, 0.0f, 1.0f);
+    const size_t n = std::min(a.size(), b.size());
+    std::vector<JointPose> out(n);
+    for (size_t j = 0; j < n; ++j) {
+        out[j].t = a[j].t + (b[j].t - a[j].t) * w;   // lerp translation
+        out[j].s = a[j].s + (b[j].s - a[j].s) * w;   // lerp scale
+        out[j].r = math::Slerp(a[j].r, b[j].r, w);   // shortest-arc, normalized
+    }
+    return out;
+}
+
+std::vector<math::Mat4> SampleAnimation(const Skeleton& skeleton, const Animation& animation,
+                                        float time) {
+    return PaletteFromLocalPose(skeleton, SampleLocalPose(skeleton, animation, time));
+}
+
+std::vector<math::Mat4> BlendAnimations(const Skeleton& skeleton,
+                                        const Animation& animA, float timeA,
+                                        const Animation& animB, float timeB, float weight) {
+    std::vector<JointPose> poseA = SampleLocalPose(skeleton, animA, timeA);
+    std::vector<JointPose> poseB = SampleLocalPose(skeleton, animB, timeB);
+    return PaletteFromLocalPose(skeleton, BlendLocalPoses(poseA, poseB, weight));
 }
 
 } // namespace hf::anim

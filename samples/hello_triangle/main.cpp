@@ -174,6 +174,7 @@ int main(int argc, char** argv) {
     //               engine headlessly from a script. Separate from --editor / interactive.
     const char* shotPath = nullptr;
     const char* skinningShotPath = nullptr;
+    const char* blendShotPath = nullptr;
     const char* pbrShotPath = nullptr;
     const char* sceneShotPath = nullptr;
     const char* iblShotPath = nullptr;
@@ -210,6 +211,11 @@ int main(int argc, char** argv) {
             // Render one frame of the skinned-Fox showcase (ground + skybox + GPU-skinned Fox at
             // animation "Survey" t=0.5s, lit + shadowed), write a BMP, exit.
             skinningShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--blend-shot") == 0 && i + 1 < argc) {
+            // Slice X: render one frame of the animation-BLENDING showcase (same scene/camera/light
+            // as --skinning-shot, but the joint palette is a 50/50 cross-clip blend of "Walk" t=0.3s
+            // and "Run" t=0.2s via anim::BlendAnimations), lit + shadowed, write a BMP, exit.
+            blendShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--instanced-shot") == 0 && i + 1 < argc) {
             // Render one frame of the GPU-instanced showcase (ground + skybox + a 12x12 field of
             // instanced spheres drawn in ONE DrawIndexedInstanced, lit + shadowed), write a BMP, exit.
@@ -2343,7 +2349,13 @@ int main(int argc, char** argv) {
         // --- Skeletal-animation showcase (--skinning-shot): a self-contained capture path that does
         // NOT touch the default scene. Ground plane + procedural sky + the GPU-skinned Fox sampled at
         // animation "Survey", time 0.5s, lit + shadowed. One frame -> BMP -> exit. ----------------
-        if (skinningShotPath) {
+        // Both --skinning-shot and --blend-shot (Slice X) drive this single capture path; they
+        // differ ONLY in how the joint palette is computed (single-clip sample vs. cross-clip blend)
+        // and which file they write to. Everything else (scene/camera/light/pipelines) is shared so
+        // the two BMPs are directly comparable.
+        const char* skinOrBlendPath = skinningShotPath ? skinningShotPath : blendShotPath;
+        if (skinOrBlendPath) {
+            const bool isBlend = (blendShotPath != nullptr);
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
@@ -2443,13 +2455,29 @@ int main(int argc, char** argv) {
                 {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
             scene::Mesh plane = scene::Mesh::Plane(*device);
 
-            // Load the skinned Fox + sample the Survey animation at t=0.5s -> joint palette.
+            // Load the skinned Fox + build the joint palette.
+            //   --skinning-shot: single-clip sample of "Survey" at t=0.5s.
+            //   --blend-shot   : 50/50 cross-clip blend of "Walk" (t=0.3s) and "Run" (t=0.2s) via
+            //                    anim::BlendAnimations. Walk+Run are both locomotion gaits, so their
+            //                    midpoint is a clearly intermediate four-legged stance distinct from
+            //                    either pure clip (Survey is near-static and would dominate a blend).
             hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
-            const anim::Animation* survey = fox.FindAnimation("Survey");
-            if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
             std::vector<Mat4> palette;
-            if (survey) palette = anim::SampleAnimation(fox.skeleton, *survey, 0.5f);
-            else palette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+            if (isBlend) {
+                const anim::Animation* walk = fox.FindAnimation("Walk");
+                const anim::Animation* run  = fox.FindAnimation("Run");
+                if (!walk && !fox.animations.empty()) walk = &fox.animations.front();
+                if (!run) run = walk;
+                if (walk && run)
+                    palette = anim::BlendAnimations(fox.skeleton, *walk, 0.3f, *run, 0.2f, 0.5f);
+                else
+                    palette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+            } else {
+                const anim::Animation* survey = fox.FindAnimation("Survey");
+                if (!survey && !fox.animations.empty()) survey = &fox.animations.front();
+                if (survey) palette = anim::SampleAnimation(fox.skeleton, *survey, 0.5f);
+                else palette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+            }
             // Pad to 64 identity matrices for the fixed-size JointPalette UBO.
             std::vector<float> paletteData(64 * 16);
             for (int j = 0; j < 64; ++j) {
@@ -2577,9 +2605,9 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
             bool ok = false;
             if (device->GetCapturedPixels(px, cw, ch2)) {
-                ok = WriteBMP(skinningShotPath, px, cw, ch2);
-                if (ok) std::printf("wrote %s (%ux%u)\n", skinningShotPath, cw, ch2);
-                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", skinningShotPath);
+                ok = WriteBMP(skinOrBlendPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u)\n", skinOrBlendPath, cw, ch2);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", skinOrBlendPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
