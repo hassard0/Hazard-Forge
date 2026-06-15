@@ -103,6 +103,7 @@ const Showcase kShowcases[] = {
     {"--mt-shot",           "Multithreaded command recording (per-thread secondaries, 1-vs-N identical)."},
     {"--gizmo-shot",        "Editor selection + translate gizmo overlay."},
     {"--camera-shot",       "Scripted-pose interactive-runtime capture."},
+    {"--audio-render",      "Deterministic audio mixer (integer/fixed-point voices -> 16-bit PCM WAV)."},
 };
 
 // The shipped feature/capability list (stable order). An agent reads this to know what the engine
@@ -138,6 +139,7 @@ const char* kFeatures[] = {
     "live-material-authoring",
     "gameplay-sample",
     "hud-text",
+    "audio-mixer",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

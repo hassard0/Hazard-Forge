@@ -37,6 +37,11 @@ hf_add_pure_test(anim_test)
 hf_add_pure_test(instance_grid_test)
 # Impulse-based rigid-body world (Slice S). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(physics_test)
+# Deterministic software audio mixer (Slice BB): integer/fixed-point Render (Q15 gains, int32
+# accumulate, int16 hard-clamp) + the 44-byte PCM WAV writer. Asserts determinism (Render twice ->
+# bit-identical), mix math + clamp, the linear pan law (endpoint-exact), ADSR Q15 at known offsets,
+# and the WAV header fields. Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(audio_test)
 # Scene-graph hierarchy composition (Slice V): parent*local world-transform walk. Pure C++, ASan.
 hf_add_pure_test(scene_import_test)
 # Immediate-mode debug-draw collector + emitters (Slice W): primitive->line-vertex counts +

@@ -17,6 +17,8 @@
 #include "anim/skeleton.h"
 #include "physics/world.h"
 #include "physics/body.h"
+#include "audio/mixer.h"
+#include "audio/wav.h"
 #include "game/roll_game.h"
 #include "ui/text.h"
 #include "render/render_graph.h"
@@ -333,6 +335,7 @@ int main(int argc, char** argv) {
     const char* gizmoShotPath = nullptr;    // --gizmo-shot <objIndex> <out.bmp>
     int gizmoShotIndex = 0;                  // selected object index for --gizmo-shot
     bool pickTest = false;                   // --pick-test: headless pick demo, prints picked index
+    const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
@@ -579,6 +582,10 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--pick-test") == 0) {
             // Slice AB: HEADLESS pick demo — cast a scripted screen ray and print the picked index.
             pickTest = true;
+        } else if (std::strcmp(argv[i], "--audio-render") == 0 && i + 1 < argc) {
+            // Slice BB: render the fixed deterministic audio scene to a WAV and exit. Pure CPU
+            // (no window/GPU), handled below before any device init.
+            audioRenderPath = argv[i + 1];
         }
     }
 
@@ -618,6 +625,96 @@ int main(int argc, char** argv) {
         std::printf("pick-test: %s (expected object 2 = sphere)\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     }
+
+    // --audio-render <out.wav> (Slice BB): fully headless (no window/GPU). Build a FIXED deterministic
+    // ~2s 44.1kHz stereo scene with the integer/fixed-point audio mixer — a sine arpeggio (ADSR-shaped
+    // notes at scheduled startSamples), a square bass, and a short panned noise hit — so the mix
+    // exercises summing, enveloping, panning, and clamping. Render -> WriteWav. The integer-only path
+    // makes the WAV byte-identical run-to-run and platform-to-platform (the audio golden contract).
+    if (audioRenderPath) {
+        const int kSR = 44100;
+        const int kFrames = kSR * 2;          // exactly 2 seconds
+        audio::MixConfig cfg{kSR, 2, kFrames};
+
+        // Q15 helper for readable fixed values (host-side authoring only; the mix path is integer).
+        auto q15 = [](double v) -> int16_t {
+            long s = static_cast<long>(v * 32767.0 + (v >= 0 ? 0.5 : -0.5));
+            if (s >  32767) s =  32767;
+            if (s < -32768) s = -32768;
+            return static_cast<int16_t>(s);
+        };
+
+        std::vector<audio::Voice> voices;
+
+        // --- Sine arpeggio: A4, C#5, E5, A5 (a major triad + octave), each 0.45s with an ADSR pluck,
+        // scheduled a quarter-second apart, gently panned across the field. ---
+        const int kNoteDur = static_cast<int>(0.45 * kSR);
+        const int kStep    = static_cast<int>(0.25 * kSR);
+        const int kArpFreq[4] = {440, 554, 659, 880};
+        const int16_t kArpPan[4] = {q15(-0.6), q15(-0.2), q15(0.2), q15(0.6)};
+        audio::Adsr pluck{static_cast<int>(0.01 * kSR), static_cast<int>(0.08 * kSR),
+                          q15(0.55), static_cast<int>(0.18 * kSR)};
+        for (int i = 0; i < 4; ++i) {
+            audio::Voice v;
+            v.wave = audio::Wave::Sine;
+            v.freqHz = kArpFreq[i];
+            v.startSample = i * kStep;
+            v.durSample = kNoteDur;
+            v.gain = q15(0.55);
+            v.pan = kArpPan[i];
+            v.env = pluck;
+            voices.push_back(v);
+        }
+
+        // --- Square bass: A2 (110 Hz) for the whole piece, centered, soft ADSR so it underpins. ---
+        {
+            audio::Voice v;
+            v.wave = audio::Wave::Square;
+            v.freqHz = 110;
+            v.startSample = 0;
+            v.durSample = kFrames;
+            v.gain = q15(0.22);
+            v.pan = 0;
+            v.env = audio::Adsr{static_cast<int>(0.02 * kSR), 0, q15(1.0),
+                                static_cast<int>(0.25 * kSR)};
+            voices.push_back(v);
+        }
+
+        // --- Noise "hit": a short panned burst mid-piece (a snare-ish accent). ---
+        {
+            audio::Voice v;
+            v.wave = audio::Wave::Noise;
+            v.freqHz = 0;
+            v.startSample = static_cast<int>(1.25 * kSR);
+            v.durSample = static_cast<int>(0.18 * kSR);
+            v.gain = q15(0.5);
+            v.pan = q15(0.5);
+            v.env = audio::Adsr{static_cast<int>(0.002 * kSR), static_cast<int>(0.05 * kSR),
+                                q15(0.2), static_cast<int>(0.1 * kSR)};
+            v.noiseSeed = 0x1357BD13u;
+            voices.push_back(v);
+        }
+
+        std::vector<int16_t> out;
+        audio::Render(cfg, voices, out);
+
+        // Peak abs sample (deterministic) for the stat line.
+        int peak = 0;
+        for (int16_t s : out) {
+            int a = (s < 0) ? -static_cast<int>(s) : static_cast<int>(s);
+            if (a > peak) peak = a;
+        }
+
+        if (!audio::WriteWav(audioRenderPath, kSR, cfg.channels, out)) {
+            std::fprintf(stderr, "FATAL: cannot write audio output '%s'\n", audioRenderPath);
+            return 1;
+        }
+        std::printf("audio: {sampleRate:%d, channels:%d, samples:%d, voices:%zu, peak:%d}\n",
+                    kSR, cfg.channels, kFrames, voices.size(), peak);
+        std::printf("audio: wrote %s\n", audioRenderPath);
+        return 0;
+    }
+
     try {
         hal::Window window({"Hazard Forge — Shadows", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);

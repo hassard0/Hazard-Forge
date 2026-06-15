@@ -34,7 +34,8 @@
       "material-graph",
       "live-material-authoring",
       "gameplay-sample",
-      "hud-text"
+      "hud-text",
+      "audio-mixer"
     ]
   },
   "showcases": [
@@ -69,7 +70,8 @@
     { "flag": "--gpu-cull-shot", "desc": "GPU-driven culling + indirect draw (compute compaction, GPU draw count)." },
     { "flag": "--mt-shot", "desc": "Multithreaded command recording (per-thread secondaries, 1-vs-N identical)." },
     { "flag": "--gizmo-shot", "desc": "Editor selection + translate gizmo overlay." },
-    { "flag": "--camera-shot", "desc": "Scripted-pose interactive-runtime capture." }
+    { "flag": "--camera-shot", "desc": "Scripted-pose interactive-runtime capture." },
+    { "flag": "--audio-render", "desc": "Deterministic audio mixer (integer/fixed-point voices -> 16-bit PCM WAV)." }
   ],
   "commands": [
     { "op": "dump", "args": {} },

@@ -175,6 +175,27 @@ if (-not `$introOk) {
 }
 Write-Host 'introspection JSON golden: exact match'
 
+# --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
+# fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
+# INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered
+# WAV is bit-identical run-to-run AND across compilers (MSVC vs Apple clang) -- we verify it once here
+# on the Windows build (the gate). Pure CPU (hf_core), no vk*/Metal symbols, like the JSON golden. ---
+Write-Host '--- audio mixer WAV golden ---'
+`$audExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$audGolden = 'tests/golden/audio/scene.wav'
+`$audLive = Join-Path `$env:TEMP 'hf_audio_live.wav'
+& `$audExe --audio-render `$audLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'audio-render run failed'; exit 24 }
+`$agBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$audGolden).Path)
+`$alBytes = [System.IO.File]::ReadAllBytes(`$audLive)
+`$audOk = (`$agBytes.Length -eq `$alBytes.Length)
+if (`$audOk) { for (`$ai = 0; `$ai -lt `$agBytes.Length; `$ai++) { if (`$agBytes[`$ai] -ne `$alBytes[`$ai]) { `$audOk = `$false; break } } }
+if (-not `$audOk) {
+    Write-Host 'audio WAV golden MISMATCH (tests/golden/audio/scene.wav)'
+    exit 25
+}
+Write-Host 'audio WAV golden: exact match'
+
 # --- Vulkan validation gate (Slice AT): run representative showcases under the Khronos validation
 # layer (synchronization + core validation) and FAIL on any real validation error. This is the
 # permanent oracle that keeps the engine Vulkan-validation-CLEAN: Slice AS activated the layer and
