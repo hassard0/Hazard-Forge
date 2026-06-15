@@ -160,6 +160,16 @@ void VulkanCommandBuffer::BindEnvironment(ITexture& env) {
                             boundEnvironmentSet_, 1, &s, 0, nullptr);
 }
 
+void VulkanCommandBuffer::BindReflectionProbe(ITexture& probeAtlas) {
+    // Slice AK — bind the baked probe atlas (an offscreen RGBA16F render target) at the dedicated
+    // environment set (set 3) so the lit_probe fragment reads it as gProbe (binding 11/12). The RT
+    // lazily allocates an env-layout descriptor set pointing at its own color view + the env sampler.
+    auto& rt = static_cast<VulkanRenderTarget&>(probeAtlas);
+    VkDescriptorSet s = rt.environmentSet();
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundEnvironmentSet_, 1, &s, 0, nullptr);
+}
+
 void VulkanCommandBuffer::BindLightClusters(IBuffer& clusters, IBuffer& lightIndices,
                                             IBuffer& lights) {
     // Push the three clustered-lighting storage buffers into the cluster set (set 3) of the bound

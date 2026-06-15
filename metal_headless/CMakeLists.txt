@@ -139,6 +139,15 @@ hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite
 # volumetric_composite adds it over the scene + tonemaps. Same HF_MSL_GEN shadow V-flip as lit.frag.
 hf_gen_msl(volumetric.frag           volumetric.frag.hlsl           frag volumetric_fragment)
 hf_gen_msl(volumetric_composite.frag volumetric_composite.frag.hlsl frag volumetric_composite_fragment)
+# Reflection + irradiance probes (Slice AK): bake the local room into a cube atlas (reflection block)
+# + cosine-convolve an irradiance block, then shade with lit_probe sampling that atlas as LOCAL GI.
+# lit_probe reuses lit.vert; the blit/convolution passes reuse post.vert. Same HLSL->SPIR-V->MSL
+# toolchain; the probe atlas binds at the env fragment texture(11)/sampler(12) like the HDR env.
+hf_gen_msl(probe_bake.vert       probe_bake.vert.hlsl       vert probe_bake_vertex)
+hf_gen_msl(probe_bake.frag       probe_bake.frag.hlsl       frag probe_bake_fragment)
+hf_gen_msl(lit_probe.frag        lit_probe.frag.hlsl        frag probe_fragment)
+hf_gen_msl(probe_blit.frag       probe_blit.frag.hlsl       frag probe_blit_fragment)
+hf_gen_msl(probe_irradiance.frag probe_irradiance.frag.hlsl frag probe_irradiance_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

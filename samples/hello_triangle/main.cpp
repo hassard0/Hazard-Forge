@@ -21,6 +21,7 @@
 #include "render/csm.h"
 #include "render/spot.h"
 #include "render/point_shadow.h"
+#include "render/probe.h"
 #include "render/clustered.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
@@ -205,6 +206,7 @@ int main(int argc, char** argv) {
     const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
     const char* volumetricShotPath = nullptr; // --volumetric-shot <out.bmp> (Slice AJ: light shafts)
+    const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -340,6 +342,15 @@ int main(int argc, char** argv) {
             // composite adds it over the scene + tonemaps. One BMP -> exit. New golden; existing
             // lit/ssao/ssr paths/shaders/goldens untouched.
             volumetricShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--probe-shot") == 0 && i + 1 < argc) {
+            // Slice AK: reflection + irradiance PROBE showcase. A Cornell-style box room (red left
+            // wall, green right wall, neutral floor/ceiling/back) is baked from a fixed probe at the
+            // room center into a single RGBA16F cube atlas (reflection block + cosine-convolved
+            // irradiance block). A metallic sphere + a matte box inside are shaded by lit_probe so the
+            // sphere REFLECTS the colored walls (local, not the sky) and the matte box picks up red/
+            // green color BLEED from the irradiance. One BMP -> exit. New golden; existing paths/
+            // shaders/goldens untouched.
+            probeShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -1091,6 +1102,348 @@ int main(int argc, char** argv) {
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pointShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels (point)\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Reflection + irradiance PROBE showcase (--probe-shot, Slice AK). A Cornell-style box
+        // room (red LEFT wall -X, green RIGHT wall +X, neutral floor/ceiling/back/front) is baked from
+        // a fixed probe at the room center into ONE RGBA16F cube atlas:
+        //   * REFLECTION block: the room rendered through the 6 cube faces (FOV 90, aspect 1) into a
+        //     3x2 grid of 512 tiles (1536x1024), reusing the point-shadow cube-atlas machinery but
+        //     rendering COLOR. (The dynamic hero objects are EXCLUDED to avoid recursion.)
+        //   * IRRADIANCE block: a 3x2 grid of 64 tiles (192x128) below it, each a cosine-hemisphere
+        //     convolution of the reflection block -> diffuse color bleed.
+        // The atlas binds at the env slot (BindReflectionProbe). Hero objects inside — a METALLIC
+        // SPHERE (reflects the red/green walls on its sides: LOCAL reflection, not the global sky) and
+        // a MATTE box (picks up red bleed on its left, green on its right from the irradiance) — are
+        // shaded by lit_probe. One BMP -> exit. New golden; existing paths/shaders/goldens untouched.
+        if (probeShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace prb = hf::render::probe;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- lit_probe FrameData (matches shaders/lit_probe.frag). 624 bytes < kFrameUboSize. ---
+            struct ProbeFrameData {
+                float viewProj[16];    //   0
+                float lightDir[4];     //  64
+                float lightColor[4];   //  80
+                float viewPos[4];      //  96
+                float faceVP[6][16];   // 112  6 probe-face view-projs -> ends 496
+                float probePos[4];     // 496
+                float atlasParams[4];  // 512  x=reflTileU y=reflTileV z=irrTileU w=irrTileV
+                float atlasParams2[4]; // 528  x=irrBlockV0 y=texelU z=texelV w=tilesPerRow
+                float camFwd[4];       // 544
+                float camRight[4];     // 560
+                float camUp[4];        // 576
+                float skyParams[4];    // 592
+                float pad0[4];         // 608
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Probe FrameData layout");
+
+            const Vec3 kProbePos{0.0f, 2.0f, 0.0f};   // room center
+
+            // === Shaders. lit.vert (scene) + lit_probe (probe-lit). CSM depth-less COLOR bake reuses
+            //     lit.vert + lit.frag-equivalent: we bake with a dedicated cube-color pipeline that is
+            //     just lit.vert + a flat-tint fragment. Reuse lit_probe.frag? No — recursion. We bake
+            //     with lit.frag (procedural sky IBL) — but the room walls dominate via their tint, and
+            //     the captured COLOR is what matters. To keep tints, the bake uses lit_probe.frag with
+            //     NO probe bound is wrong. Simplest: bake with the SAME lit.vert + a tiny flat shader.
+            //     We reuse lit.frag (Slice F) which honours the per-draw tint via vertex color * tex. ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto probeFsW    = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_probe.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto blitFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_blit.frag.hlsl.spv");
+            auto irrFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_irradiance.frag.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVs   = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto bakeVs  = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs  = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto probeFs = device->CreateShaderModule({std::span<const uint32_t>(probeFsW)});
+            auto postVs  = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto blitFs  = device->CreateShaderModule({std::span<const uint32_t>(blitFsWords)});
+            auto irrFs   = device->CreateShaderModule({std::span<const uint32_t>(irrFsWords)});
+            auto postFs  = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+            const rhi::Format kHdr  = rhi::Format::RGBA16_Float;
+
+            // Bake pipeline: probe_bake.vert (faceVP + model in the PUSH CONSTANT, like the CSM
+            // caster) + probe_bake.frag (flat wall color) into an RGBA16F target. The per-face VP via
+            // push constant lets all 6 faces render into their atlas tiles in ONE render pass via
+            // SetViewport — a single shared per-frame UBO would otherwise make every face see the LAST
+            // face's VP. No frame uniforms needed.
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;  // faceVP(16) + model(16)
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            // Blit pipeline (fullscreen): copy reflection tiles into the final atlas. Reads the source
+            // RT via BindTexture (material set 0); per-tile srcRect via a fragment push constant.
+            rhi::GraphicsPipelineDesc blitDesc;
+            blitDesc.vertex = postVs.get(); blitDesc.fragment = blitFs.get();
+            blitDesc.colorFormat = kHdr;
+            blitDesc.depthTest = false; blitDesc.usesTexture = true; blitDesc.fullscreen = true;
+            blitDesc.fragmentPushConstants = true;
+            blitDesc.pushConstantSize = sizeof(float) * 4;   // srcRect (xy origin, zw size)
+            auto blitPipeline = device->CreateGraphicsPipeline(blitDesc);
+
+            // Irradiance convolution pipeline (fullscreen): reads the reflection RT (material set 1)
+            // + the frame UBO (set 0, faceVP/atlas params) + a per-tile push constant (invFaceVP+pos).
+            rhi::GraphicsPipelineDesc irrDesc;
+            irrDesc.vertex = postVs.get(); irrDesc.fragment = irrFs.get();
+            irrDesc.colorFormat = kHdr;
+            irrDesc.depthTest = false; irrDesc.usesFrameUniforms = true; irrDesc.usesTexture = true;
+            irrDesc.fullscreen = true; irrDesc.fragmentPushConstants = true;
+            irrDesc.pushConstantSize = sizeof(float) * 20;   // invFaceVP(16) + probePos(4)
+            auto irrPipeline = device->CreateGraphicsPipeline(irrDesc);
+
+            // lit_probe pipeline: base lit PBR + probe IBL (set 3 env slot = probe atlas).
+            rhi::GraphicsPipelineDesc probeDesc;
+            probeDesc.vertex = litVs.get(); probeDesc.fragment = probeFs.get();
+            probeDesc.vertexLayout = scene::MeshVertexLayout();
+            probeDesc.colorFormat = kHdr;
+            probeDesc.depthTest = true; probeDesc.usesFrameUniforms = true; probeDesc.usesTexture = true;
+            probeDesc.usesEnvironment = true;   // reserve set 3 (the probe atlas)
+            probeDesc.pushConstantSize = sizeof(float) * 20;  // model + material
+            auto probePipeline = device->CreateGraphicsPipeline(probeDesc);
+
+            // Post pipeline -> swapchain.
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // === Render targets. ===
+            auto reflRT    = device->CreateRenderTarget(prb::kAtlasW, prb::kReflBlockH, kHdr); // 1536x1024
+            auto probeAtlas = device->CreateRenderTarget(prb::kAtlasW, prb::kAtlasH, kHdr);    // 1536x1152
+            auto sceneRT   = device->CreateRenderTarget(w, h, kHdr);
+            // The frame set (set 0) has a shadow-map slot the lit pipelines declare; point it at a
+            // dummy depth map so the set is fully valid (lit_probe never samples it — probe IBL only).
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+
+            // === Textures + meshes. ===
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // === The room: 6 inward-facing walls (big thin cubes) forming a box around the probe. The
+            // shared cube mesh has fixed per-face vertex colors, so each wall is TINTED via the push
+            // constant (material.z/w unused -> we pass tint in a SEPARATE 4-float block; lit.frag uses
+            // vertex color * tex, so to color a wall we scale by binding a 1x1 colored texture). To get
+            // per-wall color without per-wall textures we instead create small 1x1 colored textures. ===
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);   // left wall
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);   // right wall
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);   // floor/ceiling/back/front
+
+            const float R = 6.0f;   // room half-extent
+            const float T = 0.2f;   // wall thickness
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-R, 2.0f, 0.0f}) * Mat4::Scale({T, 2*R, 2*R}), redTex.get()},     // -X red
+                {Mat4::Translate({ R, 2.0f, 0.0f}) * Mat4::Scale({T, 2*R, 2*R}), greenTex.get()},   // +X green
+                {Mat4::Translate({0.0f, 2.0f - R, 0.0f}) * Mat4::Scale({2*R, T, 2*R}), neutralTex.get()}, // floor
+                {Mat4::Translate({0.0f, 2.0f + R, 0.0f}) * Mat4::Scale({2*R, T, 2*R}), neutralTex.get()}, // ceiling
+                {Mat4::Translate({0.0f, 2.0f, -R}) * Mat4::Scale({2*R, 2*R, T}), neutralTex.get()},       // back
+                {Mat4::Translate({0.0f, 2.0f,  R}) * Mat4::Scale({2*R, 2*R, T}), neutralTex.get()},       // front
+            };
+
+            // === Hero objects (NOT baked into the probe). ===
+            Mat4 sphereModel = Mat4::Translate({-1.9f, 1.4f, 0.8f}) * Mat4::Scale({1.7f, 1.7f, 1.7f});
+            // A tall WHITE matte box centered between the walls, rotated 45deg so the camera sees TWO
+            // side faces at once: the left-facing face (toward the red -X wall) reads warm/red and the
+            // right-facing face (toward the green +X wall) reads green — clear diffuse color bleed on a
+            // near-white albedo.
+            Mat4 boxModel    = Mat4::Translate({ 2.0f, 1.2f, 0.6f}) * Mat4::RotateY(0.785f)
+                                 * Mat4::Scale({1.5f, 2.4f, 1.5f});
+
+            // === Fixed deterministic camera, looking into the room from the front (+Z), slightly high. ===
+            const Vec3 eye{0.0f, 2.4f, 9.0f};
+            const Vec3 center{0.0f, 1.6f, 0.0f};
+            const float fovY = 1.04719755f;  // 60deg
+            Vec3 fwd   = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+            Vec3 up3   = math::cross(right, fwd);
+
+            auto faceVPs = prb::FaceViewProjs(kProbePos);
+
+            // === Fill the shared ProbeFrameData (used by lit_probe + irradiance). ===
+            ProbeFrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int fi = 0; fi < prb::kFaces; ++fi)
+                    for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.85f, -0.35f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+                fd.lightColor[0]=0.55f; fd.lightColor[1]=0.55f; fd.lightColor[2]=0.58f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.probePos[0]=kProbePos.x; fd.probePos[1]=kProbePos.y; fd.probePos[2]=kProbePos.z; fd.probePos[3]=1.0f;
+                fd.atlasParams[0]=(float)prb::kReflTile/(float)prb::kAtlasW; // reflTileU
+                fd.atlasParams[1]=(float)prb::kReflTile/(float)prb::kAtlasH; // reflTileV
+                fd.atlasParams[2]=(float)prb::kIrrTile/(float)prb::kAtlasW;  // irrTileU
+                fd.atlasParams[3]=(float)prb::kIrrTile/(float)prb::kAtlasH;  // irrTileV
+                fd.atlasParams2[0]=(float)prb::kReflBlockH/(float)prb::kAtlasH; // irrBlockV0
+                fd.atlasParams2[1]=1.0f/(float)prb::kAtlasW;                    // texelU
+                fd.atlasParams2[2]=1.0f/(float)prb::kAtlasH;                    // texelV
+                fd.atlasParams2[3]=(float)prb::kTilesPerRow;                    // 3
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+            }
+
+            const float kReflTileU = (float)prb::kReflTile / (float)prb::kAtlasW;
+            const float kReflTileV_atlas = (float)prb::kReflTile / (float)prb::kAtlasH;
+
+            render::RenderGraph graph;
+            render::RgResource rgRefl  = graph.ImportTarget("reflRT", render::RgResourceKind::SceneColor, *reflRT);
+            render::RgResource rgAtlas = graph.ImportTarget("probeAtlas", render::RgResourceKind::SceneColor, *probeAtlas);
+            render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+            render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+            // --- Pass 1: bake the ROOM into the reflection RT, one wall set per cube face tile. The
+            //     face VP rides in the push constant so all 6 faces share one render pass. ---
+            graph.AddPass("probeBake", {}, {rgRefl},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                    cmd.BindPipeline(*bakePipeline);
+                    for (int face = 0; face < prb::kFaces; ++face) {
+                        auto tile = prb::FaceTile(face);
+                        cmd.SetViewport((int32_t)(tile.col * prb::kReflTile),
+                                        (int32_t)(tile.row * prb::kReflTile),
+                                        prb::kReflTile, prb::kReflTile);
+                        for (const auto& wl : walls) {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k]      = faceVPs[face].m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = wl.model.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindTexture(*wl.tex);
+                            cmd.BindVertexBuffer(cube.vertices());
+                            cmd.BindIndexBuffer(cube.indices());
+                            cmd.DrawIndexed(cube.indexCount());
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // --- Pass 2: compose the FINAL atlas. Reflection tiles = passthrough copy of reflRT;
+            //     irradiance tiles = cosine convolution of reflRT. Both read reflRT (not the atlas
+            //     being written), so no read-after-write hazard. One pass, cleared once. ---
+            graph.AddPass("probeCompose", {rgRefl}, {rgAtlas},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    // Reflection block: copy each face tile 1:1 into the top of the atlas.
+                    cmd.BindPipeline(*blitPipeline);
+                    cmd.BindTexture(*reflRT);
+                    for (int face = 0; face < prb::kFaces; ++face) {
+                        auto tile = prb::FaceTile(face);
+                        cmd.SetViewport((int32_t)(tile.col * prb::kReflTile),
+                                        (int32_t)(tile.row * prb::kReflTile),
+                                        prb::kReflTile, prb::kReflTile);
+                        // Source rect in reflRT (its own UV space; reflRT is exactly the refl block).
+                        float srcRect[4] = {
+                            (float)tile.col / (float)prb::kTilesPerRow,
+                            (float)tile.row / (float)prb::kTilesPerCol,
+                            1.0f / (float)prb::kTilesPerRow,
+                            1.0f / (float)prb::kTilesPerCol,
+                        };
+                        cmd.PushConstants(srcRect, sizeof(srcRect));
+                        cmd.Draw(3);
+                    }
+                    // Irradiance block: convolve reflRT into each small tile below the reflection block.
+                    cmd.BindPipeline(*irrPipeline);
+                    dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                    cmd.BindTexture(*reflRT);
+                    for (int face = 0; face < prb::kFaces; ++face) {
+                        auto tile = prb::FaceTile(face);
+                        cmd.SetViewport((int32_t)(tile.col * prb::kIrrTile),
+                                        (int32_t)(prb::kReflBlockH + tile.row * prb::kIrrTile),
+                                        prb::kIrrTile, prb::kIrrTile);
+                        Mat4 invVP = faceVPs[face].Inverse();
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = invVP.m[k];
+                        pc[16]=kProbePos.x; pc[17]=kProbePos.y; pc[18]=kProbePos.z; pc[19]=1.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.Draw(3);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // --- Pass 3: shade the room + hero objects with lit_probe, sampling the probe atlas. ---
+            graph.AddPass("probeScene", {rgAtlas}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                    cmd.BindPipeline(*probePipeline);
+                    cmd.BindReflectionProbe(*probeAtlas);
+                    auto drawProbe = [&](const Mat4& model, const scene::Mesh& mesh, rhi::ITexture& tex,
+                                         float metallic, float rough) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                        pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(tex, *flatNormal);
+                        cmd.BindReflectionProbe(*probeAtlas);
+                        cmd.BindVertexBuffer(mesh.vertices());
+                        cmd.BindIndexBuffer(mesh.indices());
+                        cmd.DrawIndexed(mesh.indexCount());
+                    };
+                    // Room walls (matte dielectric) — they also pick up the probe, but read as walls.
+                    // Skip the FRONT (+Z) wall (index 5) in the scene so the camera sees INTO the open
+                    // box (Cornell-box style); it stays in the BAKE so reflections are complete.
+                    for (size_t wi = 0; wi < walls.size(); ++wi)
+                        if (wi != 5) drawProbe(walls[wi].model, cube, *walls[wi].tex, 0.0f, 0.95f);
+                    // Hero: metallic sphere (reflects the colored walls) + matte box (color bleed).
+                    drawProbe(sphereModel, sphere, *whiteTex, 1.0f, 0.08f);
+                    drawProbe(boxModel,    cube,   *whiteTex, 0.0f, 0.9f);
+                    cmd.EndRenderPass();
+                });
+
+            // --- Pass 4: post -> swapchain. ---
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipeline);
+                    cmd.BindTexture(*sceneRT);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            (void)kReflTileU; (void)kReflTileV_atlas;
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(probeShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — reflection+irradiance probe baked at "
+                                    "(%.1f,%.1f,%.1f), %dx%d atlas\n", probeShotPath, cw, ch2,
+                                    kProbePos.x, kProbePos.y, kProbePos.z, prb::kAtlasW, prb::kAtlasH);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels (probe)\n");
             }
             device->WaitIdle();
             return ok ? 0 : 1;

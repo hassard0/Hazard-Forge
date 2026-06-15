@@ -29,6 +29,7 @@ public:
     void BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
                          ITexture& emissive, ITexture& occlusion) override;
     void BindEnvironment(ITexture& env) override;
+    void BindReflectionProbe(ITexture& probeAtlas) override;
     void BindLightClusters(IBuffer& clusters, IBuffer& lightIndices, IBuffer& lights) override;
     void Draw(uint32_t vertexCount, uint32_t firstVertex) override;
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset) override;

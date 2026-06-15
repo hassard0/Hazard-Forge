@@ -177,6 +177,16 @@ void MetalCommandBuffer::BindEnvironment(ITexture& env) {
     [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragEnvSmp];
 }
 
+void MetalCommandBuffer::BindReflectionProbe(ITexture& probeAtlas) {
+    // Slice AK — bind the baked probe atlas (an offscreen RGBA16F render target) at the SAME flat
+    // fragment env texture(11)/sampler(12) as BindEnvironment, so the generated lit_probe MSL reads it
+    // as gProbe/gProbeSmp. A render target is an IMetalSampled, so this is identical to BindEnvironment.
+    auto* s = dynamic_cast<IMetalSampled*>(&probeAtlas);
+    if (!s) Fail("BindReflectionProbe: texture is not an IMetalSampled");
+    [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragEnvTex];
+    [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragEnvSmp];
+}
+
 void MetalCommandBuffer::BindLightClusters(IBuffer& clusters, IBuffer& lightIndices,
                                            IBuffer& lights) {
     // Clustered Forward+ lighting (Slice AG): bind the three storage buffers to the FRAGMENT stage

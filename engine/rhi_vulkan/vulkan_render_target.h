@@ -36,6 +36,12 @@ public:
     VkDescriptorSet descriptorSet() const { return set_; }
     VkDescriptorSet vkDescriptorSet() const override { return set_; }
 
+    // Slice AK — a descriptor set on the dedicated ENVIRONMENT set layout (set 3, binding 11 = this
+    // RT's color view, binding 12 = the env sampler) so a baked probe atlas RT can be bound at the
+    // env slot via BindReflectionProbe, exactly like an HDR env VulkanTexture. Allocated lazily the
+    // first time it's requested (most RTs never need it). Not valid for depth-only RTs.
+    VkDescriptorSet environmentSet();
+
     // Repoint this RT's material-set second slot (binding 3) at another image view, so a fullscreen
     // pass can sample THIS RT (binding 0) and `secondView` (binding 3) from the one set. Used by the
     // bloom composite to sample the HDR scene + the bloom result together (Slice U). Cached: a repeat
@@ -68,6 +74,7 @@ private:
 
     VkDescriptorSet set_ = VK_NULL_HANDLE;
     VkImageView     secondaryView_ = VK_NULL_HANDLE;  // current binding-3 view (cache for attachSecondaryColor)
+    VkDescriptorSet environmentSet_ = VK_NULL_HANDLE; // lazy set 3 (probe atlas at env slot), Slice AK
 };
 
 } // namespace hf::rhi::vk

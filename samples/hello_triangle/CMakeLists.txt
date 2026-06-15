@@ -70,6 +70,15 @@ hf_compile_shaders(
     # volumetric_composite adds it over the scene + tonemaps. Existing shaders + goldens untouched.
     "shaders/volumetric.frag.hlsl:ps"
     "shaders/volumetric_composite.frag.hlsl:ps"
+    # Reflection + irradiance probes (Slice AK): bake the local room into a cube atlas (reflection
+    # block) + cosine-convolve an irradiance block, then shade with lit_probe sampling that atlas as
+    # LOCAL GI. Reuses lit.vert + the CSM depth-only caster's vertex (probe-face VP in push const) and
+    # post.vert for the blit/convolution fullscreen passes. Existing shaders + goldens untouched.
+    "shaders/probe_bake.vert.hlsl:vs"
+    "shaders/probe_bake.frag.hlsl:ps"
+    "shaders/lit_probe.frag.hlsl:ps"
+    "shaders/probe_blit.frag.hlsl:ps"
+    "shaders/probe_irradiance.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

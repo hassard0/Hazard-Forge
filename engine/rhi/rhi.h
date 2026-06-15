@@ -197,6 +197,14 @@ public:
     // usesEnvironment is true. Default no-op so passes/backends without IBL are unaffected; both
     // shipping backends override it.
     virtual void BindEnvironment(ITexture& /*env*/) {}
+    // Bind a baked reflection+irradiance PROBE atlas (Slice AK) at the SAME dedicated environment
+    // set/slot BindEnvironment uses (Vulkan set 3 binding 11/12; Metal fragment texture(11)/
+    // sampler(12)), for LOCAL cubemap GI in the lit_probe pass. The argument is the RGBA16F render
+    // target the probe was baked into (a single atlas holding both the reflection and irradiance
+    // blocks). Pair with a pipeline whose usesEnvironment is true. Unlike BindEnvironment, this
+    // accepts a render target as the source. Default no-op so passes/backends without probes are
+    // unaffected; both shipping backends override it.
+    virtual void BindReflectionProbe(ITexture& /*probeAtlas*/) {}
     // Bind the THREE clustered-lighting storage buffers (Slice AG) at the dedicated cluster set
     // (set 3 on Vulkan, bindings 0/1/2; flat fragment buffer slots on Metal), readable by the
     // clustered-lit fragment shader: `clusters` = per-cluster {offset,count}, `lightIndices` = flat

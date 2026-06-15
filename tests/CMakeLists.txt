@@ -73,6 +73,12 @@ hf_add_pure_test(ssr_test)
 # (render/volumetric.h, header-only), ASan-eligible.
 hf_add_pure_test(volumetric_test)
 
+# Reflection + irradiance probes (Slice AK): the 6-face cube projection + dominant-axis face
+# selection (reused from point_shadow) + the COMBINED reflection/irradiance atlas-tile mapping the
+# lit_probe shader mirrors (on-axis dir -> face center; face round-trip; tile UVs inside their
+# block). Pure C++ (render/probe.h, header-only), ASan-eligible.
+hf_add_pure_test(probe_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

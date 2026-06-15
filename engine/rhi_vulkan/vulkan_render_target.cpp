@@ -149,7 +149,45 @@ void VulkanRenderTarget::attachSecondaryColor(VkImageView secondView) {
     vkUpdateDescriptorSets(device_.device(), 1, &w, 0, nullptr);
 }
 
+VkDescriptorSet VulkanRenderTarget::environmentSet() {
+    // Slice AK — lazily allocate a set on the dedicated environment layout pointing at this RT's color
+    // image (binding 11) + the env sampler (binding 12), so a baked probe atlas RT binds at the env
+    // slot just like an HDR env texture. Reuses the existing env set layout + sampler — no new layout.
+    if (environmentSet_ != VK_NULL_HANDLE) return environmentSet_;
+    VkDescriptorSetLayout layout = device_.environmentSetLayout();
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = device_.descriptorPool();
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &layout;
+    Check(vkAllocateDescriptorSets(device_.device(), &dai, &environmentSet_),
+          "vkAllocateDescriptorSets(rt env)");
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageView = colorView_;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo samplerInfo{};
+    samplerInfo.sampler = device_.environmentSampler();
+
+    VkWriteDescriptorSet writes[2]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = environmentSet_;
+    writes[0].dstBinding = 11;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[0].pImageInfo = &imageInfo;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = environmentSet_;
+    writes[1].dstBinding = 12;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    writes[1].pImageInfo = &samplerInfo;
+    vkUpdateDescriptorSets(device_.device(), 2, writes, 0, nullptr);
+    return environmentSet_;
+}
+
 VulkanRenderTarget::~VulkanRenderTarget() {
+    if (environmentSet_)
+        vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &environmentSet_);
     if (set_) vkFreeDescriptorSets(device_.device(), device_.descriptorPool(), 1, &set_);
     if (colorView_) vkDestroyImageView(device_.device(), colorView_, nullptr);
     if (depthView_) vkDestroyImageView(device_.device(), depthView_, nullptr);
