@@ -125,6 +125,7 @@ const char* kFeatures[] = {
     "debug-visualization",
     "interactive-runtime",
     "editor-selection-gizmos",
+    "automatic-barriers",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

@@ -21,6 +21,12 @@ endfunction()
 
 hf_add_pure_test(math_test)
 hf_add_pure_test(render_graph_test)
+# Render-graph AUTOMATIC BARRIER solver (Slice AS): the resource-state tracker + topo-ordered
+# transition solver. Asserts the emitted barrier plan (shadow->shaderRead, sceneColor->shaderRead,
+# swapchain->present) matches a hand-checked sequence, no-op (from==to) coalescing drops redundant
+# transitions, and freshly imported targets start Undefined. Pure logic — the Vulkan
+# synchronization-validation layer is the live device oracle; this pins the solver. ASan-eligible.
+hf_add_pure_test(render_graph_barriers_test)
 hf_add_pure_test(ecs_test)
 hf_add_pure_test(scene_io_test)
 hf_add_pure_test(commands_test)

@@ -293,4 +293,73 @@ void VulkanCommandBuffer::ComputeToVertexBarrier() {
     vkCmdPipelineBarrier2(cmd_, &di);
 }
 
+namespace {
+// Map a render-graph resource STATE to the Vulkan (layout, stage, access) triple for one side of an
+// image barrier. This is the backend half of the additive ResourceBarrier seam (Slice AS): the graph
+// computes the from->to transition in pure logic; here it becomes a concrete VkImageMemoryBarrier2.
+// `depth` selects the depth-vs-color attachment masks. The masks mirror the hand-placed transitions
+// the Begin*/End* scaffolding has always used, so the sync-validation layer sees identical hazard
+// coverage.
+struct VkStateMasks { VkImageLayout layout; VkPipelineStageFlags2 stage; VkAccessFlags2 access; };
+VkStateMasks MapState(ResourceState s, bool depth) {
+    switch (s) {
+        case ResourceState::Undefined:
+            return {VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0};
+        case ResourceState::ColorTarget:
+            return {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+        case ResourceState::DepthWrite:
+            return {VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT};
+        case ResourceState::DepthRead:
+            return {VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT};
+        case ResourceState::ShaderRead:
+            return {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT};
+        case ResourceState::Present:
+            return {VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0};
+    }
+    (void)depth;
+    return {VK_IMAGE_LAYOUT_UNDEFINED, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0};
+}
+} // namespace
+
+void VulkanCommandBuffer::ResourceBarrier(IRenderTarget& resource, ResourceState from,
+                                          ResourceState to) {
+    // Emitted by the render graph BEFORE the consuming pass (and for the swapchain ->Present after).
+    // A depth-only render target (the shadow map) barriers its DEPTH image on the depth aspect; a
+    // color render target (scene RT / HDR chain) barriers its COLOR image. The graph guarantees this
+    // is called OUTSIDE an open render pass and only when from != to (no-ops are coalesced upstream).
+    auto& rt = static_cast<VulkanRenderTarget&>(resource);
+    const bool depth = rt.depthOnly();
+
+    VkStateMasks src = MapState(from, depth);
+    VkStateMasks dst = MapState(to, depth);
+
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = src.stage;  b.srcAccessMask = src.access;
+    b.dstStageMask = dst.stage;  b.dstAccessMask = dst.access;
+    b.oldLayout = src.layout;    b.newLayout = dst.layout;
+    b.image = depth ? rt.depthImage() : rt.colorImage();
+    b.subresourceRange = {static_cast<VkImageAspectFlags>(
+                              depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+                          0, 1, 0, 1};
+
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd_, &di);
+
+    // Keep the RT's layout bookkeeping in sync so the Begin*/End* scaffolding's own transitions start
+    // from the correct current layout (incremental cutover: both coexist until each hardcoded
+    // transition is removed once the graph's barrier is validated to cover it).
+    if (depth) rt.setDepthLayout(dst.layout);
+    else       rt.setColorLayout(dst.layout);
+}
+
 } // namespace hf::rhi::vk

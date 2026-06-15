@@ -27,6 +27,21 @@ enum class Format {
 
 struct ClearColor { float r = 0, g = 0, b = 0, a = 1; };
 
+// Backend-agnostic resource ACCESS STATE for the render graph's automatic-barrier solver (Slice AS).
+// The graph tracks each render-target image's state and asks the command buffer to transition it via
+// ResourceBarrier; the BACKEND maps each state pair to its synchronization primitive. The names
+// describe GPU USAGE, not a layout: the Vulkan backend maps them to (VkImageLayout, srcStage/access,
+// dstStage/access) inside a vkCmdPipelineBarrier2; Metal's default tracked-hazard model makes the
+// transition a no-op. No backend types leak here — this is the pure interface seam.
+enum class ResourceState {
+    Undefined,    // initial / contents-don't-matter
+    ColorTarget,  // color attachment write
+    DepthWrite,   // depth attachment write
+    DepthRead,    // depth read (reserved)
+    ShaderRead,   // sampled in a shader
+    Present,      // handed to the presentation engine (terminal)
+};
+
 // --- Resource descriptors ----------------------------------------------------
 
 struct VertexAttribute {
@@ -275,6 +290,17 @@ public:
     virtual void DispatchCompute(uint32_t /*groupsX*/, uint32_t groupsY = 1, uint32_t groupsZ = 1) {}
     // Barrier so a later vertex stage reads the storage buffer the compute stage just wrote.
     virtual void ComputeToVertexBarrier() {}
+
+    // --- Render-graph automatic barriers (Slice AS) --------------------------
+    // Transition a render-target image from one resource STATE to another. The render graph's barrier
+    // solver computes the minimal set of (from->to) transitions and calls this BEFORE each pass that
+    // needs the new state (and for the swapchain's terminal ->Present). The BACKEND emits the actual
+    // synchronization: Vulkan maps the state pair to a vkCmdPipelineBarrier2 (VkImageMemoryBarrier2
+    // with the matching layout + stage/access masks); Metal's default tracked-hazard model auto-orders
+    // cross-encoder dependencies, so its implementation is a documented no-op. Default no-op so
+    // backends/passes that don't need it still link (must NOT be called inside an open render pass).
+    virtual void ResourceBarrier(IRenderTarget& /*resource*/, ResourceState /*from*/,
+                                 ResourceState /*to*/) {}
 };
 
 class ISwapchain {

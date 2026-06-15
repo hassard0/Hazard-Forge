@@ -31,6 +31,24 @@ void RenderGraph::AddPass(const std::string& name,
     passes_.push_back(Pass{name, std::move(reads), std::move(writes), std::move(record)});
 }
 
+// The state a pass requires a resource to be in, inferred from the resource KIND + access role.
+//   ShadowMap : write -> DepthWrite   (depth-only shadow render), read -> ShaderRead (lit pass samples)
+//   SceneColor: write -> ColorTarget  (RT color render),          read -> ShaderRead (composite samples)
+//   Swapchain : write -> ColorTarget  (final composite),          read -> ShaderRead (unused today)
+//   Transient : Undefined (no GPU-backed image; dependency edges only)
+RgResourceState RenderGraph::RequiredState(RgResourceKind kind, bool isWrite) {
+    switch (kind) {
+        case RgResourceKind::ShadowMap:  return isWrite ? RgResourceState::DepthWrite
+                                                        : RgResourceState::ShaderRead;
+        case RgResourceKind::SceneColor: return isWrite ? RgResourceState::ColorTarget
+                                                        : RgResourceState::ShaderRead;
+        case RgResourceKind::Swapchain:  return isWrite ? RgResourceState::ColorTarget
+                                                        : RgResourceState::ShaderRead;
+        case RgResourceKind::Transient:
+        default:                         return RgResourceState::Undefined;
+    }
+}
+
 const RenderGraph::Resource& RenderGraph::OutputResource(const Pass& pass) const {
     const Resource* out = nullptr;
     for (const RgResource& w : pass.writes) {
@@ -92,26 +110,115 @@ std::vector<uint32_t> RenderGraph::TopoOrder() const {
     return order;
 }
 
-void RenderGraph::Execute(rhi::IRHIDevice& device) {
+// Map the graph's pure-logic state to the backend-agnostic RHI state the command buffer transitions.
+static rhi::ResourceState ToRhi(RgResourceState s) {
+    switch (s) {
+        case RgResourceState::Undefined:   return rhi::ResourceState::Undefined;
+        case RgResourceState::ColorTarget: return rhi::ResourceState::ColorTarget;
+        case RgResourceState::DepthWrite:  return rhi::ResourceState::DepthWrite;
+        case RgResourceState::DepthRead:   return rhi::ResourceState::DepthRead;
+        case RgResourceState::ShaderRead:  return rhi::ResourceState::ShaderRead;
+        case RgResourceState::Present:     return rhi::ResourceState::Present;
+    }
+    return rhi::ResourceState::Undefined;
+}
+
+void RenderGraph::Solve() {
     std::vector<uint32_t> order = TopoOrder();
     lastOrder_.clear();
     lastOrder_.reserve(order.size());
+    lastBarriers_.clear();
+
+    // Reset the state tracker: every render-target resource begins Undefined (its contents are
+    // produced fresh each frame). Clear any stale per-pass plan from a prior Solve().
+    for (Resource& r : resources_) r.currentState = RgResourceState::Undefined;
+    for (Pass& p : passes_) { p.preBarriers.clear(); p.postBarriers.clear(); }
+
+    // Record a transition into `plan`, advancing the resource's tracked state. from==to is coalesced
+    // (a no-op needs no barrier). Transients (Undefined required state) never transition.
+    auto transition = [&](std::vector<RgBarrier>& plan, RgResource h, RgResourceState to) {
+        Resource& r = resources_.at(h.id);
+        if (r.kind == RgResourceKind::Transient) return;  // no GPU-backed image to transition
+        if (to == RgResourceState::Undefined) return;     // nothing required
+        if (r.currentState == to) return;                 // already there -> coalesce away
+        RgBarrier b{h, r.currentState, to};
+        plan.push_back(b);
+        lastBarriers_.push_back(b);
+        r.currentState = to;
+    };
+
+    for (uint32_t pi : order) {
+        Pass& pass = passes_[pi];
+        lastOrder_.push_back(pass.name);
+
+        // BEFORE the pass: every read must be in its required state, then every write. Reads first so
+        // a resource both produced earlier and read here is sampled in ShaderRead before being
+        // re-acquired for writing (no pass currently both reads and writes the same external image).
+        for (const RgResource& rd : pass.reads)
+            transition(pass.preBarriers, rd, RequiredState(resources_.at(rd.id).kind, /*write*/false));
+        for (const RgResource& wr : pass.writes)
+            transition(pass.preBarriers, wr, RequiredState(resources_.at(wr.id).kind, /*write*/true));
+
+        // AFTER the pass: the swapchain image, once written, transitions to Present (terminal). This
+        // is the only post-pass transition the graph owns.
+        for (const RgResource& wr : pass.writes) {
+            const Resource& r = resources_.at(wr.id);
+            if (r.kind == RgResourceKind::Swapchain)
+                transition(pass.postBarriers, wr, RgResourceState::Present);
+        }
+    }
+}
+
+void RenderGraph::Execute(rhi::IRHIDevice& device) {
+    Solve();
+    std::vector<uint32_t> order = TopoOrder();
+
+    // Emit the solved transitions for a pass through the given command buffer. (Vulkan turns each
+    // into a vkCmdPipelineBarrier2; Metal's tracked-hazard model no-ops them.)
+    //
+    // INCREMENTAL CUTOVER (Slice AS): the graph OWNS the inter-pass CONSUMER transitions — the ones a
+    // pass needs to READ a resource a previous pass produced: ->ShaderRead (shadow map / scene color
+    // sampled downstream) and ->Present (swapchain handed to the presentation engine). Those are the
+    // transitions removed from EndShadowPass / EndRenderTargetFrame and now emitted here, validated
+    // hazard-free by the synchronization layer. The WRITE-ACQUIRE transitions (->ColorTarget for an RT
+    // color render, ->DepthWrite for the shadow render) are STILL owned by the Begin* scaffolding
+    // (BeginRenderTargetFrame/BeginShadowPass already transition the image into its attachment layout),
+    // so the graph TRACKS them (to know each barrier's correct `from` state) but does NOT re-emit them
+    // — emitting both would double-apply and mismatch oldLayout. Likewise the swapchain image has no
+    // backing IRenderTarget here, so its ->Present is still owned by Begin/EndFrame (the graph computes
+    // it for inspection/tests; tgt==null skips emission). YAGNI to push the cutover further this slice.
+    auto emit = [&](rhi::ICommandBuffer& cmd, const std::vector<RgBarrier>& plan) {
+        for (const RgBarrier& b : plan) {
+            // Only emit consumer transitions; write-acquires stay owned by the Begin* scaffolding.
+            const bool consumer = (b.to == RgResourceState::ShaderRead ||
+                                   b.to == RgResourceState::DepthRead ||
+                                   b.to == RgResourceState::Present);
+            if (!consumer) continue;
+            rhi::IRenderTarget* tgt = resources_.at(b.resource.id).target;
+            if (tgt) cmd.ResourceBarrier(*tgt, ToRhi(b.from), ToRhi(b.to));
+        }
+    };
 
     for (uint32_t pi : order) {
         const Pass& pass = passes_[pi];
-        lastOrder_.push_back(pass.name);
         const Resource& out = OutputResource(pass);
 
         switch (out.kind) {
             case RgResourceKind::ShadowMap: {
                 rhi::FrameContext sc = device.BeginShadowPass(*out.target);
-                if (sc.cmd) pass.record(device, *sc.cmd);
+                if (sc.cmd) {
+                    emit(*sc.cmd, pass.preBarriers);
+                    if (pass.record) pass.record(device, *sc.cmd);
+                }
                 device.EndShadowPass(sc);
                 break;
             }
             case RgResourceKind::SceneColor: {
                 rhi::FrameContext rtc = device.BeginRenderTargetFrame(*out.target);
-                if (rtc.cmd) pass.record(device, *rtc.cmd);
+                if (rtc.cmd) {
+                    emit(*rtc.cmd, pass.preBarriers);
+                    if (pass.record) pass.record(device, *rtc.cmd);
+                }
                 device.EndRenderTargetFrame(rtc);
                 break;
             }
@@ -123,7 +230,11 @@ void RenderGraph::Execute(rhi::IRHIDevice& device) {
                     swapchainRetryArm_();
                     frame = device.BeginFrame();
                 }
-                if (frame.cmd) pass.record(device, *frame.cmd);
+                if (frame.cmd) {
+                    emit(*frame.cmd, pass.preBarriers);
+                    if (pass.record) pass.record(device, *frame.cmd);
+                    emit(*frame.cmd, pass.postBarriers);
+                }
                 device.EndFrame(frame);
                 break;
             }

@@ -47,6 +47,11 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
       .require_api_version(1, 3, 0)
 #ifndef NDEBUG
       .request_validation_layers(true)
+      // Slice AS: turn ON the synchronization-validation feature so a missing/wrong barrier emitted
+      // by the render-graph barrier solver surfaces as a SYNC-HAZARD-* error. This is the live oracle
+      // that proves the graph's automatic barriers are correct (a silent layer would let a real bug
+      // through). Layer-feature flag only — no vk* draw/barrier code here.
+      .add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT)
       .use_default_debug_messenger()
 #endif
       ;
@@ -846,18 +851,14 @@ FrameContext VulkanDevice::BeginShadowPass(IRenderTarget& smBase) {
 
 void VulkanDevice::EndShadowPass(const FrameContext& frame) {
     if (!frame.cmd || !shadowInFlight_) return;
-    VulkanRenderTarget& sm = *shadowInFlight_;
 
-    // The sample already called EndRenderPass() (vkCmdEndRendering). Transition the depth image
-    // DEPTH_ATTACHMENT -> SHADER_READ_ONLY so the lit pass can sample it.
-    TransitionImage(rtCmd_, sm.depthImage(),
-                    VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
-                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
-                    VK_IMAGE_ASPECT_DEPTH_BIT);
-    sm.setDepthLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Slice AS CUTOVER: the DEPTH_ATTACHMENT -> SHADER_READ_ONLY transition that used to live here is
+    // now OWNED BY THE RENDER GRAPH. The graph emits ResourceBarrier(DepthWrite -> ShaderRead) at the
+    // start of the consuming (lit) pass's command buffer, where the shadow map is first sampled. The
+    // shadow buffer therefore leaves the depth image in DEPTH_ATTACHMENT_OPTIMAL; the graph's barrier
+    // moves it to SHADER_READ_ONLY before the lit draws. Sync-validation confirms this fully covers
+    // the producer->consumer hazard (every shadow pass runs through the graph). Removing the hardcoded
+    // transition here avoids a double-apply (which would mismatch oldLayout and trip the layer).
 
     Check(vkEndCommandBuffer(rtCmd_), "vkEndCommandBuffer(shadow)");
 
@@ -908,17 +909,14 @@ FrameContext VulkanDevice::BeginRenderTargetFrame(IRenderTarget& rtBase) {
 
 void VulkanDevice::EndRenderTargetFrame(const FrameContext& frame) {
     if (!frame.cmd || !rtInFlight_) return;
-    VulkanRenderTarget& rt = *rtInFlight_;
 
-    // The sample already called EndRenderPass() (vkCmdEndRendering). Transition the color image
-    // COLOR_ATTACHMENT -> SHADER_READ_ONLY so the later swapchain pass can sample it.
-    TransitionImage(rtCmd_, rt.colorImage(),
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
-    rt.setColorLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Slice AS CUTOVER: the COLOR_ATTACHMENT -> SHADER_READ_ONLY transition that used to live here is
+    // now OWNED BY THE RENDER GRAPH. The graph emits ResourceBarrier(ColorTarget -> ShaderRead) at the
+    // start of the consuming pass's command buffer (the post/composite pass that samples this RT, or a
+    // later RT pass in a bloom/probe/ssr chain). This RT pass therefore leaves the color image in
+    // COLOR_ATTACHMENT_OPTIMAL; the graph's barrier moves it to SHADER_READ_ONLY before the reader's
+    // draws. Sync-validation confirms full coverage (every RT pass runs through the graph). Removing
+    // the hardcoded transition avoids a double-apply (oldLayout mismatch that trips the layer).
 
     Check(vkEndCommandBuffer(rtCmd_), "vkEndCommandBuffer(rt)");
 
@@ -955,10 +953,14 @@ FrameContext VulkanDevice::BeginFrame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     Check(vkBeginCommandBuffer(fr.cmd, &bi), "vkBeginCommandBuffer");
 
-    // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
+    // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL. The acquire's imageAvailable semaphore is waited on at
+    // COLOR_ATTACHMENT_OUTPUT (see EndFrame's waitSem), so this layout-transition WRITE must form an
+    // execution dependency with that stage: srcStage = COLOR_ATTACHMENT_OUTPUT. Using TOP_OF_PIPE
+    // here leaves the transition unsynchronized against the acquire (a WRITE-AFTER-READ hazard the
+    // synchronization-validation layer flags — Slice AS made the layer active and surfaced it).
     TransitionImage(fr.cmd, swapchain_->image(acquiredImage_),
                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
 

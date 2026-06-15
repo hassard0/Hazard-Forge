@@ -136,15 +136,19 @@ int main() {
             bool sawCullFeature = false;
             // Slice AR: the gpu-driven-culling capability is advertised in the feature manifest.
             bool sawGpuCullFeature = false;
+            // Slice AS: the automatic-barriers (render-graph resource-state tracking) capability.
+            bool sawBarriersFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
                     if (AsString(el->value) == "frustum-culling") sawCullFeature = true;
                     if (AsString(el->value) == "gpu-driven-culling") sawGpuCullFeature = true;
+                    if (AsString(el->value) == "automatic-barriers") sawBarriersFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
             check(sawGpuCullFeature, "engine.features includes gpu-driven-culling");
+            check(sawBarriersFeature, "engine.features includes automatic-barriers");
         }
 
         // commands manifest includes set_transform + introspect.

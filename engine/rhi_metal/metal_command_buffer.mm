@@ -339,4 +339,18 @@ void MetalCommandBuffer::ComputeToVertexBarrier() {
     }
 }
 
+void MetalCommandBuffer::ResourceBarrier(IRenderTarget& /*resource*/, ResourceState /*from*/,
+                                         ResourceState /*to*/) {
+    // Slice AS: HONEST NO-OP on Metal. The render graph's barrier solver computes the same inter-pass
+    // transitions it does on Vulkan, but Metal resources default to MTLResourceHazardTrackingModeTracked,
+    // so the driver automatically inserts the required execution/memory dependencies between an
+    // encoder that WRITES a texture (shadow-map depth render, scene-color render) and a later encoder
+    // that READS it (the lit / composite pass sampling it). The producer/consumer ordering point is
+    // the encoder boundary (endEncoding), which the existing Begin*/End* scaffolding already creates
+    // per pass. There is therefore no cross-encoder hazard left for an explicit barrier to cover, and
+    // no Metal layout concept to transition — so this is correctly a no-op (NOT a fabricated barrier
+    // that does nothing useful). If a future pass introduced an untracked resource or an intra-encoder
+    // RAW/WAR hazard, this is where a [encoder memoryBarrierWithScope:] would go.
+}
+
 } // namespace hf::rhi::mtl

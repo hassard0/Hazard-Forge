@@ -43,6 +43,7 @@ public:
     void ComputePushConstants(const void* data, uint32_t size) override;
     void DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) override;
     void ComputeToVertexBarrier() override;
+    void ResourceBarrier(IRenderTarget& resource, ResourceState from, ResourceState to) override;
 
 private:
     VulkanDevice& device_;
