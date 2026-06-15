@@ -95,6 +95,15 @@ struct GraphicsPipelineDesc {
                                      // lighting (Slice R). Bound via BindEnvironment. Existing
                                      // set 0/1/2 layouts are unchanged, so golden-locked pipelines
                                      // (which leave this false) are byte-for-byte unaffected.
+    bool usesLightClusters = false;  // when true: the layout includes a DEDICATED light-cluster set
+                                     // (set 3) — THREE fragment-stage STORAGE buffers (clusters /
+                                     // lightIndices / lights) — for clustered Forward+ shading
+                                     // (Slice AG). Bound via BindLightClusters. Mirrors usesEnvironment
+                                     // (also set 3): sets 1/2 are padded with placeholders so the
+                                     // cluster set sits at index 3. Existing set 0/1/2 layouts are
+                                     // unchanged, so golden-locked pipelines (which leave this false)
+                                     // are byte-for-byte unaffected. Mutually exclusive with
+                                     // usesEnvironment (the clustered-lit shader does its own sky IBL).
 };
 
 // Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a
@@ -188,6 +197,14 @@ public:
     // usesEnvironment is true. Default no-op so passes/backends without IBL are unaffected; both
     // shipping backends override it.
     virtual void BindEnvironment(ITexture& /*env*/) {}
+    // Bind the THREE clustered-lighting storage buffers (Slice AG) at the dedicated cluster set
+    // (set 3 on Vulkan, bindings 0/1/2; flat fragment buffer slots on Metal), readable by the
+    // clustered-lit fragment shader: `clusters` = per-cluster {offset,count}, `lightIndices` = flat
+    // light-index array, `lights` = per-light {posRadius, color}. Pair with a pipeline whose
+    // usesLightClusters is true. Default no-op so passes/backends without clustered lighting are
+    // unaffected; both shipping backends override it.
+    virtual void BindLightClusters(IBuffer& /*clusters*/, IBuffer& /*lightIndices*/,
+                                   IBuffer& /*lights*/) {}
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.

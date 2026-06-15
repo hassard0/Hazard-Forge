@@ -92,6 +92,13 @@ public:
     VkSampler environmentSampler() const { return environmentSampler_; }
     VkDescriptorSetLayout environmentSetLayout() const { return environmentSetLayout_; }
 
+    // Clustered-lighting set layout (set 3, fragment stage, Slice AG): THREE STORAGE_BUFFER bindings
+    // (0=clusters, 1=lightIndices, 2=lights). Created with PUSH_DESCRIPTOR so the three buffers are
+    // bound inline via BindLightClusters (no pool sizing — mirrors the compute SSBO path). Separate
+    // from the material/frame/joint/env layouts so the existing set 0/1/2 layouts (and the
+    // golden-locked pipelines) are byte-for-byte unchanged.
+    VkDescriptorSetLayout clusterSetLayout() const { return clusterSetLayout_; }
+
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
     // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
@@ -127,6 +134,7 @@ private:
     VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pbrMaterialSetLayout_ = VK_NULL_HANDLE;  // wider set 1 for lit-PBR
     VkDescriptorSetLayout environmentSetLayout_ = VK_NULL_HANDLE;  // dedicated set 3 for HDR IBL
+    VkDescriptorSetLayout clusterSetLayout_ = VK_NULL_HANDLE;      // dedicated set 3 for clustered lights
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the

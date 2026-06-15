@@ -21,6 +21,7 @@ void VulkanCommandBuffer::Begin(VkCommandBuffer cmd, VkImageView colorView,
     boundLayout_ = VK_NULL_HANDLE;
     boundMaterialSet_ = 0;
     boundEnvironmentSet_ = 0;
+    boundClusterSet_ = 0;
 }
 
 void VulkanCommandBuffer::BeginRenderPass(const ClearColor& clear) {
@@ -61,6 +62,7 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     boundLayout_ = p.layout();
     boundMaterialSet_ = p.materialSetIndex();
     boundEnvironmentSet_ = p.hasEnvironmentSet() ? p.environmentSetIndex() : 0;
+    boundClusterSet_ = p.hasClusterSet() ? p.clusterSetIndex() : 0;
     boundPushStages_ = p.pushConstantStages();
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
     // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
@@ -156,6 +158,31 @@ void VulkanCommandBuffer::BindEnvironment(ITexture& env) {
     VkDescriptorSet s = tex.environmentSet();
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                             boundEnvironmentSet_, 1, &s, 0, nullptr);
+}
+
+void VulkanCommandBuffer::BindLightClusters(IBuffer& clusters, IBuffer& lightIndices,
+                                            IBuffer& lights) {
+    // Push the three clustered-lighting storage buffers into the cluster set (set 3) of the bound
+    // GRAPHICS pipeline, inline via vkCmdPushDescriptorSetKHR — same mechanism the compute path uses
+    // for its SSBOs, but for VK_PIPELINE_BIND_POINT_GRAPHICS so the FRAGMENT stage can read them.
+    auto& cb = static_cast<VulkanBuffer&>(clusters);
+    auto& lb = static_cast<VulkanBuffer&>(lightIndices);
+    auto& gb = static_cast<VulkanBuffer&>(lights);
+    VkDescriptorBufferInfo infos[3] = {
+        {cb.handle(), 0, VK_WHOLE_SIZE},
+        {lb.handle(), 0, VK_WHOLE_SIZE},
+        {gb.handle(), 0, VK_WHOLE_SIZE},
+    };
+    VkWriteDescriptorSet writes[3]{};
+    for (uint32_t i = 0; i < 3; ++i) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstBinding = 13 + i;   // clusters=13, lightIndices=14, lights=15
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                               boundClusterSet_, 3, writes);
 }
 
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {

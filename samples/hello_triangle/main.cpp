@@ -21,6 +21,7 @@
 #include "render/csm.h"
 #include "render/spot.h"
 #include "render/point_shadow.h"
+#include "render/clustered.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -201,6 +202,7 @@ int main(int argc, char** argv) {
     const char* csmShotPath = nullptr;       // --csm-shot <out.bmp> (Slice AD: cascaded shadows)
     const char* spotShotPath = nullptr;      // --spot-shot <out.bmp> (Slice AE: spot-light shadows)
     const char* pointShotPath = nullptr;     // --point-shadow-shot <out.bmp> (Slice AF: omni point)
+    const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -311,6 +313,14 @@ int main(int argc, char** argv) {
             // lit_point (dominant-axis face select + per-face atlas PCF + distance falloff). One BMP
             // -> exit. New golden; the single-shadow/CSM/spot paths/shaders/goldens are untouched.
             pointShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--clustered-shot") == 0 && i + 1 < argc) {
+            // Slice AG: clustered / Forward+ lighting showcase. A ground plane + a few objects are lit
+            // by HUNDREDS of deterministic point lights (a fixed grid of varied colors/radii). The
+            // lights are culled CPU-side into a 16x9x24 cluster grid (render::clustered) producing
+            // three storage buffers (clusters / lightIndices / lights); the lit_clustered fragment
+            // computes each fragment's cluster and iterates ONLY that cluster's lights. One BMP ->
+            // exit. New golden; all existing lit/shadow paths/shaders/goldens are untouched.
+            clusteredShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -1062,6 +1072,224 @@ int main(int argc, char** argv) {
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pointShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels (point)\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Clustered / Forward+ lighting showcase (--clustered-shot, Slice AG): a ground plane +
+        // a few raised objects lit by HUNDREDS of deterministic point lights. The lights are culled
+        // CPU-side (render::clustered) into a 16x9x24 cluster grid -> three storage buffers (clusters
+        // / lightIndices / lights); the lit_clustered fragment computes each fragment's cluster and
+        // iterates ONLY that cluster's lights. A correct clustered result is indistinguishable from
+        // brute-force: a rich quilt of overlapping colored light pools with smooth falloff and NO
+        // tile banding. One BMP -> exit. New golden; all existing paths/shaders/goldens untouched.
+        if (clusteredShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cl = hf::render::clustered;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- Clustered FrameData layout (matches shaders/lit_clustered.frag). 224 bytes < 1024. ---
+            struct ClusteredFrameData {
+                float viewProj[16];      //   0
+                float view[16];          //  64  world -> view
+                float lightDir[4];       // 128  dim directional fill
+                float lightColor[4];     // 144
+                float viewPos[4];        // 160  world-space camera
+                float clusterParams[4];  // 176  x=CX y=CY z=CZ w=znear
+                float clusterParams2[4]; // 192  x=zfar y=screenW z=screenH w=tanX
+                float clusterParams3[4]; // 208  x=tanY (yzw unused)
+            };
+            static_assert(sizeof(ClusteredFrameData) == 224, "Clustered FrameData layout");
+
+            // === Cluster grid + camera. Exponential z slices between znear..zfar over the frustum. ===
+            // A 1x1x1 grid (HF_CLUSTERED_BRUTEFORCE env var) collapses every fragment to ONE cluster
+            // holding ALL lights -> the SAME shader becomes a brute-force loop over all 192 lights.
+            // Rendering both and confirming they match visually is the strongest correctness check.
+            const bool bruteForce = (std::getenv("HF_CLUSTERED_BRUTEFORCE") != nullptr);
+            const int   CX = bruteForce ? 1 : 16;
+            const int   CY = bruteForce ? 1 : 9;
+            const int   CZ = bruteForce ? 1 : 24;
+            const float kNear = 0.5f, kFar = 90.0f;
+            const float fovY = 1.04719755f;  // 60deg
+
+            // Fixed deterministic camera: looking down the field of lights from a front-high vantage.
+            const Vec3 eye{0.0f, 16.0f, 26.0f};
+            const Vec3 center{0.0f, 0.0f, -2.0f};
+            Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(fovY, aspect, kNear, kFar);
+            Mat4 vp = proj * view;
+            cl::Grid grid = cl::MakeGrid(proj, kNear, kFar, (float)w, (float)h, CX, CY, CZ);
+
+            // === MANY deterministic point lights: a 16x12 grid (192) hovering just above a wide floor.
+            // Positions/colors/radii are derived purely from the index (NO rng), so the result is bit-
+            // stable. Colors cycle through a vivid palette; radii vary so pools overlap richly. ===
+            const int   LX = 16, LZ = 12;
+            const int   kNumLights = LX * LZ;   // 192
+            const float spanX = 34.0f, spanZ = 26.0f;
+            const float lightY = 1.4f;          // just above the floor, so pools spread on the ground
+            std::vector<cl::Light> worldLights;  // store world-space too (for the brute-force ref)
+            std::vector<cl::Light> viewLights;   // view-space (what the culler + GPU buffer consume)
+            worldLights.reserve(kNumLights);
+            viewLights.reserve(kNumLights);
+            for (int iz = 0; iz < LZ; ++iz) {
+                for (int ix = 0; ix < LX; ++ix) {
+                    int idx = iz * LX + ix;
+                    float fx = ((float)ix / (float)(LX - 1) - 0.5f) * spanX;
+                    float fz = ((float)iz / (float)(LZ - 1) - 0.5f) * spanZ - 2.0f;
+                    // A vivid 6-hue palette cycled by index; some pairs mix to secondary colors.
+                    static const float palette[6][3] = {
+                        {1.00f, 0.18f, 0.20f}, // red
+                        {0.20f, 1.00f, 0.30f}, // green
+                        {0.25f, 0.40f, 1.00f}, // blue
+                        {1.00f, 0.80f, 0.15f}, // amber
+                        {0.90f, 0.20f, 1.00f}, // magenta
+                        {0.15f, 0.95f, 0.95f}, // cyan
+                    };
+                    const float* c = palette[(ix * 2 + iz * 3) % 6];
+                    // Radius varies 4.0..6.5 in a fixed pattern so neighbouring pools overlap.
+                    float radius = 4.0f + ((idx * 7) % 6) * 0.5f;
+                    float intensity = 2.6f;
+
+                    cl::Light L{};
+                    L.viewPos = {fx, lightY, fz};   // (world position; transformed below)
+                    L.radius = radius;
+                    L.color = {c[0], c[1], c[2]};
+                    L.intensity = intensity;
+                    worldLights.push_back(L);
+
+                    // Transform the world position into VIEW space for culling + the GPU buffer.
+                    float vw = 0.0f;
+                    Vec3 vpos = math::MulPointDivide(view, L.viewPos, vw);  // affine: w stays 1
+                    cl::Light Lv = L;
+                    Lv.viewPos = vpos;
+                    viewLights.push_back(Lv);
+                }
+            }
+
+            // === CPU cull -> three GPU buffers (clusters / lightIndices / lights). ===
+            cl::ClusterBuffers cb = cl::BuildClusters(grid, viewLights);
+            // lightIndices may be empty in a degenerate case; pad to 1 so the buffer is non-zero size.
+            if (cb.lightIndices.empty()) cb.lightIndices.push_back(0u);
+
+            rhi::BufferDesc clusterDesc;
+            clusterDesc.size = cb.clusters.size() * sizeof(cl::GpuCluster);
+            clusterDesc.initialData = cb.clusters.data();
+            clusterDesc.usage = rhi::BufferUsage::Storage;
+            auto clusterBuf = device->CreateBuffer(clusterDesc);
+
+            rhi::BufferDesc indexDesc;
+            indexDesc.size = cb.lightIndices.size() * sizeof(uint32_t);
+            indexDesc.initialData = cb.lightIndices.data();
+            indexDesc.usage = rhi::BufferUsage::Storage;
+            auto indexBuf = device->CreateBuffer(indexDesc);
+
+            rhi::BufferDesc lightDesc;
+            lightDesc.size = cb.lights.size() * sizeof(cl::GpuLight);
+            lightDesc.initialData = cb.lights.data();
+            lightDesc.usage = rhi::BufferUsage::Storage;
+            auto lightBuf = device->CreateBuffer(lightDesc);
+
+            // === Shaders. Reuse lit.vert; clustered fragment reads the three storage buffers. ===
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto cluFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_clustered.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto cluFs = device->CreateShaderModule({std::span<const uint32_t>(cluFsWords)});
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = cluFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kSwap;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.usesLightClusters = true;               // declares the set-3 cluster buffers
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model mat4 + material(metallic,rough)
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // === Floor + a sparse set of raised objects (so pools wrap over geometry, not just flat). ===
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            const Mat4 groundModel = Mat4::Scale({26.0f, 1.0f, 20.0f});
+            struct Obj { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+            std::vector<Obj> objs;
+            // A few low boxes + balls scattered deterministically, low enough to catch the light pools.
+            for (int k = 0; k < 7; ++k) {
+                float ox = ((k % 4) - 1.5f) * 7.0f;
+                float oz = ((k / 4) - 0.5f) * 8.0f - 2.0f;
+                float s = 1.2f + (k % 3) * 0.4f;
+                if (k % 2 == 0)
+                    objs.push_back({Mat4::Translate({ox, 0.5f * s, oz}) * Mat4::RotateY(0.3f * k)
+                                    * Mat4::Scale({s, s, s}), &cube, 0.0f, 0.55f});
+                else
+                    objs.push_back({Mat4::Translate({ox, 0.5f * s, oz}) * Mat4::Scale({s, s, s}),
+                                    &sphere, 0.05f, 0.4f});
+            }
+
+            ClusteredFrameData fd{};
+            {
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int k = 0; k < 16; ++k) fd.view[k] = view.m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+                // VERY dim directional fill so the colored point-light pools dominate the image.
+                fd.lightColor[0]=0.05f; fd.lightColor[1]=0.05f; fd.lightColor[2]=0.06f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.clusterParams[0]=(float)CX; fd.clusterParams[1]=(float)CY;
+                fd.clusterParams[2]=(float)CZ; fd.clusterParams[3]=kNear;
+                fd.clusterParams2[0]=kFar; fd.clusterParams2[1]=(float)w; fd.clusterParams2[2]=(float)h;
+                fd.clusterParams2[3]=grid.tanX;
+                fd.clusterParams3[0]=grid.tanY;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+            graph.AddPass("clusteredScene", {}, {rgSwap},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(ClusteredFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.01f, 0.01f, 0.02f, 1});  // near-black night
+                    cmd.BindPipeline(*litPipeline);
+                    cmd.BindLightClusters(*clusterBuf, *indexBuf, *lightBuf);
+                    auto drawLit = [&](const Mat4& model, const scene::Mesh& mesh, float metallic,
+                                       float rough) {
+                        float pc[20];
+                        for (int k=0;k<16;++k) pc[k] = model.m[k];
+                        pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(mesh.vertices());
+                        cmd.BindIndexBuffer(mesh.indices());
+                        cmd.DrawIndexed(mesh.indexCount());
+                    };
+                    drawLit(groundModel, plane, 0.0f, 0.7f);
+                    for (const auto& o : objs) drawLit(o.model, *o.mesh, o.metallic, o.rough);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(clusteredShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — clustered Forward+: %d point lights, "
+                                    "%dx%dx%d grid (%d clusters), %zu light-index entries\n",
+                                    clusteredShotPath, cw, ch2, kNumLights, CX, CY, CZ,
+                                    grid.clusterCount(), cb.lightIndices.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clusteredShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels (clustered)\n");
             }
             device->WaitIdle();
             return ok ? 0 : 1;

@@ -237,6 +237,30 @@ void VulkanDevice::CreateTextureResources() {
               "vkCreateDescriptorSetLayout(env)");
     }
 
+    // Clustered-lighting descriptor set layout (set 3, fragment stage, Slice AG): three STORAGE
+    // buffers — binding 13 = per-cluster {offset,count}, binding 14 = flat lightIndices, binding 15 =
+    // per-light {posRadius,color}. PUSH_DESCRIPTOR so the three buffers are written inline via
+    // vkCmdPushDescriptorSetKHR in BindLightClusters (no pool — mirrors the compute SSBO path). The
+    // binding numbers (13/14/15, past the full-PBR material's 0..10 and the env's 11/12) match the
+    // HLSL [[vk::binding(13/14/15, 3)]] so spirv-cross --msl-decoration-binding lands them on Metal
+    // fragment buffer slots 13/14/15. Kept separate from material/frame/joint/env layouts so the
+    // existing set 0/1/2 layouts (and the golden-locked pipelines) are byte-for-byte unchanged.
+    {
+        VkDescriptorSetLayoutBinding clusterBindings[3]{};
+        for (uint32_t b = 0; b < 3; ++b) {
+            clusterBindings[b].binding = 13 + b;   // 13, 14, 15
+            clusterBindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            clusterBindings[b].descriptorCount = 1;
+            clusterBindings[b].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo clci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        clci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        clci.bindingCount = 3;
+        clci.pBindings = clusterBindings;
+        Check(vkCreateDescriptorSetLayout(device_, &clci, nullptr, &clusterSetLayout_),
+              "vkCreateDescriptorSetLayout(cluster)");
+    }
+
     // --- Default flat normal map: a 1x1 RGBA8 image encoding the tangent-space normal (0,0,1) as
     // (128,128,255). Bound at material set binding 3 when a renderable has no normal map, so the lit
     // shader always samples a valid normal map (perturbation = identity). ---
@@ -507,6 +531,7 @@ void VulkanDevice::DestroyTextureResources() {
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
     if (pbrMaterialSetLayout_) vkDestroyDescriptorSetLayout(device_, pbrMaterialSetLayout_, nullptr);
     if (environmentSetLayout_) vkDestroyDescriptorSetLayout(device_, environmentSetLayout_, nullptr);
+    if (clusterSetLayout_) vkDestroyDescriptorSetLayout(device_, clusterSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     if (environmentSampler_) vkDestroySampler(device_, environmentSampler_, nullptr);
@@ -514,6 +539,7 @@ void VulkanDevice::DestroyTextureResources() {
     texturedSetLayout_ = VK_NULL_HANDLE;
     pbrMaterialSetLayout_ = VK_NULL_HANDLE;
     environmentSetLayout_ = VK_NULL_HANDLE;
+    clusterSetLayout_ = VK_NULL_HANDLE;
     defaultSampler_ = VK_NULL_HANDLE;
     shadowSampler_ = VK_NULL_HANDLE;
     environmentSampler_ = VK_NULL_HANDLE;

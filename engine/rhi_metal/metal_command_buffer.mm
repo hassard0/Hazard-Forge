@@ -177,6 +177,20 @@ void MetalCommandBuffer::BindEnvironment(ITexture& env) {
     [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragEnvSmp];
 }
 
+void MetalCommandBuffer::BindLightClusters(IBuffer& clusters, IBuffer& lightIndices,
+                                           IBuffer& lights) {
+    // Clustered Forward+ lighting (Slice AG): bind the three storage buffers to the FRAGMENT stage
+    // at flat Metal fragment buffer slots 13/14/15, matching the generated lit_clustered MSL
+    // (gClusters/gLightIndices/gLights). On Metal a storage buffer is just a setFragmentBuffer: at
+    // a buffer index — no descriptor set. The shader reads them as device const arrays.
+    auto& cb = static_cast<MetalBuffer&>(clusters);
+    auto& lb = static_cast<MetalBuffer&>(lightIndices);
+    auto& gb = static_cast<MetalBuffer&>(lights);
+    [encoder_ setFragmentBuffer:cb.handle() offset:0 atIndex:kFragClusterBuf];
+    [encoder_ setFragmentBuffer:lb.handle() offset:0 atIndex:kFragLightIndexBuf];
+    [encoder_ setFragmentBuffer:gb.handle() offset:0 atIndex:kFragLightBuf];
+}
+
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     // Line list (debug-draw, Slice W) > point list (GPU particles) > the default triangle list
     // (geometry / fullscreen tris).

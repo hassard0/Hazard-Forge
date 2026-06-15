@@ -21,6 +21,9 @@ hf_compile_shaders(
     # Omnidirectional point-light shadow (Slice AF): 6-face cube atlas lit fragment + reuse the CSM
     # depth-only caster (per-face view-proj in the push constant).
     "shaders/lit_point.frag.hlsl:ps"
+    # Clustered / Forward+ lit fragment (Slice AG): per-fragment cluster index + iterate that
+    # cluster's point lights from three fragment-stage storage buffers (set 3).
+    "shaders/lit_clustered.frag.hlsl:ps"
     "shaders/lit_pbr.frag.hlsl:ps"
     "shaders/lit_pbr_ibl.frag.hlsl:ps"
     "shaders/sky_hdr.frag.hlsl:ps"

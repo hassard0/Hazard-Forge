@@ -55,6 +55,12 @@ hf_add_pure_test(spot_test)
 # clip center + [0,1] depth; behind-a-face projects outside) + dominant-axis face selection +
 # 3x2 tile mapping. Pure C++ (render/point_shadow.h, header-only), ASan-eligible.
 hf_add_pure_test(point_shadow_test)
+# Clustered / Forward+ lighting (Slice AG): exponential z-slice round-trip (SliceZ <-> SliceForViewZ),
+# cluster-index from a view-space position (point lands inside the cluster AABB it maps to), light
+# sphere -> cluster AABB assignment (hits home cluster, misses far ones, monotone in radius), and
+# BuildClusters consistency (offsets == prefix sum, sum(count) == lightIndices.size()). Pure C++
+# (render/clustered.h, header-only), ASan-eligible.
+hf_add_pure_test(clustered_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

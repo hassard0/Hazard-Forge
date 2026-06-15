@@ -59,6 +59,14 @@ constexpr uint32_t kFragOcclusionSmp  = 10; // gOcclusionSmp (set1 b10 -> sample
 // them on Metal fragment texture(11) / sampler(12).
 constexpr uint32_t kFragEnvTex = 11;  // gEnv    (set3 b11 -> texture(11))
 constexpr uint32_t kFragEnvSmp = 12;  // gEnvSmp (set3 b12 -> sampler(12))
+// Clustered-lighting storage buffers (Slice AG): three fragment-stage STORAGE buffers bound via
+// setFragmentBuffer:atIndex:. The lit_clustered.frag HLSL declares them at [[vk::binding(13/14/15,3)]]
+// so spirv-cross --msl-decoration-binding lands them on Metal FRAGMENT BUFFER slots 13/14/15 (the
+// buffer index space, separate from texture/sampler — never collides with the env's texture(11/12)
+// nor the fragment FrameData buffer(0) / bloom push-const buffer(1)).
+constexpr uint32_t kFragClusterBuf      = 13;  // gClusters     (set3 b13 -> buffer(13))
+constexpr uint32_t kFragLightIndexBuf   = 14;  // gLightIndices (set3 b14 -> buffer(14))
+constexpr uint32_t kFragLightBuf        = 15;  // gLights       (set3 b15 -> buffer(15))
 
 // Compute (kernel) binding indices. The particle compute MSL is generated from particles.comp.hlsl
 // via spirv-cross --msl-decoration-binding: the storage buffer (binding 0) -> buffer(0), and the

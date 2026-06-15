@@ -77,6 +77,10 @@ hf_gen_msl(lit_spot.frag   lit_spot.frag.hlsl   frag spot_fragment)
 # Omnidirectional point-light shadow (Slice AF): 6-face cube atlas lit fragment. Reuses lit.vert +
 # the CSM depth-only shadow caster (shadow_csm.vert: per-face view-proj in the push constant).
 hf_gen_msl(lit_point.frag  lit_point.frag.hlsl  frag point_fragment)
+# Clustered / Forward+ lit fragment (Slice AG): per-fragment cluster index + iterate that cluster's
+# point lights from three fragment-stage storage buffers (space3 -> flat Metal fragment buffers).
+# Reuses lit.vert. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(lit_clustered.frag  lit_clustered.frag.hlsl  frag clustered_fragment)
 # Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
 hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same

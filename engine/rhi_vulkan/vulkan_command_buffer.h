@@ -26,6 +26,7 @@ public:
     void BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
                          ITexture& emissive, ITexture& occlusion) override;
     void BindEnvironment(ITexture& env) override;
+    void BindLightClusters(IBuffer& clusters, IBuffer& lightIndices, IBuffer& lights) override;
     void Draw(uint32_t vertexCount, uint32_t firstVertex) override;
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset) override;
     void DrawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
@@ -50,6 +51,7 @@ private:
     VkPipelineLayout boundLayout_ = VK_NULL_HANDLE;
     uint32_t boundMaterialSet_ = 0;  // set index for BindTexture; from the bound pipeline
     uint32_t boundEnvironmentSet_ = 0;  // set index for BindEnvironment (set 3); 0 = pipeline has none
+    uint32_t boundClusterSet_ = 0;      // set index for BindLightClusters (set 3); 0 = pipeline has none
     uint32_t boundPushStages_ = VK_SHADER_STAGE_VERTEX_BIT;  // stages PushConstants targets
     VkPipelineLayout boundComputeLayout_ = VK_NULL_HANDLE;  // for compute push-constants/descriptors
 };
