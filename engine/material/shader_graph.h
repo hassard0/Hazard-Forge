@@ -36,6 +36,15 @@ enum class NodeKind {
     Add,            // a+b component-wise; output matches input type
     Lerp,           // lerp(a, b, t); a,b match; t is float (broadcast)
     Fresnel,        // pow(1 - saturate(N·V), power); output float (scalar)
+    // --- Slice AZ node expansion -------------------------------------------------------------
+    Swizzle,        // mask (e.g. "x"/"xyz"/"ww") over xyzw/rgba of one vector input; out = mask len.
+    MakeFloat3,     // 3 scalar inputs (x,y,z) -> float3.
+    MakeFloat4,     // 4 scalar inputs (x,y,z,w) -> float4.
+    Dot,            // dot(a, b); two same-size vectors -> scalar (float).
+    Normalize,      // normalize(x); vector -> same-size unit vector.
+    Power,          // pow(base, exponent); component-wise; out matches base.
+    OneMinus,       // 1 - x; component-wise; out matches x.
+    Saturate,       // clamp(x, 0, 1); component-wise; out matches x.
     PBROutput,      // SINK: baseColor(float3) metallic(float) roughness(float) emissive(float3)
 };
 
@@ -58,7 +67,11 @@ struct Node {
     Type        outType = Type::Float4;       // Constant: which swizzle of `value` to output.
     std::string texture;                      // TextureSample: slot name (e.g. "baseColorTex").
     float       power = 1.0f;                 // Fresnel: exponent.
+    std::string swizzle;                      // Swizzle: component mask over xyzw/rgba (len 1..4).
 };
+
+// Map a swizzle mask char (xyzw or rgba alias) to a component index 0..3, or -1 if not a valid char.
+int SwizzleIndex(char c);
 
 // --- Edge --------------------------------------------------------------------------------------
 // An edge connects (fromNode's single output) -> (toNode's named input port). Each node kind has a
@@ -117,6 +130,14 @@ Value EvalMultiply(const Value& a, const Value& b);   // component-wise a*b
 Value EvalAdd(const Value& a, const Value& b);        // component-wise a+b
 Value EvalLerp(const Value& a, const Value& b, float t);
 float EvalFresnel(float NoV, float power);            // pow(1 - saturate(NoV), power)
+// --- Slice AZ node primitives (shared with the codegen) ---------------------------------------
+Value EvalSwizzle(const Value& in, const std::string& mask);  // gather components per mask -> len(mask)
+Value EvalMakeFloat(const std::array<float, 4>& comps, int count);  // build a floatN from scalars
+Value EvalDot(const Value& a, const Value& b);        // dot product -> scalar
+Value EvalNormalize(const Value& x);                  // x / length(x); same size
+Value EvalPower(const Value& base, const Value& exp);  // component-wise pow
+Value EvalOneMinus(const Value& x);                   // component-wise 1 - x
+Value EvalSaturate(const Value& x);                   // component-wise clamp(x,0,1)
 
 // Evaluate the whole graph at a sample point. `uv` feeds UV nodes; `NoV` feeds Fresnel; `sampleTex`
 // supplies a stub texture lookup (slot, uv) -> float4 so TextureSample is testable on the CPU. The

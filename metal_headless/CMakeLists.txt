@@ -93,6 +93,11 @@ hf_gen_msl(mat_showcase.frag generated/mat_showcase.frag.hlsl frag material_frag
 # Metal stays BUILD-TIME (no runtime HLSL compiler in the standalone), so showcase2 flows through the
 # SAME HLSL->SPIR-V->MSL toolchain here; the new mat_graph2.png golden is rendered from this MSL.
 hf_gen_msl(mat_showcase2.frag generated/mat_showcase2.frag.hlsl frag material2_fragment)
+# Slice AZ: the THIRD material's committed build-time-generated fragment (shaders/generated/
+# mat_showcase3.frag.hlsl) — exercises the new node types (Swizzle/MakeFloat3/Power/Saturate/OneMinus).
+# Same HLSL->SPIR-V->MSL toolchain; drawn alongside showcase + showcase2 in the --material-multi scene
+# that renders the new mat_multi.png golden.
+hf_gen_msl(mat_showcase3.frag generated/mat_showcase3.frag.hlsl frag material3_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same
 # HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
 hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)

@@ -28,7 +28,18 @@ add_custom_command(
           "${CMAKE_SOURCE_DIR}/shaders/pbr_core.hlsli"
   COMMENT "material_codegen showcase2.mat.json -> mat_showcase2.frag.hlsl"
   VERBATIM)
-add_custom_target(hello_triangle_matgen DEPENDS "${MAT_GEN_HLSL}" "${MAT2_GEN_HLSL}")
+# Slice AZ: a THIRD material exercising the new node types (Swizzle/MakeFloat3/Power/Saturate/
+# OneMinus). The multi-material showcase draws all three in one frame. Same build-time codegen path.
+set(MAT3_JSON "${CMAKE_SOURCE_DIR}/assets/materials/showcase3.mat.json")
+set(MAT3_GEN_HLSL "${CMAKE_SOURCE_DIR}/shaders/generated/mat_showcase3.frag.hlsl")
+add_custom_command(
+  OUTPUT "${MAT3_GEN_HLSL}"
+  COMMAND material_codegen "${MAT3_JSON}" "${MAT3_GEN_HLSL}"
+  DEPENDS material_codegen "${MAT3_JSON}"
+          "${CMAKE_SOURCE_DIR}/shaders/pbr_core.hlsli"
+  COMMENT "material_codegen showcase3.mat.json -> mat_showcase3.frag.hlsl"
+  VERBATIM)
+add_custom_target(hello_triangle_matgen DEPENDS "${MAT_GEN_HLSL}" "${MAT2_GEN_HLSL}" "${MAT3_GEN_HLSL}")
 add_dependencies(hello_triangle hello_triangle_matgen)
 
 set(SHADER_OUT "${CMAKE_CURRENT_BINARY_DIR}/shaders")
@@ -61,6 +72,10 @@ hf_compile_shaders(
     # RUNTIME-compiles showcase2.mat.json; this build-time .spv is kept for parity/diagnostics + so the
     # generated HLSL is exercised by the same DXC the runtime path uses.
     "shaders/generated/mat_showcase2.frag.hlsl:ps"
+    # Slice AZ: the THIRD material's build-time-generated fragment (new node types). Drawn alongside
+    # showcase + showcase2 in the --material-multi-shot multi-material scene; also runtime-compiled
+    # via --material-live-shot to prove the new nodes survive the dxc runtime path.
+    "shaders/generated/mat_showcase3.frag.hlsl:ps"
     "shaders/sky_hdr.frag.hlsl:ps"
     "shaders/lit_skinned.vert.hlsl:vs"
     "shaders/shadow_skinned.vert.hlsl:vs"
@@ -128,7 +143,8 @@ target_compile_definitions(hello_triangle PRIVATE
 # Slice AW: absolute paths to the material graphs the live/runtime path loads + recompiles at runtime.
 target_compile_definitions(hello_triangle PRIVATE
   "HF_MAT_JSON=\"${MAT_JSON}\""
-  "HF_MAT2_JSON=\"${MAT2_JSON}\"")
+  "HF_MAT2_JSON=\"${MAT2_JSON}\""
+  "HF_MAT3_JSON=\"${MAT3_JSON}\"")
 # Absolute path to the glTF showcase model, baked at configure time (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/Duck.glb\"")

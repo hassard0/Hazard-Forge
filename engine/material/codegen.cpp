@@ -116,6 +116,50 @@ std::string GenerateHlsl(const Graph& g) {
             case NodeKind::Fresnel:
                 os << "    float " << Tmp(id) << " = pow(1.0 - hfNoV(i), " << Lit(n.power) << ");\n";
                 break;
+            // --- Slice AZ nodes -----------------------------------------------------------------
+            case NodeKind::Swizzle: {
+                int src = SourceOf(g, id, "in");
+                os << "    " << Ty(t) << " " << Tmp(id) << " = " << Tmp(src) << "."
+                   << n.swizzle << ";\n";
+                break;
+            }
+            case NodeKind::MakeFloat3:
+            case NodeKind::MakeFloat4: {
+                int cnt = (n.kind == NodeKind::MakeFloat3) ? 3 : 4;
+                const char* ports[4] = {"x", "y", "z", "w"};
+                os << "    " << Ty(t) << " " << Tmp(id) << " = " << Ty(t) << "(";
+                for (int k = 0; k < cnt; ++k) {
+                    if (k) os << ", ";
+                    os << Tmp(SourceOf(g, id, ports[k]));
+                }
+                os << ");\n";
+                break;
+            }
+            case NodeKind::Dot: {
+                int a = SourceOf(g, id, "a"), b = SourceOf(g, id, "b");
+                os << "    float " << Tmp(id) << " = dot(" << Tmp(a) << ", " << Tmp(b) << ");\n";
+                break;
+            }
+            case NodeKind::Normalize: {
+                int src = SourceOf(g, id, "in");
+                os << "    " << Ty(t) << " " << Tmp(id) << " = normalize(" << Tmp(src) << ");\n";
+                break;
+            }
+            case NodeKind::Power: {
+                int a = SourceOf(g, id, "a"), b = SourceOf(g, id, "b");
+                os << "    " << Ty(t) << " " << Tmp(id) << " = pow(" << Tmp(a) << ", " << Tmp(b) << ");\n";
+                break;
+            }
+            case NodeKind::OneMinus: {
+                int src = SourceOf(g, id, "in");
+                os << "    " << Ty(t) << " " << Tmp(id) << " = 1.0 - " << Tmp(src) << ";\n";
+                break;
+            }
+            case NodeKind::Saturate: {
+                int src = SourceOf(g, id, "in");
+                os << "    " << Ty(t) << " " << Tmp(id) << " = saturate(" << Tmp(src) << ");\n";
+                break;
+            }
             case NodeKind::PBROutput:
                 break;
         }

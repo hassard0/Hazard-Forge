@@ -198,6 +198,8 @@ int main() {
         bool sawMaterialShot = false;
         // Slice AW: the --material-live-shot showcase flag is listed in the showcase manifest.
         bool sawMaterialLiveShot = false;
+        // Slice AZ: the --material-multi-shot showcase flag is listed in the showcase manifest.
+        bool sawMaterialMultiShot = false;
         // Slice AX: the --game-shot showcase flag is listed in the showcase manifest.
         bool sawGameShot = false;
         if (showcases)
@@ -209,6 +211,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--mt-shot") sawMtShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-shot") sawMaterialShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-live-shot") sawMaterialLiveShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--material-multi-shot") sawMaterialMultiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--game-shot") sawGameShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
@@ -217,6 +220,7 @@ int main() {
         check(sawMtShot, "showcases manifest includes --mt-shot");
         check(sawMaterialShot, "showcases manifest includes --material-shot");
         check(sawMaterialLiveShot, "showcases manifest includes --material-live-shot");
+        check(sawMaterialMultiShot, "showcases manifest includes --material-multi-shot");
         check(sawGameShot, "showcases manifest includes --game-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.

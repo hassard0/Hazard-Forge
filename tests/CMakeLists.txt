@@ -135,6 +135,9 @@ hf_add_pure_test(parallel_record_test)
 # determinism/structure (GenerateHlsl deterministic + topologically-ordered temporaries feeding the
 # shared PBR core), and a .mat.json loader round-trip. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(shader_graph_test)
+# Slice AZ: the new-node showcase graph the test codegens (structural asserts on the swizzle/intrinsics).
+target_compile_definitions(shader_graph_test PRIVATE
+  "HF_MAT3_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/showcase3.mat.json\"")
 
 # Live runtime material authoring (Slice AW): the reload-orchestration host logic — given a STUBBED
 # compiler (success/failure, no GPU/dxc), the LiveMaterial controller swaps on success, KEEPS the old

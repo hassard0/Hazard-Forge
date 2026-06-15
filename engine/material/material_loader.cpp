@@ -89,6 +89,7 @@ LoadResult LoadGraphFromJson(const std::string& json) {
         // (default float4 if omitted)
         n.texture = AsString(MemberOf(no, "texture"));
         if (IsNumber(MemberOf(no, "power"))) n.power = (float)AsNumber(MemberOf(no, "power"));
+        n.swizzle = AsString(MemberOf(no, "swizzle"));  // Slice AZ: Swizzle mask param.
 
         g.nodes.push_back(n);
     }

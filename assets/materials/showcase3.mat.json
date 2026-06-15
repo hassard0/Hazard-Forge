@@ -1,0 +1,35 @@
+{
+  "name": "showcase3",
+  "_comment": "Slice AZ third material — exercises the NEW node types (Swizzle/MakeFloat3/Power/Saturate/OneMinus) that the AV/AW MVP lacked. This CLOSES the AW swizzle gap: a float4 TextureSample now drives the SCALAR metallic/roughness ports via a component-extract Swizzle. Graph: TextureSample(checker) -> {Swizzle 'x' -> metallic, Swizzle 'y' -> OneMinus -> roughness, Swizzle 'z' -> baseColor.y}. baseColor = MakeFloat3( Saturate(Power(Fresnel(power=2), 3)) [a rim highlight clamped to 0..1], the checker blue channel, a constant 0.4 ). On Vulkan this renders via the RUNTIME compile path AND a build-time .spv; on Metal via the committed build-time codegen (shaders/generated/mat_showcase3.frag.hlsl). All math is shared between the CPU interpreter and the HLSL codegen.",
+  "nodes": [
+    { "id": 1, "type": "UV" },
+    { "id": 2, "type": "TextureSample", "texture": "checker" },
+    { "id": 3, "type": "Swizzle", "swizzle": "x" },
+    { "id": 4, "type": "Swizzle", "swizzle": "y" },
+    { "id": 5, "type": "OneMinus" },
+    { "id": 6, "type": "Swizzle", "swizzle": "z" },
+    { "id": 7, "type": "Fresnel", "power": 2.0 },
+    { "id": 8, "type": "Constant", "value": [3.0, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 9, "type": "Power" },
+    { "id": 10, "type": "Saturate" },
+    { "id": 11, "type": "Constant", "value": [0.4, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 12, "type": "MakeFloat3" },
+    { "id": 99, "type": "PBROutput" }
+  ],
+  "edges": [
+    { "from": 1, "to": 2, "port": "uv" },
+    { "from": 2, "to": 3, "port": "in" },
+    { "from": 2, "to": 4, "port": "in" },
+    { "from": 4, "to": 5, "port": "in" },
+    { "from": 2, "to": 6, "port": "in" },
+    { "from": 7, "to": 9, "port": "a" },
+    { "from": 8, "to": 9, "port": "b" },
+    { "from": 9, "to": 10, "port": "in" },
+    { "from": 10, "to": 12, "port": "x" },
+    { "from": 6, "to": 12, "port": "y" },
+    { "from": 11, "to": 12, "port": "z" },
+    { "from": 3, "to": 99, "port": "metallic" },
+    { "from": 5, "to": 99, "port": "roughness" },
+    { "from": 12, "to": 99, "port": "baseColor" }
+  ]
+}

@@ -257,6 +257,192 @@ int main() {
               "unknown node type is rejected");
     }
 
+    // ============================ 5. SLICE AZ NEW NODES =======================================
+    // New node types: Swizzle, MakeFloat3, MakeFloat4, Dot, Normalize, Power, OneMinus, Saturate.
+    // The CPU interpreter and the codegen share these per-node formula definitions, so the parity
+    // checks below PIN the shader semantics. Helper to build a single-source graph driving one
+    // PBROutput port through one node-under-test fed by a Constant (or two).
+
+    // --- Per-node primitive parity (hand-computed) ---------------------------------------------
+    {
+        // Swizzle: mask "x" over a float4 -> component 0 as a scalar (count 1).
+        Value v4; v4.count = 4; v4.v = {0.11f, 0.22f, 0.33f, 0.44f};
+        Value sx = EvalSwizzle(v4, "x");
+        check(sx.count == 1 && approx(sx.v[0], 0.11f), "Swizzle \"x\" on float4 -> component 0 scalar");
+        // "xyz" -> float3 prefix.
+        Value sxyz = EvalSwizzle(v4, "xyz");
+        check(sxyz.count == 3 && approx(sxyz.v[0], 0.11f) && approx(sxyz.v[1], 0.22f) &&
+              approx(sxyz.v[2], 0.33f), "Swizzle \"xyz\" -> float3 prefix");
+        // "ww" -> float2 of the w component.
+        Value sww = EvalSwizzle(v4, "ww");
+        check(sww.count == 2 && approx(sww.v[0], 0.44f) && approx(sww.v[1], 0.44f),
+              "Swizzle \"ww\" -> float2 of w");
+        // rgba aliases map to xyzw.
+        Value srg = EvalSwizzle(v4, "rg");
+        check(srg.count == 2 && approx(srg.v[0], 0.11f) && approx(srg.v[1], 0.22f),
+              "Swizzle \"rg\" alias -> xy");
+
+        // MakeFloat3 / MakeFloat4.
+        Value mf3 = EvalMakeFloat({1.0f, 2.0f, 3.0f, 0.0f}, 3);
+        check(mf3.count == 3 && approx(mf3.v[0], 1) && approx(mf3.v[1], 2) && approx(mf3.v[2], 3),
+              "MakeFloat3 constructs (1,2,3)");
+        Value mf4 = EvalMakeFloat({4.0f, 5.0f, 6.0f, 7.0f}, 4);
+        check(mf4.count == 4 && approx(mf4.v[3], 7), "MakeFloat4 constructs (...,7)");
+
+        // Dot([1,2,3],[4,5,6]) = 4+10+18 = 32.
+        Value a; a.count = 3; a.v = {1, 2, 3, 0};
+        Value b; b.count = 3; b.v = {4, 5, 6, 0};
+        Value d = EvalDot(a, b);
+        check(d.count == 1 && approx(d.v[0], 32.0f), "Dot([1,2,3],[4,5,6]) == 32");
+
+        // Normalize([3,0,4]) -> [0.6,0,0.8].
+        Value n; n.count = 3; n.v = {3, 0, 4, 0};
+        Value nn = EvalNormalize(n);
+        check(nn.count == 3 && approx(nn.v[0], 0.6f) && approx(nn.v[1], 0.0f) && approx(nn.v[2], 0.8f),
+              "Normalize([3,0,4]) == [0.6,0,0.8]");
+
+        // Power(2,3) == 8 (component-wise; here scalar base/exponent).
+        Value pb; pb.count = 1; pb.v = {2, 0, 0, 0};
+        Value pe; pe.count = 1; pe.v = {3, 0, 0, 0};
+        Value pw = EvalPower(pb, pe);
+        check(pw.count == 1 && approx(pw.v[0], 8.0f), "Power(2,3) == 8");
+
+        // OneMinus(0.25) == 0.75.
+        Value om = EvalOneMinus(Value{{0.25f, 0, 0, 0}, 1});
+        check(approx(om.v[0], 0.75f), "OneMinus(0.25) == 0.75");
+
+        // Saturate clamps to [0,1] component-wise.
+        Value sat = EvalSaturate(Value{{1.5f, -0.5f, 0.5f, 2.0f}, 4});
+        check(approx(sat.v[0], 1.0f) && approx(sat.v[1], 0.0f) && approx(sat.v[2], 0.5f) &&
+              approx(sat.v[3], 1.0f), "Saturate clamps to [0,1] (1.5->1)");
+    }
+
+    // --- Validation: new type rules ------------------------------------------------------------
+    {
+        // Swizzle out-of-range mask char rejected. Feed a float2 (UV) into a Swizzle masking "z"
+        // (index 2 is out of a float2's 0..1 range).
+        Graph g;
+        Node uv; uv.id = 1; uv.kind = NodeKind::UV;                  // float2
+        Node sw; sw.id = 2; sw.kind = NodeKind::Swizzle; sw.swizzle = "z";
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {uv, sw, out};
+        g.edges = { {1, 2, "in"}, {2, 99, "metallic"} };
+        check(!Validate(g).ok, "Swizzle mask char out of input range is rejected");
+    }
+    {
+        // Swizzle "x" on a float2 -> scalar, valid into metallic.
+        Graph g;
+        Node uv; uv.id = 1; uv.kind = NodeKind::UV;                  // float2
+        Node sw; sw.id = 2; sw.kind = NodeKind::Swizzle; sw.swizzle = "x";
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {uv, sw, out};
+        g.edges = { {1, 2, "in"}, {2, 99, "metallic"} };
+        check(Validate(g).ok, "Swizzle \"x\" (float2->scalar) into metallic validates");
+        check(OutputType(g, g.nodes[1]) == Type::Float, "Swizzle \"x\" output type is float");
+    }
+    {
+        // Empty / overlong mask rejected.
+        Graph g;
+        Node uv; uv.id = 1; uv.kind = NodeKind::UV;
+        Node sw; sw.id = 2; sw.kind = NodeKind::Swizzle; sw.swizzle = "xyzwx";  // len 5 > 4
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {uv, sw, out};
+        g.edges = { {1, 2, "in"}, {2, 99, "baseColor"} };
+        check(!Validate(g).ok, "Swizzle mask length > 4 is rejected");
+    }
+    {
+        // MakeFloat3 arity: missing one input is rejected (needs all 3 of x/y/z connected).
+        Graph g;
+        Node cx; cx.id = 1; cx.kind = NodeKind::Constant; cx.value = {1,0,0,0}; cx.outType = Type::Float;
+        Node cy; cy.id = 2; cy.kind = NodeKind::Constant; cy.value = {2,0,0,0}; cy.outType = Type::Float;
+        Node mk; mk.id = 3; mk.kind = NodeKind::MakeFloat3;
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {cx, cy, mk, out};
+        g.edges = { {1, 3, "x"}, {2, 3, "y"}, {3, 99, "baseColor"} };   // missing z
+        check(!Validate(g).ok, "MakeFloat3 with a missing input (arity mismatch) is rejected");
+        // All three connected -> valid float3.
+        Node cz; cz.id = 4; cz.kind = NodeKind::Constant; cz.value = {3,0,0,0}; cz.outType = Type::Float;
+        g.nodes.push_back(cz);
+        g.edges.push_back({4, 3, "z"});
+        check(Validate(g).ok, "MakeFloat3 with all three scalar inputs validates");
+        check(OutputType(g, g.nodes[2]) == Type::Float3, "MakeFloat3 output type is float3");
+    }
+    {
+        // MakeFloat3 rejects a NON-scalar input (a float2 into x).
+        Graph g;
+        Node uv; uv.id = 1; uv.kind = NodeKind::UV;                  // float2
+        Node cy; cy.id = 2; cy.kind = NodeKind::Constant; cy.value = {2,0,0,0}; cy.outType = Type::Float;
+        Node cz; cz.id = 3; cz.kind = NodeKind::Constant; cz.value = {3,0,0,0}; cz.outType = Type::Float;
+        Node mk; mk.id = 4; mk.kind = NodeKind::MakeFloat3;
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {uv, cy, cz, mk, out};
+        g.edges = { {1, 4, "x"}, {2, 4, "y"}, {3, 4, "z"}, {4, 99, "baseColor"} };
+        check(!Validate(g).ok, "MakeFloat3 with a non-scalar (float2) input is rejected");
+    }
+    {
+        // Dot operand size match: float3 . float2 rejected.
+        Graph g;
+        Node c3; c3.id = 1; c3.kind = NodeKind::Constant; c3.value = {1,2,3,0}; c3.outType = Type::Float3;
+        Node uv; uv.id = 2; uv.kind = NodeKind::UV;                  // float2
+        Node dt; dt.id = 3; dt.kind = NodeKind::Dot;
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {c3, uv, dt, out};
+        g.edges = { {1, 3, "a"}, {2, 3, "b"}, {3, 99, "metallic"} };
+        check(!Validate(g).ok, "Dot with mismatched operand sizes is rejected");
+        check(OutputType(g, g.nodes[2]) == Type::Float, "Dot output type is float");
+    }
+
+    // --- Codegen structure on the new nodes (showcase3) ----------------------------------------
+    {
+        LoadResult lr = LoadGraphFromFile(std::string(HF_MAT3_JSON));
+        check(lr.ok, "showcase3.mat.json loads + validates");
+        if (lr.ok) {
+            std::string h1 = GenerateHlsl(lr.graph);
+            std::string h2 = GenerateHlsl(lr.graph);
+            check(h1 == h2, "showcase3 codegen is deterministic (byte-identical)");
+            check(h1.find("// ERROR") == std::string::npos, "showcase3 codegens cleanly");
+            // Structural asserts: the new nodes emit the obvious HLSL intrinsics.
+            check(h1.find(".x") != std::string::npos, "showcase3 emits a .x swizzle");
+            check(h1.find("saturate(") != std::string::npos, "showcase3 emits saturate()");
+            check(h1.find("pow(") != std::string::npos, "showcase3 emits pow()");
+            check(h1.find("float3(") != std::string::npos, "showcase3 emits a float3() constructor");
+            check(h1.find("1.0 - ") != std::string::npos, "showcase3 emits 1.0 - x (OneMinus)");
+            check(h1.find("hfShadePBR") != std::string::npos, "showcase3 calls hfShadePBR");
+        }
+    }
+
+    // --- Loader round-trip of the new node params ----------------------------------------------
+    {
+        const char* json = R"JSON({
+          "name": "nodes_az",
+          "nodes": [
+            { "id": 1, "type": "TextureSample", "texture": "checker" },
+            { "id": 2, "type": "Swizzle", "swizzle": "x" },
+            { "id": 3, "type": "Swizzle", "swizzle": "y" },
+            { "id": 4, "type": "OneMinus" },
+            { "id": 5, "type": "Constant", "value": [0.2, 0.3, 0.4, 1.0], "outType": "float3" },
+            { "id": 99, "type": "PBROutput" }
+          ],
+          "edges": [
+            { "from": 1, "to": 2, "port": "in" },
+            { "from": 1, "to": 3, "port": "in" },
+            { "from": 3, "to": 4, "port": "in" },
+            { "from": 2, "to": 99, "port": "metallic" },
+            { "from": 4, "to": 99, "port": "roughness" },
+            { "from": 5, "to": 99, "port": "baseColor" }
+          ]
+        })JSON";
+        LoadResult lr = LoadGraphFromJson(json);
+        check(lr.ok, "AZ-node JSON loads + validates");
+        if (lr.ok) {
+            const Node* sw = nullptr;
+            for (auto& n : lr.graph.nodes) if (n.kind == NodeKind::Swizzle && n.id == 2) sw = &n;
+            check(sw && sw->swizzle == "x", "loader reads the swizzle mask param");
+            std::string h = GenerateHlsl(lr.graph);
+            check(h.find("// ERROR") == std::string::npos, "AZ-node graph codegens cleanly");
+        }
+    }
+
     if (g_fail == 0) { std::printf("shader_graph_test OK\n"); return 0; }
     std::printf("shader_graph_test: %d failures\n", g_fail);
     return 1;

@@ -807,6 +807,219 @@ static int RunMaterialShowcase2(const char* outPath) {
     return RunMaterialShowcaseImpl(outPath, "mat_showcase2.frag.gen.metal", "material2_fragment");
 }
 
+// --- Multi-material scene (Slice AZ). Mirrors the Vulkan --material-multi-shot path: three spheres
+// in a row, each shaded by a DISTINCT generated graph material (showcase / showcase2 / showcase3 —
+// the last exercising the new Swizzle/MakeFloat3/Power/Saturate/OneMinus nodes), + ground + sky,
+// lit + shadowed. One draw per material (bind that material's pipeline, draw its sphere). The same
+// committed generated HLSL flows through the HLSL->SPIR-V->MSL gen as every other shader. Camera /
+// light match the Vulkan path EXACTLY (modulo the Metal NDC +Y flip). One offscreen frame -> PNG.
+static int RunMaterialMultiShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Three distinct material pipelines (shared lit.vert + each generated material fragment; PBR set).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    struct MatSrc { const char* file; const char* entry; };
+    const MatSrc matSrc[3] = {
+        {"mat_showcase.frag.gen.metal",  "material_fragment"},
+        {"mat_showcase2.frag.gen.metal", "material2_fragment"},
+        {"mat_showcase3.frag.gen.metal", "material3_fragment"},
+    };
+    std::vector<std::unique_ptr<rhi::IShaderModule>> matFs;
+    std::vector<std::unique_ptr<rhi::IPipeline>> matPipes;
+    for (int m = 0; m < 3; ++m) {
+        matFs.push_back(loadMSL(matSrc[m].file, matSrc[m].entry));
+        rhi::GraphicsPipelineDesc d;
+        d.vertex = litVs.get(); d.fragment = matFs.back().get();
+        d.vertexLayout = scene::MeshVertexLayout();
+        d.colorFormat = device->Swapchain().ColorFormat();
+        d.depthTest = true; d.usesFrameUniforms = true;
+        d.usesTexture = true; d.pbrMaterial = true;
+        d.pushConstantSize = sizeof(float) * 20;
+        matPipes.push_back(device->CreateGraphicsPipeline(d));
+    }
+
+    // Static lit pipeline (ground plane).
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Static depth-only shadow pipeline.
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky + post.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto checkerTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t blackPx[4] = {0, 0, 0, 255};
+    auto blackTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, blackPx, sizeof(blackPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    const float sphereR = 0.8f;
+    const float spacing = 2.0f;
+    Mat4 sphereModel[3];
+    for (int m = 0; m < 3; ++m) {
+        float x = (float)(m - 1) * spacing;
+        sphereModel[m] = Mat4::Translate({x, sphereR, 0.0f}) * Mat4::Scale({sphereR, sphereR, sphereR});
+    }
+    Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+    const Vec3 eye{0.0f, 1.9f, 4.4f};
+    const Vec3 center{0.0f, 0.7f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 12.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 25.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*shadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindIndexBuffer(sphere.indices());
+            for (int m = 0; m < 3; ++m) {
+                cmd.PushConstants(sphereModel[m].m, sizeof(float) * 16);
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindIndexBuffer(sphere.indices());
+            for (int m = 0; m < 3; ++m) {
+                cmd.BindPipeline(*matPipes[m]);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = sphereModel[m].m[k];
+                pc[16] = 0.0f; pc[17] = 0.35f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterialPBR(*checkerTex, *whiteTex, *flatNormal, *blackTex, *whiteTex);
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u)\n", outPath, cw, ch);
+    return 0;
+}
+
 // --- Full glTF scene-graph import showcase (Slice V). Mirrors the Vulkan --scene-shot path: ground
 // plane + procedural sky + the CesiumMilkTruck imported via LoadGltfScene (node hierarchy walked to
 // world transforms, one renderable per primitive of every mesh-referencing node, deduped PBR
@@ -6685,6 +6898,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--material2") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mat_graph2.png";
             try { return RunMaterialShowcase2(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --material-multi <out.png>: render the MULTI-material scene (Slice AZ) — three spheres in a
+        // row, each a distinct generated graph material (showcase / showcase2 / showcase3, the last
+        // exercising the new node types). The new mat_multi.png golden is rendered here.
+        if (argc > 1 && std::strcmp(argv[1], "--material-multi") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mat_multi.png";
+            try { return RunMaterialMultiShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --scene <out.png>: render the full glTF scene-graph import showcase (Slice V) — the

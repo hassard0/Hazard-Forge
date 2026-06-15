@@ -39,9 +39,27 @@ const char* NodeKindName(NodeKind k) {
         case NodeKind::Add:           return "Add";
         case NodeKind::Lerp:          return "Lerp";
         case NodeKind::Fresnel:       return "Fresnel";
+        case NodeKind::Swizzle:       return "Swizzle";
+        case NodeKind::MakeFloat3:    return "MakeFloat3";
+        case NodeKind::MakeFloat4:    return "MakeFloat4";
+        case NodeKind::Dot:           return "Dot";
+        case NodeKind::Normalize:     return "Normalize";
+        case NodeKind::Power:         return "Power";
+        case NodeKind::OneMinus:      return "OneMinus";
+        case NodeKind::Saturate:      return "Saturate";
         case NodeKind::PBROutput:     return "PBROutput";
     }
     return "Constant";
+}
+
+int SwizzleIndex(char c) {
+    switch (c) {
+        case 'x': case 'r': return 0;
+        case 'y': case 'g': return 1;
+        case 'z': case 'b': return 2;
+        case 'w': case 'a': return 3;
+        default: return -1;
+    }
 }
 
 std::optional<NodeKind> ParseNodeKind(const std::string& s) {
@@ -52,6 +70,14 @@ std::optional<NodeKind> ParseNodeKind(const std::string& s) {
     if (s == "Add")           return NodeKind::Add;
     if (s == "Lerp")          return NodeKind::Lerp;
     if (s == "Fresnel")       return NodeKind::Fresnel;
+    if (s == "Swizzle")       return NodeKind::Swizzle;
+    if (s == "MakeFloat3")    return NodeKind::MakeFloat3;
+    if (s == "MakeFloat4")    return NodeKind::MakeFloat4;
+    if (s == "Dot")           return NodeKind::Dot;
+    if (s == "Normalize")     return NodeKind::Normalize;
+    if (s == "Power")         return NodeKind::Power;
+    if (s == "OneMinus")      return NodeKind::OneMinus;
+    if (s == "Saturate")      return NodeKind::Saturate;
     if (s == "PBROutput")     return NodeKind::PBROutput;
     return std::nullopt;
 }
@@ -85,6 +111,14 @@ int InputPortCount(NodeKind k) {
         case NodeKind::Add:           return 2;  // a, b
         case NodeKind::Lerp:          return 3;  // a, b, t
         case NodeKind::Fresnel:       return 0;
+        case NodeKind::Swizzle:       return 1;  // in
+        case NodeKind::MakeFloat3:    return 3;  // x, y, z
+        case NodeKind::MakeFloat4:    return 4;  // x, y, z, w
+        case NodeKind::Dot:           return 2;  // a, b
+        case NodeKind::Normalize:     return 1;  // in
+        case NodeKind::Power:         return 2;  // a (base), b (exponent)
+        case NodeKind::OneMinus:      return 1;  // in
+        case NodeKind::Saturate:      return 1;  // in
         case NodeKind::PBROutput:     return kPbrInputCount;
     }
     return 0;
@@ -96,6 +130,14 @@ const char* InputPortName(NodeKind k, int idx) {
         case NodeKind::Multiply:
         case NodeKind::Add:           return idx == 0 ? "a" : (idx == 1 ? "b" : "");
         case NodeKind::Lerp:          return idx == 0 ? "a" : (idx == 1 ? "b" : (idx == 2 ? "t" : ""));
+        case NodeKind::Swizzle:
+        case NodeKind::Normalize:
+        case NodeKind::OneMinus:
+        case NodeKind::Saturate:      return idx == 0 ? "in" : "";
+        case NodeKind::MakeFloat3:    return idx == 0 ? "x" : (idx == 1 ? "y" : (idx == 2 ? "z" : ""));
+        case NodeKind::MakeFloat4:    return idx == 0 ? "x" : (idx == 1 ? "y" : (idx == 2 ? "z" : (idx == 3 ? "w" : "")));
+        case NodeKind::Dot:
+        case NodeKind::Power:         return idx == 0 ? "a" : (idx == 1 ? "b" : "");
         case NodeKind::PBROutput:     return PbrInputName(idx);
         default:                      return "";
     }
@@ -116,6 +158,16 @@ Type InputPortType(NodeKind k, int idx) {
         case NodeKind::Lerp:
             if (idx == 2) return Type::Float;                     // t is scalar
             return Type::Float4;                                  // a/b wildcard
+        // Slice AZ: 'in' (Swizzle/Normalize/OneMinus/Saturate) + Dot/Power a,b are vector wildcards
+        // (Float4 sentinel). MakeFloatN x/y/z/w are strictly scalar (Float).
+        case NodeKind::Swizzle:
+        case NodeKind::Normalize:
+        case NodeKind::OneMinus:
+        case NodeKind::Saturate:
+        case NodeKind::Dot:
+        case NodeKind::Power:         return Type::Float4;        // wildcard (any vector)
+        case NodeKind::MakeFloat3:
+        case NodeKind::MakeFloat4:    return Type::Float;         // each component input is scalar
         case NodeKind::PBROutput:     return PbrInputType(idx);
         default:                      return Type::Float;
     }
@@ -135,10 +187,26 @@ static Type OutputTypeImpl(const Graph& g, const Node& n, int depth) {
         case NodeKind::UV:            return Type::Float2;
         case NodeKind::TextureSample: return Type::Float4;
         case NodeKind::Fresnel:       return Type::Float;
+        case NodeKind::Dot:           return Type::Float;        // dot -> scalar.
+        case NodeKind::MakeFloat3:    return Type::Float3;
+        case NodeKind::MakeFloat4:    return Type::Float4;
+        case NodeKind::Swizzle: {
+            // Output type = mask length (1..4), clamped to a valid range.
+            int len = (int)n.swizzle.size();
+            if (len < 1) len = 1;
+            if (len > 4) len = 4;
+            switch (len) {
+                case 1: return Type::Float;
+                case 2: return Type::Float2;
+                case 3: return Type::Float3;
+                default: return Type::Float4;
+            }
+        }
         case NodeKind::PBROutput:     return Type::Float;  // sink; no output.
         case NodeKind::Multiply:
         case NodeKind::Add:
-        case NodeKind::Lerp: {
+        case NodeKind::Lerp:
+        case NodeKind::Power: {
             if (depth > (int)g.nodes.size()) return Type::Float4;  // cycle guard.
             // Resolve from input 'a' (the first data port).
             for (const Edge& e : g.edges) {
@@ -148,6 +216,19 @@ static Type OutputTypeImpl(const Graph& g, const Node& n, int depth) {
                 }
             }
             return Type::Float4;  // unresolved (validation will have flagged a missing input).
+        }
+        case NodeKind::Normalize:
+        case NodeKind::OneMinus:
+        case NodeKind::Saturate: {
+            if (depth > (int)g.nodes.size()) return Type::Float4;  // cycle guard.
+            // Resolve from the single 'in' port.
+            for (const Edge& e : g.edges) {
+                if (e.toNode == n.id && e.toPort == "in") {
+                    if (const Node* src = g.FindNode(e.fromNode))
+                        return OutputTypeImpl(g, *src, depth + 1);
+                }
+            }
+            return Type::Float4;  // unresolved.
         }
     }
     return Type::Float4;
@@ -227,7 +308,12 @@ ValidationResult Validate(const Graph& g) {
         Type dstT = InputPortType(to->kind, portIdx);
         bool wildcard = (dstT == Type::Float4 &&
                          (to->kind == NodeKind::Multiply || to->kind == NodeKind::Add ||
-                          to->kind == NodeKind::Lerp));
+                          to->kind == NodeKind::Lerp ||
+                          // Slice AZ: the vector-input ports (Swizzle/Normalize/OneMinus/Saturate 'in',
+                          // Dot/Power 'a'/'b') accept any vector type; per-node rules below refine this.
+                          to->kind == NodeKind::Swizzle || to->kind == NodeKind::Normalize ||
+                          to->kind == NodeKind::OneMinus || to->kind == NodeKind::Saturate ||
+                          to->kind == NodeKind::Dot || to->kind == NodeKind::Power));
         // PBROutput's float3 vector ports (baseColor/emissive) accept a float4 source by taking its
         // .xyz — a documented narrowing the codegen + interpreter both implement. Scalar ports
         // (metallic/roughness) still require a float source (so e.g. a float2 -> metallic is a real
@@ -240,9 +326,10 @@ ValidationResult Validate(const Graph& g) {
                         ", port expects " + TypeName(dstT));
     }
 
-    // Multiply/Add/Lerp: 'a' and 'b' must agree in type (component-wise).
+    // Multiply/Add/Lerp + (Slice AZ) Dot/Power: 'a' and 'b' must agree in type (component-wise).
     for (const Node& n : g.nodes) {
-        if (n.kind != NodeKind::Multiply && n.kind != NodeKind::Add && n.kind != NodeKind::Lerp)
+        if (n.kind != NodeKind::Multiply && n.kind != NodeKind::Add && n.kind != NodeKind::Lerp &&
+            n.kind != NodeKind::Dot && n.kind != NodeKind::Power)
             continue;
         const Node* a = nullptr; const Node* b = nullptr;
         for (const Edge& e : g.edges) {
@@ -254,6 +341,50 @@ ValidationResult Validate(const Graph& g) {
             return Fail(std::string(NodeKindName(n.kind)) + " node " + std::to_string(n.id) +
                         ": inputs a and b have mismatched types (" + TypeName(OutputType(g, *a)) +
                         " vs " + TypeName(OutputType(g, *b)) + ")");
+    }
+
+    // --- Slice AZ: new-node type rules ----------------------------------------------------------
+    for (const Node& n : g.nodes) {
+        // Swizzle: mask length 1..4; each char a valid xyzw/rgba alias INDEXING WITHIN the input's
+        // component count. Resolve the input ('in') type to bound-check the mask.
+        if (n.kind == NodeKind::Swizzle) {
+            const std::string& mask = n.swizzle;
+            if (mask.empty()) return Fail("Swizzle node " + std::to_string(n.id) + " has an empty mask");
+            if (mask.size() > 4)
+                return Fail("Swizzle node " + std::to_string(n.id) + " mask '" + mask +
+                            "' is longer than 4 components");
+            const Node* in = nullptr;
+            for (const Edge& e : g.edges)
+                if (e.toNode == n.id && e.toPort == "in") in = g.FindNode(e.fromNode);
+            int inComp = in ? ComponentCount(OutputType(g, *in)) : 0;
+            if (!in) return Fail("Swizzle node " + std::to_string(n.id) + " has no 'in' input");
+            for (char c : mask) {
+                int idx = SwizzleIndex(c);
+                if (idx < 0)
+                    return Fail(std::string("Swizzle node ") + std::to_string(n.id) +
+                                ": invalid mask char '" + c + "' (expected x/y/z/w or r/g/b/a)");
+                if (idx >= inComp)
+                    return Fail(std::string("Swizzle node ") + std::to_string(n.id) + ": mask char '" +
+                                c + "' indexes component " + std::to_string(idx) +
+                                " but the input is " + TypeName(OutputType(g, *in)));
+            }
+        }
+        // MakeFloat3 / MakeFloat4: ALL N component inputs must be connected (arity) + scalar (the
+        // scalar requirement is already enforced by InputPortType=Float in the edge type check above,
+        // so here we only check arity).
+        if (n.kind == NodeKind::MakeFloat3 || n.kind == NodeKind::MakeFloat4) {
+            int need = InputPortCount(n.kind);
+            for (int i = 0; i < need; ++i) {
+                const char* port = InputPortName(n.kind, i);
+                bool found = false;
+                for (const Edge& e : g.edges)
+                    if (e.toNode == n.id && e.toPort == port) { found = true; break; }
+                if (!found)
+                    return Fail(std::string(NodeKindName(n.kind)) + " node " + std::to_string(n.id) +
+                                " is missing input '" + port + "' (needs all " +
+                                std::to_string(need) + " scalar inputs)");
+            }
+        }
     }
 
     ValidationResult ok; ok.ok = true; return ok;
@@ -313,6 +444,60 @@ Value EvalLerp(const Value& a, const Value& b, float t) {
 float EvalFresnel(float NoV, float power) {
     float c = NoV; if (c < 0.0f) c = 0.0f; if (c > 1.0f) c = 1.0f;  // saturate
     return std::pow(1.0f - c, power);
+}
+
+// --- Slice AZ node primitives -------------------------------------------------------------------
+Value EvalSwizzle(const Value& in, const std::string& mask) {
+    Value r;
+    int len = (int)mask.size();
+    if (len < 1) len = 1;
+    if (len > 4) len = 4;
+    r.count = len;
+    for (int i = 0; i < 4; ++i) r.v[i] = 0.0f;
+    for (int i = 0; i < len; ++i) {
+        int idx = SwizzleIndex(mask[(size_t)i]);
+        if (idx < 0) idx = 0;
+        r.v[i] = in.v[(size_t)idx];
+    }
+    return r;
+}
+Value EvalMakeFloat(const std::array<float, 4>& comps, int count) {
+    Value r; r.count = count;
+    for (int i = 0; i < 4; ++i) r.v[i] = (i < count) ? comps[(size_t)i] : 0.0f;
+    return r;
+}
+Value EvalDot(const Value& a, const Value& b) {
+    int n = std::max(a.count, b.count);
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += a.v[i] * b.v[i];
+    Value r; r.count = 1; r.v = {s, 0, 0, 0};
+    return r;
+}
+Value EvalNormalize(const Value& x) {
+    Value r; r.count = x.count;
+    float len2 = 0.0f;
+    for (int i = 0; i < x.count; ++i) len2 += x.v[i] * x.v[i];
+    float inv = (len2 > 0.0f) ? 1.0f / std::sqrt(len2) : 0.0f;
+    for (int i = 0; i < 4; ++i) r.v[i] = (i < x.count) ? x.v[i] * inv : 0.0f;
+    return r;
+}
+Value EvalPower(const Value& base, const Value& exp) {
+    Value r; r.count = std::max(base.count, exp.count);
+    for (int i = 0; i < 4; ++i) r.v[i] = std::pow(base.v[i], exp.v[i]);
+    return r;
+}
+Value EvalOneMinus(const Value& x) {
+    Value r; r.count = x.count;
+    for (int i = 0; i < 4; ++i) r.v[i] = 1.0f - x.v[i];
+    return r;
+}
+Value EvalSaturate(const Value& x) {
+    Value r; r.count = x.count;
+    for (int i = 0; i < 4; ++i) {
+        float c = x.v[i]; if (c < 0.0f) c = 0.0f; if (c > 1.0f) c = 1.0f;
+        r.v[i] = c;
+    }
+    return r;
 }
 
 // --- Whole-graph CPU interpreter ----------------------------------------------------------------
@@ -388,6 +573,48 @@ PbrResult Evaluate(const Graph& g, float u, float v, float NoV,
             case NodeKind::Fresnel: {
                 Value val; val.count = 1; val.v = {EvalFresnel(NoV, n.power), 0, 0, 0};
                 out[id] = val;
+                break;
+            }
+            case NodeKind::Swizzle: {
+                Value in = inputValue(n, "in").value_or(Value{});
+                out[id] = EvalSwizzle(in, n.swizzle);
+                break;
+            }
+            case NodeKind::MakeFloat3:
+            case NodeKind::MakeFloat4: {
+                int cnt = (n.kind == NodeKind::MakeFloat3) ? 3 : 4;
+                std::array<float, 4> comps{0, 0, 0, 0};
+                const char* ports[4] = {"x", "y", "z", "w"};
+                for (int i = 0; i < cnt; ++i)
+                    comps[(size_t)i] = inputValue(n, ports[i]).value_or(Value{}).v[0];
+                out[id] = EvalMakeFloat(comps, cnt);
+                break;
+            }
+            case NodeKind::Dot: {
+                Value a = inputValue(n, "a").value_or(Value{});
+                Value b = inputValue(n, "b").value_or(Value{});
+                out[id] = EvalDot(a, b);
+                break;
+            }
+            case NodeKind::Normalize: {
+                Value in = inputValue(n, "in").value_or(Value{});
+                out[id] = EvalNormalize(in);
+                break;
+            }
+            case NodeKind::Power: {
+                Value a = inputValue(n, "a").value_or(Value{});
+                Value b = inputValue(n, "b").value_or(Value{});
+                out[id] = EvalPower(a, b);
+                break;
+            }
+            case NodeKind::OneMinus: {
+                Value in = inputValue(n, "in").value_or(Value{});
+                out[id] = EvalOneMinus(in);
+                break;
+            }
+            case NodeKind::Saturate: {
+                Value in = inputValue(n, "in").value_or(Value{});
+                out[id] = EvalSaturate(in);
                 break;
             }
             case NodeKind::PBROutput:
