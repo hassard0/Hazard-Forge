@@ -138,6 +138,12 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
 
 VulkanDevice::~VulkanDevice() {
     if (device_) vkDeviceWaitIdle(device_);
+    // Per-thread MT recording resources (Slice AU): destroying each pool frees its secondary buffer.
+    for (auto& w : mtWorkers_) {
+        w.recorder.reset();
+        if (w.pool) vkDestroyCommandPool(device_, w.pool, nullptr);
+    }
+    mtWorkers_.clear();
     rtRecorder_.reset();
     if (rtFence_) vkDestroyFence(device_, rtFence_, nullptr);
     if (rtPool_) vkDestroyCommandPool(device_, rtPool_, nullptr);  // frees rtCmd_
@@ -975,7 +981,7 @@ FrameContext VulkanDevice::BeginRenderTargetFrame(IRenderTarget& rtBase) {
                     VK_IMAGE_ASPECT_DEPTH_BIT);
 
     rtRecorder_->Begin(rtCmd_, rt.colorView(), rt.depthView(),
-                       {rt.width(), rt.height()});
+                       {rt.width(), rt.height()}, rt.colorVkFormat(), rt.depthVkFormat());
     return FrameContext{rtRecorder_.get()};
 }
 
@@ -1003,6 +1009,70 @@ void VulkanDevice::EndRenderTargetFrame(const FrameContext& frame) {
     Check(vkWaitForFences(device_, 1, &rtFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(rt)");
 
     rtInFlight_ = nullptr;
+}
+
+// --- Multithreaded recording (Slice AU) ---
+void VulkanDevice::SetSecondaryInheritance(VkFormat colorFormat, VkFormat depthFormat,
+                                           VkExtent2D extent, bool hasColor) {
+    mtInherit_.colorFormat = colorFormat;
+    mtInherit_.depthFormat = depthFormat;
+    mtInherit_.extent = extent;
+    mtInherit_.hasColor = hasColor;
+}
+
+void VulkanDevice::EnsureMtWorker(uint32_t threadIndex) {
+    // Lazily create per-thread MT resources up to threadIndex (pools are NOT thread-safe, so each
+    // worker owns its OWN pool + secondary command buffer + recorder, created up front on the MAIN
+    // thread before any worker runs). Reused every frame; grown if a later frame asks for more
+    // workers. RESET_COMMAND_BUFFER_BIT so each frame's vkResetCommandBuffer recycles the secondary.
+    while (mtWorkers_.size() <= threadIndex) {
+        MtWorker w;
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = graphicsQueueFamily_;
+        Check(vkCreateCommandPool(device_, &pci, nullptr, &w.pool), "vkCreateCommandPool(mt)");
+
+        VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbi.commandPool = w.pool;
+        cbi.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        cbi.commandBufferCount = 1;
+        Check(vkAllocateCommandBuffers(device_, &cbi, &w.cmd), "vkAllocateCommandBuffers(mt)");
+
+        w.recorder = std::make_unique<VulkanCommandBuffer>(*this);
+        mtWorkers_.push_back(std::move(w));
+    }
+}
+
+ICommandBuffer* VulkanDevice::CreateSecondaryCommandBuffer(uint32_t threadIndex) {
+    EnsureMtWorker(threadIndex);
+    MtWorker& w = mtWorkers_[threadIndex];
+
+    Check(vkResetCommandBuffer(w.cmd, 0), "vkResetCommandBuffer(mt)");
+
+    // Dynamic-rendering inheritance: the secondary records into a render pass whose attachment
+    // formats + sample count must match the primary's open vkCmdBeginRendering (Slice AU / AT gate).
+    VkCommandBufferInheritanceRenderingInfo inheritRender{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+    VkFormat colorFmt = mtInherit_.colorFormat;
+    inheritRender.colorAttachmentCount = mtInherit_.hasColor ? 1u : 0u;
+    inheritRender.pColorAttachmentFormats = mtInherit_.hasColor ? &colorFmt : nullptr;
+    inheritRender.depthAttachmentFormat = mtInherit_.depthFormat;
+    inheritRender.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+    inheritRender.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkCommandBufferInheritanceInfo inherit{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+    inherit.pNext = &inheritRender;
+    // Dynamic rendering: no renderPass/framebuffer/subpass — the inheritance-rendering pNext carries
+    // the formats instead.
+
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    // RENDER_PASS_CONTINUE: this secondary is replayed inside the primary's already-open pass.
+    bi.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    bi.pInheritanceInfo = &inherit;
+    Check(vkBeginCommandBuffer(w.cmd, &bi), "vkBeginCommandBuffer(mt secondary)");
+
+    w.recorder->BeginSecondary(w.cmd, mtInherit_.extent);
+    return w.recorder.get();
 }
 
 // --- Frame loop ---
@@ -1051,7 +1121,8 @@ FrameContext VulkanDevice::BeginFrame() {
                     VK_IMAGE_ASPECT_DEPTH_BIT);
 
     recorder_->Begin(fr.cmd, swapchain_->view(acquiredImage_),
-                     swapchain_->depthView(), swapchain_->extent());
+                     swapchain_->depthView(), swapchain_->extent(),
+                     swapchain_->vkFormat(), swapchain_->depthFormat());
     return FrameContext{recorder_.get()};
 }
 

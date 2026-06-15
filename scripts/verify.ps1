@@ -15,9 +15,9 @@
       2. Mac / Metal (headless, over SSH on the LAN)
          - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked goldens),
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
-           EACH of the 25 committed Metal goldens run visual_test with its showcase flag and compare
+           EACH of the 26 committed Metal goldens run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 25 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 26 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -57,7 +57,7 @@ $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
 $TarName    = 'hf-verify.tar.gz'
 
-# The 25 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# The 26 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
 # golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
 # path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
 # metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
@@ -87,6 +87,7 @@ $Goldens = @(
     @{ Name = 'taa';           Flag = '--taa' }                  # Slice AP (temporal anti-aliasing)
     @{ Name = 'cull';          Flag = '--cull' }                 # Slice AQ (frustum-culling visualization)
     @{ Name = 'gpu_cull';      Flag = '--gpu-cull' }             # Slice AR (GPU-driven culling + indirect draw)
+    @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
 )
 
 $winResult = 'SKIP'
@@ -196,7 +197,7 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 `$env:VK_VALIDATION_FEATURE_ENABLE = 'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION'
 # Representative showcases: --shot (GPU particles + shared-base/varied-normal materials, where the
 # UPDATE_AFTER_BIND bug lived) and --csm-shot (cascaded shadow atlas, a heavy multi-pass graph path).
-`$vkShots = @(@('--shot'), @('--csm-shot'))
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))
@@ -215,6 +216,26 @@ foreach (`$shot in `$vkShots) {
 }
 if (`$vkErrors -ne 0) { Write-Host ('Vulkan validation gate FAILED (' + `$vkErrors + ' error line(s))'); exit 18 }
 Write-Host 'Vulkan validation gate: CLEAN (zero VUID / SYNC-HAZARD / UNASSIGNED across showcases)'
+
+# --- Multithreaded-recording determinism oracle (Slice AU): the SAME draw-heavy scene recorded with
+# 1 worker vs N workers must be BYTE-IDENTICAL. Partition + in-order secondary execution guarantee
+# the draw order is independent of worker count; this asserts it on the LIVE Vulkan render. Render
+# with --workers 1 and --workers 4, then compare the captured BMPs byte-for-byte. (The unit test
+# parallel_record_test pins the partition; this pins the end-to-end render.) ---
+Write-Host '--- multithreaded-recording 1-vs-N determinism ---'
+`$mtExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$mt1 = Join-Path `$env:TEMP 'hf_mt_w1.bmp'
+`$mt4 = Join-Path `$env:TEMP 'hf_mt_w4.bmp'
+& `$mtExe --mt-shot `$mt1 --workers 1 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'mt-shot --workers 1 failed'; exit 19 }
+& `$mtExe --mt-shot `$mt4 --workers 4 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'mt-shot --workers 4 failed'; exit 19 }
+`$mt1Bytes = [System.IO.File]::ReadAllBytes(`$mt1)
+`$mt4Bytes = [System.IO.File]::ReadAllBytes(`$mt4)
+`$mtOk = (`$mt1Bytes.Length -eq `$mt4Bytes.Length)
+if (`$mtOk) { for (`$mi = 0; `$mi -lt `$mt1Bytes.Length; `$mi++) { if (`$mt1Bytes[`$mi] -ne `$mt4Bytes[`$mi]) { `$mtOk = `$false; break } } }
+if (-not `$mtOk) { Write-Host 'multithreaded-recording MISMATCH (--workers 1 != --workers 4)'; exit 20 }
+Write-Host 'multithreaded-recording: --workers 1 == --workers 4 (byte-identical render)'
 
 exit 0
 "@
@@ -297,7 +318,7 @@ function Invoke-MacVerify {
     & $scp[0] $scp[1..($scp.Count-1)] $tarPath "${MacUser}@${MacHost}:$MacStage/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
 
-    # 3) extract + build ONCE + loop ALL 25 goldens. To avoid the login shell being zsh and to dodge
+    # 3) extract + build ONCE + loop ALL 26 goldens. To avoid the login shell being zsh and to dodge
     #    PowerShell here-string backtick-escaping fragility, the per-golden loop is generated as a
     #    standalone bash script, scp'd to the Mac, and run with an explicit `bash`. For each
     #    (flag -> golden) pair it renders visual_test <flag> /tmp/hf_<name>.png and compares to
@@ -397,7 +418,7 @@ done <<< "$PAIRS"
         return
     }
     $script:macResult = 'PASS'
-    Write-Host "Mac verification PASSED (all 25 goldens DIFF 0.0000)" -ForegroundColor Green
+    Write-Host "Mac verification PASSED (all 26 goldens DIFF 0.0000)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -418,7 +439,7 @@ function Show($label, $r) {
     Write-Host ("  {0,-22} {1}" -f $label, $r) -ForegroundColor $color
 }
 Show 'Windows / Vulkan (ctest)' $winResult
-Show 'Mac / Metal (25 goldens)'  $macResult
+Show 'Mac / Metal (26 goldens)'  $macResult
 
 # Per-golden Metal table (only when the Mac portion ran).
 if ($script:macGoldenResults -and $script:macGoldenResults.Count -gt 0) {

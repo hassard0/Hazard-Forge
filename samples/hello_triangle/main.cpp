@@ -34,6 +34,7 @@
 #include "runtime/input_state.h"
 #include "runtime/play_state.h"
 #include "runtime/hot_reload.h"
+#include "runtime/parallel_record.h"
 #include "editor/picking.h"
 #include "editor/gizmo.h"
 #include "editor/introspect.h"
@@ -221,6 +222,8 @@ int main(int argc, char** argv) {
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
     const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
     const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
+    const char* mtShotPath = nullptr;        // --mt-shot <out.bmp> (Slice AU: multithreaded recording)
+    int mtWorkers = 4;                       // --mt-shot ... --workers N (default 4)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -395,6 +398,17 @@ int main(int argc, char** argv) {
             // `gpu-cull: {drawn:<gpu>, cpuRef:<cpu>, total:1024}` and ASSERTS gpu==cpuRef (the
             // exact-count proof against engine/render/gpu_cull.h). One BMP -> exit. New golden.
             gpuCullShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--mt-shot") == 0 && i + 1 < argc) {
+            // Slice AU: multithreaded command recording. A draw-heavy grid of NON-instanced DISTINCT
+            // draws (each a separate recorded command) is recorded across N worker threads — each
+            // worker records a SECONDARY command buffer over its CONTIGUOUS draw sub-range; the primary
+            // executes them in worker-index order. Determinism oracle: --workers 1 and --workers 4
+            // produce BYTE-IDENTICAL captures. Prints `mt: {workers:N, draws:D, secondaries:N}`. One
+            // BMP -> exit. New golden mt.png.
+            mtShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+            mtWorkers = std::atoi(argv[i + 1]);
+            if (mtWorkers < 1) mtWorkers = 1;
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -4198,6 +4212,266 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — GPU-culled %u/%u instances (indirect draw)\n",
                                     gpuCullShotPath, cw, ch2, gpuDrawn, kInstanceCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gpuCullShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Multithreaded command recording (--mt-shot <out.bmp> [--workers N], Slice AU): a
+        // draw-heavy grid of NON-INSTANCED DISTINCT draws (each object is a SEPARATE recorded
+        // DrawIndexed — real per-draw recording, not one instanced call). The scene pass's object
+        // draw list is partitioned into N CONTIGUOUS index ranges (worker k -> [k*span,(k+1)*span));
+        // each worker records its range into its OWN SECONDARY command buffer (Vulkan: one
+        // VkCommandPool per worker thread). The primary executes the secondaries in WORKER-INDEX
+        // ORDER, so the draw order == single-threaded order. Determinism oracle: --workers 1 and
+        // --workers 4 produce BYTE-IDENTICAL captures (the printed pixel hash matches). Prints
+        // `mt: {workers:N, draws:D, secondaries:N}`. One BMP -> exit. New golden mt.png. ----
+        if (mtShotPath) {
+            using math::Mat4; using math::Vec3;
+            const uint32_t N = (uint32_t)mtWorkers;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+            scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+            // --- The draw-heavy scene: a 12x12 grid of 144 DISTINCT objects (alternating cube/sphere)
+            // at varying heights, each recorded as its own draw. Deterministic placement (no RNG) so the
+            // render is reproducible. This is the list the N workers split into contiguous ranges. ---
+            struct MtObj { const scene::Mesh* mesh; scene::Transform xform; float tint; };
+            std::vector<MtObj> objs;
+            const int kGrid = 12;
+            for (int gz = 0; gz < kGrid; ++gz) {
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    int idx = gz * kGrid + gx;
+                    scene::Transform t;
+                    float fx = (float)(gx - kGrid / 2) * 1.5f + 0.75f;
+                    float fz = (float)(gz - kGrid / 2) * 1.5f + 0.75f;
+                    float bob = 0.35f * std::sin((float)idx * 0.7f);
+                    t.position = {fx, 0.7f + bob, fz};
+                    t.scale = {0.45f, 0.45f, 0.45f};
+                    objs.push_back({(idx & 1) ? &sphereMesh : &cubeMesh, t,
+                                    0.35f + 0.5f * (float)((idx * 37) % 100) / 100.0f});
+                }
+            }
+            const uint32_t kDraws = (uint32_t)objs.size();
+
+            // --- Pipelines: static lit + static shadow + sky + post. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            scene::Transform groundXform; groundXform.scale = {14.0f, 1.0f, 14.0f};
+            Mat4 groundModel = groundXform.Matrix();
+
+            // --- Camera: elevated three-quarter view so the whole grid + its shadows are visible. ---
+            const Vec3 eye{0.0f, 13.0f, 16.0f};
+            const Vec3 center{0.0f, 0.5f, 0.0f};
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            FrameData fd{};
+            {
+                runtime::Camera cam;
+                cam.position = eye;
+                Vec3 dir = math::normalize(center - eye);
+                cam.yaw = std::atan2(dir.x, -dir.z);
+                cam.SetPitch(std::asin(dir.y));
+                cam.fovY = 0.9599311f;  // 55 degrees
+                cam.aspect = aspect;
+                cam.znear = 0.5f; cam.zfar = 80.0f;
+                Mat4 vp = cam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDirVec * 26.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-15.0f, 15.0f, -15.0f, 15.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            // Helper: record one lit object draw into the given command buffer.
+            auto recordObject = [&](rhi::ICommandBuffer& c, const MtObj& ob) {
+                Mat4 m = ob.xform.Matrix();
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                pc[16] = 0.0f; pc[17] = ob.tint; pc[18] = 0.0f; pc[19] = 0.0f;
+                c.PushConstants(pc, sizeof(pc));
+                c.BindVertexBuffer(ob.mesh->vertices());
+                c.BindIndexBuffer(ob.mesh->indices());
+                c.DrawIndexed(ob.mesh->indexCount());
+            };
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // Shadow pass — single-threaded (only the main scene pass is parallel this slice).
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(planeMesh.vertices());
+                    cmd.BindIndexBuffer(planeMesh.indices());
+                    cmd.DrawIndexed(planeMesh.indexCount());
+                    for (const auto& ob : objs) {
+                        Mat4 m = ob.xform.Matrix();
+                        cmd.PushConstants(m.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(ob.mesh->vertices());
+                        cmd.BindIndexBuffer(ob.mesh->indices());
+                        cmd.DrawIndexed(ob.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Scene pass — MULTITHREADED. The primary opens the pass expecting secondaries; N worker
+            // threads each record a contiguous object sub-range into their own secondary; the primary
+            // executes them in worker-index order.
+            uint32_t recordedSecondaries = 0;
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1},
+                                        /*expectsSecondaries=*/true);
+
+                    // Create one secondary per worker thread (main thread; pools not thread-safe).
+                    std::vector<rhi::ICommandBuffer*> secs(N, nullptr);
+                    for (uint32_t k = 0; k < N; ++k)
+                        secs[k] = dev.CreateSecondaryCommandBuffer(k);
+
+                    // Pre-warm worker 0's secondary on the MAIN thread with the sky + ground (sky once;
+                    // ground draws the lit material). This also forces the per-pair material-set cache
+                    // insertion to happen single-threaded, so the parallel object recording below never
+                    // mutates the cache (workers share NO mutable state — only their disjoint
+                    // secondaries + index ranges).
+                    secs[0]->BindPipeline(*skyPipe);
+                    secs[0]->Draw(3);
+                    secs[0]->BindPipeline(*litPipeline);
+                    secs[0]->BindMaterial(*groundTex, *flatNormal);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        secs[0]->PushConstants(pc, sizeof(pc));
+                        secs[0]->BindVertexBuffer(planeMesh.vertices());
+                        secs[0]->BindIndexBuffer(planeMesh.indices());
+                        secs[0]->DrawIndexed(planeMesh.indexCount());
+                    }
+
+                    // Parallel: worker k records objs[begin,end) into secs[k]. Each worker re-binds the
+                    // lit pipeline + the (already-cached) shared material into its own secondary, then
+                    // records its distinct object draws. The material set is the SAME immutable set for
+                    // all (warmed above), so no worker touches shared mutable state.
+                    runtime::RecordParallel(kDraws, N,
+                        [&](uint32_t t, uint32_t b, uint32_t e) {
+                            rhi::ICommandBuffer& c = *secs[t];
+                            c.BindPipeline(*litPipeline);
+                            c.BindMaterial(*groundTex, *flatNormal);
+                            for (uint32_t i = b; i < e; ++i) recordObject(c, objs[i]);
+                        });
+
+                    cmd.ExecuteSecondaries(std::span<rhi::ICommandBuffer* const>(secs.data(),
+                                                                                 secs.size()));
+                    recordedSecondaries = N;
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("mt: {workers:%u, draws:%u, secondaries:%u}\n", N, kDraws,
+                        recordedSecondaries);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                // FNV-1a 64-bit hash of the captured pixels — the determinism oracle's fingerprint.
+                // --workers 1 and --workers 4 MUST print the same value (byte-identical render).
+                uint64_t hash = 1469598103934665603ull;
+                for (uint8_t byte : px) { hash ^= byte; hash *= 1099511628211ull; }
+                std::printf("mt-hash: %016llx (%ux%u)\n", (unsigned long long)hash, cw, ch2);
+                ok = WriteBMP(mtShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %u draws across %u workers\n",
+                                    mtShotPath, cw, ch2, kDraws, N);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mtShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

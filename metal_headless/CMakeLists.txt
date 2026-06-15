@@ -172,6 +172,9 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_shader.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader_load.mm
     ${HF_ROOT}/engine/rhi_metal/metal_buffer.mm
+    # Deterministic parallel command-recording partition + worker pool (Slice AU). Pure C++
+    # (std::thread); drives the --mt showcase's multithreaded scene-pass recording.
+    ${HF_ROOT}/engine/runtime/parallel_record.cpp
     # Declarative render graph (backend-agnostic; depends only on rhi/ + scene/ + std).
     ${HF_ROOT}/engine/render/render_graph.cpp
     # Scene layer (plain C++): builds Mesh::Cube / Mesh::Plane through the RHI.

@@ -20,30 +20,53 @@ void MetalCommandBuffer::Begin(id<MTLCommandBuffer> cmd, id<MTLTexture> colorTex
     width_ = width;
     height_ = height;
     encoder_ = nil;
+    parallelEncoder_ = nil;
     computeEncoder_ = nil;
     indexBuffer_ = nil;
     boundFrameUniforms_ = false;
     boundPointList_ = false;
 }
 
-void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear) {
+// Build the render-pass descriptor shared by the single-encoder and parallel-encoder paths.
+static MTLRenderPassDescriptor* MakeRenderPassDescriptor(id<MTLTexture> colorTex,
+                                                         id<MTLTexture> depthTex,
+                                                         const ClearColor& clear) {
     MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
-
-    // Depth-only (shadow) pass: colorTex_ is nil -> no color attachment, and the depth must be
+    // Depth-only (shadow) pass: colorTex is nil -> no color attachment, and the depth must be
     // STORED so the lit pass can sample it. The scene/post passes have a color attachment and only
     // need depth transiently (store = DontCare).
-    const bool depthOnly = (colorTex_ == nil);
+    const bool depthOnly = (colorTex == nil);
     if (!depthOnly) {
-        rpd.colorAttachments[0].texture = colorTex_;
+        rpd.colorAttachments[0].texture = colorTex;
         rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
         rpd.colorAttachments[0].clearColor = MTLClearColorMake(clear.r, clear.g, clear.b, clear.a);
     }
-
-    rpd.depthAttachment.texture = depthTex_;
+    rpd.depthAttachment.texture = depthTex;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
     rpd.depthAttachment.storeAction = depthOnly ? MTLStoreActionStore : MTLStoreActionDontCare;
     rpd.depthAttachment.clearDepth = 1.0;
+    return rpd;
+}
+
+void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear) {
+    BeginRenderPass(clear, /*expectsSecondaries=*/false);
+}
+
+void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear, bool expectsSecondaries) {
+    MTLRenderPassDescriptor* rpd = MakeRenderPassDescriptor(colorTex_, depthTex_, clear);
+
+    if (expectsSecondaries) {
+        // Slice AU: open a PARALLEL render command encoder. It vends N sub-encoders (one per worker)
+        // that record concurrently and are committed in CREATION ORDER on endEncoding — so the draw
+        // order is the worker-index order (deterministic, == single-threaded). The primary records
+        // no draws directly; CreateSecondaryCommandBuffer pulls sub-encoders via nextParallelSubEncoder.
+        parallelEncoder_ = [cmd_ parallelRenderCommandEncoderWithDescriptor:rpd];
+        if (!parallelEncoder_) Fail("parallelRenderCommandEncoderWithDescriptor failed");
+        encoder_ = nil;
+        device_.SetActiveParallelRecorder(this);  // so CreateSecondaryCommandBuffer vends from here
+        return;
+    }
 
     encoder_ = [cmd_ renderCommandEncoderWithDescriptor:rpd];
     if (!encoder_) Fail("renderCommandEncoderWithDescriptor failed");
@@ -54,6 +77,39 @@ void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear) {
 
     MTLViewport vp{0.0, 0.0, (double)width_, (double)height_, 0.0, 1.0};
     [encoder_ setViewport:vp];
+}
+
+id<MTLRenderCommandEncoder> MetalCommandBuffer::nextParallelSubEncoder() {
+    if (!parallelEncoder_) Fail("nextParallelSubEncoder without an open parallel encoder");
+    return [parallelEncoder_ renderCommandEncoder];
+}
+
+void MetalCommandBuffer::BeginSecondary(id<MTLRenderCommandEncoder> enc, uint32_t width,
+                                        uint32_t height) {
+    // Retarget this recorder onto a parallel sub-encoder (Slice AU). Configure the same fixed state
+    // BeginRenderPass sets on the single encoder (CCW front face, back-face cull, full viewport) so a
+    // worker's draws land identically to single-threaded recording.
+    encoder_ = enc;
+    width_ = width;
+    height_ = height;
+    indexBuffer_ = nil;
+    boundFrameUniforms_ = false;
+    boundPointList_ = false;
+    [encoder_ setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder_ setCullMode:MTLCullModeBack];
+    MTLViewport vp{0.0, 0.0, (double)width_, (double)height_, 0.0, 1.0};
+    [encoder_ setViewport:vp];
+}
+
+void MetalCommandBuffer::ExecuteSecondaries(std::span<ICommandBuffer* const> secondaries) {
+    // Slice AU: end each worker's sub-encoder, ON THE PRIMARY THREAD after the join barrier (so no two
+    // threads touch the parallel encoder concurrently). The parallel encoder then commits the
+    // sub-encoders in CREATION ORDER (== worker index) when EndRenderPass calls endEncoding — giving
+    // the deterministic, single-threaded-equivalent draw order.
+    for (ICommandBuffer* s : secondaries) {
+        auto* ms = static_cast<MetalCommandBuffer*>(s);
+        if (ms->encoder_) { [ms->encoder_ endEncoding]; ms->encoder_ = nil; }
+    }
 }
 
 void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
@@ -291,6 +347,14 @@ void MetalCommandBuffer::SetViewport(int32_t x, int32_t y, uint32_t width, uint3
 }
 
 void MetalCommandBuffer::EndRenderPass() {
+    if (parallelEncoder_) {
+        // Slice AU: closing the parallel encoder commits its sub-encoders in creation order (== worker
+        // index), giving the deterministic, single-threaded-equivalent draw order.
+        [parallelEncoder_ endEncoding];
+        parallelEncoder_ = nil;
+        encoder_ = nil;
+        return;
+    }
     [encoder_ endEncoding];
     encoder_ = nil;
 }

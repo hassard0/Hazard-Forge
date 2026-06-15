@@ -13,18 +13,43 @@ namespace hf::rhi::vk {
 VulkanCommandBuffer::VulkanCommandBuffer(VulkanDevice& device) : device_(device) {}
 
 void VulkanCommandBuffer::Begin(VkCommandBuffer cmd, VkImageView colorView,
-                                VkImageView depthView, VkExtent2D extent) {
+                                VkImageView depthView, VkExtent2D extent,
+                                VkFormat colorFormat, VkFormat depthFormat) {
     cmd_ = cmd;
     colorView_ = colorView;
     depthView_ = depthView;
     extent_ = extent;
+    colorFormat_ = colorFormat;
+    depthFormat_ = depthFormat;
     boundLayout_ = VK_NULL_HANDLE;
     boundMaterialSet_ = 0;
     boundEnvironmentSet_ = 0;
     boundClusterSet_ = 0;
 }
 
+void VulkanCommandBuffer::BeginSecondary(VkCommandBuffer cmd, VkExtent2D extent) {
+    // Retarget onto an already-begun SECONDARY command buffer (Slice AU). No vkCmdBeginRendering —
+    // the primary opened the dynamic-rendering pass with the secondary-contents flag; this secondary
+    // inherits it. Reset the bound-state cache and set the dynamic viewport+scissor (dynamic state is
+    // NOT inherited across secondaries, so each one establishes its own — identical to what the
+    // primary's BeginRenderPass sets, so draws land identically).
+    cmd_ = cmd;
+    extent_ = extent;
+    boundLayout_ = VK_NULL_HANDLE;
+    boundMaterialSet_ = 0;
+    boundEnvironmentSet_ = 0;
+    boundClusterSet_ = 0;
+    VkViewport vp{0, 0, (float)extent_.width, (float)extent_.height, 0.0f, 1.0f};
+    vkCmdSetViewport(cmd_, 0, 1, &vp);
+    VkRect2D scissor{{0, 0}, extent_};
+    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+}
+
 void VulkanCommandBuffer::BeginRenderPass(const ClearColor& clear) {
+    BeginRenderPass(clear, /*expectsSecondaries=*/false);
+}
+
+void VulkanCommandBuffer::BeginRenderPass(const ClearColor& clear, bool expectsSecondaries) {
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     color.imageView = colorView_;
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -49,12 +74,43 @@ void VulkanCommandBuffer::BeginRenderPass(const ClearColor& clear) {
     ri.colorAttachmentCount = (colorView_ == VK_NULL_HANDLE) ? 0 : 1;
     ri.pColorAttachments = (colorView_ == VK_NULL_HANDLE) ? nullptr : &color;
     ri.pDepthAttachment = &depth;
+    // Slice AU: when the pass's draws arrive via SECONDARY command buffers, the contents flag must
+    // say so, or the validation layer flags mismatched render-pass contents when vkCmdExecuteCommands
+    // replays them. The primary then records NO inline draws and sets no dynamic state — each
+    // secondary sets its own viewport/scissor (dynamic state isn't inherited).
+    if (expectsSecondaries)
+        ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
     vkCmdBeginRendering(cmd_, &ri);
+
+    if (expectsSecondaries) {
+        // Publish this pass's attachment formats + extent so CreateSecondaryCommandBuffer can build
+        // matching VkCommandBufferInheritanceRenderingInfo for each worker's secondary.
+        device_.SetSecondaryInheritance(colorFormat_, depthFormat_, extent_,
+                                        colorView_ != VK_NULL_HANDLE);
+        return;  // no inline viewport/scissor — secondaries establish their own
+    }
 
     VkViewport vp{0, 0, (float)extent_.width, (float)extent_.height, 0.0f, 1.0f};
     vkCmdSetViewport(cmd_, 0, 1, &vp);
     VkRect2D scissor{{0, 0}, extent_};
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
+}
+
+void VulkanCommandBuffer::ExecuteSecondaries(std::span<ICommandBuffer* const> secondaries) {
+    // PRIMARY-only: replay the worker-recorded secondaries IN ORDER (worker-index order == the
+    // single-threaded draw order). The device ended each secondary's recording when the worker's
+    // closure returned; here we collect their VkCommandBuffer handles and execute them.
+    if (secondaries.empty()) return;
+    std::vector<VkCommandBuffer> handles;
+    handles.reserve(secondaries.size());
+    for (ICommandBuffer* s : secondaries) {
+        auto* vs = static_cast<VulkanCommandBuffer*>(s);
+        // End each worker's recording here, ON THE PRIMARY THREAD after the join barrier — so no two
+        // threads ever touch the same pool/command buffer concurrently (pool thread-safety holds).
+        Check(vkEndCommandBuffer(vs->cmd_), "vkEndCommandBuffer(mt secondary)");
+        handles.push_back(vs->cmd_);
+    }
+    vkCmdExecuteCommands(cmd_, (uint32_t)handles.size(), handles.data());
 }
 
 void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {

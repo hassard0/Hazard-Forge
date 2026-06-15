@@ -188,6 +188,20 @@ class ICommandBuffer {
 public:
     virtual ~ICommandBuffer() = default;
     virtual void BeginRenderPass(const ClearColor& clear) = 0;
+    // Open the render pass declaring that its draws will arrive via SECONDARY command buffers
+    // recorded on worker threads (Slice AU — multithreaded recording), NOT inline on this primary.
+    // The backend sets the matching "contents = secondary" flag so the validation layer doesn't flag
+    // mismatched contents (Vulkan: VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT on
+    // vkCmdBeginRendering; Metal: the parallel encoder is opened instead of a normal one). When
+    // `expectsSecondaries` is false this is byte-for-byte identical to BeginRenderPass(clear), so the
+    // single-threaded path is unchanged. After this, the worker threads record into secondaries from
+    // CreateSecondaryCommandBuffer, and the primary replays them via ExecuteSecondaries before
+    // EndRenderPass. Default forwards to the inline BeginRenderPass so backends without the parallel
+    // path still link; both shipping backends override it.
+    virtual void BeginRenderPass(const ClearColor& clear, bool expectsSecondaries) {
+        (void)expectsSecondaries;
+        BeginRenderPass(clear);
+    }
     virtual void BindPipeline(IPipeline& pipeline) = 0;
     virtual void BindVertexBuffer(IBuffer& buffer) = 0;
     // Bind a per-instance vertex stream to binding 1 (paired with a pipeline whose instanceLayout is
@@ -276,6 +290,20 @@ public:
     // tile and the casters are drawn with that cascade's lightViewProj. Default no-op so existing
     // passes/backends are byte-for-byte unaffected; both shipping backends override it.
     virtual void SetViewport(int32_t /*x*/, int32_t /*y*/, uint32_t /*width*/, uint32_t /*height*/) {}
+
+    // --- Multithreaded command recording (Slice AU) --------------------------
+    // PRIMARY-only: replay the given SECONDARY command buffers (each recorded on a worker thread by
+    // ExecuteSecondaries' siblings) into this primary IN THE GIVEN ORDER, inside the render pass
+    // opened with BeginRenderPass(clear, /*expectsSecondaries=*/true). The order is the worker-index
+    // order, so the final command stream's draw order matches single-threaded recording — that is
+    // what makes 1-worker and N-worker renders byte-identical. Vulkan: vkCmdExecuteCommands with the
+    // array in order; Metal: closing the parallel encoder commits its sub-encoders in creation order
+    // (creation order == worker index), so this is the no-op marker that the parallel encoder ends.
+    // The `secondaries` pointers come from CreateSecondaryCommandBuffer. Default no-op so backends
+    // without the parallel path still link; both shipping backends override it. All vk*/MTL* calls
+    // live inside the backend dirs.
+    virtual void ExecuteSecondaries(std::span<ICommandBuffer* const> /*secondaries*/) {}
+
     virtual void EndRenderPass() = 0;
 
     // --- Compute recording (must be OUTSIDE a render pass) -------------------
@@ -364,6 +392,20 @@ public:
     // End recording, submit, and transition the RT color to SHADER_READ_ONLY so a later pass
     // can sample it. Blocks until the RT pass completes (so the swapchain pass sees the result).
     virtual void EndRenderTargetFrame(const FrameContext&) = 0;
+
+    // Multithreaded recording (Slice AU): vend a SECONDARY command buffer for worker thread
+    // `threadIndex` to record draws into, inheriting the CURRENTLY-OPEN render pass's attachment
+    // formats/sample-count. The returned recorder is begun (ready for Bind*/Draw*), owned by the
+    // device, and valid until the primary's ExecuteSecondaries replays it this frame. Vulkan: a
+    // secondary VkCommandBuffer from a PER-THREAD VkCommandPool (pools are not thread-safe — one pool
+    // per worker thread, created up front), begun with VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_
+    // BIT + VkCommandBufferInheritanceRenderingInfo (dynamic-rendering inheritance: color/depth
+    // formats + sample count). Metal: a sub-encoder from the open MTLParallelRenderCommandEncoder
+    // (creation order == threadIndex == commit order). Each distinct threadIndex returns a DISJOINT
+    // recorder so workers never touch shared mutable state. Default returns nullptr so backends
+    // without the parallel path still link; both shipping backends override it. No vk*/MTL* leaks
+    // above the seam. Call only between BeginRenderPass(clear,true) and ExecuteSecondaries.
+    virtual ICommandBuffer* CreateSecondaryCommandBuffer(uint32_t /*threadIndex*/) { return nullptr; }
 
     // Acquire next swapchain image + begin command recording.
     // Returns FrameContext{nullptr} when the frame must be skipped this tick.

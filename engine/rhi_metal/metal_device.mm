@@ -213,6 +213,22 @@ void MetalDevice::CaptureFromTexture(id<MTLTexture> colorTex) {
            mipmapLevel:0];
 }
 
+ICommandBuffer* MetalDevice::CreateSecondaryCommandBuffer(uint32_t threadIndex) {
+    // Slice AU: vend worker `threadIndex` a recorder driving the next sub-encoder from the active
+    // primary's parallel render command encoder. Sub-encoders are created HERE on the main thread in
+    // worker-index order (== commit order); the workers then record into them concurrently. Each
+    // worker gets its OWN persistent MetalCommandBuffer, so no shared mutable state across threads.
+    if (!activeParallelRecorder_) Fail("CreateSecondaryCommandBuffer without an open parallel pass");
+    while (mtWorkers_.size() <= threadIndex)
+        mtWorkers_.push_back(std::make_unique<MetalCommandBuffer>(*this));
+    id<MTLRenderCommandEncoder> sub = activeParallelRecorder_->nextParallelSubEncoder();
+    MetalCommandBuffer* rec = mtWorkers_[threadIndex].get();
+    // The parallel pass renders at the active primary's attachment size; reuse its width/height by
+    // querying the sub-encoder's owning pass extent via the primary recorder's dimensions.
+    rec->BeginSecondary(sub, activeParallelRecorder_->width(), activeParallelRecorder_->height());
+    return rec;
+}
+
 FrameContext MetalDevice::BeginFrame() {
     // CPU/GPU pacing: don't get more than kFramesInFlight frames ahead.
     dispatch_semaphore_wait(inFlight_, DISPATCH_TIME_FOREVER);

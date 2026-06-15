@@ -52,6 +52,7 @@
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
+#include "runtime/parallel_record.h"  // Slice AU: deterministic parallel command-recording partition
 #include "editor/gizmo.h"    // Slice AB: transform gizmo emit (drawn through the debug-line layer)
 
 #include <cmath>
@@ -4097,6 +4098,226 @@ static int RunCullShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Multithreaded command recording showcase (Slice AU). Mirrors the Vulkan --mt-shot path: a
+// draw-heavy 12x12 grid of NON-INSTANCED DISTINCT draws whose scene-pass draw list is partitioned
+// into `workers` contiguous index ranges; each worker records its range into a sub-encoder vended by
+// an MTLParallelRenderCommandEncoder (creation order == worker index == commit order). The draw
+// order therefore equals single-threaded recording, so 1-worker and N-worker renders are identical.
+// New golden tests/golden/metal/mt.png.
+static int RunMtShowcase(const char* outPath, uint32_t workers) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    const uint32_t N = workers < 1 ? 1 : workers;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+    scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+    scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+    struct MtObj { const scene::Mesh* mesh; scene::Transform xform; float tint; };
+    std::vector<MtObj> objs;
+    const int kGrid = 12;
+    for (int gz = 0; gz < kGrid; ++gz) {
+        for (int gx = 0; gx < kGrid; ++gx) {
+            int idx = gz * kGrid + gx;
+            scene::Transform t;
+            float fx = (float)(gx - kGrid / 2) * 1.5f + 0.75f;
+            float fz = (float)(gz - kGrid / 2) * 1.5f + 0.75f;
+            float bob = 0.35f * std::sin((float)idx * 0.7f);
+            t.position = {fx, 0.7f + bob, fz};
+            t.scale = {0.45f, 0.45f, 0.45f};
+            objs.push_back({(idx & 1) ? &sphereMesh : &cubeMesh, t,
+                            0.35f + 0.5f * (float)((idx * 37) % 100) / 100.0f});
+        }
+    }
+    const uint32_t kDraws = (uint32_t)objs.size();
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    scene::Transform groundXform; groundXform.scale = {14.0f, 1.0f, 14.0f};
+    Mat4 groundModel = groundXform.Matrix();
+
+    const Vec3 eye{0.0f, 13.0f, 16.0f};
+    const Vec3 center{0.0f, 0.5f, 0.0f};
+    const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+    FrameData fd{};
+    {
+        runtime::Camera cam;
+        cam.position = eye;
+        Vec3 dir = math::normalize(center - eye);
+        cam.yaw = std::atan2(dir.x, -dir.z);
+        cam.SetPitch(std::asin(dir.y));
+        cam.fovY = 0.9599311f;  // 55 degrees
+        cam.aspect = (float)W / (float)H;
+        cam.znear = 0.5f; cam.zfar = 80.0f;
+        Mat4 vp = FlipProjY(cam.Proj()) * cam.View();
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDirVec * 26.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-15.0f, 15.0f, -15.0f, 15.0f, 1.0f, 60.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        runtime::CameraBasis cb = cam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = cam.aspect;
+    }
+
+    auto recordObject = [&](rhi::ICommandBuffer& c, const MtObj& ob) {
+        Mat4 m = ob.xform.Matrix();
+        float pc[20];
+        for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+        pc[16] = 0.0f; pc[17] = ob.tint; pc[18] = 0.0f; pc[19] = 0.0f;
+        c.PushConstants(pc, sizeof(pc));
+        c.BindVertexBuffer(ob.mesh->vertices());
+        c.BindIndexBuffer(ob.mesh->indices());
+        c.DrawIndexed(ob.mesh->indexCount());
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(planeMesh.vertices());
+            cmd.BindIndexBuffer(planeMesh.indices());
+            cmd.DrawIndexed(planeMesh.indexCount());
+            for (const auto& ob : objs) {
+                Mat4 m = ob.xform.Matrix();
+                cmd.PushConstants(m.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(ob.mesh->vertices());
+                cmd.BindIndexBuffer(ob.mesh->indices());
+                cmd.DrawIndexed(ob.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    // Scene pass — MULTITHREADED via the parallel render command encoder.
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1},
+                                /*expectsSecondaries=*/true);
+
+            std::vector<rhi::ICommandBuffer*> secs(N, nullptr);
+            for (uint32_t k = 0; k < N; ++k)
+                secs[k] = dev.CreateSecondaryCommandBuffer(k);
+
+            // Worker 0's sub-encoder gets the sky + ground first (single-threaded), matching the
+            // single-threaded draw order; then the parallel object recording fills each sub-encoder.
+            secs[0]->BindPipeline(*skyPipe);
+            secs[0]->Draw(3);
+            secs[0]->BindPipeline(*litPipeline);
+            secs[0]->BindMaterial(*groundTex, *flatNormal);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                secs[0]->PushConstants(pc, sizeof(pc));
+                secs[0]->BindVertexBuffer(planeMesh.vertices());
+                secs[0]->BindIndexBuffer(planeMesh.indices());
+                secs[0]->DrawIndexed(planeMesh.indexCount());
+            }
+
+            runtime::RecordParallel(kDraws, N,
+                [&](uint32_t t, uint32_t b, uint32_t e) {
+                    rhi::ICommandBuffer& c = *secs[t];
+                    c.BindPipeline(*litPipeline);
+                    c.BindMaterial(*groundTex, *flatNormal);
+                    for (uint32_t i = b; i < e; ++i) recordObject(c, objs[i]);
+                });
+
+            cmd.ExecuteSecondaries(std::span<rhi::ICommandBuffer* const>(secs.data(), secs.size()));
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("mt: {workers:%u, draws:%u, secondaries:%u}\n", N, kDraws, N);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — %u draws across %u workers\n", outPath, cw, ch, kDraws, N);
+    return 0;
+}
+
 // --- GPU-driven culling + indirect draw showcase (Slice AR). Mirrors the Vulkan --gpu-cull-shot
 // path: a compute kernel (cull.comp.gen.metal) frustum-culls a deterministic 1024-instance cube grid
 // and ORDER-compacts the survivors into a second instance buffer (single-workgroup prefix sum) +
@@ -5971,6 +6192,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gpu-cull") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gpu_cull.png";
             try { return RunGpuCullShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mt <out.png> [workers]: render the multithreaded-recording showcase (Slice AU) — a
+        // draw-heavy 12x12 grid recorded across N worker threads via the parallel render command
+        // encoder. Default 4 workers; an optional numeric 3rd arg overrides N (for the 1-vs-N
+        // determinism check). Mirrors the Vulkan --mt-shot path; new golden tests/golden/metal/mt.png.
+        if (argc > 1 && std::strcmp(argv[1], "--mt") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mt.png";
+            uint32_t workers = 4;
+            if (argc > 3) { int n = std::atoi(argv[3]); if (n >= 1) workers = (uint32_t)n; }
+            try { return RunMtShowcase(out, workers); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gizmo <objIndex> <out.png>: render the editor gizmo showcase (Slice AB) — a small

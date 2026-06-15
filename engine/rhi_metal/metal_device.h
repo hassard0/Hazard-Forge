@@ -62,6 +62,8 @@ public:
     FrameContext BeginRenderTargetFrame(IRenderTarget& rt) override;
     void EndRenderTargetFrame(const FrameContext&) override;
 
+    ICommandBuffer* CreateSecondaryCommandBuffer(uint32_t threadIndex) override;
+
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
     void SetFrameUniforms(const void* data, uint32_t size) override;
@@ -81,6 +83,11 @@ public:
     // The shadow map most recently passed to SetShadowMap (null until set). The command buffer
     // binds its depth texture + sampler to the lit pass's fragment shadow slots in BindPipeline.
     MetalRenderTarget* currentShadowMap() const { return shadowMap_; }
+
+    // Slice AU: the primary recorder whose parallel render command encoder is currently open. Set by
+    // that recorder's BeginRenderPass(clear, expectsSecondaries=true); CreateSecondaryCommandBuffer
+    // pulls sub-encoders from it. Backend-internal (not on the RHI seam).
+    void SetActiveParallelRecorder(MetalCommandBuffer* rec) { activeParallelRecorder_ = rec; }
 
 private:
     void Init();              // shared device/queue/UBO/recorder setup
@@ -103,6 +110,12 @@ private:
 
     // Shadow map currently bound for sampling by the lit pass (set via SetShadowMap). Not owned.
     MetalRenderTarget* shadowMap_ = nil;
+
+    // Slice AU — multithreaded recording. One persistent recorder per worker thread (vended a
+    // parallel sub-encoder each frame); grown on demand. activeParallelRecorder_ is the primary whose
+    // parallel encoder the sub-encoders come from.
+    std::vector<std::unique_ptr<MetalCommandBuffer>> mtWorkers_;
+    MetalCommandBuffer* activeParallelRecorder_ = nil;
 
     // Per-frame uniform buffers (shared storage), one per frame-in-flight.
     // 1024B matches the Vulkan backend's kFrameUboSize: >= sizeof(FrameData) and the CSM FrameData

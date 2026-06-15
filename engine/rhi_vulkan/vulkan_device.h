@@ -39,6 +39,8 @@ public:
     void EndShadowPass(const FrameContext&) override;
     void SetShadowMap(IRenderTarget& shadowMap) override;
 
+    ICommandBuffer* CreateSecondaryCommandBuffer(uint32_t threadIndex) override;
+
     FrameContext BeginFrame() override;
     void EndFrame(const FrameContext&) override;
     void SetFrameUniforms(const void* data, uint32_t size) override;
@@ -240,6 +242,35 @@ private:
     // The shadow (depth-only) pass reuses the dedicated rt command buffer/fence/recorder: the
     // shadow pass runs, waits on rtFence_, then the RT pass runs — they never overlap.
     class VulkanRenderTarget* shadowInFlight_ = nullptr;  // shadow map recorded between Begin/End
+
+    // --- Multithreaded recording (Slice AU) ----------------------------------
+    // One command pool + secondary command buffer + recorder PER WORKER THREAD (pools are not
+    // thread-safe, so each worker owns its own). Created lazily on first use and reused every frame;
+    // grown if a frame asks for more workers than seen before. The primary recorder records the
+    // current render pass's INHERITANCE (color/depth formats, sample count, extent, hasColor) into
+    // mtInherit_ when BeginRenderPass(clear, expectsSecondaries=true) opens the pass, so
+    // CreateSecondaryCommandBuffer begins each secondary with the matching
+    // VkCommandBufferInheritanceRenderingInfo (the AT validation gate needs this).
+    struct MtWorker {
+        VkCommandPool   pool = VK_NULL_HANDLE;
+        VkCommandBuffer cmd  = VK_NULL_HANDLE;
+        std::unique_ptr<class VulkanCommandBuffer> recorder;
+    };
+    std::vector<MtWorker> mtWorkers_;
+    struct MtInheritance {
+        VkFormat   colorFormat = VK_FORMAT_UNDEFINED;
+        VkFormat   depthFormat = VK_FORMAT_UNDEFINED;
+        VkExtent2D extent{};
+        bool       hasColor = true;
+    } mtInherit_;
+    void EnsureMtWorker(uint32_t threadIndex);
+
+public:
+    // Called by the primary VulkanCommandBuffer when it opens a render pass that expects secondaries,
+    // so CreateSecondaryCommandBuffer can build matching dynamic-rendering inheritance info. Backend-
+    // internal (takes vk* types) — NOT part of the abstract RHI seam.
+    void SetSecondaryInheritance(VkFormat colorFormat, VkFormat depthFormat, VkExtent2D extent,
+                                 bool hasColor);
 };
 
 } // namespace hf::rhi::vk

@@ -33,6 +33,11 @@ public:
     VkImageView depthView() const { return depthView_; }
     VkImage depthImage() const { return depthImage_; }
 
+    // Attachment formats (for Slice AU secondary-command-buffer dynamic-rendering inheritance).
+    // colorVkFormat() is UNDEFINED for a depth-only RT (no color image); depth is always D32.
+    VkFormat colorVkFormat() const { return colorFormat_; }
+    VkFormat depthVkFormat() const { return VK_FORMAT_D32_SFLOAT; }
+
     VkDescriptorSet descriptorSet() const { return set_; }
     VkDescriptorSet vkDescriptorSet() const override { return set_; }
 
@@ -62,6 +67,7 @@ private:
     uint32_t height_ = 0;
     bool     depthOnly_ = false;
 
+    VkFormat        colorFormat_ = VK_FORMAT_UNDEFINED;  // color attachment format (UNDEFINED if depthOnly)
     VkImage         colorImage_ = VK_NULL_HANDLE;
     VmaAllocation   colorAlloc_ = VK_NULL_HANDLE;
     VkImageView     colorView_  = VK_NULL_HANDLE;

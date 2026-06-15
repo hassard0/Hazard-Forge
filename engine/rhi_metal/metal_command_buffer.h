@@ -18,7 +18,18 @@ public:
     void Begin(id<MTLCommandBuffer> cmd, id<MTLTexture> colorTex, id<MTLTexture> depthTex,
                uint32_t width, uint32_t height);
 
+    // Retarget this recorder onto a sub-encoder vended by a parallel render command encoder (Slice
+    // AU). The worker drives this recorder over its draw range. `enc` is the sub-encoder; width/
+    // height size its viewport. Does NOT open a render pass — the primary's parallel encoder did.
+    void BeginSecondary(id<MTLRenderCommandEncoder> enc, uint32_t width, uint32_t height);
+
+    // Vend the next sub-encoder from this primary's open parallel render command encoder (creation
+    // order == worker index == commit order). Called by MetalDevice::CreateSecondaryCommandBuffer.
+    id<MTLRenderCommandEncoder> nextParallelSubEncoder();
+
     void BeginRenderPass(const ClearColor& clear) override;
+    void BeginRenderPass(const ClearColor& clear, bool expectsSecondaries) override;
+    void ExecuteSecondaries(std::span<ICommandBuffer* const> secondaries) override;
     void BindPipeline(IPipeline& pipeline) override;
     void BindVertexBuffer(IBuffer& buffer) override;
     void BindInstanceBuffer(IBuffer& buffer) override;
@@ -49,6 +60,8 @@ public:
     void ResourceBarrier(IRenderTarget& resource, ResourceState from, ResourceState to) override;
 
     id<MTLRenderCommandEncoder> encoder() const { return encoder_; }
+    uint32_t width() const { return width_; }
+    uint32_t height() const { return height_; }
 
 private:
     MetalDevice& device_;
@@ -56,6 +69,10 @@ private:
     id<MTLTexture>             colorTex_ = nil;
     id<MTLTexture>             depthTex_ = nil;
     id<MTLRenderCommandEncoder> encoder_ = nil;
+    // Parallel render command encoder open between BeginRenderPass(clear,true) and EndRenderPass
+    // (Slice AU); vends sub-encoders for the worker threads, committed in creation order on
+    // endEncoding. nil on the normal single-encoder path.
+    id<MTLParallelRenderCommandEncoder> parallelEncoder_ = nil;
     id<MTLComputeCommandEncoder> computeEncoder_ = nil;  // open between BindComputePipeline..Dispatch
     id<MTLBuffer>              indexBuffer_ = nil;  // stored by BindIndexBuffer; used by DrawIndexed
     bool boundFrameUniforms_ = false;  // current pipeline declares the per-frame UBO

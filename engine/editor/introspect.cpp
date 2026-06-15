@@ -94,6 +94,7 @@ const Showcase kShowcases[] = {
     {"--taa-shot",          "Temporal anti-aliasing (jittered accumulation)."},
     {"--cull-shot",         "Frustum culling visualization (overview camera + kept/culled bounds)."},
     {"--gpu-cull-shot",     "GPU-driven culling + indirect draw (compute compaction, GPU draw count)."},
+    {"--mt-shot",           "Multithreaded command recording (per-thread secondaries, 1-vs-N identical)."},
     {"--gizmo-shot",        "Editor selection + translate gizmo overlay."},
     {"--camera-shot",       "Scripted-pose interactive-runtime capture."},
 };
@@ -113,6 +114,7 @@ const char* kFeatures[] = {
     "temporal-anti-aliasing",
     "frustum-culling",
     "gpu-driven-culling",
+    "multithreaded-recording",
     "bloom",
     "ssao",
     "transparency",

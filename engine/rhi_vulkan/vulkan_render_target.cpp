@@ -14,6 +14,7 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     const VkFormat colorFormat = (colorFormatReq == Format::Undefined)
                                      ? device_.swapchainFormat()
                                      : ToVk(colorFormatReq);
+    colorFormat_ = depthOnly ? VK_FORMAT_UNDEFINED : colorFormat;
     if (!depthOnly_) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.imageType = VK_IMAGE_TYPE_2D;

@@ -121,6 +121,14 @@ hf_add_pure_test(frustum_test)
 # ASan-eligible.
 hf_add_pure_test(gpu_cull_test)
 
+# Multithreaded command recording (Slice AU): the deterministic CONTIGUOUS draw-list partition
+# (PartitionDraws splits [0,K) into W gap/overlap-free ranges, run-to-run identical, degenerate
+# W>K/K=0/W=1/W=0) + the real worker-pool dispatch (RecordParallel marks each draw exactly once
+# across W threads with no shared mutable state). The order-independent-of-W property is the
+# determinism oracle the 1-vs-N byte-identical render proof rests on. Pure C++ (runtime, links
+# hf_core) with REAL std::thread workers — must stay clean under MSVC /fsanitize=address.
+hf_add_pure_test(parallel_record_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)
