@@ -28,6 +28,7 @@
 #include "render/spot.h"
 #include "render/point_shadow.h"
 #include "render/probe.h"
+#include "render/decal.h"
 #include "render/clustered.h"
 #include "render/taa.h"
 #include "render/frustum.h"
@@ -344,6 +345,7 @@ int main(int argc, char** argv) {
     int gizmoShotIndex = 0;                  // selected object index for --gizmo-shot
     bool pickTest = false;                   // --pick-test: headless pick demo, prints picked index
     const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
+    const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
@@ -518,6 +520,14 @@ int main(int argc, char** argv) {
             // reflections of the objects on the floor, then a composite blends + tonemaps. One BMP ->
             // exit. New golden; existing lit/ssao/bloom paths/shaders/goldens are untouched.
             ssrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--decal-shot") == 0 && i + 1 < argc) {
+            // Slice BH: screen-space projected decals showcase. The standard lit+shadowed scene
+            // (colored objects on a floor) is rendered through the G-buffer path (reusing the SSAO/SSR
+            // view-space normal+linear-depth g-buffer); a decal composite pass reconstructs each
+            // pixel's world position, projects it top-down into a fixed decal box on the ground, and
+            // alpha-blends a procedural crack/cross decal texture over the scene + tonemaps. One BMP ->
+            // exit. New golden; existing lit/ssao/ssr/bloom paths/shaders/goldens are untouched.
+            decalShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--volumetric-shot") == 0 && i + 1 < argc) {
             // Slice AJ: volumetric fog / light shafts. A directional light at a grazing angle streams
             // BETWEEN shadow-casting occluders (a slotted wall + pillars), fog filling the air. The
@@ -5314,6 +5324,315 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — SSR, %d objects\n",
                                     ssrShotPath, cw, ch2, kNumObjs);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ssrShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Screen-space projected decals showcase (--decal-shot, Slice BH): the standard
+        // lit+shadowed scene (distinct colored cubes/spheres on a dark floor) is rendered into an HDR
+        // (RGBA16F) scene target PLUS the SAME view-space normal+linear-depth g-buffer SSR/SSAO use. A
+        // single decal composite pass reconstructs each pixel's view-space position EXACTLY as ssr.frag
+        // does (ReconstructViewPos + yFlip), maps it view->world via invView, then world->decal-local
+        // via worldToDecal (the inverse of decal::BuildDecalTransform). Pixels INSIDE the unit box get a
+        // procedural cross/crack decal (alpha = coverage * EdgeFade) alpha-blended over the scene; the
+        // sky/background (g-buffer w==0) is excluded; then exposure/ACES/grade/vignette -> swapchain.
+        // ONE decal box projected TOP-DOWN onto the ground. Reuses the SSR scene + g-buffer path; only
+        // the decal.frag composite pipeline is new. Existing lit/ssao/ssr/bloom shaders+goldens untouched.
+        if (decalShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+
+            // Scene objects (same family as --ssr-shot) on the floor at known positions.
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-2.2f, 0.7f, -0.5f}, 0.7f, true,  {0.90f, 0.20f, 0.20f}},  // red cube
+                {{ 0.0f, 0.9f, -1.2f}, 0.9f, false, {0.20f, 0.85f, 0.30f}},  // green sphere
+                {{ 2.3f, 0.6f,  0.2f}, 0.6f, true,  {0.25f, 0.45f, 0.95f}},  // blue cube
+                {{-0.9f, 0.5f,  1.4f}, 0.5f, false, {0.95f, 0.80f, 0.20f}},  // yellow sphere
+                {{ 1.4f, 0.75f, 1.6f}, 0.75f,true,  {0.85f, 0.35f, 0.90f}},  // magenta cube
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit pipeline (static, writing HDR RT) — UNCHANGED lit shaders. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // --- Shadow pipeline (static) — UNCHANGED. ---
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // --- Sky (writing HDR RT) — UNCHANGED. ---
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- G-buffer prepass pipeline (static), view-space normal + linear depth -> RGBA16F. ---
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs  = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs  = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- Decal composite fullscreen pipeline (fragment push constants). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto decalFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/decal.frag.hlsl.spv");
+            auto decalFs  = device->CreateShaderModule({std::span<const uint32_t>(decalFsW)});
+
+            // Matches DecalParams in shaders/decal.frag.hlsl (std140-friendly: vec4-aligned mats last).
+            struct DecalParams {
+                float texel[2]; float tanHalfFovY; float aspect;
+                float albedo[4];
+                float fadeIntensity[4];   // x = edge fade band, y = exposure, zw pad
+                float worldToDecal[16];
+                float invView[16];
+            };
+
+            rhi::GraphicsPipelineDesc decalD;
+            decalD.vertex = postVsM.get(); decalD.fragment = decalFs.get();
+            decalD.colorFormat = device->Swapchain().ColorFormat();
+            decalD.depthTest = false; decalD.usesTexture = true; decalD.fullscreen = true;
+            decalD.fragmentPushConstants = true; decalD.pushConstantSize = sizeof(DecalParams);
+            auto decalPipe = device->CreateGraphicsPipeline(decalD);
+
+            // --- Render targets: HDR lit scene + RGBA16F g-buffer. ---
+            auto rt    = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf  = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Brighter checker floor so the decal reads clearly on top of it.
+            std::vector<uint8_t> floorPx(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+                    floorPx[idx + 2] = (uint8_t)(v + 8); floorPx[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o) {
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+            }
+
+            // Camera: look down at the floor so the projected decal box is framed clearly.
+            const Vec3 eye{0.0f, 3.4f, 6.4f};
+            const Vec3 center{0.0f, 0.4f, 0.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 invView = viewM.Inverse();
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+                Vec3 sc{0.0f, 0.7f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            // The ONE decal: a box centered on the ground (y=0), spanning the floor's middle. It projects
+            // TOP-DOWN (along local -Y), thin in Y so it grips the ground plane. Rotated 25 deg about Y
+            // to show the oriented-box projection (the unit test pins the rotated case).
+            const Vec3 decalCenter{0.0f, 0.0f, 0.6f};
+            const Vec3 decalHalf{2.4f, 0.6f, 2.4f};
+            const Vec3 decalRot{0.0f, 0.4363323f, 0.0f};   // 25 deg about Y
+            Mat4 decalLocalToWorld = render::decal::BuildDecalTransform(decalCenter, decalHalf, decalRot);
+            Mat4 worldToDecal = decalLocalToWorld.Inverse();
+
+            DecalParams dpr{};
+            dpr.texel[0] = 1.0f / (float)w; dpr.texel[1] = 1.0f / (float)h;
+            dpr.tanHalfFovY = std::tan(0.5f * kFovY); dpr.aspect = aspect;
+            dpr.albedo[0] = 0.95f; dpr.albedo[1] = 0.15f; dpr.albedo[2] = 0.10f; dpr.albedo[3] = 1.0f;
+            dpr.fadeIntensity[0] = 0.18f;   // edge fade band (local units)
+            dpr.fadeIntensity[1] = 1.7f;    // exposure (matches ssr_composite/post)
+            for (int k = 0; k < 16; ++k) dpr.worldToDecal[k] = worldToDecal.m[k];
+            for (int k = 0; k < 16; ++k) dpr.invView[k] = invView.m[k];
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgGbuf = graph.ImportTarget(
+                "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f; // matte floor
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f; // matte objects
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*objTex[o], *flatNormal);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // G-buffer prepass -> RGBA16F (view-space normal + linear depth). Clear w=0 = background.
+            graph.AddPass("gbuffer", {}, {rgGbuf},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*gbStaticPipeline);
+                    {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Decal composite: reconstruct world pos from the g-buffer, project into the decal box,
+            // alpha-blend the procedural decal over the scene, tonemap -> swapchain. Scene at t0/s0,
+            // g-buffer at t3/s3 (BindTexturePair — IDENTICAL binding to the SSR composite).
+            graph.AddPass("decal", {rgScene, rgGbuf}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*decalPipe);
+                    cmd.BindTexturePair(*rt, *gbuf);
+                    cmd.PushConstants(&dpr, sizeof(dpr));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("decal: {decals:1, box:[%.2f,%.2f,%.2f]}\n",
+                        decalCenter.x, decalCenter.y, decalCenter.z);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(decalShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — decal, %d objects\n",
+                                    decalShotPath, cw, ch2, kNumObjs);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", decalShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

@@ -53,6 +53,7 @@
 #include "render/taa.h"           // Slice AP: temporal anti-aliasing jitter + resolve-blend (pure math)
 #include "render/frustum.h"        // Slice AQ: Gribb-Hartmann frustum extraction + sphere cull (pure math)
 #include "render/gpu_cull.h"        // Slice AR: GPU-cull CPU mirror (ordered compaction + sphere test)
+#include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
@@ -4615,6 +4616,288 @@ static int RunSsrShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Screen-space projected decals showcase (Slice BH). Mirrors the Vulkan --decal-shot path EXACTLY:
+// the same lit+shadowed scene (colored cubes/spheres on a checker floor) rendered into an HDR RT + the
+// SSAO/SSR view-space normal+linear-depth g-buffer. A single decal composite pass reconstructs each
+// pixel's view-space position (ReconstructViewPos + the HF_YS Metal Y-flip, IDENTICAL to ssr.frag),
+// maps it view->world via invView, then world->decal-local via worldToDecal; pixels inside the unit
+// box get a procedural cross/crack decal alpha-blended over the scene, then exposure/ACES/grade/
+// vignette -> swapchain. ONE decal box projected top-down onto the ground (rotated 25 deg about Y).
+// invView/worldToDecal are pure CPU math (Mat4::Inverse + decal::BuildDecalTransform), backend-agnostic;
+// the Metal proj uses FlipProjY for the geometry passes but the VIEW matrix is identical to Vulkan, so
+// the reconstructed world position matches. SEPARATE decal pipeline + shader; existing pipelines/
+// shaders/goldens untouched. -----
+static int RunDecalShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+    const Obj objs[] = {
+        {{-2.2f, 0.7f, -0.5f}, 0.7f, true,  {0.90f, 0.20f, 0.20f}},
+        {{ 0.0f, 0.9f, -1.2f}, 0.9f, false, {0.20f, 0.85f, 0.30f}},
+        {{ 2.3f, 0.6f,  0.2f}, 0.6f, true,  {0.25f, 0.45f, 0.95f}},
+        {{-0.9f, 0.5f,  1.4f}, 0.5f, false, {0.95f, 0.80f, 0.20f}},
+        {{ 1.4f, 0.75f, 1.6f}, 0.75f,true,  {0.85f, 0.35f, 0.90f}},
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    // Matches DecalParams in shaders/decal.frag.hlsl AND the Vulkan path's struct.
+    struct DecalParams {
+        float texel[2]; float tanHalfFovY; float aspect;
+        float albedo[4];
+        float fadeIntensity[4];
+        float worldToDecal[16];
+        float invView[16];
+    };
+    auto decalFs = loadMSL("decal.frag.gen.metal", "decal_fragment");
+    rhi::GraphicsPipelineDesc decalD;
+    decalD.vertex = postVs.get(); decalD.fragment = decalFs.get();
+    decalD.colorFormat = device->Swapchain().ColorFormat();
+    decalD.depthTest = false; decalD.usesTexture = true; decalD.fullscreen = true;
+    decalD.fragmentPushConstants = true; decalD.pushConstantSize = sizeof(DecalParams);
+    auto decalPipe = device->CreateGraphicsPipeline(decalD);
+
+    auto rt    = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf  = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // Brighter checker floor (matches the Vulkan --decal-shot path).
+    std::vector<uint8_t> floorPx(256 * 256 * 4);
+    for (uint32_t y = 0; y < 256; ++y)
+        for (uint32_t x = 0; x < 256; ++x) {
+            bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+            uint8_t v = dark ? 70 : 110;
+            size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+            floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+            floorPx[idx + 2] = (uint8_t)(v + 8); floorPx[idx + 3] = 255;
+        }
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+    for (int o = 0; o < kNumObjs; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+        objTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    std::vector<Mat4> objModel(kNumObjs);
+    for (int o = 0; o < kNumObjs; ++o)
+        objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+            {objs[o].scale, objs[o].scale, objs[o].scale});
+
+    const Vec3 eye{0.0f, 3.4f, 6.4f};
+    const Vec3 center{0.0f, 0.4f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 invView = viewM.Inverse();
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+        Vec3 sc{0.0f, 0.7f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    // The ONE decal box (IDENTICAL to the Vulkan path): centered on the ground, thin in Y, rotated 25
+    // deg about Y, projecting top-down.
+    const Vec3 decalCenter{0.0f, 0.0f, 0.6f};
+    const Vec3 decalHalf{2.4f, 0.6f, 2.4f};
+    const Vec3 decalRot{0.0f, 0.4363323f, 0.0f};
+    Mat4 decalLocalToWorld = render::decal::BuildDecalTransform(decalCenter, decalHalf, decalRot);
+    Mat4 worldToDecal = decalLocalToWorld.Inverse();
+
+    DecalParams dpr{};
+    dpr.texel[0] = 1.0f / (float)W; dpr.texel[1] = 1.0f / (float)H;
+    dpr.tanHalfFovY = std::tan(0.5f * kFovY); dpr.aspect = aspect;
+    dpr.albedo[0] = 0.95f; dpr.albedo[1] = 0.15f; dpr.albedo[2] = 0.10f; dpr.albedo[3] = 1.0f;
+    dpr.fadeIntensity[0] = 0.18f; dpr.fadeIntensity[1] = 1.7f;
+    for (int k = 0; k < 16; ++k) dpr.worldToDecal[k] = worldToDecal.m[k];
+    for (int k = 0; k < 16; ++k) dpr.invView[k] = invView.m[k];
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgGbuf = graph.ImportTarget(
+        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+        const scene::Mesh& m = objs[o].cube ? cube : sphere;
+        cmd.BindVertexBuffer(m.vertices());
+        cmd.BindIndexBuffer(m.indices());
+        cmd.DrawIndexed(m.indexCount());
+    };
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            for (int o = 0; o < kNumObjs; ++o) {
+                cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*objTex[o], *flatNormal);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("gbuffer", {}, {rgGbuf},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*gbStaticPipeline);
+            {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("decal", {rgScene, rgGbuf}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*decalPipe);
+            cmd.BindTexturePair(*rt, *gbuf);
+            cmd.PushConstants(&dpr, sizeof(dpr));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("decal: {decals:1, box:[%.2f,%.2f,%.2f]}\n",
+                decalCenter.x, decalCenter.y, decalCenter.z);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — decal, %d objects\n", outPath, cw, ch, kNumObjs);
+    return 0;
+}
+
 // --- Volumetric fog / light shafts showcase (Slice AJ). Mirrors the Vulkan --volumetric-shot path:
 // an OVERHEAD slatted canopy (a pergola of beams with gaps) + a near-overhead directional light, so
 // the light streams DOWN through the gaps and carves the foggy air into vertical light SHAFTS (god
@@ -7720,6 +8003,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ssr") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ssr.png";
             try { return RunSsrShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --decal <out.png>: screen-space projected-decals showcase (Slice BH) — the lit+shadowed scene
+        // + a view-space normal+linear-depth g-buffer, a decal composite pass that reconstructs the
+        // world position and projects a procedural decal top-down into a fixed box on the ground +
+        // tonemap. Mirrors the Vulkan --decal-shot exactly (same scene/decal box/camera).
+        if (argc > 1 && std::strcmp(argv[1], "--decal") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_decal.png";
+            try { return RunDecalShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --volumetric <out.png>: volumetric fog / light shafts showcase (Slice AJ) — an overhead

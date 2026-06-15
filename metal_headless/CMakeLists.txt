@@ -181,6 +181,12 @@ hf_gen_msl(probe_irradiance.frag probe_irradiance.frag.hlsl frag probe_irradianc
 # current jittered HDR scene. Reuses post.vert (fullscreen triangle). Same HLSL->SPIR-V->MSL toolchain;
 # existing shaders + goldens untouched.
 hf_gen_msl(taa_resolve.frag      taa_resolve.frag.hlsl      frag taa_resolve_fragment)
+# Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear depth)
+# + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like SSR, then
+# view->world via invView), projects it into the decal box, and alpha-blends a procedural decal over
+# the scene + tonemaps. Reuses post.vert. Same HLSL->SPIR-V->MSL toolchain; existing shaders+goldens
+# untouched.
+hf_gen_msl(decal.frag            decal.frag.hlsl            frag decal_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

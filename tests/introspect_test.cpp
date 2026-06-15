@@ -154,6 +154,8 @@ int main() {
             bool sawStreamingFeature = false;
             // Slice BF: the procedural-terrain capability is advertised.
             bool sawTerrainFeature = false;
+            // Slice BH: the screen-space projected-decals capability is advertised.
+            bool sawDecalFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -168,6 +170,7 @@ int main() {
                     if (AsString(el->value) == "audio-mixer") sawAudioFeature = true;
                     if (AsString(el->value) == "scene-streaming") sawStreamingFeature = true;
                     if (AsString(el->value) == "procedural-terrain") sawTerrainFeature = true;
+                    if (AsString(el->value) == "decals") sawDecalFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -181,6 +184,7 @@ int main() {
             check(sawAudioFeature, "engine.features includes audio-mixer");
             check(sawStreamingFeature, "engine.features includes scene-streaming");
             check(sawTerrainFeature, "engine.features includes procedural-terrain");
+            check(sawDecalFeature, "engine.features includes decals");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -228,6 +232,8 @@ int main() {
         bool sawStreamShot = false;
         // Slice BF: the --terrain-shot showcase flag is listed in the showcase manifest.
         bool sawTerrainShot = false;
+        // Slice BH: the --decal-shot showcase flag is listed in the showcase manifest.
+        bool sawDecalShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -245,6 +251,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--audio-render") sawAudioRender = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--stream-shot") sawStreamShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--terrain-shot") sawTerrainShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--decal-shot") sawDecalShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -260,6 +267,7 @@ int main() {
         check(sawAudioRender, "showcases manifest includes --audio-render");
         check(sawStreamShot, "showcases manifest includes --stream-shot");
         check(sawTerrainShot, "showcases manifest includes --terrain-shot");
+        check(sawDecalShot, "showcases manifest includes --decal-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

@@ -91,6 +91,12 @@ hf_add_pure_test(clustered_test)
 # (render/ssr.h, header-only), ASan-eligible.
 hf_add_pure_test(ssr_test)
 
+# Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
+# (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
+# InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff
+# (1 at center, 0 at a face, monotonic). Pure C++ (render/decal.h, header-only), ASan-eligible.
+hf_add_pure_test(decal_test)
+
 # Volumetric fog / light shafts (Slice AJ): Henyey-Greenstein phase (g=0 isotropic 1/4pi, forward
 # peak > back for g>0, integrates over the sphere to ~1) + camera-basis world-ray reconstruction
 # (centered pixel == camFwd, unit camFwd projection) + Beer-Lambert transmittance. Pure C++

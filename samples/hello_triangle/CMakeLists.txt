@@ -158,6 +158,11 @@ hf_compile_shaders(
     # grid and ORDER-compacts the survivors + writes the indirect draw-args; reuses lit_instanced.vert
     # for the indirect draw. Existing shaders + goldens untouched.
     "shaders/cull.comp.hlsl:cs"
+    # Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear
+    # depth) + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like
+    # SSR, then view->world via invView), projects it into the decal box, and alpha-blends the decal
+    # texture over the scene + tonemaps. Existing gbuffer/ssao/ssr/bloom shaders + goldens untouched.
+    "shaders/decal.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

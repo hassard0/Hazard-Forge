@@ -4,6 +4,12 @@
 
 namespace hf::math {
 
+struct Vec2 {
+    float x = 0, y = 0;
+    Vec2() = default;
+    Vec2(float x_, float y_) : x(x_), y(y_) {}
+};
+
 struct Vec3 {
     float x = 0, y = 0, z = 0;
     Vec3() = default;
