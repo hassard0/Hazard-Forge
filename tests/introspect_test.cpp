@@ -136,6 +136,8 @@ int main() {
             bool sawCullFeature = false;
             // Slice AR: the gpu-driven-culling capability is advertised in the feature manifest.
             bool sawGpuCullFeature = false;
+            // Slice BM: the gpu-multi-draw-indirect capability is advertised in the feature manifest.
+            bool sawMdiFeature = false;
             // Slice AS: the automatic-barriers (render-graph resource-state tracking) capability.
             bool sawBarriersFeature = false;
             // Slice AU: the multithreaded-recording capability is advertised in the feature manifest.
@@ -167,6 +169,7 @@ int main() {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
                     if (AsString(el->value) == "frustum-culling") sawCullFeature = true;
                     if (AsString(el->value) == "gpu-driven-culling") sawGpuCullFeature = true;
+                    if (AsString(el->value) == "gpu-multi-draw-indirect") sawMdiFeature = true;
                     if (AsString(el->value) == "automatic-barriers") sawBarriersFeature = true;
                     if (AsString(el->value) == "multithreaded-recording") sawMtFeature = true;
                     if (AsString(el->value) == "material-graph") sawMatGraphFeature = true;
@@ -184,6 +187,7 @@ int main() {
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
             check(sawGpuCullFeature, "engine.features includes gpu-driven-culling");
+            check(sawMdiFeature, "engine.features includes gpu-multi-draw-indirect");
             check(sawBarriersFeature, "engine.features includes automatic-barriers");
             check(sawMtFeature, "engine.features includes multithreaded-recording");
             check(sawMatGraphFeature, "engine.features includes material-graph");
@@ -224,6 +228,8 @@ int main() {
         bool sawCullShot = false;
         // Slice AR: the --gpu-cull-shot showcase flag is listed in the showcase manifest.
         bool sawGpuCullShot = false;
+        // Slice BM: the --mdi-shot showcase flag is listed in the showcase manifest.
+        bool sawMdiShot = false;
         // Slice AU: the --mt-shot showcase flag is listed in the showcase manifest.
         bool sawMtShot = false;
         // Slice AV: the --material-shot showcase flag is listed in the showcase manifest.
@@ -258,6 +264,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--taa-shot") sawTaaShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cull-shot") sawCullShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gpu-cull-shot") sawGpuCullShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--mdi-shot") sawMdiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mt-shot") sawMtShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-shot") sawMaterialShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-live-shot") sawMaterialLiveShot = true;
@@ -277,6 +284,7 @@ int main() {
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
         check(sawGpuCullShot, "showcases manifest includes --gpu-cull-shot");
+        check(sawMdiShot, "showcases manifest includes --mdi-shot");
         check(sawMtShot, "showcases manifest includes --mt-shot");
         check(sawMaterialShot, "showcases manifest includes --material-shot");
         check(sawMaterialLiveShot, "showcases manifest includes --material-live-shot");

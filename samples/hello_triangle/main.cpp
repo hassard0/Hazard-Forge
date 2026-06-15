@@ -35,6 +35,7 @@
 #include "render/taa.h"
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
+#include "render/mdi.h"   // Slice BM: GPU multi-draw-indirect batch builder (pure CPU)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -335,6 +336,7 @@ int main(int argc, char** argv) {
     const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
     const char* mtShotPath = nullptr;        // --mt-shot <out.bmp> (Slice AU: multithreaded recording)
     int mtWorkers = 4;                       // --mt-shot ... --workers N (default 4)
+    const char* mdiShotPath = nullptr;       // --mdi-shot <out.bmp> (Slice BM: multi-draw-indirect)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -607,6 +609,15 @@ int main(int argc, char** argv) {
             // produce BYTE-IDENTICAL captures. Prints `mt: {workers:N, draws:D, secondaries:N}`. One
             // BMP -> exit. New golden mt.png.
             mtShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--mdi-shot") == 0 && i + 1 < argc) {
+            // Slice BM: GPU multi-draw-indirect batching. A deterministic 144-object scene (12x12 grid
+            // of distinct cubes/spheres) is rendered with ONE vkCmdDrawIndexedIndirect(drawCount=144):
+            // N VkDrawIndexedIndirectCommand packed in one buffer, the per-draw model matrix + material
+            // read from a storage buffer indexed by gl_DrawID (lit_mdi.vert). The run ALSO renders the
+            // IDENTICAL scene via the per-object path (push-constant lit.vert, same PerDraw values) and
+            // ASSERTS the two captures are BYTE-IDENTICAL (SHA) — the render-invariance proof. Prints
+            // `mdi: {objects:144, drawCalls:1, refDrawCalls:144}`. One BMP -> exit. New golden mdi.png.
+            mdiShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             mtWorkers = std::atoi(argv[i + 1]);
             if (mtWorkers < 1) mtWorkers = 1;
@@ -4555,6 +4566,352 @@ int main(int argc, char** argv) {
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU multi-draw-indirect batching (--mdi-shot <out.bmp>, Slice BM): a deterministic
+        // 144-object scene (12x12 grid of distinct cubes/spheres, same shape as --mt-shot) is rendered
+        // with ONE vkCmdDrawIndexedIndirect(drawCount=144). render::mdi::BuildBatch lays out N
+        // VkDrawIndexedIndirectCommand into one indirect buffer + a parallel PerDraw[ ] storage buffer
+        // (model mat4 + material); lit_mdi.vert reads PerDraw[gl_DrawID] (SPIR-V DrawIndex). The run
+        // ALSO renders the IDENTICAL scene via the per-object path (push-constant lit.vert, the SAME
+        // PerDraw values) and ASSERTS the two captures are BYTE-IDENTICAL (FNV hash) — the
+        // render-invariance proof: if the gl_DrawID indexing is wrong the images differ and we fail
+        // loudly. Prints `mdi: {objects:144, drawCalls:1, refDrawCalls:144}`. The MDI capture becomes
+        // mdi.png. One BMP -> exit. Existing goldens untouched. ----
+        if (mdiShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+            scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+            // --- The 144-object scene (12x12 grid of alternating cube/sphere), deterministic. Each
+            // object has a model matrix + a per-object material tint. This is the list the MDI path
+            // batches into ONE draw and the reference path draws per-object. ---
+            struct MdiObj { const scene::Mesh* mesh; Mat4 model; float tint; };
+            std::vector<MdiObj> objs;
+            const int kGrid = 12;
+            for (int gz = 0; gz < kGrid; ++gz) {
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    int idx = gz * kGrid + gx;
+                    float fx = (float)(gx - kGrid / 2) * 1.5f + 0.75f;
+                    float fz = (float)(gz - kGrid / 2) * 1.5f + 0.75f;
+                    float bob = 0.35f * std::sin((float)idx * 0.7f);
+                    Mat4 m = Mat4::Translate({fx, 0.7f + bob, fz}) * Mat4::Scale({0.45f, 0.45f, 0.45f});
+                    float tint = 0.35f + 0.5f * (float)((idx * 37) % 100) / 100.0f;
+                    objs.push_back({(idx & 1) ? &sphereMesh : &cubeMesh, m, tint});
+                }
+            }
+            const uint32_t kObjects = (uint32_t)objs.size();
+
+            // --- A COMBINED vertex + index buffer holding the cube THEN the sphere, so every object's
+            // draw is one slice {indexCount, firstIndex, vertexOffset} of the SAME buffers — exactly
+            // what a single multi-draw-indirect call reads. Cube occupies [0, cubeIdx) / verts
+            // [0,cubeVtx); sphere occupies [cubeIdx, cubeIdx+sphereIdx) / verts [cubeVtx, ...). ---
+            scene::MeshGeometry cubeGeo = scene::CubeGeometry();
+            scene::MeshGeometry sphGeo  = scene::SphereGeometry();
+            const uint32_t cubeVtxCount = (uint32_t)cubeGeo.verts.size();
+            const uint32_t cubeIdxCount = (uint32_t)cubeGeo.indices.size();
+            const uint32_t sphIdxCount  = (uint32_t)sphGeo.indices.size();
+
+            std::vector<scene::Vertex> allVerts = cubeGeo.verts;
+            allVerts.insert(allVerts.end(), sphGeo.verts.begin(), sphGeo.verts.end());
+            std::vector<uint32_t> allIdx = cubeGeo.indices;
+            allIdx.insert(allIdx.end(), sphGeo.indices.begin(), sphGeo.indices.end());
+
+            rhi::BufferDesc vbDesc; vbDesc.size = allVerts.size() * sizeof(scene::Vertex);
+            vbDesc.initialData = allVerts.data(); vbDesc.usage = rhi::BufferUsage::Vertex;
+            auto comboVB = device->CreateBuffer(vbDesc);
+            rhi::BufferDesc ibDesc; ibDesc.size = allIdx.size() * sizeof(uint32_t);
+            ibDesc.initialData = allIdx.data(); ibDesc.usage = rhi::BufferUsage::Index;
+            auto comboIB = device->CreateBuffer(ibDesc);
+
+            // --- Build the MDI command + per-draw buffers via the PURE-CPU builder (render/mdi.h). One
+            // DrawObject per scene object: its index slice + model matrix + material. Command i and
+            // PerDraw[i] describe the SAME object; the reference path uses the SAME PerDraw values. ---
+            std::vector<render::mdi::DrawObject> drawObjs;
+            drawObjs.reserve(kObjects);
+            for (const auto& ob : objs) {
+                render::mdi::DrawObject d{};
+                const bool isSphere = (ob.mesh == &sphereMesh);
+                d.indexCount   = isSphere ? sphIdxCount  : cubeIdxCount;
+                d.firstIndex   = isSphere ? cubeIdxCount : 0u;
+                d.vertexOffset = isSphere ? cubeVtxCount : 0u;
+                for (int k = 0; k < 16; ++k) d.model[k] = ob.model.m[k];
+                d.material[0] = 0.0f; d.material[1] = ob.tint; d.material[2] = 0.0f; d.material[3] = 0.0f;
+                drawObjs.push_back(d);
+            }
+            render::mdi::MdiBatch batch = render::mdi::BuildBatch(drawObjs);
+
+            rhi::BufferDesc cmdDesc;
+            cmdDesc.size = batch.commands.size() * sizeof(render::mdi::MdiCommand);
+            cmdDesc.initialData = batch.commands.data();
+            cmdDesc.usage = rhi::BufferUsage::Indirect;
+            auto cmdBuffer = device->CreateBuffer(cmdDesc);
+
+            rhi::BufferDesc pdDesc;
+            pdDesc.size = batch.perDraw.size() * sizeof(render::mdi::PerDraw);
+            pdDesc.initialData = batch.perDraw.data();
+            pdDesc.usage = rhi::BufferUsage::Storage;
+            auto perDrawBuffer = device->CreateBuffer(pdDesc);
+
+            // --- Pipelines. MDI lit (lit_mdi.vert reads PerDraw[gl_DrawID]) + the per-object reference
+            // lit (lit.vert push-constant) — BOTH use the SHARED lit.frag. Plus static shadow, sky, post.
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+
+            auto mdiVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_mdi.vert.hlsl.spv");
+            auto mdiVs = device->CreateShaderModule({std::span<const uint32_t>(mdiVsWords)});
+            rhi::GraphicsPipelineDesc mdiDesc;
+            mdiDesc.vertex = mdiVs.get(); mdiDesc.fragment = litFs.get();
+            mdiDesc.vertexLayout = scene::MeshVertexLayout();
+            mdiDesc.colorFormat = device->Swapchain().ColorFormat();
+            mdiDesc.depthTest = true; mdiDesc.usesFrameUniforms = true; mdiDesc.usesTexture = true;
+            mdiDesc.usesPerDrawData = true;   // set 2: the PerDraw SSBO read by gl_DrawID
+            mdiDesc.pushConstantSize = 0;     // model + material come from PerDraw, not a push constant
+            auto mdiPipeline = device->CreateGraphicsPipeline(mdiDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            scene::Transform groundXform; groundXform.scale = {14.0f, 1.0f, 14.0f};
+            Mat4 groundModel = groundXform.Matrix();
+
+            // --- Camera: the SAME elevated three-quarter view the --mt-shot scene uses. ---
+            const Vec3 eye{0.0f, 13.0f, 16.0f};
+            const Vec3 center{0.0f, 0.5f, 0.0f};
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            FrameData fd{};
+            {
+                runtime::Camera cam;
+                cam.position = eye;
+                Vec3 dir = math::normalize(center - eye);
+                cam.yaw = std::atan2(dir.x, -dir.z);
+                cam.SetPitch(std::asin(dir.y));
+                cam.fovY = 0.9599311f;  // 55 degrees
+                cam.aspect = aspect;
+                cam.znear = 0.5f; cam.zfar = 80.0f;
+                Mat4 vp = cam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDirVec * 26.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-15.0f, 15.0f, -15.0f, 15.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            // The shadow pass (identical for both renders): ground + every object cast a shadow. Built
+            // once as a lambda over a graph the caller assembles, so MDI and reference share it exactly.
+            auto recordShadow = [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(planeMesh.vertices());
+                cmd.BindIndexBuffer(planeMesh.indices());
+                cmd.DrawIndexed(planeMesh.indexCount());
+                for (const auto& ob : objs) {
+                    cmd.PushConstants(ob.model.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(ob.mesh->vertices());
+                    cmd.BindIndexBuffer(ob.mesh->indices());
+                    cmd.DrawIndexed(ob.mesh->indexCount());
+                }
+                cmd.EndRenderPass();
+            };
+            // The sky + ground (identical for both renders' scene pass).
+            auto recordSkyGround = [&](rhi::ICommandBuffer& cmd) {
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(planeMesh.vertices());
+                cmd.BindIndexBuffer(planeMesh.indices());
+                cmd.DrawIndexed(planeMesh.indexCount());
+            };
+
+            // === Render ONE frame and return its captured pixels. `mdi` selects the object draw path:
+            //   true  -> ONE DrawIndexedMultiIndirect(cmdBuffer, drawCount=144) over lit_mdi.vert.
+            //   false -> 144 per-object DrawIndexed via push-constant lit.vert (the reference).
+            // Everything else (camera, shadow, sky, ground, post, frame uniforms) is byte-identical, so
+            // the ONLY thing under test is the MDI vs per-object object draws. ===
+            auto renderFrame = [&](bool mdi, std::vector<uint8_t>& outPx,
+                                   uint32_t& outW, uint32_t& outH, uint32_t& outDraws) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow}, recordShadow);
+
+                uint32_t objectDraws = 0;
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        recordSkyGround(cmd);
+                        if (mdi) {
+                            // ONE multi-draw-indirect over the combined buffers; the per-draw model +
+                            // material come from PerDraw[gl_DrawID].
+                            cmd.BindPipeline(*mdiPipeline);
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindPerDrawData(*perDrawBuffer);
+                            cmd.BindVertexBuffer(*comboVB);
+                            cmd.BindIndexBuffer(*comboIB);
+                            cmd.DrawIndexedMultiIndirect(*cmdBuffer, kObjects,
+                                                         (uint32_t)sizeof(render::mdi::MdiCommand));
+                            objectDraws = 1;
+                        } else {
+                            // The per-object reference: 144 DrawIndexed with the SAME PerDraw values
+                            // pushed as the push constant (model + material), each from the combined
+                            // buffer's matching slice.
+                            cmd.BindPipeline(*litPipeline);
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(*comboVB);
+                            cmd.BindIndexBuffer(*comboIB);
+                            for (uint32_t i = 0; i < kObjects; ++i) {
+                                const render::mdi::PerDraw& pd = batch.perDraw[i];
+                                const render::mdi::MdiCommand& c = batch.commands[i];
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = pd.model[k];
+                                pc[16] = pd.material[0]; pc[17] = pd.material[1];
+                                pc[18] = pd.material[2]; pc[19] = pd.material[3];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+                                ++objectDraws;
+                            }
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                outDraws = objectDraws;
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // --- Render the MDI path AND the per-object reference; assert BYTE-IDENTICAL. ---
+            std::vector<uint8_t> mdiPx, refPx;
+            uint32_t mw = 0, mh = 0, rw = 0, rh = 0, mdiDraws = 0, refDraws = 0;
+            if (!renderFrame(/*mdi=*/true, mdiPx, mw, mh, mdiDraws)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (MDI render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderFrame(/*mdi=*/false, refPx, rw, rh, refDraws)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (reference render)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+            uint64_t mdiHash = fnv(mdiPx), refHash = fnv(refPx);
+            std::printf("mdi: {objects:%u, drawCalls:%u, refDrawCalls:%u}\n",
+                        kObjects, mdiDraws, refDraws);
+            std::printf("mdi-hash: %016llx  ref-hash: %016llx\n",
+                        (unsigned long long)mdiHash, (unsigned long long)refHash);
+
+            const bool identical = (mw == rw) && (mh == rh) && (mdiPx.size() == refPx.size()) &&
+                                   (std::memcmp(mdiPx.data(), refPx.data(), mdiPx.size()) == 0);
+            if (!identical) {
+                std::fprintf(stderr,
+                    "FATAL: MDI render != per-object reference (gl_DrawID indexing wrong?) — "
+                    "mdi-hash %016llx vs ref-hash %016llx\n",
+                    (unsigned long long)mdiHash, (unsigned long long)refHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mdi==per-draw: BYTE-IDENTICAL (%u objects in 1 MDI call vs %u per-object draws)\n",
+                        kObjects, refDraws);
+
+            // The MDI capture is the golden (identical to the reference by the assert above).
+            bool ok = WriteBMP(mdiShotPath, mdiPx, mw, mh);
+            if (ok) std::printf("wrote %s (%ux%u) — 144-object scene via ONE multi-draw-indirect\n",
+                                mdiShotPath, mw, mh);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mdiShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

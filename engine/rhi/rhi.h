@@ -110,6 +110,18 @@ struct GraphicsPipelineDesc {
                                      // lighting (Slice R). Bound via BindEnvironment. Existing
                                      // set 0/1/2 layouts are unchanged, so golden-locked pipelines
                                      // (which leave this false) are byte-for-byte unaffected.
+    bool usesPerDrawData = false;    // when true (Slice BM): the layout includes a DEDICATED per-draw
+                                     // set placed at index 2 (after frame set 0 + material set 1) —
+                                     // ONE VERTEX-stage storage buffer holding the PerDraw[ ] array
+                                     // (model mat4 + material) the multi-draw-indirect vertex shader
+                                     // (lit_mdi.vert) reads as PerDraw[gl_DrawID]. Bound via
+                                     // BindPerDrawData. Only the MDI lit pipeline sets this; it pairs
+                                     // with usesFrameUniforms + usesTexture so the shared lit fragment
+                                     // still samples its base material at set 1. Mirrors the cluster
+                                     // set's push-descriptor mechanism but is a VERTEX-stage SSBO.
+                                     // Existing pipelines (which leave this false) are byte-for-byte
+                                     // unchanged. Mutually exclusive with usesJointPalette/usesEnvironment/
+                                     // usesLightClusters (those also claim set 2/3).
     bool usesLightClusters = false;  // when true: the layout includes a DEDICATED light-cluster set
                                      // (set 3) — THREE fragment-stage STORAGE buffers (clusters /
                                      // lightIndices / lights) — for clustered Forward+ shading
@@ -253,6 +265,13 @@ public:
     // unaffected; both shipping backends override it.
     virtual void BindLightClusters(IBuffer& /*clusters*/, IBuffer& /*lightIndices*/,
                                    IBuffer& /*lights*/) {}
+    // Bind the per-draw STORAGE buffer (Slice BM) at the dedicated per-draw set (set 2 on Vulkan),
+    // readable by the multi-draw-indirect VERTEX shader (lit_mdi.vert) as PerDraw[gl_DrawID]: the
+    // packed array of {model mat4, float4 material} laid out by render::mdi::BuildBatch, one record
+    // per object. Pair with a pipeline whose usesPerDrawData is true; call before
+    // DrawIndexedMultiIndirect. Default no-op so passes/backends without MDI are unaffected; both
+    // shipping backends override it (Vulkan: push-descriptor SSBO; Metal: a bound vertex buffer slot).
+    virtual void BindPerDrawData(IBuffer& /*perDraw*/) {}
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.
@@ -279,6 +298,19 @@ public:
     // DrawIndexedInstanced. Default no-op so backends/passes without indirect draw still link; both
     // shipping backends override it. The vk*/MTL* indirect-draw calls live ONLY in the backend dirs.
     virtual void DrawIndexedIndirect(IBuffer& /*argsBuffer*/, size_t /*offset*/ = 0) {}
+    // GPU-DRIVEN MULTI-draw (Slice BM): issue `drawCount` indexed draws in ONE call, each reading its
+    // own {indexCount, instanceCount, firstIndex, vertexOffset, firstInstance} record from `argsBuffer`
+    // (created with BufferUsage::Indirect) at successive byte offsets `i*stride` (i in [0,drawCount)).
+    // The records are the standard 5x u32 (VkDrawIndexedIndirectCommand layout), so the per-draw model
+    // matrix + material live in a SEPARATE storage buffer indexed by the per-draw index `gl_DrawID`
+    // (SPIR-V DrawIndex). This batches a many-distinct-object scene into a single draw call. Vulkan:
+    // vkCmdDrawIndexedIndirect(argsBuffer, 0, drawCount, stride). Metal: MAY no-op/fallback (the Metal
+    // golden renders the identical scene via its per-object path — the image is backend-identical, and
+    // an MTLIndirectCommandBuffer is optional, not required). Default no-op so backends/passes without
+    // MDI still link. Bind the index buffer + the per-vertex stream first, like DrawIndexedIndirect.
+    // The vk*/MTL* multi-indirect call lives ONLY in the backend dirs.
+    virtual void DrawIndexedMultiIndirect(IBuffer& /*argsBuffer*/, uint32_t /*drawCount*/,
+                                          uint32_t /*stride*/) {}
     virtual void PushConstants(const void* data, uint32_t size) = 0;
     // Override the render pass's full-extent scissor for the following draw(s). ImGui needs a
     // per-draw scissor (clip rect). Coordinates are in framebuffer pixels (top-left origin).

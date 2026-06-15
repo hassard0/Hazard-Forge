@@ -28,6 +28,11 @@ public:
     // The cluster set's index in the pipeline layout (always 3: frame 0, material 1, joint
     // placeholder 2, clusters 3 — mirrors the env set).
     uint32_t clusterSetIndex() const { return 3u; }
+    // True when the pipeline declares the dedicated per-draw set (set 2, Slice BM); BindPerDrawData
+    // binds the PerDraw SSBO there.
+    bool hasPerDrawSet() const { return hasPerDrawSet_; }
+    // The per-draw set's index in the pipeline layout (always 2: frame 0, material 1, per-draw 2).
+    uint32_t perDrawSetIndex() const { return 2u; }
     // Stage flags the push-constant range is visible to (VERTEX, or VERTEX|FRAGMENT for the bloom
     // fullscreen passes). PushConstants pushes to exactly these stages.
     uint32_t pushConstantStages() const { return pushConstantStages_; }
@@ -40,6 +45,7 @@ private:
     bool hasJointSet_ = false;
     bool hasEnvironmentSet_ = false;
     bool hasClusterSet_ = false;
+    bool hasPerDrawSet_ = false;
     uint32_t pushConstantStages_ = VK_SHADER_STAGE_VERTEX_BIT;
 };
 

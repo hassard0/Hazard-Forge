@@ -309,6 +309,16 @@ void MetalCommandBuffer::DrawIndexedIndirect(IBuffer& argsBuffer, size_t offset)
                indirectBufferOffset:(NSUInteger)offset];
 }
 
+void MetalCommandBuffer::DrawIndexedMultiIndirect(IBuffer& /*argsBuffer*/, uint32_t /*drawCount*/,
+                                                  uint32_t /*stride*/) {
+    // Slice BM — GPU multi-draw-indirect. The TRUE multi-draw + gl_DrawID-indexed per-draw data is the
+    // VULKAN GPU-driven demonstration (one vkCmdDrawIndexedIndirect(drawCount=N)). Metal's equivalent
+    // is an MTLIndirectCommandBuffer (ICB), which is OPTIONAL for this slice: the Metal golden renders
+    // the IDENTICAL N-object scene via the working per-object path (visual_test --mdi), so mdi.png is
+    // backend-identical to the Vulkan MDI image either way. This entry point is therefore a documented
+    // no-op on Metal (no ICB wired); the showcase never routes the Metal frame through it.
+}
+
 void MetalCommandBuffer::PushConstants(const void* data, uint32_t size) {
     // Vertex push constants (model matrix) -> inline setVertexBytes at the push-constant slot.
     [encoder_ setVertexBytes:data length:size atIndex:kVbPushConst];

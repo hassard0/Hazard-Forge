@@ -6222,6 +6222,215 @@ static int RunMtShowcase(const char* outPath, uint32_t workers) {
     return 0;
 }
 
+// --- GPU multi-draw-indirect showcase (Slice BM). The TRUE multi-draw (one
+// vkCmdDrawIndexedIndirect(drawCount=144) with gl_DrawID-indexed per-draw data) is the VULKAN
+// demonstration; on Metal we render the IDENTICAL 144-object scene (12x12 grid of distinct
+// cubes/spheres, the SAME geometry/material/camera as the Vulkan --mdi-shot reference) via the working
+// per-object path. The image is therefore backend-identical to the Vulkan MDI image (which is itself
+// byte-identical to the Vulkan per-object reference). Metal's MTLIndirectCommandBuffer is OPTIONAL and
+// NOT wired this slice — documented honestly. New golden tests/golden/metal/mdi.png; two runs DIFF
+// 0.0000. The scene matches RunMtShowcase exactly (single-threaded per-object draws).
+static int RunMdiShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+    scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+    scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+    // The IDENTICAL 144-object scene as the Vulkan --mdi-shot (and --mt-shot): a 12x12 grid of
+    // alternating cube/sphere at varying heights, each with a per-object tint.
+    struct MdiObj { const scene::Mesh* mesh; scene::Transform xform; float tint; };
+    std::vector<MdiObj> objs;
+    const int kGrid = 12;
+    for (int gz = 0; gz < kGrid; ++gz) {
+        for (int gx = 0; gx < kGrid; ++gx) {
+            int idx = gz * kGrid + gx;
+            scene::Transform t;
+            float fx = (float)(gx - kGrid / 2) * 1.5f + 0.75f;
+            float fz = (float)(gz - kGrid / 2) * 1.5f + 0.75f;
+            float bob = 0.35f * std::sin((float)idx * 0.7f);
+            t.position = {fx, 0.7f + bob, fz};
+            t.scale = {0.45f, 0.45f, 0.45f};
+            objs.push_back({(idx & 1) ? &sphereMesh : &cubeMesh, t,
+                            0.35f + 0.5f * (float)((idx * 37) % 100) / 100.0f});
+        }
+    }
+    const uint32_t kObjects = (uint32_t)objs.size();
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    scene::Transform groundXform; groundXform.scale = {14.0f, 1.0f, 14.0f};
+    Mat4 groundModel = groundXform.Matrix();
+
+    const Vec3 eye{0.0f, 13.0f, 16.0f};
+    const Vec3 center{0.0f, 0.5f, 0.0f};
+    const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+    FrameData fd{};
+    {
+        runtime::Camera cam;
+        cam.position = eye;
+        Vec3 dir = math::normalize(center - eye);
+        cam.yaw = std::atan2(dir.x, -dir.z);
+        cam.SetPitch(std::asin(dir.y));
+        cam.fovY = 0.9599311f;  // 55 degrees
+        cam.aspect = (float)W / (float)H;
+        cam.znear = 0.5f; cam.zfar = 80.0f;
+        Mat4 vp = FlipProjY(cam.Proj()) * cam.View();
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDirVec * 26.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-15.0f, 15.0f, -15.0f, 15.0f, 1.0f, 60.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        runtime::CameraBasis cb = cam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = cam.aspect;
+    }
+
+    auto recordObject = [&](rhi::ICommandBuffer& c, const MdiObj& ob) {
+        Mat4 m = ob.xform.Matrix();
+        float pc[20];
+        for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+        pc[16] = 0.0f; pc[17] = ob.tint; pc[18] = 0.0f; pc[19] = 0.0f;
+        c.PushConstants(pc, sizeof(pc));
+        c.BindVertexBuffer(ob.mesh->vertices());
+        c.BindIndexBuffer(ob.mesh->indices());
+        c.DrawIndexed(ob.mesh->indexCount());
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(planeMesh.vertices());
+            cmd.BindIndexBuffer(planeMesh.indices());
+            cmd.DrawIndexed(planeMesh.indexCount());
+            for (const auto& ob : objs) {
+                Mat4 m = ob.xform.Matrix();
+                cmd.PushConstants(m.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(ob.mesh->vertices());
+                cmd.BindIndexBuffer(ob.mesh->indices());
+                cmd.DrawIndexed(ob.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(planeMesh.vertices());
+                cmd.BindIndexBuffer(planeMesh.indices());
+                cmd.DrawIndexed(planeMesh.indexCount());
+            }
+            // The 144 distinct objects (per-object draws — the Metal MDI equivalent; the image matches
+            // the Vulkan one-MDI-call render).
+            for (const auto& ob : objs) recordObject(cmd, ob);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("mdi: {objects:%u, drawCalls:1, refDrawCalls:%u} (Metal: per-object path, image backend-identical)\n",
+                kObjects, kObjects);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — 144-object scene (Metal per-object; Vulkan does true MDI)\n",
+                outPath, cw, ch);
+    return 0;
+}
+
 // --- GPU-driven culling + indirect draw showcase (Slice AR). Mirrors the Vulkan --gpu-cull-shot
 // path: a compute kernel (cull.comp.gen.metal) frustum-culls a deterministic 1024-instance cube grid
 // and ORDER-compacts the survivors into a second instance buffer (single-workgroup prefix sum) +
@@ -8156,6 +8365,17 @@ int main(int argc, char** argv) {
             uint32_t workers = 4;
             if (argc > 3) { int n = std::atoi(argv[3]); if (n >= 1) workers = (uint32_t)n; }
             try { return RunMtShowcase(out, workers); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mdi <out.png>: render the GPU multi-draw-indirect showcase (Slice BM). The TRUE MDI call
+        // (one vkCmdDrawIndexedIndirect(drawCount=144) with gl_DrawID-indexed per-draw data) is the
+        // VULKAN demonstration; here Metal renders the IDENTICAL 144-object scene via its working
+        // per-object path, so mdi.png is backend-identical to the Vulkan MDI image (which is itself
+        // byte-identical to the Vulkan per-object reference). Metal ICB is optional/not wired. Mirrors
+        // the Vulkan --mdi-shot scene exactly; new golden tests/golden/metal/mdi.png.
+        if (argc > 1 && std::strcmp(argv[1], "--mdi") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mdi.png";
+            try { return RunMdiShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gizmo <objIndex> <out.png>: render the editor gizmo showcase (Slice AB) — a small

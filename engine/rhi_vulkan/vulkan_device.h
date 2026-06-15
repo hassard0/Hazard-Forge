@@ -104,6 +104,13 @@ public:
     // golden-locked pipelines) are byte-for-byte unchanged.
     VkDescriptorSetLayout clusterSetLayout() const { return clusterSetLayout_; }
 
+    // Per-draw set layout (set 2, VERTEX stage, Slice BM): ONE STORAGE_BUFFER binding (0) holding the
+    // PerDraw[ ] array (model mat4 + material) the multi-draw-indirect vertex shader reads as
+    // PerDraw[gl_DrawID]. PUSH_DESCRIPTOR so the buffer is bound inline via BindPerDrawData (no pool —
+    // mirrors the cluster/compute SSBO path). Separate from the material/frame/joint/env/cluster
+    // layouts so existing pipelines are byte-for-byte unchanged.
+    VkDescriptorSetLayout perDrawSetLayout() const { return perDrawSetLayout_; }
+
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
     // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
@@ -155,6 +162,7 @@ private:
     VkDescriptorSetLayout pbrMaterialSetLayout_ = VK_NULL_HANDLE;  // wider set 1 for lit-PBR
     VkDescriptorSetLayout environmentSetLayout_ = VK_NULL_HANDLE;  // dedicated set 3 for HDR IBL
     VkDescriptorSetLayout clusterSetLayout_ = VK_NULL_HANDLE;      // dedicated set 3 for clustered lights
+    VkDescriptorSetLayout perDrawSetLayout_ = VK_NULL_HANDLE;      // dedicated set 2 for MDI per-draw (Slice BM)
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the

@@ -160,6 +160,17 @@ hf_add_pure_test(frustum_test)
 # ASan-eligible.
 hf_add_pure_test(gpu_cull_test)
 
+# GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
+# a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
+# instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)
+# the one vkCmdDrawIndexedIndirect(drawCount=N) consumes, indexed by gl_DrawID. Asserts the command
+# layout (each command i == object i's index slice; drawCount==N), per-draw packing (PerDraw[i] round-
+# trips object i's matrix+material), POD byte layouts (20/80 bytes, std430-friendly), and DETERMINISM
+# (two builds -> bit-identical command + per-draw buffers). The render-invariance proof (MDI image ==
+# per-object image) lives in --mdi-shot; this pins the CPU layout the GPU path reads. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(mdi_test)
+
 # Multithreaded command recording (Slice AU): the deterministic CONTIGUOUS draw-list partition
 # (PartitionDraws splits [0,K) into W gap/overlap-free ranges, run-to-run identical, degenerate
 # W>K/K=0/W=1/W=0) + the real worker-pool dispatch (RecordParallel marks each draw exactly once

@@ -25,6 +25,7 @@ void VulkanCommandBuffer::Begin(VkCommandBuffer cmd, VkImageView colorView,
     boundMaterialSet_ = 0;
     boundEnvironmentSet_ = 0;
     boundClusterSet_ = 0;
+    boundPerDrawSet_ = 0;
 }
 
 void VulkanCommandBuffer::BeginSecondary(VkCommandBuffer cmd, VkExtent2D extent) {
@@ -39,6 +40,7 @@ void VulkanCommandBuffer::BeginSecondary(VkCommandBuffer cmd, VkExtent2D extent)
     boundMaterialSet_ = 0;
     boundEnvironmentSet_ = 0;
     boundClusterSet_ = 0;
+    boundPerDrawSet_ = 0;
     VkViewport vp{0, 0, (float)extent_.width, (float)extent_.height, 0.0f, 1.0f};
     vkCmdSetViewport(cmd_, 0, 1, &vp);
     VkRect2D scissor{{0, 0}, extent_};
@@ -119,6 +121,7 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     boundMaterialSet_ = p.materialSetIndex();
     boundEnvironmentSet_ = p.hasEnvironmentSet() ? p.environmentSetIndex() : 0;
     boundClusterSet_ = p.hasClusterSet() ? p.clusterSetIndex() : 0;
+    boundPerDrawSet_ = p.hasPerDrawSet() ? p.perDrawSetIndex() : 0;
     boundPushStages_ = p.pushConstantStages();
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
     // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
@@ -255,6 +258,22 @@ void VulkanCommandBuffer::BindLightClusters(IBuffer& clusters, IBuffer& lightInd
                                boundClusterSet_, 3, writes);
 }
 
+void VulkanCommandBuffer::BindPerDrawData(IBuffer& perDraw) {
+    // Slice BM — push the MDI per-draw storage buffer (PerDraw[ ] = {model mat4, float4 material}) into
+    // the dedicated per-draw set (set 2) of the bound GRAPHICS pipeline, inline via
+    // vkCmdPushDescriptorSetKHR (same mechanism BindLightClusters/BindStorageBuffer use) — VERTEX stage
+    // so lit_mdi.vert reads PerDraw[gl_DrawID]. Binding 0 matches the per-draw set layout.
+    auto& b = static_cast<VulkanBuffer&>(perDraw);
+    VkDescriptorBufferInfo info{b.handle(), 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write.pBufferInfo = &info;
+    device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                               boundPerDrawSet_, 1, &write);
+}
+
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     vkCmdDraw(cmd_, vertexCount, 1, firstVertex, 0);
 }
@@ -276,6 +295,18 @@ void VulkanCommandBuffer::DrawIndexedIndirect(IBuffer& argsBuffer, size_t offset
     // One draw (drawCount=1, stride=0). The compute shader wrote instanceCount = survivor count.
     auto& b = static_cast<VulkanBuffer&>(argsBuffer);
     vkCmdDrawIndexedIndirect(cmd_, b.handle(), (VkDeviceSize)offset, /*drawCount=*/1, /*stride=*/0);
+}
+
+void VulkanCommandBuffer::DrawIndexedMultiIndirect(IBuffer& argsBuffer, uint32_t drawCount,
+                                                   uint32_t stride) {
+    // Slice BM — GPU-driven MULTI-draw: ONE vkCmdDrawIndexedIndirect issues `drawCount` indexed draws,
+    // each reading its VkDrawIndexedIndirectCommand from `argsBuffer` at byte i*stride. The per-draw
+    // model matrix + material are read by the vertex shader as PerDraw[gl_DrawID] (SPIR-V DrawIndex,
+    // enabled via the device's shaderDrawParameters feature). This is the TRUE multi-draw batching: a
+    // 144-object scene becomes a single draw call. multiDrawIndirect is a core feature on the engine's
+    // target devices; drawCount<=maxDrawIndirectCount (validated by the layer).
+    auto& b = static_cast<VulkanBuffer&>(argsBuffer);
+    vkCmdDrawIndexedIndirect(cmd_, b.handle(), /*offset=*/0, drawCount, stride);
 }
 
 void VulkanCommandBuffer::PushConstants(const void* data, uint32_t size) {

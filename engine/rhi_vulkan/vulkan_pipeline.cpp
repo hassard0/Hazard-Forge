@@ -9,7 +9,7 @@ namespace hf::rhi::vk {
 VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc)
     : device_(device.device()), hasFrameSet_(desc.usesFrameUniforms),
       hasJointSet_(desc.usesJointPalette), hasEnvironmentSet_(desc.usesEnvironment),
-      hasClusterSet_(desc.usesLightClusters) {
+      hasClusterSet_(desc.usesLightClusters), hasPerDrawSet_(desc.usesPerDrawData) {
     auto* vs = static_cast<VulkanShaderModule*>(desc.vertex);
     auto* fs = static_cast<VulkanShaderModule*>(desc.fragment);
 
@@ -163,10 +163,11 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
                                               : device.materialSetLayout());     // set 1
     else if (desc.usesEnvironment || desc.usesLightClusters)
         setLayouts.push_back(device.materialSetLayout());                        // set 1 placeholder (env/cluster)
-    // set 2: the joint palette, OR (for the IBL / clustered pipelines, which have no skinning but
-    // need set 3 to sit at index 3) a harmless placeholder so descriptor sets stay at consecutive
-    // indices.
+    // set 2: the joint palette, OR the MDI per-draw SSBO set (Slice BM), OR (for the IBL / clustered
+    // pipelines, which have no skinning but need set 3 to sit at index 3) a harmless placeholder so
+    // descriptor sets stay at consecutive indices.
     if (desc.usesJointPalette) setLayouts.push_back(device.jointPaletteSetLayout()); // set 2
+    else if (desc.usesPerDrawData) setLayouts.push_back(device.perDrawSetLayout());  // set 2 (MDI per-draw)
     else if (desc.usesEnvironment || desc.usesLightClusters)
         setLayouts.push_back(device.jointPaletteSetLayout());                       // set 2 placeholder
     // set 3: the dedicated HDR environment set (Slice R) OR the clustered-lighting set (Slice AG).

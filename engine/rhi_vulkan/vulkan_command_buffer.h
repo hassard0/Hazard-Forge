@@ -41,11 +41,13 @@ public:
     void BindEnvironment(ITexture& env) override;
     void BindReflectionProbe(ITexture& probeAtlas) override;
     void BindLightClusters(IBuffer& clusters, IBuffer& lightIndices, IBuffer& lights) override;
+    void BindPerDrawData(IBuffer& perDraw) override;
     void Draw(uint32_t vertexCount, uint32_t firstVertex) override;
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset) override;
     void DrawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
                               int32_t vertexOffset, uint32_t firstInstance) override;
     void DrawIndexedIndirect(IBuffer& argsBuffer, size_t offset) override;
+    void DrawIndexedMultiIndirect(IBuffer& argsBuffer, uint32_t drawCount, uint32_t stride) override;
     void PushConstants(const void* data, uint32_t size) override;
     void SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) override;
     void SetViewport(int32_t x, int32_t y, uint32_t width, uint32_t height) override;
@@ -70,6 +72,7 @@ private:
     uint32_t boundMaterialSet_ = 0;  // set index for BindTexture; from the bound pipeline
     uint32_t boundEnvironmentSet_ = 0;  // set index for BindEnvironment (set 3); 0 = pipeline has none
     uint32_t boundClusterSet_ = 0;      // set index for BindLightClusters (set 3); 0 = pipeline has none
+    uint32_t boundPerDrawSet_ = 0;      // set index for BindPerDrawData (set 2, Slice BM); 0 = none
     uint32_t boundPushStages_ = VK_SHADER_STAGE_VERTEX_BIT;  // stages PushConstants targets
     VkPipelineLayout boundComputeLayout_ = VK_NULL_HANDLE;  // for compute push-constants/descriptors
 };

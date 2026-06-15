@@ -15,9 +15,9 @@
       2. Mac / Metal (headless, over SSH on the LAN)
          - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked goldens),
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
-           EACH of the 38 committed Metal goldens run visual_test with its showcase flag and compare
+           EACH of the 39 committed Metal goldens run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 38 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 39 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -57,7 +57,7 @@ $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
 $TarName    = 'hf-verify.tar.gz'
 
-# The 38 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# The 39 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
 # golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
 # path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
 # metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
@@ -92,6 +92,7 @@ $Goldens = @(
     @{ Name = 'taa';           Flag = '--taa' }                  # Slice AP (temporal anti-aliasing)
     @{ Name = 'cull';          Flag = '--cull' }                 # Slice AQ (frustum-culling visualization)
     @{ Name = 'gpu_cull';      Flag = '--gpu-cull' }             # Slice AR (GPU-driven culling + indirect draw)
+    @{ Name = 'mdi';           Flag = '--mdi' }                  # Slice BM (GPU multi-draw-indirect; Metal renders the identical scene per-object)
     @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'hud';           Flag = '--hud' }                 # Slice BA (text / HUD overlay)
@@ -253,7 +254,7 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 `$env:VK_VALIDATION_FEATURE_ENABLE = 'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION'
 # Representative showcases: --shot (GPU particles + shared-base/varied-normal materials, where the
 # UPDATE_AFTER_BIND bug lived) and --csm-shot (cascaded shadow atlas, a heavy multi-pass graph path).
-`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'))
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))
@@ -403,7 +404,7 @@ function Invoke-MacVerify {
     & $scp[0] $scp[1..($scp.Count-1)] $tarPath "${MacUser}@${MacHost}:$MacStage/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
 
-    # 3) extract + build ONCE + loop ALL 38 goldens. To avoid the login shell being zsh and to dodge
+    # 3) extract + build ONCE + loop ALL 39 goldens. To avoid the login shell being zsh and to dodge
     #    PowerShell here-string backtick-escaping fragility, the per-golden loop is generated as a
     #    standalone bash script, scp'd to the Mac, and run with an explicit `bash`. For each
     #    (flag -> golden) pair it renders visual_test <flag> /tmp/hf_<name>.png and compares to
@@ -503,7 +504,7 @@ done <<< "$PAIRS"
         return
     }
     $script:macResult = 'PASS'
-    Write-Host "Mac verification PASSED (all 38 goldens DIFF 0.0000)" -ForegroundColor Green
+    Write-Host "Mac verification PASSED (all 39 goldens DIFF 0.0000)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -524,7 +525,7 @@ function Show($label, $r) {
     Write-Host ("  {0,-22} {1}" -f $label, $r) -ForegroundColor $color
 }
 Show 'Windows / Vulkan (ctest)' $winResult
-Show 'Mac / Metal (38 goldens)'  $macResult
+Show 'Mac / Metal (39 goldens)'  $macResult
 
 # Per-golden Metal table (only when the Mac portion ran).
 if ($script:macGoldenResults -and $script:macGoldenResults.Count -gt 0) {

@@ -72,11 +72,27 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
 
+    // Slice BM (GPU multi-draw-indirect): the MDI vertex shader reads PerDraw[gl_DrawID] via the
+    // SPIR-V DrawIndex builtin, which requires the shaderDrawParameters feature (core in Vulkan 1.1,
+    // exposed through VkPhysicalDeviceVulkan11Features). Enable it here so the device advertises
+    // DrawParameters; without it the validation layer flags the DrawIndex builtin. (multiDrawIndirect
+    // is a core VkPhysicalDeviceFeatures capability available on the engine's target GPUs; the single
+    // vkCmdDrawIndexedIndirect(drawCount=N) uses it.)
+    VkPhysicalDeviceVulkan11Features f11{};
+    f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    f11.shaderDrawParameters = VK_TRUE;
+
+    VkPhysicalDeviceFeatures f10{};
+    f10.multiDrawIndirect = VK_TRUE;
+    f10.drawIndirectFirstInstance = VK_TRUE;
+
     vkb::PhysicalDeviceSelector selector{vkbInstance_};
     auto physRet = selector
         .set_surface(surface_)
         .set_minimum_version(1, 3)
         .set_required_features_13(f13)
+        .set_required_features_11(f11)
+        .set_required_features(f10)
         .select();
     if (!physRet) throw std::runtime_error("GPU select failed: " + physRet.error().message());
 
@@ -287,6 +303,26 @@ void VulkanDevice::CreateTextureResources() {
         clci.pBindings = clusterBindings;
         Check(vkCreateDescriptorSetLayout(device_, &clci, nullptr, &clusterSetLayout_),
               "vkCreateDescriptorSetLayout(cluster)");
+    }
+
+    // --- Per-draw set layout (set 2, Slice BM): ONE VERTEX-stage STORAGE_BUFFER (binding 0) holding
+    // the PerDraw[ ] array (model mat4 + material) the multi-draw-indirect vertex shader reads as
+    // PerDraw[gl_DrawID]. PUSH_DESCRIPTOR so the buffer is bound inline via vkCmdPushDescriptorSetKHR
+    // in BindPerDrawData (no pool — mirrors the cluster/compute SSBO path). Binding 0 matches the HLSL
+    // [[vk::binding(0, 2)]] in lit_mdi.vert. Kept separate from the material/frame/joint/env/cluster
+    // layouts so the existing set 0/1/2 layouts (and the golden-locked pipelines) are unchanged. ---
+    {
+        VkDescriptorSetLayoutBinding perDrawBinding{};
+        perDrawBinding.binding = 0;
+        perDrawBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        perDrawBinding.descriptorCount = 1;
+        perDrawBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        VkDescriptorSetLayoutCreateInfo pdci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        pdci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        pdci.bindingCount = 1;
+        pdci.pBindings = &perDrawBinding;
+        Check(vkCreateDescriptorSetLayout(device_, &pdci, nullptr, &perDrawSetLayout_),
+              "vkCreateDescriptorSetLayout(perDraw)");
     }
 
     // --- Default flat normal map: a 1x1 RGBA8 image encoding the tangent-space normal (0,0,1) as
@@ -615,6 +651,7 @@ void VulkanDevice::DestroyTextureResources() {
     if (pbrMaterialSetLayout_) vkDestroyDescriptorSetLayout(device_, pbrMaterialSetLayout_, nullptr);
     if (environmentSetLayout_) vkDestroyDescriptorSetLayout(device_, environmentSetLayout_, nullptr);
     if (clusterSetLayout_) vkDestroyDescriptorSetLayout(device_, clusterSetLayout_, nullptr);
+    if (perDrawSetLayout_) vkDestroyDescriptorSetLayout(device_, perDrawSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     if (environmentSampler_) vkDestroySampler(device_, environmentSampler_, nullptr);
@@ -623,6 +660,7 @@ void VulkanDevice::DestroyTextureResources() {
     pbrMaterialSetLayout_ = VK_NULL_HANDLE;
     environmentSetLayout_ = VK_NULL_HANDLE;
     clusterSetLayout_ = VK_NULL_HANDLE;
+    perDrawSetLayout_ = VK_NULL_HANDLE;
     defaultSampler_ = VK_NULL_HANDLE;
     shadowSampler_ = VK_NULL_HANDLE;
     environmentSampler_ = VK_NULL_HANDLE;

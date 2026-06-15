@@ -158,6 +158,11 @@ hf_compile_shaders(
     # grid and ORDER-compacts the survivors + writes the indirect draw-args; reuses lit_instanced.vert
     # for the indirect draw. Existing shaders + goldens untouched.
     "shaders/cull.comp.hlsl:cs"
+    # GPU multi-draw-indirect batching (Slice BM): the MDI lit vertex shader reads the per-draw model
+    # matrix + material from a storage buffer indexed by gl_DrawID (SPIR-V DrawIndex). VULKAN-ONLY (the
+    # DrawIndex builtin needs shaderDrawParameters); shares the existing lit.frag. Not in the Metal MSL
+    # gen list (glslc can't lower DrawIndex; the Metal golden uses the per-object path).
+    "shaders/lit_mdi.vert.hlsl:vs"
     # Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like
     # SSR, then view->world via invView), projects it into the decal box, and alpha-blends the decal

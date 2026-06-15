@@ -50,7 +50,7 @@ Mesh BuildMesh(rhi::IRHIDevice& device,
 
 } // namespace
 
-Mesh Mesh::Cube(rhi::IRHIDevice& device) {
+MeshGeometry CubeGeometry() {
     // 24 vertices (4 per face) so each face carries its own UV square + tint.
     // Faces wound CCW outward (RH); UVs per face: (0,0)(1,0)(1,1)(0,1).
     // tangent (location 4) = object-space dP/du, i.e. the direction of increasing U along the
@@ -99,7 +99,17 @@ Mesh Mesh::Cube(rhi::IRHIDevice& device) {
         tri[3] = base + 0; tri[4] = base + 2; tri[5] = base + 3;
     }
 
-    return BuildMesh(device, verts, sizeof(verts), indices, sizeof(indices), 36);
+    MeshGeometry g;
+    g.verts.assign(verts, verts + 24);
+    g.indices.assign(indices, indices + 36);
+    return g;
+}
+
+Mesh Mesh::Cube(rhi::IRHIDevice& device) {
+    MeshGeometry g = CubeGeometry();
+    return BuildMesh(device, g.verts.data(), g.verts.size() * sizeof(Vertex),
+                     g.indices.data(), g.indices.size() * sizeof(uint32_t),
+                     static_cast<uint32_t>(g.indices.size()));
 }
 
 Mesh Mesh::Plane(rhi::IRHIDevice& device) {
@@ -121,7 +131,7 @@ Mesh Mesh::Plane(rhi::IRHIDevice& device) {
     return BuildMesh(device, verts, sizeof(verts), indices, sizeof(indices), 6);
 }
 
-Mesh Mesh::Sphere(rhi::IRHIDevice& device, uint32_t segments, uint32_t rings) {
+MeshGeometry SphereGeometry(uint32_t segments, uint32_t rings) {
     // UV sphere of radius 0.5 centered at the origin.
     //   ring  (latitude)  0..rings    : 0 = +Y pole, rings = -Y pole
     //   seg   (longitude) 0..segments : wraps around, with a duplicated seam
@@ -179,10 +189,18 @@ Mesh Mesh::Sphere(rhi::IRHIDevice& device, uint32_t segments, uint32_t rings) {
         }
     }
 
+    MeshGeometry g;
+    g.verts = std::move(verts);
+    g.indices = std::move(indices);
+    return g;
+}
+
+Mesh Mesh::Sphere(rhi::IRHIDevice& device, uint32_t segments, uint32_t rings) {
+    MeshGeometry g = SphereGeometry(segments, rings);
     return BuildMesh(device,
-                     verts.data(), verts.size() * sizeof(Vertex),
-                     indices.data(), indices.size() * sizeof(uint32_t),
-                     static_cast<uint32_t>(indices.size()));
+                     g.verts.data(), g.verts.size() * sizeof(Vertex),
+                     g.indices.data(), g.indices.size() * sizeof(uint32_t),
+                     static_cast<uint32_t>(g.indices.size()));
 }
 
 } // namespace hf::scene
