@@ -24,6 +24,7 @@ public:
     void BindInstanceBuffer(IBuffer& buffer) override;
     void BindIndexBuffer(IBuffer& buffer) override;
     void BindTexture(ITexture& texture) override;
+    void BindTexturePair(ITexture& primary, ITexture& secondary) override;
     void BindMaterial(ITexture& base, ITexture& normalMap) override;
     void BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
                          ITexture& emissive, ITexture& occlusion) override;
@@ -54,6 +55,7 @@ private:
     id<MTLBuffer>              indexBuffer_ = nil;  // stored by BindIndexBuffer; used by DrawIndexed
     bool boundFrameUniforms_ = false;  // current pipeline declares the per-frame UBO
     bool boundPointList_ = false;      // current graphics pipeline draws points (particles)
+    bool boundFragmentPushConst_ = false;  // current pipeline reads push constants in fragment (bloom)
     uint32_t computeThreadsPerGroup_ = 64;  // [numthreads(64,1,1)] in particles.comp.hlsl
     uint32_t width_ = 0;
     uint32_t height_ = 0;

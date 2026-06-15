@@ -772,6 +772,294 @@ static int RunIblShowcase(const char* outPath) {
     return 0;
 }
 
+// --- HDR bloom showcase (Slice U). Mirrors the Vulkan --bloom-shot path: the HDR-IBL helmet scene
+// rendered into an HDR (RGBA16F) render target, then a threshold -> 5-mip downsample -> tent
+// upsample/combine bloom chain, then composite (add bloom + the post.frag tonemap/grade) to the LDR
+// swapchain. The HDR sun + the helmet's emissive cyan gauge bloom; the rest stays sharp. The bloom
+// MSL is generated from the shared HLSL by the sibling CMake gen rules; per-pass params bind at the
+// fragment push-constant slot. -----------------------------------------------------------------
+static int RunBloomShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+    const float envMaxLod = (float)(env.mipLevels - 1);
+
+    // Scene pipelines, but writing the HDR (RGBA16F) target.
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto iblFs = loadMSL("lit_pbr_ibl.frag.gen.metal", "pbr_ibl_fragment");
+    rhi::GraphicsPipelineDesc iblDesc;
+    iblDesc.vertex = litVs.get(); iblDesc.fragment = iblFs.get();
+    iblDesc.vertexLayout = scene::MeshVertexLayout();
+    iblDesc.colorFormat = kHdr;
+    iblDesc.depthTest = true; iblDesc.usesFrameUniforms = true;
+    iblDesc.usesTexture = true; iblDesc.pbrMaterial = true; iblDesc.usesEnvironment = true;
+    iblDesc.pushConstantSize = sizeof(float) * 20;
+    auto iblPipeline = device->CreateGraphicsPipeline(iblDesc);
+
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky_hdr.frag.gen.metal", "sky_hdr_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    skyD.usesEnvironment = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // Bloom pipelines (fullscreen, fragment push constants).
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct BloomParams { float texel[2]; float threshold; float knee; float strength; float intensity; };
+    const uint32_t kBloomPC = sizeof(BloomParams);
+    auto makeBloomPipe = [&](rhi::IShaderModule* fs, rhi::Format colorFmt) {
+        rhi::GraphicsPipelineDesc d;
+        d.vertex = postVs.get(); d.fragment = fs;
+        d.colorFormat = colorFmt;
+        d.depthTest = false; d.usesFrameUniforms = false;
+        d.usesTexture = true; d.fullscreen = true;
+        d.fragmentPushConstants = true; d.pushConstantSize = kBloomPC;
+        return device->CreateGraphicsPipeline(d);
+    };
+    auto prefilterFs = loadMSL("bloom_prefilter.frag.gen.metal", "bloom_prefilter_fragment");
+    auto downsampleFs = loadMSL("bloom_downsample.frag.gen.metal", "bloom_downsample_fragment");
+    auto upsampleFs  = loadMSL("bloom_upsample.frag.gen.metal", "bloom_upsample_fragment");
+    auto compositeFs = loadMSL("bloom_composite.frag.gen.metal", "bloom_composite_fragment");
+    auto prefilterPipe = makeBloomPipe(prefilterFs.get(), kHdr);
+    auto downsamplePipe = makeBloomPipe(downsampleFs.get(), kHdr);
+    auto upsamplePipe  = makeBloomPipe(upsampleFs.get(), kHdr);
+    auto compositePipe = makeBloomPipe(compositeFs.get(), device->Swapchain().ColorFormat());
+
+    auto rt = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const int kMips = 5;
+    std::vector<std::unique_ptr<rhi::IRenderTarget>> down, up;
+    std::vector<uint32_t> mw(kMips), mh(kMips);
+    for (int i = 0; i < kMips; ++i) {
+        uint32_t dw = std::max(1u, W >> (i + 1));
+        uint32_t dh = std::max(1u, H >> (i + 1));
+        mw[i] = dw; mh[i] = dh;
+        down.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+        up.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+    }
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+    const float scaleS = 1.6f;
+    Mat4 helmetModel = Mat4::Translate({0.0f, scaleS * 1.0f, 0.0f})
+                     * Mat4::RotateX(1.5707963f) * Mat4::Scale({scaleS, scaleS, scaleS});
+    Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+    const Vec3 eye{3.0f, 2.4f, 4.0f};
+    const Vec3 center{0.0f, 1.2f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.2f, 0.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 12.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 25.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up3 = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+        fd.skyParams[2] = envMaxLod;
+    }
+
+    const float kExposure = 1.7f;
+    const float kThreshold = 1.0f;
+    const float kKnee = 0.6f;
+    const float kUpStrength = 1.0f;
+    const float kBloomStrength = 0.14f;
+    auto mkPC = [&](uint32_t tw, uint32_t th, float strength) {
+        BloomParams p{}; p.texel[0] = 1.0f / (float)tw; p.texel[1] = 1.0f / (float)th;
+        p.threshold = kThreshold; p.knee = kKnee; p.strength = strength; p.intensity = kExposure;
+        return p;
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    std::vector<render::RgResource> rgDown(kMips), rgUp(kMips);
+    for (int i = 0; i < kMips; ++i) {
+        rgDown[i] = graph.ImportTarget("down" + std::to_string(i),
+                                       render::RgResourceKind::SceneColor, *down[i]);
+        rgUp[i]   = graph.ImportTarget("up" + std::to_string(i),
+                                       render::RgResourceKind::SceneColor, *up[i]);
+    }
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*shadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(helmet.mesh.vertices());
+            cmd.BindIndexBuffer(helmet.mesh.indices());
+            cmd.DrawIndexed(helmet.mesh.indexCount());
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.BindEnvironment(*env.equirect);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindPipeline(*iblPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                    *helmet.emissive, *helmet.occlusion);
+                cmd.BindEnvironment(*env.equirect);
+                cmd.BindVertexBuffer(helmet.mesh.vertices());
+                cmd.BindIndexBuffer(helmet.mesh.indices());
+                cmd.DrawIndexed(helmet.mesh.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("prefilter", {rgScene}, {rgDown[0]},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            BloomParams p = mkPC(W, H, kBloomStrength);
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*prefilterPipe);
+            cmd.BindTexture(*rt);
+            cmd.PushConstants(&p, sizeof(p));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    for (int i = 1; i < kMips; ++i) {
+        graph.AddPass("down" + std::to_string(i), {rgDown[i - 1]}, {rgDown[i]},
+            [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                BloomParams p = mkPC(mw[i - 1], mh[i - 1], kUpStrength);
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*downsamplePipe);
+                cmd.BindTexture(*down[i - 1]);
+                cmd.PushConstants(&p, sizeof(p));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+    }
+
+    graph.AddPass("upTop", {rgDown[kMips - 1]}, {rgUp[kMips - 1]},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            BloomParams p = mkPC(mw[kMips - 1], mh[kMips - 1], 0.0f);
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*upsamplePipe);
+            cmd.BindTexturePair(*down[kMips - 1], *down[kMips - 1]);
+            cmd.PushConstants(&p, sizeof(p));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    for (int i = kMips - 2; i >= 0; --i) {
+        graph.AddPass("up" + std::to_string(i), {rgUp[i + 1], rgDown[i]}, {rgUp[i]},
+            [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                BloomParams p = mkPC(mw[i + 1], mh[i + 1], kUpStrength);
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*upsamplePipe);
+                cmd.BindTexturePair(*up[i + 1], *down[i]);
+                cmd.PushConstants(&p, sizeof(p));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+    }
+
+    graph.AddPass("composite", {rgScene, rgUp[0]}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            BloomParams p = mkPC(W, H, kBloomStrength);
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*compositePipe);
+            cmd.BindTexturePair(*rt, *up[0]);
+            cmd.PushConstants(&p, sizeof(p));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — HDR bloom, %d mips\n", outPath, cw, ch, kMips);
+    return 0;
+}
+
 // --- GPU-instanced showcase (Slice Q). Mirrors the Vulkan --instanced-shot path: ground plane +
 // procedural sky + a 12x12 = 144 field of spheres drawn in ONE DrawIndexedInstanced, each placed by
 // its per-instance model matrix from a second per-instance vertex stream (binding 1), lit + shadowed
@@ -1462,6 +1750,13 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ibl") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ibl.png";
             try { return RunIblShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --bloom <out.png>: render the HDR bloom showcase (Slice U) — the HDR-IBL helmet scene into
+        // an HDR RT, then the threshold/downsample/upsample bloom chain + composite/tonemap.
+        if (argc > 1 && std::strcmp(argv[1], "--bloom") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_bloom.png";
+            try { return RunBloomShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --transparency <out.png>: render the alpha-blended transparency showcase (Slice T) —

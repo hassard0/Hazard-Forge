@@ -88,6 +88,13 @@ hf_gen_msl(transparent.vert transparent.vert.hlsl vert transparent_vertex)
 hf_gen_msl(transparent.frag transparent.frag.hlsl frag transparent_fragment)
 hf_gen_msl(post.vert   post.vert.hlsl   vert post_vertex)
 hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
+# HDR bloom chain (Slice U): bright-pass, downsample, tent upsample, composite/tonemap. All
+# fullscreen fragment shaders reusing post.vert; each reads its per-pass params from a fragment
+# push constant (a HF_MSL_GEN cbuffer at the bloom push-const slot here).
+hf_gen_msl(bloom_prefilter.frag  bloom_prefilter.frag.hlsl  frag bloom_prefilter_fragment)
+hf_gen_msl(bloom_downsample.frag bloom_downsample.frag.hlsl frag bloom_downsample_fragment)
+hf_gen_msl(bloom_upsample.frag   bloom_upsample.frag.hlsl   frag bloom_upsample_fragment)
+hf_gen_msl(bloom_composite.frag  bloom_composite.frag.hlsl  frag bloom_composite_fragment)
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
 hf_gen_msl(sky.vert    sky.vert.hlsl    vert sky_vertex)
 hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)

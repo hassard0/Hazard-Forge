@@ -1,5 +1,34 @@
 # Metal golden-image test
 
+## `bloom.png` — HDR bloom (Slice U)
+
+`bloom.png` is a SEPARATE golden produced by `visual_test --bloom`: the same HDR-IBL helmet scene as
+`--ibl`, but rendered into an **HDR `RGBA16_Float` render target** so highlights keep values >1, then
+run through a true bloom chain — a soft-knee **threshold** bright-pass, a 5-level progressively
+half-res **downsample** mip chain (13-tap COD/Jimenez dual filter), a 3×3 tent-filter
+**upsample/combine** back up, and a **composite** that adds the bloom and applies the *same*
+exposure/ACES/grade/grain/vignette as `post.frag`, writing the LDR swapchain. The HDR sun and the
+helmet's emissive cyan gauge bloom (soft halo); the rest of the frame stays sharp.
+
+New RHI: `IRHIDevice::CreateRenderTarget(w, h, Format)` (the 2-arg overload delegates with
+`Format::Undefined` → swapchain format, byte-for-byte unchanged); `GraphicsPipelineDesc.fragmentPushConstants`
+(widens the push-constant range to VERTEX|FRAGMENT so the fullscreen bloom passes read per-pass params
+in the fragment stage — default false leaves every existing pipeline's layout unchanged); and
+`ICommandBuffer::BindTexturePair(primary, secondary)` (binds two sampled images into one material set —
+base slot + the second/normal slot — so the composite samples HDR scene + bloom together). On Metal the
+RT uses `MTLPixelFormatRGBA16Float`; the bloom MSL is generated from the shared HLSL (`bloom_*.frag.hlsl`)
+and the fragment push constant binds at `kFbPushConst=1`. Deterministic — two `--bloom` runs diff
+`0.0000`. This golden is INDEPENDENT of all the others, which are unchanged (all still diff `0.0000`).
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --bloom /tmp/bloom.png
+~/mac-remote-rig/compare.sh tests/golden/metal/bloom.png /tmp/bloom.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `ibl_helmet.png` — HDR environment IBL (Slice R)
 
 `ibl_helmet.png` is a SEPARATE golden produced by `visual_test --ibl`: a minimal HDR

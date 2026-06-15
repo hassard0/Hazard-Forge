@@ -9,7 +9,7 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
     : usesFrameUniforms_(desc.usesFrameUniforms), usesTexture_(desc.usesTexture),
       usesJointPalette_(desc.usesJointPalette),
       fullscreen_(desc.fullscreen), depthOnly_(desc.depthOnly), pointList_(desc.pointList),
-      cullNone_(desc.cullNone) {
+      cullNone_(desc.cullNone), fragmentPushConstants_(desc.fragmentPushConstants) {
     id<MTLDevice> dev = device.device();
 
     auto* vs = static_cast<MetalShaderModule*>(desc.vertex);

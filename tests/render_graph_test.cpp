@@ -54,6 +54,7 @@ public:
     std::unique_ptr<rhi::IBuffer> CreateBuffer(const rhi::BufferDesc&) override { return nullptr; }
     std::unique_ptr<rhi::ITexture> CreateTexture(const rhi::TextureDesc&) override { return nullptr; }
     std::unique_ptr<rhi::IRenderTarget> CreateRenderTarget(uint32_t, uint32_t) override { return nullptr; }
+    std::unique_ptr<rhi::IRenderTarget> CreateRenderTarget(uint32_t, uint32_t, rhi::Format) override { return nullptr; }
     std::unique_ptr<rhi::IRenderTarget> CreateShadowMap(uint32_t) override { return nullptr; }
 
     rhi::FrameContext BeginShadowPass(rhi::IRenderTarget&) override {

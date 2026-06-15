@@ -69,6 +69,12 @@ struct GraphicsPipelineDesc {
     bool usesTexture = false;        // when true, layout includes the material set (set 1)
     bool usesJointPalette = false;   // when true, layout includes the skinning joint-palette set (set 2)
     bool fullscreen = false;         // when true: no vertex input (fullscreen triangle from SV_VertexID)
+    bool fragmentPushConstants = false;  // when true: the push-constant range is visible to the
+                                     // FRAGMENT stage (in addition to vertex), so a fullscreen
+                                     // fragment pass (e.g. the bloom chain, Slice U) can read its
+                                     // per-pass params from a push constant. Default false keeps
+                                     // the range vertex-only, so every existing pipeline's layout
+                                     // is byte-for-byte unchanged.
     bool depthOnly = false;          // when true: no color attachment; depth write + bias (shadow pass)
     bool pointList = false;          // when true: POINT_LIST topology (GPU particles drawn as points)
     bool additiveBlend = false;      // when true: additive color blend (glowing particles over scene)
@@ -149,6 +155,13 @@ public:
     virtual void BindInstanceBuffer(IBuffer& /*buffer*/) {}
     virtual void BindIndexBuffer(IBuffer& buffer) = 0;
     virtual void BindTexture(ITexture& texture) = 0;
+    // Bind TWO sampled images at once into a single material set: `primary` at the base slot
+    // (binding 0/1) and `secondary` at the second material slot (binding 3/4) — the same two slots
+    // BindMaterial uses for base+normal. The HDR bloom composite (Slice U) uses this to sample the
+    // HDR scene (primary) and the bloom result (secondary) in one fullscreen pass. Both arguments
+    // may be render targets. Default forwards to BindTexture(primary) so passes/backends that do not
+    // implement the second slot still bind the primary image.
+    virtual void BindTexturePair(ITexture& primary, ITexture& /*secondary*/) { BindTexture(primary); }
     // Bind a material: base-color texture at the material slot AND a tangent-space normal map at the
     // second material slot (material set binding 2/3 on Vulkan; Metal texture(3)/sampler(4)). The lit
     // pass uses this so a normal map can perturb the shading normal. Default forwards to BindTexture
@@ -236,6 +249,14 @@ public:
 
     // Offscreen render target: a sampleable color image (swapchain format) + its own depth.
     virtual std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) = 0;
+
+    // Offscreen render target with an EXPLICIT color format (Slice U: an HDR RGBA16_Float target
+    // for the bloom chain). Format::Undefined selects the swapchain color format, so this is
+    // identical to the 2-arg overload above (which delegates here with Undefined) — existing call
+    // sites are byte-for-byte unchanged. RGBA16_Float yields a renderable + sampleable half-float
+    // HDR color image (COLOR_ATTACHMENT | SAMPLED); the depth image stays D32.
+    virtual std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height,
+                                                              Format colorFormat) = 0;
 
     // Depth-only sampleable shadow map (size x size, D32, DEPTH_STENCIL_ATTACHMENT | SAMPLED).
     // Rendered into via Begin/EndShadowPass; sampled by the lit pass via the per-frame set (set 0).

@@ -4,6 +4,7 @@
 #include "rhi_vulkan/vulkan_compute_pipeline.h"
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
+#include "rhi_vulkan/vulkan_render_target.h"
 #include "rhi_vulkan/vulkan_sampled.h"
 #include "rhi_vulkan/vk_common.h"
 
@@ -60,6 +61,7 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     boundLayout_ = p.layout();
     boundMaterialSet_ = p.materialSetIndex();
     boundEnvironmentSet_ = p.hasEnvironmentSet() ? p.environmentSetIndex() : 0;
+    boundPushStages_ = p.pushConstantStages();
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
     // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
     // (frameIndex_ matches the UBO SetFrameUniforms wrote this frame — see VulkanDevice.)
@@ -103,6 +105,24 @@ void VulkanCommandBuffer::BindTexture(ITexture& texture) {
     auto* sampled = dynamic_cast<ISampledVk*>(&texture);
     VkDescriptorSet s = sampled ? sampled->vkDescriptorSet() : VK_NULL_HANDLE;
     // Material set index is whatever the bound pipeline put it at (1 behind a frame set, else 0).
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundMaterialSet_, 1, &s, 0, nullptr);
+}
+
+void VulkanCommandBuffer::BindTexturePair(ITexture& primary, ITexture& secondary) {
+    // The primary RT owns a material set (binding 0 = its color). Repoint its second slot (binding 3)
+    // at the secondary image's view, then bind the one set so the fragment shader sees primary at
+    // gTex (binding 0) and secondary at gTex2 (binding 3). Used by the bloom composite (Slice U).
+    auto* primaryRT = dynamic_cast<VulkanRenderTarget*>(&primary);
+    auto* secSampled = dynamic_cast<ISampledVk*>(&secondary);
+    VkImageView secView = VK_NULL_HANDLE;
+    if (auto* secRT = dynamic_cast<VulkanRenderTarget*>(&secondary)) secView = secRT->colorView();
+    if (primaryRT && secView) primaryRT->attachSecondaryColor(secView);
+    VkDescriptorSet s = (primaryRT) ? primaryRT->vkDescriptorSet()
+                                    : (dynamic_cast<ISampledVk*>(&primary)
+                                           ? dynamic_cast<ISampledVk*>(&primary)->vkDescriptorSet()
+                                           : VK_NULL_HANDLE);
+    (void)secSampled;
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                             boundMaterialSet_, 1, &s, 0, nullptr);
 }
@@ -154,7 +174,9 @@ void VulkanCommandBuffer::DrawIndexedInstanced(uint32_t indexCount, uint32_t ins
 }
 
 void VulkanCommandBuffer::PushConstants(const void* data, uint32_t size) {
-    vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, size, data);
+    // Push to whatever stages the bound pipeline's range covers: VERTEX for every geometry pass,
+    // VERTEX|FRAGMENT for the bloom fullscreen passes (Slice U) whose params are read in fragment.
+    vkCmdPushConstants(cmd_, boundLayout_, boundPushStages_, 0, size, data);
 }
 
 void VulkanCommandBuffer::SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {

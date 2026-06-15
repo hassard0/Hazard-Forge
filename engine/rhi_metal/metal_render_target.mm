@@ -5,15 +5,19 @@
 namespace hf::rhi::mtl {
 
 MetalRenderTarget::MetalRenderTarget(MetalDevice& device, uint32_t width, uint32_t height,
-                                     bool depthOnly)
+                                     bool depthOnly, Format colorFormat)
     : width_(width), height_(height), depthOnly_(depthOnly) {
     id<MTLDevice> dev = device.device();
 
     if (!depthOnly_) {
-        // Color: BGRA8 (matches the headless swapchain format so the lit pipeline renders into it
-        // unchanged), usage = render target + shader read (so the post pass can sample it).
+        // Color: BGRA8 by default (matches the headless swapchain format so the lit pipeline renders
+        // into it unchanged); RGBA16Float for the HDR bloom chain (Slice U). Usage = render target +
+        // shader read (so a later fullscreen pass can sample it).
+        const MTLPixelFormat colorPF = (colorFormat == Format::Undefined)
+                                           ? MTLPixelFormatBGRA8Unorm
+                                           : ToMetalPixelFormat(colorFormat);
         MTLTextureDescriptor* cd = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            texture2DDescriptorWithPixelFormat:colorPF
                                          width:width
                                         height:height
                                      mipmapped:NO];

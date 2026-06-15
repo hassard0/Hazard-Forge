@@ -742,6 +742,10 @@ std::unique_ptr<ITexture> VulkanDevice::CreateTexture(const TextureDesc& d) {
 std::unique_ptr<IRenderTarget> VulkanDevice::CreateRenderTarget(uint32_t w, uint32_t h) {
     return std::make_unique<VulkanRenderTarget>(*this, w, h);
 }
+std::unique_ptr<IRenderTarget> VulkanDevice::CreateRenderTarget(uint32_t w, uint32_t h,
+                                                                Format colorFormat) {
+    return std::make_unique<VulkanRenderTarget>(*this, w, h, /*depthOnly=*/false, colorFormat);
+}
 std::unique_ptr<IRenderTarget> VulkanDevice::CreateShadowMap(uint32_t size) {
     return std::make_unique<VulkanRenderTarget>(*this, size, size, /*depthOnly=*/true);
 }

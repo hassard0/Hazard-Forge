@@ -174,6 +174,7 @@ int main(int argc, char** argv) {
     const char* skinningShotPath = nullptr;
     const char* pbrShotPath = nullptr;
     const char* iblShotPath = nullptr;
+    const char* bloomShotPath = nullptr;
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
     const char* transparencyShotPath = nullptr;
@@ -191,6 +192,11 @@ int main(int argc, char** argv) {
             // Render one frame of the HDR-IBL showcase (HDR equirect skybox + DamagedHelmet shaded by
             // lit_pbr_ibl so the metal reflects the real captured sky/sun/terrain), write a BMP, exit.
             iblShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--bloom-shot") == 0 && i + 1 < argc) {
+            // Slice U: render the HDR-IBL helmet showcase into an HDR (RGBA16F) render target, run a
+            // threshold->downsample->upsample bloom chain on half-res HDR mips, then composite the
+            // bloom + tonemap to the swapchain. The HDR sun and the helmet's emissive gauge bloom.
+            bloomShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--skinning-shot") == 0 && i + 1 < argc) {
             // Render one frame of the skinned-Fox showcase (ground + skybox + GPU-skinned Fox at
             // animation "Survey" t=0.5s, lit + shadowed), write a BMP, exit.
@@ -987,6 +993,322 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %zu glass + %zu opaque\n",
                                     transparencyShotPath, cw, ch2, glass.size(), opaques.size());
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", transparencyShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- HDR bloom showcase (--bloom-shot, Slice U): the SAME HDR-IBL helmet scene as --ibl-shot,
+        // but rendered into an HDR (RGBA16F) render target so highlights keep values >1, then run
+        // through a true bloom chain — threshold bright-pass -> 5 progressively half-res HDR mips
+        // (13-tap downsample) -> tent-filter upsample/combine back up -> composite that adds the
+        // bloom and applies the same exposure/ACES/grade/grain/vignette as post.frag, writing the LDR
+        // swapchain. The HDR sun and the helmet's emissive cyan gauge bloom (soft halo); the rest of
+        // the frame stays sharp. SEPARATE HDR pipelines + bloom shaders; nothing existing is touched.
+        if (bloomShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+            hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+            const float envMaxLod = (float)(env.mipLevels - 1);
+
+            // --- Scene pipelines, but writing the HDR (RGBA16F) target. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto iblFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr_ibl.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto iblFs = device->CreateShaderModule({std::span<const uint32_t>(iblFsWords)});
+            rhi::GraphicsPipelineDesc iblDesc;
+            iblDesc.vertex = litVs.get(); iblDesc.fragment = iblFs.get();
+            iblDesc.vertexLayout = scene::MeshVertexLayout();
+            iblDesc.colorFormat = kHdr;            // HDR scene target
+            iblDesc.depthTest = true; iblDesc.usesFrameUniforms = true;
+            iblDesc.usesTexture = true; iblDesc.pbrMaterial = true; iblDesc.usesEnvironment = true;
+            iblDesc.pushConstantSize = sizeof(float) * 20;
+            auto iblPipeline = device->CreateGraphicsPipeline(iblDesc);
+
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;            // HDR scene target
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shadowVs.get(); shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky_hdr.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;               // HDR scene target
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            skyD.usesEnvironment = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- Bloom pipelines (all fullscreen, fragment push constants). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct BloomParams { float texel[2]; float threshold; float knee; float strength; float intensity; };
+            const uint32_t kBloomPC = sizeof(BloomParams);
+
+            auto makeBloomPipe = [&](rhi::IShaderModule* fs, rhi::Format colorFmt) {
+                rhi::GraphicsPipelineDesc d;
+                d.vertex = postVsM.get(); d.fragment = fs;
+                d.colorFormat = colorFmt;
+                d.depthTest = false; d.usesFrameUniforms = false;
+                d.usesTexture = true; d.fullscreen = true;
+                d.fragmentPushConstants = true; d.pushConstantSize = kBloomPC;
+                return device->CreateGraphicsPipeline(d);
+            };
+            auto prefilterFs = loadFs("bloom_prefilter.frag.hlsl");
+            auto downsampleFs = loadFs("bloom_downsample.frag.hlsl");
+            auto upsampleFs  = loadFs("bloom_upsample.frag.hlsl");
+            auto compositeFs = loadFs("bloom_composite.frag.hlsl");
+            auto prefilterPipe = makeBloomPipe(prefilterFs.get(), kHdr);
+            auto downsamplePipe = makeBloomPipe(downsampleFs.get(), kHdr);
+            auto upsamplePipe  = makeBloomPipe(upsampleFs.get(), kHdr);
+            // Composite writes the LDR swapchain.
+            auto compositePipe = makeBloomPipe(compositeFs.get(), device->Swapchain().ColorFormat());
+
+            // --- Render targets: HDR scene + a 5-level half-res HDR mip chain (down + up). ---
+            auto rt = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            const int kMips = 5;
+            std::vector<std::unique_ptr<rhi::IRenderTarget>> down, up;
+            std::vector<uint32_t> mw(kMips), mh(kMips);
+            for (int i = 0; i < kMips; ++i) {
+                uint32_t dw = std::max(1u, w >> (i + 1));   // start at half res
+                uint32_t dh = std::max(1u, h >> (i + 1));
+                mw[i] = dw; mh[i] = dh;
+                down.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+                up.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+            }
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+            const float scaleS = 1.6f;
+            Mat4 helmetModel = Mat4::Translate({0.0f, scaleS * 1.0f, 0.0f})
+                             * Mat4::RotateX(1.5707963f) * Mat4::Scale({scaleS, scaleS, scaleS});
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+            const Vec3 eye{3.0f, 2.4f, 4.0f};
+            const Vec3 center{0.0f, 1.2f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.2f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 25.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up3 = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+                fd.skyParams[2] = envMaxLod;
+            }
+
+            // Bloom tuning. threshold/knee in exposure-applied domain (intensity = exposure = 1.7).
+            const float kExposure = 1.7f;
+            const float kThreshold = 1.0f;
+            const float kKnee = 0.6f;
+            const float kUpStrength = 1.0f;     // coarse->fine accumulation gain inside the chain
+            const float kBloomStrength = 0.14f; // bloom presence in the final composite
+            auto mkPC = [&](uint32_t tw, uint32_t th, float strength) {
+                BloomParams p{}; p.texel[0] = 1.0f / (float)tw; p.texel[1] = 1.0f / (float)th;
+                p.threshold = kThreshold; p.knee = kKnee; p.strength = strength; p.intensity = kExposure;
+                return p;
+            };
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            std::vector<render::RgResource> rgDown(kMips), rgUp(kMips);
+            for (int i = 0; i < kMips; ++i) {
+                rgDown[i] = graph.ImportTarget("down" + std::to_string(i),
+                                               render::RgResourceKind::SceneColor, *down[i]);
+                rgUp[i]   = graph.ImportTarget("up" + std::to_string(i),
+                                               render::RgResourceKind::SceneColor, *up[i]);
+            }
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(helmet.mesh.vertices());
+                    cmd.BindIndexBuffer(helmet.mesh.indices());
+                    cmd.DrawIndexed(helmet.mesh.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.BindEnvironment(*env.equirect);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    cmd.BindPipeline(*iblPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                        pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                            *helmet.emissive, *helmet.occlusion);
+                        cmd.BindEnvironment(*env.equirect);
+                        cmd.BindVertexBuffer(helmet.mesh.vertices());
+                        cmd.BindIndexBuffer(helmet.mesh.indices());
+                        cmd.DrawIndexed(helmet.mesh.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Prefilter: bright-pass the full-res scene into down[0] (half res). `texel` is the SCENE
+            // (source) texel so the bilinear box samples the full-res footprint.
+            graph.AddPass("prefilter", {rgScene}, {rgDown[0]},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    BloomParams p = mkPC(w, h, kBloomStrength);
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*prefilterPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.PushConstants(&p, sizeof(p));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            // Downsample chain: down[i] = downsample(down[i-1]). `texel` is the SOURCE (down[i-1]) size.
+            for (int i = 1; i < kMips; ++i) {
+                graph.AddPass("down" + std::to_string(i), {rgDown[i - 1]}, {rgDown[i]},
+                    [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(mw[i - 1], mh[i - 1], kUpStrength);
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*downsamplePipe);
+                        cmd.BindTexture(*down[i - 1]);
+                        cmd.PushConstants(&p, sizeof(p));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+            }
+
+            // Coarsest "up" mip is just the coarsest downsample (no coarser level to combine).
+            graph.AddPass("upTop", {rgDown[kMips - 1]}, {rgUp[kMips - 1]},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    BloomParams p = mkPC(mw[kMips - 1], mh[kMips - 1], 0.0f);
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*upsamplePipe);
+                    // Seed up[top] = down[top]: bind down[top] as BOTH inputs; coarse strength 0 so
+                    // the upsampled "coarse" term drops out and only the fine down[top] remains.
+                    cmd.BindTexturePair(*down[kMips - 1], *down[kMips - 1]);
+                    cmd.PushConstants(&p, sizeof(p));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            // Upsample/combine: up[i] = down[i] + tent_upsample(up[i+1]) * strength. `texel` = COARSE
+            // (up[i+1]) source size. Goes from second-coarsest down to the finest (down[0]).
+            for (int i = kMips - 2; i >= 0; --i) {
+                graph.AddPass("up" + std::to_string(i), {rgUp[i + 1], rgDown[i]}, {rgUp[i]},
+                    [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(mw[i + 1], mh[i + 1], kUpStrength);
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*upsamplePipe);
+                        // primary = coarser accumulated (up[i+1]); secondary = this level's down[i].
+                        cmd.BindTexturePair(*up[i + 1], *down[i]);
+                        cmd.PushConstants(&p, sizeof(p));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+            }
+
+            // Composite: HDR scene + bloom (up[0]) -> tonemap -> swapchain.
+            graph.AddPass("composite", {rgScene, rgUp[0]}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    BloomParams p = mkPC(w, h, kBloomStrength);
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*compositePipe);
+                    cmd.BindTexturePair(*rt, *up[0]);
+                    cmd.PushConstants(&p, sizeof(p));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(bloomShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — HDR bloom, %d mips\n",
+                                    bloomShotPath, cw, ch2, kMips);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", bloomShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

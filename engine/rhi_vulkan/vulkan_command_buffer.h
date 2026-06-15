@@ -21,6 +21,7 @@ public:
     void BindInstanceBuffer(IBuffer& buffer) override;
     void BindIndexBuffer(IBuffer& buffer) override;
     void BindTexture(ITexture& texture) override;
+    void BindTexturePair(ITexture& primary, ITexture& secondary) override;
     void BindMaterial(ITexture& base, ITexture& normalMap) override;
     void BindMaterialPBR(ITexture& base, ITexture& metalRough, ITexture& normalMap,
                          ITexture& emissive, ITexture& occlusion) override;
@@ -48,6 +49,7 @@ private:
     VkPipelineLayout boundLayout_ = VK_NULL_HANDLE;
     uint32_t boundMaterialSet_ = 0;  // set index for BindTexture; from the bound pipeline
     uint32_t boundEnvironmentSet_ = 0;  // set index for BindEnvironment (set 3); 0 = pipeline has none
+    uint32_t boundPushStages_ = VK_SHADER_STAGE_VERTEX_BIT;  // stages PushConstants targets
     VkPipelineLayout boundComputeLayout_ = VK_NULL_HANDLE;  // for compute push-constants/descriptors
 };
 

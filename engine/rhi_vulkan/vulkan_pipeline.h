@@ -23,6 +23,9 @@ public:
     // The environment set's index in the pipeline layout (always 3 for the IBL pipeline: frame 0,
     // material 1, joint-set placeholder 2, env 3).
     uint32_t environmentSetIndex() const { return 3u; }
+    // Stage flags the push-constant range is visible to (VERTEX, or VERTEX|FRAGMENT for the bloom
+    // fullscreen passes). PushConstants pushes to exactly these stages.
+    uint32_t pushConstantStages() const { return pushConstantStages_; }
 
 private:
     VkDevice device_;
@@ -31,6 +34,7 @@ private:
     bool hasFrameSet_ = false;
     bool hasJointSet_ = false;
     bool hasEnvironmentSet_ = false;
+    uint32_t pushConstantStages_ = VK_SHADER_STAGE_VERTEX_BIT;
 };
 
 } // namespace hf::rhi::vk

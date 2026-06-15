@@ -21,8 +21,10 @@ class MetalDevice;
 // VulkanRenderTarget's depthOnly ctor path.
 class MetalRenderTarget final : public IRenderTarget, public IMetalSampled {
 public:
+    // colorFormat == Format::Undefined selects BGRA8 (the headless swapchain format, byte-for-byte
+    // unchanged). Format::RGBA16_Float makes a half-float HDR color texture (Slice U bloom chain).
     MetalRenderTarget(MetalDevice& device, uint32_t width, uint32_t height,
-                      bool depthOnly = false);
+                      bool depthOnly = false, Format colorFormat = Format::Undefined);
     ~MetalRenderTarget() override;
 
     uint32_t width() const override { return width_; }

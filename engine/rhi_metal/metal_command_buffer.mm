@@ -62,6 +62,7 @@ void MetalCommandBuffer::BindPipeline(IPipeline& pipeline) {
     [encoder_ setDepthStencilState:p.depthState()];
     boundFrameUniforms_ = p.usesFrameUniforms();
     boundPointList_ = p.pointList();
+    boundFragmentPushConst_ = p.fragmentPushConstants();
 
     // Joint-palette skinning set (set 2): bind the device's current palette UBO at the skinning
     // vertex-buffer slot, mirroring the Vulkan set-2 auto-bind. Only the skinned pipelines set this.
@@ -122,6 +123,18 @@ void MetalCommandBuffer::BindTexture(ITexture& texture) {
     if (!s) Fail("BindTexture: texture is not an IMetalSampled");
     [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragTexture];
     [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragSampler];
+}
+
+void MetalCommandBuffer::BindTexturePair(ITexture& primary, ITexture& secondary) {
+    // Bloom composite (Slice U): the HDR scene at texture(0)/sampler(1) (gTex) and the bloom result
+    // at texture(3)/sampler(4) (gTex2 — the same second material slot BindMaterial uses).
+    auto* p = dynamic_cast<IMetalSampled*>(&primary);
+    auto* s = dynamic_cast<IMetalSampled*>(&secondary);
+    if (!p || !s) Fail("BindTexturePair: texture is not an IMetalSampled");
+    [encoder_ setFragmentTexture:p->sampledTexture() atIndex:kFragTexture];
+    [encoder_ setFragmentSamplerState:p->sampledSampler() atIndex:kFragSampler];
+    [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragNormalTex];
+    [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragNormalSmp];
 }
 
 void MetalCommandBuffer::BindMaterial(ITexture& base, ITexture& normalMap) {
@@ -200,6 +213,11 @@ void MetalCommandBuffer::DrawIndexedInstanced(uint32_t indexCount, uint32_t inst
 void MetalCommandBuffer::PushConstants(const void* data, uint32_t size) {
     // Vertex push constants (model matrix) -> inline setVertexBytes at the push-constant slot.
     [encoder_ setVertexBytes:data length:size atIndex:kVbPushConst];
+    // Bloom fullscreen passes (Slice U) read their per-pass params in the FRAGMENT stage; mirror the
+    // Vulkan VERTEX|FRAGMENT push-constant range by also binding the bytes to the fragment slot.
+    if (boundFragmentPushConst_) {
+        [encoder_ setFragmentBytes:data length:size atIndex:kFbPushConst];
+    }
 }
 
 void MetalCommandBuffer::SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) {

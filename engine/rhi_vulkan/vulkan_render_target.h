@@ -17,8 +17,10 @@ class VulkanDevice;
 // samples it directly, so no per-RT descriptor set is allocated.
 class VulkanRenderTarget final : public IRenderTarget, public ISampledVk {
 public:
+    // colorFormat == Format::Undefined selects the swapchain color format (the historical
+    // behavior, byte-for-byte). Format::RGBA16_Float makes a half-float HDR color image (Slice U).
     VulkanRenderTarget(VulkanDevice& device, uint32_t width, uint32_t height,
-                       bool depthOnly = false);
+                       bool depthOnly = false, Format colorFormat = Format::Undefined);
     ~VulkanRenderTarget() override;
 
     uint32_t width() const override { return width_; }
@@ -33,6 +35,12 @@ public:
 
     VkDescriptorSet descriptorSet() const { return set_; }
     VkDescriptorSet vkDescriptorSet() const override { return set_; }
+
+    // Repoint this RT's material-set second slot (binding 3) at another image view, so a fullscreen
+    // pass can sample THIS RT (binding 0) and `secondView` (binding 3) from the one set. Used by the
+    // bloom composite to sample the HDR scene + the bloom result together (Slice U). Cached: a repeat
+    // with the same view issues no descriptor update.
+    void attachSecondaryColor(VkImageView secondView);
 
     // Layout bookkeeping for the color image (driven by Begin/EndRenderTargetFrame).
     VkImageLayout colorLayout() const { return colorLayout_; }
@@ -59,6 +67,7 @@ private:
     VkImageLayout   depthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkDescriptorSet set_ = VK_NULL_HANDLE;
+    VkImageView     secondaryView_ = VK_NULL_HANDLE;  // current binding-3 view (cache for attachSecondaryColor)
 };
 
 } // namespace hf::rhi::vk

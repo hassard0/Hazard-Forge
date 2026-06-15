@@ -89,6 +89,11 @@ std::unique_ptr<ITexture> MetalDevice::CreateTexture(const TextureDesc& d) {
 std::unique_ptr<IRenderTarget> MetalDevice::CreateRenderTarget(uint32_t width, uint32_t height) {
     return std::make_unique<MetalRenderTarget>(*this, width, height);
 }
+std::unique_ptr<IRenderTarget> MetalDevice::CreateRenderTarget(uint32_t width, uint32_t height,
+                                                               Format colorFormat) {
+    return std::make_unique<MetalRenderTarget>(*this, width, height, /*depthOnly=*/false,
+                                               colorFormat);
+}
 
 FrameContext MetalDevice::BeginRenderTargetFrame(IRenderTarget& rtBase) {
     auto& rt = static_cast<MetalRenderTarget&>(rtBase);

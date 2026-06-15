@@ -5,12 +5,15 @@
 namespace hf::rhi::vk {
 
 VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uint32_t height,
-                                       bool depthOnly)
+                                       bool depthOnly, Format colorFormatReq)
     : device_(device), width_(width), height_(height), depthOnly_(depthOnly) {
-    // Color image: same format as the swapchain so the existing lit pipeline renders into it
-    // unchanged. Usage: render target + sampled (so the post pass can read it).
-    // Skipped entirely for a depth-only shadow map.
-    const VkFormat colorFormat = device_.swapchainFormat();
+    // Color image format: Format::Undefined keeps the historical swapchain format (so every
+    // existing call site renders into the same image as before). An explicit format (e.g.
+    // RGBA16_Float for the HDR bloom chain, Slice U) overrides it. Usage: render target + sampled
+    // (so a later pass can read it). Skipped entirely for a depth-only shadow map.
+    const VkFormat colorFormat = (colorFormatReq == Format::Undefined)
+                                     ? device_.swapchainFormat()
+                                     : ToVk(colorFormatReq);
     if (!depthOnly_) {
         VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ici.imageType = VK_IMAGE_TYPE_2D;
@@ -129,6 +132,21 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     writes[3].pImageInfo = &normalSamplerInfo;
 
     vkUpdateDescriptorSets(device_.device(), 4, writes, 0, nullptr);
+}
+
+void VulkanRenderTarget::attachSecondaryColor(VkImageView secondView) {
+    if (secondaryView_ == secondView) return;  // already pointed there
+    secondaryView_ = secondView;
+    VkDescriptorImageInfo info{};
+    info.imageView = secondView;
+    info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = set_;
+    w.dstBinding = 3;  // the material set's second sampled-image slot (binding 3/4)
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w.pImageInfo = &info;
+    vkUpdateDescriptorSets(device_.device(), 1, &w, 0, nullptr);
 }
 
 VulkanRenderTarget::~VulkanRenderTarget() {

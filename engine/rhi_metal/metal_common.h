@@ -34,6 +34,10 @@ constexpr uint32_t kVbJointPalette = 3;
 // attributes (locations 7-10) from this stage_in buffer with a per-instance step function.
 constexpr uint32_t kVbInstance    = 4;
 constexpr uint32_t kFbFrameUbo    = 0;
+// Bloom per-pass params (Slice U): a fragment-stage push constant. The bloom fullscreen shaders
+// declare it as a HF_MSL_GEN cbuffer at [[vk::binding(1,0)]] so spirv-cross --msl-decoration-binding
+// lands it on fragment buffer(1); MetalCommandBuffer::PushConstants sets it here for those pipelines.
+constexpr uint32_t kFbPushConst   = 1;
 constexpr uint32_t kFragTexture   = 0;
 constexpr uint32_t kFragSampler   = 1;
 constexpr uint32_t kFragShadowTex = 1;

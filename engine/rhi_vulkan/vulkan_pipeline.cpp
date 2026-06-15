@@ -128,9 +128,15 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     dyn.pDynamicStates = dynStates;
 
     VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Vertex-only by default (byte-for-byte unchanged for every existing pipeline). The bloom
+    // fullscreen passes (Slice U) read their per-pass params in the FRAGMENT stage, so they widen
+    // the range to VERTEX|FRAGMENT; PushConstants then targets both stages for that pipeline.
+    pushRange.stageFlags = desc.fragmentPushConstants
+                               ? (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT)
+                               : VK_SHADER_STAGE_VERTEX_BIT;
     pushRange.offset = 0;
     pushRange.size = desc.pushConstantSize;
+    pushConstantStages_ = pushRange.stageFlags;
 
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     if (desc.pushConstantSize > 0) {

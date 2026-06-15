@@ -26,6 +26,8 @@ public:
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
     std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) override;
+    std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height,
+                                                      Format colorFormat) override;
     std::unique_ptr<IRenderTarget> CreateShadowMap(uint32_t size) override;
 
     FrameContext BeginRenderTargetFrame(IRenderTarget& rt) override;

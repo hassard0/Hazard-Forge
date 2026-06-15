@@ -49,6 +49,8 @@ public:
     // throw. The headless Slice-F scene path does not use them, so the cube/scene render is
     // unaffected. Implementing them is future Metal work (parity with the Vulkan backend).
     std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) override;
+    std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height,
+                                                      Format colorFormat) override;
     std::unique_ptr<IRenderTarget> CreateShadowMap(uint32_t size) override;
     FrameContext BeginShadowPass(IRenderTarget& shadowMap) override;
     void EndShadowPass(const FrameContext&) override;
