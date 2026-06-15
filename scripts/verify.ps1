@@ -15,9 +15,9 @@
       2. Mac / Metal (headless, over SSH on the LAN)
          - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked goldens),
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
-           EACH of the 26 committed Metal goldens run visual_test with its showcase flag and compare
+           EACH of the 28 committed Metal goldens run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 26 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 28 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -57,7 +57,7 @@ $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
 $TarName    = 'hf-verify.tar.gz'
 
-# The 26 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# The 28 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
 # golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
 # path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
 # metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
@@ -66,6 +66,7 @@ $Goldens = @(
     @{ Name = 'skinning';      Flag = '--skinning' }             # Slice O
     @{ Name = 'pbr_helmet';    Flag = '--pbr' }                  # Slice P
     @{ Name = 'mat_graph';     Flag = '--material' }             # Slice AV (data-driven material graph)
+    @{ Name = 'mat_graph2';    Flag = '--material2' }            # Slice AW (second material; build-time codegen)
     @{ Name = 'instanced';     Flag = '--instanced' }            # Slice Q
     @{ Name = 'ibl_helmet';    Flag = '--ibl' }                  # Slice R
     @{ Name = 'physics';       Flag = '--physics' }              # Slice S
@@ -151,7 +152,7 @@ if (`$LASTEXITCODE -ne 0) { exit 14 }
 # --- JSON introspection golden (Slice AL): an EXACT byte-for-byte match of the live --introspect
 # output for the default scene against the committed text golden. This is the agent-OBSERVE artifact
 # (editor::DescribeEngine). It is backend-AGNOSTIC (pure hf_core, no vk*/Metal symbols), so unlike the
-# 24 IMAGE goldens it does NOT need the Mac: the bytes are identical on Vulkan and Metal. We therefore
+# 26 IMAGE goldens it does NOT need the Mac: the bytes are identical on Vulkan and Metal. We therefore
 # verify it once, here, on the Windows/Vulkan build. ---
 Write-Host '--- introspection JSON golden ---'
 `$introExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
@@ -238,6 +239,35 @@ if (`$mtOk) { for (`$mi = 0; `$mi -lt `$mt1Bytes.Length; `$mi++) { if (`$mt1Byte
 if (-not `$mtOk) { Write-Host 'multithreaded-recording MISMATCH (--workers 1 != --workers 4)'; exit 20 }
 Write-Host 'multithreaded-recording: --workers 1 == --workers 4 (byte-identical render)'
 
+# --- Live runtime material authoring (Slice AW): the runtime==build-time proof. --material-live-shot
+# renders the showcase material via the RUNTIME path (in-process codegen -> dxc SUBPROCESS -> SPIR-V
+# -> pipeline). Because that subprocess is the SAME dxc + SAME flags the build used for
+# mat_showcase.frag.hlsl, the runtime SPIR-V is byte-identical to the build-time SPIR-V, so the live
+# image MUST be byte-identical to --material-shot (the committed-HLSL build-time path). Assert the two
+# captured BMPs are byte-for-byte equal. Also run the headless live A->B hot-swap dry-run + assert it
+# passes (the swap happened, deterministic, no crash). Both run under the validation gate above. ---
+Write-Host '--- live material authoring: runtime == build-time ---'
+`$lmExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$lmBuild = Join-Path `$env:TEMP 'hf_material_build.bmp'
+`$lmLive  = Join-Path `$env:TEMP 'hf_material_live.bmp'
+& `$lmExe --material-shot `$lmBuild 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host '--material-shot failed'; exit 21 }
+& `$lmExe --material-live-shot `$lmLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host '--material-live-shot failed'; exit 21 }
+`$bBytes = [System.IO.File]::ReadAllBytes(`$lmBuild)
+`$vBytes = [System.IO.File]::ReadAllBytes(`$lmLive)
+`$lmOk = (`$bBytes.Length -eq `$vBytes.Length)
+if (`$lmOk) { for (`$li = 0; `$li -lt `$bBytes.Length; `$li++) { if (`$bBytes[`$li] -ne `$vBytes[`$li]) { `$lmOk = `$false; break } } }
+if (-not `$lmOk) { Write-Host 'runtime != build-time: --material-live-shot != --material-shot (SPIR-V drift?)'; exit 22 }
+Write-Host 'live material authoring: --material-live-shot == --material-shot (byte-identical; runtime==build-time)'
+
+Write-Host '--- live material authoring: hot-swap dry-run ---'
+`$dry = & `$lmExe --material-hotswap-dry-run 2>&1
+`$dry | ForEach-Object { Write-Host `$_ }
+`$dryOk = (`$LASTEXITCODE -eq 0) -and (`$dry | Select-String -SimpleMatch 'hotswap-dry-run: PASS')
+if (-not `$dryOk) { Write-Host 'hot-swap dry-run FAILED'; exit 23 }
+Write-Host 'live material authoring: hot-swap dry-run PASS'
+
 exit 0
 "@
 
@@ -319,7 +349,7 @@ function Invoke-MacVerify {
     & $scp[0] $scp[1..($scp.Count-1)] $tarPath "${MacUser}@${MacHost}:$MacStage/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
 
-    # 3) extract + build ONCE + loop ALL 26 goldens. To avoid the login shell being zsh and to dodge
+    # 3) extract + build ONCE + loop ALL 28 goldens. To avoid the login shell being zsh and to dodge
     #    PowerShell here-string backtick-escaping fragility, the per-golden loop is generated as a
     #    standalone bash script, scp'd to the Mac, and run with an explicit `bash`. For each
     #    (flag -> golden) pair it renders visual_test <flag> /tmp/hf_<name>.png and compares to
@@ -419,7 +449,7 @@ done <<< "$PAIRS"
         return
     }
     $script:macResult = 'PASS'
-    Write-Host "Mac verification PASSED (all 26 goldens DIFF 0.0000)" -ForegroundColor Green
+    Write-Host "Mac verification PASSED (all 28 goldens DIFF 0.0000)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -440,7 +470,7 @@ function Show($label, $r) {
     Write-Host ("  {0,-22} {1}" -f $label, $r) -ForegroundColor $color
 }
 Show 'Windows / Vulkan (ctest)' $winResult
-Show 'Mac / Metal (26 goldens)'  $macResult
+Show 'Mac / Metal (28 goldens)'  $macResult
 
 # Per-golden Metal table (only when the Mac portion ran).
 if ($script:macGoldenResults -and $script:macGoldenResults.Count -gt 0) {

@@ -88,6 +88,11 @@ hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
 # Windows build). It #includes ../pbr_core.hlsli and reuses lit.vert + the existing PBR material set,
 # so it flows through the SAME HLSL->SPIR-V->MSL toolchain as every other shader (no hand-written MSL).
 hf_gen_msl(mat_showcase.frag generated/mat_showcase.frag.hlsl frag material_fragment)
+# Live runtime material authoring (Slice AW): the SECOND material's committed build-time-generated
+# fragment (shaders/generated/mat_showcase2.frag.hlsl, codegen'd from assets/materials/showcase2.mat.json).
+# Metal stays BUILD-TIME (no runtime HLSL compiler in the standalone), so showcase2 flows through the
+# SAME HLSL->SPIR-V->MSL toolchain here; the new mat_graph2.png golden is rendered from this MSL.
+hf_gen_msl(mat_showcase2.frag generated/mat_showcase2.frag.hlsl frag material2_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same
 # HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
 hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)

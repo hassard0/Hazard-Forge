@@ -24,6 +24,12 @@ set(HF_ENGINE_COMMON_SOURCES
   material/shader_graph.cpp
   material/codegen.cpp
   material/material_loader.cpp
+  material/live_material.cpp
+  # Runtime material -> SPIR-V via a dxc SUBPROCESS (Slice AW). Pure host/tooling (subprocess +
+  # temp-file IO; NO backend symbols), but it links into hf_engine ONLY (not the ASan-pure hf_core):
+  # the live --material-live-shot path needs it, while the runtime_material_test stubs the compiler so
+  # hf_core stays dxc/GPU-free + deterministic.
+  material/runtime_compile.cpp
 )
 
 if(APPLE)
@@ -75,6 +81,19 @@ target_compile_definitions(hf_engine PRIVATE HF_HAVE_SDL_WINDOW=1)
 # (engine/asset/gltf_loader.cpp).
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
 
+# Runtime material compile (Slice AW): bake in the EXACT dxc the build resolved (CompileShaders.cmake
+# sets DXC_EXECUTABLE) so runtime_compile.cpp invokes the SAME compiler -> byte-identical SPIR-V to
+# the build-time golden. Also bake the shaders/generated dir so the temp .hlsl's `#include
+# "../pbr_core.hlsli"` resolves exactly like the committed generated shader. DXC_EXECUTABLE is only
+# defined on the non-Apple (Vulkan) path; on Apple runtime_compile falls back to a PATH lookup (and is
+# unused — Metal stays build-time).
+if(DEFINED DXC_EXECUTABLE)
+  set_source_files_properties(material/runtime_compile.cpp PROPERTIES COMPILE_DEFINITIONS
+    "HF_DXC_PATH=\"${DXC_EXECUTABLE}\"")
+endif()
+target_compile_definitions(hf_engine PRIVATE
+  "HF_SHADER_GEN_DIR=\"${CMAKE_SOURCE_DIR}/shaders/generated\"")
+
 # ---------------------------------------------------------------------------------------------------
 # hf_core: the backend-agnostic engine core (render graph + scene/mesh + scene_io + commands +
 # gltf loader). Depends ONLY on the abstract RHI interface header and the C++ stdlib — NO Vulkan/
@@ -105,6 +124,7 @@ add_library(hf_core STATIC
   material/shader_graph.cpp
   material/codegen.cpp
   material/material_loader.cpp
+  material/live_material.cpp
 )
 target_include_directories(hf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}

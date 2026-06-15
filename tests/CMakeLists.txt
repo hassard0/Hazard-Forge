@@ -136,6 +136,14 @@ hf_add_pure_test(parallel_record_test)
 # shared PBR core), and a .mat.json loader round-trip. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(shader_graph_test)
 
+# Live runtime material authoring (Slice AW): the reload-orchestration host logic — given a STUBBED
+# compiler (success/failure, no GPU/dxc), the LiveMaterial controller swaps on success, KEEPS the old
+# material + records the error on a compile/validation/parse failure, the FileWatcher fires exactly on
+# an mtime change (fake-stat injected), and a malformed/invalid graph does NOT swap. The real
+# dxc-subprocess compile is integration-tested via the --material-live-shot byte-equality proof;
+# stubbing here keeps the unit test GPU/dxc-free + deterministic. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(runtime_material_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

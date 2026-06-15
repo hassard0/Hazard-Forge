@@ -604,7 +604,10 @@ static int RunPbrShowcase(const char* outPath) {
 // codegen'd from assets/materials/showcase.mat.json; here its committed HLSL flows through the same
 // HLSL->SPIR-V->MSL gen as every other shader). The material pipeline reuses lit.vert + the existing
 // PBR material set (no new RHI seam). One offscreen frame -> PNG. ----------------------------------
-static int RunMaterialShowcase(const char* outPath) {
+// `matMslFile` / `matEntry` select WHICH generated material fragment to render: showcase (Slice AV)
+// or showcase2 (Slice AW). Metal stays BUILD-TIME for both — the generated MSL is what runs; runtime
+// authoring is a Vulkan/Windows feature. Everything else (scene/camera/light) is identical.
+static int RunMaterialShowcaseImpl(const char* outPath, const char* matMslFile, const char* matEntry) {
     using math::Mat4; using math::Vec3;
     const uint32_t W = 1280, H = 720;
     auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
@@ -616,9 +619,9 @@ static int RunMaterialShowcase(const char* outPath) {
     auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
                                   p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
 
-    // Material pipeline (shared lit.vert + the generated material fragment; full PBR material set).
+    // Material pipeline (shared lit.vert + the selected generated material fragment; full PBR set).
     auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
-    auto matFs = loadMSL("mat_showcase.frag.gen.metal", "material_fragment");
+    auto matFs = loadMSL(matMslFile, matEntry);
     rhi::GraphicsPipelineDesc matDesc;
     matDesc.vertex = litVs.get(); matDesc.fragment = matFs.get();
     matDesc.vertexLayout = scene::MeshVertexLayout();
@@ -792,6 +795,15 @@ static int RunMaterialShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u)\n", outPath, cw, ch);
     return 0;
+}
+
+// Slice AV: the first showcase material. Slice AW: the second (different node mix). Metal stays
+// build-time for both; runtime authoring is a Vulkan/Windows feature.
+static int RunMaterialShowcase(const char* outPath) {
+    return RunMaterialShowcaseImpl(outPath, "mat_showcase.frag.gen.metal", "material_fragment");
+}
+static int RunMaterialShowcase2(const char* outPath) {
+    return RunMaterialShowcaseImpl(outPath, "mat_showcase2.frag.gen.metal", "material2_fragment");
 }
 
 // --- Full glTF scene-graph import showcase (Slice V). Mirrors the Vulkan --scene-shot path: ground
@@ -6434,6 +6446,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--material") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mat_graph.png";
             try { return RunMaterialShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --material2 <out.png>: render the SECOND data-driven material (Slice AW) — a sphere shaded
+        // by the build-time-generated fragment from showcase2.mat.json (different node mix). Metal
+        // stays build-time; the new mat_graph2.png golden is rendered here.
+        if (argc > 1 && std::strcmp(argv[1], "--material2") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mat_graph2.png";
+            try { return RunMaterialShowcase2(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --scene <out.png>: render the full glTF scene-graph import showcase (Slice V) — the

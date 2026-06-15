@@ -31,13 +31,15 @@
       "interactive-runtime",
       "editor-selection-gizmos",
       "automatic-barriers",
-      "material-graph"
+      "material-graph",
+      "live-material-authoring"
     ]
   },
   "showcases": [
     { "flag": "--shot", "desc": "Default lit + shadowed scene (ground + grid + duck)." },
     { "flag": "--pbr-shot", "desc": "Full PBR showcase (DamagedHelmet, metallic-roughness)." },
     { "flag": "--material-shot", "desc": "Data-driven material graph (sphere shaded by showcase.mat.json)." },
+    { "flag": "--material-live-shot", "desc": "Live runtime material authoring (runtime codegen+dxc compile, no rebuild)." },
     { "flag": "--ibl-shot", "desc": "HDR image-based lighting (equirect skybox reflections)." },
     { "flag": "--scene-shot", "desc": "glTF scene-graph import (CesiumMilkTruck node hierarchy)." },
     { "flag": "--bloom-shot", "desc": "HDR bloom post-process." },

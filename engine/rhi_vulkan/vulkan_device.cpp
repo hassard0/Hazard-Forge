@@ -1197,6 +1197,20 @@ void VulkanDevice::EndFrame(const FrameContext& frame) {
 
         vmaDestroyBuffer(allocator_, staging, stagingAlloc);
 
+        // A capture frame is acquired but NEVER presented, so its swapchain image is never returned to
+        // the presentation engine. A SINGLE capture per process is fine (the app exits), but a
+        // MULTI-FRAME capture session (e.g. --material-hotswap-dry-run renders A, A2, B in one process)
+        // would exhaust the acquirable images: the next vkAcquireNextImageKHR then cannot guarantee
+        // forward progress, and acquiring with an UINT64_MAX timeout in that state is a validation
+        // error (VUID-vkAcquireNextImageKHR-surface-07783). Recreate the swapchain here (Recreate
+        // vkDeviceWaitIdle's first, so the just-submitted capture work has drained) so the NEXT acquire
+        // starts from a fresh, fully-available image set — forward progress guaranteed, validation
+        // clean. For a single capture this is a cheap one-time recreate before exit. The per-image
+        // present-wait semaphores are resized to the (possibly new) image count.
+        swapchain_->Recreate(window_.FramebufferWidth(), window_.FramebufferHeight());
+        DestroyRenderFinishedSemaphores();
+        CreateRenderFinishedSemaphores();
+
         // Skip present. Advance frame index (consistent with the normal path) and disarm.
         frameIndex_ = (frameIndex_ + 1) % kFramesInFlight;
         captureArmed_ = false;

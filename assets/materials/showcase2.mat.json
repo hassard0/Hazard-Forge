@@ -1,0 +1,21 @@
+{
+  "name": "showcase2",
+  "_comment": "Slice AW second material — a DIFFERENT node mix from showcase.mat.json to demonstrate the authoring range. baseColor = Multiply(TextureSample(checker), Constant(tint)) so the checker texture is tinted by a constant (float4*float4 -> narrowed to .xyz); roughness = Fresnel(power=2) so the surface gets rougher at grazing angles; metallic = Constant(0.8) (a near-metal). NOTE on the type system: the PBROutput scalar ports (metallic/roughness) require a FLOAT source — a TextureSample is float4, so 'metallic from a TextureSample' is not expressible without a scalar-extract/swizzle node (out of scope: no node types beyond AV's set). We therefore drive baseColor via a Multiply that CONSUMES the TextureSample, roughness via Fresnel, and metallic via a Constant — a genuinely different graph that validates. On Vulkan this renders via the RUNTIME compile path (codegen -> dxc subprocess -> SPIR-V); on Metal via the committed build-time codegen (shaders/generated/mat_showcase2.frag.hlsl).",
+  "nodes": [
+    { "id": 1, "type": "UV" },
+    { "id": 2, "type": "TextureSample", "texture": "checker" },
+    { "id": 3, "type": "Constant", "value": [0.85, 0.55, 0.25, 1.0], "outType": "float4" },
+    { "id": 4, "type": "Multiply" },
+    { "id": 5, "type": "Fresnel", "power": 2.0 },
+    { "id": 6, "type": "Constant", "value": [0.8, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 99, "type": "PBROutput" }
+  ],
+  "edges": [
+    { "from": 1, "to": 2, "port": "uv" },
+    { "from": 2, "to": 4, "port": "a" },
+    { "from": 3, "to": 4, "port": "b" },
+    { "from": 4, "to": 99, "port": "baseColor" },
+    { "from": 5, "to": 99, "port": "roughness" },
+    { "from": 6, "to": 99, "port": "metallic" }
+  ]
+}
