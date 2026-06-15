@@ -83,6 +83,7 @@ const Showcase kShowcases[] = {
     {"--blend-shot",        "Animation blending between two clips."},
     {"--instanced-shot",    "Hardware-instanced grid."},
     {"--physics-shot",      "Rigid-body physics (impulse solver)."},
+    {"--game-shot",         "Playable game sample (deterministic roll-a-ball collect-the-pickups)."},
     {"--transparency-shot", "Sorted alpha-blended transparency."},
     {"--debug-shot",        "Immediate-mode debug-line visualization."},
     {"--capstone-shot",     "Capstone scene combining the major features."},
@@ -132,6 +133,7 @@ const char* kFeatures[] = {
     "automatic-barriers",
     "material-graph",
     "live-material-authoring",
+    "gameplay-sample",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

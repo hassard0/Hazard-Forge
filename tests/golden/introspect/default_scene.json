@@ -32,7 +32,8 @@
       "editor-selection-gizmos",
       "automatic-barriers",
       "material-graph",
-      "live-material-authoring"
+      "live-material-authoring",
+      "gameplay-sample"
     ]
   },
   "showcases": [
@@ -48,6 +49,7 @@
     { "flag": "--blend-shot", "desc": "Animation blending between two clips." },
     { "flag": "--instanced-shot", "desc": "Hardware-instanced grid." },
     { "flag": "--physics-shot", "desc": "Rigid-body physics (impulse solver)." },
+    { "flag": "--game-shot", "desc": "Playable game sample (deterministic roll-a-ball collect-the-pickups)." },
     { "flag": "--transparency-shot", "desc": "Sorted alpha-blended transparency." },
     { "flag": "--debug-shot", "desc": "Immediate-mode debug-line visualization." },
     { "flag": "--capstone-shot", "desc": "Capstone scene combining the major features." },

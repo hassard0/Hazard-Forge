@@ -17,6 +17,7 @@
 #include "anim/skeleton.h"
 #include "physics/world.h"
 #include "physics/body.h"
+#include "game/roll_game.h"
 #include "render/render_graph.h"
 #include "render/csm.h"
 #include "render/spot.h"
@@ -51,6 +52,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -219,6 +221,7 @@ int main(int argc, char** argv) {
     const char* bloomShotPath = nullptr;
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
+    const char* gameShotPath = nullptr;
     const char* debugShotPath = nullptr;
     const char* transparencyShotPath = nullptr;
     const char* ssaoShotPath = nullptr;
@@ -309,6 +312,13 @@ int main(int argc, char** argv) {
             // fixed number of times until it settles, then render the RESTING bodies via the existing
             // instanced pipeline (one instance transform per body), lit + shadowed. One BMP -> exit.
             physicsShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--game-shot") == 0 && i + 1 < argc) {
+            // Slice AX: run the deterministic roll-a-ball game (game::MakeRollGame/StepGame over the
+            // full game::ScriptedTrack at the engine fixed dt), then render ONE frame at a fixed
+            // mid-track capture step — the ground + the player sphere + the remaining (uncollected)
+            // pickups, lit + shadowed via the existing static-lit scene path. Prints the deterministic
+            // winning game-state line. One BMP -> exit.
+            gameShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--debug-shot") == 0 && i + 1 < argc) {
             // Slice W: the SAME settled physics sphere-pyramid scene (lit + shadowed over the
             // checkerboard ground + sky) PLUS an immediate-mode DEBUG OVERLAY drawn via DebugDraw —
@@ -6368,6 +6378,261 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %u rigid bodies settled\n",
                                     physicsShotPath, cw, ch2, kInstanceCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", physicsShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Playable game sample (--game-shot, Slice AX): a self-contained capture path that does
+        // NOT touch the default scene. Build the deterministic roll-a-ball game (game::MakeRollGame:
+        // ground + a dynamic player sphere + 3 fixed pickups), run game::StepGame over the FULL
+        // game::ScriptedTrack() at the engine fixed dt (the full winning playthrough — score 3, won),
+        // then render ONE frame at a FIXED MID-TRACK capture step (kGameCaptureStep) where the player
+        // and at least one uncollected pickup are both on-screen, so the golden is legible. The player
+        // sphere + each remaining pickup + the ground go through the EXISTING static lit + shadow
+        // scene path (one per-draw model+material push constant each; distinct solid-color textures
+        // tint them) — NO new RHI. Prints the deterministic winning state line. One BMP -> exit. The
+        // pure-CPU gameplay (engine/game/roll_game) is golden-stable; pipelines/shaders are untouched.
+        if (gameShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Fixed capture step: a winning run is 380 steps long and collects pickup2 (the last) near
+            // step ~300, so by the END all pickups are gone. We capture at step 250 — pickups 0 and 1
+            // are already collected, pickup2 (x=5, z=2.5) is still present, and the player sits near
+            // (5.4, 0.5, 0.8) rolling toward it: player + one remaining pickup both legible. The STATE
+            // line below reports the FULL winning run (score 3, won, 380 steps), per the spec.
+            const int kGameCaptureStep = 250;
+
+            const float dtG = 1.0f / 120.0f;
+            std::vector<game::GameInput> track = game::ScriptedTrack();
+
+            // (1) The captured frame's world/state: step the game up to kGameCaptureStep.
+            physics::World capWorld;
+            game::GameState capState = game::MakeRollGame(capWorld);
+            for (int s = 0; s < kGameCaptureStep && s < (int)track.size(); ++s)
+                game::StepGame(capWorld, capState, track[s], dtG);
+            const physics::RigidBody& capPlayer =
+                capWorld.bodies[(size_t)capState.playerBodyIndex];
+
+            // (2) The reported FINAL state: the full winning playthrough (independent world, so the
+            // capture-step state is unaffected). Deterministic.
+            physics::World finWorld;
+            game::GameState finState = game::MakeRollGame(finWorld);
+            for (const auto& in : track) game::StepGame(finWorld, finState, in, dtG);
+            const physics::RigidBody& finPlayer =
+                finWorld.bodies[(size_t)finState.playerBodyIndex];
+
+            // --- Static lit pipeline (player + pickups + ground) + static shadow + sky + post. ------
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground (checkerboard) + a flat normal map + distinct 1x1 solid-color tints: blue player,
+            // gold pickups. These tint `albedo` via gTex in lit.frag (vertex color is white).
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            const uint8_t playerPx[4] = {40, 110, 230, 255};   // blue
+            auto playerTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, playerPx, sizeof(playerPx)});
+            const uint8_t pickupPx[4] = {245, 200, 40, 255};   // gold
+            auto pickupTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, pickupPx, sizeof(pickupPx)});
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            // Player model: unit sphere (r=0.5) scaled to the collider diameter.
+            Mat4 playerModel = capPlayer.Transform();
+
+            // The remaining (uncollected) pickups at the capture step -> their model matrices.
+            std::vector<Mat4> pickupModels;
+            for (const auto& p : capState.pickups) {
+                if (p.collected) continue;
+                Mat4 m = math::FromTRS(p.pos, math::Quat::Identity(),
+                                       {2.0f * p.radius, 2.0f * p.radius, 2.0f * p.radius});
+                pickupModels.push_back(m);
+            }
+
+            // Camera framing the action at the capture step: the player (~5.4, 0.5, 0.8) and the
+            // remaining pickup (5, 0.3, 2.5). A raised 3/4 view centered on their midpoint.
+            const Vec3 eye{9.5f, 4.0f, 6.5f};
+            const Vec3 center{5.0f, 0.4f, 1.6f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{5.0f, 0.4f, 1.6f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            // Helper: a 20-float push constant = { model(16); metallic, roughness, 0, 0 }.
+            auto litPush = [](const Mat4& model, float metallic, float roughness) {
+                std::array<float, 20> pc{};
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                return pc;
+            };
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.PushConstants(playerModel.m, sizeof(float) * 16);
+                    cmd.DrawIndexed(sphere.indexCount());
+                    for (const Mat4& pm : pickupModels) {
+                        cmd.PushConstants(pm.m, sizeof(float) * 16);
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    // Ground.
+                    {
+                        auto pc = litPush(groundModel, 0.0f, 0.85f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Player sphere (blue).
+                    {
+                        auto pc = litPush(playerModel, 0.1f, 0.4f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*playerTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    // Remaining pickups (gold).
+                    {
+                        cmd.BindMaterial(*pickupTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        for (const Mat4& pm : pickupModels) {
+                            auto pc = litPush(pm, 0.3f, 0.3f);
+                            cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                            cmd.DrawIndexed(sphere.indexCount());
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Deterministic game-state line (the FULL winning playthrough).
+            std::printf("game: {score:%d, won:%s, steps:%d, player:[%.3f, %.3f, %.3f]}\n",
+                        finState.score, finState.won ? "true" : "false", finState.step,
+                        finPlayer.position.x, finPlayer.position.y, finPlayer.position.z);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(gameShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — capture step %d, %zu pickups remaining\n",
+                                    gameShotPath, cw, ch2, kGameCaptureStep, pickupModels.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gameShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

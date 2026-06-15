@@ -40,6 +40,7 @@
 #include "anim/skeleton.h"
 #include "physics/world.h"
 #include "physics/body.h"
+#include "game/roll_game.h"
 #include "render/render_graph.h"
 #include "render/csm.h"     // Slice AD: cascaded-shadow split + per-cascade ortho fit (pure math)
 #include "render/spot.h"    // Slice AE: spot-light perspective shadow projection + cone (pure math)
@@ -2533,6 +2534,227 @@ static int RunPhysicsShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — %u rigid bodies settled\n", outPath, cw, ch, kInstanceCount);
+    return 0;
+}
+
+// --- Playable game sample (Slice AX). Mirrors the Vulkan --game-shot path EXACTLY: build the
+// deterministic roll-a-ball game (game::MakeRollGame: ground + dynamic player sphere + 3 fixed
+// pickups), run game::StepGame over the FULL game::ScriptedTrack() at the engine fixed dt (the
+// winning playthrough — score 3, won), then render ONE frame at the FIXED mid-track capture step
+// (kGameCaptureStep == 250, identical to the Vulkan side) — the ground + the player sphere + the
+// remaining (uncollected) pickups, lit + shadowed via the existing static-lit scene path with
+// distinct solid-color tints. Identical scene/camera/light/colors to the Vulkan path so the only
+// difference vs the BMP-golden is backend-NDC handling. One offscreen frame -> PNG. The gameplay
+// (engine/game/roll_game) is pure C++ (hf_core), shared byte-for-byte with the Vulkan build. -------
+static int RunGameShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Identical capture step + track to the Vulkan --game-shot.
+    const int kGameCaptureStep = 250;
+    const float dtG = 1.0f / 120.0f;
+    std::vector<game::GameInput> track = game::ScriptedTrack();
+
+    physics::World capWorld;
+    game::GameState capState = game::MakeRollGame(capWorld);
+    for (int s = 0; s < kGameCaptureStep && s < (int)track.size(); ++s)
+        game::StepGame(capWorld, capState, track[s], dtG);
+    const physics::RigidBody& capPlayer = capWorld.bodies[(size_t)capState.playerBodyIndex];
+
+    physics::World finWorld;
+    game::GameState finState = game::MakeRollGame(finWorld);
+    for (const auto& in : track) game::StepGame(finWorld, finState, in, dtG);
+    const physics::RigidBody& finPlayer = finWorld.bodies[(size_t)finState.playerBodyIndex];
+
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    const uint8_t playerPx[4] = {40, 110, 230, 255};   // blue
+    auto playerTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, playerPx, sizeof(playerPx)});
+    const uint8_t pickupPx[4] = {245, 200, 40, 255};   // gold
+    auto pickupTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, pickupPx, sizeof(pickupPx)});
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    Mat4 playerModel = capPlayer.Transform();
+
+    std::vector<Mat4> pickupModels;
+    for (const auto& p : capState.pickups) {
+        if (p.collected) continue;
+        pickupModels.push_back(math::FromTRS(p.pos, math::Quat::Identity(),
+                                             {2.0f * p.radius, 2.0f * p.radius, 2.0f * p.radius}));
+    }
+
+    const Vec3 eye{9.5f, 4.0f, 6.5f};
+    const Vec3 center{5.0f, 0.4f, 1.6f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{5.0f, 0.4f, 1.6f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto litPush = [](const Mat4& model, float metallic, float roughness, float* pc) {
+        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+        pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.PushConstants(playerModel.m, sizeof(float) * 16);
+            cmd.DrawIndexed(sphere.indexCount());
+            for (const Mat4& pm : pickupModels) {
+                cmd.PushConstants(pm.m, sizeof(float) * 16);
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20]; litPush(groundModel, 0.0f, 0.85f, pc);
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            {
+                float pc[20]; litPush(playerModel, 0.1f, 0.4f, pc);
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*playerTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            {
+                cmd.BindMaterial(*pickupTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindIndexBuffer(sphere.indices());
+                for (const Mat4& pm : pickupModels) {
+                    float pc[20]; litPush(pm, 0.3f, 0.3f, pc);
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.DrawIndexed(sphere.indexCount());
+                }
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("game: {score:%d, won:%s, steps:%d, player:[%.3f, %.3f, %.3f]}\n",
+                finState.score, finState.won ? "true" : "false", finState.step,
+                finPlayer.position.x, finPlayer.position.y, finPlayer.position.z);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — capture step %d, %zu pickups remaining\n",
+                outPath, cw, ch, kGameCaptureStep, pickupModels.size());
     return 0;
 }
 
@@ -6372,6 +6594,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--physics") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_physics.png";
             try { return RunPhysicsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --game <out.png>: render the playable game sample (Slice AX) — the deterministic roll-a-ball
+        // game run over the scripted track, captured at a fixed mid-track step (player + remaining
+        // pickup, lit + shadowed). Mirrors the Vulkan --game-shot path; new golden
+        // tests/golden/metal/game.png.
+        if (argc > 1 && std::strcmp(argv[1], "--game") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_game.png";
+            try { return RunGameShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --debug <out.png>: render the debug-visualization showcase (Slice W) — the settled physics

@@ -144,6 +144,13 @@ hf_add_pure_test(shader_graph_test)
 # stubbing here keeps the unit test GPU/dxc-free + deterministic. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(runtime_material_test)
 
+# Deterministic roll-a-ball gameplay loop (Slice AX): MakeRollGame/StepGame/ScriptedTrack over the
+# impulse physics::World. Asserts determinism (ScriptedTrack twice -> bit-identical final GameState),
+# the win condition (collects all 3 -> score==3, won), collection logic (player AT a pickup collects
+# only it; distant collects none; at most once), and physics integration (player moves under input,
+# stays grounded y~=radius, no explosion via KineticEnergy). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(roll_game_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

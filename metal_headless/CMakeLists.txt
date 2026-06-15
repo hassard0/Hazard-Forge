@@ -200,6 +200,9 @@ add_executable(visual_test
     ${HF_ROOT}/engine/anim/animation.cpp
     # Impulse-based rigid-body world (Slice S): pure C++ physics core (no Metal/RHI deps).
     ${HF_ROOT}/engine/physics/world.cpp
+    # Deterministic roll-a-ball gameplay loop (Slice AX): pure C++ (math + physics, no Metal/RHI
+    # deps). Drives the --game showcase's scripted playthrough + capture-step state.
+    ${HF_ROOT}/engine/game/roll_game.cpp
     # Immediate-mode debug-draw collector + engine-object emitters (Slice W): pure C++ (math +
     # scene + physics), no Metal/RHI deps. Drives the LINE_LIST debug overlay.
     ${HF_ROOT}/engine/debug/debug_draw.cpp

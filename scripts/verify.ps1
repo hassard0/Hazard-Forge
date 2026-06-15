@@ -90,6 +90,7 @@ $Goldens = @(
     @{ Name = 'cull';          Flag = '--cull' }                 # Slice AQ (frustum-culling visualization)
     @{ Name = 'gpu_cull';      Flag = '--gpu-cull' }             # Slice AR (GPU-driven culling + indirect draw)
     @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
+    @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
 )
 
 $winResult = 'SKIP'
