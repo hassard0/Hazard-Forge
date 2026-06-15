@@ -7,6 +7,8 @@
 #include "hal/window.h"
 #include <map>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace hf::rhi::vk {
 
@@ -107,9 +109,24 @@ public:
     VkDescriptorSet pbrMaterialSet(ITexture& base, ITexture& metalRough, ITexture& normalMap,
                                    ITexture& emissive, ITexture& occlusion);
 
+    // Return (building + caching on first use) the 2-texture material set (texturedSetLayout_, set 1)
+    // for a (base-color view, normal-map view) PAIR: binding 0/1 = base color + default sampler,
+    // binding 3/4 = normal map + default sampler. Keyed on BOTH views so each distinct (base, normal)
+    // combination owns its OWN immutable set, written exactly once here and never mutated again.
+    // BindMaterial routes through this so a base texture shared by renderables with DIFFERENT normal
+    // maps (the default scene: checker+normalmap on the plane/cubes, checker+flat_normal on the
+    // spheres) no longer re-points one set IN PLACE after it was already bound into the recording
+    // command buffer — which the validation layer flagged as updating a bound set without
+    // UPDATE_AFTER_BIND (VUID-vkCmdBindDescriptorSets-commandBuffer-recording). Descriptor contents
+    // are byte-identical to the old in-place-updated set, so the render is unchanged. Lives until
+    // device teardown.
+    VkDescriptorSet materialSet(VkImageView baseView, VkImageView normalView);
+
 private:
     void CreateSyncObjects();
     void DestroySyncObjects();
+    void CreateRenderFinishedSemaphores();   // one present-wait semaphore per swapchain image
+    void DestroyRenderFinishedSemaphores();
     void CreateTextureResources();
     void DestroyTextureResources();
 
@@ -170,19 +187,38 @@ private:
     // VulkanPbrMaterial objects for the device's lifetime (freed on teardown before the pool dies).
     std::map<ITexture*, std::unique_ptr<class VulkanPbrMaterial>> pbrMaterials_;
 
+    // Cache of immutable 2-texture material sets, keyed on (base-color view, normal-map view). Each
+    // distinct pair owns one set on texturedSetLayout_, written once in materialSet() and never
+    // mutated, so BindMaterial never updates a descriptor set that is still bound in a recording
+    // command buffer. Freed when the descriptor pool is destroyed (the sets are pool-owned).
+    std::map<std::pair<VkImageView, VkImageView>, VkDescriptorSet> materialSets_;
+
     std::unique_ptr<VulkanSwapchain> swapchain_;
 
-    // Per-frame-in-flight sync + command resources.
+    // Per-frame-in-flight sync + command resources. imageAvailable is per-frame-in-flight: its reuse
+    // is gated by waiting inFlight before the acquire that signals it again. renderFinished is NOT
+    // here — see renderFinished_ below.
     struct FrameSync {
         VkCommandPool   pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd  = VK_NULL_HANDLE;
         VkSemaphore     imageAvailable = VK_NULL_HANDLE;
-        VkSemaphore     renderFinished = VK_NULL_HANDLE;
         VkFence         inFlight = VK_NULL_HANDLE;
     };
     FrameSync frames_[kFramesInFlight];
     uint32_t  frameIndex_ = 0;
     uint32_t  acquiredImage_ = 0;
+
+    // Present-wait (render-finished) semaphores, sized PER SWAPCHAIN IMAGE rather than per
+    // frame-in-flight. A present-wait semaphore is signalled by the queue submit that renders into
+    // image i and waited by the present of image i; its completion is NOT observable through the
+    // per-frame inFlight fence (present is a separate queue operation). With only kFramesInFlight
+    // semaphores, frame N+kFramesInFlight could re-submit a renderFinished semaphore whose previous
+    // present-wait had not yet completed (vkAcquireNextImageKHR can hand back image indices in any
+    // order), which the core-validation layer flags as semaphore reuse. One semaphore per swapchain
+    // image, indexed by the ACQUIRED image, makes each present-wait signal/wait pair unique to that
+    // image and never re-submitted while pending. Sized in CreateSyncObjects from the swapchain image
+    // count; rebuilt on swapchain Recreate.
+    std::vector<VkSemaphore> renderFinished_;
 
     // Headless capture state. When captureArmed_ is set, EndFrame copies the rendered
     // swapchain image back to host memory (capturedBGRA_) instead of presenting.

@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Full cross-platform verification for Hazard Forge: Windows/Vulkan + Mac/Metal in one command.
 
@@ -9,15 +9,15 @@
          - conan install (cppstd=17 + Ninja generator), cmake configure, build, ctest.
          - Plus the Slice-AL introspection JSON golden: an EXACT byte match of the live
            --introspect output for the default scene vs tests/golden/introspect/default_scene.json.
-           Backend-agnostic (pure hf_core) so it is verified ONLY here — the Mac is not needed.
+           Backend-agnostic (pure hf_core) so it is verified ONLY here -- the Mac is not needed.
          - All steps run inside a VS BuildTools x64 dev shell so cl/ninja resolve.
 
       2. Mac / Metal (headless, over SSH on the LAN)
          - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked goldens),
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
-           EACH of the 24 committed Metal goldens run visual_test with its showcase flag and compare
+           EACH of the 25 committed Metal goldens run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 24 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 25 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -57,7 +57,7 @@ $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
 $TarName    = 'hf-verify.tar.gz'
 
-# The 24 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# The 25 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
 # golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
 # path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
 # metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
@@ -168,6 +168,54 @@ if (-not `$introOk) {
 }
 Write-Host 'introspection JSON golden: exact match'
 
+# --- Vulkan validation gate (Slice AT): run representative showcases under the Khronos validation
+# layer (synchronization + core validation) and FAIL on any real validation error. This is the
+# permanent oracle that keeps the engine Vulkan-validation-CLEAN: Slice AS activated the layer and
+# Slice AT fixed the two latent core-validation bugs (GPU-particle descriptor invalidation +
+# swapchain semaphore reuse), so any regression that re-introduces a hazard surfaces here.
+#
+# The layer is provided by the conan 'vulkan-validationlayers' package (see conanfile.py); it is NOT
+# installed system-wide on this box, so we must point VK_LAYER_PATH at the package's bin dir (the dir
+# holding VkLayer_khronos_validation.json) or the layer loads as a no-op and the gate is blind. We
+# locate it by globbing the conan2 cache for the layer manifest; if VK_LAYER_PATH is already set in
+# the environment we honor that instead.
+Write-Host '--- Vulkan validation gate ---'
+`$vkExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$layerDir = `$env:VK_LAYER_PATH
+if (-not `$layerDir -or -not (Test-Path (Join-Path `$layerDir 'VkLayer_khronos_validation.json'))) {
+    `$manifest = Get-ChildItem -Path (Join-Path `$env:USERPROFILE '.conan2\p') -Recurse -Filter 'VkLayer_khronos_validation.json' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (`$manifest) { `$layerDir = `$manifest.Directory.FullName }
+}
+if (-not `$layerDir -or -not (Test-Path (Join-Path `$layerDir 'VkLayer_khronos_validation.json'))) {
+    Write-Host 'Vulkan validation layer not found (conan vulkan-validationlayers missing?) - cannot run the validation gate'
+    exit 17
+}
+Write-Host ('validation layer dir: ' + `$layerDir)
+`$env:VK_LAYER_PATH = `$layerDir
+`$env:VK_INSTANCE_LAYERS = 'VK_LAYER_KHRONOS_validation'
+`$env:VK_VALIDATION_FEATURE_ENABLE = 'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION'
+# Representative showcases: --shot (GPU particles + shared-base/varied-normal materials, where the
+# UPDATE_AFTER_BIND bug lived) and --csm-shot (cascaded shadow atlas, a heavy multi-pass graph path).
+`$vkShots = @(@('--shot'), @('--csm-shot'))
+`$vkErrors = 0
+foreach (`$shot in `$vkShots) {
+    `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))
+    `$vlog = & `$vkExe @shotArgs 2>&1
+    # A REAL validation error is a 'VUID-<name>' token, a 'SYNC-HAZARD-*', an 'UNASSIGNED-*', or any
+    # '[ERROR'-tagged line. The benign duplicate-limit notice mentions the bare word 'VUID' (no
+    # hyphen) inside a [WARNING] line, so we match the hyphenated token form to avoid a false positive.
+    `$bad = `$vlog | Select-String -Pattern 'VUID-|SYNC-HAZARD|UNASSIGNED-|\[ERROR'
+    if (`$bad) {
+        Write-Host ('validation FAIL on ' + (`$shot -join ' ') + ':')
+        `$bad | ForEach-Object { Write-Host ('  ' + `$_) }
+        `$vkErrors += `$bad.Count
+    } else {
+        Write-Host ('validation clean: ' + (`$shot -join ' '))
+    }
+}
+if (`$vkErrors -ne 0) { Write-Host ('Vulkan validation gate FAILED (' + `$vkErrors + ' error line(s))'); exit 18 }
+Write-Host 'Vulkan validation gate: CLEAN (zero VUID / SYNC-HAZARD / UNASSIGNED across showcases)'
+
 exit 0
 "@
 
@@ -249,7 +297,7 @@ function Invoke-MacVerify {
     & $scp[0] $scp[1..($scp.Count-1)] $tarPath "${MacUser}@${MacHost}:$MacStage/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
 
-    # 3) extract + build ONCE + loop ALL 24 goldens. To avoid the login shell being zsh and to dodge
+    # 3) extract + build ONCE + loop ALL 25 goldens. To avoid the login shell being zsh and to dodge
     #    PowerShell here-string backtick-escaping fragility, the per-golden loop is generated as a
     #    standalone bash script, scp'd to the Mac, and run with an explicit `bash`. For each
     #    (flag -> golden) pair it renders visual_test <flag> /tmp/hf_<name>.png and compares to
@@ -349,7 +397,7 @@ done <<< "$PAIRS"
         return
     }
     $script:macResult = 'PASS'
-    Write-Host "Mac verification PASSED (all 24 goldens DIFF 0.0000)" -ForegroundColor Green
+    Write-Host "Mac verification PASSED (all 25 goldens DIFF 0.0000)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -370,7 +418,7 @@ function Show($label, $r) {
     Write-Host ("  {0,-22} {1}" -f $label, $r) -ForegroundColor $color
 }
 Show 'Windows / Vulkan (ctest)' $winResult
-Show 'Mac / Metal (24 goldens)'  $macResult
+Show 'Mac / Metal (25 goldens)'  $macResult
 
 # Per-golden Metal table (only when the Mac portion ran).
 if ($script:macGoldenResults -and $script:macGoldenResults.Count -gt 0) {

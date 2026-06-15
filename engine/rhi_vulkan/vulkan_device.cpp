@@ -166,19 +166,36 @@ void VulkanDevice::CreateSyncObjects() {
 
         VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         Check(vkCreateSemaphore(device_, &si, nullptr, &fr.imageAvailable), "sem");
-        Check(vkCreateSemaphore(device_, &si, nullptr, &fr.renderFinished), "sem");
 
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         Check(vkCreateFence(device_, &fi, nullptr, &fr.inFlight), "fence");
     }
+
+    // One render-finished (present-wait) semaphore PER SWAPCHAIN IMAGE, indexed by acquired image.
+    CreateRenderFinishedSemaphores();
+}
+
+void VulkanDevice::CreateRenderFinishedSemaphores() {
+    VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    renderFinished_.resize(swapchain_->imageCount(), VK_NULL_HANDLE);
+    for (auto& s : renderFinished_) {
+        Check(vkCreateSemaphore(device_, &si, nullptr, &s), "sem(renderFinished)");
+    }
+}
+
+void VulkanDevice::DestroyRenderFinishedSemaphores() {
+    for (auto s : renderFinished_) {
+        if (s) vkDestroySemaphore(device_, s, nullptr);
+    }
+    renderFinished_.clear();
 }
 
 void VulkanDevice::DestroySyncObjects() {
+    DestroyRenderFinishedSemaphores();
     for (auto& fr : frames_) {
         if (fr.inFlight) vkDestroyFence(device_, fr.inFlight, nullptr);
         if (fr.imageAvailable) vkDestroySemaphore(device_, fr.imageAvailable, nullptr);
-        if (fr.renderFinished) vkDestroySemaphore(device_, fr.renderFinished, nullptr);
         if (fr.pool) vkDestroyCommandPool(device_, fr.pool, nullptr);
         fr = FrameSync{};
     }
@@ -368,14 +385,16 @@ void VulkanDevice::CreateTextureResources() {
     // double the per-set image/sampler capacity vs. the old single-texture material set.
     VkDescriptorPoolSize poolSizes[3]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    poolSizes[0].descriptorCount = 256 + kFramesInFlight;  // +full-PBR sets (5 images each)
+    poolSizes[0].descriptorCount = 512 + kFramesInFlight;  // +full-PBR + (base,normal) material-pair sets
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    poolSizes[1].descriptorCount = 256 + kFramesInFlight;  // +full-PBR sets (5 samplers each)
+    poolSizes[1].descriptorCount = 512 + kFramesInFlight;  // +full-PBR + (base,normal) material-pair sets
     poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[2].descriptorCount = kFramesInFlight + 16;  // margin
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pci.maxSets = 64;
+    // Was 64. Bumped to 128 to cover the per-(base,normal) material-pair sets (one immutable set per
+    // distinct pairing) on top of the existing per-texture / per-frame / per-joint / PBR sets.
+    pci.maxSets = 128;
     pci.poolSizeCount = 3;
     pci.pPoolSizes = poolSizes;
     Check(vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_),
@@ -500,9 +519,62 @@ VkDescriptorSet VulkanDevice::pbrMaterialSet(ITexture& base, ITexture& metalRoug
     return it->second->descriptorSet();
 }
 
+VkDescriptorSet VulkanDevice::materialSet(VkImageView baseView, VkImageView normalView) {
+    // Resolve (or build once + cache) the immutable 2-texture material set for this exact
+    // (base, normal) pair. Written once here; never mutated after — so binding it into a recording
+    // command buffer can never be invalidated by a later in-place descriptor update (the bug the
+    // validation layer caught when one base-texture set was re-pointed between normal maps).
+    VkImageView normal = normalView ? normalView : defaultNormalView_;
+    auto key = std::make_pair(baseView, normal);
+    auto it = materialSets_.find(key);
+    if (it != materialSets_.end()) return it->second;
+
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = descriptorPool_;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &texturedSetLayout_;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    Check(vkAllocateDescriptorSets(device_, &dai, &set), "vkAllocateDescriptorSets(material-pair)");
+
+    // binding 0 = base-color image, 1 = base sampler, 3 = normal-map image, 4 = normal sampler.
+    // Identical writes to what VulkanTexture's set carried after attachNormalMap(normal) — so the
+    // shader samples the same views/sampler and the render is byte-for-byte unchanged.
+    VkDescriptorImageInfo baseImg{};
+    baseImg.imageView = baseView;
+    baseImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo baseSmp{};
+    baseSmp.sampler = defaultSampler_;
+    VkDescriptorImageInfo normImg{};
+    normImg.imageView = normal;
+    normImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo normSmp{};
+    normSmp.sampler = defaultSampler_;
+
+    VkWriteDescriptorSet writes[4]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set; writes[0].dstBinding = 0; writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[0].pImageInfo = &baseImg;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = set; writes[1].dstBinding = 1; writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; writes[1].pImageInfo = &baseSmp;
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = set; writes[2].dstBinding = 3; writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; writes[2].pImageInfo = &normImg;
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = set; writes[3].dstBinding = 4; writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; writes[3].pImageInfo = &normSmp;
+    vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
+
+    materialSets_.emplace(key, set);
+    return set;
+}
+
 void VulkanDevice::DestroyTextureResources() {
     // Free the cached PBR material descriptor sets before the pool that owns them is destroyed.
     pbrMaterials_.clear();
+    // The (base, normal) material-pair sets are pool-owned; just drop the cache (the pool destroy
+    // below frees the underlying VkDescriptorSet handles).
+    materialSets_.clear();
 
     // Per-frame UBOs + layout. Frame sets are freed when the pool below is destroyed.
     for (uint32_t i = 0; i < kFramesInFlight; ++i) {
@@ -942,6 +1014,10 @@ FrameContext VulkanDevice::BeginFrame() {
                                          fr.imageAvailable, VK_NULL_HANDLE, &acquiredImage_);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
         swapchain_->Recreate(window_.FramebufferWidth(), window_.FramebufferHeight());
+        // The recreated swapchain may have a different image count; resize the per-image present-wait
+        // semaphores to match (Recreate already vkDeviceWaitIdle'd, so none are pending).
+        DestroyRenderFinishedSemaphores();
+        CreateRenderFinishedSemaphores();
         return FrameContext{nullptr};
     }
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) Check(acq, "vkAcquireNextImageKHR");
@@ -1065,11 +1141,18 @@ void VulkanDevice::EndFrame(const FrameContext& frame) {
 
     Check(vkEndCommandBuffer(fr.cmd), "vkEndCommandBuffer");
 
+    // Present-wait semaphore is selected PER ACQUIRED IMAGE (not per frame-in-flight): the submit
+    // that renders image `acquiredImage_` signals renderFinished_[acquiredImage_], and the present of
+    // that same image waits on it. This guarantees the semaphore is never re-submitted while a prior
+    // present-wait on it is still pending (the core-validation semaphore-reuse error), because each
+    // swapchain image has its own.
+    VkSemaphore renderFinished = renderFinished_[acquiredImage_];
+
     VkSemaphoreSubmitInfo waitSem{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     waitSem.semaphore = fr.imageAvailable;
     waitSem.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     VkSemaphoreSubmitInfo signalSem{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
-    signalSem.semaphore = fr.renderFinished;
+    signalSem.semaphore = renderFinished;
     signalSem.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
     VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     cmdSub.commandBuffer = fr.cmd;
@@ -1085,7 +1168,7 @@ void VulkanDevice::EndFrame(const FrameContext& frame) {
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &fr.renderFinished;
+    present.pWaitSemaphores = &renderFinished;
     VkSwapchainKHR sc = swapchain_->handle();
     present.swapchainCount = 1;
     present.pSwapchains = &sc;
@@ -1093,6 +1176,10 @@ void VulkanDevice::EndFrame(const FrameContext& frame) {
     VkResult pr = vkQueuePresentKHR(graphicsQueue_, &present);
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
         swapchain_->Recreate(window_.FramebufferWidth(), window_.FramebufferHeight());
+        // Image count may change on recreate; resize the per-image present-wait semaphores to match
+        // (Recreate vkDeviceWaitIdle'd, so the just-submitted present-wait has drained).
+        DestroyRenderFinishedSemaphores();
+        CreateRenderFinishedSemaphores();
     } else {
         Check(pr, "vkQueuePresentKHR");
     }

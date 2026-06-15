@@ -130,14 +130,18 @@ void VulkanCommandBuffer::BindTexturePair(ITexture& primary, ITexture& secondary
 }
 
 void VulkanCommandBuffer::BindMaterial(ITexture& base, ITexture& normalMap) {
-    // The base texture owns the material descriptor set (binding 0/1 = base-color). Point its
-    // normal-map slot (binding 3/4) at `normalMap`'s view, then bind the single combined set. The
-    // attach is cached, so re-binding the same (base, normalMap) pair each frame issues no update.
+    // Resolve the IMMUTABLE 2-texture material set for this exact (base-color, normal-map) pair from
+    // the device's per-pair cache, then bind it (binding 0/1 = base, 3/4 = normal). Previously the
+    // base texture owned ONE set whose normal slot was re-pointed in place via attachNormalMap; when
+    // a base texture was shared by renderables with DIFFERENT normal maps (the default scene shares
+    // `checker` across the plane/cubes (normalmap) and the spheres (flat_normal)), that in-place
+    // vkUpdateDescriptorSets updated a set already bound into THIS recording command buffer, which the
+    // validation layer flagged (VUID-vkCmdBindDescriptorSets-commandBuffer-recording: bound set
+    // updated without UPDATE_AFTER_BIND). A per-pair immutable set carries byte-identical descriptors,
+    // so the render is unchanged — the fix is correctness-only.
     auto& baseTex = static_cast<VulkanTexture&>(base);
     auto& normalTex = static_cast<VulkanTexture&>(normalMap);
-    baseTex.attachNormalMap(normalTex.view());
-
-    VkDescriptorSet s = baseTex.vkDescriptorSet();
+    VkDescriptorSet s = device_.materialSet(baseTex.view(), normalTex.view());
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                             boundMaterialSet_, 1, &s, 0, nullptr);
 }
