@@ -91,7 +91,10 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
     MTLDepthStencilDescriptor* dsd = [[MTLDepthStencilDescriptor alloc] init];
     if (desc.depthTest || desc.depthOnly) {
         dsd.depthCompareFunction = MTLCompareFunctionLess;
-        dsd.depthWriteEnabled = YES;
+        // Depth WRITE: the depth-only shadow pass must always write depth; otherwise honor the new
+        // depthWrite flag (default true => unchanged behavior). The translucent pass sets it false to
+        // depth-test (read) without writing (Slice T).
+        dsd.depthWriteEnabled = (desc.depthOnly || desc.depthWrite) ? YES : NO;
     } else {
         dsd.depthCompareFunction = MTLCompareFunctionAlways;
         dsd.depthWriteEnabled = NO;

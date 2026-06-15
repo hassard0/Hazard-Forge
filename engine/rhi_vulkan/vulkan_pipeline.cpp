@@ -115,7 +115,10 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     VkPipelineDepthStencilStateCreateInfo ds{
         VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     ds.depthTestEnable = desc.depthTest ? VK_TRUE : VK_FALSE;
-    ds.depthWriteEnable = desc.depthTest ? VK_TRUE : VK_FALSE;
+    // Depth WRITE is gated by both depthTest and the new depthWrite flag. depthWrite defaults true,
+    // so depth-tested pipelines write depth exactly as before; the translucent pass sets it false to
+    // depth-test (read) without writing (Slice T).
+    ds.depthWriteEnable = (desc.depthTest && desc.depthWrite) ? VK_TRUE : VK_FALSE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;
 
     VkDynamicState dynStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};

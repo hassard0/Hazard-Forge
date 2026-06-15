@@ -176,6 +176,7 @@ int main(int argc, char** argv) {
     const char* iblShotPath = nullptr;
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
+    const char* transparencyShotPath = nullptr;
     const char* commandsPath = nullptr;
     bool dumpScene = false;
     bool editor = false;
@@ -203,6 +204,11 @@ int main(int argc, char** argv) {
             // fixed number of times until it settles, then render the RESTING bodies via the existing
             // instanced pipeline (one instance transform per body), lit + shadowed. One BMP -> exit.
             physicsShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--transparency-shot") == 0 && i + 1 < argc) {
+            // Slice T: opaque scene (checkerboard ground + skybox + a couple of opaque lit objects)
+            // plus a handful of overlapping tinted GLASS objects rendered in a sorted, alpha-blended
+            // translucent pass (depth-test, depth-WRITE off), back-to-front. One BMP -> exit.
+            transparencyShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
@@ -713,6 +719,274 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %u instances\n",
                                     instancedShotPath, cw, ch2, kInstanceCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", instancedShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Alpha-blended transparency showcase (--transparency-shot, Slice T): a self-contained
+        // capture path that does NOT touch the default scene. Checkerboard ground plane + procedural
+        // sky + a few OPAQUE lit objects (cubes) to show THROUGH, then a handful of overlapping tinted
+        // GLASS spheres at different depths rendered in a SORTED (back-to-front) alpha-blended pass that
+        // depth-TESTS the opaque scene but does NOT write depth (the new depthWrite=false). One frame ->
+        // BMP -> exit. Uses a SEPARATE transparent pipeline (transparent.vert + transparent.frag);
+        // golden-locked pipelines/shaders untouched. --
+        if (transparencyShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Opaque lit pipeline (ground + opaque cubes): shared lit.vert + lit.frag, 80-byte push.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model + float4 material
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Transparent ("glass") pipeline: transparent.vert + transparent.frag. alphaBlend ON,
+            // depthTest ON, depthWrite OFF (reads opaque depth, never writes), double-sided (cullNone).
+            // Push constant = { model(64), tintAlpha(16) } = 80 bytes (separate range from lit).
+            auto tVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/transparent.vert.hlsl.spv");
+            auto tFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/transparent.frag.hlsl.spv");
+            auto tVs = device->CreateShaderModule({std::span<const uint32_t>(tVsWords)});
+            auto tFs = device->CreateShaderModule({std::span<const uint32_t>(tFsWords)});
+            rhi::GraphicsPipelineDesc tDesc;
+            tDesc.vertex = tVs.get();
+            tDesc.fragment = tFs.get();
+            tDesc.vertexLayout = scene::MeshVertexLayout();
+            tDesc.colorFormat = device->Swapchain().ColorFormat();
+            tDesc.depthTest = true;
+            tDesc.depthWrite = false;   // Slice T: depth-test against opaque, do NOT write depth
+            tDesc.alphaBlend = true;    // src_alpha / one_minus_src_alpha over the opaque scene
+            tDesc.cullNone = true;      // double-sided glass
+            tDesc.usesFrameUniforms = true;
+            tDesc.usesTexture = false;  // self-contained shader; binds no textures
+            tDesc.pushConstantSize = sizeof(float) * 20;  // model + float4 tintAlpha
+            auto transparentPipeline = device->CreateGraphicsPipeline(tDesc);
+
+            // Static depth-only shadow pipeline (ground + opaque cubes cast shadows).
+            auto shVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shVs = device->CreateShaderModule({std::span<const uint32_t>(shVsWords)});
+            auto shFs = device->CreateShaderModule({std::span<const uint32_t>(shFsWords)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shVs.get();
+            shDesc.fragment = shFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // Sky + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // Opaque cubes (behind/among the glass) so there is something to see THROUGH. Spread in X
+            // and depth, sitting on the ground.
+            // Two opaque cubes sit BEHIND the glass (so they read clearly THROUGH it), and one opaque
+            // cube sits clearly IN FRONT of the rearmost glass sphere (so it must OCCLUDE the part of
+            // that sphere behind it — the depth-test/depthWrite=false correctness check).
+            struct Opaque { Mat4 model; float r, g, b; };
+            std::vector<Opaque> opaques = {
+                {Mat4::Translate({-2.2f, 0.6f, -1.0f}) * Mat4::RotateY(0.4f) * Mat4::Scale({0.6f,0.6f,0.6f}), 0.90f, 0.30f, 0.20f},
+                {Mat4::Translate({ 2.2f, 0.6f, -1.4f}) * Mat4::RotateY(-0.5f) * Mat4::Scale({0.6f,0.6f,0.6f}), 0.95f, 0.85f, 0.25f},
+                // In-front occluder: at z=+2.6 (closer to the camera than the glass spheres), overlapping
+                // them in screen space, so it covers the glass behind it.
+                {Mat4::Translate({-0.9f, 0.7f, 2.8f}) * Mat4::RotateY(0.2f) * Mat4::Scale({0.7f,0.7f,0.7f}), 0.25f, 0.85f, 0.40f},
+            };
+
+            // Translucent glass spheres: overlapping, different colors + depths + base alphas. Each is
+            // a position + uniform scale + RGB tint + base alpha. Sorted back-to-front each frame.
+            struct Glass { Vec3 pos; float scale; float r, g, b, baseAlpha; };
+            std::vector<Glass> glass = {
+                {{-1.3f, 1.0f,  1.4f}, 1.1f, 0.85f, 0.20f, 0.20f, 0.28f},  // red
+                {{ 0.0f, 1.1f,  0.4f}, 1.2f, 0.20f, 0.55f, 0.95f, 0.26f},  // blue
+                {{ 1.4f, 1.0f,  1.2f}, 1.1f, 0.30f, 0.90f, 0.45f, 0.30f},  // green
+                {{ 0.6f, 1.8f,  2.0f}, 0.9f, 0.95f, 0.85f, 0.25f, 0.24f},  // amber, in front
+            };
+
+            // Camera + light + sky frame data (fixed, deterministic). Lower, head-on camera to read
+            // the see-through layering clearly.
+            const Vec3 eye{0.0f, 2.6f, 7.5f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.6f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-11.0f, 11.0f, -11.0f, 11.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            // Sort the glass back-to-front by distance from the camera eye (farthest first) so the
+            // alpha over-blend is correct. Deterministic for the fixed camera.
+            std::sort(glass.begin(), glass.end(), [&](const Glass& a, const Glass& b) {
+                float da = math::length(a.pos - eye);
+                float db = math::length(b.pos - eye);
+                return da > db;  // farthest first
+            });
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    // Ground caster.
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    // Opaque cubes cast shadows (glass does not, by design).
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    for (const auto& o : opaques) {
+                        cmd.PushConstants(o.model.m, sizeof(float) * 16);
+                        cmd.DrawIndexed(cube.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // --- Opaque pass (writes depth). Ground plane + opaque cubes. ---
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    for (const auto& o : opaques) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = o.model.m[k];
+                        // metallic, roughness; (tint is baked via vertex color? use material only) —
+                        // the lit shader multiplies gTex (checker) by vertex color; we want a solid
+                        // tint, so push a dielectric material and rely on the bound checker for texture.
+                        pc[16] = 0.1f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.DrawIndexed(cube.indexCount());
+                    }
+                    // --- Sorted translucent pass (alpha-blended, depth-test, NO depth write). The
+                    // glass blends over the opaque scene and reads (but does not write) depth, so
+                    // opaque geometry in FRONT correctly occludes it and overlapping glass blends. ---
+                    cmd.BindPipeline(*transparentPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    for (const auto& g : glass) {
+                        Mat4 model = Mat4::Translate(g.pos) * Mat4::Scale({g.scale, g.scale, g.scale});
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                        pc[16] = g.r; pc[17] = g.g; pc[18] = g.b; pc[19] = g.baseAlpha;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(transparencyShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %zu glass + %zu opaque\n",
+                                    transparencyShotPath, cw, ch2, glass.size(), opaques.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", transparencyShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

@@ -140,6 +140,35 @@ PCF shadow sampling.
 > change: **DIFF 0.3283** vs the previous golden. One shared HLSL change hits both backends; two
 > Metal runs diff to `0.0000`, and Vulkan renders the same bumps.
 
+## `transparency.png` — alpha-blended transparency (Slice T)
+
+`transparency.png` is a SEPARATE golden produced by `visual_test --transparency`: a minimal
+translucent-glass showcase (ground checkerboard plane + procedural sky + three **opaque** lit cubes —
+two behind the glass, one in front as an occluder — then **four overlapping tinted glass spheres** at
+different depths, lit + shadowed, fixed head-on camera/light). The glass is drawn in a SORTED
+(back-to-front by distance from the camera eye) **alpha-blended** pass using a SEPARATE transparent
+pipeline (`shaders/transparent.vert.hlsl` + `shaders/transparent.frag.hlsl`): the fragment shader is
+self-contained (no material textures) — a directional half-Lambert diffuse + a Blinn-Phong specular
+highlight + a procedural `SkyColor` reflection, with a **Fresnel-style alpha** that rises at grazing
+angles so edges read as more opaque (`alpha = lerp(baseAlpha, 1, pow(1-N·V, 5))`). Per-object tint +
+base alpha arrive via the push constant (`{ float4x4 model; float4 tintAlpha }`, 80 bytes).
+
+The pipeline runs `alphaBlend=true, depthTest=true, depthWrite=false, cullNone=true` (double-sided
+glass). The new RHI flag **`GraphicsPipelineDesc.depthWrite`** (default `true`) lets the glass
+depth-TEST against the opaque scene (so opaque geometry in front correctly occludes it — see the
+front cube) while NOT writing depth (so overlapping glass blends correctly and never self-occludes).
+`depthWrite` defaults true, so every pre-existing pipeline is byte-for-byte unchanged: the five
+goldens above (`scene_shadow`/`skinning`/`pbr_helmet`/`instanced`/`ibl_helmet`) and `physics` all
+still diff `0.0000`. The scene is deterministic (fixed camera, deterministic CPU sort) — two
+`--transparency` runs diff `0.0000`. This golden is INDEPENDENT of all the others.
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --transparency /tmp/glass.png
+~/mac-remote-rig/compare.sh tests/golden/metal/transparency.png /tmp/glass.png 0.0   # -> DIFF 0.0000
+```
+
 ## Shaders are generated, not hand-written
 
 The Metal shaders are **generated from the shared HLSL sources** at build time — there is no

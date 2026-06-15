@@ -81,6 +81,11 @@ hf_gen_msl(shadow_skinned.vert shadow_skinned.vert.hlsl vert skinned_shadow_vert
 # variant reuses lit.frag; the shadow variant is depth-only. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(lit_instanced.vert    lit_instanced.vert.hlsl    vert instanced_vertex)
 hf_gen_msl(shadow_instanced.vert shadow_instanced.vert.hlsl vert instanced_shadow_vertex)
+# Transparent ("glass") pass (Slice T): a dedicated vertex shader (model + per-object tint/alpha push
+# constant) and a self-contained glassy fragment shader (no material textures). Same HLSL->SPIR-V->MSL
+# toolchain as the others.
+hf_gen_msl(transparent.vert transparent.vert.hlsl vert transparent_vertex)
+hf_gen_msl(transparent.frag transparent.frag.hlsl frag transparent_fragment)
 hf_gen_msl(post.vert   post.vert.hlsl   vert post_vertex)
 hf_gen_msl(post.frag   post.frag.hlsl   frag post_fragment)
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)

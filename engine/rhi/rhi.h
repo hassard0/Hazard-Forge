@@ -48,6 +48,13 @@ struct GraphicsPipelineDesc {
     class IShaderModule* vertex = nullptr;
     class IShaderModule* fragment = nullptr;
     VertexLayout vertexLayout;
+    // Depth-WRITE control. Independent of depthTest. When depthTest is on, this decides whether
+    // passing fragments also WRITE the depth buffer. Default true reproduces the historical
+    // behavior (depth-tested pipelines also wrote depth), so EVERY existing pipeline is byte-for-byte
+    // unchanged. Set false for the translucent pass (Slice T): glass still depth-TESTS against the
+    // opaque scene (so opaque geometry in front occludes it) but does NOT write depth, so overlapping
+    // translucent surfaces blend correctly and never self-occlude. Ignored when depthTest is false.
+    bool depthWrite = true;
     // Optional SECOND, per-instance vertex stream (binding 1, input rate = per-instance). When its
     // `attributes` is non-empty the pipeline declares a second vertex binding fed by
     // BindInstanceBuffer; binding 0 stays the per-vertex `vertexLayout`. Empty (the default) means

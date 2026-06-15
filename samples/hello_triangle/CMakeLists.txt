@@ -20,6 +20,8 @@ hf_compile_shaders(
     "shaders/shadow_skinned.vert.hlsl:vs"
     "shaders/lit_instanced.vert.hlsl:vs"
     "shaders/shadow_instanced.vert.hlsl:vs"
+    "shaders/transparent.vert.hlsl:vs"
+    "shaders/transparent.frag.hlsl:ps"
     "shaders/shadow.vert.hlsl:vs"
     "shaders/shadow.frag.hlsl:ps"
     "shaders/post.vert.hlsl:vs"
