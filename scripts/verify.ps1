@@ -10,9 +10,11 @@
          - All steps run inside a VS BuildTools x64 dev shell so cl/ninja resolve.
 
       2. Mac / Metal (headless, over SSH on the LAN)
-         - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked golden),
-           scp it to the Mac, extract, configure+build the metal_headless target, run visual_test,
-           and compare the output to the committed golden with threshold 0.0 (must be DIFF 0.0000).
+         - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked goldens),
+           scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
+           EACH of the 15 committed Metal goldens run visual_test with its showcase flag and compare
+           the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
+           A per-golden table is printed; the Mac portion passes only if ALL 15 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -50,11 +52,33 @@ $MacUser    = 'ianhassard'
 $MacHost    = '192.168.4.215'
 $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
-$Golden     = 'tests/golden/metal/scene_shadow.png'
 $TarName    = 'hf-verify.tar.gz'
+
+# The 15 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
+# path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
+# metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
+$Goldens = @(
+    @{ Name = 'scene_shadow';  Flag = '' }                       # default visual_test <out>
+    @{ Name = 'skinning';      Flag = '--skinning' }             # Slice O
+    @{ Name = 'pbr_helmet';    Flag = '--pbr' }                  # Slice P
+    @{ Name = 'instanced';     Flag = '--instanced' }            # Slice Q
+    @{ Name = 'ibl_helmet';    Flag = '--ibl' }                  # Slice R
+    @{ Name = 'physics';       Flag = '--physics' }              # Slice S
+    @{ Name = 'transparency';  Flag = '--transparency' }         # Slice T
+    @{ Name = 'bloom';         Flag = '--bloom' }                # Slice U
+    @{ Name = 'scene_import';  Flag = '--scene' }                # Slice V
+    @{ Name = 'debug_viz';     Flag = '--debug' }                # Slice W
+    @{ Name = 'anim_blend';    Flag = '--blend' }                # Slice X
+    @{ Name = 'ssao';          Flag = '--ssao' }                 # Slice Y
+    @{ Name = 'capstone';      Flag = '--capstone' }             # Slice Z
+    @{ Name = 'camera_pose';   Flag = '--camera 0.2,-0.1,0,3,10' } # Slice AA (scripted pose)
+    @{ Name = 'gizmo';         Flag = '--gizmo 2' }              # Slice AB (select obj 2)
+)
 
 $winResult = 'SKIP'
 $macResult = 'SKIP'
+$script:macGoldenResults = @()   # per-golden [{ Name; Diff; Ok }] filled by Invoke-MacVerify
 
 function Write-Section($t) { Write-Host ""; Write-Host "==== $t ====" -ForegroundColor Cyan }
 
@@ -174,9 +198,14 @@ function Invoke-MacVerify {
         if ($LASTEXITCODE -ne 0) { throw "tar failed" }
     } finally { Pop-Location }
 
-    # Sanity: the golden MUST be in the archive or the compare on the Mac can't run.
-    $hasGolden = (& tar -tzf $tarPath) | Select-String -SimpleMatch 'golden/metal/scene_shadow.png'
-    if (-not $hasGolden) { throw "golden PNG missing from archive - refusing to continue" }
+    # Sanity: EVERY golden MUST be in the archive or its compare on the Mac can't run.
+    $archiveList = (& tar -tzf $tarPath)
+    foreach ($g in $Goldens) {
+        $needle = "golden/metal/$($g.Name).png"
+        if (-not ($archiveList | Select-String -SimpleMatch $needle)) {
+            throw "golden '$($g.Name).png' missing from archive - refusing to continue"
+        }
+    }
 
     # 2) recreate the remote staging dir + copy + extract (idempotent).
     Write-Host "--- scp + extract on Mac ---"
@@ -185,32 +214,107 @@ function Invoke-MacVerify {
     & $scp[0] $scp[1..($scp.Count-1)] $tarPath "${MacUser}@${MacHost}:$MacStage/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
 
-    # 3) extract + build + run + compare, all in one remote shell. The remote script echoes a
-    #    final DIFF line; we both stream it and parse it. `set -e` aborts on the first failure.
-    $remote = @"
+    # 3) extract + build ONCE + loop ALL 15 goldens. To avoid the login shell being zsh and to dodge
+    #    PowerShell here-string backtick-escaping fragility, the per-golden loop is generated as a
+    #    standalone bash script, scp'd to the Mac, and run with an explicit `bash`. For each
+    #    (flag -> golden) pair it renders visual_test <flag> /tmp/hf_<name>.png and compares to
+    #    tests/golden/metal/<name>.png at threshold 0.0, emitting a machine-parseable
+    #    "RESULT <name> <diff> <PASS|FAIL>" line we parse on the Windows side. The loop does NOT
+    #    abort on a single failure (no `set -e` inside it): a drifted golden must still yield the full
+    #    table so a reviewer sees exactly which one(s) changed. Build failures abort hard.
+    #    compare.sh prints "DIFF <value>" and exits 0 only when DIFF <= threshold (0.0 here).
+    #
+    #    The PAIRS data is "<name>|<flag>" lines (flag empty for the default Slice-F scene). LF-only
+    #    line endings are required so bash reads them cleanly.
+    $pairLines = ($Goldens | ForEach-Object { "$($_.Name)|$($_.Flag)" }) -join "`n"
+
+    # NOTE: this bash body is a single-quoted PS here-string, so NOTHING in it is expanded/escaped by
+    # PowerShell. The PAIRS block is injected by string-replacing the @@PAIRS@@ token afterwards.
+    $bashBody = @'
+#!/usr/bin/env bash
 set -e
 source ~/mac-remote-rig/env.sh
-cd $MacStage
-tar -xzf $TarName
+# Run from the staging dir (this script was scp'd into it).
+cd "$(cd "$(dirname "$0")" && pwd)"
+tar -xzf "$TARBALL"
 cmake -S metal_headless -B build-metal -G Ninja >/dev/null
 cmake --build build-metal >/dev/null
-./build-metal/visual_test /tmp/verify.png
-~/mac-remote-rig/compare.sh $Golden /tmp/verify.png 0.0
-"@
+set +e
+read -r -d '' PAIRS <<'PAIRS_EOF'
+@@PAIRS@@
+PAIRS_EOF
+while IFS='|' read -r name flag; do
+    [ -z "$name" ] && continue
+    out="/tmp/hf_${name}.png"
+    golden="tests/golden/metal/${name}.png"
+    if [ -z "$flag" ]; then
+        ./build-metal/visual_test "$out" >/dev/null 2>&1
+    else
+        # flag may be multi-token (e.g. "--camera 0.2,-0.1,0,3,10") -> intentional word-split.
+        ./build-metal/visual_test $flag "$out" >/dev/null 2>&1
+    fi
+    if [ $? -ne 0 ]; then
+        echo "RESULT $name RENDER_FAIL FAIL"
+        continue
+    fi
+    diffline=$(~/mac-remote-rig/compare.sh "$golden" "$out" 0.0 2>&1)
+    crc=$?
+    # compare.sh prints e.g. "DIFF 0.0000 (threshold 0.0)" -> keep ONLY the numeric value (field 2).
+    diffval=$(echo "$diffline" | sed -n 's/^DIFF \([^ ]*\).*/\1/p' | head -1)
+    [ -z "$diffval" ] && diffval=NO-DIFF
+    if [ $crc -eq 0 ]; then
+        echo "RESULT $name $diffval PASS"
+    else
+        echo "RESULT $name $diffval FAIL"
+    fi
+done <<< "$PAIRS"
+'@
 
-    $out = & $ssh[0] $ssh[1..($ssh.Count-1)] $remote 2>&1
+    $bashScript = $bashBody.Replace('@@PAIRS@@', $pairLines)
+    # Write LF-only, no BOM (bash chokes on CRLF and a UTF-8 BOM).
+    $bashScript = $bashScript -replace "`r`n", "`n"
+    $localSh = Join-Path $env:TEMP 'hf-verify-mac.sh'
+    [System.IO.File]::WriteAllText($localSh, $bashScript, (New-Object System.Text.UTF8Encoding($false)))
+
+    & $scp[0] $scp[1..($scp.Count-1)] $localSh "${MacUser}@${MacHost}:$MacStage/run-goldens.sh"
+    if ($LASTEXITCODE -ne 0) { throw "scp of golden-runner script failed" }
+
+    $out = & $ssh[0] $ssh[1..($ssh.Count-1)] "STAGE='$MacStage' TARBALL='$TarName' bash $MacStage/run-goldens.sh" 2>&1
     $code = $LASTEXITCODE
     $out | ForEach-Object { Write-Host $_ }
 
-    # compare.sh exits 0 only when DIFF <= threshold (0.0 here), and prints "DIFF 0.0000".
-    $diffOk = ($out | Select-String -SimpleMatch 'DIFF 0.0000')
-    if ($code -ne 0 -or -not $diffOk) {
+    # Parse the RESULT lines into the per-golden table.
+    $parsed = @{}
+    foreach ($line in $out) {
+        $s = [string]$line
+        if ($s -match '^RESULT\s+(\S+)\s+(\S+)\s+(PASS|FAIL)\s*$') {
+            $parsed[$matches[1]] = @{ Diff = $matches[2]; Ok = ($matches[3] -eq 'PASS') }
+        }
+    }
+
+    $results = @()
+    $allOk = $true
+    foreach ($g in $Goldens) {
+        if ($parsed.ContainsKey($g.Name)) {
+            $r = $parsed[$g.Name]
+            $results += @{ Name = $g.Name; Diff = $r.Diff; Ok = $r.Ok }
+            if (-not $r.Ok) { $allOk = $false }
+        } else {
+            # No RESULT line emitted for this golden - treat as a failure (build/loop aborted early).
+            $results += @{ Name = $g.Name; Diff = 'NO-RESULT'; Ok = $false }
+            $allOk = $false
+        }
+    }
+    $script:macGoldenResults = $results
+
+    if ($code -ne 0 -or -not $allOk) {
         $script:macResult = 'FAIL'
-        Write-Host "Mac verification FAILED (exit $code; golden DIFF not 0.0000)" -ForegroundColor Red
+        $bad = ($results | Where-Object { -not $_.Ok } | ForEach-Object { $_.Name }) -join ', '
+        Write-Host "Mac verification FAILED (remote exit $code; non-0.0000 goldens: $bad)" -ForegroundColor Red
         return
     }
     $script:macResult = 'PASS'
-    Write-Host "Mac verification PASSED (golden DIFF 0.0000)" -ForegroundColor Green
+    Write-Host "Mac verification PASSED (all 15 goldens DIFF 0.0000)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -231,7 +335,23 @@ function Show($label, $r) {
     Write-Host ("  {0,-22} {1}" -f $label, $r) -ForegroundColor $color
 }
 Show 'Windows / Vulkan (ctest)' $winResult
-Show 'Mac / Metal (golden 0.0)' $macResult
+Show 'Mac / Metal (15 goldens)'  $macResult
+
+# Per-golden Metal table (only when the Mac portion ran).
+if ($script:macGoldenResults -and $script:macGoldenResults.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Metal goldens (threshold 0.0 - every diff must be 0.0000):" -ForegroundColor Cyan
+    Write-Host ("    {0,-16} {1,-12} {2}" -f 'golden', 'DIFF', 'result')
+    Write-Host ("    {0,-16} {1,-12} {2}" -f '------', '----', '------')
+    $passCount = 0
+    foreach ($r in $script:macGoldenResults) {
+        $tag = if ($r.Ok) { 'PASS' } else { 'FAIL' }
+        if ($r.Ok) { $passCount++ }
+        $color = if ($r.Ok) { 'Green' } else { 'Red' }
+        Write-Host ("    {0,-16} {1,-12} {2}" -f $r.Name, $r.Diff, $tag) -ForegroundColor $color
+    }
+    Write-Host ("    {0} / {1} goldens at DIFF 0.0000" -f $passCount, $script:macGoldenResults.Count)
+}
 
 if ($winResult -eq 'FAIL' -or $macResult -eq 'FAIL') {
     Write-Host ""

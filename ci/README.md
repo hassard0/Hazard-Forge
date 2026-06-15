@@ -34,18 +34,34 @@ scoped token is available.
 
 ## Jobs
 
-| Job              | Runner                       | What it does                                                        |
-| ---------------- | ---------------------------- | ------------------------------------------------------------------- |
-| `windows-vulkan` | `windows-2022` (hosted)      | conan install (cppstd=17 + Ninja) -> configure -> build -> ctest    |
-| `windows-asan`   | `windows-2022` (hosted)      | `HF_SANITIZE=address` build of the pure-C++ tests -> ctest (ASan)   |
-| `macos-metal`    | `[self-hosted, macos, metal]`| headless Metal build -> `visual_test` -> golden compare (DIFF 0.0)  |
+| Job              | Runner                       | What it does                                                              |
+| ---------------- | ---------------------------- | ------------------------------------------------------------------------- |
+| `windows-vulkan` | `windows-2022` (hosted)      | conan install (cppstd=17 + Ninja) -> configure -> build -> ctest (13 tests) |
+| `windows-asan`   | `windows-2022` (hosted)      | `HF_SANITIZE=address` build of the pure-C++ core + tests -> ctest (ASan)   |
+| `macos-metal`    | `[self-hosted, macos, metal]`| headless Metal build -> render + golden-compare **all 15 goldens** (DIFF 0.0) |
 
 ### The Metal job
 
 GitHub-hosted macOS runners cannot reach the LAN bench Mac and do not provide a Metal GPU whose
-offscreen output matches the baked golden, so `macos-metal` is gated to a **self-hosted** runner
+offscreen output matches the baked goldens, so `macos-metal` is gated to a **self-hosted** runner
 labelled `metal` (set one up on the bench Mac and register it with the labels `self-hosted, macos,
 metal`). On hosted infrastructure the job is skipped.
+
+The job builds `metal_headless` **once**, then for each of the **15** committed goldens runs
+`visual_test <flag> /tmp/hf_<name>.png` and compares it to `tests/golden/metal/<name>.png` at
+threshold `0.0`. Every pair must report `DIFF 0.0000`; the job fails if any golden drifts. The
+15 (golden -> flag) pairs are:
+
+| golden              | flag                          | golden              | flag                  |
+| ------------------- | ----------------------------- | ------------------- | --------------------- |
+| `scene_shadow`      | *(default)*                   | `scene_import`      | `--scene`             |
+| `skinning`          | `--skinning`                  | `debug_viz`         | `--debug`             |
+| `pbr_helmet`        | `--pbr`                       | `anim_blend`        | `--blend`             |
+| `instanced`         | `--instanced`                 | `ssao`              | `--ssao`              |
+| `ibl_helmet`        | `--ibl`                       | `capstone`          | `--capstone`          |
+| `physics`           | `--physics`                   | `camera_pose`       | `--camera 0.2,-0.1,0,3,10` |
+| `transparency`      | `--transparency`              | `gizmo`             | `--gizmo 2`           |
+| `bloom`             | `--bloom`                     |                     |                       |
 
 For routine local verification of **both** platforms in one command, use:
 
@@ -54,8 +70,8 @@ scripts\verify.ps1
 ```
 
 That script runs the Windows/Vulkan ctest locally and drives the bench Mac over SSH to build the
-headless Metal target, render, and compare against `tests/golden/metal/scene_shadow.png` at
-threshold `0.0` (must report `DIFF 0.0000`).
+headless Metal target once and run the **same 15-golden loop**, each compared at threshold `0.0`
+(every one must report `DIFF 0.0000`). It prints a per-golden table and an overall `VERIFY: PASS/FAIL`.
 
 ## Local equivalents
 

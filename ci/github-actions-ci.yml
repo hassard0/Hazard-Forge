@@ -6,15 +6,18 @@
 # the workflow scope (see ci/README.md).
 #
 # What it does:
-#   * windows-vulkan : conan install (cppstd=17 + Ninja) -> cmake configure -> build -> ctest.
-#                      This is the same pipeline scripts/verify.ps1 runs locally for Windows.
-#   * windows-asan   : the AddressSanitizer build (HF_SANITIZE=address) of the pure-C++ tests,
-#                      then ctest under ASan.
-#   * macos-metal    : documented below. GitHub-hosted macOS runners are x86_64/ARM cloud VMs that
-#                      CANNOT reach the LAN bench Mac, and they have no Metal GPU for an offscreen
-#                      golden compare that matches the bench. Run it on a SELF-HOSTED runner on the
-#                      bench Mac, or manually via scripts/verify.ps1 (which drives the bench Mac
-#                      over SSH). The job below is gated to self-hosted and is a no-op otherwise.
+#   * windows-vulkan : conan install (cppstd=17 + Ninja) -> cmake configure -> build -> ctest
+#                      (13 tests). This is the same pipeline scripts/verify.ps1 runs locally for Windows.
+#   * windows-asan   : the AddressSanitizer build (HF_SANITIZE=address) of the pure-C++ core + tests,
+#                      then ctest under ASan (same 13 tests, the 12 pure ones instrumented).
+#   * macos-metal    : documented below. Builds metal_headless ONCE, then renders + golden-compares
+#                      ALL 15 committed Metal goldens (each visual_test showcase flag) at threshold
+#                      0.0 (every diff must be 0.0000). GitHub-hosted macOS runners are x86_64/ARM
+#                      cloud VMs that CANNOT reach the LAN bench Mac, and they have no Metal GPU for
+#                      an offscreen golden compare that matches the bench. Run it on a SELF-HOSTED
+#                      runner on the bench Mac, or manually via scripts/verify.ps1 (which drives the
+#                      bench Mac over SSH and runs the same 15-golden loop). The job below is gated to
+#                      self-hosted and is a no-op otherwise.
 
 name: ci
 
@@ -116,27 +119,67 @@ jobs:
         run: ctest --preset windows-msvc-asan --output-on-failure
 
   # ---------------------------------------------------------------------------------------------------
-  # Mac / Metal golden. GitHub-hosted runners cannot reach the LAN bench Mac and have no matching
+  # Mac / Metal goldens. GitHub-hosted runners cannot reach the LAN bench Mac and have no matching
   # Metal GPU, so this job ONLY runs on a self-hosted runner labelled 'metal' (set one up on the
   # bench Mac). On hosted infra the job is skipped. For day-to-day verification, run the Metal half
-  # via scripts/verify.ps1 from the Windows dev box (it SSHes into the bench Mac and compares the
-  # offscreen render to tests/golden/metal/scene_shadow.png at threshold 0.0).
+  # via scripts/verify.ps1 from the Windows dev box (it SSHes into the bench Mac and runs the SAME
+  # 15-golden loop below). This builds metal_headless once then renders + compares every committed
+  # golden at threshold 0.0; the job fails if ANY golden diffs != 0.0000.
   # ---------------------------------------------------------------------------------------------------
   macos-metal:
-    name: Mac / Metal (golden DIFF 0.0) [self-hosted only]
+    name: Mac / Metal (15 goldens, DIFF 0.0) [self-hosted only]
     runs-on: [self-hosted, macos, metal]
     if: ${{ contains(github.event.repository.topics, 'enable-self-hosted-metal') || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Source the Metal/MoltenVK env, build headless, render
+      - name: Source the Metal env and build headless (once)
         run: |
           source ~/mac-remote-rig/env.sh
           cmake -S metal_headless -B build-metal -G Ninja
           cmake --build build-metal
-          ./build-metal/visual_test /tmp/verify.png
 
-      - name: Compare to golden (must be DIFF 0.0000)
+      # Render + golden-compare all 15 showcases. Each entry is "<golden-basename>|<visual_test flag>"
+      # (empty flag = the default Slice-F scene). Flags are the real ones parsed in
+      # metal_headless/visual_test.mm. The loop does not abort on a single failure so the full table
+      # prints; a trailing check fails the job if any golden drifted.
+      - name: Render + compare all 15 goldens (each must be DIFF 0.0000)
         run: |
           source ~/mac-remote-rig/env.sh
-          ~/mac-remote-rig/compare.sh tests/golden/metal/scene_shadow.png /tmp/verify.png 0.0
+          fail=0
+          PAIRS='scene_shadow|
+          skinning|--skinning
+          pbr_helmet|--pbr
+          instanced|--instanced
+          ibl_helmet|--ibl
+          physics|--physics
+          transparency|--transparency
+          bloom|--bloom
+          scene_import|--scene
+          debug_viz|--debug
+          anim_blend|--blend
+          ssao|--ssao
+          capstone|--capstone
+          camera_pose|--camera 0.2,-0.1,0,3,10
+          gizmo|--gizmo 2'
+          while IFS='|' read -r name flag; do
+            [ -z "$name" ] && continue
+            out="/tmp/hf_${name}.png"
+            golden="tests/golden/metal/${name}.png"
+            if [ -z "$flag" ]; then
+              ./build-metal/visual_test "$out"
+            else
+              ./build-metal/visual_test $flag "$out"
+            fi
+            if ~/mac-remote-rig/compare.sh "$golden" "$out" 0.0; then
+              echo "PASS  $name"
+            else
+              echo "FAIL  $name (DIFF != 0.0000)"
+              fail=1
+            fi
+          done <<< "$PAIRS"
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::one or more Metal goldens drifted (DIFF != 0.0000)"
+            exit 1
+          fi
+          echo "All 15 Metal goldens at DIFF 0.0000"
