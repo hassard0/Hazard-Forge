@@ -83,6 +83,10 @@ hf_compile_shaders(
     # current jittered HDR scene. Reuses post.vert (fullscreen triangle) + the existing RT/RGBA16F path;
     # the only new shader for the slice. Existing post/bloom/ssao/ssr shaders + goldens untouched.
     "shaders/taa_resolve.frag.hlsl:ps"
+    # GPU-driven culling + indirect draw (Slice AR): a compute kernel frustum-culls a 1024-instance
+    # grid and ORDER-compacts the survivors + writes the indirect draw-args; reuses lit_instanced.vert
+    # for the indirect draw. Existing shaders + goldens untouched.
+    "shaders/cull.comp.hlsl:cs"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

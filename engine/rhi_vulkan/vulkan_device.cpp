@@ -749,6 +749,16 @@ bool VulkanDevice::GetCapturedPixels(std::vector<uint8_t>& out, uint32_t& w, uin
     return true;
 }
 
+void VulkanDevice::ReadBuffer(IBuffer& buffer, void* dst, size_t size, size_t offset) {
+    // Slice AR — read back host-visible (HOST_ACCESS_RANDOM | MAPPED) Storage/Indirect buffer bytes.
+    // Invalidate first so we observe the GPU's writes (no-op on coherent memory). Call only after the
+    // GPU work that wrote the buffer has completed (the showcase reads after the capture frame).
+    auto& b = static_cast<VulkanBuffer&>(buffer);
+    if (!b.mappedData()) return;
+    vmaInvalidateAllocation(b.allocator(), b.allocation(), (VkDeviceSize)offset, (VkDeviceSize)size);
+    std::memcpy(dst, static_cast<const uint8_t*>(b.mappedData()) + offset, size);
+}
+
 // --- Resource creation ---
 std::unique_ptr<IShaderModule> VulkanDevice::CreateShaderModule(const ShaderModuleDesc& d) {
     return std::make_unique<VulkanShaderModule>(device_, d.spirv);

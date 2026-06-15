@@ -238,6 +238,21 @@ void MetalCommandBuffer::DrawIndexedInstanced(uint32_t indexCount, uint32_t inst
                        baseInstance:firstInstance];
 }
 
+void MetalCommandBuffer::DrawIndexedIndirect(IBuffer& argsBuffer, size_t offset) {
+    // Slice AR — GPU-driven indexed draw: read the {indexCount, instanceCount, firstIndex,
+    // vertexOffset, firstInstance} record (MTLDrawIndexedPrimitivesIndirectArguments) from the buffer
+    // at `offset`. Single indirect draw — no indirect-command-buffer machinery. firstIndex is encoded
+    // as the indexBufferOffset in BYTES (uint32 indices); the args' firstIndex field stays 0 (we pass
+    // 0 here), matching the compute shader which writes firstIndex=0.
+    auto& b = static_cast<MetalBuffer&>(argsBuffer);
+    [encoder_ drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                          indexType:MTLIndexTypeUInt32
+                        indexBuffer:indexBuffer_
+                  indexBufferOffset:0
+                     indirectBuffer:b.handle()
+               indirectBufferOffset:(NSUInteger)offset];
+}
+
 void MetalCommandBuffer::PushConstants(const void* data, uint32_t size) {
     // Vertex push constants (model matrix) -> inline setVertexBytes at the push-constant slot.
     [encoder_ setVertexBytes:data length:size atIndex:kVbPushConst];
@@ -293,6 +308,9 @@ void MetalCommandBuffer::BindComputePipeline(IComputePipeline& pipeline) {
         if (!computeEncoder_) Fail("computeCommandEncoder failed");
     }
     [computeEncoder_ setComputePipelineState:p.state()];
+    // Size the threadgroup from the pipeline's [numthreads(X,1,1)] width (Slice AR: GPU cull uses
+    // 1024, one workgroup; particles use 64).
+    computeThreadsPerGroup_ = p.threadsPerGroupX();
 }
 
 void MetalCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {

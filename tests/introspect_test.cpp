@@ -134,13 +134,17 @@ int main() {
             bool sawTaaFeature = false;
             // Slice AQ: the frustum-culling capability is advertised in the feature manifest.
             bool sawCullFeature = false;
+            // Slice AR: the gpu-driven-culling capability is advertised in the feature manifest.
+            bool sawGpuCullFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
                     if (AsString(el->value) == "frustum-culling") sawCullFeature = true;
+                    if (AsString(el->value) == "gpu-driven-culling") sawGpuCullFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
+            check(sawGpuCullFeature, "engine.features includes gpu-driven-culling");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -166,14 +170,18 @@ int main() {
         bool sawTaaShot = false;
         // Slice AQ: the --cull-shot showcase flag is listed in the showcase manifest.
         bool sawCullShot = false;
+        // Slice AR: the --gpu-cull-shot showcase flag is listed in the showcase manifest.
+        bool sawGpuCullShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
                 if (s && AsString(MemberOf(s, "flag")) == "--taa-shot") sawTaaShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cull-shot") sawCullShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gpu-cull-shot") sawGpuCullShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
+        check(sawGpuCullShot, "showcases manifest includes --gpu-cull-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

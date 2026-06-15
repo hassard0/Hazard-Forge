@@ -16,9 +16,13 @@ public:
     ~MetalComputePipeline() override;
 
     id<MTLComputePipelineState> state() const { return state_; }
+    // The shader's [numthreads(X,1,1)] width (Slice AR: the GPU-cull kernel uses 1024, one
+    // workgroup). MetalCommandBuffer reads this to size dispatchThreadgroups' threadsPerThreadgroup.
+    uint32_t threadsPerGroupX() const { return threadsPerGroupX_; }
 
 private:
     id<MTLComputePipelineState> state_ = nil;
+    uint32_t threadsPerGroupX_ = 64;
 };
 
 } // namespace hf::rhi::mtl

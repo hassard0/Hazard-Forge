@@ -112,6 +112,10 @@ hf_gen_msl(bloom_composite.frag  bloom_composite.frag.hlsl  frag bloom_composite
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
 hf_gen_msl(sky.vert    sky.vert.hlsl    vert sky_vertex)
 hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)
+# GPU-driven culling + indirect draw (Slice AR): compute kernel frustum-culls a 1024-instance grid
+# and ORDER-compacts the survivors + writes the indirect draw-args. Reuses lit_instanced.vert for the
+# indirect draw. Same HLSL->SPIR-V->MSL toolchain (one workgroup, groupshared prefix sum).
+hf_gen_msl(cull.comp cull.comp.hlsl comp cull_main)
 # GPU particle system: compute kernel + point-sprite vertex/fragment.
 hf_gen_msl(particles.comp particles.comp.hlsl comp particles_main)
 hf_gen_msl(particle.vert   particle.vert.hlsl  vert particle_vertex)

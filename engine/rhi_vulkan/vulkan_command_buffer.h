@@ -32,6 +32,7 @@ public:
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset) override;
     void DrawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
                               int32_t vertexOffset, uint32_t firstInstance) override;
+    void DrawIndexedIndirect(IBuffer& argsBuffer, size_t offset) override;
     void PushConstants(const void* data, uint32_t size) override;
     void SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) override;
     void SetViewport(int32_t x, int32_t y, uint32_t width, uint32_t height) override;

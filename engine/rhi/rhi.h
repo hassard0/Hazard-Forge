@@ -108,7 +108,12 @@ struct GraphicsPipelineDesc {
 
 // Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a
 // graphics pass can draw the compute-written data without a copy).
-enum class BufferUsage { Vertex, Index, Uniform, Storage };
+// Indirect (Slice AR) = a buffer whose contents are read by the GPU as draw arguments
+// (DrawIndexedIndirect). On Vulkan it requests VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT (and is also a
+// storage buffer + transfer-dst, so a compute shader can WRITE the args and the host can READ the
+// resulting count back); on Metal an indirect-args buffer is just a shared MTLBuffer (no special
+// usage), so the flag is a no-op there. This is the minimal additive change: one new enum value.
+enum class BufferUsage { Vertex, Index, Uniform, Storage, Indirect };
 
 // Compute pipeline: a single compute shader that reads+writes storageBufferCount storage buffers
 // bound at successive bindings (0..N-1), driven by an optional push-constant block (e.g. dt/time).
@@ -116,6 +121,12 @@ struct ComputePipelineDesc {
     class IShaderModule* compute = nullptr;
     uint32_t storageBufferCount = 1;  // SSBOs bound at binding 0..count-1
     uint32_t pushConstantSize = 0;    // bytes, compute stage (params like dt/time/count)
+    // The shader's [numthreads(X,1,1)] local-workgroup width. Vulkan bakes this into the SPIR-V, so
+    // the dispatch only needs the GROUP count; Metal's dispatchThreadgroups takes an explicit
+    // threadsPerThreadgroup, so the backend reads this to size the threadgroup. Default 64 matches
+    // the GPU-particle kernel; the GPU-cull kernel (Slice AR) sets 1024 (one workgroup, ordered
+    // prefix-sum compaction over <=1024 instances). Additive: existing pipelines keep 64.
+    uint32_t threadsPerGroupX = 64;
 };
 
 struct TextureDesc {
@@ -229,6 +240,16 @@ public:
         (void)instanceCount; (void)firstInstance;
         DrawIndexed(indexCount, firstIndex, vertexOffset);
     }
+    // GPU-DRIVEN indexed draw (Slice AR): the draw arguments are READ FROM `argsBuffer` (created with
+    // BufferUsage::Indirect) at byte `offset`, NOT passed from the CPU. The buffer holds the standard
+    // 5x u32 record {indexCount, instanceCount, firstIndex, vertexOffset, firstInstance} — identical
+    // for VkDrawIndexedIndirectCommand and MTLDrawIndexedPrimitivesIndirectArguments. A compute
+    // shader writes `instanceCount` (the GPU-decided survivor count) so the number of instances is
+    // never round-tripped to the CPU. Bind the per-instance stream (the compute-compacted survivors)
+    // via BindInstanceBuffer and the index buffer via BindIndexBuffer first, exactly like
+    // DrawIndexedInstanced. Default no-op so backends/passes without indirect draw still link; both
+    // shipping backends override it. The vk*/MTL* indirect-draw calls live ONLY in the backend dirs.
+    virtual void DrawIndexedIndirect(IBuffer& /*argsBuffer*/, size_t /*offset*/ = 0) {}
     virtual void PushConstants(const void* data, uint32_t size) = 0;
     // Override the render pass's full-extent scissor for the following draw(s). ImGui needs a
     // per-draw scissor (clip rect). Coordinates are in framebuffer pixels (top-left origin).
@@ -345,6 +366,15 @@ public:
     // Returns the last captured frame as tightly-packed BGRA8 (top row first); false if none.
     virtual bool GetCapturedPixels(std::vector<uint8_t>& outBGRA,
                                    uint32_t& width, uint32_t& height) = 0;
+
+    // Read `size` bytes back from a GPU buffer (created with BufferUsage::Storage or ::Indirect) at
+    // byte `offset` into `dst`. Call AFTER the work that wrote the buffer has completed (the
+    // GPU-cull showcase reads the indirect-args instanceCount this way for the exact-count proof,
+    // after the capture frame finished). Default no-op so backends without readback still link; both
+    // shipping backends override it (Vulkan: host-visible mapped storage; Metal: shared MTLBuffer
+    // .contents). NO vk*/MTL* leaks above the seam — the mapping lives inside the backend.
+    virtual void ReadBuffer(IBuffer& /*buffer*/, void* /*dst*/, size_t /*size*/,
+                            size_t /*offset*/ = 0) {}
 };
 
 } // namespace hf::rhi

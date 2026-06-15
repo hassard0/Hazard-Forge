@@ -107,6 +107,14 @@ hf_add_pure_test(taa_test)
 # (render/frustum.h, header-only), ASan-eligible.
 hf_add_pure_test(frustum_test)
 
+# GPU-driven culling (Slice AR): the CPU MIRROR of shaders/cull.comp.hlsl's ordered single-workgroup
+# prefix-sum compaction + frustum-sphere test (render/gpu_cull.h). Asserts the compacted survivor
+# stream + count match an independent brute-force reference IN SOURCE-INDEX ORDER over a 1024-instance
+# grid and 200 random frustums (the determinism contract that makes the gpu_cull.png golden stable —
+# an unordered atomicAdd append would pass a count check but reorder the stream). Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(gpu_cull_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

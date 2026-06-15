@@ -191,6 +191,15 @@ bool MetalDevice::GetCapturedPixels(std::vector<uint8_t>& out, uint32_t& w, uint
     return true;
 }
 
+void MetalDevice::ReadBuffer(IBuffer& buffer, void* dst, size_t size, size_t offset) {
+    // Slice AR — read back a shared-storage MTLBuffer's bytes (CPU-visible via .contents on Apple
+    // Silicon). Call after the GPU work that wrote it has completed (the showcase waits for the frame
+    // before reading the GPU-cull instanceCount).
+    auto& b = static_cast<MetalBuffer&>(buffer);
+    const uint8_t* src = static_cast<const uint8_t*>([b.handle() contents]);
+    if (src) std::memcpy(dst, src + offset, size);
+}
+
 void MetalDevice::CaptureFromTexture(id<MTLTexture> colorTex) {
     capW_ = (uint32_t)colorTex.width;
     capH_ = (uint32_t)colorTex.height;

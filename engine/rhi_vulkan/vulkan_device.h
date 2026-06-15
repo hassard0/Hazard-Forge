@@ -45,6 +45,7 @@ public:
     void CaptureNextFrame() override { captureArmed_ = true; }
     bool GetCapturedPixels(std::vector<uint8_t>& outBGRA,
                            uint32_t& width, uint32_t& height) override;
+    void ReadBuffer(IBuffer& buffer, void* dst, size_t size, size_t offset) override;
 
     // Accessors used by sibling Vulkan objects.
     VkDevice device() const { return device_; }

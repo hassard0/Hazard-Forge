@@ -210,6 +210,14 @@ void VulkanCommandBuffer::DrawIndexedInstanced(uint32_t indexCount, uint32_t ins
     vkCmdDrawIndexed(cmd_, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
+void VulkanCommandBuffer::DrawIndexedIndirect(IBuffer& argsBuffer, size_t offset) {
+    // Slice AR — GPU-driven indexed draw: the {indexCount, instanceCount, firstIndex, vertexOffset,
+    // firstInstance} record is read from the buffer at `offset` (a VkDrawIndexedIndirectCommand).
+    // One draw (drawCount=1, stride=0). The compute shader wrote instanceCount = survivor count.
+    auto& b = static_cast<VulkanBuffer&>(argsBuffer);
+    vkCmdDrawIndexedIndirect(cmd_, b.handle(), (VkDeviceSize)offset, /*drawCount=*/1, /*stride=*/0);
+}
+
 void VulkanCommandBuffer::PushConstants(const void* data, uint32_t size) {
     // Push to whatever stages the bound pipeline's range covers: VERTEX for every geometry pass,
     // VERTEX|FRAGMENT for the bloom fullscreen passes (Slice U) whose params are read in fragment.
@@ -267,12 +275,18 @@ void VulkanCommandBuffer::DispatchCompute(uint32_t groupsX, uint32_t groupsY, ui
 
 void VulkanCommandBuffer::ComputeToVertexBarrier() {
     // Compute writes (SHADER_WRITE) -> vertex-input reads (VERTEX_ATTRIBUTE_READ): the draw consumes
-    // the particle buffer as a vertex stream. sync2 buffer memory barrier on the whole pipeline.
+    // the particle/survivor buffer as a vertex stream. Slice AR ALSO has the compute shader write the
+    // indirect draw-args buffer, read at the DRAW_INDIRECT stage (INDIRECT_COMMAND_READ) by
+    // DrawIndexedIndirect — so broaden the dst to cover that too. Conservatively adding the indirect
+    // stage/access is harmless for the existing particle path (which has no indirect read). sync2
+    // memory barrier on the whole pipeline.
     VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    b.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT;
-    b.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                     VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    b.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                      VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.memoryBarrierCount = 1;
     di.pMemoryBarriers = &b;

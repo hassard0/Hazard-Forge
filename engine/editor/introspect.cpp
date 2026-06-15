@@ -93,6 +93,7 @@ const Showcase kShowcases[] = {
     {"--probe-shot",        "Reflection + irradiance probes (local cubemap GI)."},
     {"--taa-shot",          "Temporal anti-aliasing (jittered accumulation)."},
     {"--cull-shot",         "Frustum culling visualization (overview camera + kept/culled bounds)."},
+    {"--gpu-cull-shot",     "GPU-driven culling + indirect draw (compute compaction, GPU draw count)."},
     {"--gizmo-shot",        "Editor selection + translate gizmo overlay."},
     {"--camera-shot",       "Scripted-pose interactive-runtime capture."},
 };
@@ -111,6 +112,7 @@ const char* kFeatures[] = {
     "reflection-irradiance-probes",
     "temporal-anti-aliasing",
     "frustum-culling",
+    "gpu-driven-culling",
     "bloom",
     "ssao",
     "transparency",

@@ -5,7 +5,8 @@
 
 namespace hf::rhi::mtl {
 
-MetalComputePipeline::MetalComputePipeline(MetalDevice& device, const ComputePipelineDesc& desc) {
+MetalComputePipeline::MetalComputePipeline(MetalDevice& device, const ComputePipelineDesc& desc)
+    : threadsPerGroupX_(desc.threadsPerGroupX) {
     auto* cs = static_cast<MetalShaderModule*>(desc.compute);
     NSError* err = nil;
     state_ = [device.device() newComputePipelineStateWithFunction:cs->function() error:&err];

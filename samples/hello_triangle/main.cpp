@@ -25,6 +25,7 @@
 #include "render/clustered.h"
 #include "render/taa.h"
 #include "render/frustum.h"
+#include "render/gpu_cull.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -219,6 +220,7 @@ int main(int argc, char** argv) {
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
     const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
+    const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -385,6 +387,14 @@ int main(int argc, char** argv) {
             // partition is the conservative bounding-sphere test (engine/render/frustum.h) the render
             // submission path uses — render-invariant. One BMP -> exit. New golden (cull.png).
             cullShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--gpu-cull-shot") == 0 && i + 1 < argc) {
+            // Slice AR: GPU-driven culling + indirect draw. A compute shader frustum-culls a
+            // 1024-instance cube grid, ORDER-compacts the survivors into a second instance buffer, and
+            // writes the indirect draw-args (instanceCount = survivor count) — then ONE
+            // DrawIndexedIndirect renders exactly the survivors, the count decided on the GPU. Prints
+            // `gpu-cull: {drawn:<gpu>, cpuRef:<cpu>, total:1024}` and ASSERTS gpu==cpuRef (the
+            // exact-count proof against engine/render/gpu_cull.h). One BMP -> exit. New golden.
+            gpuCullShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -3902,6 +3912,292 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %d drawn / %d culled of %d, %u debug-line vertices\n",
                                     cullShotPath, cw, ch2, drawn, culled, total, kLineVertCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cullShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU-driven culling + indirect draw (--gpu-cull-shot, Slice AR): a compute shader
+        // (shaders/cull.comp.hlsl) frustum-culls a deterministic 1024-instance cube grid, ORDER-
+        // compacts the survivors into a second instance buffer via a single-workgroup prefix sum, and
+        // writes the indirect draw-args buffer (instanceCount = GPU survivor count). ONE
+        // DrawIndexedIndirect then renders exactly the survivors — the draw count is decided on the
+        // GPU, never round-tripped. We read the GPU count back ONCE and ASSERT it equals the CPU
+        // reference over the SAME instances (engine/render/gpu_cull.h, mirroring frustum.h): the
+        // exact-count proof. One BMP -> exit. New golden gpu_cull.png; existing goldens untouched. ----
+        if (gpuCullShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace fr = render::frustum;
+            namespace gc = render::gpu_cull;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            scene::Mesh planeMesh = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh  = scene::Mesh::Cube(*device);
+
+            // --- The 32x32 = 1024 instance grid (one workgroup). Deterministic (no RNG); a WIDE grid
+            // so a narrow camera sees only a central subset (a real cull). Same builder the
+            // --instanced-shot uses; the unit cube's local bound is center=origin, radius=sqrt(0.75). -
+            const uint32_t kGridN = 32;
+            std::vector<scene::InstanceData> grid =
+                scene::BuildInstanceGrid(kGridN, /*spacing=*/1.3f, /*scale=*/0.45f);
+            const uint32_t kInstanceCount = (uint32_t)grid.size();
+            const Vec3 localCenter{0.0f, 0.0f, 0.0f};
+            const float localRadius = std::sqrt(0.75f);
+
+            // Flatten to the 16-floats-per-instance model stream the shader/mirror consume.
+            std::vector<float> models;
+            models.reserve((size_t)kInstanceCount * 16);
+            for (const auto& inst : grid)
+                for (int k = 0; k < 16; ++k) models.push_back(inst.model[k]);
+
+            // --- The render camera: elevated, looking at the grid centre, narrow 35deg FOV so the
+            // wings of the wide grid fall outside the frustum. This view-proj (Vulkan clip) feeds BOTH
+            // the GPU cull (its six planes) and the CPU reference. ---
+            const Vec3 eye{0.0f, 11.0f, 17.0f};
+            const Vec3 center{0.0f, 0.0f, 0.0f};
+            Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(0.6108652f /*35deg*/, aspect, 0.5f, 80.0f);
+            Mat4 vp = proj * view;
+            fr::Frustum cullFrustum = fr::FromViewProj(vp);
+
+            // --- CPU REFERENCE survivor count (the exact-count proof's right-hand side). ---
+            const uint32_t cpuRef =
+                gc::SurvivorCount(models, kInstanceCount, cullFrustum, localCenter, localRadius);
+
+            // --- GPU buffers. Source instances (Storage, also a vertex stream); compacted survivors
+            // (Storage, consumed as the per-instance stream by the indirect draw); indirect args
+            // (Indirect); cull params (Storage: 6 planes + localCenter/radius + counts). ---
+            rhi::BufferDesc srcDesc;
+            srcDesc.size = (uint64_t)kInstanceCount * sizeof(scene::InstanceData);
+            srcDesc.initialData = grid.data();
+            srcDesc.usage = rhi::BufferUsage::Storage;
+            auto srcInstances = device->CreateBuffer(srcDesc);
+
+            rhi::BufferDesc survDesc;
+            survDesc.size = (uint64_t)kInstanceCount * sizeof(scene::InstanceData);
+            survDesc.usage = rhi::BufferUsage::Storage;  // written by compute, read as instance stream
+            auto survInstances = device->CreateBuffer(survDesc);
+
+            // Indirect args: {indexCount, instanceCount, firstIndex, vertexOffset, firstInstance}.
+            // Seed indexCount so even a no-dispatch path is well-formed; the compute overwrites all 5.
+            uint32_t argsInit[5] = {cubeMesh.indexCount(), 0u, 0u, 0u, 0u};
+            rhi::BufferDesc argsDesc;
+            argsDesc.size = sizeof(argsInit);
+            argsDesc.initialData = argsInit;
+            argsDesc.usage = rhi::BufferUsage::Indirect;
+            auto argsBuffer = device->CreateBuffer(argsDesc);
+
+            // Cull params (matches shaders/cull.comp.hlsl Params, std430): 6 planes (n.xyz,d) +
+            // localCenter(xyz)+radius(w) + counts(instanceCount,indexCount,_,_).
+            struct CullParams {
+                float planes[6][4];
+                float localCenter[4];
+                uint32_t counts[4];
+            };
+            static_assert(sizeof(CullParams) == 128, "CullParams layout");
+            CullParams params{};
+            for (int p = 0; p < 6; ++p) {
+                params.planes[p][0] = cullFrustum.planes[p].n.x;
+                params.planes[p][1] = cullFrustum.planes[p].n.y;
+                params.planes[p][2] = cullFrustum.planes[p].n.z;
+                params.planes[p][3] = cullFrustum.planes[p].d;
+            }
+            params.localCenter[0] = localCenter.x; params.localCenter[1] = localCenter.y;
+            params.localCenter[2] = localCenter.z; params.localCenter[3] = localRadius;
+            params.counts[0] = kInstanceCount;
+            params.counts[1] = cubeMesh.indexCount();
+            rhi::BufferDesc paramDesc;
+            paramDesc.size = sizeof(params);
+            paramDesc.initialData = &params;
+            paramDesc.usage = rhi::BufferUsage::Storage;
+            auto paramBuffer = device->CreateBuffer(paramDesc);
+
+            // --- Compute cull pipeline: 4 storage buffers (instances/survivors/args/params), one
+            // workgroup of 1024 threads (ordered prefix-sum compaction over <=1024 instances). ---
+            auto cullCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cull.comp.hlsl.spv");
+            auto cullCs = device->CreateShaderModule({std::span<const uint32_t>(cullCsWords)});
+            rhi::ComputePipelineDesc cullCdesc;
+            cullCdesc.compute = cullCs.get();
+            cullCdesc.storageBufferCount = 4;
+            cullCdesc.pushConstantSize = 0;       // all params come from the storage buffer
+            cullCdesc.threadsPerGroupX = 1024;    // [numthreads(1024,1,1)] — one workgroup
+            auto cullCompute = device->CreateComputePipeline(cullCdesc);
+
+            // --- Instanced lit pipeline (lit_instanced.vert + shared lit.frag): draws the survivor
+            // stream. Same pipeline the --instanced-shot uses (per-instance mat4 at locations 7-10). --
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get();
+            instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = device->Swapchain().ColorFormat();
+            instDesc.depthTest = true;
+            instDesc.usesFrameUniforms = true;
+            instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;  // float4 material
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            // Static lit pipeline (ground) + sky + post.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            Mat4 groundModel = Mat4::Scale({26.0f, 1.0f, 26.0f});
+
+            // --- Frame uniforms (fixed, deterministic). ---
+            FrameData fd{};
+            {
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 30.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-24.0f, 24.0f, -24.0f, 24.0f, 1.0f, 70.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 0.6108652f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("scene", {}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    // GPU cull dispatch (OUTSIDE the render pass): compute compacts survivors + writes
+                    // the indirect args, then barrier compute->(vertex+indirect).
+                    cmd.BindComputePipeline(*cullCompute);
+                    cmd.BindStorageBuffer(*srcInstances, 0);
+                    cmd.BindStorageBuffer(*survInstances, 1);
+                    cmd.BindStorageBuffer(*argsBuffer, 2);
+                    cmd.BindStorageBuffer(*paramBuffer, 3);
+                    cmd.DispatchCompute(1);   // ONE workgroup of 1024 threads
+                    cmd.ComputeToVertexBarrier();
+
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // Ground plane.
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(planeMesh.vertices());
+                        cmd.BindIndexBuffer(planeMesh.indices());
+                        cmd.DrawIndexed(planeMesh.indexCount());
+                    }
+                    // GPU-CULLED instanced cubes: ONE DrawIndexedIndirect. The survivor stream + the
+                    // indirect args were produced by the compute dispatch.
+                    cmd.BindPipeline(*instPipeline);
+                    {
+                        float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+                        cmd.PushConstants(material, sizeof(material));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(cubeMesh.vertices());
+                        cmd.BindInstanceBuffer(*survInstances);
+                        cmd.BindIndexBuffer(cubeMesh.indices());
+                        cmd.DrawIndexedIndirect(*argsBuffer, 0);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            device->WaitIdle();
+
+            // --- Exact-count proof: read the GPU-written instanceCount back and assert == CPU ref. ---
+            uint32_t gpuArgs[5] = {0, 0, 0, 0, 0};
+            device->ReadBuffer(*argsBuffer, gpuArgs, sizeof(gpuArgs), 0);
+            const uint32_t gpuDrawn = gpuArgs[1];
+            std::printf("gpu-cull: {drawn: %u, cpuRef: %u, total: %u}\n",
+                        gpuDrawn, cpuRef, kInstanceCount);
+            if (gpuDrawn != cpuRef) {
+                std::fprintf(stderr,
+                    "FATAL: GPU survivor count %u != CPU reference %u (cull-logic mismatch)\n",
+                    gpuDrawn, cpuRef);
+                device->WaitIdle();
+                return 1;
+            }
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(gpuCullShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — GPU-culled %u/%u instances (indirect draw)\n",
+                                    gpuCullShotPath, cw, ch2, gpuDrawn, kInstanceCount);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gpuCullShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
