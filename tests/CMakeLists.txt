@@ -67,6 +67,12 @@ hf_add_pure_test(clustered_test)
 # (render/ssr.h, header-only), ASan-eligible.
 hf_add_pure_test(ssr_test)
 
+# Volumetric fog / light shafts (Slice AJ): Henyey-Greenstein phase (g=0 isotropic 1/4pi, forward
+# peak > back for g>0, integrates over the sphere to ~1) + camera-basis world-ray reconstruction
+# (centered pixel == camFwd, unit camFwd projection) + Beer-Lambert transmittance. Pure C++
+# (render/volumetric.h, header-only), ASan-eligible.
+hf_add_pure_test(volumetric_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

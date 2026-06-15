@@ -134,6 +134,11 @@ hf_gen_msl(ssao_composite.frag    ssao_composite.frag.hlsl    frag ssao_composit
 # HLSL->SPIR-V->MSL toolchain. Existing shaders + goldens untouched.
 hf_gen_msl(ssr.frag               ssr.frag.hlsl               frag ssr_fragment)
 hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite_fragment)
+# Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
+# volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
+# volumetric_composite adds it over the scene + tonemaps. Same HF_MSL_GEN shadow V-flip as lit.frag.
+hf_gen_msl(volumetric.frag           volumetric.frag.hlsl           frag volumetric_fragment)
+hf_gen_msl(volumetric_composite.frag volumetric_composite.frag.hlsl frag volumetric_composite_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

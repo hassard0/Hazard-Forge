@@ -2969,6 +2969,296 @@ static int RunSsrShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Volumetric fog / light shafts showcase (Slice AJ). Mirrors the Vulkan --volumetric-shot path:
+// an OVERHEAD slatted canopy (a pergola of beams with gaps) + a near-overhead directional light, so
+// the light streams DOWN through the gaps and carves the foggy air into vertical light SHAFTS (god
+// rays) separated by dark shadow volumes under the slats. The scene renders to an HDR RT + the SSAO
+// view-space normal+linear-depth g-buffer; a fullscreen volumetric pass reconstructs each pixel's
+// world-space view ray (from the camera basis in the frame UBO), clamps the march end to the scene
+// depth (fog stops at solids), and RAY-MARCHES 64 steps sampling the directional shadow map per step
+// — lit air adds Henyey-Greenstein in-scattering with Beer-Lambert extinction; a composite ADDS it
+// over the scene + tonemaps. The per-step shadow sample carries the SAME HF_MSL_GEN V-flip the lit
+// pass uses (lightViewProj has its NDC Y-flip baked in via FlipProjY, kept self-consistent with the
+// shadow render). SEPARATE volumetric/volumetric_composite pipelines + shaders; existing pipelines/
+// shaders/goldens untouched. -----
+static int RunVolumetricShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Occluders: an overhead slatted canopy (slats run deep in Z, spaced along X with gaps) + a back
+    // wall. Matches the Vulkan path.
+    struct Occ { Vec3 pos; Vec3 scale; float col[3]; };
+    std::vector<Occ> occs;
+    const float kCanopyY = 5.4f;
+    const int kSlats = 7;
+    for (int p = 0; p < kSlats; ++p) {
+        float x = -5.4f + (float)p * 1.8f;
+        occs.push_back({{x, kCanopyY, -1.0f}, {0.45f, 0.30f, 7.0f}, {0.40f, 0.41f, 0.47f}});
+    }
+    occs.push_back({{0.0f, 3.0f, -9.0f}, {12.0f, 3.0f, 0.4f}, {0.30f, 0.31f, 0.36f}});
+    const int kNumOcc = (int)occs.size();
+
+    // Lit pipeline (static, writing HDR RT) — UNCHANGED lit shaders.
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Shadow pipeline (static) — UNCHANGED.
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // G-buffer prepass pipeline (static), view-space normal + linear depth -> RGBA16F.
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    // Volumetric + composite fullscreen pipelines. The volumetric pass needs BOTH frame uniforms
+    // (camera basis + lightViewProj + shadow map in set 0 t1/s1) AND a texture (the g-buffer in set 1
+    // t0/s0), plus a fragment push constant for the fog params.
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct VolParams {
+        float texel[2]; float density; float g;
+        float extinction; float marchDist; float steps; float pad;
+    };
+    struct VolCompParams { float texel[2]; float intensity; float pad; };
+
+    auto volFs  = loadMSL("volumetric.frag.gen.metal", "volumetric_fragment");
+    auto compFs = loadMSL("volumetric_composite.frag.gen.metal", "volumetric_composite_fragment");
+
+    rhi::GraphicsPipelineDesc volD;
+    volD.vertex = postVs.get(); volD.fragment = volFs.get();
+    volD.colorFormat = kHdr;
+    volD.depthTest = false; volD.fullscreen = true;
+    volD.usesFrameUniforms = true; volD.usesTexture = true;
+    volD.fragmentPushConstants = true; volD.pushConstantSize = sizeof(VolParams);
+    auto volPipe = device->CreateGraphicsPipeline(volD);
+
+    rhi::GraphicsPipelineDesc compD;
+    compD.vertex = postVs.get(); compD.fragment = compFs.get();
+    compD.colorFormat = device->Swapchain().ColorFormat();
+    compD.depthTest = false; compD.usesTexture = true; compD.fullscreen = true;
+    compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(VolCompParams);
+    auto compPipe = device->CreateGraphicsPipeline(compD);
+
+    auto rt    = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf  = device->CreateRenderTarget(W, H, kHdr);
+    auto volRT = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // Near-black floor so the god rays glow against a dark base (matches Vulkan path).
+    std::vector<uint8_t> floorPx(256 * 256 * 4);
+    for (uint32_t y = 0; y < 256; ++y)
+        for (uint32_t x = 0; x < 256; ++x) {
+            bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+            uint8_t v = dark ? 12 : 20;
+            size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+            floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+            floorPx[idx + 2] = (uint8_t)(v + 3); floorPx[idx + 3] = 255;
+        }
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> occTex;
+    for (int o = 0; o < kNumOcc; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(occs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(occs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(occs[o].col[2] * 255.0f), 255};
+        occTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+
+    Mat4 groundModel = Mat4::Scale({20.0f, 1.0f, 20.0f});
+    std::vector<Mat4> occModel(kNumOcc);
+    for (int o = 0; o < kNumOcc; ++o)
+        occModel[o] = Mat4::Translate(occs[o].pos) * Mat4::Scale(occs[o].scale);
+
+    const Vec3 eye{0.0f, 2.7f, 10.5f};
+    const Vec3 center{0.0f, 2.4f, -2.0f};
+    const float aspect = (float)W / (float)H;
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Vec3 lightDir = math::normalize(Vec3{0.05f, -0.74f, 0.67f});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = lightDir.x; fd.lightDir[1] = lightDir.y; fd.lightDir[2] = lightDir.z;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.95f; fd.lightColor[2] = 0.82f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.5f, -1.0f};
+        Vec3 lightEye = sc - lightDir * 26.0f;
+        // Near-vertical light: world-Z up reference for the light's view basis (world-Y degenerate).
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 0, -1});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 52.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    VolParams vparm{};
+    vparm.texel[0] = 1.0f / (float)W; vparm.texel[1] = 1.0f / (float)H;
+    vparm.density = 0.8f; vparm.g = 0.4f; vparm.extinction = 0.06f;
+    vparm.marchDist = 26.0f; vparm.steps = 64.0f; vparm.pad = 0.0f;
+    VolCompParams cp{}; cp.texel[0] = 1.0f / (float)W; cp.texel[1] = 1.0f / (float)H;
+    cp.intensity = 0.72f; cp.pad = 0.0f;
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgGbuf = graph.ImportTarget(
+        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+    render::RgResource rgVol = graph.ImportTarget(
+        "volumetric", render::RgResourceKind::SceneColor, *volRT);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            for (int o = 0; o < kNumOcc; ++o) {
+                cmd.PushConstants(occModel[o].m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexed(cube.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    // No sky pass: dark dusk backdrop so the god rays are the bright feature.
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.015f, 0.02f, 0.035f, 1});
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumOcc; ++o) {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = occModel[o].m[k];
+                pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*occTex[o], *flatNormal);
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexed(cube.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("gbuffer", {}, {rgGbuf},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*gbStaticPipeline);
+            {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumOcc; ++o) {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = occModel[o].m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexed(cube.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("volumetric", {rgShadow, rgGbuf}, {rgVol},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*volPipe);
+            cmd.BindTexture(*gbuf);
+            cmd.PushConstants(&vparm, sizeof(vparm));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("composite", {rgScene, rgVol}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*compPipe);
+            cmd.BindTexturePair(*rt, *volRT);
+            cmd.PushConstants(&cp, sizeof(cp));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — volumetric, %d occluders\n", outPath, cw, ch, kNumOcc);
+    return 0;
+}
+
 // --- Debug-visualization showcase (Slice W). Mirrors the Vulkan --debug-shot path: the SAME settled
 // physics sphere-pyramid scene (ground + sky + lit/shadowed resting bodies), then an immediate-mode
 // DebugDraw overlay (ground grid + per-body wireframe AABB + per-body wire sphere + light-direction
@@ -4683,6 +4973,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ssr") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ssr.png";
             try { return RunSsrShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --volumetric <out.png>: volumetric fog / light shafts showcase (Slice AJ) — an overhead
+        // slatted canopy + near-overhead light streaming through the gaps, ray-marched against the
+        // directional shadow map for Henyey-Greenstein in-scattering (god rays), composited + tonemapped.
+        if (argc > 1 && std::strcmp(argv[1], "--volumetric") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_volumetric.png";
+            try { return RunVolumetricShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         const char* outPath = argc > 1 ? argv[1] : "metal_scene.png";
