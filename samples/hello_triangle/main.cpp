@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
     const char* ssaoShotPath = nullptr;
     const char* ssaoShotOffPath = nullptr;
     const char* ssaoDebugPath = nullptr;
+    const char* capstoneShotPath = nullptr;
     const char* commandsPath = nullptr;
     bool dumpScene = false;
     bool editor = false;
@@ -255,6 +256,15 @@ int main(int argc, char** argv) {
             ssaoShotOffPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--ssao-debug") == 0 && i + 1 < argc) {
             ssaoDebugPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--capstone-shot") == 0 && i + 1 < argc) {
+            // Slice Z: the integrated capstone showcase. ONE composed, deterministic frame that
+            // combines the HDR-IBL environment (sky_hdr + lit_pbr_ibl), the imported CesiumMilkTruck
+            // (LoadGltfScene), the GPU-skinned Fox at a fixed Walk+Run blend (BlendAnimations), the
+            // full-PBR DamagedHelmet on a pedestal, a settled physics sphere pyramid (instanced
+            // pipeline), and a translucent glass panel (transparent pipeline, sorted) — all lit +
+            // directionally shadowed, rendered into an HDR RGBA16F target and finished with the bloom
+            // chain. One BMP -> exit. New golden; existing pipelines/shaders/showcases untouched.
+            capstoneShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
@@ -268,6 +278,612 @@ int main(int argc, char** argv) {
     try {
         hal::Window window({"Hazard Forge — Shadows", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
+
+        // --- Integrated CAPSTONE showcase (--capstone-shot, Slice Z): ONE composed deterministic
+        // frame that orchestrates every per-feature showcase into a single coherent scene. The HDR
+        // equirect environment (sky_hdr) is the background AND the IBL source; on the ground under it
+        // sit the imported CesiumMilkTruck (LoadGltfScene, lit_pbr), the GPU-skinned Fox at a fixed
+        // Walk+Run blend (lit_skinned + BlendAnimations), the full-PBR DamagedHelmet reflecting the
+        // environment (lit_pbr_ibl) on a pedestal cube, a settled physics sphere pyramid (instanced
+        // lit pipeline), and — IN FRONT — a couple of sorted translucent glass spheres (transparent
+        // pipeline, depthWrite off). All opaque geometry casts into a single directional shadow map
+        // (static + skinned + instanced shadow pipelines). The whole scene renders into an HDR
+        // RGBA16F target which is finished by the existing bloom chain (prefilter -> down -> up ->
+        // composite/tonemap). This is the INTEGRATION TEST: 7 distinct opaque pipelines + a
+        // transparent pipeline with different descriptor sets (frame UBO, 2-tex material, 5-tex PBR
+        // set, environment, joint palette, instance buffer) must coexist in ONE scene render pass
+        // without state leaking between consecutive draws. One BMP -> exit. Reuses ALL existing
+        // pipelines/shaders/loaders; nothing existing is touched. -------------------------------------
+        if (capstoneShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+            // === HDR environment (sky + IBL). ===
+            hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+            const float envMaxLod = (float)(env.mipLevels - 1);
+
+            // === Shaders shared across pipelines. ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto pbrFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr.frag.hlsl.spv");
+            auto iblFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr_ibl.frag.hlsl.spv");
+            auto skVsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_skinned.vert.hlsl.spv");
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litVs  = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            auto pbrFs  = device->CreateShaderModule({std::span<const uint32_t>(pbrFsWords)});
+            auto iblFs  = device->CreateShaderModule({std::span<const uint32_t>(iblFsWords)});
+            auto skVs   = device->CreateShaderModule({std::span<const uint32_t>(skVsWords)});
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+
+            // Static lit (ground + pedestal): writes the HDR target.
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Full-PBR (truck): 5-texture material set.
+            rhi::GraphicsPipelineDesc pbrDesc;
+            pbrDesc.vertex = litVs.get(); pbrDesc.fragment = pbrFs.get();
+            pbrDesc.vertexLayout = scene::MeshVertexLayout();
+            pbrDesc.colorFormat = kHdr;
+            pbrDesc.depthTest = true; pbrDesc.usesFrameUniforms = true; pbrDesc.usesTexture = true;
+            pbrDesc.pbrMaterial = true;
+            pbrDesc.pushConstantSize = sizeof(float) * 20;
+            auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+            // Full-PBR + IBL (helmet): 5-texture material set + environment.
+            rhi::GraphicsPipelineDesc iblDesc;
+            iblDesc.vertex = litVs.get(); iblDesc.fragment = iblFs.get();
+            iblDesc.vertexLayout = scene::MeshVertexLayout();
+            iblDesc.colorFormat = kHdr;
+            iblDesc.depthTest = true; iblDesc.usesFrameUniforms = true; iblDesc.usesTexture = true;
+            iblDesc.pbrMaterial = true; iblDesc.usesEnvironment = true;
+            iblDesc.pushConstantSize = sizeof(float) * 20;
+            auto iblPipeline = device->CreateGraphicsPipeline(iblDesc);
+
+            // Skinned lit (fox): joint palette (set 2).
+            rhi::GraphicsPipelineDesc skDesc;
+            skDesc.vertex = skVs.get(); skDesc.fragment = litFs.get();
+            skDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skDesc.colorFormat = kHdr;
+            skDesc.depthTest = true; skDesc.usesFrameUniforms = true; skDesc.usesTexture = true;
+            skDesc.usesJointPalette = true;
+            skDesc.pushConstantSize = sizeof(float) * 20;
+            auto skinnedPipeline = device->CreateGraphicsPipeline(skDesc);
+
+            // Instanced lit (physics spheres): per-instance transform stream.
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = kHdr;
+            instDesc.depthTest = true; instDesc.usesFrameUniforms = true; instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            // Transparent glass: depthTest on, depthWrite off, alpha blend, double-sided.
+            auto tVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/transparent.vert.hlsl.spv");
+            auto tFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/transparent.frag.hlsl.spv");
+            auto tVs = device->CreateShaderModule({std::span<const uint32_t>(tVsWords)});
+            auto tFs = device->CreateShaderModule({std::span<const uint32_t>(tFsWords)});
+            rhi::GraphicsPipelineDesc tDesc;
+            tDesc.vertex = tVs.get(); tDesc.fragment = tFs.get();
+            tDesc.vertexLayout = scene::MeshVertexLayout();
+            tDesc.colorFormat = kHdr;
+            tDesc.depthTest = true; tDesc.depthWrite = false; tDesc.alphaBlend = true;
+            tDesc.cullNone = true; tDesc.usesFrameUniforms = true; tDesc.usesTexture = false;
+            tDesc.pushConstantSize = sizeof(float) * 20;
+            auto transparentPipeline = device->CreateGraphicsPipeline(tDesc);
+
+            // === Shadow pipelines: static + skinned + instanced casters share one shadow map. ===
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto skShadowW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_skinned.vert.hlsl.spv");
+            auto instShW     = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_instanced.vert.hlsl.spv");
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto skShadowVs = device->CreateShaderModule({std::span<const uint32_t>(skShadowW)});
+            auto instShVs   = device->CreateShaderModule({std::span<const uint32_t>(instShW)});
+
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            rhi::GraphicsPipelineDesc skShDesc;
+            skShDesc.vertex = skShadowVs.get(); skShDesc.fragment = shadowFs.get();
+            skShDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skShDesc.depthTest = true; skShDesc.depthOnly = true; skShDesc.usesFrameUniforms = true;
+            skShDesc.usesJointPalette = true;
+            skShDesc.pushConstantSize = sizeof(float) * 16;
+            auto skinnedShadowPipeline = device->CreateGraphicsPipeline(skShDesc);
+
+            rhi::GraphicsPipelineDesc instShDesc;
+            instShDesc.vertex = instShVs.get(); instShDesc.fragment = shadowFs.get();
+            instShDesc.vertexLayout = scene::MeshVertexLayout();
+            instShDesc.instanceLayout = scene::InstanceTransformLayout();
+            instShDesc.depthTest = true; instShDesc.depthOnly = true; instShDesc.usesFrameUniforms = true;
+            auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+            // === Sky (HDR equirect). ===
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky_hdr.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            skyD.usesEnvironment = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // === Bloom pipelines (fullscreen, fragment push constants). ===
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct BloomParams { float texel[2]; float threshold; float knee; float strength; float intensity; };
+            const uint32_t kBloomPC = sizeof(BloomParams);
+            auto makeBloomPipe = [&](rhi::IShaderModule* fs, rhi::Format colorFmt) {
+                rhi::GraphicsPipelineDesc d;
+                d.vertex = postVsM.get(); d.fragment = fs;
+                d.colorFormat = colorFmt;
+                d.depthTest = false; d.usesFrameUniforms = false;
+                d.usesTexture = true; d.fullscreen = true;
+                d.fragmentPushConstants = true; d.pushConstantSize = kBloomPC;
+                return device->CreateGraphicsPipeline(d);
+            };
+            auto prefilterFs  = loadFs("bloom_prefilter.frag.hlsl");
+            auto downsampleFs = loadFs("bloom_downsample.frag.hlsl");
+            auto upsampleFs   = loadFs("bloom_upsample.frag.hlsl");
+            auto compositeFs  = loadFs("bloom_composite.frag.hlsl");
+            auto prefilterPipe  = makeBloomPipe(prefilterFs.get(), kHdr);
+            auto downsamplePipe = makeBloomPipe(downsampleFs.get(), kHdr);
+            auto upsamplePipe   = makeBloomPipe(upsampleFs.get(), kHdr);
+            auto compositePipe  = makeBloomPipe(compositeFs.get(), device->Swapchain().ColorFormat());
+
+            // === Render targets: HDR scene + 5-level half-res mip chain. ===
+            auto rt = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+            const int kMips = 5;
+            std::vector<std::unique_ptr<rhi::IRenderTarget>> down, up;
+            std::vector<uint32_t> mw(kMips), mh(kMips);
+            for (int i = 0; i < kMips; ++i) {
+                uint32_t dw = std::max(1u, w >> (i + 1));
+                uint32_t dh = std::max(1u, h >> (i + 1));
+                mw[i] = dw; mh[i] = dh;
+                down.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+                up.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+            }
+
+            // === Shared meshes + textures. ===
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // === Imported PBR helmet. ===
+            hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+            // === Imported truck scene (node hierarchy -> instances + deduped materials). ===
+            hf::asset::GltfScene truck = hf::asset::LoadGltfScene(*device, HF_TRUCK_MODEL_PATH);
+
+            // === Skinned fox + Walk+Run blended palette (fixed times, deterministic). ===
+            hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
+            std::vector<Mat4> foxPalette;
+            {
+                const anim::Animation* walk = fox.FindAnimation("Walk");
+                const anim::Animation* run  = fox.FindAnimation("Run");
+                if (!walk && !fox.animations.empty()) walk = &fox.animations.front();
+                if (!run) run = walk;
+                if (walk && run)
+                    foxPalette = anim::BlendAnimations(fox.skeleton, *walk, 0.3f, *run, 0.2f, 0.5f);
+                else
+                    foxPalette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+            }
+            std::vector<float> paletteData(64 * 16);
+            for (int j = 0; j < 64; ++j) {
+                Mat4 mm = (j < (int)foxPalette.size()) ? foxPalette[j] : Mat4::Identity();
+                for (int k = 0; k < 16; ++k) paletteData[j * 16 + k] = mm.m[k];
+            }
+
+            // === Settled physics sphere pyramid (deterministic step budget). ===
+            physics::World world;
+            {
+                const float R = 0.5f;
+                const int kLayers = 3;
+                const float d = 2.0f * R;
+                const float dy = R * 1.41421356f;
+                for (int k = 0; k < kLayers; ++k) {
+                    int m = kLayers - k;
+                    float off = 0.5f * (float)(m - 1) * d;
+                    float y = R + (float)k * dy;
+                    for (int gx = 0; gx < m; ++gx)
+                        for (int gz = 0; gz < m; ++gz) {
+                            float x = (float)gx * d - off;
+                            float z = (float)gz * d - off;
+                            world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                        }
+                }
+            }
+            const float dtP = 1.0f / 120.0f;
+            for (int s = 0; s < 240; ++s) world.Step(dtP);
+
+            // === Layout transforms (place everything on the ground plane y=0). ===
+            // Physics pyramid: drop it onto the ground to the LEFT-FRONT.
+            const Mat4 physicsPlace = Mat4::Translate({-5.0f, 0.0f, 2.6f});
+            std::vector<scene::InstanceData> instances;
+            instances.reserve(world.bodies.size());
+            for (const auto& b : world.bodies) {
+                Mat4 m = physicsPlace * b.Transform();
+                scene::InstanceData di;
+                for (int k = 0; k < 16; ++k) di.model[k] = m.m[k];
+                instances.push_back(di);
+            }
+            const uint32_t kInstanceCount = (uint32_t)instances.size();
+            rhi::BufferDesc instBufDesc;
+            instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+            instBufDesc.initialData = instances.data();
+            instBufDesc.usage = rhi::BufferUsage::Vertex;
+            auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+            // Truck: stand-upright fit (same recipe as --scene-shot) then place to the LEFT-BACK.
+            Mat4 truckOrient = Mat4::RotateY(2.1f);
+            float oMin[3] = { 1e30f,  1e30f,  1e30f};
+            float oMax[3] = {-1e30f, -1e30f, -1e30f};
+            for (int c = 0; c < 8; ++c) {
+                float p[3] = {
+                    (c & 1) ? truck.bbMax[0] : truck.bbMin[0],
+                    (c & 2) ? truck.bbMax[1] : truck.bbMin[1],
+                    (c & 4) ? truck.bbMax[2] : truck.bbMin[2],
+                };
+                float x = truckOrient.m[0]*p[0] + truckOrient.m[4]*p[1] + truckOrient.m[8]*p[2]  + truckOrient.m[12];
+                float y = truckOrient.m[1]*p[0] + truckOrient.m[5]*p[1] + truckOrient.m[9]*p[2]  + truckOrient.m[13];
+                float z = truckOrient.m[2]*p[0] + truckOrient.m[6]*p[1] + truckOrient.m[10]*p[2] + truckOrient.m[14];
+                float wp[3] = {x, y, z};
+                for (int k = 0; k < 3; ++k) {
+                    if (wp[k] < oMin[k]) oMin[k] = wp[k];
+                    if (wp[k] > oMax[k]) oMax[k] = wp[k];
+                }
+            }
+            Mat4 truckFit;
+            {
+                float ext[3] = {oMax[0]-oMin[0], oMax[1]-oMin[1], oMax[2]-oMin[2]};
+                float maxExt = ext[0]; if (ext[1] > maxExt) maxExt = ext[1]; if (ext[2] > maxExt) maxExt = ext[2];
+                float scale = (maxExt > 1e-6f) ? (5.0f / maxExt) : 1.0f;
+                float cx = 0.5f * (oMin[0] + oMax[0]);
+                float cz = 0.5f * (oMin[2] + oMax[2]);
+                truckFit = Mat4::Translate({-cx * scale, -oMin[1] * scale, -cz * scale})
+                         * Mat4::Scale({scale, scale, scale});
+            }
+            const Mat4 truckPlace = Mat4::Translate({-2.9f, 0.0f, 0.2f}) * truckFit * truckOrient;
+
+            // Fox: ground-aligned uniform scale (same recipe as --skinning-shot), placed RIGHT-FRONT.
+            float foxH = fox.bbMax[1] - fox.bbMin[1];
+            float foxScale = (foxH > 1e-4f) ? (2.2f / foxH) : 0.05f;
+            float fcx = 0.5f * (fox.bbMin[0] + fox.bbMax[0]);
+            float fcz = 0.5f * (fox.bbMin[2] + fox.bbMax[2]);
+            const Mat4 foxModel = Mat4::Translate({3.4f, 0.0f, 1.6f})
+                                * Mat4::RotateY(-0.9f)
+                                * Mat4::Translate({-fcx * foxScale, -fox.bbMin[1] * foxScale, -fcz * foxScale})
+                                * Mat4::Scale({foxScale, foxScale, foxScale});
+
+            // Helmet on a pedestal cube at CENTER-BACK so its metal reflects the environment.
+            const float pedH = 0.5f;                       // pedestal half-height (cube is unit)
+            const Mat4 pedestalModel = Mat4::Translate({0.0f, pedH, -1.8f}) * Mat4::Scale({1.0f, pedH, 1.0f});
+            const float helmetScale = 1.3f;
+            const Mat4 helmetModel = Mat4::Translate({0.0f, 2.0f * pedH + helmetScale, -1.8f})
+                                   * Mat4::RotateX(1.5707963f) * Mat4::Scale({helmetScale, helmetScale, helmetScale});
+
+            // Ground plane.
+            const Mat4 groundModel = Mat4::Scale({14.0f, 1.0f, 14.0f});
+
+            // Translucent glass spheres IN FRONT (sorted back-to-front), so the scene reads through them.
+            struct Glass { Vec3 pos; float scale; float r, g, b, baseAlpha; };
+            std::vector<Glass> glass = {
+                {{-1.4f, 1.3f, 3.8f}, 1.4f, 0.22f, 0.55f, 0.98f, 0.34f},  // blue
+                {{ 1.3f, 1.2f, 4.2f}, 1.3f, 0.32f, 0.95f, 0.45f, 0.34f},  // green
+            };
+
+            // === Camera + light + sky frame data (fixed, deterministic). Wide framing so EVERY
+            // element is visible together. ===
+            const Vec3 eye{0.0f, 4.0f, 10.0f};
+            const Vec3 center{0.0f, 1.2f, 0.2f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 20.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-9.0f, 9.0f, -9.0f, 9.0f, 1.0f, 45.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up3 = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+                fd.skyParams[2] = envMaxLod;
+            }
+
+            // Sort glass back-to-front from the eye (deterministic for the fixed camera).
+            std::sort(glass.begin(), glass.end(), [&](const Glass& a, const Glass& b) {
+                return math::length(a.pos - eye) > math::length(b.pos - eye);
+            });
+
+            // === Bloom tuning (matches --bloom-shot). ===
+            const float kExposure = 1.7f;
+            const float kThreshold = 1.0f;
+            const float kKnee = 0.6f;
+            const float kUpStrength = 1.0f;
+            const float kBloomStrength = 0.14f;
+            auto mkPC = [&](uint32_t tw, uint32_t th, float strength) {
+                BloomParams p{}; p.texel[0] = 1.0f / (float)tw; p.texel[1] = 1.0f / (float)th;
+                p.threshold = kThreshold; p.knee = kKnee; p.strength = strength; p.intensity = kExposure;
+                return p;
+            };
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            std::vector<render::RgResource> rgDown(kMips), rgUp(kMips);
+            for (int i = 0; i < kMips; ++i) {
+                rgDown[i] = graph.ImportTarget("down" + std::to_string(i),
+                                               render::RgResourceKind::SceneColor, *down[i]);
+                rgUp[i]   = graph.ImportTarget("up" + std::to_string(i),
+                                               render::RgResourceKind::SceneColor, *up[i]);
+            }
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // --- Shadow pass: ALL opaque casters into one shadow map (static + skinned + instanced). ---
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    // Static casters: ground, pedestal, truck primitives, helmet.
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.PushConstants(pedestalModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    cmd.DrawIndexed(cube.indexCount());
+                    cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(helmet.mesh.vertices());
+                    cmd.BindIndexBuffer(helmet.mesh.indices());
+                    cmd.DrawIndexed(helmet.mesh.indexCount());
+                    for (const auto& inst : truck.instances) {
+                        Mat4 world = truckPlace * inst.worldTransform;
+                        cmd.PushConstants(world.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(inst.mesh->vertices());
+                        cmd.BindIndexBuffer(inst.mesh->indices());
+                        cmd.DrawIndexed(inst.mesh->indexCount());
+                    }
+                    // Skinned caster: fox.
+                    cmd.BindPipeline(*skinnedShadowPipeline);
+                    cmd.PushConstants(foxModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(fox.mesh.vertices());
+                    cmd.BindIndexBuffer(fox.mesh.indices());
+                    cmd.DrawIndexed(fox.mesh.indexCount());
+                    // Instanced casters: physics spheres.
+                    cmd.BindPipeline(*instShadowPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindInstanceBuffer(*instanceBuffer);
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    cmd.EndRenderPass();
+                });
+
+            // --- Scene pass into the HDR target: sky -> opaque (lit/PBR/IBL/skinned/instanced) ->
+            // sorted transparent glass. Re-bind every required descriptor before each pipeline's draws
+            // so no descriptor-set state leaks across the 7 consecutive pipeline switches. ---
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    // HDR sky background.
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.BindEnvironment(*env.equirect);
+                    cmd.Draw(3);
+                    // Ground + pedestal (static lit, dielectric).
+                    cmd.BindPipeline(*litPipeline);
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = pedestalModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.5f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(cube.vertices());
+                        cmd.BindIndexBuffer(cube.indices());
+                        cmd.DrawIndexed(cube.indexCount());
+                    }
+                    // Truck (full-PBR): every imported instance with its own world + material set.
+                    cmd.BindPipeline(*pbrPipeline);
+                    for (const auto& inst : truck.instances) {
+                        Mat4 world = truckPlace * inst.worldTransform;
+                        const hf::asset::PbrMaterial& m = *inst.material;
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = world.m[k];
+                        pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
+                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
+                                            *m.emissive, *m.occlusion);
+                        cmd.BindVertexBuffer(inst.mesh->vertices());
+                        cmd.BindIndexBuffer(inst.mesh->indices());
+                        cmd.DrawIndexed(inst.mesh->indexCount());
+                    }
+                    // Helmet (full-PBR + IBL): reflects the bound environment.
+                    cmd.BindPipeline(*iblPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                        pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                            *helmet.emissive, *helmet.occlusion);
+                        cmd.BindEnvironment(*env.equirect);
+                        cmd.BindVertexBuffer(helmet.mesh.vertices());
+                        cmd.BindIndexBuffer(helmet.mesh.indices());
+                        cmd.DrawIndexed(helmet.mesh.indexCount());
+                    }
+                    // Fox (skinned lit): re-bind the joint palette + 2-tex material.
+                    cmd.BindPipeline(*skinnedPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = foxModel.m[k];
+                        pc[16] = fox.metallic; pc[17] = fox.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*fox.baseColor, *flatNormal);
+                        cmd.BindVertexBuffer(fox.mesh.vertices());
+                        cmd.BindIndexBuffer(fox.mesh.indices());
+                        cmd.DrawIndexed(fox.mesh.indexCount());
+                    }
+                    // Physics spheres (instanced lit).
+                    cmd.BindPipeline(*instPipeline);
+                    {
+                        float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+                        cmd.PushConstants(material, sizeof(material));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*instanceBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    // Sorted translucent glass (depth-test, no depth write) over the opaque scene.
+                    cmd.BindPipeline(*transparentPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    for (const auto& g : glass) {
+                        Mat4 model = Mat4::Translate(g.pos) * Mat4::Scale({g.scale, g.scale, g.scale});
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                        pc[16] = g.r; pc[17] = g.g; pc[18] = g.b; pc[19] = g.baseAlpha;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // --- Bloom chain (identical to --bloom-shot). ---
+            graph.AddPass("prefilter", {rgScene}, {rgDown[0]},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    BloomParams p = mkPC(w, h, kBloomStrength);
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*prefilterPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.PushConstants(&p, sizeof(p));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            for (int i = 1; i < kMips; ++i) {
+                graph.AddPass("down" + std::to_string(i), {rgDown[i - 1]}, {rgDown[i]},
+                    [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(mw[i - 1], mh[i - 1], kUpStrength);
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*downsamplePipe);
+                        cmd.BindTexture(*down[i - 1]);
+                        cmd.PushConstants(&p, sizeof(p));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+            }
+            graph.AddPass("upTop", {rgDown[kMips - 1]}, {rgUp[kMips - 1]},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    BloomParams p = mkPC(mw[kMips - 1], mh[kMips - 1], 0.0f);
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*upsamplePipe);
+                    cmd.BindTexturePair(*down[kMips - 1], *down[kMips - 1]);
+                    cmd.PushConstants(&p, sizeof(p));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+            for (int i = kMips - 2; i >= 0; --i) {
+                graph.AddPass("up" + std::to_string(i), {rgUp[i + 1], rgDown[i]}, {rgUp[i]},
+                    [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        BloomParams p = mkPC(mw[i + 1], mh[i + 1], kUpStrength);
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*upsamplePipe);
+                        cmd.BindTexturePair(*up[i + 1], *down[i]);
+                        cmd.PushConstants(&p, sizeof(p));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+            }
+            graph.AddPass("composite", {rgScene, rgUp[0]}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    BloomParams p = mkPC(w, h, kBloomStrength);
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*compositePipe);
+                    cmd.BindTexturePair(*rt, *up[0]);
+                    cmd.PushConstants(&p, sizeof(p));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(capstoneShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — capstone: truck(%zu inst) + fox + helmet + "
+                                    "%u physics spheres + %zu glass, IBL+shadows+bloom\n",
+                                    capstoneShotPath, cw, ch2, truck.instances.size(),
+                                    kInstanceCount, glass.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", capstoneShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
 
         // --- Physics showcase (--physics-shot, Slice S): a self-contained capture path that does NOT
         // touch the default scene. Build a physics::World with a static ground plane (y=0) and a

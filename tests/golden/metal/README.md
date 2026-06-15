@@ -1,5 +1,38 @@
 # Metal golden-image test
 
+## `capstone.png` — integrated capstone showcase (Slice Z)
+
+`capstone.png` is a SEPARATE golden produced by `visual_test --capstone`: ONE composed,
+deterministic frame that **orchestrates every prior per-feature showcase into a single coherent
+scene** — both a milestone demo and an INTEGRATION TEST. Under the **HDR equirect environment**
+(`sky_hdr` background + IBL source) sit, on one ground plane: the imported **CesiumMilkTruck**
+(`LoadGltfScene`, node hierarchy + deduped PBR materials, `lit_pbr`), the GPU-skinned **Fox** at a
+fixed 50/50 **Walk(t=0.3)+Run(t=0.2) blend** (`lit_skinned` + `BlendAnimations`), the full-PBR
+**DamagedHelmet** reflecting the environment (`lit_pbr_ibl`) on a pedestal cube, a **settled physics
+sphere pyramid** (3-layer pile stepped 240× @ dt=1/120, instanced lit pipeline), and — in front —
+two sorted **translucent glass spheres** (`transparent` pipeline, `depthWrite=false`). All opaque
+geometry casts into ONE directional shadow map (static + skinned + instanced shadow pipelines), and
+the whole scene renders into an **HDR `RGBA16_Float` target** finished by the same bloom chain as
+`--bloom` (prefilter → 5 down → up → composite/tonemap).
+
+This is the integration value: **7 distinct opaque pipelines + a transparent pipeline**, each with a
+different descriptor set (frame UBO, 2-tex material, 5-tex PBR set, environment, joint palette,
+instance buffer), coexist in ONE scene render pass — exercising descriptor-set / pipeline-state /
+push-constant coexistence that no isolated showcase hits. It reuses every existing pipeline / shader /
+loader; **nothing existing is touched**, so all 12 prior goldens still diff `0.0000`. The scene is
+fully deterministic (fixed camera/light, fixed transforms, fixed physics step budget + fox blend
+times) — two `--capstone` runs diff `0.0000`. The construction mirrors the Vulkan `--capstone-shot`
+path byte-for-byte (only the CPU NDC-Y flip differs).
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --capstone /tmp/capstone.png
+~/mac-remote-rig/compare.sh tests/golden/metal/capstone.png /tmp/capstone.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `ssao.png` — screen-space ambient occlusion (Slice Y)
 
 `ssao.png` is a SEPARATE golden produced by `visual_test --ssao`: the SAME settled physics

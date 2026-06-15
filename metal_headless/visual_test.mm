@@ -1014,6 +1014,561 @@ static int RunIblShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Integrated CAPSTONE showcase (Slice Z). Mirrors the Vulkan --capstone-shot path BYTE-FOR-BYTE
+// (same deterministic physics step budget, same Walk+Run fox blend times, same transforms, same
+// camera/light). ONE composed frame: HDR equirect environment (sky_hdr) as background + IBL source;
+// on the ground sit the imported CesiumMilkTruck (LoadGltfScene, lit_pbr), the GPU-skinned Fox at a
+// fixed Walk+Run blend (lit_skinned + BlendAnimations), the full-PBR DamagedHelmet reflecting the
+// environment (lit_pbr_ibl) on a pedestal cube, a settled physics sphere pyramid (instanced lit), and
+// — in front — sorted translucent glass spheres (transparent pipeline). All opaque geometry casts
+// into one directional shadow map; the whole scene renders into an HDR RGBA16F target finished by the
+// bloom chain. The integration test: 7 opaque pipelines + a transparent pipeline with distinct
+// descriptor sets coexisting in one scene pass. -------------------------------------------------
+static int RunCapstoneShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === HDR environment (sky + IBL). ===
+    hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+    const float envMaxLod = (float)(env.mipLevels - 1);
+
+    // === Shaders. ===
+    auto litVs  = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    auto pbrFs  = loadMSL("lit_pbr.frag.gen.metal", "pbr_fragment");
+    auto iblFs  = loadMSL("lit_pbr_ibl.frag.gen.metal", "pbr_ibl_fragment");
+    auto skVs   = loadMSL("lit_skinned.vert.gen.metal", "skinned_vertex");
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+
+    // Static lit (ground + pedestal).
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Full-PBR (truck).
+    rhi::GraphicsPipelineDesc pbrDesc;
+    pbrDesc.vertex = litVs.get(); pbrDesc.fragment = pbrFs.get();
+    pbrDesc.vertexLayout = scene::MeshVertexLayout();
+    pbrDesc.colorFormat = kHdr;
+    pbrDesc.depthTest = true; pbrDesc.usesFrameUniforms = true; pbrDesc.usesTexture = true;
+    pbrDesc.pbrMaterial = true;
+    pbrDesc.pushConstantSize = sizeof(float) * 20;
+    auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+    // Full-PBR + IBL (helmet).
+    rhi::GraphicsPipelineDesc iblDesc;
+    iblDesc.vertex = litVs.get(); iblDesc.fragment = iblFs.get();
+    iblDesc.vertexLayout = scene::MeshVertexLayout();
+    iblDesc.colorFormat = kHdr;
+    iblDesc.depthTest = true; iblDesc.usesFrameUniforms = true; iblDesc.usesTexture = true;
+    iblDesc.pbrMaterial = true; iblDesc.usesEnvironment = true;
+    iblDesc.pushConstantSize = sizeof(float) * 20;
+    auto iblPipeline = device->CreateGraphicsPipeline(iblDesc);
+
+    // Skinned lit (fox).
+    rhi::GraphicsPipelineDesc skDesc;
+    skDesc.vertex = skVs.get(); skDesc.fragment = litFs.get();
+    skDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+    skDesc.colorFormat = kHdr;
+    skDesc.depthTest = true; skDesc.usesFrameUniforms = true; skDesc.usesTexture = true;
+    skDesc.usesJointPalette = true;
+    skDesc.pushConstantSize = sizeof(float) * 20;
+    auto skinnedPipeline = device->CreateGraphicsPipeline(skDesc);
+
+    // Instanced lit (physics spheres).
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = kHdr;
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true; instDesc.usesTexture = true;
+    instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    // Transparent glass.
+    auto tVs = loadMSL("transparent.vert.gen.metal", "transparent_vertex");
+    auto tFs = loadMSL("transparent.frag.gen.metal", "transparent_fragment");
+    rhi::GraphicsPipelineDesc tDesc;
+    tDesc.vertex = tVs.get(); tDesc.fragment = tFs.get();
+    tDesc.vertexLayout = scene::MeshVertexLayout();
+    tDesc.colorFormat = kHdr;
+    tDesc.depthTest = true; tDesc.depthWrite = false; tDesc.alphaBlend = true;
+    tDesc.cullNone = true; tDesc.usesFrameUniforms = true; tDesc.usesTexture = false;
+    tDesc.pushConstantSize = sizeof(float) * 20;
+    auto transparentPipeline = device->CreateGraphicsPipeline(tDesc);
+
+    // === Shadow pipelines (static + skinned + instanced; shadow frag is nullptr on Metal). ===
+    auto staticShadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    auto skShadowVs     = loadMSL("shadow_skinned.vert.gen.metal", "skinned_shadow_vertex");
+    auto instShVs       = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+
+    rhi::GraphicsPipelineDesc stShDesc;
+    stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = nullptr;
+    stShDesc.vertexLayout = scene::MeshVertexLayout();
+    stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+    stShDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+    rhi::GraphicsPipelineDesc skShDesc;
+    skShDesc.vertex = skShadowVs.get(); skShDesc.fragment = nullptr;
+    skShDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+    skShDesc.depthTest = true; skShDesc.depthOnly = true; skShDesc.usesFrameUniforms = true;
+    skShDesc.usesJointPalette = true;
+    skShDesc.pushConstantSize = sizeof(float) * 16;
+    auto skinnedShadowPipeline = device->CreateGraphicsPipeline(skShDesc);
+
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true; instShDesc.usesFrameUniforms = true;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    // === Sky (HDR equirect). ===
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky_hdr.frag.gen.metal", "sky_hdr_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    skyD.usesEnvironment = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // === Bloom pipelines. ===
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct BloomParams { float texel[2]; float threshold; float knee; float strength; float intensity; };
+    const uint32_t kBloomPC = sizeof(BloomParams);
+    auto makeBloomPipe = [&](rhi::IShaderModule* fs, rhi::Format colorFmt) {
+        rhi::GraphicsPipelineDesc d;
+        d.vertex = postVs.get(); d.fragment = fs;
+        d.colorFormat = colorFmt;
+        d.depthTest = false; d.usesFrameUniforms = false;
+        d.usesTexture = true; d.fullscreen = true;
+        d.fragmentPushConstants = true; d.pushConstantSize = kBloomPC;
+        return device->CreateGraphicsPipeline(d);
+    };
+    auto prefilterFs  = loadMSL("bloom_prefilter.frag.gen.metal", "bloom_prefilter_fragment");
+    auto downsampleFs = loadMSL("bloom_downsample.frag.gen.metal", "bloom_downsample_fragment");
+    auto upsampleFs   = loadMSL("bloom_upsample.frag.gen.metal", "bloom_upsample_fragment");
+    auto compositeFs  = loadMSL("bloom_composite.frag.gen.metal", "bloom_composite_fragment");
+    auto prefilterPipe  = makeBloomPipe(prefilterFs.get(), kHdr);
+    auto downsamplePipe = makeBloomPipe(downsampleFs.get(), kHdr);
+    auto upsamplePipe   = makeBloomPipe(upsampleFs.get(), kHdr);
+    auto compositePipe  = makeBloomPipe(compositeFs.get(), device->Swapchain().ColorFormat());
+
+    // === Render targets. ===
+    auto rt = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+    const int kMips = 5;
+    std::vector<std::unique_ptr<rhi::IRenderTarget>> down, up;
+    std::vector<uint32_t> mw(kMips), mh(kMips);
+    for (int i = 0; i < kMips; ++i) {
+        uint32_t dw = std::max(1u, W >> (i + 1));
+        uint32_t dh = std::max(1u, H >> (i + 1));
+        mw[i] = dw; mh[i] = dh;
+        down.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+        up.push_back(device->CreateRenderTarget(dw, dh, kHdr));
+    }
+
+    // === Meshes + textures. ===
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    // === Imported PBR helmet. ===
+    hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+    // === Imported truck scene. ===
+    hf::asset::GltfScene truck = hf::asset::LoadGltfScene(*device, HF_TRUCK_MODEL_PATH);
+
+    // === Skinned fox + Walk+Run blended palette (fixed times, deterministic). ===
+    hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
+    std::vector<Mat4> foxPalette;
+    {
+        const anim::Animation* walk = fox.FindAnimation("Walk");
+        const anim::Animation* run  = fox.FindAnimation("Run");
+        if (!walk && !fox.animations.empty()) walk = &fox.animations.front();
+        if (!run) run = walk;
+        if (walk && run)
+            foxPalette = anim::BlendAnimations(fox.skeleton, *walk, 0.3f, *run, 0.2f, 0.5f);
+        else
+            foxPalette.assign(fox.skeleton.joints.size(), Mat4::Identity());
+    }
+    std::vector<float> paletteData(64 * 16);
+    for (int j = 0; j < 64; ++j) {
+        Mat4 mm = (j < (int)foxPalette.size()) ? foxPalette[j] : Mat4::Identity();
+        for (int k = 0; k < 16; ++k) paletteData[j * 16 + k] = mm.m[k];
+    }
+
+    // === Settled physics sphere pyramid (deterministic step budget). ===
+    physics::World world;
+    {
+        const float R = 0.5f;
+        const int kLayers = 3;
+        const float d = 2.0f * R;
+        const float dy = R * 1.41421356f;
+        for (int k = 0; k < kLayers; ++k) {
+            int m = kLayers - k;
+            float off = 0.5f * (float)(m - 1) * d;
+            float y = R + (float)k * dy;
+            for (int gx = 0; gx < m; ++gx)
+                for (int gz = 0; gz < m; ++gz) {
+                    float x = (float)gx * d - off;
+                    float z = (float)gz * d - off;
+                    world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                }
+        }
+    }
+    const float dtP = 1.0f / 120.0f;
+    for (int s = 0; s < 240; ++s) world.Step(dtP);
+
+    // === Layout transforms (mirror the Vulkan path exactly). ===
+    const Mat4 physicsPlace = Mat4::Translate({-5.0f, 0.0f, 2.6f});
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(world.bodies.size());
+    for (const auto& b : world.bodies) {
+        Mat4 m = physicsPlace * b.Transform();
+        scene::InstanceData di;
+        for (int k = 0; k < 16; ++k) di.model[k] = m.m[k];
+        instances.push_back(di);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+    rhi::BufferDesc instBufDesc;
+    instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+    instBufDesc.initialData = instances.data();
+    instBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+    Mat4 truckOrient = Mat4::RotateY(2.1f);
+    float oMin[3] = { 1e30f,  1e30f,  1e30f};
+    float oMax[3] = {-1e30f, -1e30f, -1e30f};
+    for (int c = 0; c < 8; ++c) {
+        float p[3] = {
+            (c & 1) ? truck.bbMax[0] : truck.bbMin[0],
+            (c & 2) ? truck.bbMax[1] : truck.bbMin[1],
+            (c & 4) ? truck.bbMax[2] : truck.bbMin[2],
+        };
+        float x = truckOrient.m[0]*p[0] + truckOrient.m[4]*p[1] + truckOrient.m[8]*p[2]  + truckOrient.m[12];
+        float y = truckOrient.m[1]*p[0] + truckOrient.m[5]*p[1] + truckOrient.m[9]*p[2]  + truckOrient.m[13];
+        float z = truckOrient.m[2]*p[0] + truckOrient.m[6]*p[1] + truckOrient.m[10]*p[2] + truckOrient.m[14];
+        float wp[3] = {x, y, z};
+        for (int k = 0; k < 3; ++k) {
+            if (wp[k] < oMin[k]) oMin[k] = wp[k];
+            if (wp[k] > oMax[k]) oMax[k] = wp[k];
+        }
+    }
+    Mat4 truckFit;
+    {
+        float ext[3] = {oMax[0]-oMin[0], oMax[1]-oMin[1], oMax[2]-oMin[2]};
+        float maxExt = ext[0]; if (ext[1] > maxExt) maxExt = ext[1]; if (ext[2] > maxExt) maxExt = ext[2];
+        float scale = (maxExt > 1e-6f) ? (5.0f / maxExt) : 1.0f;
+        float cx = 0.5f * (oMin[0] + oMax[0]);
+        float cz = 0.5f * (oMin[2] + oMax[2]);
+        truckFit = Mat4::Translate({-cx * scale, -oMin[1] * scale, -cz * scale})
+                 * Mat4::Scale({scale, scale, scale});
+    }
+    const Mat4 truckPlace = Mat4::Translate({-2.9f, 0.0f, 0.2f}) * truckFit * truckOrient;
+
+    float foxH = fox.bbMax[1] - fox.bbMin[1];
+    float foxScale = (foxH > 1e-4f) ? (2.2f / foxH) : 0.05f;
+    float fcx = 0.5f * (fox.bbMin[0] + fox.bbMax[0]);
+    float fcz = 0.5f * (fox.bbMin[2] + fox.bbMax[2]);
+    const Mat4 foxModel = Mat4::Translate({3.4f, 0.0f, 1.6f})
+                        * Mat4::RotateY(-0.9f)
+                        * Mat4::Translate({-fcx * foxScale, -fox.bbMin[1] * foxScale, -fcz * foxScale})
+                        * Mat4::Scale({foxScale, foxScale, foxScale});
+
+    const float pedH = 0.5f;
+    const Mat4 pedestalModel = Mat4::Translate({0.0f, pedH, -1.8f}) * Mat4::Scale({1.0f, pedH, 1.0f});
+    const float helmetScale = 1.3f;
+    const Mat4 helmetModel = Mat4::Translate({0.0f, 2.0f * pedH + helmetScale, -1.8f})
+                           * Mat4::RotateX(1.5707963f) * Mat4::Scale({helmetScale, helmetScale, helmetScale});
+
+    const Mat4 groundModel = Mat4::Scale({14.0f, 1.0f, 14.0f});
+
+    struct Glass { Vec3 pos; float scale; float r, g, b, baseAlpha; };
+    std::vector<Glass> glass = {
+        {{-1.4f, 1.3f, 3.8f}, 1.4f, 0.22f, 0.55f, 0.98f, 0.34f},
+        {{ 1.3f, 1.2f, 4.2f}, 1.3f, 0.32f, 0.95f, 0.45f, 0.34f},
+    };
+
+    const Vec3 eye{0.0f, 4.0f, 10.0f};
+    const Vec3 center{0.0f, 1.2f, 0.2f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 20.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-9.0f, 9.0f, -9.0f, 9.0f, 1.0f, 45.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up3 = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+        fd.skyParams[2] = envMaxLod;
+    }
+
+    std::sort(glass.begin(), glass.end(), [&](const Glass& a, const Glass& b) {
+        return math::length(a.pos - eye) > math::length(b.pos - eye);
+    });
+
+    const float kExposure = 1.7f;
+    const float kThreshold = 1.0f;
+    const float kKnee = 0.6f;
+    const float kUpStrength = 1.0f;
+    const float kBloomStrength = 0.14f;
+    auto mkPC = [&](uint32_t tw, uint32_t th, float strength) {
+        BloomParams p{}; p.texel[0] = 1.0f / (float)tw; p.texel[1] = 1.0f / (float)th;
+        p.threshold = kThreshold; p.knee = kKnee; p.strength = strength; p.intensity = kExposure;
+        return p;
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    std::vector<render::RgResource> rgDown(kMips), rgUp(kMips);
+    for (int i = 0; i < kMips; ++i) {
+        rgDown[i] = graph.ImportTarget("down" + std::to_string(i),
+                                       render::RgResourceKind::SceneColor, *down[i]);
+        rgUp[i]   = graph.ImportTarget("up" + std::to_string(i),
+                                       render::RgResourceKind::SceneColor, *up[i]);
+    }
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.PushConstants(pedestalModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(cube.vertices());
+            cmd.BindIndexBuffer(cube.indices());
+            cmd.DrawIndexed(cube.indexCount());
+            cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(helmet.mesh.vertices());
+            cmd.BindIndexBuffer(helmet.mesh.indices());
+            cmd.DrawIndexed(helmet.mesh.indexCount());
+            for (const auto& inst : truck.instances) {
+                Mat4 world = truckPlace * inst.worldTransform;
+                cmd.PushConstants(world.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(inst.mesh->vertices());
+                cmd.BindIndexBuffer(inst.mesh->indices());
+                cmd.DrawIndexed(inst.mesh->indexCount());
+            }
+            cmd.BindPipeline(*skinnedShadowPipeline);
+            cmd.PushConstants(foxModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(fox.mesh.vertices());
+            cmd.BindIndexBuffer(fox.mesh.indices());
+            cmd.DrawIndexed(fox.mesh.indexCount());
+            cmd.BindPipeline(*instShadowPipeline);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindInstanceBuffer(*instanceBuffer);
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.BindEnvironment(*env.equirect);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = pedestalModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.5f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexed(cube.indexCount());
+            }
+            cmd.BindPipeline(*pbrPipeline);
+            for (const auto& inst : truck.instances) {
+                Mat4 world = truckPlace * inst.worldTransform;
+                const hf::asset::PbrMaterial& m = *inst.material;
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = world.m[k];
+                pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
+                pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
+                                    *m.emissive, *m.occlusion);
+                cmd.BindVertexBuffer(inst.mesh->vertices());
+                cmd.BindIndexBuffer(inst.mesh->indices());
+                cmd.DrawIndexed(inst.mesh->indexCount());
+            }
+            cmd.BindPipeline(*iblPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                    *helmet.emissive, *helmet.occlusion);
+                cmd.BindEnvironment(*env.equirect);
+                cmd.BindVertexBuffer(helmet.mesh.vertices());
+                cmd.BindIndexBuffer(helmet.mesh.indices());
+                cmd.DrawIndexed(helmet.mesh.indexCount());
+            }
+            cmd.BindPipeline(*skinnedPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = foxModel.m[k];
+                pc[16] = fox.metallic; pc[17] = fox.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*fox.baseColor, *flatNormal);
+                cmd.BindVertexBuffer(fox.mesh.vertices());
+                cmd.BindIndexBuffer(fox.mesh.indices());
+                cmd.DrawIndexed(fox.mesh.indexCount());
+            }
+            cmd.BindPipeline(*instPipeline);
+            {
+                float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.BindPipeline(*transparentPipeline);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindIndexBuffer(sphere.indices());
+            for (const auto& g : glass) {
+                Mat4 model = Mat4::Translate(g.pos) * Mat4::Scale({g.scale, g.scale, g.scale});
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = g.r; pc[17] = g.g; pc[18] = g.b; pc[19] = g.baseAlpha;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("prefilter", {rgScene}, {rgDown[0]},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            BloomParams p = mkPC(W, H, kBloomStrength);
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*prefilterPipe);
+            cmd.BindTexture(*rt);
+            cmd.PushConstants(&p, sizeof(p));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+    for (int i = 1; i < kMips; ++i) {
+        graph.AddPass("down" + std::to_string(i), {rgDown[i - 1]}, {rgDown[i]},
+            [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                BloomParams p = mkPC(mw[i - 1], mh[i - 1], kUpStrength);
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*downsamplePipe);
+                cmd.BindTexture(*down[i - 1]);
+                cmd.PushConstants(&p, sizeof(p));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+    }
+    graph.AddPass("upTop", {rgDown[kMips - 1]}, {rgUp[kMips - 1]},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            BloomParams p = mkPC(mw[kMips - 1], mh[kMips - 1], 0.0f);
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*upsamplePipe);
+            cmd.BindTexturePair(*down[kMips - 1], *down[kMips - 1]);
+            cmd.PushConstants(&p, sizeof(p));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+    for (int i = kMips - 2; i >= 0; --i) {
+        graph.AddPass("up" + std::to_string(i), {rgUp[i + 1], rgDown[i]}, {rgUp[i]},
+            [&, i](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                BloomParams p = mkPC(mw[i + 1], mh[i + 1], kUpStrength);
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*upsamplePipe);
+                cmd.BindTexturePair(*up[i + 1], *down[i]);
+                cmd.PushConstants(&p, sizeof(p));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+    }
+    graph.AddPass("composite", {rgScene, rgUp[0]}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            BloomParams p = mkPC(W, H, kBloomStrength);
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*compositePipe);
+            cmd.BindTexturePair(*rt, *up[0]);
+            cmd.PushConstants(&p, sizeof(p));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — capstone: truck(%zu) + fox + helmet + %u spheres + %zu glass\n",
+                outPath, cw, ch, truck.instances.size(), kInstanceCount, glass.size());
+    return 0;
+}
+
 // --- HDR bloom showcase (Slice U). Mirrors the Vulkan --bloom-shot path: the HDR-IBL helmet scene
 // rendered into an HDR (RGBA16F) render target, then a threshold -> 5-mip downsample -> tent
 // upsample/combine bloom chain, then composite (add bloom + the post.frag tonemap/grade) to the LDR
@@ -2631,6 +3186,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--bloom") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_bloom.png";
             try { return RunBloomShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --capstone <out.png>: render the integrated capstone showcase (Slice Z) — ONE composed
+        // frame combining the HDR-IBL environment, the imported truck, the skinned blended fox, the
+        // PBR helmet on a pedestal, a settled physics sphere stack, and sorted glass, all lit +
+        // shadowed into an HDR RT finished with the bloom chain.
+        if (argc > 1 && std::strcmp(argv[1], "--capstone") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_capstone.png";
+            try { return RunCapstoneShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ssao <out.png>: render the SSAO showcase (Slice Y) — the settled physics sphere-pyramid
