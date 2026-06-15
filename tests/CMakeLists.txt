@@ -61,6 +61,11 @@ hf_add_pure_test(point_shadow_test)
 # BuildClusters consistency (offsets == prefix sum, sum(count) == lightIndices.size()). Pure C++
 # (render/clustered.h, header-only), ASan-eligible.
 hf_add_pure_test(clustered_test)
+# Screen-space reflections (Slice AH): view<->screen projection round-trip (ViewToScreenUV and
+# ReconstructViewPos are mutual inverses, with the Vulkan/Metal yFlip sign) + the view-space
+# reflection ray (ReflectView matches HLSL reflect; down ray off a floor goes up). Pure C++
+# (render/ssr.h, header-only), ASan-eligible.
+hf_add_pure_test(ssr_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

@@ -129,6 +129,11 @@ hf_gen_msl(gbuffer.frag           gbuffer.frag.hlsl           frag gbuffer_fragm
 hf_gen_msl(ssao.frag              ssao.frag.hlsl              frag ssao_fragment)
 hf_gen_msl(ssao_blur.frag         ssao_blur.frag.hlsl         frag ssao_blur_fragment)
 hf_gen_msl(ssao_composite.frag    ssao_composite.frag.hlsl    frag ssao_composite_fragment)
+# Screen-space reflections (Slice AH): reuses the SSAO g-buffer (view normal + linear depth); ssr.frag
+# ray-marches the depth buffer for on-screen reflections, ssr_composite blends + tonemaps. Same
+# HLSL->SPIR-V->MSL toolchain. Existing shaders + goldens untouched.
+hf_gen_msl(ssr.frag               ssr.frag.hlsl               frag ssr_fragment)
+hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

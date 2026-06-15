@@ -60,6 +60,11 @@ hf_compile_shaders(
     "shaders/ssao.frag.hlsl:ps"
     "shaders/ssao_blur.frag.hlsl:ps"
     "shaders/ssao_composite.frag.hlsl:ps"
+    # Screen-space reflections (Slice AH): reuses the SSAO g-buffer (view normal + linear depth);
+    # ssr.frag ray-marches the depth buffer for on-screen reflections, ssr_composite blends +
+    # tonemaps. Existing gbuffer/ssao/bloom shaders + their goldens untouched.
+    "shaders/ssr.frag.hlsl:ps"
+    "shaders/ssr_composite.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")
