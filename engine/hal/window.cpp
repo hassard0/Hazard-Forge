@@ -52,6 +52,11 @@ static runtime::Key MapScancode(SDL_Scancode sc) {
         case SDL_SCANCODE_LSHIFT:
         case SDL_SCANCODE_RSHIFT: return K::Shift;
         case SDL_SCANCODE_ESCAPE: return K::Esc;
+        case SDL_SCANCODE_P: return K::P;   // editor: play/pause toggle
+        case SDL_SCANCODE_O: return K::O;   // editor: single step
+        case SDL_SCANCODE_G: return K::G;   // editor: gizmo Translate
+        case SDL_SCANCODE_R: return K::R;   // editor: gizmo Rotate
+        case SDL_SCANCODE_T: return K::T;   // editor: gizmo Scale
         default: return K::Count;
     }
 }

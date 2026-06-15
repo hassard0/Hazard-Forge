@@ -16,6 +16,8 @@ set(HF_ENGINE_COMMON_SOURCES
   physics/world.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp
+  editor/picking.cpp
+  editor/gizmo.cpp
 )
 
 if(APPLE)
@@ -84,6 +86,8 @@ add_library(hf_core STATIC
   physics/world.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp
+  editor/picking.cpp
+  editor/gizmo.cpp
 )
 target_include_directories(hf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}

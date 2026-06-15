@@ -24,6 +24,9 @@
 #include "runtime/clock.h"
 #include "runtime/fly_camera_controller.h"
 #include "runtime/input_state.h"
+#include "runtime/play_state.h"
+#include "editor/picking.h"
+#include "editor/gizmo.h"
 
 #ifdef HF_HAS_EDITOR
 #include "imgui.h"
@@ -36,6 +39,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -199,6 +203,10 @@ int main(int argc, char** argv) {
     bool flyDryRun = false;                 // --fly-dry-run: exercise the loop headlessly, then exit
     bool dumpScene = false;
     bool editor = false;
+    // Slice AB (editor interaction): gizmo capture + headless pick test.
+    const char* gizmoShotPath = nullptr;    // --gizmo-shot <objIndex> <out.bmp>
+    int gizmoShotIndex = 0;                  // selected object index for --gizmo-shot
+    bool pickTest = false;                   // --pick-test: headless pick demo, prints picked index
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
@@ -299,7 +307,52 @@ int main(int argc, char** argv) {
             // Overlay the Dear ImGui editor (hierarchy/inspector/stats) on the viewport, rendered
             // through the engine RHI. Works in interactive mode and in the --shot capture.
             editor = true;
+        } else if (std::strcmp(argv[i], "--gizmo-shot") == 0 && i + 2 < argc) {
+            // Slice AB: select object <objIndex> in a small deterministic scene, render it + the
+            // selected object's translate gizmo (axis arrows) through the debug-line layer, capture.
+            gizmoShotIndex = std::atoi(argv[i + 1]);
+            gizmoShotPath = argv[i + 2];
+        } else if (std::strcmp(argv[i], "--pick-test") == 0) {
+            // Slice AB: HEADLESS pick demo — cast a scripted screen ray and print the picked index.
+            pickTest = true;
         }
+    }
+
+    // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
+    // the gizmo-shot uses, cast a scripted screen-center ray through a fixed camera, and print which
+    // object index is selected (demonstrating scriptable selection for agents; also unit-tested).
+    if (pickTest) {
+        using math::Vec3;
+        // World AABBs for the gizmo-shot scene's objects (see BuildGizmoScene below for the matching
+        // placement): 0 = ground plane, 1 = cube at (-2,0.5,0), 2 = sphere at (1.5,1,1.5),
+        // 3 = tall box at (3,1.5,-1).
+        std::vector<editor::PickAabb> objs = {
+            {{{-7.0f, -0.05f, -7.0f}, {7.0f, 0.05f, 7.0f}}},   // 0 ground
+            {{{-2.5f, 0.0f, -0.5f},  {-1.5f, 1.0f, 0.5f}}},     // 1 cube
+            {{{0.7f, 0.2f, 0.7f},    {2.3f, 1.8f, 2.3f}}},      // 2 sphere
+            {{{2.7f, 0.0f, -1.3f},   {3.3f, 3.0f, -0.7f}}},     // 3 tall box
+        };
+        // Fixed camera looking at the cube/sphere cluster.
+        runtime::Camera cam;
+        cam.position = {2.0f, 4.5f, 9.0f};
+        cam.yaw = 0.15f;
+        cam.SetPitch(-0.32f);
+        cam.aspect = 1280.0f / 720.0f;
+        // Aim the ray at the sphere (object 2): project its center to NDC, then cast back through it.
+        Vec3 sphereCenter{1.5f, 1.0f, 1.5f};
+        float wclip = 0.0f;
+        Vec3 ndc = math::MulPointDivide(cam.ViewProj(), sphereCenter, wclip);
+        math::Ray ray = editor::ScreenRayThroughCamera(cam, ndc.x, ndc.y);
+        editor::PickResult r = editor::PickNearest(ray, objs);
+        std::printf("pick-test: screen ndc=(%.3f,%.3f) -> picked object index %d (t=%.3f)\n",
+                    ndc.x, ndc.y, r.index, r.t);
+        const char* names[] = {"ground", "cube", "sphere", "tallbox"};
+        if (r.index >= 0 && r.index < 4)
+            std::printf("pick-test: that is the '%s'\n", names[r.index]);
+        // The scripted ray aims at the sphere (object 2); assert that is what we pick.
+        bool ok = (r.index == 2);
+        std::printf("pick-test: %s (expected object 2 = sphere)\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
     }
     try {
         hal::Window window({"Hazard Forge — Shadows", 1280, 720});
@@ -1541,7 +1594,34 @@ int main(int argc, char** argv) {
             // Live windowed loop.
             window.SetRelativeMouse(true);  // mouse-look engaged; ESC quits, frees the cursor on exit
             std::printf("--fly: WASD move, mouse look, Space/E up, Ctrl/Q down, Shift sprint, "
-                        "wheel speed, ESC quit\n");
+                        "wheel speed, ESC quit | P play/pause, O step, G/R/T gizmo mode, Ctrl+S save\n");
+
+            // Slice AB: editor run-state + selection wired into the live loop. The simulation is static
+            // this scene, so play/pause/step is demonstrated by the accumulated fixed-step count the
+            // PlayState gates; Ctrl+S serializes a representative ECS (the fly scene's placed objects)
+            // back to disk via scene::DumpScene; G/R/T pick the gizmo manipulation mode. Live click-to-
+            // pick + axis drag is manual (the picking/gizmo math itself is unit-tested + golden-verified
+            // via --pick-test / --gizmo-shot); this loop drives the same headless-proven logic. -------
+            runtime::PlayState play;
+            editor::Selection sel;
+            sel.index = 0; sel.mode = editor::GizmoMode::Translate;
+            // A representative editable ECS mirroring a couple of the fly scene's static objects, so
+            // Ctrl+S has real transforms to serialize through the IO layer.
+            ecs::Registry editReg;
+            scene::SceneResources editRes;
+            editRes.AddMesh("cube", &cube);
+            editRes.AddMesh("sphere", &sphere);
+            {
+                ecs::Entity ped = editReg.create();
+                scene::Transform pt; pt.position = {0.0f, pedH, -1.8f}; pt.scale = {1.0f, pedH, 1.0f};
+                editReg.add(ped, scene::TransformC{pt});
+                editReg.add(ped, scene::MeshC{&cube});
+                editReg.add(ped, scene::MaterialC{});
+            }
+            bool prevP = false, prevO = false, prevCtrlS = false;
+            int savedCount = 0;
+            int liveSteps = 0;
+
             auto last = std::chrono::steady_clock::now();
             bool running = true;
             while (running) {
@@ -1557,13 +1637,35 @@ int main(int argc, char** argv) {
                     buildMips(w, h);
                     cam.aspect = (h > 0) ? (float)w / (float)h : 1.0f;
                 }
+                // --- Editor controls (edge-triggered). ---
+                bool nowP = in.Down(runtime::Key::P);
+                if (nowP && !prevP) { play.Toggle();
+                    std::printf("[editor] %s\n", play.IsPlaying() ? "PLAY" : "PAUSE"); }
+                prevP = nowP;
+                bool nowO = in.Down(runtime::Key::O);
+                if (nowO && !prevO) { play.RequestStep(); }
+                prevO = nowO;
+                if (in.Down(runtime::Key::G)) sel.mode = editor::GizmoMode::Translate;
+                if (in.Down(runtime::Key::R)) sel.mode = editor::GizmoMode::Rotate;
+                if (in.Down(runtime::Key::T)) sel.mode = editor::GizmoMode::Scale;
+                bool nowCtrlS = in.Down(runtime::Key::Ctrl) && in.Down(runtime::Key::S);
+                if (nowCtrlS && !prevCtrlS) {
+                    std::string json = scene::DumpScene(editReg, editRes);
+                    std::ofstream out("fly_scene_edit.json", std::ios::binary);
+                    if (out) { out << json; ++savedCount;
+                        std::printf("[editor] saved fly_scene_edit.json (%zu bytes)\n", json.size()); }
+                }
+                prevCtrlS = nowCtrlS;
+
                 auto now = std::chrono::steady_clock::now();
                 float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
                 last = now;
 
-                // Fixed-timestep advance (animation/physics would step here; the scene is static this
-                // slice, but the accumulator runs so the loop is the canonical fixed-step pattern).
-                (void)clock.Tick(dt);
+                // Fixed-timestep advance, GATED by the editor run-state: paused freezes simulation
+                // time (0 steps) unless a single step was requested; playing passes all steps through.
+                int fixedSteps = clock.Tick(dt);
+                liveSteps += play.StepsThisTick(fixedSteps);
+                // The camera still flies while paused (paused freezes SIM, not the viewport).
                 controller.Update(cam, in, dt);
 
                 FrameData fd = makeFrameData(cam);
@@ -1572,6 +1674,9 @@ int main(int argc, char** argv) {
                 graph.Execute(*device);  // composite -> swapchain -> present
             }
             window.SetRelativeMouse(false);
+            std::printf("--fly: exited after %d simulated fixed steps, %d save(s)\n",
+                        liveSteps, savedCount);
+            (void)sel;
             device->WaitIdle();
             return 0;
         }
@@ -1868,6 +1973,241 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %u bodies, %u debug-line vertices\n",
                                     debugShotPath, cw, ch2, kInstanceCount, kLineVertCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", debugShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Editor gizmo showcase (--gizmo-shot <objIndex> <out.bmp>, Slice AB): build a small
+        // deterministic multi-object scene (ground plane + cube + sphere + tall box), programmatically
+        // SELECT object <objIndex>, and render the scene PLUS the selected object's TRANSLATE gizmo
+        // (3 colored axis arrows) drawn through the Slice-W debug-line layer (depthTest on / write off,
+        // AFTER opaque geometry) from a fixed camera. The gizmo is emitted by editor::EmitGizmo at the
+        // selected object's Transform via debug::DebugDraw, then uploaded as one LINE_LIST draw — the
+        // SAME path --debug-shot uses. One BMP -> exit. New golden; existing goldens untouched. ----
+        if (gizmoShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- Scene objects: transforms + (matching) world AABBs. These MUST match the --pick-test
+            // AABBs above so headless picking and the rendered gizmo agree on object placement. ---
+            scene::Mesh planeMesh = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh  = scene::Mesh::Cube(*device);
+            scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+            struct GizmoObj { const scene::Mesh* mesh; scene::Transform xform; Vec3 color; };
+            std::vector<GizmoObj> objs;
+            // 0: ground plane (Plane is the XZ unit quad; scale to a 14x14 ground).
+            { scene::Transform t; t.scale = {7.0f, 1.0f, 7.0f};
+              objs.push_back({&planeMesh, t, {0.55f, 0.55f, 0.6f}}); }
+            // 1: cube at (-2, 0.5, 0) (Cube is a unit [-0.5,0.5] cube -> half-extent 0.5).
+            { scene::Transform t; t.position = {-2.0f, 0.5f, 0.0f};
+              objs.push_back({&cubeMesh, t, {0.8f, 0.35f, 0.25f}}); }
+            // 2: sphere at (1.5, 1.0, 1.5) (unit sphere radius 0.5 -> scale 1.6 => radius 0.8).
+            { scene::Transform t; t.position = {1.5f, 1.0f, 1.5f}; t.scale = {1.6f, 1.6f, 1.6f};
+              objs.push_back({&sphereMesh, t, {0.3f, 0.6f, 0.85f}}); }
+            // 3: tall box at (3, 1.5, -1), 0.6 wide / 3 tall.
+            { scene::Transform t; t.position = {3.0f, 1.5f, -1.0f}; t.scale = {0.6f, 3.0f, 0.6f};
+              objs.push_back({&cubeMesh, t, {0.45f, 0.75f, 0.4f}}); }
+
+            int selIndex = gizmoShotIndex;
+            if (selIndex < 0) selIndex = 0;
+            if (selIndex >= (int)objs.size()) selIndex = (int)objs.size() - 1;
+            editor::Selection sel;
+            sel.index = selIndex;
+            sel.mode = editor::GizmoMode::Translate;
+
+            // --- Pipelines: static lit + static shadow + sky + post + debug-line (LDR). ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto dbgVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.vert.hlsl.spv");
+            auto dbgFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.frag.hlsl.spv");
+            auto dbgVs = device->CreateShaderModule({std::span<const uint32_t>(dbgVsW)});
+            auto dbgFs = device->CreateShaderModule({std::span<const uint32_t>(dbgFsW)});
+            rhi::GraphicsPipelineDesc dbgD;
+            dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+            dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+            dbgD.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {1, rhi::Format::RGB32_Float, 12},
+            };
+            dbgD.colorFormat = device->Swapchain().ColorFormat();
+            dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+            dbgD.usesFrameUniforms = true;
+            auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            // --- Build the gizmo overlay: the selected object's translate gizmo, sized to the object,
+            // emitted through the debug-line layer at the object's transform. ---
+            debug::DebugDraw dd;
+            {
+                const scene::Transform& xf = objs[sel.index].xform;
+                // Handle length scales with the object so it reads at any size (sphere bigger, etc.).
+                float reach = std::max({xf.scale.x, xf.scale.y, xf.scale.z});
+                float handleLen = 1.2f + 0.8f * reach;
+                editor::EmitGizmo(dd, xf, sel.mode, handleLen, editor::kAxisNone);
+            }
+            const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+            rhi::BufferDesc lineBufDesc;
+            lineBufDesc.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+            lineBufDesc.initialData = dd.Vertices().data();
+            lineBufDesc.usage = rhi::BufferUsage::Vertex;
+            auto lineBuffer = device->CreateBuffer(lineBufDesc);
+
+            // --- Fixed camera (same pose --pick-test uses). ---
+            runtime::Camera cam;
+            cam.position = {2.0f, 4.5f, 9.0f};
+            cam.yaw = 0.15f; cam.SetPitch(-0.32f);
+            cam.aspect = aspect;
+
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            FrameData fd{};
+            {
+                Mat4 vp = cam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = cam.position.x; fd.viewPos[1] = cam.position.y;
+                fd.viewPos[2] = cam.position.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDirVec * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    for (const auto& ob : objs) {
+                        Mat4 m = ob.xform.Matrix();
+                        cmd.PushConstants(m.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(ob.mesh->vertices());
+                        cmd.BindIndexBuffer(ob.mesh->indices());
+                        cmd.DrawIndexed(ob.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    for (const auto& ob : objs) {
+                        Mat4 m = ob.xform.Matrix();
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(ob.mesh->vertices());
+                        cmd.BindIndexBuffer(ob.mesh->indices());
+                        cmd.DrawIndexed(ob.mesh->indexCount());
+                    }
+                    // Gizmo overlay: one LINE_LIST draw, after opaque geometry (depth-tested).
+                    if (kLineVertCount > 0) {
+                        cmd.BindPipeline(*debugPipeline);
+                        cmd.BindVertexBuffer(*lineBuffer);
+                        cmd.Draw(kLineVertCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(gizmoShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — selected object %d, %u gizmo-line vertices\n",
+                                    gizmoShotPath, cw, ch2, sel.index, kLineVertCount);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gizmoShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

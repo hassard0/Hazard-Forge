@@ -150,6 +150,9 @@ add_executable(visual_test
     # scene + physics), no Metal/RHI deps. Drives the LINE_LIST debug overlay.
     ${HF_ROOT}/engine/debug/debug_draw.cpp
     ${HF_ROOT}/engine/debug/debug_emitters.cpp
+    # Editor transform-gizmo emit (Slice AB): pure C++ (math + scene::Transform + debug::DebugDraw),
+    # no Metal/RHI deps. Drives the --gizmo showcase's translate-gizmo line overlay.
+    ${HF_ROOT}/engine/editor/gizmo.cpp
 )
 
 # The generated MSL must exist before the executable's shaders are loaded at runtime; make the

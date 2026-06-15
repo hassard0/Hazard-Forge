@@ -109,6 +109,9 @@ struct Mat4 {
         r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
         return r;
     }
+
+    // General 4x4 inverse (adjugate / cofactor method). Defined out-of-line below operator*.
+    Mat4 Inverse() const;
 };
 
 // C = A * B  (standard matrix product; C(row,col) = sum_k A(row,k)*B(k,col)).
@@ -122,6 +125,156 @@ inline Mat4 operator*(const Mat4& a, const Mat4& b) {
             c.m[col*4 + row] = sum;
         }
     return c;
+}
+
+// General 4x4 inverse via the adjugate (cofactor) method, column-major. Used by the editor's
+// screen-ray unprojection (inverse view-proj). If the matrix is singular (|det| ~ 0) the identity
+// is returned so callers degrade gracefully rather than producing NaNs. Verified by the unit test
+// (M * M.Inverse() == I) for identity, translation, and a full TRS matrix.
+inline Mat4 Mat4::Inverse() const {
+    const float* a = m;
+    float inv[16];
+    inv[0]  =  a[5]*a[10]*a[15] - a[5]*a[11]*a[14] - a[9]*a[6]*a[15] + a[9]*a[7]*a[14] + a[13]*a[6]*a[11] - a[13]*a[7]*a[10];
+    inv[4]  = -a[4]*a[10]*a[15] + a[4]*a[11]*a[14] + a[8]*a[6]*a[15] - a[8]*a[7]*a[14] - a[12]*a[6]*a[11] + a[12]*a[7]*a[10];
+    inv[8]  =  a[4]*a[9]*a[15]  - a[4]*a[11]*a[13] - a[8]*a[5]*a[15] + a[8]*a[7]*a[13] + a[12]*a[5]*a[11] - a[12]*a[7]*a[9];
+    inv[12] = -a[4]*a[9]*a[14]  + a[4]*a[10]*a[13] + a[8]*a[5]*a[14] - a[8]*a[6]*a[13] - a[12]*a[5]*a[10] + a[12]*a[6]*a[9];
+    inv[1]  = -a[1]*a[10]*a[15] + a[1]*a[11]*a[14] + a[9]*a[2]*a[15] - a[9]*a[3]*a[14] - a[13]*a[2]*a[11] + a[13]*a[3]*a[10];
+    inv[5]  =  a[0]*a[10]*a[15] - a[0]*a[11]*a[14] - a[8]*a[2]*a[15] + a[8]*a[3]*a[14] + a[12]*a[2]*a[11] - a[12]*a[3]*a[10];
+    inv[9]  = -a[0]*a[9]*a[15]  + a[0]*a[11]*a[13] + a[8]*a[1]*a[15] - a[8]*a[3]*a[13] - a[12]*a[1]*a[11] + a[12]*a[3]*a[9];
+    inv[13] =  a[0]*a[9]*a[14]  - a[0]*a[10]*a[13] - a[8]*a[1]*a[14] + a[8]*a[2]*a[13] + a[12]*a[1]*a[10] - a[12]*a[2]*a[9];
+    inv[2]  =  a[1]*a[6]*a[15]  - a[1]*a[7]*a[14]  - a[5]*a[2]*a[15] + a[5]*a[3]*a[14] + a[13]*a[2]*a[7]  - a[13]*a[3]*a[6];
+    inv[6]  = -a[0]*a[6]*a[15]  + a[0]*a[7]*a[14]  + a[4]*a[2]*a[15] - a[4]*a[3]*a[14] - a[12]*a[2]*a[7]  + a[12]*a[3]*a[6];
+    inv[10] =  a[0]*a[5]*a[15]  - a[0]*a[7]*a[13]  - a[4]*a[1]*a[15] + a[4]*a[3]*a[13] + a[12]*a[1]*a[7]  - a[12]*a[3]*a[5];
+    inv[14] = -a[0]*a[5]*a[14]  + a[0]*a[6]*a[13]  + a[4]*a[1]*a[14] - a[4]*a[2]*a[13] - a[12]*a[1]*a[6]  + a[12]*a[2]*a[5];
+    inv[3]  = -a[1]*a[6]*a[11]  + a[1]*a[7]*a[10]  + a[5]*a[2]*a[11] - a[5]*a[3]*a[10] - a[9]*a[2]*a[7]   + a[9]*a[3]*a[6];
+    inv[7]  =  a[0]*a[6]*a[11]  - a[0]*a[7]*a[10]  - a[4]*a[2]*a[11] + a[4]*a[3]*a[10] + a[8]*a[2]*a[7]   - a[8]*a[3]*a[6];
+    inv[11] = -a[0]*a[5]*a[11]  + a[0]*a[7]*a[9]   + a[4]*a[1]*a[11] - a[4]*a[3]*a[9]  - a[8]*a[1]*a[7]   + a[8]*a[3]*a[5];
+    inv[15] =  a[0]*a[5]*a[10]  - a[0]*a[6]*a[9]   - a[4]*a[1]*a[10] + a[4]*a[2]*a[9]  + a[8]*a[1]*a[6]   - a[8]*a[2]*a[5];
+
+    float det = a[0]*inv[0] + a[1]*inv[4] + a[2]*inv[8] + a[3]*inv[12];
+    if (det > -1e-12f && det < 1e-12f) return Mat4::Identity();
+    float invDet = 1.0f / det;
+    Mat4 r;
+    for (int i = 0; i < 16; ++i) r.m[i] = inv[i] * invDet;
+    return r;
+}
+
+// Transform a point (w=1) by a column-major Mat4: p' = M * [p,1] (no perspective divide). Named
+// MulPoint (not TransformPoint) to avoid colliding with the file-local helper in debug_draw.cpp.
+inline Vec3 MulPoint(const Mat4& m, const Vec3& p) {
+    return {
+        m.m[0]*p.x + m.m[4]*p.y + m.m[8] *p.z + m.m[12],
+        m.m[1]*p.x + m.m[5]*p.y + m.m[9] *p.z + m.m[13],
+        m.m[2]*p.x + m.m[6]*p.y + m.m[10]*p.z + m.m[14],
+    };
+}
+
+// Transform a point through a clip-space matrix and apply the perspective divide (w). Returns the
+// post-divide xyz; `outW` exposes the clip w so callers can detect points behind the camera (w<=0).
+inline Vec3 MulPointDivide(const Mat4& m, const Vec3& p, float& outW) {
+    float x = m.m[0]*p.x + m.m[4]*p.y + m.m[8] *p.z + m.m[12];
+    float y = m.m[1]*p.x + m.m[5]*p.y + m.m[9] *p.z + m.m[13];
+    float z = m.m[2]*p.x + m.m[6]*p.y + m.m[10]*p.z + m.m[14];
+    float w = m.m[3]*p.x + m.m[7]*p.y + m.m[11]*p.z + m.m[15];
+    outW = w;
+    float inv = (w > 1e-9f || w < -1e-9f) ? 1.0f / w : 1.0f;
+    return {x*inv, y*inv, z*inv};
+}
+
+// --- Ray + intersection math (editor picking / gizmo hit-testing). -----------------------------
+// All deterministic and window-free; unit-tested in tests/editor_test.cpp.
+
+struct Ray {
+    Vec3 origin;
+    Vec3 dir;  // assumed normalized (use MakeRay to build from two points)
+};
+
+// Ray from `origin` toward `target` (direction normalized).
+inline Ray MakeRay(const Vec3& origin, const Vec3& target) {
+    return Ray{origin, normalize(target - origin)};
+}
+
+// Axis-aligned bounding box.
+struct Aabb {
+    Vec3 min;
+    Vec3 max;
+};
+
+// Slab ray/AABB test. On a hit, `tHit` is the nearest non-negative entry parameter along the ray
+// (0 if the origin is inside the box). Returns false if the box is entirely behind the origin or
+// missed. dir components of 0 are handled via the standard inf-slope slab convention.
+inline bool RayAabb(const Ray& r, const Aabb& box, float& tHit) {
+    float tmin = -1e30f, tmax = 1e30f;
+    const float o[3] = {r.origin.x, r.origin.y, r.origin.z};
+    const float d[3] = {r.dir.x, r.dir.y, r.dir.z};
+    const float mn[3] = {box.min.x, box.min.y, box.min.z};
+    const float mx[3] = {box.max.x, box.max.y, box.max.z};
+    for (int i = 0; i < 3; ++i) {
+        if (d[i] > -1e-9f && d[i] < 1e-9f) {
+            if (o[i] < mn[i] || o[i] > mx[i]) return false;  // parallel & outside this slab
+        } else {
+            float inv = 1.0f / d[i];
+            float t1 = (mn[i] - o[i]) * inv;
+            float t2 = (mx[i] - o[i]) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) return false;
+        }
+    }
+    if (tmax < 0.0f) return false;       // box entirely behind the ray origin
+    tHit = (tmin > 0.0f) ? tmin : 0.0f;  // inside the box -> 0
+    return true;
+}
+
+// Ray/sphere intersection (nearest non-negative root). On a hit, `tHit` = that parameter.
+inline bool RaySphere(const Ray& r, const Vec3& center, float radius, float& tHit) {
+    Vec3 oc = r.origin - center;
+    float b = dot(oc, r.dir);
+    float c = dot(oc, oc) - radius * radius;
+    float disc = b * b - c;
+    if (disc < 0.0f) return false;
+    float s = std::sqrt(disc);
+    float t = -b - s;
+    if (t < 0.0f) t = -b + s;
+    if (t < 0.0f) return false;
+    tHit = t;
+    return true;
+}
+
+// Closest approach between an (infinite) ray and the segment a->b. Returns the segment parameter
+// `segT` in [0,1] of the closest point on the segment; `outRayT` (>=0, clamped) is the ray
+// parameter; `outDist` is the world distance between the two closest points. Used for gizmo axis
+// hit-testing and translate-drag projection. Based on the standard closest-points-of-two-lines
+// solve with the segment clamped to [0,1] and the ray clamped to t>=0.
+inline float RayClosestParamToSegment(const Ray& r, const Vec3& a, const Vec3& b,
+                                      float& outRayT, float& outDist) {
+    Vec3 u = r.dir;            // ray direction (unit)
+    Vec3 v = b - a;            // segment direction (not unit)
+    Vec3 w0 = r.origin - a;
+    float A = dot(u, u);       // == 1
+    float B = dot(u, v);
+    float C = dot(v, v);
+    float D = dot(u, w0);
+    float E = dot(v, w0);
+    float denom = A * C - B * B;
+    float sc, tc;  // sc = ray param, tc = segment param
+    if (denom > -1e-9f && denom < 1e-9f) {
+        // Ray and segment parallel: clamp the segment param to the ray-origin projection.
+        sc = 0.0f;
+        tc = (C > 1e-9f) ? (E / C) : 0.0f;
+    } else {
+        sc = (B * E - C * D) / denom;
+        tc = (A * E - B * D) / denom;
+    }
+    if (sc < 0.0f) sc = 0.0f;          // ray cannot go behind its origin
+    if (tc < 0.0f) tc = 0.0f;          // clamp to the segment
+    if (tc > 1.0f) tc = 1.0f;
+    Vec3 pRay = r.origin + u * sc;
+    Vec3 pSeg = a + v * tc;
+    outRayT = sc;
+    outDist = length(pRay - pSeg);
+    return tc;
 }
 
 // --- Quaternion (x,y,z,w), used for skeletal-animation rotation channels. ----------------------

@@ -44,10 +44,12 @@
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
+#include "editor/gizmo.h"    // Slice AB: transform gizmo emit (drawn through the debug-line layer)
 
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -2926,6 +2928,214 @@ static int RunDebugShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Editor gizmo showcase (Slice AB). Mirrors the Vulkan --gizmo-shot path: a small deterministic
+// multi-object scene (ground plane + cube + sphere + tall box), SELECT object <objIndex>, render the
+// scene plus that object's translate gizmo (3 colored axis arrows) through the debug-line layer from
+// a fixed runtime::Camera. One PNG -> exit (two-run DIFF 0.0000). New golden. -----------------------
+static int RunGizmoShowcase(int objIndex, const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    scene::Mesh planeMesh = scene::Mesh::Plane(*device);
+    scene::Mesh cubeMesh  = scene::Mesh::Cube(*device);
+    scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+    struct GizmoObj { const scene::Mesh* mesh; scene::Transform xform; };
+    std::vector<GizmoObj> objs;
+    { scene::Transform t; t.scale = {7.0f, 1.0f, 7.0f}; objs.push_back({&planeMesh, t}); }
+    { scene::Transform t; t.position = {-2.0f, 0.5f, 0.0f}; objs.push_back({&cubeMesh, t}); }
+    { scene::Transform t; t.position = {1.5f, 1.0f, 1.5f}; t.scale = {1.6f, 1.6f, 1.6f};
+      objs.push_back({&sphereMesh, t}); }
+    { scene::Transform t; t.position = {3.0f, 1.5f, -1.0f}; t.scale = {0.6f, 3.0f, 0.6f};
+      objs.push_back({&cubeMesh, t}); }
+
+    int selIndex = objIndex;
+    if (selIndex < 0) selIndex = 0;
+    if (selIndex >= (int)objs.size()) selIndex = (int)objs.size() - 1;
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto dbgVs = loadMSL("debug_line.vert.gen.metal", "debug_line_vertex");
+    auto dbgFs = loadMSL("debug_line.frag.gen.metal", "debug_line_fragment");
+    rhi::GraphicsPipelineDesc dbgD;
+    dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+    dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+    dbgD.vertexLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {1, rhi::Format::RGB32_Float, 12},
+    };
+    dbgD.colorFormat = device->Swapchain().ColorFormat();
+    dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+    dbgD.usesFrameUniforms = true;
+    auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    // Build the selected object's translate gizmo through the debug-line layer.
+    debug::DebugDraw dd;
+    {
+        const scene::Transform& xf = objs[selIndex].xform;
+        float reach = std::max({xf.scale.x, xf.scale.y, xf.scale.z});
+        float handleLen = 1.2f + 0.8f * reach;
+        editor::EmitGizmo(dd, xf, editor::GizmoMode::Translate, handleLen, editor::kAxisNone);
+    }
+    const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+    rhi::BufferDesc lineBufDesc;
+    lineBufDesc.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+    lineBufDesc.initialData = dd.Vertices().data();
+    lineBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto lineBuffer = device->CreateBuffer(lineBufDesc);
+
+    runtime::Camera cam;
+    cam.position = {2.0f, 4.5f, 9.0f};
+    cam.yaw = 0.15f; cam.SetPitch(-0.32f);
+    cam.aspect = (float)W / (float)H;
+
+    const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+    FrameData fd{};
+    {
+        // Camera Proj() bakes the Vulkan Y-flip; Metal applies its own flip on top (as the other
+        // Metal showcases do) so the captured frame matches the Vulkan orientation.
+        Mat4 proj = FlipProjY(cam.Proj());
+        Mat4 vp = proj * cam.View();
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = cam.position.x; fd.viewPos[1] = cam.position.y;
+        fd.viewPos[2] = cam.position.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDirVec * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        runtime::CameraBasis cb = cam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = cam.aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            for (const auto& ob : objs) {
+                Mat4 m = ob.xform.Matrix();
+                cmd.PushConstants(m.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(ob.mesh->vertices());
+                cmd.BindIndexBuffer(ob.mesh->indices());
+                cmd.DrawIndexed(ob.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            for (const auto& ob : objs) {
+                Mat4 m = ob.xform.Matrix();
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(ob.mesh->vertices());
+                cmd.BindIndexBuffer(ob.mesh->indices());
+                cmd.DrawIndexed(ob.mesh->indexCount());
+            }
+            if (kLineVertCount > 0) {
+                cmd.BindPipeline(*debugPipeline);
+                cmd.BindVertexBuffer(*lineBuffer);
+                cmd.Draw(kLineVertCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — selected object %d, %u gizmo-line vertices\n",
+                outPath, cw, ch, selIndex, kLineVertCount);
+    return 0;
+}
+
 // --- Alpha-blended transparency showcase (Slice T). Mirrors the Vulkan --transparency-shot path:
 // checkerboard ground + procedural sky + a few OPAQUE lit cubes (two behind the glass, one in front
 // as an occluder), then 4 overlapping tinted GLASS spheres at different depths rendered in a SORTED
@@ -3172,6 +3382,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--debug") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_debug_viz.png";
             try { return RunDebugShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gizmo <objIndex> <out.png>: render the editor gizmo showcase (Slice AB) — a small
+        // multi-object scene with the selected object's translate gizmo drawn through the debug-line
+        // layer. Mirrors the Vulkan --gizmo-shot path; new golden tests/golden/metal/gizmo.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gizmo") == 0) {
+            int idx = argc > 2 ? std::atoi(argv[2]) : 2;
+            const char* out = argc > 3 ? argv[3] : "metal_gizmo.png";
+            try { return RunGizmoShowcase(idx, out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --skinning <out.png>: render the skeletal-animation showcase (Slice O) instead of the

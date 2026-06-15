@@ -12,6 +12,7 @@ enum class Key {
     Q, E,
     Space, Ctrl, Shift,
     Esc,
+    P, O, G, R, T,   // editor: P=play/pause toggle, O=single step, G/R/T=gizmo mode, plus Ctrl+S save
     Count
 };
 

@@ -1,5 +1,29 @@
 # Metal golden-image test
 
+## `gizmo.png` — editor selection + transform gizmo (Slice AB, editor interaction)
+
+`gizmo.png` is a SEPARATE golden produced by `visual_test --gizmo <objIndex> <out>`: a small
+deterministic multi-object scene (a ground checkerboard plane + a cube + a sphere + a tall box,
+lit + shadowed under the procedural sky, fixed `runtime::Camera`) with the **selected object's
+translate gizmo** — three colored axis arrows (X red / Y green / Z blue) — drawn at the object's
+position through the Slice-W **debug-line layer** (`debug::DebugDraw` LINE_LIST, `depthTest=true`,
+`depthWrite=false`, drawn AFTER opaque geometry). The gizmo is emitted by the pure-C++
+`editor::EmitGizmo` (`engine/editor/gizmo.cpp`); the golden was baked selecting **object 2 (the
+sphere)**, so the arrows land ON the sphere — golden-verifying that selection + gizmo projection
+agree on the object's screen position. The selection/picking/gizmo/drag math is pure C++ in
+`engine/editor/` (`picking.cpp` / `gizmo.cpp`), unit-tested in `tests/editor_test.cpp` and exercised
+headlessly by the Vulkan `--gizmo-shot` / `--pick-test` entries; live mouse-drag manipulation is
+Windows/Vulkan `--fly` only and is manual (the math under it is what these goldens + unit tests
+prove). No existing pipeline/shader/golden is touched — the gizmo reuses the debug-line pipeline, so
+all 14 prior goldens still diff `0.0000`. Deterministic — two `--gizmo 2` runs diff `0.0000`.
+
+```sh
+./build-metal/visual_test --gizmo 2 /tmp/giz.png
+~/mac-remote-rig/compare.sh tests/golden/metal/gizmo.png /tmp/giz.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `camera_pose.png` — scripted-camera pose (Slice AA, interactive runtime)
 
 `camera_pose.png` is a SEPARATE golden produced by `visual_test --camera <yaw,pitch,x,y,z> <out>`:
