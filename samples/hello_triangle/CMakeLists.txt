@@ -98,6 +98,10 @@ hf_compile_shaders(
     "shaders/particle.frag.hlsl:ps"
     "shaders/ui.vert.hlsl:vs"
     "shaders/ui.frag.hlsl:ps"
+    # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
+    # text color in a fragment push constant). Alpha-blended screen-space overlay drawn after post.
+    "shaders/text.vert.hlsl:vs"
+    "shaders/text.frag.hlsl:ps"
     # Immediate-mode debug-draw line pipeline (Slice W): world-space line verts projected by
     # FrameData.viewProj, flat per-vertex color. LINE_LIST topology.
     "shaders/debug_line.vert.hlsl:vs"

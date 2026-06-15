@@ -18,6 +18,7 @@
 #include "physics/world.h"
 #include "physics/body.h"
 #include "game/roll_game.h"
+#include "ui/text.h"
 #include "render/render_graph.h"
 #include "render/csm.h"
 #include "render/spot.h"
@@ -192,6 +193,76 @@ static bool WriteBMP(const char* path, const std::vector<uint8_t>& bgra,
     return true;
 }
 
+// --- HUD text overlay (Slice BA) -----------------------------------------------------------------
+// A small reusable screen-space text overlay: builds the baked-font atlas as a sampled texture + a
+// text pipeline (alphaBlend + cullNone, no depth, no frame uniforms, fragment push-const text color)
+// ONCE, then draws one or more HUD lines as a single alpha-blended quad batch over the final target.
+// Reuses the EXISTING alpha-blend + sampled-texture paths — no new RHI. The fragment push constant
+// is the text color (float4 rgb + opacity).
+using namespace hf;  // bring rhi::/ui:: into scope for the HUD helper (anon namespace, file scope)
+
+struct HudLine { std::string text; float x; float y; float scale; float color[4]; };
+
+struct HudOverlay {
+    std::unique_ptr<rhi::IShaderModule> vs, fs;
+    std::unique_ptr<rhi::IPipeline> pipeline;
+    std::unique_ptr<rhi::ITexture> atlas;
+
+    HudOverlay(rhi::IRHIDevice& device, rhi::Format colorFormat) {
+        auto vsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/text.vert.hlsl.spv");
+        auto fsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/text.frag.hlsl.spv");
+        vs = device.CreateShaderModule({std::span<const uint32_t>(vsW)});
+        fs = device.CreateShaderModule({std::span<const uint32_t>(fsW)});
+
+        std::vector<uint8_t> px((size_t)ui::kAtlasW * ui::kAtlasH * 4);
+        ui::BuildFontAtlas(px.data(), ui::kAtlasW, ui::kAtlasH);
+        rhi::TextureDesc td;
+        td.width = ui::kAtlasW; td.height = ui::kAtlasH; td.format = rhi::Format::RGBA8_UNorm;
+        td.data = px.data(); td.dataSize = px.size();
+        atlas = device.CreateTexture(td);
+
+        rhi::GraphicsPipelineDesc pd;
+        pd.vertex = vs.get(); pd.fragment = fs.get();
+        pd.vertexLayout.stride = sizeof(ui::TextVertex);
+        pd.vertexLayout.attributes = {
+            {0, rhi::Format::RG32_Float, (uint32_t)offsetof(ui::TextVertex, posPx)},
+            {1, rhi::Format::RG32_Float, (uint32_t)offsetof(ui::TextVertex, uv)},
+        };
+        pd.colorFormat = colorFormat;
+        pd.depthTest = false;             // overlay: no depth test/write
+        pd.usesFrameUniforms = false;     // no per-frame set -> atlas binds at set 0
+        pd.usesTexture = true;            // atlas at the material set (set 0)
+        pd.alphaBlend = true;             // src_alpha / one_minus_src_alpha
+        pd.cullNone = true;               // screen-space quads — don't back-face cull
+        pd.pushConstantSize = sizeof(float) * 4;   // text color (rgb + opacity)
+        pd.fragmentPushConstants = true;  // color is read in the fragment stage
+        pipeline = device.CreateGraphicsPipeline(pd);
+    }
+
+    // Draw the given lines into the CURRENT (already-open) render pass. Builds one combined vertex
+    // buffer per group of same-colored quads; each distinct color is one draw (one push constant).
+    // The vertex buffers are returned so the caller keeps them alive until the frame submits.
+    void Draw(rhi::IRHIDevice& device, rhi::ICommandBuffer& cmd, const std::vector<HudLine>& lines,
+              int screenW, int screenH, std::vector<std::unique_ptr<rhi::IBuffer>>& keepAlive) {
+        cmd.BindPipeline(*pipeline);
+        cmd.BindTexture(*atlas);
+        for (const HudLine& ln : lines) {
+            std::vector<ui::TextVertex> verts;
+            int quads = ui::LayoutText(ln.text, ln.x, ln.y, ln.scale, screenW, screenH, verts);
+            if (quads == 0) continue;
+            rhi::BufferDesc bd;
+            bd.size = verts.size() * sizeof(ui::TextVertex);
+            bd.initialData = verts.data();
+            bd.usage = rhi::BufferUsage::Vertex;
+            auto vb = device.CreateBuffer(bd);
+            cmd.PushConstants(ln.color, sizeof(float) * 4);
+            cmd.BindVertexBuffer(*vb);
+            cmd.Draw((uint32_t)verts.size());
+            keepAlive.push_back(std::move(vb));
+        }
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -225,6 +296,8 @@ int main(int argc, char** argv) {
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
     const char* gameShotPath = nullptr;
+    const char* hudShotPath = nullptr;       // --hud-shot <out.bmp> (Slice BA: text/HUD overlay)
+    const char* gameHudShotPath = nullptr;   // --game-hud-shot <out.bmp> (Slice BA: game + score HUD)
     const char* debugShotPath = nullptr;
     const char* transparencyShotPath = nullptr;
     const char* ssaoShotPath = nullptr;
@@ -327,6 +400,16 @@ int main(int argc, char** argv) {
             // pickups, lit + shadowed via the existing static-lit scene path. Prints the deterministic
             // winning game-state line. One BMP -> exit.
             gameShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--hud-shot") == 0 && i + 1 < argc) {
+            // Slice BA: the standard lit + shadowed scene PLUS a deterministic screen-space HUD text
+            // overlay ("HAZARD FORGE" + "SCORE: 0" + a fixed stat line — NO clock), drawn as an
+            // alpha-blended quad batch over the final target through the new text pipeline. One BMP.
+            hudShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--game-hud-shot") == 0 && i + 1 < argc) {
+            // Slice BA: the AX game scene (identical to --game-shot) PLUS a "SCORE: N" HUD overlay
+            // (N from the deterministic GameState at the capture step). Its OWN golden; --game-shot's
+            // game.png stays byte-identical. One BMP -> exit.
+            gameHudShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--debug-shot") == 0 && i + 1 < argc) {
             // Slice W: the SAME settled physics sphere-pyramid scene (lit + shadowed over the
             // checkerboard ground + sky) PLUS an immediate-mode DEBUG OVERLAY drawn via DebugDraw —
@@ -6641,6 +6724,250 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — capture step %d, %zu pickups remaining\n",
                                     gameShotPath, cw, ch2, kGameCaptureStep, pickupModels.size());
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gameShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Text / HUD showcases (--hud-shot + --game-hud-shot, Slice BA): a self-contained capture
+        // path that renders a lit + shadowed scene + a deterministic screen-space HUD text overlay
+        // (the baked 8x8 font atlas + alpha-blended quad batch through the new text pipeline, drawn
+        // OVER the final target in the post pass). --hud-shot draws the standard scene + a full HUD
+        // ("HAZARD FORGE" + "SCORE: 0" + a fixed stat line, NO clock). --game-hud-shot draws the AX
+        // game scene (identical to --game-shot) + a "SCORE: N" overlay (N from the deterministic
+        // GameState at the capture step), with its OWN golden so game.png stays byte-identical. Fixed
+        // text/positions/scale/color -> deterministic. One BMP -> exit. ------------------------------
+        if (hudShotPath || gameHudShotPath) {
+            using math::Mat4; using math::Vec3;
+            const bool gameMode = (gameHudShotPath != nullptr);
+            const char* outPath = gameMode ? gameHudShotPath : hudShotPath;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Deterministic roll-a-ball scene at the fixed mid-track capture step (identical recipe
+            // to --game-shot, so the underlying scene matches the existing game golden). The HUD score
+            // is read from capState.score at this step.
+            const int kGameCaptureStep = 250;
+            const float dtG = 1.0f / 120.0f;
+            std::vector<game::GameInput> track = game::ScriptedTrack();
+            physics::World capWorld;
+            game::GameState capState = game::MakeRollGame(capWorld);
+            for (int s = 0; s < kGameCaptureStep && s < (int)track.size(); ++s)
+                game::StepGame(capWorld, capState, track[s], dtG);
+            const physics::RigidBody& capPlayer = capWorld.bodies[(size_t)capState.playerBodyIndex];
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // The reusable HUD text overlay (baked-font atlas + alphaBlend text pipeline).
+            HudOverlay hud(*device, device->Swapchain().ColorFormat());
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            const uint8_t playerPx[4] = {40, 110, 230, 255};   // blue
+            auto playerTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, playerPx, sizeof(playerPx)});
+            const uint8_t pickupPx[4] = {245, 200, 40, 255};   // gold
+            auto pickupTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, pickupPx, sizeof(pickupPx)});
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            Mat4 playerModel = capPlayer.Transform();
+            std::vector<Mat4> pickupModels;
+            for (const auto& p : capState.pickups) {
+                if (p.collected) continue;
+                pickupModels.push_back(math::FromTRS(p.pos, math::Quat::Identity(),
+                                       {2.0f * p.radius, 2.0f * p.radius, 2.0f * p.radius}));
+            }
+
+            const Vec3 eye{9.5f, 4.0f, 6.5f};
+            const Vec3 center{5.0f, 0.4f, 1.6f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{5.0f, 0.4f, 1.6f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto litPush = [](const Mat4& model, float metallic, float roughness) {
+                std::array<float, 20> pc{};
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                return pc;
+            };
+
+            // --- Deterministic HUD content (fixed text/positions/scale/color — NO clock). ---
+            std::vector<HudLine> hudLines;
+            char scoreBuf[32];
+            std::snprintf(scoreBuf, sizeof(scoreBuf), "SCORE: %d", capState.score);
+            if (gameMode) {
+                // Game HUD: just the live score, top-left, bright white.
+                hudLines.push_back({scoreBuf, 32.0f, 32.0f, 4.0f, {1.0f, 1.0f, 1.0f, 1.0f}});
+            } else {
+                // Full HUD: title + score + a fixed stat line.
+                hudLines.push_back({"HAZARD FORGE", 32.0f, 28.0f, 5.0f, {1.0f, 0.85f, 0.2f, 1.0f}});
+                hudLines.push_back({"SCORE: 0",     32.0f, 76.0f, 4.0f, {1.0f, 1.0f, 1.0f, 1.0f}});
+                hudLines.push_back({"PICKUPS: 3  LEVEL: 1", 32.0f, 112.0f, 3.0f, {0.6f, 0.9f, 1.0f, 1.0f}});
+            }
+            std::vector<std::unique_ptr<rhi::IBuffer>> hudKeepAlive;
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.PushConstants(playerModel.m, sizeof(float) * 16);
+                    cmd.DrawIndexed(sphere.indexCount());
+                    for (const Mat4& pm : pickupModels) {
+                        cmd.PushConstants(pm.m, sizeof(float) * 16);
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        auto pc = litPush(groundModel, 0.0f, 0.85f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    {
+                        auto pc = litPush(playerModel, 0.1f, 0.4f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*playerTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    {
+                        cmd.BindMaterial(*pickupTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        for (const Mat4& pm : pickupModels) {
+                            auto pc = litPush(pm, 0.3f, 0.3f);
+                            cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                            cmd.DrawIndexed(sphere.indexCount());
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    // HUD overlay: alpha-blended text quads OVER the tonemapped scene, in the SAME
+                    // final-target pass (after post). Reuses the existing alpha-blend + texture paths.
+                    hud.Draw(dev, cmd, hudLines, (int)w, (int)h, hudKeepAlive);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(outPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %s HUD, score %d\n",
+                                    outPath, cw, ch2, gameMode ? "game" : "standard", capState.score);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", outPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

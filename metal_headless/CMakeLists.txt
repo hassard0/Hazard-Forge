@@ -139,6 +139,11 @@ hf_gen_msl(particle.frag   particle.frag.hlsl  frag particle_fragment)
 # FrameData.viewProj, flat per-vertex color. LINE_LIST topology. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(debug_line.vert debug_line.vert.hlsl vert debug_line_vertex)
 hf_gen_msl(debug_line.frag debug_line.frag.hlsl frag debug_line_fragment)
+# Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
+# text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
+# slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.
+hf_gen_msl(text.vert text.vert.hlsl vert text_vertex)
+hf_gen_msl(text.frag text.frag.hlsl frag text_fragment)
 # SSAO chain (Slice Y): view-space normal+linear-depth g-buffer prepass (static + instanced vertex
 # variants + shared fragment), hemisphere-kernel AO pass, box blur, composite/apply. Same
 # HLSL->SPIR-V->MSL toolchain as the others.
@@ -208,6 +213,9 @@ add_executable(visual_test
     # Deterministic roll-a-ball gameplay loop (Slice AX): pure C++ (math + physics, no Metal/RHI
     # deps). Drives the --game showcase's scripted playthrough + capture-step state.
     ${HF_ROOT}/engine/game/roll_game.cpp
+    # Text / HUD layout + baked font atlas (Slice BA): pure C++ (no Metal/RHI deps). Drives the
+    # --hud + --game-hud showcases' screen-space alpha-blended text overlay.
+    ${HF_ROOT}/engine/ui/text.cpp
     # Immediate-mode debug-draw collector + engine-object emitters (Slice W): pure C++ (math +
     # scene + physics), no Metal/RHI deps. Drives the LINE_LIST debug overlay.
     ${HF_ROOT}/engine/debug/debug_draw.cpp

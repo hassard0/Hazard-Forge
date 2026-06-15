@@ -33,7 +33,8 @@
       "automatic-barriers",
       "material-graph",
       "live-material-authoring",
-      "gameplay-sample"
+      "gameplay-sample",
+      "hud-text"
     ]
   },
   "showcases": [
@@ -51,6 +52,8 @@
     { "flag": "--instanced-shot", "desc": "Hardware-instanced grid." },
     { "flag": "--physics-shot", "desc": "Rigid-body physics (impulse solver)." },
     { "flag": "--game-shot", "desc": "Playable game sample (deterministic roll-a-ball collect-the-pickups)." },
+    { "flag": "--hud-shot", "desc": "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)." },
+    { "flag": "--game-hud-shot", "desc": "Game scene with a live SCORE HUD overlay (own golden; game.png unchanged)." },
     { "flag": "--transparency-shot", "desc": "Sorted alpha-blended transparency." },
     { "flag": "--debug-shot", "desc": "Immediate-mode debug-line visualization." },
     { "flag": "--capstone-shot", "desc": "Capstone scene combining the major features." },

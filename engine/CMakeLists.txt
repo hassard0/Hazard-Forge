@@ -17,6 +17,7 @@ set(HF_ENGINE_COMMON_SOURCES
   anim/animation.cpp
   physics/world.cpp
   game/roll_game.cpp
+  ui/text.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp
   editor/picking.cpp
@@ -118,6 +119,7 @@ add_library(hf_core STATIC
   anim/animation.cpp
   physics/world.cpp
   game/roll_game.cpp
+  ui/text.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp
   editor/picking.cpp

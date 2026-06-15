@@ -146,6 +146,8 @@ int main() {
             bool sawLiveMatFeature = false;
             // Slice AX: the playable gameplay-sample capability is advertised.
             bool sawGameplayFeature = false;
+            // Slice BA: the text / HUD capability is advertised.
+            bool sawHudTextFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -156,6 +158,7 @@ int main() {
                     if (AsString(el->value) == "material-graph") sawMatGraphFeature = true;
                     if (AsString(el->value) == "live-material-authoring") sawLiveMatFeature = true;
                     if (AsString(el->value) == "gameplay-sample") sawGameplayFeature = true;
+                    if (AsString(el->value) == "hud-text") sawHudTextFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -165,6 +168,7 @@ int main() {
             check(sawMatGraphFeature, "engine.features includes material-graph");
             check(sawLiveMatFeature, "engine.features includes live-material-authoring");
             check(sawGameplayFeature, "engine.features includes gameplay-sample");
+            check(sawHudTextFeature, "engine.features includes hud-text");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -202,6 +206,8 @@ int main() {
         bool sawMaterialMultiShot = false;
         // Slice AX: the --game-shot showcase flag is listed in the showcase manifest.
         bool sawGameShot = false;
+        // Slice BA: the --hud-shot + --game-hud-shot showcase flags are listed.
+        bool sawHudShot = false, sawGameHudShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -213,6 +219,8 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--material-live-shot") sawMaterialLiveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-multi-shot") sawMaterialMultiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--game-shot") sawGameShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--hud-shot") sawHudShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--game-hud-shot") sawGameHudShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -222,6 +230,8 @@ int main() {
         check(sawMaterialLiveShot, "showcases manifest includes --material-live-shot");
         check(sawMaterialMultiShot, "showcases manifest includes --material-multi-shot");
         check(sawGameShot, "showcases manifest includes --game-shot");
+        check(sawHudShot, "showcases manifest includes --hud-shot");
+        check(sawGameHudShot, "showcases manifest includes --game-hud-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

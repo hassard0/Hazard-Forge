@@ -154,6 +154,12 @@ hf_add_pure_test(runtime_material_test)
 # stays grounded y~=radius, no explosion via KineticEnergy). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(roll_game_test)
 
+# Text / HUD layout + atlas (Slice BA): BuildFontAtlas determinism + shape (128x48, white with
+# coverage alpha) and LayoutText math — 6 verts/visible glyph, quad count with spaces + newline,
+# cursor advance == kGlyphPx*pxScale, atlas-cell UVs, pixel->NDC conversion, empty string => 0 quads,
+# out-of-range char => blank. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(text_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

@@ -85,6 +85,8 @@ const Showcase kShowcases[] = {
     {"--instanced-shot",    "Hardware-instanced grid."},
     {"--physics-shot",      "Rigid-body physics (impulse solver)."},
     {"--game-shot",         "Playable game sample (deterministic roll-a-ball collect-the-pickups)."},
+    {"--hud-shot",          "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)."},
+    {"--game-hud-shot",     "Game scene with a live SCORE HUD overlay (own golden; game.png unchanged)."},
     {"--transparency-shot", "Sorted alpha-blended transparency."},
     {"--debug-shot",        "Immediate-mode debug-line visualization."},
     {"--capstone-shot",     "Capstone scene combining the major features."},
@@ -135,6 +137,7 @@ const char* kFeatures[] = {
     "material-graph",
     "live-material-authoring",
     "gameplay-sample",
+    "hud-text",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to
