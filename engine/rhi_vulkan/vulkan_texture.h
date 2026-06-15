@@ -23,6 +23,10 @@ public:
     // the device's flat default normal.
     void attachNormalMap(VkImageView normalView);
 
+    // The dedicated environment descriptor set (set 3) for an HDR equirect env texture (Slice R),
+    // or VK_NULL_HANDLE for an ordinary material texture. Bound by BindEnvironment.
+    VkDescriptorSet environmentSet() const { return environmentSet_; }
+
 private:
     VulkanDevice& device_;
     VkImage image_ = VK_NULL_HANDLE;
@@ -30,6 +34,7 @@ private:
     VkImageView view_ = VK_NULL_HANDLE;
     VkDescriptorSet set_ = VK_NULL_HANDLE;
     VkImageView boundNormalView_ = VK_NULL_HANDLE;  // last normal-map view written into the set
+    VkDescriptorSet environmentSet_ = VK_NULL_HANDLE;  // set 3 (HDR env), null for material textures
 };
 
 } // namespace hf::rhi::vk

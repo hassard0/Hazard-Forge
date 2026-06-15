@@ -202,6 +202,41 @@ void VulkanDevice::CreateTextureResources() {
     ssci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     Check(vkCreateSampler(device_, &ssci, nullptr, &shadowSampler_), "vkCreateSampler(shadow)");
 
+    // HDR environment sampler (Slice R): trilinear (linear min/mag + linear mipmap, full LOD range)
+    // so SampleLevel reads a smoothly-prefiltered mip; address U = repeat (equirect longitude wraps
+    // seamlessly at +/-pi), address V = clamp-to-edge (poles must not wrap top<->bottom).
+    VkSamplerCreateInfo eci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    eci.magFilter = VK_FILTER_LINEAR;
+    eci.minFilter = VK_FILTER_LINEAR;
+    eci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    eci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    eci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    eci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    eci.maxLod = VK_LOD_CLAMP_NONE;
+    Check(vkCreateSampler(device_, &eci, nullptr, &environmentSampler_), "vkCreateSampler(env)");
+
+    // Dedicated environment descriptor set layout (set 3, fragment stage): binding 11 = HDR sampled
+    // image, binding 12 = sampler. The binding numbers are chosen (11/12, past the full-PBR material
+    // set's 0..10) so spirv-cross --msl-decoration-binding maps them to Metal fragment
+    // texture(11)/sampler(12) on the MSL-gen path. Kept SEPARATE from the material/frame/joint
+    // layouts so the existing set 0/1/2 layouts (and the golden-locked pipelines) are byte-unchanged.
+    {
+        VkDescriptorSetLayoutBinding envBindings[2]{};
+        envBindings[0].binding = 11;
+        envBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        envBindings[0].descriptorCount = 1;
+        envBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        envBindings[1].binding = 12;
+        envBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        envBindings[1].descriptorCount = 1;
+        envBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo elci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        elci.bindingCount = 2;
+        elci.pBindings = envBindings;
+        Check(vkCreateDescriptorSetLayout(device_, &elci, nullptr, &environmentSetLayout_),
+              "vkCreateDescriptorSetLayout(env)");
+    }
+
     // --- Default flat normal map: a 1x1 RGBA8 image encoding the tangent-space normal (0,0,1) as
     // (128,128,255). Bound at material set binding 3 when a renderable has no normal map, so the lit
     // shader always samples a valid normal map (perturbation = identity). ---
@@ -471,13 +506,17 @@ void VulkanDevice::DestroyTextureResources() {
     if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);
     if (texturedSetLayout_) vkDestroyDescriptorSetLayout(device_, texturedSetLayout_, nullptr);
     if (pbrMaterialSetLayout_) vkDestroyDescriptorSetLayout(device_, pbrMaterialSetLayout_, nullptr);
+    if (environmentSetLayout_) vkDestroyDescriptorSetLayout(device_, environmentSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
+    if (environmentSampler_) vkDestroySampler(device_, environmentSampler_, nullptr);
     descriptorPool_ = VK_NULL_HANDLE;
     texturedSetLayout_ = VK_NULL_HANDLE;
     pbrMaterialSetLayout_ = VK_NULL_HANDLE;
+    environmentSetLayout_ = VK_NULL_HANDLE;
     defaultSampler_ = VK_NULL_HANDLE;
     shadowSampler_ = VK_NULL_HANDLE;
+    environmentSampler_ = VK_NULL_HANDLE;
 }
 
 void VulkanDevice::UploadToImage(VkImage image, uint32_t w, uint32_t h,
@@ -553,6 +592,99 @@ void VulkanDevice::UploadToImage(VkImage image, uint32_t w, uint32_t h,
     Check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(upload)");
 
     // 7. Cleanup.
+    vkDestroyCommandPool(device_, pool, nullptr);
+    vmaDestroyBuffer(allocator_, staging, stagingAlloc);
+}
+
+void VulkanDevice::UploadToImageMips(VkImage image, uint32_t w, uint32_t h, uint32_t mipLevels,
+                                     const void* const* mipData, const uint64_t* mipBytes) {
+    // One staging buffer holding all mips back-to-back; one transient command buffer copies each mip.
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < mipLevels; ++i) total += mipBytes[i];
+
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = total;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    VmaAllocationInfo info{};
+    Check(vmaCreateBuffer(allocator_, &bci, &aci, &staging, &stagingAlloc, &info),
+          "vmaCreateBuffer(staging-mips)");
+    std::vector<uint64_t> offsets(mipLevels);
+    {
+        auto* dst = static_cast<uint8_t*>(info.pMappedData);
+        uint64_t off = 0;
+        for (uint32_t i = 0; i < mipLevels; ++i) {
+            offsets[i] = off;
+            std::memcpy(dst + off, mipData[i], mipBytes[i]);
+            off += mipBytes[i];
+        }
+    }
+    Check(vmaFlushAllocation(allocator_, stagingAlloc, 0, total), "vmaFlushAllocation(staging-mips)");
+
+    VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cpci.queueFamilyIndex = graphicsQueueFamily_;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    Check(vkCreateCommandPool(device_, &cpci, nullptr, &pool), "vkCreateCommandPool(mips)");
+    VkCommandBufferAllocateInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbi.commandPool = pool;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    Check(vkAllocateCommandBuffers(device_, &cbi, &cmd), "vkAllocateCommandBuffers(mips)");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer(mips)");
+
+    // UNDEFINED -> TRANSFER_DST_OPTIMAL for ALL mip levels.
+    {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT; b.srcAccessMask = 0;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
+
+    for (uint32_t i = 0; i < mipLevels; ++i) {
+        uint32_t mw = w >> i; if (mw == 0) mw = 1;
+        uint32_t mh = h >> i; if (mh == 0) mh = 1;
+        VkBufferImageCopy region{};
+        region.bufferOffset = offsets[i];
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+        region.imageExtent = {mw, mh, 1};
+        vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
+
+    // TRANSFER_DST -> SHADER_READ_ONLY_OPTIMAL for ALL mip levels.
+    {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT; b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1; di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
+
+    Check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer(mips)");
+    VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmdSub.commandBuffer = cmd;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1; submit.pCommandBufferInfos = &cmdSub;
+    Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit2(mips)");
+    Check(vkQueueWaitIdle(graphicsQueue_), "vkQueueWaitIdle(mips)");
     vkDestroyCommandPool(device_, pool, nullptr);
     vmaDestroyBuffer(allocator_, staging, stagingAlloc);
 }

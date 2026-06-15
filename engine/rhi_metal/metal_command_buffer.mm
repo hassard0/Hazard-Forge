@@ -154,6 +154,15 @@ void MetalCommandBuffer::BindMaterialPBR(ITexture& base, ITexture& metalRough, I
     bind(occlusion,  kFragOcclusionTex,   kFragOcclusionSmp);
 }
 
+void MetalCommandBuffer::BindEnvironment(ITexture& env) {
+    // HDR equirect environment map (Slice R) for image-based lighting: bind at the dedicated
+    // fragment texture(11)/sampler(12), matching the generated sky_hdr/lit_pbr_ibl MSL (gEnv/gEnvSmp).
+    auto* s = dynamic_cast<IMetalSampled*>(&env);
+    if (!s) Fail("BindEnvironment: texture is not an IMetalSampled");
+    [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragEnvTex];
+    [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragEnvSmp];
+}
+
 void MetalCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {
     // Point list (GPU particles) vs the default triangle list (geometry / fullscreen tris).
     MTLPrimitiveType prim = boundPointList_ ? MTLPrimitiveTypePoint : MTLPrimitiveTypeTriangle;

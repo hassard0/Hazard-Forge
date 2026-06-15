@@ -1,5 +1,31 @@
 # Metal golden-image test
 
+## `ibl_helmet.png` — HDR environment IBL (Slice R)
+
+`ibl_helmet.png` is a SEPARATE golden produced by `visual_test --ibl`: a minimal HDR
+image-based-lighting showcase (HDR **equirectangular** skybox + ground checkerboard plane + the
+DamagedHelmet shaded so its metal reflects the **real captured sky/sun/terrain**, lit + shadowed,
+fixed camera/light). The environment is `assets/env/env.hdr` (a CC0 clear-sky 1k equirect), decoded
+with `stbi_loadf` and uploaded as an **N-mip `RGBA16_Float`** texture: each coarser mip is a CPU 2×2
+box-downsample (progressively blurrier → approximates a roughness-prefiltered specular environment).
+The new shaders `shaders/sky_hdr.frag.hlsl` (background, LOD 0) and `shaders/lit_pbr_ibl.frag.hlsl`
+(specular = env at `roughness*maxLod`, diffuse irradiance = env at a very high mip) sample the env
+via the equirect mapping `u = atan2(z,x)/2π+0.5, v = acos(y)/π`. The env binds on a DEDICATED slot
+(`usesEnvironment` → flat fragment `texture(11)/sampler(12)`, `metal_common.h kFragEnvTex/kFragEnvSmp`)
+via `ICommandBuffer::BindEnvironment`, so the existing set 0/1/2 layouts and the golden-locked
+`lit`/`sky`/`lit_pbr` pipelines are byte-for-byte unchanged. The frame is deterministic — two runs
+diff `0.0000`. This golden is INDEPENDENT of `scene_shadow.png` / `skinning.png` / `pbr_helmet.png` /
+`instanced.png`, which are all unchanged (still diff `0.0000`).
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --ibl /tmp/ibl.png
+~/mac-remote-rig/compare.sh tests/golden/metal/ibl_helmet.png /tmp/ibl.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `instanced.png` — GPU instanced rendering (Slice Q)
 
 `instanced.png` is a SEPARATE golden produced by `visual_test --instanced`: a minimal GPU-instancing

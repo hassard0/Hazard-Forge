@@ -12,6 +12,7 @@
 #include "scene/commands.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
+#include "asset/env_loader.h"
 #include "anim/animation.h"
 #include "anim/skeleton.h"
 #include "render/render_graph.h"
@@ -170,6 +171,7 @@ int main(int argc, char** argv) {
     const char* shotPath = nullptr;
     const char* skinningShotPath = nullptr;
     const char* pbrShotPath = nullptr;
+    const char* iblShotPath = nullptr;
     const char* instancedShotPath = nullptr;
     const char* commandsPath = nullptr;
     bool dumpScene = false;
@@ -181,6 +183,10 @@ int main(int argc, char** argv) {
             // Render one frame of the full-PBR showcase (ground + skybox + DamagedHelmet with the
             // full glTF metallic-roughness material set, lit + shadowed), write a BMP, exit.
             pbrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ibl-shot") == 0 && i + 1 < argc) {
+            // Render one frame of the HDR-IBL showcase (HDR equirect skybox + DamagedHelmet shaded by
+            // lit_pbr_ibl so the metal reflects the real captured sky/sun/terrain), write a BMP, exit.
+            iblShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--skinning-shot") == 0 && i + 1 < argc) {
             // Render one frame of the skinned-Fox showcase (ground + skybox + GPU-skinned Fox at
             // animation "Survey" t=0.5s, lit + shadowed), write a BMP, exit.
@@ -432,6 +438,231 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %u instances\n",
                                     instancedShotPath, cw, ch2, kInstanceCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", instancedShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- HDR environment IBL showcase (--ibl-shot, Slice R): a self-contained capture path that
+        // does NOT touch the default scene. HDR equirect skybox (sky_hdr) + ground plane + the
+        // DamagedHelmet shaded by lit_pbr_ibl so the metal reflects the REAL captured sky/sun/terrain
+        // (mip-LOD prefiltered), lit + shadowed. One frame -> BMP -> exit. Uses SEPARATE sky_hdr +
+        // lit_pbr_ibl pipelines + an environment set bound via BindEnvironment; the golden-locked
+        // lit/sky/lit_pbr pipelines are untouched. ---------------------------------------------------
+        if (iblShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Load the HDR equirect environment (N-mip RGBA16F, CPU box-prefiltered).
+            hf::asset::EnvironmentMap env = hf::asset::LoadHdrEnvironment(*device, HF_ENV_PATH);
+            const float envMaxLod = (float)(env.mipLevels - 1);
+
+            // Lit-PBR-IBL pipeline: shared lit.vert + lit_pbr_ibl.frag; wider PBR material set (set 1)
+            // PLUS the dedicated environment set (set 3) declared via usesEnvironment.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto iblFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr_ibl.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto iblFs = device->CreateShaderModule({std::span<const uint32_t>(iblFsWords)});
+            rhi::GraphicsPipelineDesc iblDesc;
+            iblDesc.vertex = litVs.get();
+            iblDesc.fragment = iblFs.get();
+            iblDesc.vertexLayout = scene::MeshVertexLayout();
+            iblDesc.colorFormat = device->Swapchain().ColorFormat();
+            iblDesc.depthTest = true;
+            iblDesc.usesFrameUniforms = true;
+            iblDesc.usesTexture = true;
+            iblDesc.pbrMaterial = true;
+            iblDesc.usesEnvironment = true;   // adds the set-3 env binding
+            iblDesc.pushConstantSize = sizeof(float) * 20;
+            auto iblPipeline = device->CreateGraphicsPipeline(iblDesc);
+
+            // Static lit pipeline for the ground plane (untouched lit.frag, 2-texture material set).
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Static depth-only shadow pipeline (ground + helmet casters).
+            auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shadowVs.get();
+            shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // HDR sky pipeline (sky_hdr.frag) + post. The sky pipeline also declares usesEnvironment.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky_hdr.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            skyD.usesEnvironment = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+
+            hf::asset::PbrModel helmet = hf::asset::LoadPbrGltfModel(*device, HF_HELMET_MODEL_PATH);
+
+            const float scaleS = 1.6f;
+            Mat4 helmetModel = Mat4::Translate({0.0f, scaleS * 1.0f, 0.0f})
+                             * Mat4::RotateX(1.5707963f)
+                             * Mat4::Scale({scaleS, scaleS, scaleS});
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+            const Vec3 eye{3.0f, 2.4f, 4.0f};
+            const Vec3 center{0.0f, 1.2f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.2f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 25.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+                fd.skyParams[2] = envMaxLod;   // env maxLod for the IBL fragment shader (Slice R)
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.PushConstants(helmetModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(helmet.mesh.vertices());
+                    cmd.BindIndexBuffer(helmet.mesh.indices());
+                    cmd.DrawIndexed(helmet.mesh.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    // HDR equirect skybox.
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.BindEnvironment(*env.equirect);
+                    cmd.Draw(3);
+                    // Ground plane (lit, dielectric).
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Helmet (full-PBR with HDR IBL): reflects the real sky.
+                    cmd.BindPipeline(*iblPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = helmetModel.m[k];
+                        pc[16] = helmet.metallicFactor; pc[17] = helmet.roughnessFactor;
+                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*helmet.baseColor, *helmet.metalRough, *helmet.normalMap,
+                                            *helmet.emissive, *helmet.occlusion);
+                        cmd.BindEnvironment(*env.equirect);
+                        cmd.BindVertexBuffer(helmet.mesh.vertices());
+                        cmd.BindIndexBuffer(helmet.mesh.indices());
+                        cmd.DrawIndexed(helmet.mesh.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(iblShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — env %dx%d, %d mips\n",
+                                    iblShotPath, cw, ch2, env.width, env.height, env.mipLevels);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", iblShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

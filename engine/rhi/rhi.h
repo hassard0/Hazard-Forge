@@ -21,6 +21,7 @@ enum class Format {
     RG32_Float,    // vec2 vertex attribute
     RGB32_Float,   // vec3 vertex attribute
     RGBA32_Float,  // vec4 vertex attribute (skinned joints/weights)
+    RGBA16_Float,  // half4 sampled HDR texture (equirect environment map; Slice R)
     D32_Float,     // depth attachment
 };
 
@@ -70,6 +71,11 @@ struct GraphicsPipelineDesc {
                                      // base/metalRough/normal/emissive/occlusion) instead of the 2-texture
                                      // material set. Only the lit-PBR pipeline sets this; all other
                                      // material pipelines keep the unchanged 2-texture set.
+    bool usesEnvironment = false;    // when true: the layout includes a DEDICATED environment set
+                                     // (set 3) — one sampled HDR image + sampler — for image-based
+                                     // lighting (Slice R). Bound via BindEnvironment. Existing
+                                     // set 0/1/2 layouts are unchanged, so golden-locked pipelines
+                                     // (which leave this false) are byte-for-byte unaffected.
 };
 
 // Storage = read-write SSBO usable by a compute shader (and bindable as a vertex stream so a
@@ -88,8 +94,17 @@ struct TextureDesc {
     uint32_t width = 0;
     uint32_t height = 0;
     Format format = Format::RGBA8_UNorm;
-    const void* data = nullptr;   // tightly packed pixels
+    const void* data = nullptr;   // tightly packed pixels (mip 0 when mipLevels==1)
     uint64_t dataSize = 0;        // bytes
+    // --- Optional N-mip 2D texture (Slice R: HDR environment with a CPU-prefiltered mip chain). ---
+    // When mipLevels > 1 the backend creates an N-mip sampled image and uploads each mip from
+    // mipData[i] (tightly packed, dimensions max(1, width>>i) x max(1, height>>i)). When mipLevels
+    // == 1 (the default) the existing single-mip data/dataSize path is used verbatim, so RGBA8
+    // textures are byte-for-byte unchanged. The mip sampler uses trilinear filtering (linear mipmap).
+    uint32_t mipLevels = 1;
+    const void* const* mipData = nullptr;  // [mipLevels] tightly-packed per-mip pixel pointers
+    bool environment = false;       // when true: address U = repeat (equirect longitude wraps),
+                                    // address V = clamp (poles); used for the HDR equirect env map.
 };
 
 struct BufferDesc {
@@ -141,6 +156,12 @@ public:
         (void)metalRough; (void)emissive; (void)occlusion;
         BindMaterial(base, normalMap);
     }
+    // Bind an HDR environment map (equirectangular, N-mip) at the dedicated environment set/slot
+    // (set 3 on the Vulkan backend; flat fragment texture/sampler slots 11/12 on the other), for
+    // image-based lighting in the sky_hdr + lit_pbr_ibl passes (Slice R). Pair with a pipeline whose
+    // usesEnvironment is true. Default no-op so passes/backends without IBL are unaffected; both
+    // shipping backends override it.
+    virtual void BindEnvironment(ITexture& /*env*/) {}
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.

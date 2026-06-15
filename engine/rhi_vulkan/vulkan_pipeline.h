@@ -18,6 +18,11 @@ public:
     uint32_t materialSetIndex() const { return hasFrameSet_ ? 1u : 0u; }
     // True when the pipeline declares the joint-palette set (set 2); BindPipeline binds it there.
     bool hasJointSet() const { return hasJointSet_; }
+    // True when the pipeline declares the dedicated HDR environment set (set 3, Slice R).
+    bool hasEnvironmentSet() const { return hasEnvironmentSet_; }
+    // The environment set's index in the pipeline layout (always 3 for the IBL pipeline: frame 0,
+    // material 1, joint-set placeholder 2, env 3).
+    uint32_t environmentSetIndex() const { return 3u; }
 
 private:
     VkDevice device_;
@@ -25,6 +30,7 @@ private:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     bool hasFrameSet_ = false;
     bool hasJointSet_ = false;
+    bool hasEnvironmentSet_ = false;
 };
 
 } // namespace hf::rhi::vk

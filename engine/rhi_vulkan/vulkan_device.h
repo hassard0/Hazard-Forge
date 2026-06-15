@@ -77,6 +77,19 @@ public:
     void UploadToImage(VkImage image, uint32_t w, uint32_t h,
                        const void* data, uint64_t size);
 
+    // Stage N mip levels into a device-local image (synchronous). mipData[i] points at tightly-packed
+    // pixels for mip i (dimensions max(1,w>>i) x max(1,h>>i)); mipBytes[i] is its byte count. Used by
+    // the HDR environment texture (Slice R). bytesPerPixel selects the element size (8 for RGBA16F).
+    void UploadToImageMips(VkImage image, uint32_t w, uint32_t h, uint32_t mipLevels,
+                           const void* const* mipData, const uint64_t* mipBytes);
+
+    // HDR environment sampling support (Slice R): the trilinear sampler (repeat-U / clamp-V) used by
+    // the equirect env map, and the dedicated environment descriptor set layout (set 3: binding 0 =
+    // sampled image, binding 1 = sampler). Separate from the material/frame/joint layouts so the
+    // existing pipelines' set 0/1/2 layouts are byte-for-byte unchanged.
+    VkSampler environmentSampler() const { return environmentSampler_; }
+    VkDescriptorSetLayout environmentSetLayout() const { return environmentSetLayout_; }
+
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
     // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
@@ -108,8 +121,10 @@ private:
     // Texture support: one default sampler + a shared image+sampler set layout (set 1) + pool.
     VkSampler             defaultSampler_    = VK_NULL_HANDLE;
     VkSampler             shadowSampler_     = VK_NULL_HANDLE;  // clamp-to-edge linear (shadow map)
+    VkSampler             environmentSampler_ = VK_NULL_HANDLE; // trilinear repeat-U/clamp-V (HDR env)
     VkDescriptorSetLayout texturedSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout pbrMaterialSetLayout_ = VK_NULL_HANDLE;  // wider set 1 for lit-PBR
+    VkDescriptorSetLayout environmentSetLayout_ = VK_NULL_HANDLE;  // dedicated set 3 for HDR IBL
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the

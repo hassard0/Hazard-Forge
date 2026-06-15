@@ -69,6 +69,10 @@ hf_gen_msl(lit.vert    lit.vert.hlsl    vert vertex_main)
 hf_gen_msl(lit.frag    lit.frag.hlsl    frag fragment_main)
 # Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
 hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
+# HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same
+# HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
+hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)
+hf_gen_msl(lit_pbr_ibl.frag  lit_pbr_ibl.frag.hlsl  frag pbr_ibl_fragment)
 # Skinned-animation variants (Slice O): GPU skinning vertex shader (reuses lit.frag) + skinned
 # depth-only shadow vertex shader. Same HLSL->SPIR-V->MSL toolchain as the others.
 hf_gen_msl(lit_skinned.vert    lit_skinned.vert.hlsl    vert skinned_vertex)
@@ -110,6 +114,8 @@ add_executable(visual_test
     ${HF_ROOT}/engine/scene/scene_io.cpp
     # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.
     ${HF_ROOT}/engine/asset/gltf_loader.cpp
+    # HDR environment loader (Slice R): decodes env.hdr, builds the CPU mip chain, uploads RGBA16F.
+    ${HF_ROOT}/engine/asset/env_loader.cpp
     # Skeletal-animation sampling (plain C++): Quat/Slerp/FromTRS live in math.h; this is the
     # SampleAnimation palette builder (Slice O).
     ${HF_ROOT}/engine/anim/animation.cpp
@@ -137,6 +143,7 @@ target_compile_definitions(visual_test PRIVATE
     HF_FOX_MODEL_PATH="${HF_ROOT}/assets/models/Fox.glb"
     HF_HELMET_MODEL_PATH="${HF_ROOT}/assets/models/DamagedHelmet.glb"
     HF_SCENE_PATH="${HF_ROOT}/assets/scenes/default.json"
+    HF_ENV_PATH="${HF_ROOT}/assets/env/env.hdr"
 )
 
 target_link_libraries(visual_test PRIVATE

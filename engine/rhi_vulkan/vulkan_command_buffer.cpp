@@ -19,6 +19,7 @@ void VulkanCommandBuffer::Begin(VkCommandBuffer cmd, VkImageView colorView,
     extent_ = extent;
     boundLayout_ = VK_NULL_HANDLE;
     boundMaterialSet_ = 0;
+    boundEnvironmentSet_ = 0;
 }
 
 void VulkanCommandBuffer::BeginRenderPass(const ClearColor& clear) {
@@ -58,6 +59,7 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     auto& p = static_cast<VulkanPipeline&>(pipeline);
     boundLayout_ = p.layout();
     boundMaterialSet_ = p.materialSetIndex();
+    boundEnvironmentSet_ = p.hasEnvironmentSet() ? p.environmentSetIndex() : 0;
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
     // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
     // (frameIndex_ matches the UBO SetFrameUniforms wrote this frame — see VulkanDevice.)
@@ -125,6 +127,15 @@ void VulkanCommandBuffer::BindMaterialPBR(ITexture& base, ITexture& metalRough, 
     VkDescriptorSet s = device_.pbrMaterialSet(base, metalRough, normalMap, emissive, occlusion);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                             boundMaterialSet_, 1, &s, 0, nullptr);
+}
+
+void VulkanCommandBuffer::BindEnvironment(ITexture& env) {
+    // Bind the HDR equirect env texture's dedicated set (set 3) for image-based lighting. The
+    // VulkanTexture (created with desc.environment) owns the env descriptor set.
+    auto& tex = static_cast<VulkanTexture&>(env);
+    VkDescriptorSet s = tex.environmentSet();
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundEnvironmentSet_, 1, &s, 0, nullptr);
 }
 
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {

@@ -49,6 +49,12 @@ constexpr uint32_t kFragEmissiveTex   = 7;  // gEmissive    (set1 b7  -> texture
 constexpr uint32_t kFragEmissiveSmp   = 8;  // gEmissiveSmp (set1 b8  -> sampler(8))
 constexpr uint32_t kFragOcclusionTex  = 9;  // gOcclusion   (set1 b9  -> texture(9))
 constexpr uint32_t kFragOcclusionSmp  = 10; // gOcclusionSmp (set1 b10 -> sampler(10))
+// HDR environment map (Slice R): a dedicated equirect texture + trilinear sampler for image-based
+// lighting, past the full-PBR material's 0..10. The sky_hdr.frag / lit_pbr_ibl.frag HLSL declare
+// these at [[vk::binding(11,3)]]/[[vk::binding(12,3)]] so spirv-cross --msl-decoration-binding lands
+// them on Metal fragment texture(11) / sampler(12).
+constexpr uint32_t kFragEnvTex = 11;  // gEnv    (set3 b11 -> texture(11))
+constexpr uint32_t kFragEnvSmp = 12;  // gEnvSmp (set3 b12 -> sampler(12))
 
 // Compute (kernel) binding indices. The particle compute MSL is generated from particles.comp.hlsl
 // via spirv-cross --msl-decoration-binding: the storage buffer (binding 0) -> buffer(0), and the
@@ -61,6 +67,7 @@ inline MTLPixelFormat ToMetalPixelFormat(Format f) {
     switch (f) {
         case Format::RGBA8_UNorm: return MTLPixelFormatRGBA8Unorm;
         case Format::BGRA8_UNorm: return MTLPixelFormatBGRA8Unorm;
+        case Format::RGBA16_Float: return MTLPixelFormatRGBA16Float;
         case Format::D32_Float:   return MTLPixelFormatDepth32Float;
         default:                  return MTLPixelFormatInvalid;
     }

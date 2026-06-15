@@ -14,6 +14,8 @@ hf_compile_shaders(
     "shaders/lit.vert.hlsl:vs"
     "shaders/lit.frag.hlsl:ps"
     "shaders/lit_pbr.frag.hlsl:ps"
+    "shaders/lit_pbr_ibl.frag.hlsl:ps"
+    "shaders/sky_hdr.frag.hlsl:ps"
     "shaders/lit_skinned.vert.hlsl:vs"
     "shaders/shadow_skinned.vert.hlsl:vs"
     "shaders/lit_instanced.vert.hlsl:vs"
@@ -44,3 +46,6 @@ target_compile_definitions(hello_triangle PRIVATE
 # Absolute path to the default data-driven scene description (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SCENE_PATH=\"${CMAKE_SOURCE_DIR}/assets/scenes/default.json\"")
+# Absolute path to the HDR equirectangular environment map (Slice R: kloofendal clear sky, 1k).
+target_compile_definitions(hello_triangle PRIVATE
+  "HF_ENV_PATH=\"${CMAKE_SOURCE_DIR}/assets/env/env.hdr\"")

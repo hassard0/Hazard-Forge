@@ -8,7 +8,7 @@ namespace hf::rhi::vk {
 
 VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc)
     : device_(device.device()), hasFrameSet_(desc.usesFrameUniforms),
-      hasJointSet_(desc.usesJointPalette) {
+      hasJointSet_(desc.usesJointPalette), hasEnvironmentSet_(desc.usesEnvironment) {
     auto* vs = static_cast<VulkanShaderModule*>(desc.vertex);
     auto* fs = static_cast<VulkanShaderModule*>(desc.fragment);
 
@@ -141,13 +141,22 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     std::vector<VkDescriptorSetLayout> setLayouts;
     if (desc.usesFrameUniforms) setLayouts.push_back(device.frameSetLayout());   // set 0
     // set 1: the lit-PBR pipeline uses the WIDER full-PBR material set layout; everything else uses
-    // the existing 2-texture material set (also the joint-set placeholder).
+    // the existing 2-texture material set (also the joint-set placeholder). When usesEnvironment is
+    // set but there is no material set (the HDR sky pipeline), a material-layout placeholder fills
+    // set 1 so the dedicated environment set always sits at index 3.
     if (desc.usesJointPalette && !desc.usesTexture)
         setLayouts.push_back(device.materialSetLayout());                        // set 1 placeholder
     else if (desc.usesTexture)
         setLayouts.push_back(desc.pbrMaterial ? device.pbrMaterialSetLayout()
                                               : device.materialSetLayout());     // set 1
+    else if (desc.usesEnvironment)
+        setLayouts.push_back(device.materialSetLayout());                        // set 1 placeholder (env)
+    // set 2: the joint palette, OR (for the IBL pipelines, which have no skinning but need set 3 to
+    // sit at index 3) a harmless placeholder so descriptor sets stay at consecutive indices.
     if (desc.usesJointPalette) setLayouts.push_back(device.jointPaletteSetLayout()); // set 2
+    else if (desc.usesEnvironment) setLayouts.push_back(device.jointPaletteSetLayout()); // set 2 placeholder
+    // set 3: the dedicated HDR environment set (Slice R). Only the IBL pipelines declare this.
+    if (desc.usesEnvironment) setLayouts.push_back(device.environmentSetLayout()); // set 3
     if (!setLayouts.empty()) {
         lci.setLayoutCount = (uint32_t)setLayouts.size();
         lci.pSetLayouts = setLayouts.data();
