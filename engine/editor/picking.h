@@ -24,6 +24,17 @@ using math::Ray;
 // through VP-inverse), so it lands on objects the camera actually sees.
 Ray ScreenRayThroughCamera(const runtime::Camera& cam, float ndcX, float ndcY);
 
+// Convert an absolute cursor position in FRAMEBUFFER PIXELS (origin top-left, +x right, +y DOWN —
+// the windowing convention) to normalized device coordinates (ndcX,ndcY in [-1,1], +x right, +y UP —
+// what ScreenRayThroughCamera expects). The Y axis is flipped. Pure math, shared between the live
+// viewport (HAL cursor px) and the unit test so both exercise the identical mapping.
+struct Ndc { float x, y; };
+inline Ndc PixelToNdc(float px, float py, float width, float height) {
+    float nx = (width  > 0.0f) ? (px / width)  * 2.0f - 1.0f : 0.0f;
+    float ny = (height > 0.0f) ? (py / height) * 2.0f - 1.0f : 0.0f;
+    return Ndc{nx, -ny};  // flip Y: pixel +y is down, NDC +y is up
+}
+
 // One pickable object: its world-space AABB. (The caller fits this from the object's posed mesh
 // bounds; the picker stays geometry-agnostic.)
 struct PickAabb {

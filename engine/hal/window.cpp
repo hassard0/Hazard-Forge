@@ -90,6 +90,22 @@ bool Window::PumpEvents() {
         }
     }
 
+    // Absolute cursor position. SDL reports it in WINDOW POINTS (logical units); the editor unprojects
+    // through a framebuffer-pixel NDC map, so scale by the framebuffer/window-size ratio (>1 on HiDPI).
+    // Frozen while in relative (mouse-look) mode, where the OS cursor is hidden and position is moot.
+    {
+        float mx = 0.0f, my = 0.0f;
+        SDL_GetMouseState(&mx, &my);
+        int winW = 0, winH = 0;
+        SDL_GetWindowSize(window_, &winW, &winH);
+        int fbW = 0, fbH = 0;
+        SDL_GetWindowSizeInPixels(window_, &fbW, &fbH);
+        float sx = (winW > 0) ? (float)fbW / (float)winW : 1.0f;
+        float sy = (winH > 0) ? (float)fbH / (float)winH : 1.0f;
+        input_.mouseX = mx * sx;
+        input_.mouseY = my * sy;
+    }
+
     // Level keyboard state (independent of event ordering) into the snapshot.
     int numKeys = 0;
     const bool* ks = SDL_GetKeyboardState(&numKeys);

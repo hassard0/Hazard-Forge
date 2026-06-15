@@ -86,6 +86,13 @@ hf_add_pure_test(probe_test)
 # C++ (hf_core), ASan-eligible.
 hf_add_pure_test(introspect_test)
 
+# Live editor: cursor-px->NDC->ray (PixelToNdc round-trip + ScreenRayThroughCamera), click-ray
+# picks the expected entity among world AABBs, ApplyDrag axis delta (prevRay/curRay), and
+# FileWatcher.Poll change detection via an injected fake-stat clock (Slice AM). The live mouse
+# interaction in --fly is manual-only; this exercises the deterministic logic it drives. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(live_editor_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

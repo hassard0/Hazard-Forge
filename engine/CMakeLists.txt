@@ -6,6 +6,7 @@ set(HF_ENGINE_COMMON_SOURCES
   runtime/camera.cpp
   runtime/clock.cpp
   runtime/fly_camera_controller.cpp
+  runtime/hot_reload.cpp
   render/render_graph.cpp
   scene/mesh.cpp
   scene/scene_io.cpp
@@ -77,6 +78,7 @@ add_library(hf_core STATIC
   runtime/camera.cpp
   runtime/clock.cpp
   runtime/fly_camera_controller.cpp
+  runtime/hot_reload.cpp
   render/render_graph.cpp
   scene/mesh.cpp
   scene/scene_io.cpp

@@ -22,6 +22,9 @@ struct InputState {
     bool  keyDown[static_cast<int>(Key::Count)] = {};
     float mouseDx = 0.0f;      // relative mouse motion since last pump (pixels)
     float mouseDy = 0.0f;
+    float mouseX = 0.0f;       // ABSOLUTE cursor position in framebuffer pixels (origin top-left,
+    float mouseY = 0.0f;       // +x right, +y down). Meaningful only while NOT in relativeMouse
+                               // (mouse-look) mode; the editor unprojects a left-click from these.
     bool  mouseButtons[3] = {};  // 0 = left, 1 = right, 2 = middle
     float wheel = 0.0f;          // accumulated wheel ticks since last pump
     bool  relativeMouse = false; // true while mouse-look (relative) mode is engaged

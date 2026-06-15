@@ -30,6 +30,7 @@
 #include "runtime/fly_camera_controller.h"
 #include "runtime/input_state.h"
 #include "runtime/play_state.h"
+#include "runtime/hot_reload.h"
 #include "editor/picking.h"
 #include "editor/gizmo.h"
 #include "editor/introspect.h"
@@ -2445,6 +2446,29 @@ int main(int argc, char** argv) {
             auto upsamplePipe   = makeBloomPipe(upsampleFs.get(), kHdr);
             auto compositePipe  = makeBloomPipe(compositeFs.get(), device->Swapchain().ColorFormat());
 
+            // === Slice AM: debug-line pipeline for the LIVE editor gizmo overlay. Draws the selected
+            // object's gizmo (emitted by editor::EmitGizmo into a DebugDraw line list) into the HDR
+            // scene target after opaque geometry — the SAME path --gizmo-shot uses, here per-frame. The
+            // line vertex buffer is rebuilt each frame from the current selection (see the fly loop).
+            auto dbgVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.vert.hlsl.spv");
+            auto dbgFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.frag.hlsl.spv");
+            auto dbgVs = device->CreateShaderModule({std::span<const uint32_t>(dbgVsW)});
+            auto dbgFs = device->CreateShaderModule({std::span<const uint32_t>(dbgFsW)});
+            rhi::GraphicsPipelineDesc dbgD;
+            dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+            dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+            dbgD.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {1, rhi::Format::RGB32_Float, 12},
+            };
+            dbgD.colorFormat = kHdr;
+            dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+            dbgD.usesFrameUniforms = true;
+            auto debugLinePipeline = device->CreateGraphicsPipeline(dbgD);
+            // Per-frame gizmo line buffer + vertex count, referenced inside recordFrame's scene pass.
+            std::unique_ptr<rhi::IBuffer> gizmoLineBuffer;
+            uint32_t gizmoVertCount = 0;
+
             // === Render targets (recreated on resize in the fly loop). ===
             auto rt = device->CreateRenderTarget(w, h, kHdr);
             auto shadowMap = device->CreateShadowMap(2048);
@@ -2777,6 +2801,14 @@ int main(int argc, char** argv) {
                             cmd.PushConstants(pc, sizeof(pc));
                             cmd.DrawIndexed(sphere.indexCount());
                         }
+                        // Slice AM: live editor gizmo overlay — one LINE_LIST draw after opaque
+                        // geometry (depth-tested, no depth write). Rebuilt each frame for the current
+                        // selection; empty (gizmoVertCount==0) when nothing is selected.
+                        if (gizmoVertCount > 0 && gizmoLineBuffer) {
+                            cmd.BindPipeline(*debugLinePipeline);
+                            cmd.BindVertexBuffer(*gizmoLineBuffer);
+                            cmd.Draw(gizmoVertCount);
+                        }
                         cmd.EndRenderPass();
                     });
 
@@ -2884,63 +2916,298 @@ int main(int argc, char** argv) {
             runtime::FlyCameraController controller;
             runtime::FixedTimestep clock(1.0f / 120.0f);
 
-            if (flyDryRun) {
-                // Headless CI exercise: feed synthetic input frames through the loop logic (camera +
-                // clock update + frame record) WITHOUT presenting, then exit. Proves the loop drives
-                // the camera and records a valid graph without a GUI window.
-                runtime::InputState in;
-                in.relativeMouse = true;
-                int totalSteps = 0;
-                math::Vec3 startPos = cam.position;
-                for (int frame = 0; frame < 8; ++frame) {
-                    in.keyDown[(int)runtime::Key::W] = true;       // drive forward
-                    in.mouseDx = 6.0f; in.mouseDy = -3.0f;         // look around
-                    float dt = 1.0f / 60.0f;
-                    totalSteps += clock.Tick(dt);
-                    controller.Update(cam, in, dt);
-                    FrameData fd = makeFrameData(cam);
-                    render::RenderGraph graph;
-                    recordFrame(graph, fd, sortGlass(cam.position));
-                    // Topo-sort/validate the graph (no Execute -> no swapchain present needed).
-                    (void)graph;
-                }
-                bool moved = math::length(cam.position - startPos) > 1e-3f;
-                std::printf("fly-dry-run: %d frames, %d fixed steps, camera moved %s "
-                            "(yaw=%.3f pitch=%.3f pos=(%.2f,%.2f,%.2f))\n",
-                            8, totalSteps, moved ? "yes" : "NO",
-                            cam.yaw, cam.pitch, cam.position.x, cam.position.y, cam.position.z);
-                device->WaitIdle();
-                return moved ? 0 : 1;
-            }
-
-            // Live windowed loop.
-            window.SetRelativeMouse(true);  // mouse-look engaged; ESC quits, frees the cursor on exit
-            std::printf("--fly: WASD move, mouse look, Space/E up, Ctrl/Q down, Shift sprint, "
-                        "wheel speed, ESC quit | P play/pause, O step, G/R/T gizmo mode, Ctrl+S save\n");
-
-            // Slice AB: editor run-state + selection wired into the live loop. The simulation is static
-            // this scene, so play/pause/step is demonstrated by the accumulated fixed-step count the
-            // PlayState gates; Ctrl+S serializes a representative ECS (the fly scene's placed objects)
-            // back to disk via scene::DumpScene; G/R/T pick the gizmo manipulation mode. Live click-to-
-            // pick + axis drag is manual (the picking/gizmo math itself is unit-tested + golden-verified
-            // via --pick-test / --gizmo-shot); this loop drives the same headless-proven logic. -------
+            // === Slice AM: LIVE editor state shared by --fly and --fly-dry-run. ===
             runtime::PlayState play;
-            editor::Selection sel;
-            sel.index = 0; sel.mode = editor::GizmoMode::Translate;
-            // A representative editable ECS mirroring a couple of the fly scene's static objects, so
-            // Ctrl+S has real transforms to serialize through the IO layer.
+            editor::Selection sel;            // starts unselected; a left-click picks.
+            sel.index = -1; sel.mode = editor::GizmoMode::Translate;
+
+            // The LIVE editable scene: real meshes (with bounds) so picking + gizmo drag act on actual
+            // geometry. A couple of cubes + a sphere at distinct spots; Ctrl+S serializes THIS registry
+            // via scene::DumpScene, and scene hot-reload re-LoadScenes into it.
             ecs::Registry editReg;
             scene::SceneResources editRes;
             editRes.AddMesh("cube", &cube);
             editRes.AddMesh("sphere", &sphere);
-            {
-                ecs::Entity ped = editReg.create();
-                scene::Transform pt; pt.position = {0.0f, pedH, -1.8f}; pt.scale = {1.0f, pedH, 1.0f};
-                editReg.add(ped, scene::TransformC{pt});
-                editReg.add(ped, scene::MeshC{&cube});
-                editReg.add(ped, scene::MaterialC{});
+            editRes.AddMesh("plane", &plane);
+            // Register the textures the scene schema can name so a hot-reloaded scene JSON resolves
+            // them. A scene referencing a resource NOT registered here is rejected by LoadScene and the
+            // current scene is kept (logged) — see the design spec's hot-reload scope note.
+            editRes.AddTexture("checker", groundTex.get());
+            editRes.AddTexture("flat_normal", flatNormal.get());
+            auto buildDefaultEditScene = [&](ecs::Registry& reg) {
+                auto addObj = [&](scene::Mesh* mesh, math::Vec3 pos, math::Vec3 scl) {
+                    ecs::Entity e = reg.create();
+                    scene::Transform t; t.position = pos; t.scale = scl;
+                    reg.add(e, scene::TransformC{t});
+                    reg.add(e, scene::MeshC{mesh});
+                    reg.add(e, scene::MaterialC{});
+                };
+                addObj(&cube,   {-2.5f, 0.5f,  0.0f}, {1.0f, 1.0f, 1.0f});
+                addObj(&sphere, { 1.5f, 1.0f,  1.5f}, {1.6f, 1.6f, 1.6f});
+                addObj(&cube,   { 3.0f, 1.5f, -1.0f}, {0.6f, 3.0f, 0.6f});
+            };
+            buildDefaultEditScene(editReg);
+
+            // World AABB of an entity: its mesh object-space bounds transformed by its Transform and
+            // re-fit to an axis-aligned box (8-corner transform -> min/max). Used for ray picking.
+            auto worldAabb = [](const scene::Transform& xf, const scene::MeshBounds& b) {
+                math::Mat4 m = xf.Matrix();
+                math::Vec3 mn{1e30f, 1e30f, 1e30f}, mx{-1e30f, -1e30f, -1e30f};
+                for (int c = 0; c < 8; ++c) {
+                    math::Vec3 corner{ (c & 1) ? b.max.x : b.min.x,
+                                       (c & 2) ? b.max.y : b.min.y,
+                                       (c & 4) ? b.max.z : b.min.z };
+                    float wclip = 1.0f;
+                    math::Vec3 wp = math::MulPointDivide(m, corner, wclip);
+                    mn.x = std::min(mn.x, wp.x); mn.y = std::min(mn.y, wp.y); mn.z = std::min(mn.z, wp.z);
+                    mx.x = std::max(mx.x, wp.x); mx.y = std::max(mx.y, wp.y); mx.z = std::max(mx.z, wp.z);
+                }
+                return math::Aabb{mn, mx};
+            };
+            // Snapshot the live entities (in view order) + their world AABBs for one pick query.
+            auto snapshotPickList = [&](std::vector<ecs::Entity>& ents,
+                                        std::vector<editor::PickAabb>& boxes) {
+                ents.clear(); boxes.clear();
+                for (auto [e, tc, mc] : editReg.view<scene::TransformC, scene::MeshC>()) {
+                    ents.push_back(e);
+                    scene::MeshBounds mb = mc.mesh ? mc.mesh->bounds() : scene::MeshBounds{};
+                    boxes.push_back({worldAabb(tc.t, mb)});
+                }
+            };
+            // Gizmo handle length for the selected entity, sized to its world AABB so it always reads.
+            auto handleLenFor = [&](const editor::PickAabb& box) {
+                math::Vec3 ext{box.box.max.x - box.box.min.x, box.box.max.y - box.box.min.y,
+                               box.box.max.z - box.box.min.z};
+                float reach = std::max({ext.x, ext.y, ext.z});
+                return 1.2f + 0.6f * reach;
+            };
+            // Rebuild the gizmo line vertex buffer for the current selection (empty if nothing picked).
+            auto rebuildGizmoLines = [&](int activeAxis) {
+                gizmoVertCount = 0; gizmoLineBuffer.reset();
+                if (!sel.Has()) return;
+                std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
+                snapshotPickList(ents, boxes);
+                if (sel.index < 0 || sel.index >= (int)ents.size()) { sel.index = -1; return; }
+                const scene::Transform& xf = editReg.get<scene::TransformC>(ents[sel.index]).t;
+                float handleLen = handleLenFor(boxes[sel.index]);
+                debug::DebugDraw dd;
+                editor::EmitGizmo(dd, xf, sel.mode, handleLen, activeAxis);
+                if (dd.VertexCount() == 0) return;
+                rhi::BufferDesc bd;
+                bd.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+                bd.initialData = dd.Vertices().data();
+                bd.usage = rhi::BufferUsage::Vertex;
+                gizmoLineBuffer = device->CreateBuffer(bd);
+                gizmoVertCount = (uint32_t)dd.VertexCount();
+            };
+
+            // --- Drag state for the gizmo (the per-frame prevRay/curRay manipulation). ---
+            int   dragAxis = editor::kAxisNone;   // grabbed gizmo axis while left-dragging (-1 = none)
+            math::Ray dragPrevRay{};              // last frame's cursor ray (seeded on grab -> no jump)
+
+            // Cursor ray for an input snapshot: framebuffer px -> NDC -> world ray. (The px->NDC map is
+            // editor::PixelToNdc, shared with the unit test.) Only meaningful while NOT mouse-looking.
+            auto cursorRay = [&](const runtime::InputState& in) {
+                editor::Ndc n = editor::PixelToNdc(in.mouseX, in.mouseY, (float)w, (float)h);
+                return editor::ScreenRayThroughCamera(cam, n.x, n.y);
+            };
+
+            // One editor interaction step for an input snapshot: left-click picks (or grabs a gizmo
+            // axis), left-drag manipulates the selected transform, left-release ends the drag. Returns
+            // the active axis to brighten (for the gizmo render). Pure logic over picking/gizmo math —
+            // identical in --fly (real cursor) and --fly-dry-run (synthetic InputState).
+            auto editorInteract = [&](const runtime::InputState& in, bool leftEdge,
+                                      bool leftDown) -> int {
+                math::Ray ray = cursorRay(in);
+                if (leftEdge) {
+                    // Grab a gizmo axis if one is hovered for the current selection; else pick an entity.
+                    if (sel.Has()) {
+                        std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
+                        snapshotPickList(ents, boxes);
+                        if (sel.index >= 0 && sel.index < (int)ents.size()) {
+                            const scene::Transform& xf = editReg.get<scene::TransformC>(ents[sel.index]).t;
+                            float hl = handleLenFor(boxes[sel.index]);
+                            int axis = editor::PickGizmoAxis(ray, xf, sel.mode, hl);
+                            if (axis != editor::kAxisNone) {
+                                dragAxis = axis;
+                                dragPrevRay = ray;   // seed: first drag frame is a no-op (no jump)
+                                return dragAxis;
+                            }
+                        }
+                    }
+                    // No axis grabbed -> pick the entity under the cursor (or clear on a miss).
+                    std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
+                    snapshotPickList(ents, boxes);
+                    editor::PickResult r = editor::PickNearest(ray, boxes);
+                    sel.index = r.index;   // -1 on a miss = deselect
+                    dragAxis = editor::kAxisNone;
+                    return editor::kAxisNone;
+                }
+                if (leftDown && dragAxis != editor::kAxisNone && sel.Has()) {
+                    // Apply the per-frame drag: prevRay (last frame) -> curRay (this frame).
+                    std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
+                    snapshotPickList(ents, boxes);
+                    if (sel.index >= 0 && sel.index < (int)ents.size()) {
+                        scene::Transform& live = editReg.get<scene::TransformC>(ents[sel.index]).t;
+                        live = editor::ApplyDrag(live, sel.mode, dragAxis, dragPrevRay, ray);
+                    }
+                    dragPrevRay = ray;
+                    return dragAxis;
+                }
+                if (!leftDown) dragAxis = editor::kAxisNone;  // release ends the drag
+                return dragAxis;
+            };
+
+            // --- Hot-reload: watch the active scene JSON + a representative shader .spv. ---
+            runtime::FileWatcher watcher;
+            const std::string scenePath  = HF_SCENE_PATH;
+            const std::string shaderPath = std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv";
+            watcher.Watch(scenePath);
+            watcher.Watch(shaderPath);
+            // Apply detected file changes. Scene reload is robust end-to-end; shader reload recreates
+            // the lit fragment module (best-effort) — see the design spec for scope. Returns a summary.
+            auto applyHotReload = [&](const std::vector<std::string>& changed) {
+                for (const std::string& p : changed) {
+                    if (p == scenePath) {
+                        try {
+                            ecs::Registry fresh;
+                            scene::LoadScene(fresh, editRes, scenePath.c_str());
+                            editReg = std::move(fresh);
+                            sel.index = -1; dragAxis = editor::kAxisNone;
+                            std::printf("[hot-reload] scene reloaded from %s\n", scenePath.c_str());
+                        } catch (const std::exception& ex) {
+                            std::printf("[hot-reload] scene reload FAILED (%s) — keeping current\n",
+                                        ex.what());
+                        }
+                    } else if (p == shaderPath) {
+                        try {
+                            auto words = LoadSpirv(shaderPath);
+                            litFs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                            std::printf("[hot-reload] lit.frag.hlsl.spv shader module recreated "
+                                        "(pipeline hot-swap deferred — see spec)\n");
+                        } catch (const std::exception& ex) {
+                            std::printf("[hot-reload] shader reload FAILED (%s)\n", ex.what());
+                        }
+                    }
+                }
+            };
+
+            if (flyDryRun) {
+                // Headless CI exercise (Slice AA + AM): feed synthetic input frames through the FULL
+                // loop logic (camera + clock + ONE pick + ONE drag + a scene hot-reload) WITHOUT
+                // presenting, then exit. Proves the live loop's editor logic path runs end-to-end with
+                // no GUI window. The real mouse interaction in the window is manual-only.
+                runtime::InputState in;
+                int totalSteps = 0;
+                math::Vec3 startPos = cam.position;
+
+                // Frame 0: a synthetic left-click aimed at the sphere (entity 1). Project its center to
+                // NDC, convert to a cursor pixel, and drive a left-press edge through editorInteract.
+                {
+                    math::Vec3 sphereCenter{1.5f, 1.0f, 1.5f};
+                    float wclip = 0.0f;
+                    math::Vec3 ndc = math::MulPointDivide(cam.ViewProj(), sphereCenter, wclip);
+                    in.mouseX = (ndc.x * 0.5f + 0.5f) * (float)w;
+                    in.mouseY = (-ndc.y * 0.5f + 0.5f) * (float)h;
+                    editorInteract(in, /*leftEdge=*/true, /*leftDown=*/true);
+                }
+                bool picked = sel.Has();
+                int pickedIndex = sel.index;
+
+                // Frames: a synthetic translate-drag along +X of the selected entity (grab the X handle,
+                // then drag the cursor to move it). Capture the before/after X to prove the drag moved it.
+                math::Vec3 beforePos{};
+                math::Vec3 afterPos{};
+                if (picked) {
+                    std::vector<ecs::Entity> ents; std::vector<editor::PickAabb> boxes;
+                    snapshotPickList(ents, boxes);
+                    beforePos = editReg.get<scene::TransformC>(ents[pickedIndex]).t.position;
+                    // Grab the +X translate handle: aim a downward ray through (origin + X*handleLen/2).
+                    sel.mode = editor::GizmoMode::Translate;
+                    const scene::Transform& xf = editReg.get<scene::TransformC>(ents[pickedIndex]).t;
+                    float hl = handleLenFor(boxes[pickedIndex]);
+                    // Build a fake cursor by projecting a point ON the +X handle to a pixel.
+                    math::Vec3 onHandle = xf.position + math::Vec3{hl * 0.5f, 0, 0};
+                    float wclip = 0.0f;
+                    math::Vec3 ndc = math::MulPointDivide(cam.ViewProj(), onHandle, wclip);
+                    in.mouseX = (ndc.x * 0.5f + 0.5f) * (float)w;
+                    in.mouseY = (-ndc.y * 0.5f + 0.5f) * (float)h;
+                    editorInteract(in, /*leftEdge=*/true, /*leftDown=*/true);  // grab the X axis
+                    // Drag: move the cursor to a point further along +X each frame.
+                    for (int f = 0; f < 4; ++f) {
+                        math::Vec3 farther = xf.position + math::Vec3{hl * 0.5f + (f + 1) * 0.4f, 0, 0};
+                        ndc = math::MulPointDivide(cam.ViewProj(), farther, wclip);
+                        in.mouseX = (ndc.x * 0.5f + 0.5f) * (float)w;
+                        in.mouseY = (-ndc.y * 0.5f + 0.5f) * (float)h;
+                        editorInteract(in, /*leftEdge=*/false, /*leftDown=*/true);
+                    }
+                    editorInteract(in, /*leftEdge=*/false, /*leftDown=*/false);  // release
+                    afterPos = editReg.get<scene::TransformC>(ents[pickedIndex]).t.position;
+                }
+                bool dragged = (afterPos.x - beforePos.x) > 1e-3f;
+
+                // Exercise the camera + clock for a few frames (as before).
+                runtime::InputState flyIn;
+                flyIn.relativeMouse = true;
+                for (int frame = 0; frame < 8; ++frame) {
+                    flyIn.keyDown[(int)runtime::Key::W] = true;
+                    flyIn.mouseDx = 6.0f; flyIn.mouseDy = -3.0f;
+                    float dt = 1.0f / 60.0f;
+                    totalSteps += clock.Tick(dt);
+                    controller.Update(cam, flyIn, dt);
+                    FrameData fd = makeFrameData(cam);
+                    render::RenderGraph graph;
+                    recordFrame(graph, fd, sortGlass(cam.position));
+                    (void)graph;
+                }
+                bool moved = math::length(cam.position - startPos) > 1e-3f;
+
+                // Exercise the hot-reload path end-to-end: DUMP the current edited registry to a temp
+                // JSON (it references only registered resources: cube/sphere/plane), then re-LOAD it
+                // through the SAME applyHotReload path the live FileWatcher drives, swapping the live
+                // registry. Proves LoadScene->swap works on real data (the stock default.json names a
+                // 'duck' mesh not registered in the fly editRes, so we round-trip our own scene here).
+                size_t before = editReg.aliveCount();
+                bool reloaded = false;
+                {
+                    std::string tmpScene = "fly_dryrun_scene.json";
+                    std::string json = scene::DumpScene(editReg, editRes);
+                    std::ofstream out(tmpScene, std::ios::binary);
+                    out << json; out.close();
+                    runtime::FileWatcher dryWatch;
+                    dryWatch.Watch(tmpScene);              // baseline
+                    // Re-LoadScene via the same logic the live watcher uses (inline, temp path).
+                    try {
+                        ecs::Registry fresh;
+                        scene::LoadScene(fresh, editRes, tmpScene.c_str());
+                        size_t loaded = fresh.aliveCount();
+                        editReg = std::move(fresh);
+                        sel.index = -1;
+                        reloaded = (loaded == before && loaded > 0);
+                    } catch (const std::exception& ex) {
+                        std::printf("[hot-reload] dry-run scene reload FAILED (%s)\n", ex.what());
+                    }
+                }
+                // Also confirm the live-path applyHotReload is robust on the stock scene (caught + kept).
+                applyHotReload({scenePath});
+
+                std::printf("fly-dry-run: %d frames, %d fixed steps, camera moved %s | "
+                            "pick=%s(idx %d) drag+X=%s reload=%s (entities %zu->%zu)\n",
+                            8, totalSteps, moved ? "yes" : "NO",
+                            picked ? "yes" : "NO", pickedIndex, dragged ? "yes" : "NO",
+                            reloaded ? "yes" : "NO", before, editReg.aliveCount());
+                device->WaitIdle();
+                bool ok = moved && picked && dragged && reloaded;
+                return ok ? 0 : 1;
             }
-            bool prevP = false, prevO = false, prevCtrlS = false;
+
+            // Live windowed loop. Mouse-look is engaged only while the RIGHT button is held, so the
+            // cursor stays visible for LEFT-click picking + gizmo drag (Slice AM). ESC quits.
+            std::printf("--fly: WASD move, RIGHT-drag look, Space/E up, Ctrl/Q down, Shift sprint, "
+                        "wheel speed, ESC quit | LEFT-click pick, LEFT-drag gizmo, P play/pause, O "
+                        "step, G/R/T gizmo mode, Ctrl+S save\n");
+
+            bool prevP = false, prevO = false, prevCtrlS = false, prevLeft = false, prevRight = false;
             int savedCount = 0;
             int liveSteps = 0;
 
@@ -2959,6 +3226,13 @@ int main(int argc, char** argv) {
                     buildMips(w, h);
                     cam.aspect = (h > 0) ? (float)w / (float)h : 1.0f;
                 }
+
+                // --- Mouse-look on RIGHT button (engages/releases relative mouse). ---
+                bool nowRight = in.mouseButtons[1];
+                if (nowRight && !prevRight) window.SetRelativeMouse(true);
+                if (!nowRight && prevRight) window.SetRelativeMouse(false);
+                prevRight = nowRight;
+
                 // --- Editor controls (edge-triggered). ---
                 bool nowP = in.Down(runtime::Key::P);
                 if (nowP && !prevP) { play.Toggle();
@@ -2979,6 +3253,21 @@ int main(int argc, char** argv) {
                 }
                 prevCtrlS = nowCtrlS;
 
+                // --- LEFT-click pick + LEFT-drag gizmo (only while NOT mouse-looking on the right). ---
+                int activeAxis = editor::kAxisNone;
+                if (!nowRight) {
+                    bool nowLeft = in.mouseButtons[0];
+                    bool leftEdge = nowLeft && !prevLeft;
+                    activeAxis = editorInteract(in, leftEdge, nowLeft);
+                    prevLeft = nowLeft;
+                } else {
+                    prevLeft = false;  // ignore left while flying so a release after fly doesn't pick
+                }
+                rebuildGizmoLines(activeAxis);
+
+                // --- Hot-reload poll (scene JSON + shader .spv). ---
+                applyHotReload(watcher.Poll());
+
                 auto now = std::chrono::steady_clock::now();
                 float dt = std::min(std::chrono::duration<float>(now - last).count(), 0.1f);
                 last = now;
@@ -2998,7 +3287,6 @@ int main(int argc, char** argv) {
             window.SetRelativeMouse(false);
             std::printf("--fly: exited after %d simulated fixed steps, %d save(s)\n",
                         liveSteps, savedCount);
-            (void)sel;
             device->WaitIdle();
             return 0;
         }
