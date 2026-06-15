@@ -49,6 +49,10 @@ target_compile_definitions(hello_triangle PRIVATE
 # Absolute path to the full-PBR showcase model (DamagedHelmet.glb: 5-texture metallic-roughness PBR).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_HELMET_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/DamagedHelmet.glb\"")
+# Absolute path to the scene-graph import showcase model (CesiumMilkTruck.glb: node hierarchy +
+# multiple meshes/materials; the wheels mesh is placed at two positions via two parent transforms).
+target_compile_definitions(hello_triangle PRIVATE
+  "HF_TRUCK_MODEL_PATH=\"${CMAKE_SOURCE_DIR}/assets/models/CesiumMilkTruck.glb\"")
 # Absolute path to the default data-driven scene description (repo asset).
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SCENE_PATH=\"${CMAKE_SOURCE_DIR}/assets/scenes/default.json\"")

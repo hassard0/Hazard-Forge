@@ -31,6 +31,8 @@ hf_add_pure_test(anim_test)
 hf_add_pure_test(instance_grid_test)
 # Impulse-based rigid-body world (Slice S). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(physics_test)
+# Scene-graph hierarchy composition (Slice V): parent*local world-transform walk. Pure C++, ASan.
+hf_add_pure_test(scene_import_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

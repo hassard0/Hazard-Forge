@@ -33,10 +33,19 @@ const cgltf_accessor* FindAttr(const cgltf_primitive& prim, cgltf_attribute_type
     return nullptr;
 }
 
-// Build a scene::Mesh from the first primitive of the first mesh, recentred on origin.
-scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const char* path) {
-    const cgltf_primitive& prim = data->meshes[0].primitives[0];
-
+// Build a scene::Mesh from an arbitrary glTF primitive.
+//
+//  * recentre — when true, the geometry is recentred so its bbox centre sits at the origin (the
+//               legacy single-mesh behaviour for LoadGltfMesh/LoadGltfModel/LoadPbrGltfModel). When
+//               false (scene-graph import) the authored model-space positions are kept verbatim so
+//               the node world transforms place them; scene-level recentring is done once instead.
+//  * outBbMin/outBbMax — optional (may be null): the primitive's MODEL-SPACE (post-recentre) bbox,
+//               so the scene importer can compute a world AABB by transforming these corners.
+//
+// Reads POSITION / NORMAL / TEXCOORD_0 into scene::Vertex, widens indices to u32, and fills tangents
+// (authored TANGENT preferred, else Lengyel from POSITION/UV/NORMAL, else default (1,0,0)).
+scene::Mesh BuildPrimitive(rhi::IRHIDevice& device, const cgltf_primitive& prim, const char* path,
+                           bool recentre, float* outBbMin = nullptr, float* outBbMax = nullptr) {
     const cgltf_accessor* posAcc = FindAttr(prim, cgltf_attribute_type_position);
     if (!posAcc)
         throw std::runtime_error(std::string("glTF primitive has no POSITION: ") + path);
@@ -67,14 +76,19 @@ scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const cha
         v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
     }
 
-    const float center[3] = {0.5f * (bbMin[0] + bbMax[0]),
-                             0.5f * (bbMin[1] + bbMax[1]),
-                             0.5f * (bbMin[2] + bbMax[2])};
-    for (cgltf_size i = 0; i < vertCount; ++i) {
-        verts[i].pos[0] -= center[0];
-        verts[i].pos[1] -= center[1];
-        verts[i].pos[2] -= center[2];
+    const float center[3] = {recentre ? 0.5f * (bbMin[0] + bbMax[0]) : 0.0f,
+                             recentre ? 0.5f * (bbMin[1] + bbMax[1]) : 0.0f,
+                             recentre ? 0.5f * (bbMin[2] + bbMax[2]) : 0.0f};
+    if (recentre) {
+        for (cgltf_size i = 0; i < vertCount; ++i) {
+            verts[i].pos[0] -= center[0];
+            verts[i].pos[1] -= center[1];
+            verts[i].pos[2] -= center[2];
+        }
     }
+    // Report the (post-recentre) model-space bbox for scene-level fitting.
+    if (outBbMin) { for (int k = 0; k < 3; ++k) outBbMin[k] = bbMin[k] - center[k]; }
+    if (outBbMax) { for (int k = 0; k < 3; ++k) outBbMax[k] = bbMax[k] - center[k]; }
 
     if (nrmAcc) {
         for (cgltf_size i = 0; i < vertCount; ++i) {
@@ -166,6 +180,11 @@ scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const cha
 
     return scene::Mesh{std::move(vbuffer), std::move(ibuffer),
                        static_cast<uint32_t>(indices.size())};
+}
+
+// Legacy single-mesh helper: the first primitive of the first mesh, recentred on origin.
+scene::Mesh BuildMesh(rhi::IRHIDevice& device, const cgltf_data* data, const char* path) {
+    return BuildPrimitive(device, data->meshes[0].primitives[0], path, /*recentre=*/true);
 }
 
 // A flat-white 1x1 RGBA8 texture: used as a fallback when the material has no usable
@@ -275,6 +294,50 @@ cgltf_data* OpenGltf(const char* path) {
         throw std::runtime_error(std::string("glTF has no mesh/primitive: ") + path);
     }
     return data;
+}
+
+// Decode a glTF material's metallic-roughness factors + the five PBR textures into a PbrMaterial.
+// Every texture is non-null (neutral 1x1 fallbacks per absent map, identical semantics to
+// LoadPbrGltfModel). A null `mat` yields a sensible default (white base, neutral metalRough,
+// flat normal, black emissive, white occlusion, metallic 0 / roughness 1).
+PbrMaterial DecodeMaterial(rhi::IRHIDevice& device, const cgltf_material* mat) {
+    float metallic = mat ? 1.0f : 0.0f;   // default material: dielectric (metallic 0)
+    float roughness = 1.0f;
+    float emissiveF[3] = {0.0f, 0.0f, 0.0f};
+    const cgltf_image* baseImg = nullptr;
+    const cgltf_image* mrImg = nullptr;
+    const cgltf_image* normalImg = nullptr;
+    const cgltf_image* emissiveImg = nullptr;
+    const cgltf_image* occlusionImg = nullptr;
+
+    if (mat) {
+        if (mat->has_pbr_metallic_roughness) {
+            const cgltf_pbr_metallic_roughness& pbr = mat->pbr_metallic_roughness;
+            metallic = pbr.metallic_factor;
+            roughness = pbr.roughness_factor;
+            baseImg = ImageOf(pbr.base_color_texture);
+            mrImg = ImageOf(pbr.metallic_roughness_texture);
+        }
+        normalImg = ImageOf(mat->normal_texture);
+        emissiveImg = ImageOf(mat->emissive_texture);
+        occlusionImg = ImageOf(mat->occlusion_texture);
+        for (int k = 0; k < 3; ++k) emissiveF[k] = mat->emissive_factor[k];
+    }
+
+    PbrMaterial out;
+    out.baseColor = LoadBaseColorTexture(device, baseImg);
+    out.metalRough = DecodeImage(device, mrImg, "metallic-roughness");
+    if (!out.metalRough) out.metalRough = MakeSolidTexture(device, 255, 255, 0, 255);
+    out.normalMap = DecodeImage(device, normalImg, "normal");
+    if (!out.normalMap) out.normalMap = MakeSolidTexture(device, 128, 128, 255, 255);
+    out.emissive = DecodeImage(device, emissiveImg, "emissive");
+    if (!out.emissive) out.emissive = MakeSolidTexture(device, 0, 0, 0, 255);
+    out.occlusion = DecodeImage(device, occlusionImg, "occlusion");
+    if (!out.occlusion) out.occlusion = MakeWhiteTexture(device);
+    out.metallicFactor = metallic;
+    out.roughnessFactor = roughness;
+    for (int k = 0; k < 3; ++k) out.emissiveFactor[k] = emissiveF[k];
+    return out;
 }
 
 } // namespace
@@ -690,6 +753,204 @@ SkinnedModel LoadSkinnedGltfModel(rhi::IRHIDevice& device, const char* path) {
 
     return SkinnedModel(std::move(mesh), std::move(baseColor), metallic, roughness,
                         std::move(sb.skeleton), std::move(animations), bbMin, bbMax);
+}
+
+// ============================== Full scene-graph import (Slice V) ===============================
+
+math::Mat4 ComposeWorld(const math::Mat4& parentWorld, const math::Mat4& local) {
+    return parentWorld * local;
+}
+
+void WalkHierarchy(const std::vector<SceneNode>& nodes, const std::vector<int>& roots,
+                   const std::function<void(int, const math::Mat4&)>& visit) {
+    std::vector<bool> visited(nodes.size(), false);
+    // Iterative DFS over an explicit stack of (nodeIndex, worldTransform).
+    struct Frame { int node; math::Mat4 world; };
+    std::vector<Frame> stack;
+    for (auto it = roots.rbegin(); it != roots.rend(); ++it) {
+        int r = *it;
+        if (r < 0 || (size_t)r >= nodes.size()) continue;
+        stack.push_back({r, nodes[r].local});
+    }
+    while (!stack.empty()) {
+        Frame f = stack.back();
+        stack.pop_back();
+        if (f.node < 0 || (size_t)f.node >= nodes.size() || visited[f.node]) continue;
+        visited[f.node] = true;
+        visit(f.node, f.world);
+        const SceneNode& nd = nodes[f.node];
+        // Push children in reverse so they are visited in authored order.
+        for (auto it = nd.children.rbegin(); it != nd.children.rend(); ++it) {
+            int c = *it;
+            if (c < 0 || (size_t)c >= nodes.size() || visited[c]) continue;
+            stack.push_back({c, ComposeWorld(f.world, nodes[c].local)});
+        }
+    }
+}
+
+namespace {
+
+// Resolve a glTF node's local transform: its `matrix` (column-major 16 floats, copied straight into
+// math::Mat4) if present, else FromTRS(translation, rotation-quaternion, scale).
+math::Mat4 NodeLocalTransform(const cgltf_node& nd) {
+    if (nd.has_matrix) {
+        math::Mat4 m;
+        for (int k = 0; k < 16; ++k) m.m[k] = nd.matrix[k];
+        return m;
+    }
+    math::Vec3 t{0, 0, 0}, s{1, 1, 1};
+    math::Quat r{0, 0, 0, 1};
+    if (nd.has_translation) t = {nd.translation[0], nd.translation[1], nd.translation[2]};
+    if (nd.has_rotation)    r = {nd.rotation[0], nd.rotation[1], nd.rotation[2], nd.rotation[3]};
+    if (nd.has_scale)       s = {nd.scale[0], nd.scale[1], nd.scale[2]};
+    return math::FromTRS(t, r, s);
+}
+
+// Transform a model-space AABB by a world matrix and expand a running world-space AABB. Transforms
+// all eight corners (handles rotation/scale correctly).
+void ExpandWorldAabb(const math::Mat4& world, const float bbMin[3], const float bbMax[3],
+                     float outMin[3], float outMax[3]) {
+    for (int corner = 0; corner < 8; ++corner) {
+        float p[3] = {
+            (corner & 1) ? bbMax[0] : bbMin[0],
+            (corner & 2) ? bbMax[1] : bbMin[1],
+            (corner & 4) ? bbMax[2] : bbMin[2],
+        };
+        // world * [p,1] (column-major: element(row,col) == m[col*4+row]).
+        float wx = world.m[0]*p[0] + world.m[4]*p[1] + world.m[8]*p[2]  + world.m[12];
+        float wy = world.m[1]*p[0] + world.m[5]*p[1] + world.m[9]*p[2]  + world.m[13];
+        float wz = world.m[2]*p[0] + world.m[6]*p[1] + world.m[10]*p[2] + world.m[14];
+        float wp[3] = {wx, wy, wz};
+        for (int k = 0; k < 3; ++k) {
+            if (wp[k] < outMin[k]) outMin[k] = wp[k];
+            if (wp[k] > outMax[k]) outMax[k] = wp[k];
+        }
+    }
+}
+
+} // namespace
+
+math::Mat4 GltfScene::FitTransform(float targetSize, float groundY) const {
+    float ext[3] = {bbMax[0] - bbMin[0], bbMax[1] - bbMin[1], bbMax[2] - bbMin[2]};
+    float maxExt = ext[0];
+    if (ext[1] > maxExt) maxExt = ext[1];
+    if (ext[2] > maxExt) maxExt = ext[2];
+    if (maxExt <= 1e-8f) return math::Mat4::Identity();   // degenerate / empty scene
+
+    float scale = targetSize / maxExt;
+    // After scaling about the origin, centre XZ on the origin and drop min-Y onto groundY.
+    float cx = 0.5f * (bbMin[0] + bbMax[0]);
+    float cz = 0.5f * (bbMin[2] + bbMax[2]);
+    math::Vec3 translate{
+        -cx * scale,
+        groundY - bbMin[1] * scale,
+        -cz * scale,
+    };
+    return math::Mat4::Translate(translate) * math::Mat4::Scale({scale, scale, scale});
+}
+
+GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path) {
+    cgltf_data* data = OpenGltf(path);
+    struct Guard { cgltf_data* d; ~Guard() { if (d) cgltf_free(d); } } guard{data};
+
+    GltfScene out;
+
+    // --- Decode + dedup materials. Cache by cgltf_material* (and one shared default for null). ---
+    std::vector<const PbrMaterial*> materialByIndex(data->materials_count, nullptr);
+    const PbrMaterial* defaultMaterial = nullptr;
+    auto getMaterial = [&](const cgltf_material* mat) -> const PbrMaterial* {
+        if (!mat) {
+            if (!defaultMaterial) {
+                out.materialStorage.push_back(
+                    std::make_unique<PbrMaterial>(DecodeMaterial(device, nullptr)));
+                defaultMaterial = out.materialStorage.back().get();
+            }
+            return defaultMaterial;
+        }
+        ptrdiff_t idx = mat - data->materials;
+        if (idx < 0 || (cgltf_size)idx >= data->materials_count) {
+            // Foreign pointer (shouldn't happen); decode standalone, owned but un-cached.
+            out.materialStorage.push_back(
+                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat)));
+            return out.materialStorage.back().get();
+        }
+        if (!materialByIndex[idx]) {
+            out.materialStorage.push_back(
+                std::make_unique<PbrMaterial>(DecodeMaterial(device, mat)));
+            materialByIndex[idx] = out.materialStorage.back().get();
+        }
+        return materialByIndex[idx];
+    };
+
+    // --- Cache for unique (meshIndex, primIndex) geometry: uploaded once, shared across instances
+    // (so the truck's single wheels mesh, referenced by two nodes, uploads exactly once). ---
+    struct PrimEntry { const scene::Mesh* mesh; float bbMin[3]; float bbMax[3]; const PbrMaterial* material; };
+    std::vector<std::vector<PrimEntry>> meshPrims(data->meshes_count);  // [meshIndex][primIndex]
+    auto getMeshPrims = [&](cgltf_size meshIdx) -> const std::vector<PrimEntry>& {
+        std::vector<PrimEntry>& prims = meshPrims[meshIdx];
+        if (!prims.empty() || data->meshes[meshIdx].primitives_count == 0) return prims;
+        const cgltf_mesh& mesh = data->meshes[meshIdx];
+        prims.reserve(mesh.primitives_count);
+        for (cgltf_size p = 0; p < mesh.primitives_count; ++p) {
+            const cgltf_primitive& prim = mesh.primitives[p];
+            float bbMin[3], bbMax[3];
+            scene::Mesh built = BuildPrimitive(device, prim, path, /*recentre=*/false, bbMin, bbMax);
+            out.meshStorage.push_back(std::make_unique<scene::Mesh>(std::move(built)));
+            PrimEntry e;
+            e.mesh = out.meshStorage.back().get();
+            for (int k = 0; k < 3; ++k) { e.bbMin[k] = bbMin[k]; e.bbMax[k] = bbMax[k]; }
+            e.material = getMaterial(prim.material);
+            prims.push_back(e);
+        }
+        return prims;
+    };
+
+    // --- Build the SceneNode hierarchy for the default scene, then walk it. ---
+    const cgltf_scene* scene = data->scene ? data->scene
+                                           : (data->scenes_count > 0 ? &data->scenes[0] : nullptr);
+    if (!scene)
+        throw std::runtime_error(std::string("glTF has no scene: ") + path);
+
+    std::vector<SceneNode> nodes(data->nodes_count);
+    for (cgltf_size i = 0; i < data->nodes_count; ++i) {
+        nodes[i].local = NodeLocalTransform(data->nodes[i]);
+        for (cgltf_size c = 0; c < data->nodes[i].children_count; ++c) {
+            ptrdiff_t ci = data->nodes[i].children[c] - data->nodes;
+            if (ci >= 0 && (cgltf_size)ci < data->nodes_count) nodes[i].children.push_back((int)ci);
+        }
+    }
+    std::vector<int> roots;
+    roots.reserve(scene->nodes_count);
+    for (cgltf_size i = 0; i < scene->nodes_count; ++i) {
+        ptrdiff_t ni = scene->nodes[i] - data->nodes;
+        if (ni >= 0 && (cgltf_size)ni < data->nodes_count) roots.push_back((int)ni);
+    }
+
+    float bbMin[3] = { 1e30f,  1e30f,  1e30f};
+    float bbMax[3] = {-1e30f, -1e30f, -1e30f};
+    bool any = false;
+
+    WalkHierarchy(nodes, roots, [&](int nodeIdx, const math::Mat4& world) {
+        const cgltf_node& nd = data->nodes[nodeIdx];
+        if (!nd.mesh) return;
+        ptrdiff_t meshIdx = nd.mesh - data->meshes;
+        if (meshIdx < 0 || (cgltf_size)meshIdx >= data->meshes_count) return;
+        const std::vector<PrimEntry>& prims = getMeshPrims((cgltf_size)meshIdx);
+        for (const PrimEntry& e : prims) {
+            SceneInstance inst;
+            inst.mesh = e.mesh;
+            inst.material = e.material;
+            inst.worldTransform = world;
+            out.instances.push_back(inst);
+            ExpandWorldAabb(world, e.bbMin, e.bbMax, bbMin, bbMax);
+            any = true;
+        }
+    });
+
+    if (any) {
+        for (int k = 0; k < 3; ++k) { out.bbMin[k] = bbMin[k]; out.bbMax[k] = bbMax[k]; }
+    }
+    return out;
 }
 
 } // namespace hf::asset

@@ -156,6 +156,7 @@ target_compile_definitions(visual_test PRIVATE
     HF_MODEL_PATH="${HF_ROOT}/assets/models/Duck.glb"
     HF_FOX_MODEL_PATH="${HF_ROOT}/assets/models/Fox.glb"
     HF_HELMET_MODEL_PATH="${HF_ROOT}/assets/models/DamagedHelmet.glb"
+    HF_TRUCK_MODEL_PATH="${HF_ROOT}/assets/models/CesiumMilkTruck.glb"
     HF_SCENE_PATH="${HF_ROOT}/assets/scenes/default.json"
     HF_ENV_PATH="${HF_ROOT}/assets/env/env.hdr"
 )

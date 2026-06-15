@@ -3,10 +3,32 @@
 #include "rhi/rhi.h"
 #include "anim/skeleton.h"
 #include "anim/animation.h"
+#include "math/math.h"
+#include <functional>
 #include <memory>
 #include <vector>
 
 namespace hf::asset {
+
+// ---------------------------------------------------------------------------------------------------
+// Pure scene-graph hierarchy composition (no device, no cgltf) — factored out so it can be unit
+// tested in isolation. A SceneNode is a plain node: a local transform (already resolved from a
+// glTF node's `matrix` or its TRS) plus child indices.
+struct SceneNode {
+    math::Mat4 local = math::Mat4::Identity();
+    std::vector<int> children;   // indices into the node array
+};
+
+// Compose a child's world transform from its parent's world and its own local: world = parent * local.
+// (Column-major RH math::Mat4; the same product order used throughout the engine.)
+math::Mat4 ComposeWorld(const math::Mat4& parentWorld, const math::Mat4& local);
+
+// Depth-first walk: for each node reachable from `roots`, compute its world transform (parent*local)
+// and invoke `visit(nodeIndex, world)`. Pure: operates on plain SceneNode arrays so it can be tested
+// without a glTF file or a device. Cycles are guarded against via a visited set.
+void WalkHierarchy(const std::vector<SceneNode>& nodes, const std::vector<int>& roots,
+                   const std::function<void(int, const math::Mat4&)>& visit);
+
 
 // Load the first primitive of the first mesh of a glTF/glb file into a scene::Mesh.
 //
@@ -127,5 +149,53 @@ struct PbrModel {
 // Load geometry + the full glTF metallic-roughness PBR material (5 textures + factors). See PbrModel.
 // Throws std::runtime_error on parse/load/validation failure or missing POSITION.
 PbrModel LoadPbrGltfModel(rhi::IRHIDevice& device, const char* path);
+
+// ============================== Full scene-graph import (Slice V) ===============================
+
+// A decoded, shareable PBR material: the five RGBA8 textures (every one non-null, with neutral 1x1
+// fallbacks) + the metallic/roughness/emissive factors. Owned by the GltfScene material table; many
+// SceneInstances may point at the same PbrMaterial (glTF materials are deduped on decode).
+struct PbrMaterial {
+    std::unique_ptr<rhi::ITexture> baseColor;
+    std::unique_ptr<rhi::ITexture> metalRough;
+    std::unique_ptr<rhi::ITexture> normalMap;
+    std::unique_ptr<rhi::ITexture> emissive;
+    std::unique_ptr<rhi::ITexture> occlusion;
+    float metallicFactor = 1.0f;
+    float roughnessFactor = 1.0f;
+    float emissiveFactor[3] = {0.0f, 0.0f, 0.0f};
+};
+
+// One renderable: a (non-owning) mesh + material + the node's composed world transform. The same
+// mesh referenced by multiple nodes yields multiple instances at different worldTransforms (e.g. the
+// CesiumMilkTruck's single wheels mesh placed at the front and back via two parent transforms).
+struct SceneInstance {
+    const scene::Mesh* mesh = nullptr;        // into GltfScene::meshStorage
+    const PbrMaterial* material = nullptr;     // into GltfScene::materialStorage
+    math::Mat4 worldTransform = math::Mat4::Identity();
+};
+
+// A fully imported glTF scene: owning storage for the unique meshes + materials, the flat list of
+// renderable instances (one per primitive of every mesh-referencing node, in DFS order), and the
+// scene-wide world-space AABB over all instances' transformed geometry bounds.
+struct GltfScene {
+    std::vector<std::unique_ptr<scene::Mesh>> meshStorage;       // unique (mesh,prim) GPU meshes
+    std::vector<std::unique_ptr<PbrMaterial>> materialStorage;   // deduped materials (+ a default)
+    std::vector<SceneInstance> instances;
+    float bbMin[3] = {0, 0, 0};   // world-space scene AABB (over all instances)
+    float bbMax[3] = {0, 0, 0};
+
+    // A uniform-scale + translate that fits the whole scene to a cube of side `targetSize` and sets
+    // it down so its min-Y rests at `groundY` and its XZ centre is at the origin. Pure: does NOT
+    // mutate geometry; the caller pre-multiplies this onto each instance's world transform. Returns
+    // identity for a degenerate (empty / zero-extent) scene.
+    math::Mat4 FitTransform(float targetSize, float groundY) const;
+};
+
+// Walk the default scene's node hierarchy depth-first, composing world = parent*local for each node,
+// and emit one SceneInstance per primitive of every mesh-referencing node. glTF materials are decoded
+// once and shared; the same (mesh,primitive) geometry is uploaded once and shared across instances.
+// Throws std::runtime_error on parse/load/validation failure or missing POSITION.
+GltfScene LoadGltfScene(rhi::IRHIDevice& device, const char* path);
 
 } // namespace hf::asset

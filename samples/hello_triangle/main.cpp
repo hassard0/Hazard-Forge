@@ -173,6 +173,7 @@ int main(int argc, char** argv) {
     const char* shotPath = nullptr;
     const char* skinningShotPath = nullptr;
     const char* pbrShotPath = nullptr;
+    const char* sceneShotPath = nullptr;
     const char* iblShotPath = nullptr;
     const char* bloomShotPath = nullptr;
     const char* instancedShotPath = nullptr;
@@ -188,6 +189,11 @@ int main(int argc, char** argv) {
             // Render one frame of the full-PBR showcase (ground + skybox + DamagedHelmet with the
             // full glTF metallic-roughness material set, lit + shadowed), write a BMP, exit.
             pbrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--scene-shot") == 0 && i + 1 < argc) {
+            // Slice V: render one frame of the full glTF scene-graph import showcase (ground + skybox
+            // + the CesiumMilkTruck imported as a node hierarchy: body + two wheel sets, each
+            // primitive with its own deduped PBR material), lit + shadowed, write a BMP, exit.
+            sceneShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--ibl-shot") == 0 && i + 1 < argc) {
             // Render one frame of the HDR-IBL showcase (HDR equirect skybox + DamagedHelmet shaded by
             // lit_pbr_ibl so the metal reflects the real captured sky/sun/terrain), write a BMP, exit.
@@ -1755,6 +1761,276 @@ int main(int argc, char** argv) {
                 ok = WriteBMP(pbrShotPath, px, cw, ch2);
                 if (ok) std::printf("wrote %s (%ux%u)\n", pbrShotPath, cw, ch2);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pbrShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Full glTF scene-graph import showcase (--scene-shot): a self-contained capture path
+        // that does NOT touch the default scene. Ground plane + procedural sky + the CesiumMilkTruck
+        // imported via LoadGltfScene (node hierarchy walked to world transforms, one renderable per
+        // primitive of every mesh-referencing node, deduped PBR materials), lit + shadowed. The same
+        // wheels mesh is drawn at the FRONT and BACK positions purely from the composed node
+        // transforms. One frame -> BMP -> exit. Reuses the Slice-P lit-PBR pipeline + BindMaterialPBR;
+        // no golden-locked pipeline/shader is touched. -----------------------------------------------
+        if (sceneShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Lit-PBR pipeline (shared lit.vert + full-PBR fragment; 5-texture material set).
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto pbrFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_pbr.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto pbrFs = device->CreateShaderModule({std::span<const uint32_t>(pbrFsWords)});
+            rhi::GraphicsPipelineDesc pbrDesc;
+            pbrDesc.vertex = litVs.get();
+            pbrDesc.fragment = pbrFs.get();
+            pbrDesc.vertexLayout = scene::MeshVertexLayout();
+            pbrDesc.colorFormat = device->Swapchain().ColorFormat();
+            pbrDesc.depthTest = true;
+            pbrDesc.usesFrameUniforms = true;
+            pbrDesc.usesTexture = true;
+            pbrDesc.pbrMaterial = true;
+            pbrDesc.pushConstantSize = sizeof(float) * 20;  // mat4 model + float4 material
+            auto pbrPipeline = device->CreateGraphicsPipeline(pbrDesc);
+
+            // Static lit pipeline for the ground plane (2-texture material set, untouched lit.frag).
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Depth-only shadow pipeline (ground + every truck primitive casts).
+            auto shadowVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shadowVs = device->CreateShaderModule({std::span<const uint32_t>(shadowVsW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shadowVs.get();
+            shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // Sky + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground plane: flat checkerboard dielectric.
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+
+            // Import the full truck scene (node hierarchy -> instances + deduped materials).
+            hf::asset::GltfScene truck = hf::asset::LoadGltfScene(*device, HF_TRUCK_MODEL_PATH);
+            std::printf("[scene] imported %zu instances, %zu meshes, %zu materials\n",
+                        truck.instances.size(), truck.meshStorage.size(),
+                        truck.materialStorage.size());
+
+            // Orientation + placement. The asset's root "Yup2Zup" node rotates the Y-up authored
+            // truck into Z-up, which lays it on its side in our Y-up engine; rotate -90deg about X to
+            // stand it back upright on its wheels. Then fit the WHOLE scene (post-orientation AABB is
+            // handled by composing: fit is computed on the imported world AABB, the orientation is
+            // applied on top, so we recompute placement by wrapping the fit in the orientation). We
+            // apply: world' = ground-fit * orient * instanceWorld, where ground-fit re-grounds after
+            // the orientation. To keep it simple and robust we: (1) orient each instance, (2) fit the
+            // oriented scene by recomputing its world AABB here.
+            // The asset's "Yup2Zup" root node already lands the truck upright in our Y-up world
+            // (imported world AABB: height/Y is the smallest extent, length along Z, width along X),
+            // so no extra orientation fix is needed — the node-hierarchy transforms stand it on its
+            // wheels directly. We still rotate about Y so the long side faces the camera nicely.
+            Mat4 orient = Mat4::RotateY(2.1f);
+
+            // Recompute the oriented scene AABB so the fit grounds the truck correctly after orient.
+            float oMin[3] = { 1e30f,  1e30f,  1e30f};
+            float oMax[3] = {-1e30f, -1e30f, -1e30f};
+            {
+                // Transform the original world AABB's 8 corners by orient.
+                for (int c = 0; c < 8; ++c) {
+                    float p[3] = {
+                        (c & 1) ? truck.bbMax[0] : truck.bbMin[0],
+                        (c & 2) ? truck.bbMax[1] : truck.bbMin[1],
+                        (c & 4) ? truck.bbMax[2] : truck.bbMin[2],
+                    };
+                    float x = orient.m[0]*p[0] + orient.m[4]*p[1] + orient.m[8]*p[2]  + orient.m[12];
+                    float y = orient.m[1]*p[0] + orient.m[5]*p[1] + orient.m[9]*p[2]  + orient.m[13];
+                    float z = orient.m[2]*p[0] + orient.m[6]*p[1] + orient.m[10]*p[2] + orient.m[14];
+                    float wp[3] = {x, y, z};
+                    for (int k = 0; k < 3; ++k) {
+                        if (wp[k] < oMin[k]) oMin[k] = wp[k];
+                        if (wp[k] > oMax[k]) oMax[k] = wp[k];
+                    }
+                }
+            }
+            // Build a fit (uniform scale + ground/centre) from the ORIENTED AABB.
+            Mat4 sceneFit;
+            {
+                float ext[3] = {oMax[0]-oMin[0], oMax[1]-oMin[1], oMax[2]-oMin[2]};
+                float maxExt = ext[0]; if (ext[1] > maxExt) maxExt = ext[1]; if (ext[2] > maxExt) maxExt = ext[2];
+                float scale = (maxExt > 1e-6f) ? (5.0f / maxExt) : 1.0f;
+                float cx = 0.5f * (oMin[0] + oMax[0]);
+                float cz = 0.5f * (oMin[2] + oMax[2]);
+                sceneFit = Mat4::Translate({-cx * scale, -oMin[1] * scale, -cz * scale})
+                         * Mat4::Scale({scale, scale, scale});
+            }
+            // Final per-instance placement = sceneFit * orient * instanceWorld.
+            Mat4 placement = sceneFit * orient;
+
+            // Camera + light + sky frame data (fixed, deterministic).
+            const Vec3 eye{5.0f, 3.2f, 6.0f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 14.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 30.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    for (const auto& inst : truck.instances) {
+                        Mat4 world = placement * inst.worldTransform;
+                        cmd.PushConstants(world.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(inst.mesh->vertices());
+                        cmd.BindIndexBuffer(inst.mesh->indices());
+                        cmd.DrawIndexed(inst.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // Ground plane (lit, dielectric).
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Truck (full-PBR): iterate every imported instance with its own world + material.
+                    cmd.BindPipeline(*pbrPipeline);
+                    for (const auto& inst : truck.instances) {
+                        Mat4 world = placement * inst.worldTransform;
+                        const hf::asset::PbrMaterial& m = *inst.material;
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = world.m[k];
+                        pc[16] = m.metallicFactor; pc[17] = m.roughnessFactor;
+                        pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterialPBR(*m.baseColor, *m.metalRough, *m.normalMap,
+                                            *m.emissive, *m.occlusion);
+                        cmd.BindVertexBuffer(inst.mesh->vertices());
+                        cmd.BindIndexBuffer(inst.mesh->indices());
+                        cmd.DrawIndexed(inst.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(sceneShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u)\n", sceneShotPath, cw, ch2);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sceneShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
