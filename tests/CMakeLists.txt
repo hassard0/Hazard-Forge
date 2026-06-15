@@ -36,6 +36,9 @@ hf_add_pure_test(scene_import_test)
 # Immediate-mode debug-draw collector + emitters (Slice W): primitive->line-vertex counts +
 # endpoint correctness. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(debug_draw_test)
+# Interactive-runtime core (Slice AA): Camera yaw/pitch->basis/view, FlyCameraController move/look
+# deltas, FixedTimestep accumulator step counts. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(runtime_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

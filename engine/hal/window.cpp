@@ -36,16 +36,75 @@ Window::~Window() {
     SDL_Quit();
 }
 
+// Map an SDL scancode to our backend-agnostic runtime::Key, or Key::Count if unmapped.
+static runtime::Key MapScancode(SDL_Scancode sc) {
+    using K = runtime::Key;
+    switch (sc) {
+        case SDL_SCANCODE_W: return K::W;
+        case SDL_SCANCODE_A: return K::A;
+        case SDL_SCANCODE_S: return K::S;
+        case SDL_SCANCODE_D: return K::D;
+        case SDL_SCANCODE_Q: return K::Q;
+        case SDL_SCANCODE_E: return K::E;
+        case SDL_SCANCODE_SPACE: return K::Space;
+        case SDL_SCANCODE_LCTRL:
+        case SDL_SCANCODE_RCTRL: return K::Ctrl;
+        case SDL_SCANCODE_LSHIFT:
+        case SDL_SCANCODE_RSHIFT: return K::Shift;
+        case SDL_SCANCODE_ESCAPE: return K::Esc;
+        default: return K::Count;
+    }
+}
+
 bool Window::PumpEvents() {
+    // Deltas/wheel are "since last pump": reset at the start of each pump and accumulate below.
+    input_.mouseDx = 0.0f;
+    input_.mouseDy = 0.0f;
+    input_.wheel = 0.0f;
+
+    bool quit = false;
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT) return false;
+        if (e.type == SDL_EVENT_QUIT) quit = true;
         if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
             e.type == SDL_EVENT_WINDOW_RESIZED) {
             resized_ = true;
         }
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {
+            input_.mouseDx += e.motion.xrel;
+            input_.mouseDy += e.motion.yrel;
+        }
+        if (e.type == SDL_EVENT_MOUSE_WHEEL) {
+            input_.wheel += e.wheel.y;
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+            bool down = (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+            if (e.button.button == SDL_BUTTON_LEFT)   input_.mouseButtons[0] = down;
+            if (e.button.button == SDL_BUTTON_RIGHT)  input_.mouseButtons[1] = down;
+            if (e.button.button == SDL_BUTTON_MIDDLE) input_.mouseButtons[2] = down;
+        }
     }
-    return true;
+
+    // Level keyboard state (independent of event ordering) into the snapshot.
+    int numKeys = 0;
+    const bool* ks = SDL_GetKeyboardState(&numKeys);
+    for (int i = 0; i < static_cast<int>(runtime::Key::Count); ++i)
+        input_.keyDown[i] = false;
+    if (ks) {
+        for (int sc = 0; sc < numKeys; ++sc) {
+            if (!ks[sc]) continue;
+            runtime::Key k = MapScancode(static_cast<SDL_Scancode>(sc));
+            if (k != runtime::Key::Count)
+                input_.keyDown[static_cast<int>(k)] = true;
+        }
+    }
+
+    return !quit;
+}
+
+void Window::SetRelativeMouse(bool enabled) {
+    SDL_SetWindowRelativeMouseMode(window_, enabled);
+    input_.relativeMouse = enabled;
 }
 
 bool Window::ConsumeResized() {

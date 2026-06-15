@@ -43,6 +43,7 @@
 #include "render/render_graph.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
+#include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
 
 #include <cmath>
 #include <cstdio>
@@ -1024,7 +1025,17 @@ static int RunIblShowcase(const char* outPath) {
 // into one directional shadow map; the whole scene renders into an HDR RGBA16F target finished by the
 // bloom chain. The integration test: 7 opaque pipelines + a transparent pipeline with distinct
 // descriptor sets coexisting in one scene pass. -------------------------------------------------
-static int RunCapstoneShowcase(const char* outPath) {
+// Slice AA: optional scripted camera pose. When `active`, the fixed capstone camera is replaced by a
+// runtime::Camera at this pose (yaw/pitch radians + world position) — golden-verifying the Camera
+// math on Metal. When inactive (the default --capstone path), the byte-for-byte fixed camera is used
+// so the capstone golden is unchanged.
+struct ScriptedCamera {
+    bool active = false;
+    float yaw = 0.0f, pitch = 0.0f;
+    math::Vec3 position{0, 0, 0};
+};
+
+static int RunCapstoneShowcase(const char* outPath, ScriptedCamera scripted = {}) {
     using math::Mat4; using math::Vec3;
     const uint32_t W = 1280, H = 720;
     auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
@@ -1312,9 +1323,28 @@ static int RunCapstoneShowcase(const char* outPath) {
         {{ 1.3f, 1.2f, 4.2f}, 1.3f, 0.32f, 0.95f, 0.45f, 0.34f},
     };
 
-    const Vec3 eye{0.0f, 4.0f, 10.0f};
-    const Vec3 center{0.0f, 1.2f, 0.2f};
     const float aspect = (float)W / (float)H;
+    // Default fixed capstone camera. When a scripted pose is supplied (Slice AA --camera), the
+    // runtime::Camera below overrides eye/center/fwd/right/up so the SAME scene is framed from an
+    // arbitrary pose — golden-verifying the Camera->viewProj path on Metal.
+    Vec3 eye{0.0f, 4.0f, 10.0f};
+    Vec3 center{0.0f, 1.2f, 0.2f};
+    Vec3 camFwd, camRight, camUp;
+    {
+        Vec3 fwd = math::normalize(center - eye);
+        camRight = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        camUp = math::cross(camRight, fwd);
+        camFwd = fwd;
+    }
+    if (scripted.active) {
+        runtime::Camera cam;
+        cam.aspect = aspect; cam.yaw = scripted.yaw; cam.SetPitch(scripted.pitch);
+        cam.position = scripted.position;
+        runtime::CameraBasis b = cam.Basis();
+        eye = b.position;
+        center = b.position + b.forward;
+        camFwd = b.forward; camRight = b.right; camUp = b.up;
+    }
     FrameData fd{};
     {
         Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
@@ -1332,12 +1362,9 @@ static int RunCapstoneShowcase(const char* outPath) {
         Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-9.0f, 9.0f, -9.0f, 9.0f, 1.0f, 45.0f));
         Mat4 lightVP = lightOrtho * lightView;
         for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
-        Vec3 fwd = math::normalize(center - eye);
-        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
-        Vec3 up3 = math::cross(right, fwd);
-        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
-        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
-        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.camFwd[0]=camFwd.x; fd.camFwd[1]=camFwd.y; fd.camFwd[2]=camFwd.z;
+        fd.camRight[0]=camRight.x; fd.camRight[1]=camRight.y; fd.camRight[2]=camRight.z;
+        fd.camUp[0]=camUp.x; fd.camUp[1]=camUp.y; fd.camUp[2]=camUp.z;
         fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
         fd.skyParams[1] = aspect;
         fd.skyParams[2] = envMaxLod;
@@ -3195,6 +3222,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--capstone") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_capstone.png";
             try { return RunCapstoneShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --camera <yaw,pitch,x,y,z> <out.png>: Slice AA scripted-pose capture. Renders the SAME
+        // capstone scene but framed by a runtime::Camera at the given pose, golden-verifying the
+        // backend-agnostic Camera->viewProj math on Metal (matches the Vulkan --camera-shot pose).
+        if (argc > 1 && std::strcmp(argv[1], "--camera") == 0) {
+            ScriptedCamera sc; sc.active = true;
+            const char* out = "metal_camera_pose.png";
+            if (argc > 2) {
+                float v[5] = {0, 0, 0, 4, 10};
+                std::sscanf(argv[2], "%f,%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3], &v[4]);
+                sc.yaw = v[0]; sc.pitch = v[1]; sc.position = {v[2], v[3], v[4]};
+            }
+            if (argc > 3) out = argv[3];
+            try { return RunCapstoneShowcase(out, sc); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ssao <out.png>: render the SSAO showcase (Slice Y) — the settled physics sphere-pyramid

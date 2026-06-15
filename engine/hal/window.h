@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "runtime/input_state.h"
+
 struct SDL_Window;
 struct VkInstance_T;  using VkInstance = VkInstance_T*;
 struct VkSurfaceKHR_T; using VkSurfaceKHR = VkSurfaceKHR_T*;
@@ -29,6 +31,15 @@ public:
     // True for exactly one PumpEvents cycle after a size/resize event.
     bool ConsumeResized();
 
+    // Input snapshot for the frame most recently pumped: level keyboard/mouse-button state plus the
+    // relative mouse-motion and wheel ACCUMULATED since the previous PumpEvents. Backend-agnostic
+    // (runtime::InputState carries no SDL types); the fly-camera controller consumes it directly.
+    const runtime::InputState& Input() const { return input_; }
+
+    // Toggle relative ("captured") mouse mode for mouse-look. While on, the OS cursor is hidden and
+    // motion is reported as deltas. Reflected in Input().relativeMouse.
+    void SetRelativeMouse(bool enabled);
+
     // Vulkan instance extensions SDL requires for this window's surface.
     std::vector<const char*> RequiredVulkanInstanceExtensions() const;
 
@@ -49,6 +60,7 @@ public:
 private:
     SDL_Window* window_ = nullptr;
     bool resized_ = false;
+    runtime::InputState input_;  // filled from SDL each PumpEvents (no SDL types escape this header)
 #ifdef __APPLE__
     void* metalView_ = nullptr;  // SDL_MetalView (opaque); created lazily by CreateMetalLayer()
 #endif

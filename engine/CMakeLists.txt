@@ -3,6 +3,9 @@
 set(HF_ENGINE_COMMON_SOURCES
   hal/window.cpp
   rhi/rhi_factory.cpp
+  runtime/camera.cpp
+  runtime/clock.cpp
+  runtime/fly_camera_controller.cpp
   render/render_graph.cpp
   scene/mesh.cpp
   scene/scene_io.cpp
@@ -68,6 +71,9 @@ target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../third
 # hf_engine for the live Vulkan/Metal builds; this duplicate compilation of a handful of small TUs
 # is deliberate and keeps the sanitizer scoping clean.
 add_library(hf_core STATIC
+  runtime/camera.cpp
+  runtime/clock.cpp
+  runtime/fly_camera_controller.cpp
   render/render_graph.cpp
   scene/mesh.cpp
   scene/scene_io.cpp

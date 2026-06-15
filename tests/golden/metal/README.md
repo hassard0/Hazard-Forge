@@ -1,5 +1,28 @@
 # Metal golden-image test
 
+## `camera_pose.png` — scripted-camera pose (Slice AA, interactive runtime)
+
+`camera_pose.png` is a SEPARATE golden produced by `visual_test --camera <yaw,pitch,x,y,z> <out>`:
+the SAME integrated capstone scene (HDR-IBL environment + truck + skinned-blend fox + PBR helmet +
+settled physics pyramid + sorted glass, lit + shadowed + bloom), but framed by the **backend-agnostic
+`hf::runtime::Camera`** (Slice AA) at an arbitrary scripted pose instead of the fixed capstone camera.
+This golden-verifies the new `Camera` math (yaw/pitch → forward/right/up, `View()`/`Proj()`/`ViewProj()`)
+through the real `viewProj → render` path on Metal — the same `Camera` the Vulkan `--camera-shot`
+headless capture and the windowed `--fly` viewport use. The golden was baked at pose
+`0.2,-0.1,0,3,10` (yaw 0.2 rad, pitch −0.1 rad, eye (0,3,10)). The camera math is pure C++ in
+`engine/runtime/camera.h`; the scene/light/bloom are byte-identical to `--capstone`, so the camera is
+the only variable. When NO pose is supplied the `--capstone` path uses the original fixed camera, so
+`capstone.png` (and every other golden) still diffs `0.0000`. Deterministic — two `--camera` runs diff
+`0.0000`. The interactive windowed `--fly` loop is Windows/Vulkan only this slice; windowed Metal
+(SDL Metal view + present loop) is a known separate gap and is intentionally NOT attempted here.
+
+```sh
+./build-metal/visual_test --camera 0.2,-0.1,0,3,10 /tmp/cam.png
+~/mac-remote-rig/compare.sh tests/golden/metal/camera_pose.png /tmp/cam.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `capstone.png` — integrated capstone showcase (Slice Z)
 
 `capstone.png` is a SEPARATE golden produced by `visual_test --capstone`: ONE composed,
