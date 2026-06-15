@@ -201,6 +201,8 @@ add_executable(visual_test
     ${HF_ROOT}/engine/scene/mesh.cpp
     # Data-driven scene load/dump (plain C++, vendored single-header JSON parser).
     ${HF_ROOT}/engine/scene/scene_io.cpp
+    # Distance-based scene/asset streaming (Slice BD, pure C++): the --stream showcase.
+    ${HF_ROOT}/engine/scene/streaming.cpp
     # glTF loader (plain C++, header-only cgltf): loads a real model into a scene::Mesh.
     ${HF_ROOT}/engine/asset/gltf_loader.cpp
     # HDR environment loader (Slice R): decodes env.hdr, builds the CPU mip chain, uploads RGBA16F.

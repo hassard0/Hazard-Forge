@@ -33,6 +33,7 @@
 #include "scene/renderable.h"
 #include "scene/components.h"
 #include "scene/scene_io.h"
+#include "scene/streaming.h"        // Slice BD: distance-based scene/asset streaming (pure CPU)
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "asset/env_loader.h"
@@ -2969,6 +2970,230 @@ static int RunGameShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — capture step %d, %zu pickups remaining\n",
                 outPath, cw, ch, kGameCaptureStep, pickupModels.size());
+    return 0;
+}
+
+// --- Scene / asset STREAMING showcase (Slice BD). Mirrors the Vulkan --stream-shot path EXACTLY:
+// build the fixed 8x8=64 cell world (engine/scene/streaming, pure CPU — shared byte-for-byte with the
+// Vulkan build), fly the IDENTICAL scripted ground-level camera path across the grid calling
+// StreamingWorld::Update each frame (cells stream in/out under the per-frame budget), then at the
+// IDENTICAL fixed capture frame (kStreamCaptureFrame == 40) render the RESIDENT cells' procedural
+// clusters (cubes + spheres) over the checkerboard ground + sky, lit + shadowed via the existing
+// static-lit scene path with the same 4-color tint palette. Identical grid/config/path/capture/camera/
+// light/colors to the Vulkan path so the only difference vs the BMP-golden is backend-NDC handling.
+// One offscreen frame -> PNG. Prints the SAME deterministic `stream: {...}` state line. ------------
+static int RunStreamShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // The fixed world + streaming policy (identical to the Vulkan side + the unit-test grid).
+    const int   kGridN   = 8;
+    const float kSpacing = 4.0f;
+    scene::StreamConfig cfg;
+    cfg.loadRadius           = 9.0f;
+    cfg.unloadRadius         = 14.0f;
+    cfg.loadBudgetPerFrame   = 2;
+    cfg.unloadBudgetPerFrame = 3;
+
+    // IDENTICAL scripted ground-level camera path.
+    const int kStreamFrames = 90;
+    std::vector<Vec3> path;
+    path.reserve(kStreamFrames);
+    const float startXZ = -20.0f, endXZ = 20.0f;
+    for (int f = 0; f < kStreamFrames; ++f) {
+        float t = (float)f / (float)(kStreamFrames - 1);
+        float p = startXZ + t * (endXZ - startXZ);
+        path.push_back(Vec3{p, 0.0f, p});
+    }
+    const int kStreamCaptureFrame = 40;
+
+    scene::StreamingWorld streamWorld(kGridN, kSpacing, cfg);
+    for (int f = 0; f <= kStreamCaptureFrame && f < kStreamFrames; ++f)
+        streamWorld.Update(path[(size_t)f]);
+
+    const Vec3 focus = path[(size_t)kStreamCaptureFrame];
+    scene::StreamStats stats = streamWorld.Stats();
+    std::vector<int> residentIds = streamWorld.ResidentCellIds();
+    std::vector<scene::CellRenderable> residentDraws = streamWorld.ResidentRenderables();
+
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    const uint8_t palettePx[4][4] = {
+        {220, 70, 70, 255}, {70, 200, 90, 255}, {70, 130, 230, 255}, {230, 190, 60, 255},
+    };
+    std::unique_ptr<rhi::ITexture> paletteTex[4];
+    for (int k = 0; k < 4; ++k)
+        paletteTex[k] = device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, palettePx[k], sizeof(palettePx[k])});
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    Mat4 groundModel = Mat4::Scale({22.0f, 1.0f, 22.0f});
+
+    const Vec3 eye = focus + Vec3{-7.0f, 7.0f, -7.0f};
+    const Vec3 center = focus + Vec3{4.0f, 0.0f, 4.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 200.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc = center;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 24.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-14.0f, 14.0f, -14.0f, 14.0f, 1.0f, 56.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto litPush = [](const Mat4& model, float metallic, float roughness, float* pc) {
+        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+        pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+    };
+    auto bindMeshFor = [&](rhi::ICommandBuffer& cmd, scene::CellRenderable::Kind kind) {
+        const scene::Mesh& m = (kind == scene::CellRenderable::Kind::Cube) ? cube : sphere;
+        cmd.BindVertexBuffer(m.vertices());
+        cmd.BindIndexBuffer(m.indices());
+        return m.indexCount();
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            for (const auto& d : residentDraws) {
+                uint32_t ic = bindMeshFor(cmd, d.kind);
+                cmd.PushConstants(d.model.m, sizeof(float) * 16);
+                cmd.DrawIndexed(ic);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20]; litPush(groundModel, 0.0f, 0.85f, pc);
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (const auto& d : residentDraws) {
+                int ci = d.colorIndex & 3;
+                cmd.BindMaterial(*paletteTex[ci], *flatNormal);
+                uint32_t ic = bindMeshFor(cmd, d.kind);
+                float pc[20]; litPush(d.model, d.metallic, d.roughness, pc);
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.DrawIndexed(ic);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("stream: {frame:%d, resident:%d, loading:%d, unloading:%d, total:%d, residentIds:[",
+                kStreamCaptureFrame, stats.resident, stats.loading, stats.unloading, stats.totalCells);
+    for (size_t k = 0; k < residentIds.size(); ++k)
+        std::printf("%s%d", k ? ", " : "", residentIds[k]);
+    std::printf("]}\n");
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — capture frame %d, %d/%d cells resident\n",
+                outPath, cw, ch, kStreamCaptureFrame, stats.resident, stats.totalCells);
     return 0;
 }
 
@@ -7088,6 +7313,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--game") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_game.png";
             try { return RunGameShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --stream <out.png>: render the scene/asset streaming showcase (Slice BD) — the RESIDENT
+        // subset of an 8x8 cell world (distance-based residency + per-frame budget) at a fixed scripted
+        // capture frame, lit + shadowed. Mirrors the Vulkan --stream-shot; new golden stream.png.
+        if (argc > 1 && std::strcmp(argv[1], "--stream") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_stream.png";
+            try { return RunStreamShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --hud <out.png>: render the text / HUD showcase (Slice BA) — the lit + shadowed scene plus a

@@ -37,6 +37,12 @@ hf_add_pure_test(anim_test)
 hf_add_pure_test(instance_grid_test)
 # Impulse-based rigid-body world (Slice S). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(physics_test)
+# Distance-based scene/asset streaming (Slice BD): StreamingWorld::Update residency policy. Asserts
+# radius residency + the hysteresis band (band cell keeps prior state both ways), the per-frame load
+# BUDGET throttle with NEAREST-first ordering (all resident after ceil(M/K) frames), no-thrash when the
+# camera oscillates in the band, and determinism (a scripted camera path replays bit-identical
+# per-frame ResidentCellIds). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(streaming_test)
 # Deterministic software audio mixer (Slice BB): integer/fixed-point Render (Q15 gains, int32
 # accumulate, int16 hard-clamp) + the 44-byte PCM WAV writer. Asserts determinism (Render twice ->
 # bit-identical), mix math + clamp, the linear pan law (endpoint-exact), ADSR Q15 at known offsets,

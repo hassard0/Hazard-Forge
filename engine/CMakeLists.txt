@@ -12,6 +12,7 @@ set(HF_ENGINE_COMMON_SOURCES
   scene/mesh.cpp
   scene/scene_io.cpp
   scene/commands.cpp
+  scene/streaming.cpp
   asset/gltf_loader.cpp
   asset/env_loader.cpp
   anim/animation.cpp
@@ -116,6 +117,7 @@ add_library(hf_core STATIC
   scene/mesh.cpp
   scene/scene_io.cpp
   scene/commands.cpp
+  scene/streaming.cpp
   asset/gltf_loader.cpp
   asset/env_loader.cpp
   anim/animation.cpp

@@ -150,6 +150,8 @@ int main() {
             bool sawHudTextFeature = false;
             // Slice BB: the deterministic audio-mixer capability is advertised.
             bool sawAudioFeature = false;
+            // Slice BD: the scene/asset-streaming capability is advertised.
+            bool sawStreamingFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -162,6 +164,7 @@ int main() {
                     if (AsString(el->value) == "gameplay-sample") sawGameplayFeature = true;
                     if (AsString(el->value) == "hud-text") sawHudTextFeature = true;
                     if (AsString(el->value) == "audio-mixer") sawAudioFeature = true;
+                    if (AsString(el->value) == "scene-streaming") sawStreamingFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -173,6 +176,7 @@ int main() {
             check(sawGameplayFeature, "engine.features includes gameplay-sample");
             check(sawHudTextFeature, "engine.features includes hud-text");
             check(sawAudioFeature, "engine.features includes audio-mixer");
+            check(sawStreamingFeature, "engine.features includes scene-streaming");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -214,6 +218,8 @@ int main() {
         bool sawHudShot = false, sawGameHudShot = false;
         // Slice BB: the --audio-render showcase flag is listed in the showcase manifest.
         bool sawAudioRender = false;
+        // Slice BD: the --stream-shot showcase flag is listed in the showcase manifest.
+        bool sawStreamShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -228,6 +234,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--hud-shot") sawHudShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--game-hud-shot") sawGameHudShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--audio-render") sawAudioRender = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--stream-shot") sawStreamShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -240,6 +247,7 @@ int main() {
         check(sawHudShot, "showcases manifest includes --hud-shot");
         check(sawGameHudShot, "showcases manifest includes --game-hud-shot");
         check(sawAudioRender, "showcases manifest includes --audio-render");
+        check(sawStreamShot, "showcases manifest includes --stream-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

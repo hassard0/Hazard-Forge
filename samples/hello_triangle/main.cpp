@@ -10,6 +10,7 @@
 #include "scene/components.h"
 #include "scene/scene_io.h"
 #include "scene/commands.h"
+#include "scene/streaming.h"
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
 #include "asset/env_loader.h"
@@ -298,6 +299,7 @@ int main(int argc, char** argv) {
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
     const char* gameShotPath = nullptr;
+    const char* streamShotPath = nullptr;    // --stream-shot <out.bmp> (Slice BD: scene streaming)
     const char* hudShotPath = nullptr;       // --hud-shot <out.bmp> (Slice BA: text/HUD overlay)
     const char* gameHudShotPath = nullptr;   // --game-hud-shot <out.bmp> (Slice BA: game + score HUD)
     const char* debugShotPath = nullptr;
@@ -403,6 +405,13 @@ int main(int argc, char** argv) {
             // pickups, lit + shadowed via the existing static-lit scene path. Prints the deterministic
             // winning game-state line. One BMP -> exit.
             gameShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--stream-shot") == 0 && i + 1 < argc) {
+            // Slice BD: distance-based scene streaming. Build a fixed 8x8 cell world, fly a SCRIPTED
+            // camera path across it calling StreamingWorld::Update each frame (cells stream in/out
+            // under the per-frame budget), then render the RESIDENT cells at a fixed capture frame
+            // (some still Loading, some already Unloaded behind the camera), lit + shadowed via the
+            // existing static-lit scene path. Prints the deterministic stream-state line. One BMP.
+            streamShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--hud-shot") == 0 && i + 1 < argc) {
             // Slice BA: the standard lit + shadowed scene PLUS a deterministic screen-space HUD text
             // overlay ("HAZARD FORGE" + "SCORE: 0" + a fixed stat line — NO clock), drawn as an
@@ -6821,6 +6830,262 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — capture step %d, %zu pickups remaining\n",
                                     gameShotPath, cw, ch2, kGameCaptureStep, pickupModels.size());
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gameShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Scene / asset STREAMING showcase (--stream-shot, Slice BD): a self-contained capture path
+        // that does NOT touch the default scene. Build a fixed 8x8=64 cell world (engine/scene/
+        // streaming, pure CPU), fly a SCRIPTED ground-level camera path diagonally across the grid over
+        // a fixed frame count calling StreamingWorld::Update each frame (cells stream in/out under the
+        // per-frame budget — nearest first, deterministic), then at a FIXED capture frame render the
+        // RESIDENT cells' procedural clusters (cubes + spheres) over the checkerboard ground + sky, lit
+        // + shadowed via the EXISTING static-lit scene path (one per-draw model+material push constant
+        // each; a small fixed tint palette colors them) — NO new RHI. Prints the deterministic
+        // `stream: {...}` state line. One BMP -> exit. The pure-CPU streaming policy is golden-stable;
+        // pipelines/shaders are untouched. (The "load" is synchronous procedural construction modeling
+        // the budget/over-frames behavior — async disk I/O is a future slice.)
+        if (streamShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // The fixed world + streaming policy (identical to the Metal showcase + the unit test grid).
+            const int   kGridN   = 8;
+            const float kSpacing = 4.0f;
+            scene::StreamConfig cfg;
+            cfg.loadRadius          = 9.0f;
+            cfg.unloadRadius        = 14.0f;   // > loadRadius (hysteresis band)
+            cfg.loadBudgetPerFrame  = 2;       // throttle: stream in over frames
+            cfg.unloadBudgetPerFrame = 3;
+
+            // SCRIPTED ground-level camera path: fly diagonally across the grid (no live input/RNG/
+            // clock). The grid spans [-14, 14] on X/Z; the path runs corner-to-corner past both ends.
+            const int kStreamFrames = 90;
+            std::vector<Vec3> path;
+            path.reserve(kStreamFrames);
+            const float startXZ = -20.0f, endXZ = 20.0f;
+            for (int f = 0; f < kStreamFrames; ++f) {
+                float t = (float)f / (float)(kStreamFrames - 1);
+                float p = startXZ + t * (endXZ - startXZ);
+                path.push_back(Vec3{p, 0.0f, p});
+            }
+
+            // FIXED capture frame: chosen (after inspecting the deterministic run) so the camera sits
+            // mid-grid with a CLEAR resident subset, some cells still Loading ahead (budget catch-up),
+            // and cells already Unloaded behind the camera. Documented constant; deterministic.
+            const int kStreamCaptureFrame = 40;
+
+            scene::StreamingWorld streamWorld(kGridN, kSpacing, cfg);
+            for (int f = 0; f <= kStreamCaptureFrame && f < kStreamFrames; ++f)
+                streamWorld.Update(path[(size_t)f]);
+
+            const Vec3 focus = path[(size_t)kStreamCaptureFrame];
+            scene::StreamStats stats = streamWorld.Stats();
+            std::vector<int> residentIds = streamWorld.ResidentCellIds();
+            std::vector<scene::CellRenderable> residentDraws = streamWorld.ResidentRenderables();
+
+            // --- Static lit pipeline (cell clusters + ground) + static shadow + sky + post. ----------
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground (checkerboard) + flat normal + a small fixed 4-color tint palette for the cells.
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            const uint8_t palettePx[4][4] = {
+                {220, 70, 70, 255},    // red
+                {70, 200, 90, 255},    // green
+                {70, 130, 230, 255},   // blue
+                {230, 190, 60, 255},   // gold
+            };
+            std::array<std::unique_ptr<rhi::ITexture>, 4> paletteTex;
+            for (int k = 0; k < 4; ++k)
+                paletteTex[(size_t)k] = device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, palettePx[k], sizeof(palettePx[k])});
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // A wide ground plane covering the whole grid.
+            Mat4 groundModel = Mat4::Scale({22.0f, 1.0f, 22.0f});
+
+            // Camera: a lower, closer 3/4 view trailing the scripted ground focus so the resident
+            // subset (centered on `focus`) reads as a partial world — near-camera cell clusters present
+            // and legible, the unloaded grid beyond the load radius empty (bare ground / horizon).
+            const Vec3 eye = focus + Vec3{-7.0f, 7.0f, -7.0f};
+            const Vec3 center = focus + Vec3{4.0f, 0.0f, 4.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 200.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc = center;
+                Vec3 lightEye = sc - lightDir * 24.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-14.0f, 14.0f, -14.0f, 14.0f, 1.0f, 56.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            // 20-float push constant = { model(16); metallic, roughness, 0, 0 }.
+            auto litPush = [](const Mat4& model, float metallic, float roughness) {
+                std::array<float, 20> pc{};
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                return pc;
+            };
+
+            // Helper: bind the right primitive mesh for a CellRenderable kind.
+            auto bindMeshFor = [&](rhi::ICommandBuffer& cmd, scene::CellRenderable::Kind kind) {
+                const scene::Mesh& m = (kind == scene::CellRenderable::Kind::Cube) ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                return m.indexCount();
+            };
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    for (const auto& d : residentDraws) {
+                        uint32_t ic = bindMeshFor(cmd, d.kind);
+                        cmd.PushConstants(d.model.m, sizeof(float) * 16);
+                        cmd.DrawIndexed(ic);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    // Ground.
+                    {
+                        auto pc = litPush(groundModel, 0.0f, 0.85f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Resident cell renderables (tinted by colorIndex).
+                    for (const auto& d : residentDraws) {
+                        int ci = d.colorIndex & 3;
+                        cmd.BindMaterial(*paletteTex[(size_t)ci], *flatNormal);
+                        uint32_t ic = bindMeshFor(cmd, d.kind);
+                        auto pc = litPush(d.model, d.metallic, d.roughness);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.DrawIndexed(ic);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Deterministic stream-state line.
+            std::printf("stream: {frame:%d, resident:%d, loading:%d, unloading:%d, total:%d, residentIds:[",
+                        kStreamCaptureFrame, stats.resident, stats.loading, stats.unloading, stats.totalCells);
+            for (size_t k = 0; k < residentIds.size(); ++k)
+                std::printf("%s%d", k ? ", " : "", residentIds[k]);
+            std::printf("]}\n");
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(streamShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — capture frame %d, %d/%d cells resident\n",
+                                    streamShotPath, cw, ch2, kStreamCaptureFrame, stats.resident, stats.totalCells);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", streamShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

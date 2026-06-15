@@ -57,7 +57,7 @@ $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
 $TarName    = 'hf-verify.tar.gz'
 
-# The 32 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# The 33 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
 # golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
 # path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
 # metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
@@ -94,6 +94,7 @@ $Goldens = @(
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'hud';           Flag = '--hud' }                 # Slice BA (text / HUD overlay)
     @{ Name = 'game_hud';      Flag = '--game-hud' }            # Slice BA (game scene + live SCORE HUD)
+    @{ Name = 'stream';        Flag = '--stream' }             # Slice BD (scene/asset streaming; resident cell subset)
 )
 
 $winResult = 'SKIP'
