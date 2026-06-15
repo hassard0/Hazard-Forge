@@ -208,6 +208,13 @@ public:
     // Override the render pass's full-extent scissor for the following draw(s). ImGui needs a
     // per-draw scissor (clip rect). Coordinates are in framebuffer pixels (top-left origin).
     virtual void SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) = 0;
+    // Restrict the following draw(s) to a sub-rect of the current attachment, by setting BOTH the
+    // viewport (so NDC maps into the sub-rect) AND the scissor (so nothing draws outside it). The
+    // cascaded-shadow pass (Slice AD) uses this to render each cascade into one tile of a shadow
+    // ATLAS: BeginRenderPass clears the whole atlas once, then per cascade SetViewport selects the
+    // tile and the casters are drawn with that cascade's lightViewProj. Default no-op so existing
+    // passes/backends are byte-for-byte unaffected; both shipping backends override it.
+    virtual void SetViewport(int32_t /*x*/, int32_t /*y*/, uint32_t /*width*/, uint32_t /*height*/) {}
     virtual void EndRenderPass() = 0;
 
     // --- Compute recording (must be OUTSIDE a render pass) -------------------

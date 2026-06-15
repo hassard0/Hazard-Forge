@@ -185,6 +185,16 @@ void VulkanCommandBuffer::SetScissor(int32_t x, int32_t y, uint32_t width, uint3
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
 }
 
+void VulkanCommandBuffer::SetViewport(int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    // Render the following draw(s) into a sub-rect of the attachment: set the viewport so NDC maps
+    // into [x, x+width] x [y, y+height], and a matching scissor so nothing spills outside. Used by
+    // the CSM shadow-atlas pass to target one cascade tile (Slice AD).
+    VkViewport vp{(float)x, (float)y, (float)width, (float)height, 0.0f, 1.0f};
+    vkCmdSetViewport(cmd_, 0, 1, &vp);
+    VkRect2D scissor{{x, y}, {width, height}};
+    vkCmdSetScissor(cmd_, 0, 1, &scissor);
+}
+
 void VulkanCommandBuffer::EndRenderPass() {
     vkCmdEndRendering(cmd_);
 }

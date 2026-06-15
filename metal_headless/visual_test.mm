@@ -41,6 +41,7 @@
 #include "physics/world.h"
 #include "physics/body.h"
 #include "render/render_graph.h"
+#include "render/csm.h"     // Slice AD: cascaded-shadow split + per-cascade ortho fit (pure math)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
@@ -3361,8 +3362,247 @@ static int RunTransparencyShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Cascaded shadow maps showcase (Slice AD). Mirrors the Vulkan --csm-shot path: a long ground
+// plane receding from the camera with cubes + spheres at near/mid/far, a grazing directional light,
+// 4 cascades fitted to the camera frustum's depth slices rendered into a single 4096 shadow ATLAS
+// (2x2 tiles via SetViewport), and the scene shaded by lit_csm. Renders into an offscreen RT then
+// blits to the swapchain (post) so the Metal capture matches the structure of the other goldens. ---
+static int RunCsmShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace csm = hf::render::csm;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    // Metal NDC +Y up: flip the clip-space Y row of any projection built by the (Vulkan) math lib.
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // CSM FrameData layout (matches shaders/lit_csm.frag + shadow_csm.vert).
+    struct CsmFrameData {
+        float viewProj[16];
+        float lightDir[4];
+        float lightColor[4];
+        float viewPos[4];
+        float csmSplits[4];
+        float cascadeVP[4][16];
+        float camFwd[4];
+        float camRight[4];
+        float camUp[4];
+        float skyParams[4];
+        float csmAtlas[4];
+    };
+    static_assert(sizeof(CsmFrameData) == 464, "CSM FrameData layout");
+
+    const int      kCascades    = 4;
+    const uint32_t kAtlas       = 4096;
+    const int      kTilesPerRow = 2;
+    const uint32_t kTile        = kAtlas / kTilesPerRow;
+    const float    kSplitLambda = 0.5f;
+    const float    kShadowNear  = 0.5f, kShadowFar = 60.0f, kZPadNear = 12.0f;
+
+    auto litVs   = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto csmFs   = loadMSL("lit_csm.frag.gen.metal", "csm_fragment");
+    auto csmShVs = loadMSL("shadow_csm.vert.gen.metal", "csm_shadow_vertex");
+
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = csmFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = csmShVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+    shDesc.pushConstantSize = sizeof(float) * 32;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowAtlas = device->CreateShadowMap(kAtlas);
+    device->SetShadowMap(*shadowAtlas);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    const Mat4 groundModel = Mat4::Scale({60.0f, 1.0f, 80.0f});
+    struct Caster { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+    std::vector<Caster> casters;
+    auto box = [&](float x, float z, float s, float rot) {
+        casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::RotateY(rot) * Mat4::Scale({s,s,s}),
+                           &cube, 0.0f, 0.8f});
+    };
+    auto ball = [&](float x, float z, float s) {
+        casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s,s,s}), &sphere, 0.1f, 0.4f});
+    };
+    box(-3.5f,  9.0f, 2.0f,  0.4f);
+    ball( 3.5f,  8.0f, 2.4f);
+    box( 0.0f, -2.0f, 2.6f, -0.6f);
+    box(-5.5f, -4.0f, 2.0f,  0.9f);
+    ball( 5.5f, -5.0f, 2.4f);
+    box( 4.0f, -15.0f, 4.0f, 0.2f);
+    box(-4.5f, -18.0f, 4.6f, 0.5f);
+    box( 0.5f, -28.0f, 5.0f, 0.5f);
+
+    const Vec3 eye{0.0f, 5.0f, 17.0f};
+    const Vec3 center{0.0f, 1.2f, -10.0f};
+    const float fovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+    Vec3 fwd   = math::normalize(center - eye);
+    Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+    Vec3 up3   = math::cross(right, fwd);
+    const float tanHalf = std::tan(0.5f * fovY);
+    Vec3 lightDir = math::normalize(Vec3{-0.65f, -0.5f, -0.35f});
+
+    CsmFrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+        fd.lightDir[0]=lightDir.x; fd.lightDir[1]=lightDir.y; fd.lightDir[2]=lightDir.z;
+        fd.lightColor[0]=1.5f; fd.lightColor[1]=1.45f; fd.lightColor[2]=1.35f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.skyParams[0]=tanHalf; fd.skyParams[1]=aspect;
+        fd.csmAtlas[0]=(float)kTilesPerRow; fd.csmAtlas[1]=1.0f/(float)kTilesPerRow;
+        fd.csmAtlas[2]=(float)kCascades; fd.csmAtlas[3]=0.0f;
+    }
+
+    auto splits = csm::CsmSplits(kShadowNear, kShadowFar, kCascades, kSplitLambda);
+    for (int c = 0; c < kCascades; ++c) fd.csmSplits[c] = splits[c];
+    Mat4 cascadeVP[4];
+    {
+        float sliceNear = kShadowNear;
+        for (int c = 0; c < kCascades; ++c) {
+            float sliceFar = splits[c];
+            auto corners = csm::FrustumSliceCornersWorld(eye, fwd, right, up3, tanHalf, aspect,
+                                                         sliceNear, sliceFar);
+            auto fit = csm::FitCascadeLightMatrix(corners, lightDir, kZPadNear);
+            // Metal NDC +Y up: flip the cascade's clip-space Y. The lit_csm.frag samples with the
+            // matching V-flip under HF_MSL_GEN, so RENDER and SAMPLE stay self-consistent.
+            cascadeVP[c] = FlipProjY(fit.lightViewProj);
+            for (int k = 0; k < 16; ++k) fd.cascadeVP[c][k] = cascadeVP[c].m[k];
+            sliceNear = sliceFar;
+        }
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "csmAtlas", render::RgResourceKind::ShadowMap, *shadowAtlas);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("csmShadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(CsmFrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*shadowPipeline);
+            for (int c = 0; c < kCascades; ++c) {
+                int col = c % kTilesPerRow, row = c / kTilesPerRow;
+                cmd.SetViewport((int32_t)(col * kTile), (int32_t)(row * kTile), kTile, kTile);
+                {
+                    float pc[32];
+                    for (int k=0;k<16;++k) pc[k] = cascadeVP[c].m[k];
+                    for (int k=0;k<16;++k) pc[16+k] = groundModel.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (const auto& ca : casters) {
+                    float pc[32];
+                    for (int k=0;k<16;++k) pc[k] = cascadeVP[c].m[k];
+                    for (int k=0;k<16;++k) pc[16+k] = ca.model.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(ca.mesh->vertices());
+                    cmd.BindIndexBuffer(ca.mesh->indices());
+                    cmd.DrawIndexed(ca.mesh->indexCount());
+                }
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("csmScene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(CsmFrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.55f, 0.68f, 0.82f, 1});
+            cmd.BindPipeline(*litPipeline);
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            {
+                float pc[20];
+                for (int k=0;k<16;++k) pc[k] = groundModel.m[k];
+                pc[16]=0.0f; pc[17]=0.9f; pc[18]=0.0f; pc[19]=0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (const auto& ca : casters) {
+                float pc[20];
+                for (int k=0;k<16;++k) pc[k] = ca.model.m[k];
+                pc[16]=ca.metallic; pc[17]=ca.rough; pc[18]=0.0f; pc[19]=0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(ca.mesh->vertices());
+                cmd.BindIndexBuffer(ca.mesh->indices());
+                cmd.DrawIndexed(ca.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — CSM: %d cascades, %u atlas, %zu casters\n",
+                outPath, cw, ch, kCascades, kAtlas, casters.size());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
+        // --csm <out.png>: cascaded shadow maps showcase (Slice AD).
+        if (argc > 1 && std::strcmp(argv[1], "--csm") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_csm.png";
+            try { return RunCsmShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
         // --instanced <out.png>: render the GPU-instanced showcase (Slice Q).
         if (argc > 1 && std::strcmp(argv[1], "--instanced") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_instanced.png";

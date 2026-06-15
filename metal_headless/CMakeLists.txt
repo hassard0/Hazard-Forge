@@ -67,6 +67,10 @@ endfunction()
 
 hf_gen_msl(lit.vert    lit.vert.hlsl    vert vertex_main)
 hf_gen_msl(lit.frag    lit.frag.hlsl    frag fragment_main)
+# Cascaded shadow maps (Slice AD): CSM lit fragment (atlas cascade selection + PCF) + the depth-only
+# CSM shadow caster (cascade VP in the push constant). Reuse lit.vert. Same HLSL->SPIR-V->MSL chain.
+hf_gen_msl(lit_csm.frag    lit_csm.frag.hlsl    frag csm_fragment)
+hf_gen_msl(shadow_csm.vert shadow_csm.vert.hlsl vert csm_shadow_vertex)
 # Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
 hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same

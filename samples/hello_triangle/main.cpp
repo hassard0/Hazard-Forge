@@ -18,6 +18,7 @@
 #include "physics/world.h"
 #include "physics/body.h"
 #include "render/render_graph.h"
+#include "render/csm.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -195,6 +196,7 @@ int main(int argc, char** argv) {
     const char* ssaoShotOffPath = nullptr;
     const char* ssaoDebugPath = nullptr;
     const char* capstoneShotPath = nullptr;
+    const char* csmShotPath = nullptr;       // --csm-shot <out.bmp> (Slice AD: cascaded shadows)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -282,6 +284,13 @@ int main(int argc, char** argv) {
             // directionally shadowed, rendered into an HDR RGBA16F target and finished with the bloom
             // chain. One BMP -> exit. New golden; existing pipelines/shaders/showcases untouched.
             capstoneShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--csm-shot") == 0 && i + 1 < argc) {
+            // Slice AD: cascaded-shadow-map showcase. A long ground plane receding from the camera
+            // with shadow-casters (cubes/spheres/truck) at near/mid/far and a grazing directional
+            // light (long shadows). Renders a 4-cascade shadow ATLAS (2x2 tiles in one 4096 map),
+            // then the scene with lit_csm (per-fragment cascade selection + atlas PCF). One BMP ->
+            // exit. New golden; the single-shadow path/shaders/goldens are untouched.
+            csmShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -357,6 +366,252 @@ int main(int argc, char** argv) {
     try {
         hal::Window window({"Hazard Forge — Shadows", 1280, 720});
         auto device = rhi::CreateDevice(rhi::Backend::Vulkan, window);
+
+        // --- Cascaded shadow maps showcase (--csm-shot, Slice AD). A long ground plane receding from
+        // the camera with shadow-casting objects (cubes + a sphere + the truck) at NEAR / MID / FAR
+        // distances, lit by a grazing directional light so the shadows are long. Four cascades fit the
+        // camera frustum's depth slices and render into a single 4096x4096 shadow ATLAS (2x2 tiles of
+        // 2048). The scene is shaded by lit_csm, which picks a cascade per fragment from its view-space
+        // depth, samples that cascade's atlas tile with 3x3 PCF, so shadows stay crisp from near to far.
+        // One BMP -> exit. The single-shadow path/shaders/goldens are entirely untouched. ------------
+        if (csmShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace csm = hf::render::csm;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- CSM FrameData layout (matches shaders/lit_csm.frag + shadow_csm.vert). ---
+            struct CsmFrameData {
+                float viewProj[16];     //   0
+                float lightDir[4];      //  64
+                float lightColor[4];    //  80
+                float viewPos[4];       //  96
+                float csmSplits[4];     // 112
+                float cascadeVP[4][16]; // 128  (256B) -> ends 384
+                float camFwd[4];        // 384
+                float camRight[4];      // 400
+                float camUp[4];         // 416
+                float skyParams[4];     // 432
+                float csmAtlas[4];      // 448  x=tilesPerRow, y=tileUVScale, z=numCascades
+            };
+            static_assert(sizeof(CsmFrameData) == 464, "CSM FrameData layout");
+
+            // === Cascade config. ===
+            const int   kCascades   = 4;
+            const uint32_t kAtlas   = 4096;
+            const int   kTilesPerRow = 2;                 // 2x2 grid
+            const uint32_t kTile    = kAtlas / kTilesPerRow;  // 2048 px per cascade
+            const float kSplitLambda = 0.5f;
+            const float kShadowNear = 0.5f;               // CSM range near (matches camera near)
+            const float kShadowFar  = 60.0f;              // CSM range far (covers the receding ground)
+            const float kZPadNear   = 12.0f;              // pull each cascade's near plane back
+
+            // === Shaders. ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto csmFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_csm.frag.hlsl.spv");
+            auto csmShWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_csm.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto litVs   = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto csmFs   = device->CreateShaderModule({std::span<const uint32_t>(csmFsWords)});
+            auto csmShVs = device->CreateShaderModule({std::span<const uint32_t>(csmShWords)});
+            auto shadowFs= device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            // Lit-CSM scene pipeline (lit.vert + lit_csm.frag), straight to the swapchain (LDR).
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = csmFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kSwap;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model mat4 + material(metallic,rough)
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // CSM shadow caster: depth-only, push constant = cascadeVP mat4 + model mat4 (128B).
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = csmShVs.get(); shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 32;   // cascadeVP(16) + model(16)
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // === Shadow atlas + meshes + textures. ===
+            auto shadowAtlas = device->CreateShadowMap(kAtlas);
+            device->SetShadowMap(*shadowAtlas);
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // === Scene layout. Camera looks down the -Z corridor; the ground recedes into -Z. ===
+            // Casters at NEAR (+Z, close), MID, FAR (-Z, distant) so each cascade has work to shadow.
+            const Mat4 groundModel = Mat4::Scale({60.0f, 1.0f, 80.0f});  // big receding floor
+            struct Caster { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; float r,g,b; };
+            std::vector<Caster> casters;
+            // Cube + sphere meshes have half-extent 0.5, so a primitive scaled by s has half-height
+            // 0.5*s; placing the center at y = 0.5*s seats it exactly ON the ground (no peter-panning).
+            auto box = [&](float x, float z, float s, float rot, float r, float g, float b) {
+                Caster c; c.model = Mat4::Translate({x, 0.5f * s, z}) * Mat4::RotateY(rot)
+                                  * Mat4::Scale({s, s, s});
+                c.mesh = &cube; c.metallic = 0.0f; c.rough = 0.8f; c.r=r; c.g=g; c.b=b;
+                casters.push_back(c);
+            };
+            auto ball = [&](float x, float z, float s, float r, float g, float b) {
+                Caster c; c.model = Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s});
+                c.mesh = &sphere; c.metallic = 0.1f; c.rough = 0.4f; c.r=r; c.g=g; c.b=b;
+                casters.push_back(c);
+            };
+            // NEAR band (close to camera, +Z).
+            box(-3.5f,  9.0f, 2.0f,  0.4f, 0.85f, 0.35f, 0.30f);
+            ball( 3.5f,  8.0f, 2.4f,        0.30f, 0.55f, 0.85f);
+            // MID band.
+            box( 0.0f, -2.0f, 2.6f, -0.6f, 0.30f, 0.80f, 0.45f);
+            box(-5.5f, -4.0f, 2.0f,  0.9f, 0.80f, 0.75f, 0.30f);
+            ball( 5.5f, -5.0f, 2.4f,        0.85f, 0.45f, 0.45f);
+            // FAR band — taller so the long shadow reads clearly in the far cascade.
+            box( 4.0f, -15.0f, 4.0f, 0.2f, 0.78f, 0.40f, 0.78f);
+            box(-4.5f, -18.0f, 4.6f, 0.5f, 0.55f, 0.62f, 0.85f);
+            box( 0.5f, -28.0f, 5.0f, 0.5f, 0.65f, 0.65f, 0.40f);
+
+            // === Fixed deterministic camera + grazing directional light. ===
+            const Vec3 eye{0.0f, 5.0f, 17.0f};
+            const Vec3 center{0.0f, 1.2f, -10.0f};
+            const float fovY = 1.04719755f;  // 60deg
+            Vec3 fwd   = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+            Vec3 up3   = math::cross(right, fwd);
+            const float tanHalf = std::tan(0.5f * fovY);
+            // Grazing light from the upper-left -> long shadows raking across the corridor.
+            Vec3 lightDir = math::normalize(Vec3{-0.65f, -0.5f, -0.35f});
+
+            CsmFrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                fd.lightDir[0]=lightDir.x; fd.lightDir[1]=lightDir.y; fd.lightDir[2]=lightDir.z;
+                fd.lightColor[0]=1.5f; fd.lightColor[1]=1.45f; fd.lightColor[2]=1.35f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                fd.skyParams[0]=tanHalf; fd.skyParams[1]=aspect;
+                fd.csmAtlas[0]=(float)kTilesPerRow; fd.csmAtlas[1]=1.0f/(float)kTilesPerRow;
+                fd.csmAtlas[2]=(float)kCascades; fd.csmAtlas[3]=0.0f;
+            }
+
+            // === Build the N cascades: practical-split distances + per-cascade ortho fit. ===
+            auto splits = csm::CsmSplits(kShadowNear, kShadowFar, kCascades, kSplitLambda);
+            for (int c = 0; c < kCascades; ++c) fd.csmSplits[c] = splits[c];
+            Mat4 cascadeVP[4];
+            {
+                float sliceNear = kShadowNear;
+                for (int c = 0; c < kCascades; ++c) {
+                    float sliceFar = splits[c];
+                    auto corners = csm::FrustumSliceCornersWorld(eye, fwd, right, up3, tanHalf,
+                                                                 aspect, sliceNear, sliceFar);
+                    auto fit = csm::FitCascadeLightMatrix(corners, lightDir, kZPadNear);
+                    cascadeVP[c] = fit.lightViewProj;
+                    for (int k = 0; k < 16; ++k) fd.cascadeVP[c][k] = fit.lightViewProj.m[k];
+                    sliceNear = sliceFar;
+                }
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "csmAtlas", render::RgResourceKind::ShadowMap, *shadowAtlas);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // --- Shadow pass: clear the whole atlas once, then for each cascade SetViewport(tile) and
+            // draw every caster with that cascade's lightViewProj (pushed as a constant). ---
+            graph.AddPass("csmShadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(CsmFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    for (int c = 0; c < kCascades; ++c) {
+                        int col = c % kTilesPerRow, row = c / kTilesPerRow;
+                        cmd.SetViewport((int32_t)(col * kTile), (int32_t)(row * kTile), kTile, kTile);
+                        // Ground.
+                        {
+                            float pc[32];
+                            for (int k=0;k<16;++k) pc[k] = cascadeVP[c].m[k];
+                            for (int k=0;k<16;++k) pc[16+k] = groundModel.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (const auto& ca : casters) {
+                            float pc[32];
+                            for (int k=0;k<16;++k) pc[k] = cascadeVP[c].m[k];
+                            for (int k=0;k<16;++k) pc[16+k] = ca.model.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(ca.mesh->vertices());
+                            cmd.BindIndexBuffer(ca.mesh->indices());
+                            cmd.DrawIndexed(ca.mesh->indexCount());
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // --- Scene pass straight to the swapchain: ground + casters, shaded by lit_csm. ---
+            graph.AddPass("csmScene", {rgShadow}, {rgSwap},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(CsmFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.55f, 0.68f, 0.82f, 1});  // sky-ish
+                    cmd.BindPipeline(*litPipeline);
+                    // Ground.
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    {
+                        float pc[20];
+                        for (int k=0;k<16;++k) pc[k] = groundModel.m[k];
+                        pc[16]=0.0f; pc[17]=0.9f; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    // Casters (flat-colored via vertex color * white texture; use groundTex tinted? -
+                    // simpler: bind a 1x1 white tex would be cleaner, but groundTex*color reads fine).
+                    for (const auto& ca : casters) {
+                        float pc[20];
+                        for (int k=0;k<16;++k) pc[k] = ca.model.m[k];
+                        pc[16]=ca.metallic; pc[17]=ca.rough; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(ca.mesh->vertices());
+                        cmd.BindIndexBuffer(ca.mesh->indices());
+                        cmd.DrawIndexed(ca.mesh->indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(csmShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — CSM: %d cascades, %ux%u atlas (%dx%d tiles), "
+                                    "%zu casters\n", csmShotPath, cw, ch2, kCascades, kAtlas, kAtlas,
+                                    kTilesPerRow, kTilesPerRow, casters.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", csmShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels (CSM)\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
 
         // --- Integrated CAPSTONE showcase (--capstone-shot, Slice Z): ONE composed deterministic
         // frame that orchestrates every per-feature showcase into a single coherent scene. The HDR

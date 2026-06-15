@@ -43,6 +43,10 @@ hf_add_pure_test(runtime_test)
 # PickGizmoAxis, ApplyDrag (translate/rotate/scale), PlayState, select->translate->DumpScene
 # round-trip. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(editor_test)
+# Cascaded shadow maps (Slice AD): frustum-split scheme (N increasing splits in (near,far]) +
+# per-cascade ortho fit (all 8 slice corners land inside the cascade clip volume). Pure C++
+# (render/csm.h, header-only), ASan-eligible.
+hf_add_pure_test(csm_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)

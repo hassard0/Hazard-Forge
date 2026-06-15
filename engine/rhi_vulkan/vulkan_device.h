@@ -137,7 +137,10 @@ private:
 
     // Per-frame uniform buffers (set 0): one host-visible mapped UBO + descriptor set per
     // frame-in-flight, so the CPU never writes a UBO the GPU is still reading.
-    static constexpr uint32_t kFrameUboSize = 512;  // >= sizeof(FrameData) (288B w/ lightViewProj)
+    // 1024B (was 512). Bumped for the CSM FrameData layout (Slice AD): 4 cascade mat4 (256B) on top
+    // of the ~352B base layout + split/atlas vec4s overflows 512. Additive — existing shaders read
+    // fewer bytes, so their layout (and the 15 goldens) are byte-for-byte unchanged.
+    static constexpr uint32_t kFrameUboSize = 1024;  // >= sizeof(FrameData) and the CSM layout (464B)
     VkDescriptorSetLayout frameSetLayout_ = VK_NULL_HANDLE;
     VkBuffer        uboBuffer_[kFramesInFlight]{};
     VmaAllocation   uboAlloc_[kFramesInFlight]{};

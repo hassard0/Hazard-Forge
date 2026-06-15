@@ -1,5 +1,27 @@
 # Metal golden-image test
 
+## `csm.png` — cascaded shadow maps (Slice AD, fidelity)
+
+`csm.png` is a SEPARATE golden produced by `visual_test --csm`: a long ground plane receding from the
+camera with cubes + spheres at NEAR / MID / FAR distances and a grazing directional light, so the
+shadows are long and span the full view-distance range. The directional shadow is rendered as **4
+cascades into a single 4096×4096 shadow ATLAS** (2×2 tiles of 2048): the camera frustum is split into
+4 depth slices by a practical (log/uniform, λ=0.5) scheme, each slice gets a tight ortho light fit
+(`engine/render/csm.h`, the SAME pure math `tests/csm_test.cpp` checks), and each cascade is rendered
+into its atlas tile via the new `ICommandBuffer::SetViewport` sub-rect. The scene is shaded by the new
+`lit_csm.frag`, which picks a cascade per fragment from its view-space depth, remaps into that
+cascade's tile, and does 3×3 PCF clamped to the tile — so shadows stay crisp from near to far with no
+cascade seams or peter-panning. This is **additive**: the single-shadow path (`lit.frag` / `shadow.vert`)
+and all 15 prior goldens are untouched (the `kFrameUboSize` 512→1024 bump and `SetViewport` default-
+preserve existing behavior). Deterministic — two `--csm` runs diff `0.0000`.
+
+```sh
+./build-metal/visual_test --csm /tmp/csm.png
+~/mac-remote-rig/compare.sh tests/golden/metal/csm.png /tmp/csm.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `gizmo.png` — editor selection + transform gizmo (Slice AB, editor interaction)
 
 `gizmo.png` is a SEPARATE golden produced by `visual_test --gizmo <objIndex> <out>`: a small

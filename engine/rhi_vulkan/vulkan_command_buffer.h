@@ -32,6 +32,7 @@ public:
                               int32_t vertexOffset, uint32_t firstInstance) override;
     void PushConstants(const void* data, uint32_t size) override;
     void SetScissor(int32_t x, int32_t y, uint32_t width, uint32_t height) override;
+    void SetViewport(int32_t x, int32_t y, uint32_t width, uint32_t height) override;
     void EndRenderPass() override;
 
     void BindComputePipeline(IComputePipeline& pipeline) override;

@@ -100,9 +100,10 @@ private:
     MetalRenderTarget* shadowMap_ = nil;
 
     // Per-frame uniform buffers (shared storage), one per frame-in-flight.
-    // 512B matches the Vulkan backend's kFrameUboSize: >= sizeof(FrameData) (288B with the added
-    // lightViewProj) and future-proofs UBO growth.
-    static constexpr uint32_t kFrameUboSize = 512;
+    // 1024B matches the Vulkan backend's kFrameUboSize: >= sizeof(FrameData) and the CSM FrameData
+    // layout (Slice AD: 4 cascade mat4 + splits/atlas overflow 512). Additive — existing shaders read
+    // fewer bytes, so their layout and the 15 goldens are byte-for-byte unchanged.
+    static constexpr uint32_t kFrameUboSize = 1024;
     id<MTLBuffer> uboBuffer_[kFramesInFlight] = {nil, nil};
 
     // Joint-palette UBO (set 2): JointPalette { float4x4 joints[64]; } = 4096 B, one per

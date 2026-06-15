@@ -236,6 +236,21 @@ void MetalCommandBuffer::SetScissor(int32_t x, int32_t y, uint32_t width, uint32
     [encoder_ setScissorRect:r];
 }
 
+void MetalCommandBuffer::SetViewport(int32_t x, int32_t y, uint32_t width, uint32_t height) {
+    // Render the following draw(s) into a sub-rect of the attachment: set BOTH the viewport (so NDC
+    // maps into the sub-rect) and a matching scissor (so nothing spills outside). Used by the CSM
+    // shadow-atlas pass to target one cascade tile (Slice AD). Clamp to the attachment bounds.
+    int32_t vx = x < 0 ? 0 : x;
+    int32_t vy = y < 0 ? 0 : y;
+    uint32_t vw = width, vh = height;
+    if ((uint32_t)vx + vw > width_)  vw = (vx < (int32_t)width_)  ? (width_  - (uint32_t)vx) : 0;
+    if ((uint32_t)vy + vh > height_) vh = (vy < (int32_t)height_) ? (height_ - (uint32_t)vy) : 0;
+    MTLViewport vp{(double)vx, (double)vy, (double)vw, (double)vh, 0.0, 1.0};
+    [encoder_ setViewport:vp];
+    MTLScissorRect r{(NSUInteger)vx, (NSUInteger)vy, (NSUInteger)vw, (NSUInteger)vh};
+    [encoder_ setScissorRect:r];
+}
+
 void MetalCommandBuffer::EndRenderPass() {
     [encoder_ endEncoding];
     encoder_ = nil;

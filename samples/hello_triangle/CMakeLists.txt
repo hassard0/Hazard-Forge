@@ -13,6 +13,8 @@ hf_compile_shaders(
   SHADERS
     "shaders/lit.vert.hlsl:vs"
     "shaders/lit.frag.hlsl:ps"
+    "shaders/lit_csm.frag.hlsl:ps"
+    "shaders/shadow_csm.vert.hlsl:vs"
     "shaders/lit_pbr.frag.hlsl:ps"
     "shaders/lit_pbr_ibl.frag.hlsl:ps"
     "shaders/sky_hdr.frag.hlsl:ps"
