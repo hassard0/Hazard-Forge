@@ -79,6 +79,10 @@ hf_compile_shaders(
     "shaders/lit_probe.frag.hlsl:ps"
     "shaders/probe_blit.frag.hlsl:ps"
     "shaders/probe_irradiance.frag.hlsl:ps"
+    # Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
+    # current jittered HDR scene. Reuses post.vert (fullscreen triangle) + the existing RT/RGBA16F path;
+    # the only new shader for the slice. Existing post/bloom/ssao/ssr shaders + goldens untouched.
+    "shaders/taa_resolve.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

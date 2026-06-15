@@ -14,6 +14,7 @@
       "screen-space-reflections",
       "volumetric-fog",
       "reflection-irradiance-probes",
+      "temporal-anti-aliasing",
       "bloom",
       "ssao",
       "transparency",
@@ -49,6 +50,7 @@
     { "flag": "--ssr-shot", "desc": "Screen-space reflections." },
     { "flag": "--volumetric-shot", "desc": "Volumetric fog / light shafts." },
     { "flag": "--probe-shot", "desc": "Reflection + irradiance probes (local cubemap GI)." },
+    { "flag": "--taa-shot", "desc": "Temporal anti-aliasing (jittered accumulation)." },
     { "flag": "--gizmo-shot", "desc": "Editor selection + translate gizmo overlay." },
     { "flag": "--camera-shot", "desc": "Scripted-pose interactive-runtime capture." }
   ],

@@ -46,6 +46,7 @@
 #include "render/point_shadow.h" // Slice AF: omnidirectional point-light 6-face cube shadow (pure math)
 #include "render/probe.h"        // Slice AK: reflection + irradiance probe atlas math (pure math)
 #include "render/clustered.h"     // Slice AG: clustered / Forward+ light culling (pure math)
+#include "render/taa.h"           // Slice AP: temporal anti-aliasing jitter + resolve-blend (pure math)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
@@ -83,6 +84,7 @@ struct FrameData {
     float camRight[4];
     float camUp[4];
     float skyParams[4];
+    float prevViewProj[16];    // TAA (Slice AP): previous frame's view-proj (layout parity; identity reprojection)
 };
 
 static std::string LoadText(const std::string& path) {
@@ -2661,6 +2663,303 @@ static int RunSsaoShowcase(const char* outPath, bool aoOn = true) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — SSAO %s, %u bodies\n",
                 outPath, cw, ch, aoOn ? "ON" : "OFF", kInstanceCount);
+    return 0;
+}
+
+// --- Temporal anti-aliasing showcase (Slice AP). Mirrors the Vulkan --taa-shot path byte-for-byte
+// in INTENT: the SAME settled sphere-pyramid scene + camera + lights, rendered as a FIXED N=8
+// accumulation loop. Each accumulation frame jitters the PROJECTION by the SAME deterministic
+// Halton(2,3) sub-pixel offset (render::taa::Jitter) the Vulkan path uses, renders the lit + shadowed
+// scene into an HDR RT, then taa_resolve blends it into a neighborhood-clamped history (ping-ponged
+// between two RGBA16F textures: first frame unblended, then render::taa::kSteadyAlpha of the new
+// frame). The 8th resolved frame is tonemapped through post.frag and captured. Static scene/camera +
+// deterministic jitter => two runs DIFF 0.0000. New golden tests/golden/metal/taa.png; existing
+// pipelines/shaders/goldens untouched. -----------------------------------------------------------
+static int RunTaaShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace taa = render::taa;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Static scene: a settled 4-layer instanced sphere pyramid (identical recipe to the Vulkan path).
+    physics::World world;
+    {
+        const float R = 0.5f;
+        const int kLayers = 4;
+        const float d = 2.0f * R;
+        const float dy = R * 1.41421356f;
+        for (int k = 0; k < kLayers; ++k) {
+            int m = kLayers - k;
+            float off = 0.5f * (float)(m - 1) * d;
+            float y = R + (float)k * dy;
+            for (int gx = 0; gx < m; ++gx)
+                for (int gz = 0; gz < m; ++gz) {
+                    float x = (float)gx * d - off;
+                    float z = (float)gz * d - off;
+                    world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+                }
+        }
+    }
+    for (int s = 0; s < 240; ++s) world.Step(1.0f / 120.0f);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(world.bodies.size());
+    for (const auto& b : world.bodies) {
+        Mat4 m = b.Transform();
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // Lit pipelines (HDR RT) — UNCHANGED lit/instanced shaders.
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = kHdr;
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Shadow pipelines (UNCHANGED).
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky (HDR RT) — UNCHANGED procedural sky.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // TAA resolve + final post (fullscreen, fragment push constants).
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto taaFs  = loadMSL("taa_resolve.frag.gen.metal", "taa_resolve_fragment");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    struct TaaParams { float texel[2]; float alpha; float firstFrame; };
+
+    rhi::GraphicsPipelineDesc taaD;
+    taaD.vertex = postVs.get(); taaD.fragment = taaFs.get();
+    taaD.colorFormat = kHdr;
+    taaD.depthTest = false; taaD.usesTexture = true; taaD.fullscreen = true;
+    taaD.fragmentPushConstants = true; taaD.pushConstantSize = sizeof(TaaParams);
+    auto taaPipe = device->CreateGraphicsPipeline(taaD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    // Render targets: HDR scene + two ping-pong history textures.
+    auto rt    = device->CreateRenderTarget(W, H, kHdr);
+    auto histA = device->CreateRenderTarget(W, H, kHdr);
+    auto histB = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    rhi::BufferDesc instBufDesc;
+    instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+    instBufDesc.initialData = instances.data();
+    instBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    const Vec3 eye{6.5f, 4.5f, 7.0f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 unjittered = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f)) * viewM;
+
+    FrameData fdBase{};
+    {
+        fdBase.lightDir[0] = -0.5f; fdBase.lightDir[1] = -1.0f; fdBase.lightDir[2] = -0.3f;
+        fdBase.lightColor[0] = 1.0f; fdBase.lightColor[1] = 0.97f; fdBase.lightColor[2] = 0.9f; fdBase.lightColor[3] = 1.0f;
+        fdBase.viewPos[0] = eye.x; fdBase.viewPos[1] = eye.y; fdBase.viewPos[2] = eye.z; fdBase.viewPos[3] = 1.0f;
+        fdBase.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fdBase.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fdBase.camFwd[0]=fwd.x; fdBase.camFwd[1]=fwd.y; fdBase.camFwd[2]=fwd.z;
+        fdBase.camRight[0]=right.x; fdBase.camRight[1]=right.y; fdBase.camRight[2]=right.z;
+        fdBase.camUp[0]=up.x; fdBase.camUp[1]=up.y; fdBase.camUp[2]=up.z;
+        fdBase.skyParams[0] = std::tan(0.5f * kFovY);
+        fdBase.skyParams[1] = aspect;
+        for (int k = 0; k < 16; ++k) fdBase.prevViewProj[k] = unjittered.m[k];
+    }
+
+    auto recordScene = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindPipeline(*skyPipe);
+        cmd.Draw(3);
+        cmd.BindPipeline(*litPipeline);
+        {
+            float pc[20];
+            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+        }
+        cmd.BindPipeline(*instPipeline);
+        {
+            float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+            cmd.PushConstants(material, sizeof(material));
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindInstanceBuffer(*instanceBuffer);
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+        }
+    };
+    auto recordShadow = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindPipeline(*staticShadowPipeline);
+        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+        cmd.BindVertexBuffer(plane.vertices());
+        cmd.BindIndexBuffer(plane.indices());
+        cmd.DrawIndexed(plane.indexCount());
+        cmd.BindPipeline(*instShadowPipeline);
+        cmd.BindVertexBuffer(sphere.vertices());
+        cmd.BindInstanceBuffer(*instanceBuffer);
+        cmd.BindIndexBuffer(sphere.indices());
+        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+    };
+
+    // N=8 accumulation loop (identical jitter sequence to the Vulkan path).
+    rhi::IRenderTarget* prevHist = histA.get();
+    rhi::IRenderTarget* curHist  = histB.get();
+    for (int frame = 0; frame < taa::kAccumFrames; ++frame) {
+        taa::Vec2 j = taa::Jitter(frame, (int)W, (int)H);
+        // Add the sub-pixel NDC jitter into the base projection's clip-space XY translation per unit W
+        // BEFORE FlipProjY (so the Y-flip carries through consistently), then compose view-proj.
+        Mat4 jProj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+        jProj.m[2 * 4 + 0] += j.x;
+        jProj.m[2 * 4 + 1] += j.y;
+        Mat4 jvp = FlipProjY(jProj) * viewM;
+        FrameData fd = fdBase;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = jvp.m[k];
+
+        const bool first = (frame == 0);
+        TaaParams tp{};
+        tp.texel[0] = 1.0f / (float)W; tp.texel[1] = 1.0f / (float)H;
+        tp.alpha = first ? 1.0f : taa::kSteadyAlpha;
+        tp.firstFrame = first ? 1.0f : 0.0f;
+
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgPrev = graph.ImportTarget(
+            "history", render::RgResourceKind::SceneColor, *prevHist);
+        render::RgResource rgCur = graph.ImportTarget(
+            "resolved", render::RgResourceKind::SceneColor, *curHist);
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                recordShadow(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                recordScene(cmd);
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("taaResolve", {rgScene, rgPrev}, {rgCur},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*taaPipe);
+                cmd.BindTexturePair(*rt, *prevHist);
+                cmd.PushConstants(&tp, sizeof(tp));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        std::swap(prevHist, curHist);
+    }
+
+    // Final: tonemap the last resolved image (now in prevHist after the swap) -> swapchain.
+    {
+        render::RenderGraph graph;
+        render::RgResource rgResolved = graph.ImportTarget(
+            "resolved", render::RgResourceKind::SceneColor, *prevHist);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+        graph.AddPass("post", {rgResolved}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*prevHist);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+    }
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — TAA %d-frame accumulation, %u bodies\n",
+                outPath, cw, ch, taa::kAccumFrames, kInstanceCount);
     return 0;
 }
 
@@ -5253,6 +5552,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--probe") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_probe.png";
             try { return RunProbeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --taa <out.png>: temporal anti-aliasing showcase (Slice AP). The settled sphere-pyramid scene
+        // rendered as a FIXED 8-frame Halton(2,3)-jittered accumulation, neighborhood-clamped history
+        // blend (taa_resolve), tonemapped + captured. Mirrors the Vulkan --taa-shot exactly; two runs
+        // DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--taa") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_taa.png";
+            try { return RunTaaShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         const char* outPath = argc > 1 ? argv[1] : "metal_scene.png";

@@ -93,6 +93,13 @@ hf_add_pure_test(introspect_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(live_editor_test)
 
+# Temporal anti-aliasing (Slice AP): Halton(2,3) radical-inverse determinism + [0,1) range, the
+# sub-pixel NDC Jitter offset (bounded by one pixel, deterministic, frame-dependent), the
+# neighborhood clamp (per-channel AABB, exactly what taa_resolve.frag does), and the resolve blend
+# (lerp(clampedHistory, current, alpha): alpha=1 first frame, ~0.1 steady state). Pure C++
+# (render/taa.h, header-only), ASan-eligible.
+hf_add_pure_test(taa_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

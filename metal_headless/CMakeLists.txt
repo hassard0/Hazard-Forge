@@ -148,6 +148,10 @@ hf_gen_msl(probe_bake.frag       probe_bake.frag.hlsl       frag probe_bake_frag
 hf_gen_msl(lit_probe.frag        lit_probe.frag.hlsl        frag probe_fragment)
 hf_gen_msl(probe_blit.frag       probe_blit.frag.hlsl       frag probe_blit_fragment)
 hf_gen_msl(probe_irradiance.frag probe_irradiance.frag.hlsl frag probe_irradiance_fragment)
+# Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
+# current jittered HDR scene. Reuses post.vert (fullscreen triangle). Same HLSL->SPIR-V->MSL toolchain;
+# existing shaders + goldens untouched.
+hf_gen_msl(taa_resolve.frag      taa_resolve.frag.hlsl      frag taa_resolve_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

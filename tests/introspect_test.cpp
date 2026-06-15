@@ -130,6 +130,12 @@ int main() {
             }
             const json_array_s* features = AsArray(MemberOf(engine, "features"));
             check(features != nullptr && features->length > 10, "engine.features is a non-trivial list");
+            // Slice AP: the temporal-anti-aliasing capability is advertised in the feature manifest.
+            bool sawTaaFeature = false;
+            if (features)
+                for (const json_array_element_s* el = features->start; el; el = el->next)
+                    if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
+            check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -151,6 +157,14 @@ int main() {
         // showcases present + non-trivial.
         const json_array_s* showcases = AsArray(MemberOf(top, "showcases"));
         check(showcases != nullptr && showcases->length > 10, "showcases is a non-trivial list");
+        // Slice AP: the --taa-shot showcase flag is listed in the showcase manifest.
+        bool sawTaaShot = false;
+        if (showcases)
+            for (const json_array_element_s* el = showcases->start; el; el = el->next) {
+                const json_object_s* s = AsObject(el->value);
+                if (s && AsString(MemberOf(s, "flag")) == "--taa-shot") sawTaaShot = true;
+            }
+        check(sawTaaShot, "showcases manifest includes --taa-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));
