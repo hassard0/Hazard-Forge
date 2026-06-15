@@ -79,6 +79,13 @@ hf_add_pure_test(volumetric_test)
 # block). Pure C++ (render/probe.h, header-only), ASan-eligible.
 hf_add_pure_test(probe_test)
 
+# Machine-readable engine-state introspection (Slice AL): DescribeEngine builds a deterministic JSON
+# document (engine/features/showcases/commands + scene entities + camera/lights + stats). Asserts the
+# JSON parses, the entity/transform/camera/light values are present, backends == ["vulkan","metal"],
+# the commands manifest includes set_transform, and the output is byte-identical across runs. Pure
+# C++ (hf_core), ASan-eligible.
+hf_add_pure_test(introspect_test)
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

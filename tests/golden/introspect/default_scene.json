@@ -1,0 +1,274 @@
+{
+  "engine": {
+    "name": "Hazard Forge",
+    "version": "0.1.0",
+    "backends": ["vulkan", "metal"],
+    "activeBackend": "vulkan",
+    "features": [
+      "pbr-metallic-roughness",
+      "image-based-lighting",
+      "cascaded-shadow-maps",
+      "spot-light-shadows",
+      "point-light-shadows",
+      "clustered-lighting",
+      "screen-space-reflections",
+      "volumetric-fog",
+      "reflection-irradiance-probes",
+      "bloom",
+      "ssao",
+      "transparency",
+      "hardware-instancing",
+      "gpu-particles",
+      "gltf-import",
+      "skeletal-animation",
+      "animation-blending",
+      "rigid-body-physics",
+      "debug-visualization",
+      "interactive-runtime",
+      "editor-selection-gizmos"
+    ]
+  },
+  "showcases": [
+    { "flag": "--shot", "desc": "Default lit + shadowed scene (ground + grid + duck)." },
+    { "flag": "--pbr-shot", "desc": "Full PBR showcase (DamagedHelmet, metallic-roughness)." },
+    { "flag": "--ibl-shot", "desc": "HDR image-based lighting (equirect skybox reflections)." },
+    { "flag": "--scene-shot", "desc": "glTF scene-graph import (CesiumMilkTruck node hierarchy)." },
+    { "flag": "--bloom-shot", "desc": "HDR bloom post-process." },
+    { "flag": "--ssao-shot", "desc": "Screen-space ambient occlusion." },
+    { "flag": "--skinning-shot", "desc": "Skeletal animation (GPU skinning)." },
+    { "flag": "--blend-shot", "desc": "Animation blending between two clips." },
+    { "flag": "--instanced-shot", "desc": "Hardware-instanced grid." },
+    { "flag": "--physics-shot", "desc": "Rigid-body physics (impulse solver)." },
+    { "flag": "--transparency-shot", "desc": "Sorted alpha-blended transparency." },
+    { "flag": "--debug-shot", "desc": "Immediate-mode debug-line visualization." },
+    { "flag": "--capstone-shot", "desc": "Capstone scene combining the major features." },
+    { "flag": "--csm-shot", "desc": "Cascaded shadow maps (directional)." },
+    { "flag": "--spot-shot", "desc": "Spot light with perspective shadow." },
+    { "flag": "--point-shadow-shot", "desc": "Omnidirectional point-light shadow (cube map)." },
+    { "flag": "--clustered-shot", "desc": "Clustered / Forward+ many-light shading." },
+    { "flag": "--ssr-shot", "desc": "Screen-space reflections." },
+    { "flag": "--volumetric-shot", "desc": "Volumetric fog / light shafts." },
+    { "flag": "--probe-shot", "desc": "Reflection + irradiance probes (local cubemap GI)." },
+    { "flag": "--gizmo-shot", "desc": "Editor selection + translate gizmo overlay." },
+    { "flag": "--camera-shot", "desc": "Scripted-pose interactive-runtime capture." }
+  ],
+  "commands": [
+    { "op": "dump", "args": {} },
+    { "op": "list", "args": {} },
+    { "op": "set_transform", "args": {"entity": "int", "position": "[x,y,z]?", "euler": "[x,y,z]?", "scale": "[x,y,z]?"} },
+    { "op": "set_material", "args": {"entity": "int", "metallic": "float?", "roughness": "float?", "baseColor": "string|null?", "normalMap": "string|null?"} },
+    { "op": "add", "args": {"mesh": "string", "baseColor": "string|null?", "normalMap": "string|null?", "metallic": "float?", "roughness": "float?", "position": "[x,y,z]?", "euler": "[x,y,z]?", "scale": "[x,y,z]?"} },
+    { "op": "remove", "args": {"entity": "int"} },
+    { "op": "capture", "args": {"path": "string"} },
+    { "op": "save_scene", "args": {"path": "string"} },
+    { "op": "introspect", "args": {"path": "string?"} }
+  ],
+  "scene": {
+    "entities": [
+      {
+        "id": 0,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [0, 0, 0],
+            "euler": [0, 0, 0],
+            "scale": [6, 1, 6]
+          },
+          "mesh": "plane",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.8,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [-1.8, 0.55, -1.8],
+            "euler": [0, 0, 0],
+            "scale": [0.55, 0.55, 0.55]
+          },
+          "mesh": "sphere",
+          "material": {
+            "metallic": 1,
+            "roughness": 0.15,
+            "baseColor": "checker",
+            "normalMap": "flat_normal"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [-1.8, 0.6, 0],
+            "euler": [0, -0.5, 0],
+            "scale": [0.5, 0.5, 0.5]
+          },
+          "mesh": "cube",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.5,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [-1.8, 0.6, 1.8],
+            "euler": [0, 0, 0],
+            "scale": [0.5, 0.5, 0.5]
+          },
+          "mesh": "cube",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.5,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [0, 0.6, -1.8],
+            "euler": [0, -0.5, 0],
+            "scale": [0.5, 0.5, 0.5]
+          },
+          "mesh": "cube",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.5,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [0, 0.6, 1.8],
+            "euler": [0, 0.5, 0],
+            "scale": [0.5, 0.5, 0.5]
+          },
+          "mesh": "cube",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.5,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [1.8, 0.6, -1.8],
+            "euler": [0, 0, 0],
+            "scale": [0.5, 0.5, 0.5]
+          },
+          "mesh": "cube",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.5,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [1.8, 0.6, 0],
+            "euler": [0, 0.5, 0],
+            "scale": [0.5, 0.5, 0.5]
+          },
+          "mesh": "cube",
+          "material": {
+            "metallic": 0,
+            "roughness": 0.5,
+            "baseColor": "checker",
+            "normalMap": "normalmap"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [1.8, 0.55, 1.8],
+            "euler": [0, 0, 0],
+            "scale": [0.55, 0.55, 0.55]
+          },
+          "mesh": "sphere",
+          "material": {
+            "metallic": 1,
+            "roughness": 0.15,
+            "baseColor": "checker",
+            "normalMap": "flat_normal"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "generation": 0,
+        "components": {
+          "transform": {
+            "position": [0, 1.35, 0],
+            "euler": [0, 2.3, 0],
+            "scale": [0.022, 0.022, 0.022]
+          },
+          "mesh": "duck",
+          "material": {
+            "metallic": 0,
+            "roughness": 1,
+            "baseColor": "duck_basecolor",
+            "normalMap": "flat_normal"
+          }
+        }
+      }
+    ]
+  },
+  "camera": {
+    "position": [4.5, 4, 6.5],
+    "yaw": -0.605545,
+    "pitch": -0.416782,
+    "fovDeg": 60
+  },
+  "lights": {
+    "directional": { "dir": [-0.5, -1, -0.3], "color": [0.95, 0.93, 0.85] },
+    "points": [
+      { "pos": [3, 1.1, 0], "color": [1, 0.25, 0.2], "radius": 3.2, "intensity": 1 },
+      { "pos": [-1.5, 1.1, 2.59808], "color": [0.2, 1, 0.35], "radius": 3.2, "intensity": 1 },
+      { "pos": [-1.5, 1.1, -2.59808], "color": [0.3, 0.45, 1], "radius": 3.2, "intensity": 1 }
+    ],
+    "spots": []
+  },
+  "stats": {
+    "entityCount": 10,
+    "aliveEntities": 10,
+    "transformCount": 10,
+    "meshCount": 10,
+    "materialCount": 10,
+    "pointLightCount": 3,
+    "spotLightCount": 0
+  }
+}

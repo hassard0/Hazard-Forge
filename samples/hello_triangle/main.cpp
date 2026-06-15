@@ -32,6 +32,7 @@
 #include "runtime/play_state.h"
 #include "editor/picking.h"
 #include "editor/gizmo.h"
+#include "editor/introspect.h"
 
 #ifdef HF_HAS_EDITOR
 #include "imgui.h"
@@ -214,6 +215,11 @@ int main(int argc, char** argv) {
     bool fly = false;                       // --fly: open the window and run the live fly loop
     bool flyDryRun = false;                 // --fly-dry-run: exercise the loop headlessly, then exit
     bool dumpScene = false;
+    // --introspect [outpath]: build the default scene + a representative EngineState (camera +
+    // lights) and write the full machine-readable engine-state JSON (editor::DescribeEngine) to
+    // outpath, or stdout if omitted. Headless, no GPU, deterministic. The agent-facing OBSERVE side.
+    bool introspect = false;
+    const char* introspectPath = nullptr;
     bool editor = false;
     // Slice AB (editor interaction): gizmo capture + headless pick test.
     const char* gizmoShotPath = nullptr;    // --gizmo-shot <objIndex> <out.bmp>
@@ -372,6 +378,13 @@ int main(int argc, char** argv) {
             flyDryRun = true;
         } else if (std::strcmp(argv[i], "--dump-scene") == 0) {
             dumpScene = true;
+        } else if (std::strcmp(argv[i], "--introspect") == 0) {
+            introspect = true;
+            // Optional output path: consume the next arg only if it isn't another flag.
+            if (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0) {
+                introspectPath = argv[i + 1];
+                ++i;
+            }
         } else if (std::strcmp(argv[i], "--editor") == 0) {
             // Overlay the Dear ImGui editor (hierarchy/inspector/stats) on the viewport, rendered
             // through the engine RHI. Works in interactive mode and in the --shot capture.
@@ -6849,6 +6862,64 @@ int main(int argc, char** argv) {
         if (dumpScene) {
             std::string json = scene::DumpScene(registry, resources);
             std::fputs(json.c_str(), stdout);
+            device->WaitIdle();
+            return 0;
+        }
+
+        // --introspect [outpath]: write the FULL machine-readable engine-state JSON (the agent-facing
+        // OBSERVE call) and exit. We fill a representative EngineState from the SAME values the
+        // interactive showcase uses below (eye/center camera, the warm key directional, and the three
+        // colored point lights at their t=0 phase), so the dump describes the live default scene.
+        // Deterministic + backend-agnostic (DescribeEngine is pure hf_core).
+        if (introspect) {
+            using math::Vec3;
+            editor::EngineState state;
+            state.backend = "vulkan";
+
+            // Camera: matches makeFrameData's eye/center + 60deg vertical FOV. yaw/pitch are derived
+            // from the look direction (eye -> center) so an agent sees the actual framing.
+            const Vec3 eye{4.5f, 4.0f, 6.5f};
+            const Vec3 center{0.0f, 0.5f, 0.0f};
+            Vec3 fwd = math::normalize(center - eye);
+            state.hasCamera = true;
+            state.camera.position = eye;
+            state.camera.yaw = std::atan2(fwd.x, -fwd.z);
+            state.camera.pitch = std::asin(fwd.y);
+            state.camera.fovDeg = 60.0f;
+
+            // Directional key light (matches makeFrameData's lightDir/lightColor).
+            state.hasDirectional = true;
+            state.directional.dir = {-0.5f, -1.0f, -0.3f};
+            state.directional.color = {0.95f, 0.93f, 0.85f};
+
+            // Three colored point lights at their t=0 phase (matches makeFrameData's accent lights).
+            const float kR = 3.0f, kH = 1.1f, kRadius = 3.2f, kInt = 1.0f;
+            const float ptColors[3][3] = {{1.0f, 0.25f, 0.2f},   // warm red
+                                          {0.2f, 1.0f, 0.35f},   // green
+                                          {0.3f, 0.45f, 1.0f}};  // blue
+            for (int li = 0; li < 3; ++li) {
+                float a = (float)li * 2.0943951f;  // t=0; 120deg apart
+                editor::LightPoint p;
+                p.pos = {std::cos(a) * kR, kH, std::sin(a) * kR};
+                p.color = {ptColors[li][0], ptColors[li][1], ptColors[li][2]};
+                p.radius = kRadius;
+                p.intensity = kInt;
+                state.points.push_back(p);
+            }
+
+            std::string json = editor::DescribeEngine(registry, resources, state);
+            if (introspectPath) {
+                std::ofstream f(introspectPath, std::ios::binary);
+                if (!f) {
+                    std::fprintf(stderr, "FATAL: cannot write introspect output '%s'\n", introspectPath);
+                    device->WaitIdle();
+                    return 1;
+                }
+                f << json;
+                std::printf("introspect: wrote %s\n", introspectPath);
+            } else {
+                std::fputs(json.c_str(), stdout);
+            }
             device->WaitIdle();
             return 0;
         }

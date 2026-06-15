@@ -6,6 +6,7 @@
 #include "scene/commands.h"
 
 #include "scene/components.h"
+#include "editor/introspect.h"
 #include "json/json.h"
 
 #include <cstdio>
@@ -233,6 +234,27 @@ bool OpSaveScene(ecs::Registry& reg, SceneResources& res, const json_object_s* o
     return true;
 }
 
+// {"op":"introspect","path":"out.json"} -> write the machine-readable engine-state JSON document
+// (editor::DescribeEngine) to `path`, or to stdout if `path` is absent/empty. This is the OBSERVE
+// half of the agentic loop, requestable mid-script. The command layer holds no camera/light state,
+// so it dumps the scene + the shipped-engine manifest with an empty EngineState (no camera/lights,
+// backend ""); the sample's --introspect entry supplies the full camera/light view. The op routes
+// purely through hf_core (DescribeEngine touches no backend symbols), so no rendering callback.
+bool OpIntrospect(ecs::Registry& reg, SceneResources& res, const json_object_s* obj) {
+    editor::EngineState state;  // scene-only view: no camera/lights, backend unset.
+    std::string json = editor::DescribeEngine(reg, res, state);
+    std::string path = StringMember(obj, "path");
+    if (path.empty()) {
+        std::fputs(json.c_str(), stdout);
+        return true;
+    }
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "introspect: cannot write '%s'\n", path.c_str()); return false; }
+    f << json;
+    std::printf("introspect: wrote %s\n", path.c_str());
+    return true;
+}
+
 // --- Driver --------------------------------------------------------------------------------------
 
 bool RunParsed(json_value_s* root, ecs::Registry& reg, SceneResources& res,
@@ -260,6 +282,7 @@ bool RunParsed(json_value_s* root, ecs::Registry& reg, SceneResources& res,
         else if (op == "remove")       ok = OpRemove(reg, obj);
         else if (op == "capture")      ok = OpCapture(obj, capture);
         else if (op == "save_scene")   ok = OpSaveScene(reg, res, obj);
+        else if (op == "introspect")   ok = OpIntrospect(reg, res, obj);
         else {
             std::fprintf(stderr, "command %d: unknown op '%s'\n", cmdIndex, op.c_str());
             ok = false;

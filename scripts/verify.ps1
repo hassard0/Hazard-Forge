@@ -7,6 +7,9 @@
 
       1. Windows / Vulkan
          - conan install (cppstd=17 + Ninja generator), cmake configure, build, ctest.
+         - Plus the Slice-AL introspection JSON golden: an EXACT byte match of the live
+           --introspect output for the default scene vs tests/golden/introspect/default_scene.json.
+           Backend-agnostic (pure hf_core) so it is verified ONLY here — the Mac is not needed.
          - All steps run inside a VS BuildTools x64 dev shell so cl/ninja resolve.
 
       2. Mac / Metal (headless, over SSH on the LAN)
@@ -139,6 +142,28 @@ if (`$LASTEXITCODE -ne 0) { exit 13 }
 Write-Host '--- ctest ---'
 ctest --preset windows-msvc-debug
 if (`$LASTEXITCODE -ne 0) { exit 14 }
+
+# --- JSON introspection golden (Slice AL): an EXACT byte-for-byte match of the live --introspect
+# output for the default scene against the committed text golden. This is the agent-OBSERVE artifact
+# (editor::DescribeEngine). It is backend-AGNOSTIC (pure hf_core, no vk*/Metal symbols), so unlike the
+# 22 IMAGE goldens it does NOT need the Mac: the bytes are identical on Vulkan and Metal. We therefore
+# verify it once, here, on the Windows/Vulkan build. ---
+Write-Host '--- introspection JSON golden ---'
+`$introExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$introGolden = 'tests/golden/introspect/default_scene.json'
+`$introLive = Join-Path `$env:TEMP 'hf_introspect_live.json'
+& `$introExe --introspect `$introLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'introspect run failed'; exit 15 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$gBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$introGolden).Path)
+`$lBytes = [System.IO.File]::ReadAllBytes(`$introLive)
+`$introOk = (`$gBytes.Length -eq `$lBytes.Length)
+if (`$introOk) { for (`$bi = 0; `$bi -lt `$gBytes.Length; `$bi++) { if (`$gBytes[`$bi] -ne `$lBytes[`$bi]) { `$introOk = `$false; break } } }
+if (-not `$introOk) {
+    Write-Host 'introspection JSON golden MISMATCH (tests/golden/introspect/default_scene.json)'
+    exit 16
+}
+Write-Host 'introspection JSON golden: exact match'
 
 exit 0
 "@

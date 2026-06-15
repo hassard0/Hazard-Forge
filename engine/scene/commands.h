@@ -31,6 +31,10 @@
 //   {"op":"remove","entity":N}             -> destroy entity N.
 //   {"op":"capture","path":"out.bmp"}      -> render the current scene to a file via the callback.
 //   {"op":"save_scene","path":"x.json"}    -> write DumpScene(...) to a file.
+//   {"op":"introspect","path":"x.json"}    -> write the full machine-readable engine-state JSON
+//                                             (editor::DescribeEngine) to a file (or stdout if no
+//                                             path): engine/features/showcases/commands + scene +
+//                                             stats. The agent-facing OBSERVE call.
 //
 // A baseColor/normalMap of JSON null (or "") clears the texture; an unknown texture name is an
 // error, as is an unknown mesh name on "add" or an out-of-range entity index.

@@ -1,0 +1,4 @@
+# The introspection JSON golden (Slice AL) is compared BYTE-FOR-BYTE against the live --introspect
+# output, which the engine writes with LF-only line endings (no BOM). Pin it to LF so a checkout on a
+# CRLF-default Windows clone does not rewrite it and break the exact-match verify step.
+tests/golden/introspect/*.json text eol=lf

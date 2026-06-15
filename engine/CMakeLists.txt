@@ -18,6 +18,7 @@ set(HF_ENGINE_COMMON_SOURCES
   debug/debug_emitters.cpp
   editor/picking.cpp
   editor/gizmo.cpp
+  editor/introspect.cpp
 )
 
 if(APPLE)
@@ -88,6 +89,7 @@ add_library(hf_core STATIC
   debug/debug_emitters.cpp
   editor/picking.cpp
   editor/gizmo.cpp
+  editor/introspect.cpp
 )
 target_include_directories(hf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
