@@ -2,7 +2,7 @@
 
 A C++20 cross-platform game engine built around a thin, explicit **Rendering Hardware Interface (RHI) seam** that renders natively on **Vulkan (Windows)** and **Apple Metal (macOS, Apple Silicon)** from one codebase. The design is Apple-native and Metal-first in philosophy, with Vulkan as the primary shipping platform; Metal parity is verified headlessly against committed golden images.
 
-> **Status:** Active development — an in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a full PBR/IBL/post-processed scene on a Vulkan RTX GPU (Windows) and on Apple Metal (M4, macOS), verified by **29 deterministic golden-image regression tests** (plus a machine-readable engine-state JSON golden) that must each diff `0.0000`, and by a **30-test** ctest suite that runs clean under AddressSanitizer. Roughly slices A–AX have shipped — PBR materials, image-based lighting, HDR bloom, SSAO, alpha-blended transparency, glTF scene-graph import, skeletal animation + blending, rigid-body physics, GPU instancing, compute particles, immediate-mode debug visualization, an interactive runtime (fixed-timestep loop + flyable camera), a full shadow set (cascaded shadow maps, spot-light shadows, omnidirectional point-light cube shadows), clustered/Forward+ lighting, screen-space reflections, volumetric fog / light shafts, reflection + irradiance probes (local cubemap GI), temporal anti-aliasing (TAA), CPU frustum culling, **GPU-driven culling + indirect draw**, a **render graph with automatic resource-state barriers** (Vulkan-synchronization-validation-clean), **multithreaded command recording** (byte-identical 1-vs-N workers), a **data-driven material / shader graph** with **live runtime material authoring**, a **playable deterministic game sample**, machine-readable engine-state JSON introspection for agents, a live editor (mouse pick + gizmo drag + shader/scene hot-reload), and a macOS windowed Metal viewport.
+> **Status:** Active development — an in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a full PBR/IBL/post-processed scene on a Vulkan RTX GPU (Windows) and on Apple Metal (M4, macOS), verified by **32 deterministic golden-image regression tests** (plus a machine-readable engine-state JSON golden **and** a byte-exact audio-WAV golden) that must each diff `0.0000`, and by a **32-test** ctest suite that runs clean under AddressSanitizer. Roughly slices A–BB have shipped — PBR materials, image-based lighting, HDR bloom, SSAO, alpha-blended transparency, glTF scene-graph import, skeletal animation + blending, rigid-body physics, GPU instancing, compute particles, immediate-mode debug visualization, an interactive runtime (fixed-timestep loop + flyable camera), a full shadow set (cascaded shadow maps, spot-light shadows, omnidirectional point-light cube shadows), clustered/Forward+ lighting, screen-space reflections, volumetric fog / light shafts, reflection + irradiance probes (local cubemap GI), temporal anti-aliasing (TAA), CPU frustum culling, **GPU-driven culling + indirect draw**, a **render graph with automatic resource-state barriers** (Vulkan-synchronization-validation-clean), **multithreaded command recording** (byte-identical 1-vs-N workers), a **data-driven material / shader graph** (expanded node set + a multi-material scene) with **live runtime material authoring**, a **baked-font text / HUD overlay renderer**, a **deterministic integer-mixer audio engine** (byte-exact WAV golden), a **playable deterministic game sample**, machine-readable engine-state JSON introspection for agents, a live editor (mouse pick + gizmo drag + shader/scene hot-reload), and a macOS windowed Metal viewport.
 
 ---
 
@@ -42,7 +42,12 @@ The central bet: **one engine layer above a clean seam, two GPU backends below i
 - **GPU-driven culling + indirect draw** — a compute pass culls the instance set against the frustum on the GPU and compacts the survivors into an ordered indirect-args buffer (`render/gpu_cull.h` reference CPU model, mirrored by the compute shader), which a single `DrawIndexedIndirect` consumes. The CPU reference and the GPU result agree, and the `gpu_cull` golden matches the brute-force draw.
 - **Render graph + automatic barriers** — `render::RenderGraph` declares passes over imported resources (shadow map / scene color / swapchain) and a **resource-state tracker + barrier solver** automatically inserts the correct transitions between passes from each resource's prior→next state. On Vulkan each transition lowers to an explicit `vkCmdPipelineBarrier2`, **proven hazard-free by the Khronos synchronization-validation layer**; on Metal the tracked-hazard model makes them no-ops. The graph logic itself carries zero backend symbols.
 - **Multithreaded command recording** — passes record into per-thread secondary command buffers from a worker pool and are replayed in deterministic creation order (`vkCmdExecuteCommands` on Vulkan; an `MTLParallelRenderCommandEncoder`'s sub-encoders on Metal). A 1-worker render and an N-worker render are **byte-identical** (proven by the `mt` golden and a 1-vs-N hash test).
-- **Data-driven material / shader graph** — materials are authored as a node graph in JSON (`assets/materials/*.mat.json`); `material::ShaderGraph` + the codegen emit HLSL for the PBR inputs (base color / metallic / roughness / emissive). A **build-time codegen tool** bakes the showcase materials into committed generated HLSL, and a **live runtime path** re-compiles an edited material on the fly (dxc subprocess → SPIR-V → pipeline) for in-editor authoring. The build-time and runtime paths render **byte-identically** (the `mat_graph` / `mat_graph2` goldens; a runtime==build-time hash check).
+- **Data-driven material / shader graph** — materials are authored as a node graph in JSON (`assets/materials/*.mat.json`); `material::ShaderGraph` + the codegen emit HLSL for the PBR inputs (base color / metallic / roughness / emissive). The node set spans `Constant`, `UV`, `TextureSample`, `Multiply`, `Add`, `Lerp`, `Fresnel` plus a **Slice-AZ expansion** — `Swizzle`, `MakeFloat3`, `MakeFloat4`, `Dot`, `Normalize`, `Power`, `OneMinus`, `Saturate`, and the `PBROutput` sink — enough to author non-trivial materials as graphs. A **build-time codegen tool** bakes the showcase materials into committed generated HLSL, and a **live runtime path** re-compiles an edited material on the fly (dxc subprocess → SPIR-V → pipeline) for in-editor authoring. The build-time and runtime paths render **byte-identically** (the `mat_graph` / `mat_graph2` goldens; a runtime==build-time hash check). A **multi-material scene** (`--material-multi-shot` / `--material-multi`) renders three spheres each shaded by a distinct graph material in one frame (the `mat_multi` golden).
+
+### Text / HUD and audio
+
+- **Text / HUD overlay renderer** — `engine/ui/` bakes a fixed 8×8 monospace bitmap font into an RGBA atlas (`BuildFontAtlas`) and lays a string out into a batch of screen-space NDC quads (`LayoutText`) — pure CPU, zero backend symbols, no asset/clock/RNG, so the same string yields the same pixels on both backends. The draw side reuses the existing alpha-blend + sampled-texture **screen-space overlay** pass (`shaders/text.{vert,frag}.hlsl`), compositing the HUD over the scene after post. Golden-captured standalone (`--hud-shot` / `--hud`, the `hud` golden) and over the game (`--game-hud-shot` / `--game-hud`, the `game_hud` golden).
+- **Deterministic audio mixer + WAV writer** — `engine/audio/` is a software mixer that is **integer / fixed-point end to end** (Q15 gains, an int32 accumulator, hard-clamp to int16 — no float in the sample loop) with sine/square/noise voices and a piecewise-linear ADSR envelope, plus a canonical 16-bit-PCM WAV writer (hand-serialized little-endian, no timestamps). Pure CPU in `hf_core` (ASan-scoped, unit-tested), it produces **bit-identical** output on every compiler/run; `--audio-render out.wav` renders a fixed scene that is byte-exact against the committed `tests/golden/audio/scene.wav` golden.
 
 ### Assets, animation, physics
 
@@ -59,16 +64,16 @@ The central bet: **one engine layer above a clean seam, two GPU backends below i
 - **Immediate-mode debug visualization** — `debug::DebugDraw` collects grids / AABBs / wire spheres / arrows / contact markers into a LINE_LIST and draws them in one call through a debug-line pipeline (`depthTest=true, depthWrite=false`).
 - **Headless GPU capture** — `CaptureNextFrame()` / `GetCapturedPixels()`: render a frame, read pixels back from the GPU, write a PNG/BMP. No visible desktop required — the primary verification path.
 - **Vulkan validation-clean invariant** — every showcase runs under the Khronos validation layer (core + **synchronization** validation) with **zero** `VUID-*` / `SYNC-HAZARD-*` / `UNASSIGNED-*` / `[ERROR]` lines; the render graph's auto-inserted barriers are proven hazard-free by the sync-validation layer. (Only a benign `[WARNING: Performance]` "vertex attribute not consumed" notice from the depth-only shadow pipelines remains, and is expected.) The validation layer is pulled in as a Conan dependency for debug builds.
-- **Cross-platform verification** — `scripts/verify.ps1` runs the Windows/Vulkan ctest **and** the introspection JSON-golden byte match, **and** drives the bench Mac over SSH to build `metal_headless` and golden-compare all 29 Metal goldens at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
+- **Cross-platform verification** — `scripts/verify.ps1` runs the Windows/Vulkan ctest **and** the introspection JSON-golden + audio-WAV-golden byte matches, **and** drives the bench Mac over SSH to build `metal_headless` and golden-compare all 32 Metal goldens at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
 - **AddressSanitizer** — an opt-in `HF_SANITIZE=address` build (`windows-msvc-asan` preset) instruments the backend-agnostic core (`hf_core`) and the pure-C++ unit tests so they run clean under MSVC `/fsanitize=address`.
 
-**Metal parity status:** The Metal backend renders **every** showcase headless on Apple Silicon (M4) and is verified against a committed golden at `DIFF 0.0000` for all 29 scenes (see below). The Metal shaders are **generated from the shared HLSL** at build time (HLSL → SPIR-V via `glslc` → MSL via `spirv-cross`), so there is no hand-written MSL to drift. A **windowed** Metal present loop now also exists on macOS: a SDL-free native Cocoa entry builds a `MetalDevice` from a `CAMetalLayer*` and runs the same interactive `--fly` viewport (pick / drag / gizmos). It is **build-verified** in CI/`verify.ps1` (the bench Mac compiles and headless-renders all 29 goldens); the interactive on-screen window itself is exercised manually — the user confirms the live viewport, while the deterministic logic under it (camera, picking, gizmo, file-watch) is golden- and unit-tested on both backends.
+**Metal parity status:** The Metal backend renders **every** showcase headless on Apple Silicon (M4) and is verified against a committed golden at `DIFF 0.0000` for all 32 scenes (see below). The Metal shaders are **generated from the shared HLSL** at build time (HLSL → SPIR-V via `glslc` → MSL via `spirv-cross`), so there is no hand-written MSL to drift. A **windowed** Metal present loop now also exists on macOS: a SDL-free native Cocoa entry builds a `MetalDevice` from a `CAMetalLayer*` and runs the same interactive `--fly` viewport (pick / drag / gizmos). It is **build-verified** in CI/`verify.ps1` (the bench Mac compiles and headless-renders all 32 goldens); the interactive on-screen window itself is exercised manually — the user confirms the live viewport, while the deterministic logic under it (camera, picking, gizmo, file-watch) is golden- and unit-tested on both backends.
 
 ---
 
-## The 29 Metal goldens
+## The 32 Metal goldens
 
-Each is produced by a distinct `metal_headless/visual_test` flag and compared against `tests/golden/metal/<name>.png` at threshold `0.0` (deterministic — two runs diff `0.0000`). A 30th, non-image golden — the engine-state JSON (`tests/golden/introspect/default_scene.json`) — is byte-matched on the Windows side:
+Each is produced by a distinct `metal_headless/visual_test` flag and compared against `tests/golden/metal/<name>.png` at threshold `0.0` (deterministic — two runs diff `0.0000`). Two further non-image goldens are byte-matched on the Windows side: the engine-state JSON (`tests/golden/introspect/default_scene.json`) and the audio WAV (`tests/golden/audio/scene.wav`, from `--audio-render`):
 
 | golden            | flag                          | what it proves                                            |
 | ----------------- | ----------------------------- | --------------------------------------------------------- |
@@ -100,7 +105,10 @@ Each is produced by a distinct `metal_headless/visual_test` flag and compared ag
 | `mt`              | `--mt`                        | multithreaded recording, byte-identical to single-threaded (Slice AU) |
 | `mat_graph`       | `--material`                  | data-driven material/shader graph, build-time codegen (Slice AV) |
 | `mat_graph2`      | `--material2`                 | second graph material via live runtime compile path (Slice AW) |
+| `mat_multi`       | `--material-multi`            | multi-material scene: 3 spheres, 3 distinct graph materials (Slice AZ) |
 | `game`            | `--game`                      | playable deterministic roll-a-ball game sample (Slice AX) |
+| `hud`             | `--hud`                       | baked-font text / HUD screen-space overlay (Slice BA)     |
+| `game_hud`        | `--game-hud`                  | game sample with the score HUD overlaid (Slice BA)        |
 
 ---
 
@@ -111,7 +119,7 @@ Hazard Forge is organized in layers, all above the seam:
 1. **HAL** (`engine/hal/`) — SDL3 window + Vulkan surface creation.
 2. **RHI seam** (`engine/rhi/`) — pure C++ interfaces (`IRHIDevice`, `ICommandBuffer`, `IPipeline`, `IBuffer`, `ITexture`, `IRenderTarget`, `ISwapchain`, compute). Zero backend symbols.
 3. **Backends** — Vulkan (`engine/rhi_vulkan/`) and Metal (`engine/rhi_metal/`). Accessed via `rhi::CreateDevice(Backend::Vulkan, window)` or `rhi::mtl::CreateMetalDeviceHeadless(w, h)`.
-4. **Engine modules** — `scene/`, `render/` (render graph + barrier solver + frustum/GPU-cull/TAA), `asset/` (glTF + HDR env), `anim/`, `physics/`, `material/` (shader graph + codegen + runtime compile + live authoring), `game/` (roll_game), `runtime/`, `editor/`, `debug/`. All depend only on `rhi/` + `math/`; the backend-agnostic subset compiles into `hf_core` for the sanitized unit tests.
+4. **Engine modules** — `scene/`, `render/` (render graph + barrier solver + frustum/GPU-cull/TAA), `asset/` (glTF + HDR env), `anim/`, `physics/`, `material/` (shader graph + codegen + runtime compile + live authoring), `ui/` (baked-font text / HUD overlay), `audio/` (integer mixer + WAV writer), `game/` (roll_game), `runtime/`, `editor/`, `debug/`. All depend only on `rhi/` + `math/`; the backend-agnostic subset compiles into `hf_core` for the sanitized unit tests.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the seam design, descriptor model, frame structure, the shared HLSL→MSL toolchain, and per-backend notes.
 
@@ -137,6 +145,8 @@ hazard-forge/
 │   ├── anim/                   skeleton + animation sampling + blending
 │   ├── physics/                impulse rigid-body World
 │   ├── material/               shader_graph + codegen + material_loader + runtime_compile + live_material
+│   ├── ui/                     baked 8x8 font atlas + screen-space text/HUD layout (pure CPU)
+│   ├── audio/                  integer/fixed-point software mixer + canonical 16-bit PCM WAV writer
 │   ├── game/                   roll_game: deterministic gameplay layer (sample)
 │   ├── runtime/                Clock/FixedTimestep, Camera, FlyCameraController, hot_reload (FileWatcher)
 │   ├── editor/                 picking, gizmo, introspect (engine-state JSON) (+ ImGui editor shell)
@@ -146,13 +156,14 @@ hazard-forge/
 ├── tools/                      material_codegen: build-time HLSL generator from *.mat.json graphs
 ├── mac_window/                 SDL-free native Cocoa entry: windowed Metal viewport from a CAMetalLayer*
 ├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot headless capture + --fly + --introspect
-├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, 29 showcases)
+├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, 32 showcases)
 ├── tests/                      Pure unit tests (math/ecs/render_graph/scene_io/commands/anim/physics/
 │   │                           runtime/editor/volumetric/probe/taa/frustum/gpu_cull/parallel_record/
-│   │                           shader_graph/runtime_material/roll_game/introspect/live_editor/...) + rhi_smoke
-│   ├── golden/metal/           The 29 committed Metal goldens
-│   └── golden/introspect/      The engine-state JSON golden (default_scene.json)
-├── scripts/verify.ps1          Cross-platform gate: Windows ctest + JSON golden + Mac 29-golden compare
+│   │                           shader_graph/runtime_material/roll_game/introspect/live_editor/text/...) + rhi_smoke
+│   ├── golden/metal/           The 32 committed Metal goldens
+│   ├── golden/introspect/      The engine-state JSON golden (default_scene.json)
+│   └── golden/audio/           The audio WAV golden (scene.wav, from --audio-render)
+├── scripts/verify.ps1          Cross-platform gate: Windows ctest + JSON + audio goldens + Mac 32-golden compare
 ├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
 └── docs/                       ARCHITECTURE.md + per-slice specs/plans
 ```
@@ -174,7 +185,7 @@ conan install . -of=build/windows-msvc-debug `
 # 2. Configure + build + test (from a VS x64 developer shell):
 cmake --preset windows-msvc-debug
 cmake --build --preset windows-msvc-debug
-ctest --preset windows-msvc-debug          # 30 tests
+ctest --preset windows-msvc-debug          # 32 tests
 
 # 3. AddressSanitizer build of the pure-C++ core + tests:
 conan install . -of=build/windows-msvc-asan `
@@ -192,7 +203,7 @@ ctest --preset windows-msvc-asan
 ```sh
 cmake -S metal_headless -B build-metal -G Ninja
 cmake --build build-metal          # also generates *.gen.metal from the HLSL
-./build-metal/visual_test out.png  # default scene (one of 29 showcase flags)
+./build-metal/visual_test out.png  # default scene (one of 32 showcase flags)
 ```
 
 ### Full cross-platform verification (one command)
@@ -201,7 +212,7 @@ cmake --build build-metal          # also generates *.gen.metal from the HLSL
 scripts\verify.ps1
 ```
 
-Runs the Windows/Vulkan ctest (plus the engine-state JSON-golden byte match) locally and drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 29** Metal goldens at threshold `0.0`. Prints a per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
+Runs the Windows/Vulkan ctest (plus the engine-state JSON-golden and audio-WAV-golden byte matches) locally and drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 32** Metal goldens at threshold `0.0`. Prints a per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
 
 ---
 
@@ -239,7 +250,11 @@ The same scenes render on both backends. On **Vulkan** (Windows sample), each is
 | multithreaded record| `--mt-shot out.bmp [--workers N]`  | `--mt out.png`                     |
 | material graph      | `--material-shot out.bmp`          | `--material out.png`               |
 | material (live compile) | `--material-live-shot out.bmp [mat.json]` | `--material2 out.png`     |
+| multi-material scene | `--material-multi-shot out.bmp`   | `--material-multi out.png`         |
 | game sample         | `--game-shot out.bmp`              | `--game out.png`                   |
+| text / HUD overlay  | `--hud-shot out.bmp`               | `--hud out.png`                    |
+| game + score HUD    | `--game-hud-shot out.bmp`          | `--game-hud out.png`               |
+| audio render (WAV)  | `--audio-render out.wav`           | *(pure hf_core; same bytes)*       |
 | engine-state JSON   | `--introspect out.json`            | *(pure hf_core; same bytes)*       |
 | live viewport       | `--fly` (WASD + mouse-look)        | `--fly` (windowed Metal viewport)  |
 
