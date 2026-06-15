@@ -43,6 +43,7 @@
 #include "render/render_graph.h"
 #include "render/csm.h"     // Slice AD: cascaded-shadow split + per-cascade ortho fit (pure math)
 #include "render/spot.h"    // Slice AE: spot-light perspective shadow projection + cone (pure math)
+#include "render/point_shadow.h" // Slice AF: omnidirectional point-light 6-face cube shadow (pure math)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
@@ -3813,8 +3814,228 @@ static int RunSpotShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Omnidirectional point-light shadow showcase (Slice AF). Mirrors the Vulkan --point-shadow-shot
+// path: a point light hovers among a RING of cubes/spheres on a ground plane with a back wall,
+// casting shadows RADIALLY OUTWARD in every direction. The scene is rendered from the light through
+// 6 cube faces (Perspective 90deg, aspect 1) into ONE 3072 shadow ATLAS (3x2 grid of 1024 tiles via
+// SetViewport per face), then shaded by lit_point (dominant-axis face select + per-face atlas PCF +
+// distance falloff). Renders into an offscreen RT then blits (post) like the others. -------------
+static int RunPointShadowShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace ptns = hf::render::point_shadow;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Point FrameData layout (matches shaders/lit_point.frag). 608 bytes.
+    struct PointFrameData {
+        float viewProj[16];
+        float lightDir[4];
+        float lightColor[4];
+        float viewPos[4];
+        float faceVP[6][16];
+        float ptPos[4];
+        float ptColor[4];
+        float atlasParams[4];
+        float camFwd[4];
+        float camRight[4];
+        float camUp[4];
+        float skyParams[4];
+    };
+    static_assert(sizeof(PointFrameData) == 608, "Point FrameData layout");
+
+    const uint32_t kAtlas    = 3072;
+    const uint32_t kTile     = 1024;
+    const int   kTilesPerRow = 3;
+    const int   kTilesPerCol = 2;
+    const float kPtNear  = 0.1f,  kPtRange = 30.0f;
+    const Vec3  kPtPos{0.0f, 3.0f, 0.0f};
+
+    auto litVs   = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto ptFs    = loadMSL("lit_point.frag.gen.metal", "point_fragment");
+    auto shVs    = loadMSL("shadow_csm.vert.gen.metal", "csm_shadow_vertex");
+
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = ptFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+    shDesc.pushConstantSize = sizeof(float) * 32;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowAtlas = device->CreateShadowMap(kAtlas);
+    device->SetShadowMap(*shadowAtlas);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    const Mat4 groundModel = Mat4::Scale({40.0f, 1.0f, 40.0f});
+    const Mat4 wallModel = Mat4::Translate({0.0f, 4.0f, -9.0f}) * Mat4::Scale({12.0f, 8.0f, 0.5f});
+    struct Caster { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+    std::vector<Caster> casters;
+    auto box = [&](float x, float z, float s, float rot) {
+        casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::RotateY(rot) * Mat4::Scale({s,s,s}),
+                           &cube, 0.0f, 0.8f});
+    };
+    auto ball = [&](float x, float z, float s) {
+        casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s,s,s}), &sphere, 0.05f, 0.45f});
+    };
+    box( 4.5f,  0.0f, 1.2f,  0.4f);
+    box(-4.5f,  0.0f, 1.2f, -0.4f);
+    ball( 0.0f,  4.5f, 1.3f);
+    ball( 0.0f, -4.5f, 1.3f);
+    box( 3.2f,  3.2f, 1.1f,  0.8f);
+    box(-3.2f,  3.2f, 1.1f, -0.8f);
+    ball( 3.2f, -3.2f, 1.1f);
+    ball(-3.2f, -3.2f, 1.1f);
+
+    const Vec3 eye{0.0f, 9.0f, 13.0f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float fovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+    Vec3 fwd   = math::normalize(center - eye);
+    Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+    Vec3 up3   = math::cross(right, fwd);
+    const float tanHalf = std::tan(0.5f * fovY);
+
+    // 6 cube-face view-projs; Metal flips clip-space Y so the lit_point V-flip matches.
+    std::array<Mat4, ptns::kFaces> faceVPs;
+    for (int fi = 0; fi < ptns::kFaces; ++fi)
+        faceVPs[fi] = FlipProjY(ptns::FaceViewProj(kPtPos, fi, kPtNear, kPtRange));
+
+    PointFrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+        for (int fi = 0; fi < ptns::kFaces; ++fi)
+            for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+        Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+        fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+        fd.lightColor[0]=0.13f; fd.lightColor[1]=0.14f; fd.lightColor[2]=0.17f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.ptPos[0]=kPtPos.x; fd.ptPos[1]=kPtPos.y; fd.ptPos[2]=kPtPos.z; fd.ptPos[3]=kPtRange;
+        fd.ptColor[0]=1.0f; fd.ptColor[1]=0.93f; fd.ptColor[2]=0.82f; fd.ptColor[3]=14.0f;
+        fd.atlasParams[0]=(float)kTilesPerRow; fd.atlasParams[1]=(float)kTilesPerCol;
+        fd.atlasParams[2]=1.0f/(float)kAtlas;   fd.atlasParams[3]=kPtNear;
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.skyParams[0]=tanHalf; fd.skyParams[1]=aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "pointAtlas", render::RgResourceKind::ShadowMap, *shadowAtlas);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("pointShadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(PointFrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*shadowPipeline);
+            for (int face = 0; face < ptns::kFaces; ++face) {
+                auto tile = ptns::FaceTile(face);
+                cmd.SetViewport((int32_t)(tile.col * kTile), (int32_t)(tile.row * kTile), kTile, kTile);
+                auto drawOne = [&](const Mat4& model, const scene::Mesh& mesh) {
+                    float pc[32];
+                    for (int k=0;k<16;++k) pc[k] = faceVPs[face].m[k];
+                    for (int k=0;k<16;++k) pc[16+k] = model.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(mesh.vertices());
+                    cmd.BindIndexBuffer(mesh.indices());
+                    cmd.DrawIndexed(mesh.indexCount());
+                };
+                drawOne(groundModel, plane);
+                drawOne(wallModel, cube);
+                for (const auto& ca : casters) drawOne(ca.model, *ca.mesh);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("pointScene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(PointFrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.03f, 0.04f, 0.06f, 1});
+            cmd.BindPipeline(*litPipeline);
+            auto drawLit = [&](const Mat4& model, const scene::Mesh& mesh, float metallic, float rough) {
+                float pc[20];
+                for (int k=0;k<16;++k) pc[k] = model.m[k];
+                pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(mesh.vertices());
+                cmd.BindIndexBuffer(mesh.indices());
+                cmd.DrawIndexed(mesh.indexCount());
+            };
+            cmd.BindMaterial(*groundTex, *flatNormal);
+            drawLit(groundModel, plane, 0.0f, 0.9f);
+            drawLit(wallModel, cube, 0.0f, 0.9f);
+            for (const auto& ca : casters) drawLit(ca.model, *ca.mesh, ca.metallic, ca.rough);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — point light: 6-face cube, %u atlas (%dx%d tiles), %zu casters\n",
+                outPath, cw, ch, kAtlas, kTilesPerRow, kTilesPerCol, casters.size());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
+        // --point-shadow <out.png>: omnidirectional point-light 6-face cube shadow showcase (Slice AF).
+        if (argc > 1 && std::strcmp(argv[1], "--point-shadow") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_point_shadow.png";
+            try { return RunPointShadowShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
         // --spot <out.png>: spot-light perspective shadow showcase (Slice AE).
         if (argc > 1 && std::strcmp(argv[1], "--spot") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_spot.png";

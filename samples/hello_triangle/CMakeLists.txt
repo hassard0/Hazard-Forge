@@ -18,6 +18,9 @@ hf_compile_shaders(
     # Spot light + perspective spot-light shadow (Slice AE): cone-cut lit fragment + reuse the CSM
     # depth-only caster (spotViewProj in the push constant).
     "shaders/lit_spot.frag.hlsl:ps"
+    # Omnidirectional point-light shadow (Slice AF): 6-face cube atlas lit fragment + reuse the CSM
+    # depth-only caster (per-face view-proj in the push constant).
+    "shaders/lit_point.frag.hlsl:ps"
     "shaders/lit_pbr.frag.hlsl:ps"
     "shaders/lit_pbr_ibl.frag.hlsl:ps"
     "shaders/sky_hdr.frag.hlsl:ps"

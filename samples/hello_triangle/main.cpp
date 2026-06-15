@@ -20,6 +20,7 @@
 #include "render/render_graph.h"
 #include "render/csm.h"
 #include "render/spot.h"
+#include "render/point_shadow.h"
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -199,6 +200,7 @@ int main(int argc, char** argv) {
     const char* capstoneShotPath = nullptr;
     const char* csmShotPath = nullptr;       // --csm-shot <out.bmp> (Slice AD: cascaded shadows)
     const char* spotShotPath = nullptr;      // --spot-shot <out.bmp> (Slice AE: spot-light shadows)
+    const char* pointShotPath = nullptr;     // --point-shadow-shot <out.bmp> (Slice AF: omni point)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -301,6 +303,14 @@ int main(int argc, char** argv) {
             // lit_spot (cone smoothstep + distance falloff + 3x3 PCF spot shadow). One BMP -> exit.
             // New golden; the single-shadow/CSM paths/shaders/goldens are untouched.
             spotShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--point-shadow-shot") == 0 && i + 1 < argc) {
+            // Slice AF: omnidirectional point-light shadow showcase. A point light hovers among a
+            // RING of cubes/spheres on a ground plane with a back wall, casting shadows RADIALLY
+            // OUTWARD in every direction. The scene is rendered from the light through 6 cube faces
+            // (FOV=90, aspect=1) into a 3x2 atlas (1024 tiles in a 3072 map), then shaded by
+            // lit_point (dominant-axis face select + per-face atlas PCF + distance falloff). One BMP
+            // -> exit. New golden; the single-shadow/CSM/spot paths/shaders/goldens are untouched.
+            pointShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--commands") == 0 && i + 1 < argc) {
             commandsPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--camera-shot") == 0 && i + 2 < argc) {
@@ -833,6 +843,225 @@ int main(int argc, char** argv) {
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", spotShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels (spot)\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Omnidirectional point-light shadow showcase (--point-shadow-shot, Slice AF). A point
+        // light hovers a few units above a ground plane, surrounded by a RING of cubes and spheres at
+        // different azimuths plus a back wall, so it casts shadows RADIALLY OUTWARD in every direction
+        // (objects on the left shadow leftward, right ones rightward, front/back too). The scene is
+        // rendered from the light through 6 cube faces (Perspective 90deg, aspect 1) into ONE 3072
+        // shadow ATLAS — a 3x2 grid of 1024 tiles — via SetViewport per face (exactly like CSM's N
+        // cascades). The scene is then shaded by lit_point: per-fragment dominant-axis face selection
+        // + that face's atlas-tile PCF + distance falloff. A DIM directional fill keeps shadows from
+        // pure black. One BMP -> exit. The single-shadow/CSM/spot paths/shaders/goldens are untouched.
+        if (pointShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace ptns = hf::render::point_shadow;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- Point FrameData layout (matches shaders/lit_point.frag). 608 bytes < kFrameUboSize. ---
+            struct PointFrameData {
+                float viewProj[16];     //   0
+                float lightDir[4];      //  64  dim directional fill
+                float lightColor[4];    //  80
+                float viewPos[4];       //  96
+                float faceVP[6][16];    // 112  6 face view-projs (384B) -> ends 496
+                float ptPos[4];         // 496  xyz pos, w=range
+                float ptColor[4];       // 512  rgb color, w=intensity
+                float atlasParams[4];   // 528  x=tilesPerRow, y=tilesPerCol, z=1/atlasSize, w=near
+                float camFwd[4];        // 544
+                float camRight[4];      // 560
+                float camUp[4];         // 576
+                float skyParams[4];     // 592
+            };
+            static_assert(sizeof(PointFrameData) == 608, "Point FrameData layout");
+
+            // === Atlas config: 3x2 grid of 1024 tiles in a 3072 square map. ===
+            const uint32_t kAtlas    = 3072;
+            const uint32_t kTile     = 1024;
+            const int   kTilesPerRow = 3;       // 3x2 grid -> 6 faces
+            const int   kTilesPerCol = 2;
+            const float kPtNear  = 0.1f;
+            const float kPtRange = 30.0f;
+            const Vec3  kPtPos{0.0f, 3.0f, 0.0f};   // light hovers above the ring center
+
+            // === Shaders. Reuse lit.vert + the CSM depth-only caster (faceVP in push const). ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto ptFsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_point.frag.hlsl.spv");
+            auto shVsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_csm.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto litVs    = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto ptFs     = device->CreateShaderModule({std::span<const uint32_t>(ptFsWords)});
+            auto shVs     = device->CreateShaderModule({std::span<const uint32_t>(shVsWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = ptFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kSwap;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model mat4 + material(metallic,rough)
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shVs.get(); shDesc.fragment = shadowFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 32;   // faceVP(16) + model(16)
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // === Shadow atlas + meshes + textures. ===
+            auto shadowAtlas = device->CreateShadowMap(kAtlas);
+            device->SetShadowMap(*shadowAtlas);
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // === Scene: ground + a RING of casters around the light + a back wall. The light sits at
+            // the ring center, so each object's shadow points radially AWAY from the center — proving
+            // the 6 cube faces all contribute (left objs shadow left, right right, front/back too). ===
+            const Mat4 groundModel = Mat4::Scale({40.0f, 1.0f, 40.0f});
+            // Back wall behind the ring (-Z), faces +Z so the -Z cube face shadows onto it.
+            const Mat4 wallModel = Mat4::Translate({0.0f, 4.0f, -9.0f}) * Mat4::Scale({12.0f, 8.0f, 0.5f});
+            struct Caster { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+            std::vector<Caster> casters;
+            auto box = [&](float x, float z, float s, float rot) {
+                casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::RotateY(rot)
+                                   * Mat4::Scale({s, s, s}), &cube, 0.0f, 0.8f});
+            };
+            auto ball = [&](float x, float z, float s) {
+                casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s}),
+                                   &sphere, 0.05f, 0.45f});
+            };
+            // Ring at radius ~4.5 around the light's ground projection (0,0). Each object casts its
+            // shadow outward along its own azimuth -> different cube faces.
+            box( 4.5f,  0.0f, 1.2f,  0.4f);   // +X  -> +X face
+            box(-4.5f,  0.0f, 1.2f, -0.4f);   // -X  -> -X face
+            ball( 0.0f,  4.5f, 1.3f);          // +Z
+            ball( 0.0f, -4.5f, 1.3f);          // -Z
+            box( 3.2f,  3.2f, 1.1f,  0.8f);   // +X+Z diagonal
+            box(-3.2f,  3.2f, 1.1f, -0.8f);   // -X+Z
+            ball( 3.2f, -3.2f, 1.1f);          // +X-Z
+            ball(-3.2f, -3.2f, 1.1f);          // -X-Z
+
+            // === Fixed deterministic camera looking down at the ring from the +Z+Y front. ===
+            const Vec3 eye{0.0f, 9.0f, 13.0f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            const float fovY = 1.04719755f;  // 60deg
+            Vec3 fwd   = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+            Vec3 up3   = math::cross(right, fwd);
+            const float tanHalf = std::tan(0.5f * fovY);
+
+            // === 6 cube-face view-projs (Vulkan clip space; the shader's V-flip is MSL-only). ===
+            auto faceVPs = ptns::FaceViewProjs(kPtPos, kPtNear, kPtRange);
+
+            PointFrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int fi = 0; fi < ptns::kFaces; ++fi)
+                    for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+                // DIM directional fill (the point light dominates).
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+                fd.lightColor[0]=0.13f; fd.lightColor[1]=0.14f; fd.lightColor[2]=0.17f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.ptPos[0]=kPtPos.x; fd.ptPos[1]=kPtPos.y; fd.ptPos[2]=kPtPos.z; fd.ptPos[3]=kPtRange;
+                fd.ptColor[0]=1.0f; fd.ptColor[1]=0.93f; fd.ptColor[2]=0.82f; fd.ptColor[3]=14.0f; // intensity
+                fd.atlasParams[0]=(float)kTilesPerRow; fd.atlasParams[1]=(float)kTilesPerCol;
+                fd.atlasParams[2]=1.0f/(float)kAtlas;   fd.atlasParams[3]=kPtNear;
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                fd.skyParams[0]=tanHalf; fd.skyParams[1]=aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "pointAtlas", render::RgResourceKind::ShadowMap, *shadowAtlas);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // --- Shadow pass: clear the atlas once, then for each cube face SetViewport(tile) and draw
+            // every caster (+ ground + wall) with that face's view-proj pushed as a constant. ---
+            graph.AddPass("pointShadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(PointFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    for (int face = 0; face < ptns::kFaces; ++face) {
+                        auto tile = ptns::FaceTile(face);
+                        cmd.SetViewport((int32_t)(tile.col * kTile), (int32_t)(tile.row * kTile),
+                                        kTile, kTile);
+                        auto drawOne = [&](const Mat4& model, const scene::Mesh& mesh) {
+                            float pc[32];
+                            for (int k=0;k<16;++k) pc[k] = faceVPs[face].m[k];
+                            for (int k=0;k<16;++k) pc[16+k] = model.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(mesh.vertices());
+                            cmd.BindIndexBuffer(mesh.indices());
+                            cmd.DrawIndexed(mesh.indexCount());
+                        };
+                        drawOne(groundModel, plane);
+                        drawOne(wallModel, cube);
+                        for (const auto& ca : casters) drawOne(ca.model, *ca.mesh);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // --- Scene pass straight to the swapchain: ground + wall + casters, shaded by lit_point. ---
+            graph.AddPass("pointScene", {rgShadow}, {rgSwap},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(PointFrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.03f, 0.04f, 0.06f, 1});  // dim night sky
+                    cmd.BindPipeline(*litPipeline);
+                    auto drawLit = [&](const Mat4& model, const scene::Mesh& mesh, float metallic,
+                                       float rough) {
+                        float pc[20];
+                        for (int k=0;k<16;++k) pc[k] = model.m[k];
+                        pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(mesh.vertices());
+                        cmd.BindIndexBuffer(mesh.indices());
+                        cmd.DrawIndexed(mesh.indexCount());
+                    };
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    drawLit(groundModel, plane, 0.0f, 0.9f);
+                    drawLit(wallModel, cube, 0.0f, 0.9f);
+                    for (const auto& ca : casters) drawLit(ca.model, *ca.mesh, ca.metallic, ca.rough);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(pointShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — point light: 6-face cube, %ux%u atlas "
+                                    "(%dx%d tiles), %zu casters\n", pointShotPath, cw, ch2, kAtlas,
+                                    kAtlas, kTilesPerRow, kTilesPerCol, casters.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pointShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels (point)\n");
             }
             device->WaitIdle();
             return ok ? 0 : 1;

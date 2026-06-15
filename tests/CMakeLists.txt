@@ -51,6 +51,10 @@ hf_add_pure_test(csm_test)
 # projects to clip center + [0,1] depth; off-axis projects outside the frustum) + cone attenuation
 # smoothstep (1 on-axis, 0 past outer). Pure C++ (render/spot.h, header-only), ASan-eligible.
 hf_add_pure_test(spot_test)
+# Omnidirectional point-light shadows (Slice AF): 6-face cube view-proj (on-axis center projects to
+# clip center + [0,1] depth; behind-a-face projects outside) + dominant-axis face selection +
+# 3x2 tile mapping. Pure C++ (render/point_shadow.h, header-only), ASan-eligible.
+hf_add_pure_test(point_shadow_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
