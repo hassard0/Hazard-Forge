@@ -2,7 +2,7 @@
 
 A C++20 cross-platform game engine built around a thin, explicit **Rendering Hardware Interface (RHI) seam** that renders natively on **Vulkan (Windows)** and **Apple Metal (macOS, Apple Silicon)** from one codebase. The design is Apple-native and Metal-first in philosophy, with Vulkan as the primary shipping platform; Metal parity is verified headlessly against committed golden images.
 
-> **Status:** Active development — an in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a full PBR/IBL/post-processed scene on a Vulkan RTX GPU (Windows) and on Apple Metal (M4, macOS), verified by **15 deterministic golden-image regression tests** that must each diff `0.0000`. Roughly slices A–AB have shipped — PBR materials, image-based lighting, HDR bloom, SSAO, alpha-blended transparency, glTF scene-graph import, skeletal animation + blending, rigid-body physics, GPU instancing, compute particles, immediate-mode debug visualization, an interactive runtime (fixed-timestep loop + flyable camera), and an editor layer (ray-cast selection + transform gizmos).
+> **Status:** Active development — an in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a full PBR/IBL/post-processed scene on a Vulkan RTX GPU (Windows) and on Apple Metal (M4, macOS), verified by **20 deterministic golden-image regression tests** that must each diff `0.0000`. Roughly slices A–AH have shipped — PBR materials, image-based lighting, HDR bloom, SSAO, alpha-blended transparency, glTF scene-graph import, skeletal animation + blending, rigid-body physics, GPU instancing, compute particles, immediate-mode debug visualization, an interactive runtime (fixed-timestep loop + flyable camera), an editor layer (ray-cast selection + transform gizmos), a full shadow set (cascaded shadow maps, spot-light shadows, omnidirectional point-light cube shadows), clustered/Forward+ lighting, and screen-space reflections.
 
 ---
 
@@ -14,7 +14,7 @@ The central bet: **one engine layer above a clean seam, two GPU backends below i
 
 ---
 
-## Features (shipped, slices A–AB)
+## Features (shipped, slices A–AH)
 
 ### Rendering
 
@@ -23,6 +23,11 @@ The central bet: **one engine layer above a clean seam, two GPU backends below i
 - **PBR materials** — full glTF metallic-roughness Cook-Torrance shading: base color, metallic-roughness, tangent-space normal mapping, emissive, and ambient occlusion, bound as a 5-texture material set.
 - **Image-based lighting** — both a lightweight **procedural** sky-color IBL and real **HDR equirectangular** environment IBL (`assets/env/env.hdr`, CPU box-prefiltered mip chain → roughness-aware specular + diffuse irradiance).
 - **Directional shadow mapping (PCF)** — depth-only pass into a 2048² shadow map; 3×3 PCF in the lit shaders; `Mat4::Ortho` light projection. Static, skinned, and instanced shadow pipelines.
+- **Cascaded shadow maps (CSM)** — the directional light's frustum is split into N cascades (increasing splits over `(near, far]`), each fit to a tight ortho volume and rendered into one tile of a shadow atlas via `SetViewport`. The lit shaders select a cascade per fragment by view depth. `render/csm.h` is header-only and unit-tested (frustum split + per-cascade ortho fit).
+- **Spot lights + spot shadows** — a perspective spot-light shadow (`render/spot.h`: `spotViewProj` projection + cone attenuation smoothstep), depth-rendered into the shadow atlas and PCF-sampled in the lit pass.
+- **Omnidirectional point-light shadows** — a 6-face cube shadow atlas (`render/point_shadow.h`: per-face cube view-proj, dominant-axis face selection, 3×2 tile mapping) so a point light casts shadows in every direction. Rendered into six atlas tiles via `SetViewport`.
+- **Clustered / Forward+ lighting** — the view frustum is divided into a 3D cluster grid (exponential z-slices); each cluster gets the list of lights whose sphere overlaps it (`render/clustered.h`: `BuildClusters` → per-cluster offset/count + a flat light-index list). The lit pass reads the cluster set (set 3, storage buffers) and shades only the lights touching its cluster, scaling to **hundreds** of lights. Proven **byte-identical to brute-force** shading by golden (`clustered`, 192 lights).
+- **Screen-space reflections (SSR)** — a depth-marched SSR pass (`render/ssr.h`: view↔screen projection round-trip + view-space reflection ray) reflects the scene off a reflective floor by ray-marching the depth buffer, with the Vulkan/Metal yFlip handled in the projection.
 - **Multi-pass post-processing** — fullscreen pass with FXAA, exposure, ACES tonemap, cinematic grade, film grain, and vignette.
 - **HDR bloom** — render into an `RGBA16_Float` target, soft-knee threshold bright-pass, a 5-level downsample mip chain (13-tap dual filter), tent-filter upsample/combine, and a composite that tonemaps.
 - **SSAO** — view-space normal+depth g-buffer prepass, a 16-sample hemisphere-kernel AO pass (baked kernel + noise, no runtime RNG), a box blur, and a composite that multiplies the lit scene by the blurred AO (contact AO).
@@ -44,14 +49,14 @@ The central bet: **one engine layer above a clean seam, two GPU backends below i
 - **Editor layer** — ray-cast **selection** (`editor::picking`: `ScreenRayThroughCamera`, `PickNearest`), transform **gizmos** (`editor::gizmo`: translate/rotate/scale axis math + `ApplyDrag`), and play/pause/step. The selection/gizmo math is pure C++ and unit-tested; live mouse-drag manipulation is Windows/Vulkan `--fly` only and is manual — the **goldens + unit tests prove the math under it**.
 - **Immediate-mode debug visualization** — `debug::DebugDraw` collects grids / AABBs / wire spheres / arrows / contact markers into a LINE_LIST and draws them in one call through a debug-line pipeline (`depthTest=true, depthWrite=false`).
 - **Headless GPU capture** — `CaptureNextFrame()` / `GetCapturedPixels()`: render a frame, read pixels back from the GPU, write a PNG/BMP. No visible desktop required — the primary verification path.
-- **Cross-platform verification** — `scripts/verify.ps1` runs the Windows/Vulkan ctest **and** drives the bench Mac over SSH to build `metal_headless` and golden-compare all 15 Metal goldens at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
+- **Cross-platform verification** — `scripts/verify.ps1` runs the Windows/Vulkan ctest **and** drives the bench Mac over SSH to build `metal_headless` and golden-compare all 20 Metal goldens at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
 - **AddressSanitizer** — an opt-in `HF_SANITIZE=address` build (`windows-msvc-asan` preset) instruments the backend-agnostic core (`hf_core`) and the pure-C++ unit tests so they run clean under MSVC `/fsanitize=address`.
 
-**Metal parity status:** The Metal backend renders **every** showcase headless on Apple Silicon (M4) and is verified against a committed golden at `DIFF 0.0000` for all 15 scenes (see below). The Metal shaders are **generated from the shared HLSL** at build time (HLSL → SPIR-V via `glslc` → MSL via `spirv-cross`), so there is no hand-written MSL to drift. The remaining gap is intentional and documented: the live **windowed** present loop (interactive viewport + mouse-drag editing) is Vulkan/Windows only; Metal is headless-offscreen-verified.
+**Metal parity status:** The Metal backend renders **every** showcase headless on Apple Silicon (M4) and is verified against a committed golden at `DIFF 0.0000` for all 20 scenes (see below). The Metal shaders are **generated from the shared HLSL** at build time (HLSL → SPIR-V via `glslc` → MSL via `spirv-cross`), so there is no hand-written MSL to drift. The remaining gap is intentional and documented: the live **windowed** present loop (interactive viewport + mouse-drag editing) is Vulkan/Windows only; Metal is headless-offscreen-verified.
 
 ---
 
-## The 15 Metal goldens
+## The 20 Metal goldens
 
 Each is produced by a distinct `metal_headless/visual_test` flag and compared against `tests/golden/metal/<name>.png` at threshold `0.0` (deterministic — two runs diff `0.0000`):
 
@@ -72,6 +77,11 @@ Each is produced by a distinct `metal_headless/visual_test` flag and compared ag
 | `capstone`        | `--capstone`                  | integrated scene: every feature in one frame (Slice Z)    |
 | `camera_pose`     | `--camera 0.2,-0.1,0,3,10`    | scripted runtime-camera pose (Slice AA)                   |
 | `gizmo`           | `--gizmo 2`                   | editor selection + transform gizmo (Slice AB)             |
+| `csm`             | `--csm`                       | cascaded shadow maps over a receding plane (Slice AD)     |
+| `spot`            | `--spot`                      | spot light + perspective spot shadow (Slice AE)           |
+| `point_shadow`    | `--point-shadow`              | omnidirectional point-light 6-face cube shadows (Slice AF)|
+| `clustered`       | `--clustered`                 | clustered/Forward+ lighting, 192 lights, byte-identical to brute force (Slice AG) |
+| `ssr`             | `--ssr`                       | screen-space reflections off a reflective floor (Slice AH)|
 
 ---
 
@@ -102,7 +112,7 @@ hazard-forge/
 │   ├── rhi/                    THE SEAM — pure interfaces, zero backend symbols
 │   ├── rhi_vulkan/             Vulkan backend (vk-bootstrap, VMA, Vulkan 1.3 dynamic rendering)
 │   ├── rhi_metal/              Metal backend (Obj-C++/ARC, runtime MSL compile)
-│   ├── render/                 RenderGraph
+│   ├── render/                 RenderGraph + csm / spot / point_shadow / clustered / ssr (header-only math)
 │   ├── scene/                  Vertex, Transform, Mesh, Renderable, scene_io, commands, instancing
 │   ├── asset/                  glTF loader + scene-graph import + HDR env loader
 │   ├── anim/                   skeleton + animation sampling + blending
@@ -112,11 +122,11 @@ hazard-forge/
 │   └── debug/                  DebugDraw collector + emitters
 ├── shaders/                    Shared HLSL (lit/pbr/ibl/shadow/post/bloom/ssao/sky/...) → SPIR-V & MSL
 ├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot headless capture + --fly
-├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, 15 showcases)
+├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, 20 showcases)
 ├── tests/                      Pure unit tests (math/ecs/render_graph/scene_io/commands/anim/
 │   │                           physics/runtime/editor/...) + rhi_smoke + golden/metal/*.png
-│   └── golden/metal/           The 15 committed Metal goldens
-├── scripts/verify.ps1          Cross-platform gate: Windows ctest + Mac 15-golden compare
+│   └── golden/metal/           The 20 committed Metal goldens
+├── scripts/verify.ps1          Cross-platform gate: Windows ctest + Mac 20-golden compare
 ├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
 └── docs/                       ARCHITECTURE.md + per-slice specs/plans
 ```
@@ -138,7 +148,7 @@ conan install . -of=build/windows-msvc-debug `
 # 2. Configure + build + test (from a VS x64 developer shell):
 cmake --preset windows-msvc-debug
 cmake --build --preset windows-msvc-debug
-ctest --preset windows-msvc-debug          # 13 tests
+ctest --preset windows-msvc-debug          # 18 tests
 
 # 3. AddressSanitizer build of the pure-C++ core + tests:
 conan install . -of=build/windows-msvc-asan `
@@ -165,7 +175,7 @@ cmake --build build-metal          # also generates *.gen.metal from the HLSL
 scripts\verify.ps1
 ```
 
-Runs the Windows/Vulkan ctest locally and drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 15** Metal goldens at threshold `0.0`. Prints a per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
+Runs the Windows/Vulkan ctest locally and drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 20** Metal goldens at threshold `0.0`. Prints a per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
 
 ---
 
@@ -190,6 +200,11 @@ The same scenes render on both backends. On **Vulkan** (Windows sample), each is
 | capstone            | `--capstone-shot out.bmp`          | `--capstone out.png`               |
 | scripted camera     | `--camera-shot <yaw,pitch,x,y,z> out.bmp` | `--camera <yaw,pitch,x,y,z> out.png` |
 | editor gizmo        | `--gizmo-shot <objIndex> out.bmp`  | `--gizmo <objIndex> out.png`       |
+| cascaded shadows    | `--csm-shot out.bmp`               | `--csm out.png`                    |
+| spot-light shadows  | `--spot-shot out.bmp`              | `--spot out.png`                   |
+| point shadows       | `--point-shadow-shot out.bmp`      | `--point-shadow out.png`           |
+| clustered lighting  | `--clustered-shot out.bmp`         | `--clustered out.png`              |
+| screen-space reflections | `--ssr-shot out.bmp`          | `--ssr out.png`                    |
 | live viewport       | `--fly` (WASD + mouse-look)        | *(Vulkan/Windows only)*            |
 
 ---

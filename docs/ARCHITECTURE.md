@@ -24,7 +24,7 @@ ITexture          — device-local image + sampler descriptor (base for render t
 IRenderTarget     — sampleable offscreen color (+depth) image; inherits ITexture
 ```
 
-`GraphicsPipelineDesc` is a small, flat descriptor that encodes what the pipeline needs to know about shaders, vertex layout, depth, push constants, descriptor set membership, and a set of mode flags that has grown additively slice by slice — `fullscreen`, `depthOnly`, `pbrMaterial`, `usesEnvironment`, `usesJointPalette`, `depthWrite`, `alphaBlend`, `cullNone`, `lineList`, `fragmentPushConstants` — all in terms of engine-defined enums and types, no backend types. Every new flag **defaults to the value that leaves all pre-existing pipelines byte-for-byte unchanged**, which is what keeps the committed goldens stable as features land.
+`GraphicsPipelineDesc` is a small, flat descriptor that encodes what the pipeline needs to know about shaders, vertex layout, depth, push constants, descriptor set membership, and a set of mode flags that has grown additively slice by slice — `fullscreen`, `depthOnly`, `pbrMaterial`, `usesEnvironment`, `usesJointPalette`, `depthWrite`, `alphaBlend`, `cullNone`, `lineList`, `fragmentPushConstants`, `usesLightClusters` — all in terms of engine-defined enums and types, no backend types. Every new flag **defaults to the value that leaves all pre-existing pipelines byte-for-byte unchanged**, which is what keeps the committed goldens stable as features land.
 
 There is also a compute path (`IComputePipeline` + `Dispatch`) used by the GPU particle system, on the same seam.
 
@@ -51,8 +51,11 @@ Hazard Forge uses a **frequency-based descriptor set layout** adopted in Slice D
 | 0 | Per frame | UBO: `viewProj`, directional light, view position, point lights, `lightViewProj`, camera basis for sky; shadow map depth image (binding 1) + shadow sampler (binding 2) |
 | 1 | Per material / per draw | Material textures + samplers. The base set is color + normal; the **PBR** path (`BindMaterialPBR`) widens it to the full 5-texture metallic-roughness set (base / metal-rough / normal / emissive / occlusion). The **environment** (HDR IBL) binds on a dedicated slot via `BindEnvironment` so the base material layouts are unchanged. |
 | 2 | Per skinned draw | Joint palette (skinning), bound via `SetJointPalette` at a dedicated vertex binding. |
+| 3 | Per clustered-lit frame | The clustered/Forward+ light data (Slice AG): the per-cluster `Cluster` array (offset/count) at binding 13, the flat light-index list at binding 14, and the `GpuLight` array at binding 15. Bound via `BindLightClusters` when a pipeline sets `usesLightClusters = true`; otherwise the set is absent and pre-existing pipelines are byte-for-byte unchanged. |
 
 GPU instancing adds a **second per-instance vertex stream** (binding 1, step-per-instance) rather than a descriptor set — four `RGBA32_Float` attributes carry a column-major `float4x4` per instance.
+
+The set-3 cluster set follows the **same dedicated-extra-set pattern** established by the environment (HDR IBL) set and the joint palette: a feature that only some pipelines need binds on its own slot through a single `Bind*` call, so the base material/frame layouts — and therefore every existing golden — are untouched. `BindLightClusters` is the first case of **graphics-stage storage buffers** on the seam: the three set-3 bindings are `STORAGE_BUFFER`s read by the fragment shader (`lit_clustered.frag`), not the uniform buffers used by set 0/1. On Vulkan they are SSBO descriptors; on Metal they map to fragment `[[buffer(13/14/15)]]` via `spirv-cross --msl-decoration-binding` (`engine/rhi_metal/metal_common.h`: `kFragClusterBuf=13`, etc.).
 
 **Set 0** is owned by the device. The device maintains one UBO per frame-in-flight (double-buffered), each with a pre-baked descriptor set that already points at its buffer. `SetFrameUniforms(data, size)` memcpys into the current frame's UBO; `BindPipeline` auto-binds set 0 when the pipeline has `usesFrameUniforms = true`. The CPU never writes a UBO that the GPU is still reading.
 
@@ -66,12 +69,13 @@ When `usesFrameUniforms = false` (the post-processing pipeline), the material se
 
 ## Per-frame UBO growth
 
-The `FrameData` struct (352 bytes at the time of the skybox slice; `kFrameUboSize` is 512) has grown additively across slices:
+The `FrameData` struct (352 bytes at the time of the skybox slice; `kFrameUboSize` was 512) has grown additively across slices:
 
 - Slice D: `viewProj`, `lightDir`, `lightColor`, `viewPos` — basic per-frame camera + directional light
 - Slice H: `ptCount`, `ptPos[3]`, `ptColor[3]` — colored point lights
 - Slice I: `lightViewProj` — directional shadow map light-space matrix
 - Slice J: `camFwd`, `camRight`, `camUp`, `skyParams` — camera basis for sky ray reconstruction
+- Slices AD–AF: the cascaded / spot / point shadow matrices, per-cascade split distances, and the spot/point light parameters — the shadow set's per-frame data. This is what pushed the struct past 512 B, so **`kFrameUboSize` was bumped 512 → 1024** (`engine/rhi_vulkan/vulkan_device.cpp` and `engine/rhi_metal/metal_device.h`, kept in sync); both backends now allocate a 1024-byte per-frame UBO, and `SetFrameUniforms` asserts the upload fits.
 
 The `kFrameUboSize` constant is bumped whenever the struct approaches the current allocation. The C++ `FrameData` struct (mirrored byte-for-byte in `metal_headless/visual_test.mm`) and the HLSL `cbuffer FrameData` in every shader that reads it must be kept in sync by hand — the Metal struct layout is asserted to match the Vulkan sample's. Pass-specific parameters that are NOT per-frame (bloom thresholds, SSAO kernel params, per-object material factors, glass tint/alpha) travel via **push constants**, not the UBO — the vertex push constant carries `mat4 model + float4 material`, and the bloom/SSAO fullscreen passes use the `fragmentPushConstants` flag to read their params in the fragment stage.
 
@@ -106,6 +110,12 @@ Pass 2: Post pass → swapchain
 
 Passes 0 and 1 use dedicated command buffers (`rtCmd_`, `rtPool_`, `rtFence_`) to avoid contention with the per-frame swapchain recorder. Both are submitted synchronously (fence-wait) before the swapchain pass begins, so there are no semaphore dependencies to track.
 
+### Shadow-atlas tiling (`SetViewport`)
+
+The expanded shadow set (Slices AD–AF) renders **many** light-space depth maps per frame — N directional cascades, a spot map, and the six faces of a point light's cube — without allocating N separate depth textures. Instead the depth pass clears one shadow **atlas** once, then for each sub-map calls a new seam entry point, `ICommandBuffer::SetViewport(x, y, w, h)`, to restrict rasterization to that tile before drawing the geometry for that cascade/face. The lit pass samples the right tile by transforming into the corresponding light-space matrix and offsetting into the atlas region.
+
+`SetViewport` is a defaulted no-op on the base interface, so passes and backends that don't tile an atlas are unaffected (the pre-existing single-shadow-map goldens are byte-for-byte unchanged). On Vulkan it records `vkCmdSetViewport`/`vkCmdSetScissor`; on Metal it sets the encoder viewport + scissor rect. The CSM frustum-split + per-cascade ortho fit, the spot `spotViewProj`, and the point-light 6-face cube view-proj + dominant-axis face/tile mapping are all pure, header-only, unit-tested math (`render/csm.h`, `render/spot.h`, `render/point_shadow.h`) — the goldens prove the GPU side, the unit tests prove the math.
+
 ---
 
 ## Headless Capture and Golden-Image Testing
@@ -116,7 +126,7 @@ Headless capture is a first-class RHI feature, not a test harness hack.
 
 The Metal headless target (`metal_headless/visual_test`) uses the same `CaptureNextFrame()` / `GetCapturedPixels()` path, but the "swapchain" is an offscreen `MTLTexture` (no `CAMetalLayer`, no window server). The same `IRHIDevice` / `ICommandBuffer` calls that the Vulkan sample makes drive the Metal backend through the exact same code path.
 
-There are now **15 committed Metal reference renders** under `tests/golden/metal/` (M4, deterministic to byte level — two runs diff `0.0000`), one per `visual_test` showcase flag: `scene_shadow` (default), `skinning`, `pbr_helmet`, `instanced`, `ibl_helmet`, `physics`, `transparency`, `bloom`, `scene_import`, `debug_viz`, `anim_blend`, `ssao`, `capstone`, `camera_pose`, and `gizmo`. `scripts/verify.ps1` (and the self-hosted CI Metal job) build `metal_headless` once and golden-compare **all 15** at threshold `0.0` on every run, so any unintended change to shared shader/render/loader code is caught as a non-zero DIFF on a specific golden.
+There are now **20 committed Metal reference renders** under `tests/golden/metal/` (M4, deterministic to byte level — two runs diff `0.0000`), one per `visual_test` showcase flag: `scene_shadow` (default), `skinning`, `pbr_helmet`, `instanced`, `ibl_helmet`, `physics`, `transparency`, `bloom`, `scene_import`, `debug_viz`, `anim_blend`, `ssao`, `capstone`, `camera_pose`, `gizmo`, `csm`, `spot`, `point_shadow`, `clustered`, and `ssr`. `scripts/verify.ps1` (and the self-hosted CI Metal job) build `metal_headless` once and golden-compare **all 20** at threshold `0.0` on every run, so any unintended change to shared shader/render/loader code is caught as a non-zero DIFF on a specific golden. The `clustered` golden additionally proves the Forward+ light-culling path is **byte-identical to brute-force** shading (192 deterministic lights produce the same image as shading every light per fragment).
 
 ### Shaders are generated, not hand-written
 
@@ -139,7 +149,7 @@ The Metal shaders are **generated from the shared HLSL sources at build time** �
 - **NDC Y-flip (CPU-side).** `hf::math::Perspective` / `Ortho` bake the Vulkan clip-space Y-flip. Metal NDC is +Y up, so `visual_test` flips the projection's and ortho's Y row on the **CPU** before composing view-proj / lightViewProj, rather than flipping in the shader (which would diverge from the shared HLSL). The shared math and Vulkan backend are untouched; only two `#ifdef HF_MSL_GEN`-guarded texture-origin V-flips remain shader-side.
 - **No explicit barriers.** Metal's command encoder model uses implicit hazard tracking; there are no `MTLBlitCommandEncoder` barriers equivalent to Vulkan image layout transitions. The Metal backend omits them.
 - **Frame pacing.** A `dispatch_semaphore_t inFlight_` (initial count = `kFramesInFlight`) blocks `BeginFrame` until the GPU has finished with the oldest in-flight frame's resources, replacing Vulkan's per-frame fence approach.
-- **Full feature parity on Metal, golden-tested.** Offscreen render targets (including `RGBA16_Float` HDR targets for bloom/SSAO), directional shadow mapping (static / skinned / instanced depth-only + PCF), multi-pass post, HDR bloom, SSAO, alpha-blended transparency, GPU instancing, compute particles, skinning, PBR + HDR-IBL materials, and the debug-line pipeline all run on the M4 and are each verified against a committed golden at `DIFF 0.0000` (15 in total). Notable Metal-vs-Vulkan differences: depth bias is set on the encoder (not the PSO); `End*Pass` uses `commit + waitUntilCompleted` in place of Vulkan's barrier+fence; LINE_LIST topology is selected at draw time. The remaining intentional gap is the **windowed present loop** (interactive viewport + mouse-drag editing), which is Vulkan/Windows only; Metal is headless-offscreen-verified.
+- **Full feature parity on Metal, golden-tested.** Offscreen render targets (including `RGBA16_Float` HDR targets for bloom/SSAO), directional shadow mapping (static / skinned / instanced depth-only + PCF), cascaded shadow maps, spot-light shadows, omnidirectional point-light cube shadows (all atlas-tiled via `SetViewport`), clustered/Forward+ lighting (set-3 fragment storage buffers via `BindLightClusters`), screen-space reflections, multi-pass post, HDR bloom, SSAO, alpha-blended transparency, GPU instancing, compute particles, skinning, PBR + HDR-IBL materials, and the debug-line pipeline all run on the M4 and are each verified against a committed golden at `DIFF 0.0000` (20 in total). Notable Metal-vs-Vulkan differences: depth bias is set on the encoder (not the PSO); `End*Pass` uses `commit + waitUntilCompleted` in place of Vulkan's barrier+fence; LINE_LIST topology is selected at draw time; `SetViewport` sets the encoder viewport+scissor; the set-3 cluster storage buffers bind to fragment `[[buffer(13/14/15)]]`. The remaining intentional gap is the **windowed present loop** (interactive viewport + mouse-drag editing), which is Vulkan/Windows only; Metal is headless-offscreen-verified.
 
 ---
 
