@@ -1,5 +1,29 @@
 # Metal golden-image test
 
+## `anim_blend.png` — animation blending (Slice X)
+
+`anim_blend.png` is a SEPARATE golden produced by `visual_test --blend`: the SAME scene/camera/light
+as `--skinning` (ground checkerboard + procedural sky + the GPU-skinned Fox, lit + shadowed), but the
+joint palette is a **50/50 cross-clip blend** of the Fox's `"Walk"` (t=0.3s) and `"Run"` (t=0.2s)
+clips instead of a single-clip sample. The blend is pure CPU-side C++ in `hf::anim`: each clip is
+sampled into a local pose (`SampleLocalPose`), the two poses are blended per joint
+(`BlendLocalPoses`: lerp translation/scale, slerp rotation), and the blended pose is composed into the
+matrix palette (`PaletteFromLocalPose`) — `BlendAnimations` chains these. NO RHI/backend/shader change:
+it feeds the existing skinned lit + shadow pipeline exactly like `--skinning`. The blended pose is a
+clearly intermediate four-legged locomotion stance, visibly distinct from either pure clip and from
+the near-static `"Survey"` pose used by `--skinning`. Deterministic — two `--blend` runs diff `0.0000`.
+This golden is INDEPENDENT of all the others; the `SampleAnimation` refactor that introduced the
+local-pose step is byte-identical, so `skinning.png` (and every other golden) still diffs `0.0000`.
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --blend /tmp/blend.png
+~/mac-remote-rig/compare.sh tests/golden/metal/anim_blend.png /tmp/blend.png 0.0   # -> DIFF 0.0000
+```
+
+---
+
 ## `debug_viz.png` — immediate-mode debug visualization (Slice W)
 
 `debug_viz.png` is a SEPARATE golden produced by `visual_test --debug`: the SAME settled physics
