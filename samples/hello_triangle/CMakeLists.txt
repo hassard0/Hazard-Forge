@@ -41,6 +41,14 @@ hf_compile_shaders(
     # FrameData.viewProj, flat per-vertex color. LINE_LIST topology.
     "shaders/debug_line.vert.hlsl:vs"
     "shaders/debug_line.frag.hlsl:ps"
+    # SSAO chain (Slice Y): view-space normal+linear-depth g-buffer prepass (static + instanced
+    # vertex variants + shared fragment), hemisphere-kernel AO pass, box blur, and composite/apply.
+    "shaders/gbuffer.vert.hlsl:vs"
+    "shaders/gbuffer_instanced.vert.hlsl:vs"
+    "shaders/gbuffer.frag.hlsl:ps"
+    "shaders/ssao.frag.hlsl:ps"
+    "shaders/ssao_blur.frag.hlsl:ps"
+    "shaders/ssao_composite.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

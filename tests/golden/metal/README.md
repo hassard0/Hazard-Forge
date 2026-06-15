@@ -1,5 +1,33 @@
 # Metal golden-image test
 
+## `ssao.png` — screen-space ambient occlusion (Slice Y)
+
+`ssao.png` is a SEPARATE golden produced by `visual_test --ssao`: the SAME settled physics
+sphere-pyramid scene as `--physics` (ground checkerboard + procedural sky + the 30 resting spheres,
+lit + shadowed), rendered into an HDR (RGBA16F) target, PLUS classic **screen-space ambient
+occlusion**. A dedicated **g-buffer prepass** (`gbuffer.vert`/`gbuffer_instanced.vert` +
+`gbuffer.frag`) writes the **view-space normal (xyz) + view-space linear depth (w)** into an RGBA16F
+target; an **SSAO pass** (`ssao.frag`) reconstructs each pixel's view-space position from the linear
+depth + projection params (no matrix inverse), orients a baked **16-sample hemisphere kernel** to the
+surface via a TBN from a tiled rotation noise (kernel + noise are BAKED CONSTANTS — no runtime RNG),
+samples neighbour depths with a smooth range check, and writes an AO factor; a **4×4 box blur**
+(`ssao_blur.frag`) removes the kernel noise; and a **composite** (`ssao_composite.frag`) multiplies
+the lit scene by the blurred AO then applies the same exposure/ACES/grade/vignette as `post.frag`.
+The AO visibly darkens the contact crevices where spheres touch each other and the ground while flat
+open surfaces stay bright — localized contact AO, not a global dim. SEPARATE pipelines + shaders; no
+existing pipeline/shader/golden is touched. Deterministic — two `--ssao` runs diff `0.0000`.
+
+Re-bake / validate the same way as the others:
+
+```sh
+./build-metal/visual_test --ssao /tmp/ssao.png
+~/mac-remote-rig/compare.sh tests/golden/metal/ssao.png /tmp/ssao.png 0.0   # -> DIFF 0.0000
+# Compare on/off:
+./build-metal/visual_test --ssao-off /tmp/ssao_off.png
+```
+
+---
+
 ## `anim_blend.png` — animation blending (Slice X)
 
 `anim_blend.png` is a SEPARATE golden produced by `visual_test --blend`: the SAME scene/camera/light

@@ -1735,6 +1735,346 @@ static int RunPhysicsShowcase(const char* outPath) {
     return 0;
 }
 
+// --- SSAO showcase (Slice Y). Mirrors the Vulkan --ssao-shot path: the SAME settled physics
+// sphere-pyramid scene rendered into an HDR (RGBA16F) target, PLUS classic screen-space ambient
+// occlusion — a view-space normal+linear-depth g-buffer prepass, a 16-sample baked-hemisphere-kernel
+// AO pass, a box blur, and a composite that MULTIPLIES the lit scene by the blurred AO (then the
+// usual exposure/ACES/grade/vignette). aoOn=true applies AO; aoOn=false renders the same scene with
+// AO forced off through the IDENTICAL composite. SEPARATE gbuffer/ssao/blur/composite pipelines +
+// shaders; existing pipelines/shaders/goldens untouched. -----------------------------------------
+static int RunSsaoShowcase(const char* outPath, bool aoOn = true) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Build + settle the pyramid (identical scenario + step budget to the Vulkan path).
+    physics::World world;
+    const float R = 0.5f;
+    const int kLayers = 4;
+    const float d = 2.0f * R;
+    const float dy = R * 1.41421356f;
+    for (int k = 0; k < kLayers; ++k) {
+        int m = kLayers - k;
+        float off = 0.5f * (float)(m - 1) * d;
+        float y = R + (float)k * dy;
+        for (int gx = 0; gx < m; ++gx)
+            for (int gz = 0; gz < m; ++gz) {
+                float x = (float)gx * d - off;
+                float z = (float)gz * d - off;
+                world.bodies.push_back(physics::MakeDynamicSphere({x, y + 0.01f, z}, R));
+            }
+    }
+    const float dt = 1.0f / 120.0f;
+    for (int s = 0; s < 240; ++s) world.Step(dt);
+
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(world.bodies.size());
+    for (const auto& b : world.bodies) {
+        Mat4 m = b.Transform();
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // Lit scene pipelines (writing the HDR RT) — UNCHANGED lit shaders.
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = kHdr;
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Shadow pipelines (UNCHANGED).
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky (writing HDR RT) — UNCHANGED.
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // NEW: g-buffer prepass pipelines (static + instanced), RGBA16F view-space normal + linear depth.
+    auto gbVs   = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbInVs = loadMSL("gbuffer_instanced.vert.gen.metal", "gbuffer_instanced_vertex");
+    auto gbFs   = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    rhi::GraphicsPipelineDesc gbInDesc;
+    gbInDesc.vertex = gbInVs.get(); gbInDesc.fragment = gbFs.get();
+    gbInDesc.vertexLayout = scene::MeshVertexLayout();
+    gbInDesc.instanceLayout = scene::InstanceTransformLayout();
+    gbInDesc.colorFormat = kHdr;
+    gbInDesc.depthTest = true; gbInDesc.usesFrameUniforms = true;
+    gbInDesc.pushConstantSize = sizeof(float) * 16;   // view(16)
+    auto gbInstPipeline = device->CreateGraphicsPipeline(gbInDesc);
+
+    // NEW: SSAO + blur + composite fullscreen pipelines (fragment push constants).
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct SsaoParams { float texel[2]; float radius, bias, intensity, tanHalfFovY, aspect, pad; };
+    struct BlurParams { float texel[2]; float pad[2]; };
+    struct SsaoCompParams { float texel[2]; float aoStrength, intensity; };
+
+    auto ssaoFs = loadMSL("ssao.frag.gen.metal", "ssao_fragment");
+    auto blurFs = loadMSL("ssao_blur.frag.gen.metal", "ssao_blur_fragment");
+    auto compFs = loadMSL("ssao_composite.frag.gen.metal", "ssao_composite_fragment");
+
+    rhi::GraphicsPipelineDesc ssaoD;
+    ssaoD.vertex = postVs.get(); ssaoD.fragment = ssaoFs.get();
+    ssaoD.colorFormat = kHdr;
+    ssaoD.depthTest = false; ssaoD.usesTexture = true; ssaoD.fullscreen = true;
+    ssaoD.fragmentPushConstants = true; ssaoD.pushConstantSize = sizeof(SsaoParams);
+    auto ssaoPipe = device->CreateGraphicsPipeline(ssaoD);
+
+    rhi::GraphicsPipelineDesc blurD;
+    blurD.vertex = postVs.get(); blurD.fragment = blurFs.get();
+    blurD.colorFormat = kHdr;
+    blurD.depthTest = false; blurD.usesTexture = true; blurD.fullscreen = true;
+    blurD.fragmentPushConstants = true; blurD.pushConstantSize = sizeof(BlurParams);
+    auto blurPipe = device->CreateGraphicsPipeline(blurD);
+
+    rhi::GraphicsPipelineDesc compD;
+    compD.vertex = postVs.get(); compD.fragment = compFs.get();
+    compD.colorFormat = device->Swapchain().ColorFormat();
+    compD.depthTest = false; compD.usesTexture = true; compD.fullscreen = true;
+    compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(SsaoCompParams);
+    auto compPipe = device->CreateGraphicsPipeline(compD);
+
+    auto rt       = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf     = device->CreateRenderTarget(W, H, kHdr);
+    auto aoRT     = device->CreateRenderTarget(W, H, kHdr);
+    auto aoBlurRT = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    rhi::BufferDesc instBufDesc;
+    instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+    instBufDesc.initialData = instances.data();
+    instBufDesc.usage = rhi::BufferUsage::Vertex;
+    auto instanceBuffer = device->CreateBuffer(instBufDesc);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    const Vec3 eye{6.5f, 4.5f, 7.0f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    SsaoParams sp{};
+    sp.texel[0] = 1.0f / (float)W; sp.texel[1] = 1.0f / (float)H;
+    sp.radius = 0.30f; sp.bias = 0.025f; sp.intensity = 1.6f;
+    sp.tanHalfFovY = std::tan(0.5f * kFovY); sp.aspect = aspect; sp.pad = 0.0f;
+    BlurParams blurP{}; blurP.texel[0] = 1.0f / (float)W; blurP.texel[1] = 1.0f / (float)H;
+    SsaoCompParams cp{}; cp.texel[0] = 1.0f / (float)W; cp.texel[1] = 1.0f / (float)H;
+    cp.aoStrength = aoOn ? 1.0f : 0.0f; cp.intensity = 1.7f;
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgGbuf = graph.ImportTarget(
+        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+    render::RgResource rgAO = graph.ImportTarget(
+        "ao", render::RgResourceKind::SceneColor, *aoRT);
+    render::RgResource rgAOBlur = graph.ImportTarget(
+        "aoBlur", render::RgResourceKind::SceneColor, *aoBlurRT);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.BindPipeline(*instShadowPipeline);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindInstanceBuffer(*instanceBuffer);
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindPipeline(*instPipeline);
+            {
+                float material[4] = {0.1f, 0.5f, 0.0f, 0.0f};
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("gbuffer", {}, {rgGbuf},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*gbStaticPipeline);
+            {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            cmd.BindPipeline(*gbInstPipeline);
+            {
+                cmd.PushConstants(viewM.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("ssao", {rgGbuf}, {rgAO},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+            cmd.BindPipeline(*ssaoPipe);
+            cmd.BindTexture(*gbuf);
+            cmd.PushConstants(&sp, sizeof(sp));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("ssaoBlur", {rgAO}, {rgAOBlur},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+            cmd.BindPipeline(*blurPipe);
+            cmd.BindTexture(*aoRT);
+            cmd.PushConstants(&blurP, sizeof(blurP));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("composite", {rgScene, rgAOBlur}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*compPipe);
+            cmd.BindTexturePair(*rt, *aoBlurRT);
+            cmd.PushConstants(&cp, sizeof(cp));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — SSAO %s, %u bodies\n",
+                outPath, cw, ch, aoOn ? "ON" : "OFF", kInstanceCount);
+    return 0;
+}
+
 // --- Debug-visualization showcase (Slice W). Mirrors the Vulkan --debug-shot path: the SAME settled
 // physics sphere-pyramid scene (ground + sky + lit/shadowed resting bodies), then an immediate-mode
 // DebugDraw overlay (ground grid + per-body wireframe AABB + per-body wire sphere + light-direction
@@ -2291,6 +2631,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--bloom") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_bloom.png";
             try { return RunBloomShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ssao <out.png>: render the SSAO showcase (Slice Y) — the settled physics sphere-pyramid
+        // into an HDR RT, a view-space normal+depth g-buffer prepass, a hemisphere-kernel AO pass, a
+        // box blur, and a composite that multiplies the lit scene by the blurred AO (contact AO).
+        if (argc > 1 && std::strcmp(argv[1], "--ssao") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ssao.png";
+            try { return RunSsaoShowcase(out, /*aoOn=*/true); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ssao-off <out.png>: the IDENTICAL SSAO scene with AO forced off, for an on/off comparison.
+        if (argc > 1 && std::strcmp(argv[1], "--ssao-off") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ssao_off.png";
+            try { return RunSsaoShowcase(out, /*aoOn=*/false); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --transparency <out.png>: render the alpha-blended transparency showcase (Slice T) —

@@ -106,6 +106,15 @@ hf_gen_msl(particle.frag   particle.frag.hlsl  frag particle_fragment)
 # FrameData.viewProj, flat per-vertex color. LINE_LIST topology. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(debug_line.vert debug_line.vert.hlsl vert debug_line_vertex)
 hf_gen_msl(debug_line.frag debug_line.frag.hlsl frag debug_line_fragment)
+# SSAO chain (Slice Y): view-space normal+linear-depth g-buffer prepass (static + instanced vertex
+# variants + shared fragment), hemisphere-kernel AO pass, box blur, composite/apply. Same
+# HLSL->SPIR-V->MSL toolchain as the others.
+hf_gen_msl(gbuffer.vert           gbuffer.vert.hlsl           vert gbuffer_vertex)
+hf_gen_msl(gbuffer_instanced.vert gbuffer_instanced.vert.hlsl vert gbuffer_instanced_vertex)
+hf_gen_msl(gbuffer.frag           gbuffer.frag.hlsl           frag gbuffer_fragment)
+hf_gen_msl(ssao.frag              ssao.frag.hlsl              frag ssao_fragment)
+hf_gen_msl(ssao_blur.frag         ssao_blur.frag.hlsl         frag ssao_blur_fragment)
+hf_gen_msl(ssao_composite.frag    ssao_composite.frag.hlsl    frag ssao_composite_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 
