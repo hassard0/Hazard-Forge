@@ -13,7 +13,10 @@ struct Vec3 {
 inline Vec3 operator-(const Vec3& a, const Vec3& b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
 inline Vec3 operator+(const Vec3& a, const Vec3& b) { return {a.x+b.x, a.y+b.y, a.z+b.z}; }
 inline Vec3 operator*(const Vec3& a, float s) { return {a.x*s, a.y*s, a.z*s}; }
+inline Vec3 operator-(const Vec3& a) { return {-a.x, -a.y, -a.z}; }              // unary negate
+inline Vec3 operator/(const Vec3& a, float s) { return {a.x/s, a.y/s, a.z/s}; }
 inline float dot(const Vec3& a, const Vec3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+inline float length(const Vec3& v) { return std::sqrt(dot(v, v)); }
 inline Vec3 cross(const Vec3& a, const Vec3& b) {
     return {a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x};
 }
@@ -184,6 +187,24 @@ inline Mat4 FromTRS(const Vec3& t, const Quat& r, const Vec3& s) {
     // Translation in the last column.
     m.m[12] = t.x; m.m[13] = t.y; m.m[14] = t.z;
     return m;
+}
+
+// Advance an orientation quaternion by a world-space angular velocity over dt, using the standard
+// first-order rigid-body update q' = normalize(q + 0.5 * (0,omega) * q * dt). The pure-quaternion
+// (0, omega) is multiplied on the LEFT (world-frame angular velocity), matching the semi-implicit
+// Euler integrator in engine/physics. Renormalizes to keep q unit. Reusable, RNG/clock-free.
+inline Quat IntegrateOrientation(const Quat& q, const Vec3& omega, float dt) {
+    // Quaternion product (0,omega) * q, with the omega quaternion w-component = 0.
+    float wx = omega.x, wy = omega.y, wz = omega.z;
+    Quat dq{
+        wy*q.z - wz*q.y + wx*q.w,   // x
+        wz*q.x - wx*q.z + wy*q.w,   // y
+        wx*q.y - wy*q.x + wz*q.w,   // z
+        -(wx*q.x + wy*q.y + wz*q.z) // w
+    };
+    float h = 0.5f * dt;
+    Quat r{q.x + dq.x*h, q.y + dq.y*h, q.z + dq.z*h, q.w + dq.w*h};
+    return Normalize(r);
 }
 
 } // namespace hf::math

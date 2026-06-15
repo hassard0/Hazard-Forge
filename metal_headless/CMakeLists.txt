@@ -119,6 +119,8 @@ add_executable(visual_test
     # Skeletal-animation sampling (plain C++): Quat/Slerp/FromTRS live in math.h; this is the
     # SampleAnimation palette builder (Slice O).
     ${HF_ROOT}/engine/anim/animation.cpp
+    # Impulse-based rigid-body world (Slice S): pure C++ physics core (no Metal/RHI deps).
+    ${HF_ROOT}/engine/physics/world.cpp
 )
 
 # The generated MSL must exist before the executable's shaders are loaded at runtime; make the

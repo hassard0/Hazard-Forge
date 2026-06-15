@@ -10,6 +10,7 @@ set(HF_ENGINE_COMMON_SOURCES
   asset/gltf_loader.cpp
   asset/env_loader.cpp
   anim/animation.cpp
+  physics/world.cpp
 )
 
 if(APPLE)
@@ -72,6 +73,7 @@ add_library(hf_core STATIC
   asset/gltf_loader.cpp
   asset/env_loader.cpp
   anim/animation.cpp
+  physics/world.cpp
 )
 target_include_directories(hf_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}

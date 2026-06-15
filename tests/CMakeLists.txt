@@ -29,6 +29,8 @@ hf_add_pure_test(commands_test)
 hf_add_pure_test(anim_test)
 # Instanced-rendering layout + grid builder (Slice Q). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(instance_grid_test)
+# Impulse-based rigid-body world (Slice S). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(physics_test)
 
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
