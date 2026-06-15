@@ -17,7 +17,7 @@
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
            EACH of the 36 committed Metal goldens run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 30 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 36 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -199,6 +199,29 @@ if (-not `$audOk) {
     exit 25
 }
 Write-Host 'audio WAV golden: exact match'
+
+# --- Material-graph introspection JSON golden (Slice BI): an EXACT byte-for-byte match of a fresh
+# --material-introspect dump of assets/materials/showcase3.mat.json against the committed
+# tests/golden/material/showcase3_graph.json. DescribeGraphJson is pure CPU (hf_core, no vk*/Metal
+# symbols) and deterministic by construction, so the text is bit-identical run-to-run AND across
+# backends/compilers -- we verify it once here on the Windows build (the gate), like the JSON + WAV
+# goldens. No Metal round-trip needed. ---
+Write-Host '--- material-graph introspection JSON golden ---'
+`$matExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$matGolden = 'tests/golden/material/showcase3_graph.json'
+`$matSrc = 'assets/materials/showcase3.mat.json'
+`$matLive = Join-Path `$env:TEMP 'hf_matintrospect_live.json'
+& `$matExe --material-introspect `$matSrc `$matLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'material-introspect run failed'; exit 26 }
+`$mgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$matGolden).Path)
+`$mlBytes = [System.IO.File]::ReadAllBytes(`$matLive)
+`$matOk = (`$mgBytes.Length -eq `$mlBytes.Length)
+if (`$matOk) { for (`$mi = 0; `$mi -lt `$mgBytes.Length; `$mi++) { if (`$mgBytes[`$mi] -ne `$mlBytes[`$mi]) { `$matOk = `$false; break } } }
+if (-not `$matOk) {
+    Write-Host 'material-graph introspection JSON golden MISMATCH (tests/golden/material/showcase3_graph.json)'
+    exit 27
+}
+Write-Host 'material-graph introspection JSON golden: exact match'
 
 # --- Vulkan validation gate (Slice AT): run representative showcases under the Khronos validation
 # layer (synchronization + core validation) and FAIL on any real validation error. This is the

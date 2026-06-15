@@ -188,6 +188,19 @@ hf_add_pure_test(roll_game_test)
 # out-of-range char => blank. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(text_test)
 
+# Material-graph introspection (Slice BI): DescribeGraphJson + ToDot over the in-memory material
+# Graph. Asserts structure (nodeCount/edgeCount/output + per-node type/params/inputs/output + edge
+# from/to with the right port names), unconnected PBROutput defaults (source:null + the documented
+# default value), determinism (two runs byte-identical, stable node/port order), DOT well-formedness
+# (starts with 'digraph', one node line per node + one edge line per edge), and GOLDEN PARITY:
+# DescribeGraphJson(load(showcase3.mat.json)) byte-equals tests/golden/material/showcase3_graph.json
+# (the test reads the committed golden + compares, so CI checks it too). Pure C++ (hf_core),
+# ASan-eligible; ZERO backend symbols (pure CPU text over the graph).
+hf_add_pure_test(graph_introspect_test)
+target_compile_definitions(graph_introspect_test PRIVATE
+  "HF_MAT3_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/showcase3.mat.json\""
+  "HF_MAT3_GOLDEN=\"${CMAKE_SOURCE_DIR}/tests/golden/material/showcase3_graph.json\"")
+
 # Live-device smoke test: full engine, never sanitized.
 add_executable(rhi_smoke rhi_smoke.cpp)
 target_link_libraries(rhi_smoke PRIVATE hf_engine)

@@ -1,0 +1,156 @@
+{
+  "material": "showcase3",
+  "nodeCount": 13,
+  "edgeCount": 14,
+  "output": 99,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UV",
+      "params": {},
+      "inputs": [],
+      "output": { "type": "float2" }
+    },
+    {
+      "id": 2,
+      "type": "TextureSample",
+      "params": {
+        "texture": "checker"
+      },
+      "inputs": [
+        { "port": "uv", "type": "float2", "source": "1.out", "default": null }
+      ],
+      "output": { "type": "float4" }
+    },
+    {
+      "id": 3,
+      "type": "Swizzle",
+      "params": {
+        "swizzle": "x"
+      },
+      "inputs": [
+        { "port": "in", "type": "any", "source": "2.out", "default": null }
+      ],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 4,
+      "type": "Swizzle",
+      "params": {
+        "swizzle": "y"
+      },
+      "inputs": [
+        { "port": "in", "type": "any", "source": "2.out", "default": null }
+      ],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 5,
+      "type": "OneMinus",
+      "params": {},
+      "inputs": [
+        { "port": "in", "type": "any", "source": "4.out", "default": null }
+      ],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 6,
+      "type": "Swizzle",
+      "params": {
+        "swizzle": "z"
+      },
+      "inputs": [
+        { "port": "in", "type": "any", "source": "2.out", "default": null }
+      ],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 7,
+      "type": "Fresnel",
+      "params": {
+        "power": 2
+      },
+      "inputs": [],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 8,
+      "type": "Constant",
+      "params": {
+        "value": [3, 0, 0, 0],
+        "outType": "float"
+      },
+      "inputs": [],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 9,
+      "type": "Power",
+      "params": {},
+      "inputs": [
+        { "port": "a", "type": "any", "source": "7.out", "default": null },
+        { "port": "b", "type": "any", "source": "8.out", "default": null }
+      ],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 10,
+      "type": "Saturate",
+      "params": {},
+      "inputs": [
+        { "port": "in", "type": "any", "source": "9.out", "default": null }
+      ],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 11,
+      "type": "Constant",
+      "params": {
+        "value": [0.4, 0, 0, 0],
+        "outType": "float"
+      },
+      "inputs": [],
+      "output": { "type": "float" }
+    },
+    {
+      "id": 12,
+      "type": "MakeFloat3",
+      "params": {},
+      "inputs": [
+        { "port": "x", "type": "float", "source": "10.out", "default": null },
+        { "port": "y", "type": "float", "source": "6.out", "default": null },
+        { "port": "z", "type": "float", "source": "11.out", "default": null }
+      ],
+      "output": { "type": "float3" }
+    },
+    {
+      "id": 99,
+      "type": "PBROutput",
+      "params": {},
+      "inputs": [
+        { "port": "baseColor", "type": "float3", "source": "12.out", "default": null },
+        { "port": "metallic", "type": "float", "source": "3.out", "default": null },
+        { "port": "roughness", "type": "float", "source": "5.out", "default": null },
+        { "port": "emissive", "type": "float3", "source": null, "default": [0, 0, 0] },
+        { "port": "normal", "type": "float3", "source": null, "default": [0, 0, 1] }
+      ],
+      "output": { "type": "none" }
+    }
+  ],
+  "edges": [
+    { "from": "1.out", "to": "2.uv" },
+    { "from": "2.out", "to": "3.in" },
+    { "from": "2.out", "to": "4.in" },
+    { "from": "4.out", "to": "5.in" },
+    { "from": "2.out", "to": "6.in" },
+    { "from": "7.out", "to": "9.a" },
+    { "from": "8.out", "to": "9.b" },
+    { "from": "9.out", "to": "10.in" },
+    { "from": "10.out", "to": "12.x" },
+    { "from": "6.out", "to": "12.y" },
+    { "from": "11.out", "to": "12.z" },
+    { "from": "3.out", "to": "99.metallic" },
+    { "from": "5.out", "to": "99.roughness" },
+    { "from": "12.out", "to": "99.baseColor" }
+  ]
+}

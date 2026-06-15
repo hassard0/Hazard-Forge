@@ -48,6 +48,7 @@
 // Slice AW (live runtime material authoring): in-process graph load + runtime dxc-subprocess compile
 // + the live-swap controller. Pure host logic (no backend symbols) above the RHI seam.
 #include "material/material_loader.h"
+#include "material/graph_introspect.h"  // Slice BI: pure-CPU material-graph introspection (JSON/DOT).
 #include "material/runtime_compile.h"
 #include "material/live_material.h"
 
@@ -346,6 +347,11 @@ int main(int argc, char** argv) {
     bool pickTest = false;                   // --pick-test: headless pick demo, prints picked index
     const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
     const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
+    // Slice BI: material-graph introspection (pure CPU, headless). --material-introspect <mat.json>
+    // [out.json] dumps DescribeGraphJson; --dot switches the dump to a Graphviz DOT digraph.
+    const char* matIntrospectPath = nullptr;   // the input .mat.json
+    const char* matIntrospectOut = nullptr;    // optional output file (stdout if omitted)
+    bool matIntrospectDot = false;             // --dot: emit DOT instead of JSON
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
@@ -626,6 +632,19 @@ int main(int argc, char** argv) {
             // Slice BB: render the fixed deterministic audio scene to a WAV and exit. Pure CPU
             // (no window/GPU), handled below before any device init.
             audioRenderPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--material-introspect") == 0 && i + 1 < argc) {
+            // Slice BI: load the material graph + dump its deterministic JSON description (or DOT, with
+            // --dot). Pure CPU (no window/GPU), handled below before any device init. The input is the
+            // next arg; an optional output path follows if it isn't another flag.
+            matIntrospectPath = argv[i + 1];
+            ++i;
+            if (i + 1 < argc && std::strncmp(argv[i + 1], "--", 2) != 0) {
+                matIntrospectOut = argv[i + 1];
+                ++i;
+            }
+        } else if (std::strcmp(argv[i], "--dot") == 0) {
+            // Slice BI: with --material-introspect, emit a Graphviz DOT digraph instead of JSON.
+            matIntrospectDot = true;
         }
     }
 
@@ -752,6 +771,38 @@ int main(int argc, char** argv) {
         std::printf("audio: {sampleRate:%d, channels:%d, samples:%d, voices:%zu, peak:%d}\n",
                     kSR, cfg.channels, kFrames, voices.size(), peak);
         std::printf("audio: wrote %s\n", audioRenderPath);
+        return 0;
+    }
+
+    // --material-introspect <mat.json> [out.json] [--dot] (Slice BI): fully headless (no window/GPU).
+    // Load the material graph via the existing loader, then dump a DETERMINISTIC description — pretty
+    // JSON by default, or a Graphviz DOT digraph with --dot — to the output file (or stdout). Pure CPU
+    // (material::DescribeGraphJson / ToDot are above the RHI seam), so the text is byte-identical
+    // run-to-run and cross-platform. Prints a one-line summary `mat-introspect: {...}`.
+    if (matIntrospectPath) {
+        material::LoadResult lr = material::LoadGraphFromFile(matIntrospectPath);
+        if (!lr.ok) {
+            std::fprintf(stderr, "FATAL: --material-introspect could not load '%s': %s\n",
+                         matIntrospectPath, lr.error.c_str());
+            return 1;
+        }
+        const std::string text = matIntrospectDot ? material::ToDot(lr.graph)
+                                                   : material::DescribeGraphJson(lr.graph, lr.name);
+        if (matIntrospectOut) {
+            std::ofstream f(matIntrospectOut, std::ios::binary);  // binary => LF-only, no CRLF/BOM.
+            if (!f) {
+                std::fprintf(stderr, "FATAL: cannot write material-introspect output '%s'\n",
+                             matIntrospectOut);
+                return 1;
+            }
+            f << text;
+        } else {
+            std::fputs(text.c_str(), stdout);
+        }
+        std::printf("mat-introspect: {material:%s, nodes:%zu, edges:%zu}\n",
+                    lr.name.c_str(), lr.graph.nodes.size(), lr.graph.edges.size());
+        if (matIntrospectOut)
+            std::printf("mat-introspect: wrote %s\n", matIntrospectOut);
         return 0;
     }
 

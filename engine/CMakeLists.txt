@@ -30,6 +30,7 @@ set(HF_ENGINE_COMMON_SOURCES
   material/shader_graph.cpp
   material/codegen.cpp
   material/material_loader.cpp
+  material/graph_introspect.cpp
   material/live_material.cpp
   # Runtime material -> SPIR-V via a dxc SUBPROCESS (Slice AW). Pure host/tooling (subprocess +
   # temp-file IO; NO backend symbols), but it links into hf_engine ONLY (not the ASan-pure hf_core):
@@ -136,6 +137,7 @@ add_library(hf_core STATIC
   material/shader_graph.cpp
   material/codegen.cpp
   material/material_loader.cpp
+  material/graph_introspect.cpp
   material/live_material.cpp
 )
 target_include_directories(hf_core PUBLIC

@@ -2,3 +2,8 @@
 # output, which the engine writes with LF-only line endings (no BOM). Pin it to LF so a checkout on a
 # CRLF-default Windows clone does not rewrite it and break the exact-match verify step.
 tests/golden/introspect/*.json text eol=lf
+
+# The material-graph introspection golden (Slice BI) is compared BYTE-FOR-BYTE against a fresh
+# --material-introspect dump (material::DescribeGraphJson), which is written LF-only (no BOM). Pin to
+# LF so a CRLF-default Windows checkout does not rewrite it and break the exact-match verify + test.
+tests/golden/material/*.json text eol=lf
