@@ -23,8 +23,12 @@ class MetalRenderTarget;
 
 class MetalDevice final : public IRHIDevice {
 public:
-    // Windowed: render into the window's CAMetalLayer drawable and present each frame.
+    // Windowed (SDL HAL): render into the window's CAMetalLayer drawable and present each frame.
     explicit MetalDevice(hf::hal::Window& window);
+    // Windowed (raw CAMetalLayer): same windowed/present path as the Window& ctor, but built from a
+    // CAMetalLayer* passed as void* (cast to CAMetalLayer* in the .mm). Used by the SDL-free native
+    // Cocoa entry (mac_window/), so a windowed Metal device can be built WITHOUT hal/window.h / SDL.
+    MetalDevice(void* caMetalLayer, uint32_t width, uint32_t height);
     // Headless: render into an offscreen MTLTexture (no window/CAMetalLayer/present). Read the
     // result back via CaptureNextFrame() + GetCapturedPixels(). For SSH / CI golden-image runs.
     MetalDevice(uint32_t width, uint32_t height);

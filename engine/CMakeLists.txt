@@ -62,6 +62,11 @@ add_library(hf_engine STATIC
 # mismatches. ASan is scoped to the pure-C++ core (hf_core, below) + the pure test executables.
 
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# hf_engine always links SDL (it owns the SDL HAL window). HF_HAVE_SDL_WINDOW gates the
+# SDL-dependent windowed Metal ctor MetalDevice(hal::Window&) + CreateMetalDevice(Window&) so the
+# SDL-free standalone mac_window/ target (which compiles the SAME metal_device_windowed.mm) does NOT
+# pull in hal/window.h / SDL — it uses the MetalDevice(void* layer,...) ctor instead.
+target_compile_definitions(hf_engine PRIVATE HF_HAVE_SDL_WINDOW=1)
 # Header-only third-party (cgltf): CGLTF_IMPLEMENTATION is defined in exactly one TU
 # (engine/asset/gltf_loader.cpp).
 target_include_directories(hf_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
