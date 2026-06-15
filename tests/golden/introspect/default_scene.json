@@ -39,7 +39,8 @@
       "gameplay-sample",
       "hud-text",
       "audio-mixer",
-      "scene-streaming"
+      "scene-streaming",
+      "terrain-streaming-lod"
     ]
   },
   "showcases": [
@@ -61,6 +62,7 @@
     { "flag": "--terrain-shot", "desc": "Procedural terrain / heightmap (deterministic NxN displaced grid, lit + shadowed)." },
     { "flag": "--game-shot", "desc": "Playable game sample (deterministic roll-a-ball collect-the-pickups)." },
     { "flag": "--stream-shot", "desc": "Scene/asset streaming (distance-based cell residency + per-frame budget)." },
+    { "flag": "--terrain-stream-shot", "desc": "Terrain streaming with per-tile LOD (distance-banded tile residency + LOD selection)." },
     { "flag": "--hud-shot", "desc": "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)." },
     { "flag": "--game-hud-shot", "desc": "Game scene with a live SCORE HUD overlay (own golden; game.png unchanged)." },
     { "flag": "--transparency-shot", "desc": "Sorted alpha-blended transparency." },

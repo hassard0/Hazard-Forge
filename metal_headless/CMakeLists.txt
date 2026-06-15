@@ -227,6 +227,10 @@ add_executable(visual_test
     # Windows engine compiles, so the generated terrain mesh is BIT-IDENTICAL across backends (the
     # cross-backend golden contract). No Metal/RHI deps. Drives the --terrain showcase.
     ${HF_ROOT}/engine/terrain/heightmap.cpp
+    # Terrain-streaming LOD integration (Slice BJ): the SAME pure-C++ TileGrid + residency/LOD TU the
+    # Windows engine compiles, so the per-tile meshes are BIT-IDENTICAL across backends. No Metal/RHI
+    # deps. Drives the --terrain-stream showcase.
+    ${HF_ROOT}/engine/terrain/terrain_stream.cpp
     # Deterministic roll-a-ball gameplay loop (Slice AX): pure C++ (math + physics, no Metal/RHI
     # deps). Drives the --game showcase's scripted playthrough + capture-step state.
     ${HF_ROOT}/engine/game/roll_game.cpp

@@ -44,6 +44,13 @@ hf_add_pure_test(physics_test)
 # determinism (two calls -> bit-identical buffers). Pure CPU (hf_core), no RHI/backend symbols,
 # ASan-eligible.
 hf_add_pure_test(terrain_test)
+# Terrain-streaming LOD integration (Slice BJ): the TileGrid layout + BuildTerrainTile world-origin mesh
+# (tile coverage + shared-edge seamlessness at equal LOD), the discrete LOD distance bands (LodFor) +
+# hysteresis (LodNext doesn't coarsen within the margin after refining), per-LOD mesh vertex/index
+# counts, and residency+LOD DETERMINISM (a scripted camera path replays bit-identical per-frame
+# {resident ids + LODs}) + LOD refine-on-approach rebuild. Pure CPU (hf_core), no RHI/backend symbols,
+# ASan-eligible.
+hf_add_pure_test(terrain_stream_test)
 # Distance-based scene/asset streaming (Slice BD): StreamingWorld::Update residency policy. Asserts
 # radius residency + the hysteresis band (band cell keeps prior state both ways), the per-frame load
 # BUDGET throttle with NEAREST-first ordering (all resident after ceil(M/K) frames), no-thrash when the

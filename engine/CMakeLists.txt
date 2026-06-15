@@ -18,6 +18,7 @@ set(HF_ENGINE_COMMON_SOURCES
   anim/animation.cpp
   physics/world.cpp
   terrain/heightmap.cpp
+  terrain/terrain_stream.cpp
   audio/mixer.cpp
   audio/wav.cpp
   game/roll_game.cpp
@@ -125,6 +126,7 @@ add_library(hf_core STATIC
   anim/animation.cpp
   physics/world.cpp
   terrain/heightmap.cpp
+  terrain/terrain_stream.cpp
   audio/mixer.cpp
   audio/wav.cpp
   game/roll_game.cpp

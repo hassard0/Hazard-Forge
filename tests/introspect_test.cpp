@@ -158,6 +158,8 @@ int main() {
             bool sawDecalFeature = false;
             // Slice BI: the material-graph-introspection capability is advertised.
             bool sawMatIntrospectFeature = false;
+            // Slice BJ: the terrain-streaming-LOD capability is advertised.
+            bool sawTerrainStreamFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -174,6 +176,7 @@ int main() {
                     if (AsString(el->value) == "procedural-terrain") sawTerrainFeature = true;
                     if (AsString(el->value) == "decals") sawDecalFeature = true;
                     if (AsString(el->value) == "material-graph-introspection") sawMatIntrospectFeature = true;
+                    if (AsString(el->value) == "terrain-streaming-lod") sawTerrainStreamFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -189,6 +192,7 @@ int main() {
             check(sawTerrainFeature, "engine.features includes procedural-terrain");
             check(sawDecalFeature, "engine.features includes decals");
             check(sawMatIntrospectFeature, "engine.features includes material-graph-introspection");
+            check(sawTerrainStreamFeature, "engine.features includes terrain-streaming-lod");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -234,6 +238,8 @@ int main() {
         bool sawAudioRender = false;
         // Slice BD: the --stream-shot showcase flag is listed in the showcase manifest.
         bool sawStreamShot = false;
+        // Slice BJ: the --terrain-stream-shot showcase flag is listed in the showcase manifest.
+        bool sawTerrainStreamShot = false;
         // Slice BF: the --terrain-shot showcase flag is listed in the showcase manifest.
         bool sawTerrainShot = false;
         // Slice BH: the --decal-shot showcase flag is listed in the showcase manifest.
@@ -256,6 +262,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--game-hud-shot") sawGameHudShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--audio-render") sawAudioRender = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--stream-shot") sawStreamShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--terrain-stream-shot") sawTerrainStreamShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--terrain-shot") sawTerrainShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--decal-shot") sawDecalShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-introspect") sawMaterialIntrospectShot = true;
@@ -273,6 +280,7 @@ int main() {
         check(sawGameHudShot, "showcases manifest includes --game-hud-shot");
         check(sawAudioRender, "showcases manifest includes --audio-render");
         check(sawStreamShot, "showcases manifest includes --stream-shot");
+        check(sawTerrainStreamShot, "showcases manifest includes --terrain-stream-shot");
         check(sawTerrainShot, "showcases manifest includes --terrain-shot");
         check(sawDecalShot, "showcases manifest includes --decal-shot");
         check(sawMaterialIntrospectShot, "showcases manifest includes --material-introspect");

@@ -89,6 +89,7 @@ const Showcase kShowcases[] = {
     {"--terrain-shot",      "Procedural terrain / heightmap (deterministic NxN displaced grid, lit + shadowed)."},
     {"--game-shot",         "Playable game sample (deterministic roll-a-ball collect-the-pickups)."},
     {"--stream-shot",       "Scene/asset streaming (distance-based cell residency + per-frame budget)."},
+    {"--terrain-stream-shot","Terrain streaming with per-tile LOD (distance-banded tile residency + LOD selection)."},
     {"--hud-shot",          "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)."},
     {"--game-hud-shot",     "Game scene with a live SCORE HUD overlay (own golden; game.png unchanged)."},
     {"--transparency-shot", "Sorted alpha-blended transparency."},
@@ -149,6 +150,7 @@ const char* kFeatures[] = {
     "hud-text",
     "audio-mixer",
     "scene-streaming",
+    "terrain-streaming-lod",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

@@ -19,6 +19,7 @@
 #include "physics/world.h"
 #include "physics/body.h"
 #include "terrain/heightmap.h"
+#include "terrain/terrain_stream.h"   // Slice BJ: terrain-streaming LOD integration (pure CPU)
 #include "audio/mixer.h"
 #include "audio/wav.h"
 #include "game/roll_game.h"
@@ -308,6 +309,7 @@ int main(int argc, char** argv) {
     const char* terrainShotPath = nullptr;   // --terrain-shot <out.bmp> (Slice BF: procedural terrain)
     const char* gameShotPath = nullptr;
     const char* streamShotPath = nullptr;    // --stream-shot <out.bmp> (Slice BD: scene streaming)
+    const char* terrainStreamShotPath = nullptr; // --terrain-stream-shot <out.bmp> (Slice BJ)
     const char* hudShotPath = nullptr;       // --hud-shot <out.bmp> (Slice BA: text/HUD overlay)
     const char* gameHudShotPath = nullptr;   // --game-hud-shot <out.bmp> (Slice BA: game + score HUD)
     const char* debugShotPath = nullptr;
@@ -441,6 +443,16 @@ int main(int argc, char** argv) {
             // (some still Loading, some already Unloaded behind the camera), lit + shadowed via the
             // existing static-lit scene path. Prints the deterministic stream-state line. One BMP.
             streamShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--terrain-stream-shot") == 0 && i + 1 < argc) {
+            // Slice BJ: terrain-streaming LOD integration. Build a fixed 6x6=36 tile terrain world
+            // (engine/terrain/terrain_stream, pure CPU — each tile meshed by BuildTerrainTile over the
+            // GLOBAL Height field so adjacent tiles are seamless at equal LOD), fly a SCRIPTED camera
+            // across it calling TerrainStreamWorld::Update each frame (tiles stream in/out by distance
+            // under the per-frame budget + select a discrete LOD band per tile with hysteresis), then at
+            // a fixed capture frame render the RESIDENT tiles at their LODs lit + shadowed via the
+            // existing static-lit scene path (BF height-tint vertex color). Prints the deterministic
+            // `terrain-stream: {...}` state line. One BMP -> exit. NO new RHI seam.
+            terrainStreamShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--hud-shot") == 0 && i + 1 < argc) {
             // Slice BA: the standard lit + shadowed scene PLUS a deterministic screen-space HUD text
             // overlay ("HAZARD FORGE" + "SCORE: 0" + a fixed stat line — NO clock), drawn as an
@@ -7166,6 +7178,251 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — terrain %dx%d, %u verts, %u tris\n",
                                     terrainShotPath, cw, ch2, kN, kN, kVertCount, kTriCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", terrainShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Terrain-streaming LOD showcase (--terrain-stream-shot, Slice BJ): a self-contained capture
+        // path that does NOT touch the default scene. Build a fixed 6x6=36 tile terrain world
+        // (terrain::TerrainStreamWorld, pure CPU — each tile meshed by BuildTerrainTile over the GLOBAL
+        // Height field so adjacent tiles are seamless at equal LOD), fly a SCRIPTED camera diagonally
+        // across the grid over a fixed frame count calling Update each frame (tiles stream in/out by
+        // distance under the per-frame budget + each resident tile selects a discrete LOD band from its
+        // center distance, with hysteresis), then at a FIXED capture frame upload + render the RESIDENT
+        // tiles' meshes AT THEIR LODs (near tiles dense LOD0, distant coarse LOD2, far tiles unloaded)
+        // lit + shadowed via the EXISTING static-lit scene path. The height tint is baked into the
+        // vertex color (the unchanged lit shader multiplies texture * vertex color), so NO new shader /
+        // RHI seam. Prints the deterministic `terrain-stream: {...}` state line. One BMP -> exit. -------
+        if (terrainStreamShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // The fixed terrain-stream world + policy (identical to the Metal showcase + the unit test).
+            const int   kT = 6;             // 6x6 = 36 tiles
+            const float kTileSize = 16.0f;  // grid spans [-48, 48] on X/Z
+            const float kHeightScale = 2.0f;
+            terrain::TerrainStreamConfig tcfg;
+            tcfg.loadRadius           = 40.0f;
+            tcfg.unloadRadius         = 52.0f;   // > loadRadius (residency hysteresis)
+            tcfg.loadBudgetPerFrame   = 6;       // stream in over frames
+            tcfg.unloadBudgetPerFrame = 6;
+            tcfg.heightScale          = kHeightScale;
+            tcfg.bands.bandNear       = 15.0f;   // dist <= 15 -> LOD0 (n=96)
+            tcfg.bands.bandMid        = 28.0f;   // dist <= 28 -> LOD1 (n=48), else LOD2 (n=24)
+            tcfg.bands.hysteresis     = 3.0f;
+
+            // SCRIPTED camera path: fly diagonally across the grid at a low altitude so the near tiles
+            // sit at LOD0 and distant tiles fall to LOD1/LOD2 / unload (no live input/RNG/clock).
+            const int kTSFrames = 90;
+            std::vector<Vec3> path;
+            path.reserve(kTSFrames);
+            const float startXZ = -64.0f, endXZ = 64.0f;
+            for (int f = 0; f < kTSFrames; ++f) {
+                float t = (float)f / (float)(kTSFrames - 1);
+                float p = startXZ + t * (endXZ - startXZ);
+                path.push_back(Vec3{p, 8.0f, p});
+            }
+
+            // FIXED capture frame: chosen (after inspecting the deterministic run) so the camera sits
+            // mid-grid with a CLEAR LOD mix — near high-LOD tiles + mid/far coarse tiles + far unloaded.
+            const int kTSCaptureFrame = 45;
+
+            terrain::TerrainStreamWorld tworld(kT, kTileSize, tcfg);
+            for (int f = 0; f <= kTSCaptureFrame && f < kTSFrames; ++f)
+                tworld.Update(path[(size_t)f]);
+
+            const Vec3 focus = path[(size_t)kTSCaptureFrame];
+            terrain::TerrainStreamStats tstats = tworld.Stats();
+            std::vector<terrain::ResidentTile> residentTiles = tworld.ResidentTiles();
+
+            // Upload each resident tile's mesh (varying vertex count by LOD) into its own GPU buffers.
+            struct TileDraw { std::unique_ptr<rhi::IBuffer> vb, ib; uint32_t indexCount; };
+            std::vector<TileDraw> tileDraws;
+            tileDraws.reserve(residentTiles.size());
+            for (const auto& rt : residentTiles) {
+                const terrain::TerrainMesh& tm = *rt.mesh;
+                rhi::BufferDesc tvb;
+                tvb.size = (uint64_t)tm.verts.size() * sizeof(scene::Vertex);
+                tvb.initialData = tm.verts.data();
+                tvb.usage = rhi::BufferUsage::Vertex;
+                rhi::BufferDesc tib;
+                tib.size = (uint64_t)tm.indices.size() * sizeof(uint32_t);
+                tib.initialData = tm.indices.data();
+                tib.usage = rhi::BufferUsage::Index;
+                TileDraw td;
+                td.vb = device->CreateBuffer(tvb);
+                td.ib = device->CreateBuffer(tib);
+                td.indexCount = (uint32_t)tm.indices.size();
+                tileDraws.push_back(std::move(td));
+            }
+
+            // Static lit + static shadow + sky + post (the EXACT pipelines the BF terrain showcase uses).
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Flat white base + flat normal so the per-vertex height tint shows unmodulated (like BF).
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            Mat4 terrainModel = Mat4::Identity();  // tiles are authored in world space already.
+
+            // A trailing 3/4 camera that frames the resident field around the scripted focus.
+            const Vec3 eye = focus + Vec3{-26.0f, 24.0f, -26.0f};
+            const Vec3 center = focus + Vec3{10.0f, 0.0f, 10.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 300.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc = center;
+                Vec3 lightEye = sc - lightDir * 50.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-34.0f, 34.0f, -34.0f, 34.0f, 1.0f, 110.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(terrainModel.m, sizeof(float) * 16);
+                    for (const auto& td : tileDraws) {
+                        cmd.BindVertexBuffer(*td.vb);
+                        cmd.BindIndexBuffer(*td.ib);
+                        cmd.DrawIndexed(td.indexCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = terrainModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.92f; pc[18] = 0.0f; pc[19] = 0.0f;  // dielectric, rough
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*whiteTex, *flatNormal);
+                        for (const auto& td : tileDraws) {
+                            cmd.BindVertexBuffer(*td.vb);
+                            cmd.BindIndexBuffer(*td.ib);
+                            cmd.DrawIndexed(td.indexCount);
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Deterministic terrain-stream state line (matches the Metal --terrain-stream side).
+            std::printf("terrain-stream: {frame:%d, resident:%d, lod0:%d, lod1:%d, lod2:%d, total:%d, tiles:[",
+                        kTSCaptureFrame, tstats.resident, tstats.byLod[0], tstats.byLod[1],
+                        tstats.byLod[2], tstats.total);
+            for (size_t k = 0; k < residentTiles.size(); ++k) {
+                const auto& rt2 = residentTiles[k];
+                std::printf("%s(%d,%d):%d", k ? ", " : "", rt2.tile.i, rt2.tile.j, rt2.lod);
+            }
+            std::printf("]}\n");
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(terrainStreamShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — capture frame %d, %d/%d tiles resident\n",
+                                    terrainStreamShotPath, cw, ch2, kTSCaptureFrame, tstats.resident, tstats.total);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", terrainStreamShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
