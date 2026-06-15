@@ -41,6 +41,7 @@
 #include "anim/skeleton.h"
 #include "physics/world.h"
 #include "physics/body.h"
+#include "terrain/heightmap.h"      // Slice BF: deterministic procedural terrain / heightmap (pure CPU)
 #include "game/roll_game.h"
 #include "ui/text.h"               // Slice BA: baked 8x8 font atlas + screen-space text layout (pure CPU)
 #include "render/render_graph.h"
@@ -2770,6 +2771,188 @@ static int RunPhysicsShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — %u rigid bodies settled\n", outPath, cw, ch, kInstanceCount);
+    return 0;
+}
+
+// --- Procedural terrain showcase (Slice BF). Mirrors the Vulkan --terrain-shot path EXACTLY: build
+// an n x n procedural terrain patch via terrain::BuildTerrain over the deterministic terrain::Height
+// field (the SAME pure-C++ heightmap.cpp compiled into this target, so the mesh is bit-identical to
+// the Windows build), upload its CPU vertex/index grid as a normal scene mesh, and render ONE lit +
+// shadowed frame from the SAME fixed 3/4 camera + directional light. The height tint is baked into
+// the per-vertex color (the unchanged lit fragment multiplies texture * vertex color) — no new
+// shader. Identical scene/camera/light to the Vulkan path so the only difference vs the BMP is the
+// backend NDC handling (FlipProjY). One offscreen frame -> PNG (new golden terrain.png). ------------
+static int RunTerrainShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Build the deterministic terrain patch (IDENTICAL params to the Vulkan --terrain-shot).
+    const int   kN = 128;
+    const float kWorldSize = 20.0f;
+    const float kHeightScale = 2.0f;
+    terrain::TerrainMesh tm = terrain::BuildTerrain(kN, kWorldSize, kHeightScale);
+    const uint32_t kVertCount = (uint32_t)tm.verts.size();
+    const uint32_t kIndexCount = (uint32_t)tm.indices.size();
+    const uint32_t kTriCount = kIndexCount / 3;
+
+    rhi::BufferDesc tvb;
+    tvb.size = (uint64_t)tm.verts.size() * sizeof(scene::Vertex);
+    tvb.initialData = tm.verts.data();
+    tvb.usage = rhi::BufferUsage::Vertex;
+    auto terrainVB = device->CreateBuffer(tvb);
+    rhi::BufferDesc tib;
+    tib.size = (uint64_t)tm.indices.size() * sizeof(uint32_t);
+    tib.initialData = tm.indices.data();
+    tib.usage = rhi::BufferUsage::Index;
+    auto terrainIB = device->CreateBuffer(tib);
+    scene::Mesh terrainMesh{std::move(terrainVB), std::move(terrainIB), kIndexCount};
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    Mat4 terrainModel = Mat4::Identity();
+
+    const Vec3 eye{14.0f, 11.0f, 14.0f};
+    const Vec3 center{0.0f, 0.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-13.0f, 13.0f, -13.0f, 13.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(terrainModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(terrainMesh.vertices());
+            cmd.BindIndexBuffer(terrainMesh.indices());
+            cmd.DrawIndexed(terrainMesh.indexCount());
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = terrainModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.92f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*whiteTex, *flatNormal);
+                cmd.BindVertexBuffer(terrainMesh.vertices());
+                cmd.BindIndexBuffer(terrainMesh.indices());
+                cmd.DrawIndexed(terrainMesh.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("terrain: {n:%d, verts:%u, tris:%u, peak:%g}\n",
+                kN, kVertCount, kTriCount, (double)tm.peak);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — terrain %dx%d, %u verts, %u tris\n",
+                outPath, cw, ch, kN, kN, kVertCount, kTriCount);
     return 0;
 }
 
@@ -7325,6 +7508,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--physics") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_physics.png";
             try { return RunPhysicsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --terrain <out.png>: render the procedural terrain showcase (Slice BF) — an n x n
+        // deterministic heightmap-displaced grid (terrain::BuildTerrain), lit + shadowed from a fixed
+        // 3/4 camera. Mirrors the Vulkan --terrain-shot path; new golden tests/golden/metal/terrain.png.
+        if (argc > 1 && std::strcmp(argv[1], "--terrain") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_terrain.png";
+            try { return RunTerrainShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --game <out.png>: render the playable game sample (Slice AX) — the deterministic roll-a-ball

@@ -37,6 +37,13 @@ hf_add_pure_test(anim_test)
 hf_add_pure_test(instance_grid_test)
 # Impulse-based rigid-body world (Slice S). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(physics_test)
+# Procedural terrain / heightmap (Slice BF): the deterministic Height(x,z) field + BuildTerrain mesh
+# generator. Asserts Height determinism + hand-anchored sample values (vs an independent in-test
+# reimplementation of the locked formula), mesh structure/counts/index-range/corner positions/
+# displaced Y, finite-difference normals (unit length, +Y up, flat->+Y, slope tilt), and BuildTerrain
+# determinism (two calls -> bit-identical buffers). Pure CPU (hf_core), no RHI/backend symbols,
+# ASan-eligible.
+hf_add_pure_test(terrain_test)
 # Distance-based scene/asset streaming (Slice BD): StreamingWorld::Update residency policy. Asserts
 # radius residency + the hysteresis band (band cell keeps prior state both ways), the per-frame load
 # BUDGET throttle with NEAREST-first ordering (all resident after ceil(M/K) frames), no-thrash when the

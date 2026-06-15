@@ -217,6 +217,10 @@ add_executable(visual_test
     ${HF_ROOT}/engine/anim/animation.cpp
     # Impulse-based rigid-body world (Slice S): pure C++ physics core (no Metal/RHI deps).
     ${HF_ROOT}/engine/physics/world.cpp
+    # Procedural terrain / heightmap (Slice BF): the SAME pure-C++ Height + BuildTerrain TU the
+    # Windows engine compiles, so the generated terrain mesh is BIT-IDENTICAL across backends (the
+    # cross-backend golden contract). No Metal/RHI deps. Drives the --terrain showcase.
+    ${HF_ROOT}/engine/terrain/heightmap.cpp
     # Deterministic roll-a-ball gameplay loop (Slice AX): pure C++ (math + physics, no Metal/RHI
     # deps). Drives the --game showcase's scripted playthrough + capture-step state.
     ${HF_ROOT}/engine/game/roll_game.cpp

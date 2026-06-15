@@ -18,6 +18,7 @@
 #include "anim/skeleton.h"
 #include "physics/world.h"
 #include "physics/body.h"
+#include "terrain/heightmap.h"
 #include "audio/mixer.h"
 #include "audio/wav.h"
 #include "game/roll_game.h"
@@ -302,6 +303,7 @@ int main(int argc, char** argv) {
     const char* bloomShotPath = nullptr;
     const char* instancedShotPath = nullptr;
     const char* physicsShotPath = nullptr;
+    const char* terrainShotPath = nullptr;   // --terrain-shot <out.bmp> (Slice BF: procedural terrain)
     const char* gameShotPath = nullptr;
     const char* streamShotPath = nullptr;    // --stream-shot <out.bmp> (Slice BD: scene streaming)
     const char* hudShotPath = nullptr;       // --hud-shot <out.bmp> (Slice BA: text/HUD overlay)
@@ -409,6 +411,14 @@ int main(int argc, char** argv) {
             // fixed number of times until it settles, then render the RESTING bodies via the existing
             // instanced pipeline (one instance transform per body), lit + shadowed. One BMP -> exit.
             physicsShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--terrain-shot") == 0 && i + 1 < argc) {
+            // Slice BF: build a procedural terrain patch (terrain::BuildTerrain over the deterministic
+            // terrain::Height field), upload its CPU vertex/index grid as a normal scene mesh, and
+            // render ONE lit + shadowed frame from a fixed 3/4 camera. The height-based color tint is
+            // baked into the per-vertex color (the unchanged lit shader multiplies texture*color), so
+            // NO new shader / RHI is needed — it reuses the static lit + shadow + sky + post path. One
+            // BMP -> exit. Prints the deterministic `terrain: {...}` stat line.
+            terrainShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--game-shot") == 0 && i + 1 < argc) {
             // Slice AX: run the deterministic roll-a-ball game (game::MakeRollGame/StepGame over the
             // full game::ScriptedTrack at the engine fixed dt), then render ONE frame at a fixed
@@ -6586,6 +6596,206 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %u rigid bodies settled\n",
                                     physicsShotPath, cw, ch2, kInstanceCount);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", physicsShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Procedural terrain showcase (--terrain-shot, Slice BF): a self-contained capture path
+        // that does NOT touch the default scene. Build an n x n procedural terrain patch
+        // (terrain::BuildTerrain over the deterministic terrain::Height field), upload its CPU vertex/
+        // index grid as a normal scene mesh, and render ONE lit + shadowed frame from a fixed 3/4
+        // camera. The terrain casts + receives its own directional shadow (the existing shadow map).
+        // The height-based color tint is baked into the per-vertex color (the unchanged lit shader
+        // multiplies texture * vertex color), so NO new shader / RHI seam is added — it reuses the
+        // static lit + static shadow + sky + post pipelines. One frame -> BMP -> exit. The
+        // terrain mesh (pure C++, hf_core) is bit-identical to the Metal build's. ---------------------
+        if (terrainShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Build the deterministic terrain patch. n=128 over a 20x20 m world, heightScale 2.0 so
+            // the rolling relief is clearly visible from the 3/4 camera.
+            const int   kN = 128;
+            const float kWorldSize = 20.0f;
+            const float kHeightScale = 2.0f;
+            terrain::TerrainMesh tm = terrain::BuildTerrain(kN, kWorldSize, kHeightScale);
+            const uint32_t kVertCount = (uint32_t)tm.verts.size();
+            const uint32_t kIndexCount = (uint32_t)tm.indices.size();
+            const uint32_t kTriCount = kIndexCount / 3;
+
+            // Upload the terrain vertex/index buffers + wrap them in a scene::Mesh (the same vertex
+            // layout the static lit pipeline binds).
+            rhi::BufferDesc tvb;
+            tvb.size = (uint64_t)tm.verts.size() * sizeof(scene::Vertex);
+            tvb.initialData = tm.verts.data();
+            tvb.usage = rhi::BufferUsage::Vertex;
+            auto terrainVB = device->CreateBuffer(tvb);
+            rhi::BufferDesc tib;
+            tib.size = (uint64_t)tm.indices.size() * sizeof(uint32_t);
+            tib.initialData = tm.indices.data();
+            tib.usage = rhi::BufferUsage::Index;
+            auto terrainIB = device->CreateBuffer(tib);
+            scene::Mesh terrainMesh{std::move(terrainVB), std::move(terrainIB), kIndexCount};
+
+            // Static lit pipeline (lit.vert + shared lit.frag) — the terrain is one static draw.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Static depth-only shadow pipeline (terrain caster).
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // Sky + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // A flat white base texture + flat normal so the per-vertex height tint shows unmodulated.
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            Mat4 terrainModel = Mat4::Identity();  // terrain is authored in world space already.
+
+            // Fixed 3/4 camera framing the 20x20 patch (centered at origin).
+            const Vec3 eye{14.0f, 11.0f, 14.0f};
+            const Vec3 center{0.0f, 0.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 22.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-13.0f, 13.0f, -13.0f, 13.0f, 1.0f, 48.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(terrainModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(terrainMesh.vertices());
+                    cmd.BindIndexBuffer(terrainMesh.indices());
+                    cmd.DrawIndexed(terrainMesh.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = terrainModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.92f; pc[18] = 0.0f; pc[19] = 0.0f;  // dielectric, rough
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*whiteTex, *flatNormal);
+                        cmd.BindVertexBuffer(terrainMesh.vertices());
+                        cmd.BindIndexBuffer(terrainMesh.indices());
+                        cmd.DrawIndexed(terrainMesh.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Deterministic stat line (matches the Metal --terrain side).
+            std::printf("terrain: {n:%d, verts:%u, tris:%u, peak:%g}\n",
+                        kN, kVertCount, kTriCount, (double)tm.peak);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(terrainShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — terrain %dx%d, %u verts, %u tris\n",
+                                    terrainShotPath, cw, ch2, kN, kN, kVertCount, kTriCount);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", terrainShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
