@@ -76,6 +76,7 @@ const Showcase kShowcases[] = {
     {"--material-shot",     "Data-driven material graph (sphere shaded by showcase.mat.json)."},
     {"--material-live-shot","Live runtime material authoring (runtime codegen+dxc compile, no rebuild)."},
     {"--material-multi-shot","Multi-material scene (three spheres, each a distinct graph material)."},
+    {"--material-normal-shot","Tangent-space normal-mapped material graph (NormalMap node perturbs the shading normal)."},
     {"--ibl-shot",          "HDR image-based lighting (equirect skybox reflections)."},
     {"--scene-shot",        "glTF scene-graph import (CesiumMilkTruck node hierarchy)."},
     {"--bloom-shot",        "HDR bloom post-process."},

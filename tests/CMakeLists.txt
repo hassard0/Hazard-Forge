@@ -149,6 +149,10 @@ hf_add_pure_test(shader_graph_test)
 # Slice AZ: the new-node showcase graph the test codegens (structural asserts on the swizzle/intrinsics).
 target_compile_definitions(shader_graph_test PRIVATE
   "HF_MAT3_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/showcase3.mat.json\"")
+# Slice BE: the NormalMap-node material (PBROutput.normal = NormalMap(slot="normalmap")) the test
+# codegens (structural asserts on the TBN transform + perturbed-normal lighting).
+target_compile_definitions(shader_graph_test PRIVATE
+  "HF_MATNORMAL_JSON=\"${CMAKE_SOURCE_DIR}/assets/materials/normalmap.mat.json\"")
 
 # Live runtime material authoring (Slice AW): the reload-orchestration host logic — given a STUBBED
 # compiler (success/failure, no GPU/dxc), the LiveMaterial controller swaps on success, KEEPS the old

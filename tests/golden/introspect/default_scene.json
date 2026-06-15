@@ -45,6 +45,7 @@
     { "flag": "--material-shot", "desc": "Data-driven material graph (sphere shaded by showcase.mat.json)." },
     { "flag": "--material-live-shot", "desc": "Live runtime material authoring (runtime codegen+dxc compile, no rebuild)." },
     { "flag": "--material-multi-shot", "desc": "Multi-material scene (three spheres, each a distinct graph material)." },
+    { "flag": "--material-normal-shot", "desc": "Tangent-space normal-mapped material graph (NormalMap node perturbs the shading normal)." },
     { "flag": "--ibl-shot", "desc": "HDR image-based lighting (equirect skybox reflections)." },
     { "flag": "--scene-shot", "desc": "glTF scene-graph import (CesiumMilkTruck node hierarchy)." },
     { "flag": "--bloom-shot", "desc": "HDR bloom post-process." },

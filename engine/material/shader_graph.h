@@ -45,17 +45,23 @@ enum class NodeKind {
     Power,          // pow(base, exponent); component-wise; out matches base.
     OneMinus,       // 1 - x; component-wise; out matches x.
     Saturate,       // clamp(x, 0, 1); component-wise; out matches x.
-    PBROutput,      // SINK: baseColor(float3) metallic(float) roughness(float) emissive(float3)
+    // --- Slice BE node -----------------------------------------------------------------------
+    NormalMap,      // param normal-texture slot (default "normalmap"); input UV (default interpolated);
+                    // output TANGENT-SPACE float3 = normalize(decode(sample(tex, uv))), decode(c)=c*2-1.
+    PBROutput,      // SINK: baseColor(float3) metallic(float) roughness(float) emissive(float3) normal(float3)
 };
 
 const char* NodeKindName(NodeKind k);
 // Parse a node "type" string from JSON; returns nullopt for an unknown kind.
 std::optional<NodeKind> ParseNodeKind(const std::string& s);
 
-// The PBROutput sink input slots, in a FIXED order (also the topo/emit order).
-enum PbrInput { kBaseColor = 0, kMetallic = 1, kRoughness = 2, kEmissive = 3, kPbrInputCount = 4 };
-const char* PbrInputName(int slot);       // "baseColor"/"metallic"/"roughness"/"emissive"
-Type        PbrInputType(int slot);       // float3/float/float/float3
+// The PBROutput sink input slots, in a FIXED order (also the topo/emit order). Slice BE appends a
+// 5th input `normal` (tangent-space float3, default (0,0,1) = no perturbation) — appended LAST so the
+// first four keep their order/semantics and unconnected-normal graphs codegen byte-identically.
+enum PbrInput { kBaseColor = 0, kMetallic = 1, kRoughness = 2, kEmissive = 3, kNormal = 4,
+                kPbrInputCount = 5 };
+const char* PbrInputName(int slot);       // "baseColor"/"metallic"/"roughness"/"emissive"/"normal"
+Type        PbrInputType(int slot);       // float3/float/float/float3/float3
 
 // --- Node --------------------------------------------------------------------------------------
 struct Node {
@@ -138,6 +144,9 @@ Value EvalNormalize(const Value& x);                  // x / length(x); same siz
 Value EvalPower(const Value& base, const Value& exp);  // component-wise pow
 Value EvalOneMinus(const Value& x);                   // component-wise 1 - x
 Value EvalSaturate(const Value& x);                   // component-wise clamp(x,0,1)
+// --- Slice BE: NormalMap decode (shared with the codegen) -------------------------------------
+float EvalNormalDecode(float c);                      // decode(c) = c*2 - 1 (single source of truth)
+Value EvalNormalMap(const std::array<float, 4>& texel);  // normalize(decode(texel.rgb)) -> float3
 
 // Evaluate the whole graph at a sample point. `uv` feeds UV nodes; `NoV` feeds Fresnel; `sampleTex`
 // supplies a stub texture lookup (slot, uv) -> float4 so TextureSample is testable on the CPU. The

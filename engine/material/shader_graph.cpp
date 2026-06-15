@@ -47,6 +47,7 @@ const char* NodeKindName(NodeKind k) {
         case NodeKind::Power:         return "Power";
         case NodeKind::OneMinus:      return "OneMinus";
         case NodeKind::Saturate:      return "Saturate";
+        case NodeKind::NormalMap:     return "NormalMap";
         case NodeKind::PBROutput:     return "PBROutput";
     }
     return "Constant";
@@ -78,6 +79,7 @@ std::optional<NodeKind> ParseNodeKind(const std::string& s) {
     if (s == "Power")         return NodeKind::Power;
     if (s == "OneMinus")      return NodeKind::OneMinus;
     if (s == "Saturate")      return NodeKind::Saturate;
+    if (s == "NormalMap")     return NodeKind::NormalMap;
     if (s == "PBROutput")     return NodeKind::PBROutput;
     return std::nullopt;
 }
@@ -88,6 +90,7 @@ const char* PbrInputName(int slot) {
         case kMetallic:  return "metallic";
         case kRoughness: return "roughness";
         case kEmissive:  return "emissive";
+        case kNormal:    return "normal";   // Slice BE: tangent-space normal (default (0,0,1)).
     }
     return "";
 }
@@ -97,6 +100,7 @@ Type PbrInputType(int slot) {
         case kMetallic:  return Type::Float;
         case kRoughness: return Type::Float;
         case kEmissive:  return Type::Float3;
+        case kNormal:    return Type::Float3;   // Slice BE.
     }
     return Type::Float;
 }
@@ -119,6 +123,7 @@ int InputPortCount(NodeKind k) {
         case NodeKind::Power:         return 2;  // a (base), b (exponent)
         case NodeKind::OneMinus:      return 1;  // in
         case NodeKind::Saturate:      return 1;  // in
+        case NodeKind::NormalMap:     return 1;  // uv (optional; defaults to interpolated UV)
         case NodeKind::PBROutput:     return kPbrInputCount;
     }
     return 0;
@@ -126,7 +131,8 @@ int InputPortCount(NodeKind k) {
 
 const char* InputPortName(NodeKind k, int idx) {
     switch (k) {
-        case NodeKind::TextureSample: return idx == 0 ? "uv" : "";
+        case NodeKind::TextureSample:
+        case NodeKind::NormalMap:     return idx == 0 ? "uv" : "";  // Slice BE: NormalMap.uv (optional)
         case NodeKind::Multiply:
         case NodeKind::Add:           return idx == 0 ? "a" : (idx == 1 ? "b" : "");
         case NodeKind::Lerp:          return idx == 0 ? "a" : (idx == 1 ? "b" : (idx == 2 ? "t" : ""));
@@ -152,7 +158,8 @@ const char* InputPortName(NodeKind k, int idx) {
 //   treats Float4 here as a wildcard.
 Type InputPortType(NodeKind k, int idx) {
     switch (k) {
-        case NodeKind::TextureSample: return Type::Float2;        // uv is float2
+        case NodeKind::TextureSample:
+        case NodeKind::NormalMap:     return Type::Float2;        // uv is float2 (Slice BE NormalMap.uv)
         case NodeKind::Multiply:
         case NodeKind::Add:           return Type::Float4;        // wildcard (any vector, a==b)
         case NodeKind::Lerp:
@@ -187,6 +194,7 @@ static Type OutputTypeImpl(const Graph& g, const Node& n, int depth) {
         case NodeKind::UV:            return Type::Float2;
         case NodeKind::TextureSample: return Type::Float4;
         case NodeKind::Fresnel:       return Type::Float;
+        case NodeKind::NormalMap:     return Type::Float3;       // Slice BE: tangent-space normal.
         case NodeKind::Dot:           return Type::Float;        // dot -> scalar.
         case NodeKind::MakeFloat3:    return Type::Float3;
         case NodeKind::MakeFloat4:    return Type::Float4;
@@ -500,6 +508,17 @@ Value EvalSaturate(const Value& x) {
     return r;
 }
 
+// --- Slice BE: NormalMap decode (the SINGLE source of truth, shared with the codegen) -----------
+// decode(c) = c*2 - 1 maps the 0..1 encoded texel back to a -1..1 tangent-space component. The codegen
+// emits the textual twin (`<texel>.xyz * 2.0 - 1.0` then `normalize(...)`).
+float EvalNormalDecode(float c) { return c * 2.0f - 1.0f; }
+Value EvalNormalMap(const std::array<float, 4>& texel) {
+    Value decoded; decoded.count = 3;
+    for (int i = 0; i < 3; ++i) decoded.v[i] = EvalNormalDecode(texel[(size_t)i]);
+    decoded.v[3] = 0.0f;
+    return EvalNormalize(decoded);  // normalize(decode(texel.rgb)) -> unit tangent-space normal.
+}
+
 // --- Whole-graph CPU interpreter ----------------------------------------------------------------
 namespace {
 
@@ -615,6 +634,15 @@ PbrResult Evaluate(const Graph& g, float u, float v, float NoV,
             case NodeKind::Saturate: {
                 Value in = inputValue(n, "in").value_or(Value{});
                 out[id] = EvalSaturate(in);
+                break;
+            }
+            case NodeKind::NormalMap: {
+                // Sample the normal-map texture (defaults to the interpolated UV) then decode+normalize.
+                float su = u, sv = v;
+                if (auto uvIn = inputValue(n, "uv")) { su = uvIn->v[0]; sv = uvIn->v[1]; }
+                std::array<float, 4> t = sampleTex ? sampleTex(n.texture, su, sv)
+                                                   : std::array<float, 4>{0.5f, 0.5f, 1.0f, 1.0f};
+                out[id] = EvalNormalMap(t);
                 break;
             }
             case NodeKind::PBROutput:

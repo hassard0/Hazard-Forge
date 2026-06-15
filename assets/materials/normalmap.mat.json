@@ -1,0 +1,17 @@
+{
+  "name": "normalmap",
+  "_comment": "Slice BE NormalMap-node showcase. PBROutput.normal = NormalMap(slot=\"normalmap\") so the surface's shading normal is perturbed by the tangent-space normal map (decode(c)=c*2-1, then the codegen rotates it into world space via the SAME Gram-Schmidt TBN lit.frag.hlsl uses). baseColor / metallic / roughness are PLAIN constants so the ONLY visible difference vs a flat surface is the normal detail (bump/relief shading). Build-time codegen -> shaders/generated/mat_normalmap.frag.hlsl -> the same HLSL->SPIR-V->MSL toolchain.",
+  "nodes": [
+    { "id": 1, "type": "NormalMap", "texture": "normalmap" },
+    { "id": 2, "type": "Constant", "value": [0.72, 0.74, 0.78, 1.0], "outType": "float3" },
+    { "id": 3, "type": "Constant", "value": [0.0, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 4, "type": "Constant", "value": [0.45, 0.0, 0.0, 0.0], "outType": "float" },
+    { "id": 99, "type": "PBROutput" }
+  ],
+  "edges": [
+    { "from": 2, "to": 99, "port": "baseColor" },
+    { "from": 3, "to": 99, "port": "metallic" },
+    { "from": 4, "to": 99, "port": "roughness" },
+    { "from": 1, "to": 99, "port": "normal" }
+  ]
+}

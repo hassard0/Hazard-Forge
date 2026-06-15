@@ -610,7 +610,8 @@ static int RunPbrShowcase(const char* outPath) {
 // `matMslFile` / `matEntry` select WHICH generated material fragment to render: showcase (Slice AV)
 // or showcase2 (Slice AW). Metal stays BUILD-TIME for both — the generated MSL is what runs; runtime
 // authoring is a Vulkan/Windows feature. Everything else (scene/camera/light) is identical.
-static int RunMaterialShowcaseImpl(const char* outPath, const char* matMslFile, const char* matEntry) {
+static int RunMaterialShowcaseImpl(const char* outPath, const char* matMslFile, const char* matEntry,
+                                   bool bumpyNormal = false) {
     using math::Mat4; using math::Vec3;
     const uint32_t W = 1280, H = 720;
     auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
@@ -683,6 +684,15 @@ static int RunMaterialShowcaseImpl(const char* outPath, const char* matMslFile, 
     const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
     auto flatNormal = device->CreateTexture(
         {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    // Slice BE: a real tangent-space normal map (8x8 domed tiles) for the NormalMap-node material so
+    // the sphere shows bump relief. Bound at the normal slot ONLY when bumpyNormal (mat_normal); the
+    // showcase/showcase2 paths keep the flat 1x1 normal so their goldens are unchanged.
+    std::vector<uint8_t> bumpy = bumpyNormal ? MakeBumpyNormalMap() : std::vector<uint8_t>{};
+    std::unique_ptr<rhi::ITexture> bumpyNormalTex;
+    if (bumpyNormal)
+        bumpyNormalTex = device->CreateTexture(
+            {256, 256, rhi::Format::RGBA8_UNorm, bumpy.data(), bumpy.size()});
+    rhi::ITexture& normalTex = bumpyNormal ? *bumpyNormalTex : *flatNormal;
     const uint8_t whitePx[4] = {255, 255, 255, 255};
     auto whiteTex = device->CreateTexture(
         {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
@@ -770,9 +780,12 @@ static int RunMaterialShowcaseImpl(const char* outPath, const char* matMslFile, 
             {
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = sphereModel.m[k];
-                pc[16] = 0.0f; pc[17] = 0.35f; pc[18] = 0.0f; pc[19] = 0.0f;
+                // Roughness matches the Vulkan --material-normal-shot path (0.45 for the normalmap
+                // material, 0.35 for showcase/showcase2). metallic stays 0 (the push-constant
+                // metallic/roughness are flat-shaded; the graph overrides them per its constants).
+                pc[16] = 0.0f; pc[17] = bumpyNormal ? 0.45f : 0.35f; pc[18] = 0.0f; pc[19] = 0.0f;
                 cmd.PushConstants(pc, sizeof(pc));
-                cmd.BindMaterialPBR(*checkerTex, *whiteTex, *flatNormal, *blackTex, *whiteTex);
+                cmd.BindMaterialPBR(*checkerTex, *whiteTex, normalTex, *blackTex, *whiteTex);
                 cmd.BindVertexBuffer(sphere.vertices());
                 cmd.BindIndexBuffer(sphere.indices());
                 cmd.DrawIndexed(sphere.indexCount());
@@ -807,6 +820,14 @@ static int RunMaterialShowcase(const char* outPath) {
 }
 static int RunMaterialShowcase2(const char* outPath) {
     return RunMaterialShowcaseImpl(outPath, "mat_showcase2.frag.gen.metal", "material2_fragment");
+}
+// Slice BE: the NormalMap-node material — PBROutput.normal = NormalMap(slot="normalmap"); a tangent-
+// space normal map (domed tiles) perturbs the shading normal via the codegen's TBN (the same Gram-
+// Schmidt construction lit.frag uses). The bumpy normal map binds at the normal slot; the sphere
+// shows clear bump relief. Renders the new mat_normal.png golden.
+static int RunMaterialNormalShowcase(const char* outPath) {
+    return RunMaterialShowcaseImpl(outPath, "mat_normalmap.frag.gen.metal", "material_normal_fragment",
+                                   /*bumpyNormal=*/true);
 }
 
 // --- Multi-material scene (Slice AZ). Mirrors the Vulkan --material-multi-shot path: three spheres
@@ -7426,6 +7447,14 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--material-multi") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mat_multi.png";
             try { return RunMaterialMultiShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --material-normal <out.png>: render the NormalMap-node showcase (Slice BE) — a sphere shaded
+        // by normalmap.mat.json whose PBROutput.normal = NormalMap(slot="normalmap"); a tangent-space
+        // normal map perturbs the shading normal (bump relief). The new mat_normal.png golden.
+        if (argc > 1 && std::strcmp(argv[1], "--material-normal") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mat_normal.png";
+            try { return RunMaterialNormalShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --scene <out.png>: render the full glTF scene-graph import showcase (Slice V) — the

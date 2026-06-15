@@ -160,6 +160,16 @@ std::string GenerateHlsl(const Graph& g) {
                 os << "    " << Ty(t) << " " << Tmp(id) << " = saturate(" << Tmp(src) << ");\n";
                 break;
             }
+            case NodeKind::NormalMap: {
+                // Slice BE: sample the tangent-space normal map (defaults to the interpolated UV),
+                // decode 0..1 -> -1..1 (decode(c)=c*2-1, the textual twin of EvalNormalDecode), then
+                // normalize. Output is a TANGENT-SPACE float3; PBROutput.normal applies the TBN below.
+                int uvSrc = SourceOf(g, id, "uv");
+                std::string uvExpr = (uvSrc >= 0) ? Tmp(uvSrc) : "i.uv";
+                os << "    float3 " << Tmp(id) << " = normalize(gNormalMap.Sample(gNormalSmp, "
+                   << uvExpr << ").xyz * 2.0 - 1.0);\n";
+                break;
+            }
             case NodeKind::PBROutput:
                 break;
         }
@@ -190,7 +200,25 @@ std::string GenerateHlsl(const Graph& g) {
     os << "    float  metallic  = " << arg("metallic",  Type::Float,  "0.0") << ";\n";
     os << "    float  roughness = " << arg("roughness", Type::Float,  "1.0") << ";\n";
     os << "    float3 emissive  = " << arg("emissive",  Type::Float3, "float3(0.0, 0.0, 0.0)") << ";\n";
-    os << "    return hfShadePBR(i, baseColor, metallic, roughness, emissive);\n";
+
+    // Slice BE: tangent-space normal mapping. ONLY emit the TBN transform when PBROutput.normal is
+    // CONNECTED — an unconnected normal keeps the EXACT pre-BE geometric-normal call below, so graphs
+    // without a normal codegen BYTE-IDENTICALLY (the existing material goldens stay unchanged).
+    int normalSrc = SourceOf(g, sink->id, "normal");
+    if (normalSrc < 0) {
+        os << "    return hfShadePBR(i, baseColor, metallic, roughness, emissive);\n";
+    } else {
+        // The graph normal is tangent-space (default (0,0,1) = no perturbation). Build the SAME
+        // Gram-Schmidt TBN from the interpolated wnormal + wtangent that lit.frag.hlsl uses, rotate
+        // the graph normal into world space, and feed THAT into the lighting core (hfShadePBRN).
+        os << "    float3 nTS = " << arg("normal", Type::Float3, "float3(0.0, 0.0, 1.0)") << ";\n";
+        os << "    float3 Ng_ = normalize(i.wnormal);\n";
+        os << "    float3 T_  = normalize(i.wtangent - Ng_ * dot(Ng_, i.wtangent));\n";
+        os << "    float3 B_  = cross(Ng_, T_);\n";
+        os << "    float3x3 TBN_ = float3x3(T_, B_, Ng_);\n";
+        os << "    float3 N_  = normalize(mul(nTS, TBN_));\n";
+        os << "    return hfShadePBRN(i, baseColor, metallic, roughness, emissive, N_);\n";
+    }
     os << "}\n";
     return os.str();
 }

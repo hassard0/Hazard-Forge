@@ -443,6 +443,92 @@ int main() {
         }
     }
 
+    // ============================ 6. SLICE BE — NORMALMAP NODE ================================
+    // New tangent-space NormalMap node (sample a normal texture -> decode(c)=c*2-1 -> normalize) and
+    // a 5th PBROutput input `normal` (tangent-space float3, DEFAULT (0,0,1) = no perturbation). The
+    // decode math is shared by the CPU interpreter + the codegen; the default-(0,0,1) invariant
+    // protects the existing material goldens (an UNCONNECTED normal emits the SAME geometric-normal
+    // codegen as pre-BE: NO TBN block).
+
+    // --- NormalMap decode parity (shared formula decode(c) = c*2 - 1) ---------------------------
+    {
+        // decode(0.5)==0, decode(1.0)==1, decode(0.0)==-1 (component-wise).
+        check(approx(EvalNormalDecode(0.5f), 0.0f), "NormalMap decode(0.5) == 0");
+        check(approx(EvalNormalDecode(1.0f), 1.0f), "NormalMap decode(1.0) == 1");
+        check(approx(EvalNormalDecode(0.0f), -1.0f), "NormalMap decode(0.0) == -1");
+
+        // A FLAT normal-map texel (0.5,0.5,1.0) decodes to (0,0,1) (no perturbation) and the node
+        // output (normalize(decode(texel))) is exactly (0,0,1).
+        Value flat = EvalNormalMap({0.5f, 0.5f, 1.0f, 1.0f});
+        check(flat.count == 3 && approx(flat.v[0], 0.0f) && approx(flat.v[1], 0.0f) &&
+              approx(flat.v[2], 1.0f), "NormalMap flat texel (0.5,0.5,1) -> (0,0,1)");
+
+        // Output is normalized (unit length) for a non-flat texel. Texel (1.0,1.0,0.5):
+        // decode -> (1,1,0); normalize -> (0.7071,0.7071,0).
+        Value perturbed = EvalNormalMap({1.0f, 1.0f, 0.5f, 1.0f});
+        float len = std::sqrt(perturbed.v[0] * perturbed.v[0] + perturbed.v[1] * perturbed.v[1] +
+                              perturbed.v[2] * perturbed.v[2]);
+        check(perturbed.count == 3 && approx(len, 1.0f), "NormalMap output is normalized (unit length)");
+        check(approx(perturbed.v[0], 0.70710678f) && approx(perturbed.v[1], 0.70710678f) &&
+              approx(perturbed.v[2], 0.0f), "NormalMap (1,1,0.5) -> normalized (0.707,0.707,0)");
+    }
+
+    // --- A standalone NormalMap node graph: validates; the node outputs float3. -----------------
+    {
+        Graph g;
+        Node nm; nm.id = 1; nm.kind = NodeKind::NormalMap; nm.texture = "normalmap";
+        Node out; out.id = 99; out.kind = NodeKind::PBROutput;
+        g.nodes = {nm, out};
+        g.edges = { {1, 99, "normal"} };
+        check(Validate(g).ok, "NormalMap -> PBROutput.normal validates");
+        check(OutputType(g, g.nodes[0]) == Type::Float3, "NormalMap output type is float3");
+        // A float2 (UV) into PBROutput.normal (float3) is a type error.
+        Graph bad;
+        Node uv; uv.id = 1; uv.kind = NodeKind::UV;
+        Node out2; out2.id = 99; out2.kind = NodeKind::PBROutput;
+        bad.nodes = {uv, out2};
+        bad.edges = { {1, 99, "normal"} };
+        check(!Validate(bad).ok, "float2 -> PBROutput.normal is rejected (type mismatch)");
+    }
+
+    // --- PBROutput.normal DEFAULT: unconnected -> (0,0,1) AND byte-identical pre-BE codegen ------
+    // CRITICAL invariance: a graph WITHOUT a normal connection must generate the SAME geometric-
+    // normal shader as before BE (no TBN block, calls hfShadePBR not hfShadePBRN), so the existing
+    // mat_showcase / mat_showcase2 / mat_showcase3 goldens stay byte-identical.
+    {
+        Graph g = MakeShowcaseGraph();  // no `normal` edge.
+        std::string h = GenerateHlsl(g);
+        check(h.find("// ERROR") == std::string::npos, "showcase (no normal) codegens cleanly");
+        // NO TBN block emitted when normal is unconnected (protects existing goldens).
+        check(h.find("wtangent") == std::string::npos,
+              "unconnected normal: NO tangent/TBN block emitted (geometric-normal path)");
+        check(h.find("hfShadePBRN") == std::string::npos,
+              "unconnected normal: calls hfShadePBR (NOT the world-normal overload)");
+        check(h.find("hfShadePBR(i,") != std::string::npos,
+              "unconnected normal: emits the original hfShadePBR(i, ...) call");
+    }
+
+    // --- CONNECTED case: the normalmap material codegens a TBN transform + perturbed normal. -----
+    {
+        LoadResult lr = LoadGraphFromFile(std::string(HF_MATNORMAL_JSON));
+        check(lr.ok, "normalmap.mat.json loads + validates");
+        if (lr.ok) {
+            std::string h1 = GenerateHlsl(lr.graph);
+            std::string h2 = GenerateHlsl(lr.graph);
+            check(h1 == h2, "normalmap codegen is deterministic (byte-identical)");
+            check(h1.find("// ERROR") == std::string::npos, "normalmap codegens cleanly");
+            // The NormalMap node samples the normal-map texture + decodes.
+            check(h1.find("gNormalMap.Sample") != std::string::npos,
+                  "NormalMap node samples gNormalMap");
+            // TBN transform present (Gram-Schmidt against the interpolated tangent, like lit.frag).
+            check(h1.find("i.wtangent") != std::string::npos, "connected normal: uses the wtangent varying");
+            check(h1.find("float3x3") != std::string::npos, "connected normal: builds a TBN matrix");
+            // The perturbed world normal feeds lighting via the world-normal overload.
+            check(h1.find("hfShadePBRN") != std::string::npos,
+                  "connected normal: feeds the perturbed normal into hfShadePBRN");
+        }
+    }
+
     if (g_fail == 0) { std::printf("shader_graph_test OK\n"); return 0; }
     std::printf("shader_graph_test: %d failures\n", g_fail);
     return 1;

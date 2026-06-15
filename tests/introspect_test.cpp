@@ -212,6 +212,8 @@ int main() {
         bool sawMaterialLiveShot = false;
         // Slice AZ: the --material-multi-shot showcase flag is listed in the showcase manifest.
         bool sawMaterialMultiShot = false;
+        // Slice BE: the --material-normal-shot showcase flag is listed in the showcase manifest.
+        bool sawMaterialNormalShot = false;
         // Slice AX: the --game-shot showcase flag is listed in the showcase manifest.
         bool sawGameShot = false;
         // Slice BA: the --hud-shot + --game-hud-shot showcase flags are listed.
@@ -230,6 +232,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--material-shot") sawMaterialShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-live-shot") sawMaterialLiveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-multi-shot") sawMaterialMultiShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--material-normal-shot") sawMaterialNormalShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--game-shot") sawGameShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--hud-shot") sawHudShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--game-hud-shot") sawGameHudShot = true;
@@ -243,6 +246,7 @@ int main() {
         check(sawMaterialShot, "showcases manifest includes --material-shot");
         check(sawMaterialLiveShot, "showcases manifest includes --material-live-shot");
         check(sawMaterialMultiShot, "showcases manifest includes --material-multi-shot");
+        check(sawMaterialNormalShot, "showcases manifest includes --material-normal-shot");
         check(sawGameShot, "showcases manifest includes --game-shot");
         check(sawHudShot, "showcases manifest includes --hud-shot");
         check(sawGameHudShot, "showcases manifest includes --game-hud-shot");

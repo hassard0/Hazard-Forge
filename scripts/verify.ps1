@@ -68,6 +68,7 @@ $Goldens = @(
     @{ Name = 'mat_graph';     Flag = '--material' }             # Slice AV (data-driven material graph)
     @{ Name = 'mat_graph2';    Flag = '--material2' }            # Slice AW (second material; build-time codegen)
     @{ Name = 'mat_multi';     Flag = '--material-multi' }       # Slice AZ (three distinct graph materials in one frame)
+    @{ Name = 'mat_normal';    Flag = '--material-normal' }      # Slice BE (NormalMap node: tangent-space normal map)
     @{ Name = 'instanced';     Flag = '--instanced' }            # Slice Q
     @{ Name = 'ibl_helmet';    Flag = '--ibl' }                  # Slice R
     @{ Name = 'physics';       Flag = '--physics' }              # Slice S

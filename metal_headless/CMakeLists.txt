@@ -98,6 +98,11 @@ hf_gen_msl(mat_showcase2.frag generated/mat_showcase2.frag.hlsl frag material2_f
 # Same HLSL->SPIR-V->MSL toolchain; drawn alongside showcase + showcase2 in the --material-multi scene
 # that renders the new mat_multi.png golden.
 hf_gen_msl(mat_showcase3.frag generated/mat_showcase3.frag.hlsl frag material3_fragment)
+# Slice BE: the NormalMap-node material's committed build-time-generated fragment (shaders/generated/
+# mat_normalmap.frag.hlsl) — PBROutput.normal = NormalMap(slot="normalmap"), so the codegen builds the
+# world normal from the tangent-space sample via the SAME Gram-Schmidt TBN lit.frag uses and shades via
+# hfShadePBRN. Same HLSL->SPIR-V->MSL toolchain; renders the new mat_normal.png golden (--material-normal).
+hf_gen_msl(mat_normalmap.frag generated/mat_normalmap.frag.hlsl frag material_normal_fragment)
 # HDR environment IBL (Slice R): equirect skybox + full-PBR-with-HDR-IBL fragment shaders. Same
 # HLSL->SPIR-V->MSL toolchain; the env map binds at flat fragment texture(11)/sampler(12).
 hf_gen_msl(sky_hdr.frag      sky_hdr.frag.hlsl      frag sky_hdr_fragment)
