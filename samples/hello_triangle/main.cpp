@@ -25,6 +25,7 @@
 #include "audio/wav.h"
 #include "game/roll_game.h"
 #include "net/snapshot.h"            // Slice BQ: replication snapshot layer (pure CPU)
+#include "net/transport.h"           // Slice BU: simulated transport + client jitter-buffer/interp (pure CPU)
 #include "ui/text.h"
 #include "render/render_graph.h"
 #include "render/csm.h"
@@ -318,6 +319,7 @@ int main(int argc, char** argv) {
     const char* terrainShotPath = nullptr;   // --terrain-shot <out.bmp> (Slice BF: procedural terrain)
     const char* gameShotPath = nullptr;
     const char* netShotPath = nullptr;       // --net-shot <out.bmp> (Slice BQ: replication replica render)
+    const char* netsimShotPath = nullptr;    // --netsim-shot <out.bmp> (Slice BU: lossy channel + client interp)
     const char* streamShotPath = nullptr;    // --stream-shot <out.bmp> (Slice BD: scene streaming)
     const char* terrainStreamShotPath = nullptr; // --terrain-stream-shot <out.bmp> (Slice BJ)
     const char* hudShotPath = nullptr;       // --hud-shot <out.bmp> (Slice BA: text/HUD overlay)
@@ -469,6 +471,17 @@ int main(int argc, char** argv) {
             // (player + remaining pickups from its RepEntities) lit + shadowed via the existing static-
             // lit scene path. Prints the deterministic net: {...replicaMatch:true, savings} line. One BMP.
             netShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--netsim-shot") == 0 && i + 1 < argc) {
+            // Slice BU: networking TRANSPORT + client jitter-buffer / interpolation. Run the AX roll-game
+            // as the AUTHORITY over the full scripted track; each tick Capture+serialize the snapshot and
+            // Send it through a SimChannel with a FIXED lossy/laggy config (latency 3, dropRate 0.15,
+            // reorderRate 0.1, fixed lossSeed) — a deterministic SEEDED channel (NO sockets). Each tick
+            // the CLIENT Delivers + buffers the (possibly dropped/reordered) snapshots; at a fixed render
+            // tick it renders its INTERPOLATED RenderState (player + remaining pickups, lit + shadowed via
+            // the existing static-lit scene path). The smoothing HIDES the loss — `converged` asserts the
+            // interpolated client state is within a documented tolerance of the authority's true state.
+            // Prints the deterministic netsim: {...converged:true} line. One BMP -> exit.
+            netsimShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--stream-shot") == 0 && i + 1 < argc) {
             // Slice BD: distance-based scene streaming. Build a fixed 8x8 cell world, fly a SCRIPTED
             // camera path across it calling StreamingWorld::Update each frame (cells stream in/out
@@ -9038,6 +9051,304 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — capture step %d, %zu pickups remaining (replica)\n",
                                     netShotPath, cw, ch2, kNetCaptureStep, pickupModels.size());
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", netShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Networking TRANSPORT + client jitter-buffer / interpolation showcase (--netsim-shot, Slice
+        // BU): a self-contained capture path that does NOT touch the default scene. Extends --net-shot
+        // with the HARD part of real networking — an IMPERFECT channel + client-side smoothing — made
+        // deterministic via a SEEDED channel model (still NO sockets). Run the AX roll-game as the
+        // AUTHORITY over the full scripted track at the engine fixed dt; each tick Capture a Snapshot
+        // (player id 0 + uncollected pickups id 1..N), serialize it, and Send it through a SimChannel
+        // with a FIXED lossy/laggy ChannelConfig (latency 3, dropRate 0.15, reorderRate 0.1, a fixed
+        // lossSeed) — a pure integer-LCG seeded channel (drop/reorder are deterministic; NO real RNG, NO
+        // clock). Each tick the CLIENT Delivers the (possibly dropped / reordered) packets and buffers the
+        // deserialized snapshots in a jitter buffer. At a FIXED render tick the client renders its
+        // INTERPOLATED RenderState (interpDelay 2 ticks behind the leading edge — lerp position + nlerp
+        // orientation between the bracketing snapshots, hiding the loss). `converged` asserts the
+        // interpolated client state is within a documented tolerance of the authority's TRUE state at that
+        // tick. Render the CLIENT'S interpolated player + remaining pickups lit + shadowed via the existing
+        // static-lit scene path. Prints the deterministic netsim: {...converged:true} line. One BMP -> exit.
+        // Pure-CPU transport/interpolation (engine/net); pipelines/shaders are untouched.
+        if (netsimShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // FIXED, deterministic channel + interpolation config (per the BU spec).
+            const int kNetCaptureStep = 250;       // identical scene framing to --game-shot / --net-shot
+            const int kSimLatency = 3;             // base one-way delay (ticks)
+            const float kSimDropRate = 0.15f;      // 15% seeded packet loss
+            const float kSimReorderRate = 0.10f;   // 10% seeded reordering
+            const uint32_t kSimLossSeed = 0xBADC0DEu;
+            const int kInterpDelay = 2;            // render 2 ticks behind the leading edge
+            const float dtG = 1.0f / 120.0f;
+            std::vector<game::GameInput> track = game::ScriptedTrack();
+
+            net::ChannelConfig cfg;
+            cfg.latencyTicks = kSimLatency;
+            cfg.lossSeed = kSimLossSeed;
+            cfg.dropRate = kSimDropRate;
+            cfg.reorderRate = kSimReorderRate;
+            net::SimChannel channel(cfg);
+            net::ClientView client(kInterpDelay);
+
+            // Run the AUTHORITY sim. Each tick: Capture -> Send through the channel; then Deliver every
+            // packet due at this tick into the client's jitter buffer. We also stash the authority's TRUE
+            // snapshot at the render tick for the convergence assertion. Drive a few ticks PAST the render
+            // tick so the client has buffered the snapshots that bracket renderTick (latency + interp
+            // delay + the channel's reorder spread of up to +5 ticks => +~10 is ample).
+            physics::World authWorld;
+            game::GameState authState = game::MakeRollGame(authWorld);
+            const int totalTicks = (int)track.size();
+            const int kRenderTick = kNetCaptureStep;
+            const int kDriveUntil = std::min(totalTicks, kRenderTick + kSimLatency + kInterpDelay + 12);
+            net::Snapshot authAtRender;
+            bool haveAuth = false;
+            for (int t = 0; t <= kDriveUntil; ++t) {
+                net::Snapshot snap = net::Replicator::Capture((uint32_t)t, authState, authWorld);
+                if (t == kRenderTick) { authAtRender = snap; haveAuth = true; }
+                channel.Send(t, net::Serialize(snap));
+                for (const net::Packet& p : channel.Deliver(t)) client.Receive(p.bytes);
+                if (t < totalTicks) game::StepGame(authWorld, authState, track[(size_t)t], dtG);
+            }
+            if (!haveAuth) { std::fprintf(stderr, "FATAL: no authority snapshot at render tick\n"); return 1; }
+
+            // The client's INTERPOLATED view at the fixed render tick (the whole point of the slice).
+            net::Snapshot clientView = client.RenderState((float)kRenderTick);
+
+            // Convergence: the player's interpolated position must sit within a documented tolerance of
+            // the authority's TRUE position at the render tick (the jitter buffer + interpolation hide the
+            // 15% loss + 10% reorder). The roll-game player moves at most ~kMaxPlanarSpd*dt per tick; a
+            // generous 0.25 m tolerance covers a worst-case interpolation across a multi-tick hole.
+            const float kConvergeTol = 0.25f;
+            auto playerPos = [](const net::Snapshot& s) -> Vec3 {
+                for (const net::RepEntity& e : s.entities) if (e.flags & net::kFlagPlayer) return e.position;
+                return Vec3{0, 0, 0};
+            };
+            const float convErr = math::length(playerPos(clientView) - playerPos(authAtRender));
+            const bool converged = convErr <= kConvergeTol;
+            if (!converged) {
+                std::fprintf(stderr, "FATAL: client interp state diverged from authority (err=%.4f > tol=%.4f)\n",
+                             convErr, kConvergeTol);
+                return 1;
+            }
+
+            // Build the render models from the CLIENT'S interpolated RepEntities (id 0 == player, pickup
+            // flag == remaining pickup). The renderer consumes the client's smoothed state, not the
+            // authority's.
+            Mat4 replicaPlayerModel = Mat4::Identity();
+            bool havePlayer = false;
+            std::vector<Mat4> pickupModels;
+            for (const net::RepEntity& e : clientView.entities) {
+                if (e.flags & net::kFlagPlayer) {
+                    replicaPlayerModel = math::FromTRS(
+                        e.position, e.orientation,
+                        {2.0f * game::kPlayerRadius, 2.0f * game::kPlayerRadius, 2.0f * game::kPlayerRadius});
+                    havePlayer = true;
+                } else if (e.flags & net::kFlagPickup) {
+                    pickupModels.push_back(math::FromTRS(
+                        e.position, e.orientation,
+                        {2.0f * game::kPickupRadius, 2.0f * game::kPickupRadius, 2.0f * game::kPickupRadius}));
+                }
+            }
+            if (!havePlayer) { std::fprintf(stderr, "FATAL: client view has no player entity\n"); return 1; }
+            Mat4 playerModel = replicaPlayerModel;
+
+            // --- Static lit pipeline (player + pickups + ground) + static shadow + sky + post. ------
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            const uint8_t playerPx[4] = {40, 110, 230, 255};   // blue
+            auto playerTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, playerPx, sizeof(playerPx)});
+            const uint8_t pickupPx[4] = {245, 200, 40, 255};   // gold
+            auto pickupTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, pickupPx, sizeof(pickupPx)});
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // Same camera framing as --game-shot / --net-shot.
+            const Vec3 eye{9.5f, 4.0f, 6.5f};
+            const Vec3 center{5.0f, 0.4f, 1.6f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{5.0f, 0.4f, 1.6f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto litPush = [](const Mat4& model, float metallic, float roughness) {
+                std::array<float, 20> pc{};
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                return pc;
+            };
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.PushConstants(playerModel.m, sizeof(float) * 16);
+                    cmd.DrawIndexed(sphere.indexCount());
+                    for (const Mat4& pm : pickupModels) {
+                        cmd.PushConstants(pm.m, sizeof(float) * 16);
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        auto pc = litPush(groundModel, 0.0f, 0.85f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    {
+                        auto pc = litPush(playerModel, 0.1f, 0.4f);
+                        cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                        cmd.BindMaterial(*playerTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexed(sphere.indexCount());
+                    }
+                    {
+                        cmd.BindMaterial(*pickupTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        for (const Mat4& pm : pickupModels) {
+                            auto pc = litPush(pm, 0.3f, 0.3f);
+                            cmd.PushConstants(pc.data(), sizeof(float) * 20);
+                            cmd.DrawIndexed(sphere.indexCount());
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Deterministic netsim stat line.
+            std::printf("netsim: {latency:%d, lossRate:%.2f, delivered:%u, dropped:%u, reordered:%u, "
+                        "interpDelay:%d, renderTick:%d, converged:%s}\n",
+                        kSimLatency, kSimDropRate, channel.Delivered(), channel.Dropped(),
+                        channel.Reordered(), kInterpDelay, kRenderTick, converged ? "true" : "false");
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(netsimShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — render tick %d, %zu pickups remaining (client interp)\n",
+                                    netsimShotPath, cw, ch2, kRenderTick, pickupModels.size());
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", netsimShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

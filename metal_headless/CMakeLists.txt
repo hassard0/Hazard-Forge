@@ -262,6 +262,11 @@ add_executable(visual_test
     # engine compiles, so the serialized snapshot/delta BYTES are bit-identical cross-backend. No
     # Metal/RHI deps. Drives the --net showcase's authority->replica stream + replica-scene render.
     ${HF_ROOT}/engine/net/snapshot.cpp
+    # Networking TRANSPORT + client jitter-buffer / interpolation (Slice BU): the SAME pure-C++
+    # transport.cpp the Windows engine compiles, so the seeded channel's drop/reorder decisions + the
+    # client interpolation are BIT-IDENTICAL cross-backend (the netsim stat line matches Vulkan). No
+    # Metal/RHI deps. Drives the --netsim showcase's authority->lossy-channel->client-interp render.
+    ${HF_ROOT}/engine/net/transport.cpp
     # Text / HUD layout + baked font atlas (Slice BA): pure C++ (no Metal/RHI deps). Drives the
     # --hud + --game-hud showcases' screen-space alpha-blended text overlay.
     ${HF_ROOT}/engine/ui/text.cpp

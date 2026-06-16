@@ -46,7 +46,8 @@
       "audio-mixer",
       "scene-streaming",
       "terrain-streaming-lod",
-      "state-replication"
+      "state-replication",
+      "network-transport-sim"
     ]
   },
   "showcases": [
@@ -69,6 +70,7 @@
     { "flag": "--terrain-shot", "desc": "Procedural terrain / heightmap (deterministic NxN displaced grid, lit + shadowed)." },
     { "flag": "--game-shot", "desc": "Playable game sample (deterministic roll-a-ball collect-the-pickups)." },
     { "flag": "--net-shot", "desc": "State replication (deterministic snapshot+delta; replica reconstructs the scene)." },
+    { "flag": "--netsim-shot", "desc": "Simulated network transport + client jitter-buffer interpolation (seeded latency/loss/reorder; smoothing hides the lossy channel)." },
     { "flag": "--stream-shot", "desc": "Scene/asset streaming (distance-based cell residency + per-frame budget)." },
     { "flag": "--terrain-stream-shot", "desc": "Terrain streaming with per-tile LOD (distance-banded tile residency + LOD selection)." },
     { "flag": "--hud-shot", "desc": "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)." },

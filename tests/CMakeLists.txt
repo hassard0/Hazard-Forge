@@ -248,6 +248,17 @@ hf_add_pure_test(roll_game_test)
 # symbols, ASan-eligible.
 hf_add_pure_test(replication_test)
 
+# Networking transport + client jitter-buffer / interpolation (Slice BU): the deterministic, socket-free
+# SimChannel (seeded-LCG latency + packet loss + reordering) + ClientView jitter buffer over the BQ
+# snapshot layer (engine/net/transport). Asserts channel determinism (same config+stream -> identical
+# delivered/dropped/reordered two runs; delivered+dropped==sent; latency respected), loss/reorder
+# (dropRate>0 drops some; reorderRate>0 perturbs delivery order; rates=0 = pure FIFO delay), jitter-
+# buffer interpolation (clean channel render == authority at renderTick; a single dropped snapshot is
+# hidden by interpolating across the gap; hold-last edge policy), and convergence/bounds (interpolated
+# client stays within tolerance of the authority over a lossy stream, no unbounded drift, deterministic).
+# Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(net_transport_test)
+
 # Text / HUD layout + atlas (Slice BA): BuildFontAtlas determinism + shape (128x48, white with
 # coverage alpha) and LayoutText math — 6 verts/visible glyph, quad count with spaces + newline,
 # cursor advance == kGlyphPx*pxScale, atlas-cell UVs, pixel->NDC conversion, empty string => 0 quads,

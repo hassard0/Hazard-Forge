@@ -98,6 +98,7 @@ $Goldens = @(
     @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'net';           Flag = '--net' }                 # Slice BQ (replication; replica reconstructs + renders the scene)
+    @{ Name = 'netsim';        Flag = '--netsim' }              # Slice BU (transport sim: lossy/laggy channel + client jitter-buffer interpolation)
     @{ Name = 'hud';           Flag = '--hud' }                 # Slice BA (text / HUD overlay)
     @{ Name = 'game_hud';      Flag = '--game-hud' }            # Slice BA (game scene + live SCORE HUD)
     @{ Name = 'stream';        Flag = '--stream' }             # Slice BD (scene/asset streaming; resident cell subset)

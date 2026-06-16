@@ -90,6 +90,7 @@ const Showcase kShowcases[] = {
     {"--terrain-shot",      "Procedural terrain / heightmap (deterministic NxN displaced grid, lit + shadowed)."},
     {"--game-shot",         "Playable game sample (deterministic roll-a-ball collect-the-pickups)."},
     {"--net-shot",          "State replication (deterministic snapshot+delta; replica reconstructs the scene)."},
+    {"--netsim-shot",       "Simulated network transport + client jitter-buffer interpolation (seeded latency/loss/reorder; smoothing hides the lossy channel)."},
     {"--stream-shot",       "Scene/asset streaming (distance-based cell residency + per-frame budget)."},
     {"--terrain-stream-shot","Terrain streaming with per-tile LOD (distance-banded tile residency + LOD selection)."},
     {"--hud-shot",          "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)."},
@@ -164,6 +165,7 @@ const char* kFeatures[] = {
     "scene-streaming",
     "terrain-streaming-lod",
     "state-replication",
+    "network-transport-sim",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

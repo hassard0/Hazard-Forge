@@ -170,6 +170,8 @@ int main() {
             bool sawSsgiFeature = false;
             // Slice BQ: the state-replication capability is advertised in the feature manifest.
             bool sawReplicationFeature = false;
+            // Slice BU: the network-transport-sim capability is advertised in the feature manifest.
+            bool sawNetsimFeature = false;
             // Slice BT: the docked-editor capability is advertised in the feature manifest.
             bool sawDockedEditorFeature = false;
             if (features)
@@ -194,6 +196,7 @@ int main() {
                     if (AsString(el->value) == "post-process-stack") sawPostStackFeature = true;
                     if (AsString(el->value) == "screen-space-global-illumination") sawSsgiFeature = true;
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
+                    if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
                     if (AsString(el->value) == "docked-editor") sawDockedEditorFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
@@ -216,6 +219,7 @@ int main() {
             check(sawPostStackFeature, "engine.features includes post-process-stack");
             check(sawSsgiFeature, "engine.features includes screen-space-global-illumination");
             check(sawReplicationFeature, "engine.features includes state-replication");
+            check(sawNetsimFeature, "engine.features includes network-transport-sim");
             check(sawDockedEditorFeature, "engine.features includes docked-editor");
         }
 
@@ -282,6 +286,8 @@ int main() {
         bool sawSsgiDenoiseShot = false;
         // Slice BQ: the --net-shot showcase flag is listed in the showcase manifest.
         bool sawNetShot = false;
+        // Slice BU: the --netsim-shot showcase flag is listed in the showcase manifest.
+        bool sawNetsimShot = false;
         // Slice BT: the --editor-shot showcase flag is listed in the showcase manifest.
         bool sawEditorShot = false;
         if (showcases)
@@ -310,6 +316,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-shot") sawSsgiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--net-shot") sawNetShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--netsim-shot") sawNetsimShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-shot") sawEditorShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
@@ -335,6 +342,7 @@ int main() {
         check(sawSsgiShot, "showcases manifest includes --ssgi-shot");
         check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
         check(sawNetShot, "showcases manifest includes --net-shot");
+        check(sawNetsimShot, "showcases manifest includes --netsim-shot");
         check(sawEditorShot, "showcases manifest includes --editor-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
