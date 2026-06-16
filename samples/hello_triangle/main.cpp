@@ -349,6 +349,7 @@ int main(int argc, char** argv) {
     const char* dofShotPath = nullptr;       // --dof-shot <out.bmp> (Slice CG: depth of field)
     const char* motionBlurShotPath = nullptr;// --motionblur-shot <out.bmp> (Slice CN: motion blur)
     const char* oitShotPath = nullptr;       // --oit-shot <out.bmp> (Slice CO: order-independent transparency)
+    const char* pomShotPath = nullptr;       // --pom-shot <out.bmp> (Slice CP: parallax occlusion mapping)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -654,6 +655,16 @@ int main(int argc, char** argv) {
             // independence proof (accum is a SUM, revealage a PRODUCT). One BMP -> exit. New golden;
             // existing lit/ssao/ssr/dof/motionblur paths/shaders/goldens are untouched.
             oitShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--pom-shot") == 0 && i + 1 < argc) {
+            // Slice CP: Parallax Occlusion Mapping. A single height-mapped surface (a procedural
+            // brick/groove height field generated in-engine) filling the view at a GRAZING angle, lit by
+            // the sun + shadowed, shaded by the pom.frag steep-parallax march (render/pom.h ParallaxUV)
+            // so bricks recess + mortar grooves cast self-shadows (pom::SelfShadow). CRITICAL: the SAME
+            // surface is ALSO rendered with heightScale=0 (pom.frag's degenerate exit) AND via the plain
+            // lit pipeline, and all three captures are asserted BYTE-IDENTICAL (SHA) — the zero-height
+            // equivalence proof (the march introduces zero UV drift at zero amplitude). One BMP -> exit.
+            // New golden; existing lit/ssao/ssr/dof/motionblur/oit paths/shaders/goldens are untouched.
+            pomShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -9372,6 +9383,343 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — OIT, %d glass layers, %d opaque\n",
                                 oitShotPath, cw, ch2, kNumGlass, kNumOpaque);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", oitShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Parallax Occlusion Mapping showcase (--pom-shot, Slice CP): a single large height-mapped
+        // surface filling the view at a GRAZING angle, lit + shadowed by the sun. A deterministic
+        // procedural BRICK height field (raised bricks, recessed mortar grooves) is baked in-engine into
+        // a height texture (R = h, 1 = top), a matching tangent-space normal map (from the height
+        // gradient), and a brick albedo. pom.frag ray-marches the height field in tangent space
+        // (render/pom.h ParallaxUV) so the bricks show real per-pixel depth + the mortar grooves
+        // self-shadow (pom::SelfShadow) at the grazing angle.
+        //
+        // THE ZERO-HEIGHT EQUIVALENCE PROOF: the SAME surface is rendered THREE ways into the same HDR
+        // pipeline + tonemap — (1) the real heightScale>0 POM (the golden), (2) the POM shader with
+        // heightScale==0 (its degenerate march exit -> base uv, self-shadow 1.0), and (3) the PLAIN lit
+        // pipeline (lit.frag, plain normal mapping). Captures (2) and (3) are asserted BYTE-IDENTICAL
+        // (SHA) — proving the march/refine add ZERO uv drift at zero amplitude. Fails loudly on any diff.
+        // Deterministic (fixed camera/heightScale/steps, no RNG); two runs byte-identical. SEPARATE pom
+        // pipeline + shaders; existing lit/gbuffer/oit + goldens untouched.
+        if (pomShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+            const float kHeightScale = 0.08f;   // POM depth amplitude (UV units) — fixed
+            const int   kNumSteps = 32;          // march layer count — fixed
+
+            // --- Deterministic procedural BRICK height field, baked to a TEX_N x TEX_N texture. h in
+            // [0,1], 1 = brick top, dropping toward 0 in the mortar grooves. A smooth field (sin^2 bumps
+            // per brick cell with offset rows) so the march converges + the grooves read as recesses. ---
+            const uint32_t TEX_N = 512;
+            const float kBrickCols = 6.0f, kBrickRows = 12.0f;  // bricks across the [0,1] uv square
+            auto brickHeight = [&](float u, float v) -> float {
+                // Offset alternate rows by half a brick (running-bond pattern).
+                float row = v * kBrickRows;
+                float ri = std::floor(row);
+                float uu = u * kBrickCols + (((int)ri & 1) ? 0.5f : 0.0f);
+                float fu = uu - std::floor(uu);
+                float fv = row - ri;
+                // Smooth bump inside each brick cell; a mortar gap near the cell borders dips to ~0.
+                float bu = std::sin(3.14159265358979323846f * fu);
+                float bv = std::sin(3.14159265358979323846f * fv);
+                float brick = std::pow(bu * bu, 0.25f) * std::pow(bv * bv, 0.25f);  // flat-topped bricks
+                return std::min(std::max(brick, 0.0f), 1.0f);
+            };
+            std::vector<uint8_t> heightTexels(static_cast<size_t>(TEX_N) * TEX_N * 4);
+            std::vector<float> hf(static_cast<size_t>(TEX_N) * TEX_N);
+            for (uint32_t y = 0; y < TEX_N; ++y)
+                for (uint32_t x = 0; x < TEX_N; ++x) {
+                    float u = (x + 0.5f) / TEX_N, v = (y + 0.5f) / TEX_N;
+                    float hv = brickHeight(u, v);
+                    hf[static_cast<size_t>(y) * TEX_N + x] = hv;
+                    uint8_t hb = (uint8_t)std::lround(hv * 255.0f);
+                    size_t idx = (static_cast<size_t>(y) * TEX_N + x) * 4;
+                    heightTexels[idx + 0] = hb; heightTexels[idx + 1] = hb;
+                    heightTexels[idx + 2] = hb; heightTexels[idx + 3] = 255;
+                }
+            // Tangent-space normal map from the height gradient (central differences). Encoded 0..1.
+            std::vector<uint8_t> normalTexels(static_cast<size_t>(TEX_N) * TEX_N * 4);
+            // Albedo: warm brick red in the bricks, dark grey in the grooves (keyed off the height).
+            std::vector<uint8_t> albedoTexels(static_cast<size_t>(TEX_N) * TEX_N * 4);
+            const float kBumpScale = 6.0f;
+            for (uint32_t y = 0; y < TEX_N; ++y)
+                for (uint32_t x = 0; x < TEX_N; ++x) {
+                    uint32_t xm = (x + TEX_N - 1) % TEX_N, xp = (x + 1) % TEX_N;
+                    uint32_t ym = (y + TEX_N - 1) % TEX_N, yp = (y + 1) % TEX_N;
+                    float hl = hf[static_cast<size_t>(y) * TEX_N + xm];
+                    float hr = hf[static_cast<size_t>(y) * TEX_N + xp];
+                    float hd = hf[static_cast<size_t>(ym) * TEX_N + x];
+                    float hu = hf[static_cast<size_t>(yp) * TEX_N + x];
+                    Vec3 nrm = math::normalize(Vec3{(hl - hr) * kBumpScale, (hd - hu) * kBumpScale, 1.0f});
+                    size_t idx = (static_cast<size_t>(y) * TEX_N + x) * 4;
+                    normalTexels[idx + 0] = (uint8_t)std::lround((nrm.x * 0.5f + 0.5f) * 255.0f);
+                    normalTexels[idx + 1] = (uint8_t)std::lround((nrm.y * 0.5f + 0.5f) * 255.0f);
+                    normalTexels[idx + 2] = (uint8_t)std::lround((nrm.z * 0.5f + 0.5f) * 255.0f);
+                    normalTexels[idx + 3] = 255;
+                    float hv = hf[static_cast<size_t>(y) * TEX_N + x];
+                    Vec3 brickCol{0.62f, 0.27f, 0.20f};
+                    Vec3 mortarCol{0.30f, 0.29f, 0.27f};
+                    Vec3 col{mortarCol.x + (brickCol.x - mortarCol.x) * hv,
+                             mortarCol.y + (brickCol.y - mortarCol.y) * hv,
+                             mortarCol.z + (brickCol.z - mortarCol.z) * hv};
+                    albedoTexels[idx + 0] = (uint8_t)std::lround(col.x * 255.0f);
+                    albedoTexels[idx + 1] = (uint8_t)std::lround(col.y * 255.0f);
+                    albedoTexels[idx + 2] = (uint8_t)std::lround(col.z * 255.0f);
+                    albedoTexels[idx + 3] = 255;
+                }
+            auto heightTex = device->CreateTexture(
+                {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, heightTexels.data(), heightTexels.size()});
+            auto normalTex = device->CreateTexture(
+                {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, normalTexels.data(), normalTexels.size()});
+            auto albedoTex = device->CreateTexture(
+                {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, albedoTexels.data(), albedoTexels.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            const uint8_t flatHeightPx[4] = {255, 255, 255, 255};  // h==1 flat (unused by lit path)
+            auto flatHeight = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatHeightPx, sizeof(flatHeightPx)});
+
+            // --- POM pipeline (pom.vert + pom.frag): NEW lit-surface variant. Push constant = the same
+            // {model, material(float4)} lit.vert uses, with material = (metallic, roughness, heightScale,
+            // numSteps). Reuses the lit material set (albedo t0, normal t3, height t5). ---
+            auto pomVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/pom.vert.hlsl.spv");
+            auto pomFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/pom.frag.hlsl.spv");
+            auto pomVs = device->CreateShaderModule({std::span<const uint32_t>(pomVsW)});
+            auto pomFs = device->CreateShaderModule({std::span<const uint32_t>(pomFsW)});
+            rhi::GraphicsPipelineDesc pomDesc;
+            pomDesc.vertex = pomVs.get(); pomDesc.fragment = pomFs.get();
+            pomDesc.vertexLayout = scene::MeshVertexLayout();
+            pomDesc.colorFormat = kHdr;
+            pomDesc.depthTest = true; pomDesc.usesFrameUniforms = true; pomDesc.usesTexture = true;
+            // The WIDER full-PBR material set (set 1) so the height map binds at the metalRough slot
+            // (t5/s5) alongside albedo (t0) + normal (t3) via BindMaterialPBR (the existing texture-pair
+            // binding path — no new RHI seam).
+            pomDesc.pbrMaterial = true;
+            pomDesc.pushConstantSize = sizeof(float) * 20;
+            auto pomPipeline = device->CreateGraphicsPipeline(pomDesc);
+
+            // --- Plain lit pipeline (lit.vert + lit.frag, UNCHANGED) for the zero-height reference. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // Tonemap composite to the swapchain (post.vert + post.frag, the standard HDR resolve).
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt        = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // A large quad in the XZ-ish plane, tilted up to face the camera, filling the view. We use a
+            // unit quad facing +Z (normal +Z, tangent +X), tiled UVs, scaled big and placed at a grazing
+            // viewing angle. ---
+            scene::Vertex qv[4] = {};
+            auto setV = [&](scene::Vertex& v, float x, float y, float u, float vv) {
+                v.pos[0] = x; v.pos[1] = y; v.pos[2] = 0.0f;
+                v.color[0] = v.color[1] = v.color[2] = 1.0f;
+                v.uv[0] = u; v.uv[1] = vv;
+                v.normal[2] = 1.0f; v.tangent[0] = 1.0f;
+            };
+            const float kQuadHalf = 6.0f;
+            setV(qv[0], -kQuadHalf, -kQuadHalf, 0.0f, 1.0f);
+            setV(qv[1],  kQuadHalf, -kQuadHalf, 1.0f, 1.0f);
+            setV(qv[2],  kQuadHalf,  kQuadHalf, 1.0f, 0.0f);
+            setV(qv[3], -kQuadHalf,  kQuadHalf, 0.0f, 0.0f);
+            uint32_t qidx[6] = {0, 1, 2, 0, 2, 3};
+            rhi::BufferDesc qvbD; qvbD.size = sizeof(qv); qvbD.initialData = qv;
+            qvbD.usage = rhi::BufferUsage::Vertex;
+            auto quadVB = device->CreateBuffer(qvbD);
+            rhi::BufferDesc qibD; qibD.size = sizeof(qidx); qibD.initialData = qidx;
+            qibD.usage = rhi::BufferUsage::Index;
+            auto quadIB = device->CreateBuffer(qibD);
+
+            // Lay the quad flat on the ground (rotate -90deg about X so +Z normal -> +Y up), then view it
+            // at a grazing angle so the parallax depth + groove self-shadows are obvious.
+            Mat4 quadModel = Mat4::RotateX(-1.57079632679f);
+
+            const Vec3 eye{0.0f, 3.2f, 4.6f};
+            const Vec3 center{0.0f, 0.0f, -0.6f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+            FrameData fd{};
+            {
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.55f; fd.lightDir[1] = -0.7f; fd.lightDir[2] = -0.45f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.55f, -0.7f, -0.45f});
+                Vec3 sc{0.0f, 0.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            // Render the surface with a given pipeline + heightScale; capture pixels. usePom selects the
+            // pom pipeline (height bound via BindMaterialPBR: albedo, height@t5, normal); the lit path
+            // binds (albedo, normal) only. material = (metallic=0, roughness=0.85, heightScale, steps).
+            auto renderSurface = [&](bool usePom, float heightScale,
+                                     std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(quadModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(*quadVB);
+                        cmd.BindIndexBuffer(*quadIB);
+                        cmd.DrawIndexed(6);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(usePom ? *pomPipeline : *litPipeline);
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = quadModel.m[k];
+                        pc[16] = 0.0f;            // metallic
+                        pc[17] = 0.85f;           // roughness
+                        pc[18] = heightScale;     // heightScale (ignored by lit.frag)
+                        pc[19] = (float)kNumSteps;// numSteps    (ignored by lit.frag)
+                        cmd.PushConstants(pc, sizeof(pc));
+                        if (usePom)
+                            cmd.BindMaterialPBR(*albedoTex, *heightTex, *normalTex, *normalTex, *normalTex);
+                        else
+                            cmd.BindMaterial(*albedoTex, *normalTex);
+                        cmd.BindVertexBuffer(*quadVB);
+                        cmd.BindIndexBuffer(*quadIB);
+                        cmd.DrawIndexed(6);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("composite", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            std::vector<uint8_t> pomPx, zeroPomPx, litPx;
+            uint32_t pw = 0, ph = 0, zw = 0, zh = 0, lw = 0, lh = 0;
+            if (!renderSurface(true, kHeightScale, pomPx, pw, ph)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (POM heightScale>0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderSurface(true, 0.0f, zeroPomPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (POM heightScale=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderSurface(false, 0.0f, litPx, lw, lh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (plain lit reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t zeroPomHash = fnv(zeroPomPx), litHash = fnv(litPx), pomHash = fnv(pomPx);
+            std::printf("pom heightScale=0 hash: %016llx  plain-lit hash: %016llx\n",
+                        (unsigned long long)zeroPomHash, (unsigned long long)litHash);
+            const bool zeroEquivalent = (zw == lw) && (zh == lh) &&
+                                        (zeroPomPx.size() == litPx.size()) &&
+                                        (std::memcmp(zeroPomPx.data(), litPx.data(), litPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: POM heightScale=0 render != plain normal-mapped lit render — the march/refine "
+                    "introduced UV drift at zero amplitude (degenerate-exit/off-by-one bug). pom0 %016llx "
+                    "vs lit %016llx\n",
+                    (unsigned long long)zeroPomHash, (unsigned long long)litHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("pom heightScale=0 == plain normal-mapped: BYTE-IDENTICAL (zero-height proof)\n");
+            std::printf("pom: {heightScale:%.4g, steps:%d}\n", (double)kHeightScale, kNumSteps);
+            // Sanity: the real POM render must DIFFER from the flat render (the parallax actually does
+            // something) — otherwise the showcase would silently render nothing of interest.
+            if (pomHash == zeroPomHash)
+                std::fprintf(stderr, "WARNING: POM heightScale>0 render is identical to the flat render "
+                                     "(no visible parallax) — check the height field / grazing angle\n");
+
+            bool ok = WriteBMP(pomShotPath, pomPx, pw, ph);
+            if (ok) std::printf("wrote %s (%ux%u) — POM, heightScale %.4g, %d steps\n",
+                                pomShotPath, pw, ph, (double)kHeightScale, kNumSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", pomShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

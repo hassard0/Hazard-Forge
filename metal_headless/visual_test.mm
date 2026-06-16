@@ -6595,6 +6595,272 @@ static int RunOitShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Parallax Occlusion Mapping showcase (Slice CP). Mirrors the Vulkan --pom-shot path EXACTLY: a
+// single large height-mapped surface (a deterministic procedural BRICK height field baked in-engine to
+// a height texture + matching normal map + brick albedo) filling the view at a GRAZING angle, lit +
+// shadowed by the sun. pom.frag ray-marches the height field in tangent space (render/pom.h ParallaxUV
+// mirrored in-shader) so the bricks show per-pixel depth + the grooves self-shadow (pom::SelfShadow).
+// The SAME render/pom.h math compiled into pom.frag here makes the marched uv bit-identical to the
+// Vulkan/CPU path. INTERNALLY renders the SAME surface with heightScale=0 (pom.frag's degenerate exit)
+// AND via the plain lit pipeline and asserts all three captures' zero-height equivalence BYTE-IDENTICAL
+// — the zero-height proof. SEPARATE pom pipeline + shaders; existing goldens untouched. ---
+static int RunPomShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+    const float kHeightScale = 0.08f;
+    const int   kNumSteps = 32;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- Deterministic procedural BRICK height field (IDENTICAL to the Vulkan path). ---
+    const uint32_t TEX_N = 512;
+    const float kBrickCols = 6.0f, kBrickRows = 12.0f;
+    auto brickHeight = [&](float u, float v) -> float {
+        float row = v * kBrickRows;
+        float ri = std::floor(row);
+        float uu = u * kBrickCols + (((int)ri & 1) ? 0.5f : 0.0f);
+        float fu = uu - std::floor(uu);
+        float fv = row - ri;
+        float bu = std::sin(3.14159265358979323846f * fu);
+        float bv = std::sin(3.14159265358979323846f * fv);
+        float brick = std::pow(bu * bu, 0.25f) * std::pow(bv * bv, 0.25f);
+        return std::min(std::max(brick, 0.0f), 1.0f);
+    };
+    std::vector<uint8_t> heightTexels(static_cast<size_t>(TEX_N) * TEX_N * 4);
+    std::vector<float> hf(static_cast<size_t>(TEX_N) * TEX_N);
+    for (uint32_t y = 0; y < TEX_N; ++y)
+        for (uint32_t x = 0; x < TEX_N; ++x) {
+            float u = (x + 0.5f) / TEX_N, v = (y + 0.5f) / TEX_N;
+            float hv = brickHeight(u, v);
+            hf[static_cast<size_t>(y) * TEX_N + x] = hv;
+            uint8_t hb = (uint8_t)std::lround(hv * 255.0f);
+            size_t idx = (static_cast<size_t>(y) * TEX_N + x) * 4;
+            heightTexels[idx + 0] = hb; heightTexels[idx + 1] = hb;
+            heightTexels[idx + 2] = hb; heightTexels[idx + 3] = 255;
+        }
+    std::vector<uint8_t> normalTexels(static_cast<size_t>(TEX_N) * TEX_N * 4);
+    std::vector<uint8_t> albedoTexels(static_cast<size_t>(TEX_N) * TEX_N * 4);
+    const float kBumpScale = 6.0f;
+    for (uint32_t y = 0; y < TEX_N; ++y)
+        for (uint32_t x = 0; x < TEX_N; ++x) {
+            uint32_t xm = (x + TEX_N - 1) % TEX_N, xp = (x + 1) % TEX_N;
+            uint32_t ym = (y + TEX_N - 1) % TEX_N, yp = (y + 1) % TEX_N;
+            float hl = hf[static_cast<size_t>(y) * TEX_N + xm];
+            float hr = hf[static_cast<size_t>(y) * TEX_N + xp];
+            float hd = hf[static_cast<size_t>(ym) * TEX_N + x];
+            float hu = hf[static_cast<size_t>(yp) * TEX_N + x];
+            Vec3 nrm = math::normalize(Vec3{(hl - hr) * kBumpScale, (hd - hu) * kBumpScale, 1.0f});
+            size_t idx = (static_cast<size_t>(y) * TEX_N + x) * 4;
+            normalTexels[idx + 0] = (uint8_t)std::lround((nrm.x * 0.5f + 0.5f) * 255.0f);
+            normalTexels[idx + 1] = (uint8_t)std::lround((nrm.y * 0.5f + 0.5f) * 255.0f);
+            normalTexels[idx + 2] = (uint8_t)std::lround((nrm.z * 0.5f + 0.5f) * 255.0f);
+            normalTexels[idx + 3] = 255;
+            float hv = hf[static_cast<size_t>(y) * TEX_N + x];
+            Vec3 brickCol{0.62f, 0.27f, 0.20f};
+            Vec3 mortarCol{0.30f, 0.29f, 0.27f};
+            Vec3 col{mortarCol.x + (brickCol.x - mortarCol.x) * hv,
+                     mortarCol.y + (brickCol.y - mortarCol.y) * hv,
+                     mortarCol.z + (brickCol.z - mortarCol.z) * hv};
+            albedoTexels[idx + 0] = (uint8_t)std::lround(col.x * 255.0f);
+            albedoTexels[idx + 1] = (uint8_t)std::lround(col.y * 255.0f);
+            albedoTexels[idx + 2] = (uint8_t)std::lround(col.z * 255.0f);
+            albedoTexels[idx + 3] = 255;
+        }
+    auto heightTex = device->CreateTexture(
+        {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, heightTexels.data(), heightTexels.size()});
+    auto normalTex = device->CreateTexture(
+        {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, normalTexels.data(), normalTexels.size()});
+    auto albedoTex = device->CreateTexture(
+        {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, albedoTexels.data(), albedoTexels.size()});
+
+    // POM pipeline (pom.vert + pom.frag; wider full-PBR material set: albedo t0, normal t3, height t5).
+    auto pomVs = loadMSL("pom.vert.gen.metal", "vertex_main");
+    auto pomFs = loadMSL("pom.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc pomDesc;
+    pomDesc.vertex = pomVs.get(); pomDesc.fragment = pomFs.get();
+    pomDesc.vertexLayout = scene::MeshVertexLayout();
+    pomDesc.colorFormat = kHdr;
+    pomDesc.depthTest = true; pomDesc.usesFrameUniforms = true;
+    pomDesc.usesTexture = true; pomDesc.pbrMaterial = true;
+    pomDesc.pushConstantSize = sizeof(float) * 20;
+    auto pomPipeline = device->CreateGraphicsPipeline(pomDesc);
+
+    // Plain lit pipeline (lit.vert + lit.frag, UNCHANGED) for the zero-height reference.
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt        = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    scene::Vertex qv[4] = {};
+    auto setV = [&](scene::Vertex& v, float x, float y, float u, float vv) {
+        v.pos[0] = x; v.pos[1] = y; v.pos[2] = 0.0f;
+        v.color[0] = v.color[1] = v.color[2] = 1.0f;
+        v.uv[0] = u; v.uv[1] = vv;
+        v.normal[2] = 1.0f; v.tangent[0] = 1.0f;
+    };
+    const float kQuadHalf = 6.0f;
+    setV(qv[0], -kQuadHalf, -kQuadHalf, 0.0f, 1.0f);
+    setV(qv[1],  kQuadHalf, -kQuadHalf, 1.0f, 1.0f);
+    setV(qv[2],  kQuadHalf,  kQuadHalf, 1.0f, 0.0f);
+    setV(qv[3], -kQuadHalf,  kQuadHalf, 0.0f, 0.0f);
+    uint32_t qidx[6] = {0, 1, 2, 0, 2, 3};
+    rhi::BufferDesc qvbD; qvbD.size = sizeof(qv); qvbD.initialData = qv;
+    qvbD.usage = rhi::BufferUsage::Vertex;
+    auto quadVB = device->CreateBuffer(qvbD);
+    rhi::BufferDesc qibD; qibD.size = sizeof(qidx); qibD.initialData = qidx;
+    qibD.usage = rhi::BufferUsage::Index;
+    auto quadIB = device->CreateBuffer(qibD);
+
+    Mat4 quadModel = Mat4::RotateX(-1.57079632679f);
+
+    const Vec3 eye{0.0f, 3.2f, 4.6f};
+    const Vec3 center{0.0f, 0.0f, -0.6f};
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+    FrameData fd{};
+    {
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.55f; fd.lightDir[1] = -0.7f; fd.lightDir[2] = -0.45f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.55f, -0.7f, -0.45f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto renderSurface = [&](bool usePom, float heightScale,
+                             std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(quadModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(*quadVB);
+                cmd.BindIndexBuffer(*quadIB);
+                cmd.DrawIndexed(6);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(usePom ? *pomPipeline : *litPipeline);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = quadModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = heightScale; pc[19] = (float)kNumSteps;
+                cmd.PushConstants(pc, sizeof(pc));
+                if (usePom)
+                    cmd.BindMaterialPBR(*albedoTex, *heightTex, *normalTex, *normalTex, *normalTex);
+                else
+                    cmd.BindMaterial(*albedoTex, *normalTex);
+                cmd.BindVertexBuffer(*quadVB);
+                cmd.BindIndexBuffer(*quadIB);
+                cmd.DrawIndexed(6);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("composite", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    std::vector<uint8_t> pomPx, zeroPomPx, litPx;
+    uint32_t pw = 0, ph = 0, zw = 0, zh = 0, lw = 0, lh = 0;
+    if (!renderSurface(true, kHeightScale, pomPx, pw, ph)) return fail("no captured pixels (POM)");
+    if (!renderSurface(true, 0.0f, zeroPomPx, zw, zh)) return fail("no captured pixels (POM h=0)");
+    if (!renderSurface(false, 0.0f, litPx, lw, lh)) return fail("no captured pixels (plain lit)");
+
+    const bool zeroEquivalent = (zw == lw) && (zh == lh) && (zeroPomPx.size() == litPx.size()) &&
+                                (std::memcmp(zeroPomPx.data(), litPx.data(), litPx.size()) == 0);
+    if (!zeroEquivalent)
+        return fail("POM heightScale=0 render != plain normal-mapped lit render — NOT zero-height equivalent");
+    std::printf("pom heightScale=0 == plain normal-mapped: BYTE-IDENTICAL (zero-height proof)\n");
+    std::printf("pom: {heightScale:%.4g, steps:%d}\n", (double)kHeightScale, kNumSteps);
+
+    if (!WritePNG(outPath, pomPx, pw, ph)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — POM, heightScale %.4g, %d steps\n",
+                outPath, pw, ph, (double)kHeightScale, kNumSteps);
+    return 0;
+}
+
 // --- Water rendering showcase (Slice CF). Mirrors the Vulkan --water-shot path EXACTLY: a few objects
 // partially submerged at the water level + a procedural sky + directional light. The opaque scene
 // renders into an HDR RT + the SSAO/SSR view-space normal+linear-depth g-buffer; then a Gerstner WATER
@@ -13964,6 +14230,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--oit") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_oit.png";
             try { return RunOitShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --pom <out.png>: parallax occlusion mapping showcase (Slice CP) — a single height-mapped brick
+        // surface filling the view at a grazing angle, lit + shadowed; pom.frag ray-marches the height
+        // field in tangent space (render/pom.h ParallaxUV) for per-pixel depth + groove self-shadowing.
+        // INTERNALLY renders the SAME surface with heightScale=0 + via the plain lit pipeline and asserts
+        // they are BYTE-IDENTICAL — the zero-height equivalence proof. Mirrors the Vulkan --pom-shot
+        // exactly (same scene/textures/camera/heightScale/steps; the SAME render/pom.h math makes the
+        // marched uv bit-identical).
+        if (argc > 1 && std::strcmp(argv[1], "--pom") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_pom.png";
+            try { return RunPomShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --water <out.png>: water-rendering showcase (Slice CF) — objects partially submerged at the

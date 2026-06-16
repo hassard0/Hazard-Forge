@@ -17,7 +17,7 @@
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
            EACH committed Metal golden run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 41 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 42 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -91,6 +91,7 @@ $Goldens = @(
     @{ Name = 'dof';           Flag = '--dof' }                  # Slice CG (depth of field: thin-lens CoC depth gather)
     @{ Name = 'motion_blur';   Flag = '--motionblur' }           # Slice CN (per-object + camera motion blur: velocity-gather streak; zero motion byte-identical pass-through)
     @{ Name = 'oit';           Flag = '--oit' }                  # Slice CO (order-independent transparency: Weighted Blended OIT; permuted draw order resolves byte-identically)
+    @{ Name = 'pom';           Flag = '--pom' }                  # Slice CP (parallax occlusion mapping: tangent-space height-field march; heightScale=0 byte-identical to plain normal mapping)
     @{ Name = 'water';         Flag = '--water' }                # Slice CF (Gerstner water reflect/refract + sun glint)
     @{ Name = 'ssgi';          Flag = '--ssgi' }                 # Slice BP (screen-space global illumination)
     @{ Name = 'ssgi_denoise';  Flag = '--ssgi-denoise' }         # Slice BR (SSGI bilateral spatial denoise)

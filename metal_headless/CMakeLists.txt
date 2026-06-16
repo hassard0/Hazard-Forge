@@ -197,6 +197,13 @@ hf_gen_msl(oit_accum.vert         oit_accum.vert.hlsl         vert oit_accum_ver
 hf_gen_msl(oit_accum.frag         oit_accum.frag.hlsl         frag oit_accum_fragment)
 hf_gen_msl(oit_revealage.frag     oit_revealage.frag.hlsl     frag oit_revealage_fragment)
 hf_gen_msl(oit_resolve.frag       oit_resolve.frag.hlsl       frag oit_resolve_fragment)
+# Parallax Occlusion Mapping (Slice CP): pom.vert (lit.vert + heightScale/numSteps forwarded in the
+# material push constant .zw) + pom.frag (TBN -> tangent-space view dir -> render/pom.h ParallaxUV march
+# of the height texture -> displaced-uv lit shading + pom::SelfShadow). The SAME render/pom.h math
+# mirrored in-shader makes the marched uv bit-identical to the Vulkan/CPU path; heightScale==0 degenerates
+# to the base uv -> byte-identical to the plain normal-mapped lit render. Behind --pom only.
+hf_gen_msl(pom.vert               pom.vert.hlsl               vert vertex_main)
+hf_gen_msl(pom.frag               pom.frag.hlsl               frag fragment_main)
 # Water rendering (Slice CF): water.vert displaces a 128x128 grid by the Gerstner field (render/water.h
 # math, mirrored in-shader); water.frag fresnel-blends a SKY reflection + a depth-tinted REFRACTION of
 # the scene-color RT (G-buffer depth like SSR) + a sun glint; water_composite blends + tonemaps. Same

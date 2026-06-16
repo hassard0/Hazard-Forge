@@ -167,6 +167,16 @@ hf_compile_shaders(
     "shaders/oit_accum.frag.hlsl:ps"
     "shaders/oit_revealage.frag.hlsl:ps"
     "shaders/oit_resolve.frag.hlsl:ps"
+    # Parallax Occlusion Mapping (Slice CP): pom.vert mirrors lit.vert but forwards heightScale+numSteps
+    # in the material push constant .zw; pom.frag builds the orthonormal TBN, rotates the view dir into
+    # tangent space, ray-marches the HEIGHT texture (steep parallax + binary refine, render/pom.h
+    # ParallaxUV mirrored in-shader) to a parallax-offset uv, samples albedo+normal there, applies the
+    # soft pom::SelfShadow toward the sun, and lights it with the SAME directional-sun + shadow + IBL
+    # model as lit.frag. Behind --pom-shot ONLY; with heightScale==0 the march/self-shadow degenerate
+    # to the base uv / 1.0 -> byte-identical to the plain normal-mapped lit render. Height bound via the
+    # existing BindMaterialPBR slot (t5). Existing lit/gbuffer/oit shaders + goldens untouched.
+    "shaders/pom.vert.hlsl:vs"
+    "shaders/pom.frag.hlsl:ps"
     # Water rendering (Slice CF): water.vert displaces a flat NxN grid by the summed Gerstner waves at a
     # FIXED time (render/water.h math, mirrored in-shader); water.frag recomputes the analytic wave
     # normal and shades a fresnel blend of a SKY reflection (reusing SkyColor) and a REFRACTED scene

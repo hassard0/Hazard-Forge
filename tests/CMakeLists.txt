@@ -180,6 +180,15 @@ hf_add_pure_test(motion_blur_test)
 # oit_accum/oit_resolve shaders + the showcase read. Pure C++ (render/oit.h, header-only), ASan-eligible.
 hf_add_pure_test(oit_test)
 
+# Parallax Occlusion Mapping (Slice CP): the steep-parallax + binary-refine ParallaxUV march and the
+# SelfShadow soft self-occlusion (render/pom.h, header-only). The CORE proof: ParallaxUV(heightScale=0)
+# == baseUV EXACTLY and a straight-on view -> baseUV exactly (zero UV drift -> the heightScale=0 render
+# is byte-identical to plain normal mapping). Also pins offset direction/magnitude (deeper height /
+# steeper angle -> larger monotone offset), march intersection-on-surface (no overshoot), the SelfShadow
+# crevice-occlusion + degenerate exits + monotone-in-heightScale, and determinism. The same pom.h math
+# is mirrored VERBATIM in pom.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(pom_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so
