@@ -206,6 +206,15 @@ hf_compile_shaders(
     # post/ssr/ssgi/dof/gtao shaders + goldens untouched.
     "shaders/sss_mask.frag.hlsl:ps"
     "shaders/sss_blur.frag.hlsl:ps"
+    # Color Grading (Slice DB): analytic lift/gamma/gain + ASC-CDL slope/offset/power + saturation,
+    # applied POST-tonemap. color_grade.frag is a fullscreen pass (reuses post.vert) that reads the
+    # resolved TONEMAPPED scene color (the engine's post.frag ACES+gamma LDR result rendered into an
+    # intermediate RT) and applies render/color_grade.h's Grade (LiftGammaGain + ASC_CDL + Saturate,
+    # mirrored in-shader) from a small GradeParams push constant, for a cinematic look. Behind
+    # --colorgrade-shot ONLY; at the IDENTITY params (lift 0/gamma 1/gain 1/slope 1/offset 0/power 1/
+    # saturation 1) the grade is a pure pass-through -> byte-identical to the ungraded tonemap render.
+    # Existing post/ssr/ssgi/dof/gtao/sss shaders + goldens untouched.
+    "shaders/color_grade.frag.hlsl:ps"
     # Screen-Space Contact Shadows (Slice CT): reuses the SSAO/SSR/GTAO g-buffer (view normal + linear
     # depth). contact_shadows.frag reconstructs the view position (like gtao.frag), marches a SHORT ray
     # TOWARD the sun through the depth field (render/contact_shadows.h RayMarchShadow mirrored in-shader)

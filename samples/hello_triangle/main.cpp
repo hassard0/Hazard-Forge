@@ -36,6 +36,7 @@
 #include "render/probe.h"
 #include "render/reflection_probe.h"
 #include "render/decal.h"
+#include "render/color_grade.h"
 #include "render/post_stack.h"
 #include "render/clustered.h"
 #include "render/cluster.h"
@@ -355,6 +356,7 @@ int main(int argc, char** argv) {
     const char* pomShotPath = nullptr;       // --pom-shot <out.bmp> (Slice CP: parallax occlusion mapping)
     const char* gtaoShotPath = nullptr;      // --gtao-shot <out.bmp> (Slice CR: ground-truth ambient occlusion)
     const char* sssShotPath = nullptr;       // --sss-shot <out.bmp> (Slice CZ: subsurface scattering)
+    const char* colorGradeShotPath = nullptr;// --colorgrade-shot <out.bmp> (Slice DB: analytic color grade)
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
@@ -701,6 +703,19 @@ int main(int argc, char** argv) {
             // center tap, no normalization/centering bug). Prints `sss: {width:W, strength:S, taps:N}`.
             // One BMP -> exit. New golden; existing lit/ssao/ssr/dof/gtao paths/shaders/goldens untouched.
             sssShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--colorgrade-shot") == 0 && i + 1 < argc) {
+            // Slice DB: Color Grading (analytic lift/gamma/gain + ASC-CDL slope/offset/power +
+            // saturation, applied POST-tonemap). The standard lit+shadowed scene renders into an HDR RT,
+            // the engine's post.frag tonemaps it into an intermediate LDR RT (swapchain format), then a
+            // fullscreen color_grade.frag pass (reusing post.vert) reads that tonemapped color and
+            // applies render/color_grade.h's Grade (mirrored in-shader) from a small GradeParams push
+            // constant with a CINEMATIC teal-shadows / warm-highlights grade -> swapchain. CRITICAL: the
+            // SAME chain is ALSO rendered with the IDENTITY grade (color_grade.frag's pure pass-through)
+            // and asserted BYTE-IDENTICAL (SHA) to the ungraded render (post.frag directly to the
+            // swapchain) -- the identity-grade no-op proof (the grade has no rounding/clamp bias at
+            // identity). Prints `color-grade: {sat:S, gamma:G}`. One BMP -> exit. New golden; existing
+            // post/lit/ssao/ssr/dof/gtao/sss paths/shaders/goldens untouched.
+            colorGradeShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxelfog-shot") == 0 && i + 1 < argc) {
             // Slice CS: Froxel Volumetric Fog (sun single-scattering). A lit+shadowed scene (ground +
             // objects) wrapped in a TRUE 3D view-space FROXEL volume: a compute pass (froxel_inject)
@@ -15881,6 +15896,378 @@ int main(int argc, char** argv) {
                                 sssShotPath, sw, sh, (double)kSssWidthPx, (double)kSssStrength,
                                 kTaps, kNumObjs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sssShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Color Grading showcase (--colorgrade-shot, Slice DB): analytic lift/gamma/gain + ASC-CDL
+        // slope/offset/power + saturation, applied POST-tonemap. The standard lit+shadowed scene renders
+        // into an HDR RT; the EXISTING post.frag tonemaps it into an intermediate LDR RT (swapchain
+        // format); then a fullscreen color_grade.frag pass (reusing post.vert) reads that tonemapped color
+        // and applies render/color_grade.h's Grade (LiftGammaGain + ASC_CDL + Saturate, mirrored in-shader)
+        // from a small GradeParams push constant -> swapchain. A CINEMATIC grade (teal-shadows /
+        // warm-highlights: lift toward teal, gain toward warm, a slight black lift + a saturation bump)
+        // gives a graded look clearly distinct from the ungraded tonemap. THE IDENTITY-GRADE NO-OP PROOF:
+        // the SAME chain at the IDENTITY grade (color_grade.frag's pure pass-through -> the graded LDR
+        // equals the tonemapped LDR) and the UNGRADED render (post.frag DIRECTLY to the swapchain) are
+        // asserted BYTE-IDENTICAL (SHA) -- both quantize the SAME post.frag float to the SAME 8-bit
+        // swapchain format and the identity grade is an exact pass-through, so it holds on every backend.
+        // Deterministic (fixed camera/lights/grade params, no RNG); two runs byte-identical. SEPARATE
+        // color_grade pipeline + the REUSED lit/shadow/sky/post pipelines; existing post/lit/ssao/ssr/dof/
+        // gtao/sss paths/shaders/goldens untouched.
+        if (colorGradeShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+            const float kFovY = 1.04719755f;
+
+            // FIXED, deterministic CINEMATIC grade: teal-shadows / warm-highlights. Lift toward teal
+            // (a slight black lift biased to G/B), gain toward warm (boost R, trim B), a touch of gamma
+            // in the mids, and a saturation bump. ASC-CDL kept near identity (a tiny global slope/offset
+            // contrast nudge) so the lift/gamma/gain wheels + saturation carry the look.
+            render::grade::GradeParams gp;
+            gp.lift   = {0.015f, 0.045f, 0.060f};  // teal-ish black lift (more G/B than R)
+            gp.gamma  = {1.05f,  1.02f,  0.98f};   // slightly brighter warm mids, cooler shadows toe
+            gp.gain   = {1.10f,  1.00f,  0.90f};   // warm highlights (boost R, trim B)
+            gp.slope  = {1.02f,  1.00f,  0.98f};   // ASC-CDL: a faint warm contrast nudge
+            gp.offset = {0.00f,  0.00f,  0.005f};  // ASC-CDL: a whisper of cool offset
+            gp.power  = {1.00f,  1.00f,  1.00f};   // ASC-CDL power left at identity
+            gp.saturation = 1.18f;                 // a saturation bump (punchier look)
+
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-2.2f, 0.7f, -0.5f}, 0.7f, true,  {0.90f, 0.20f, 0.20f}},  // red cube
+                {{ 0.0f, 0.9f, -1.2f}, 0.9f, false, {0.20f, 0.85f, 0.30f}},  // green sphere
+                {{ 2.3f, 0.6f,  0.2f}, 0.6f, true,  {0.25f, 0.45f, 0.95f}},  // blue cube
+                {{-0.9f, 0.5f,  1.4f}, 0.5f, false, {0.95f, 0.80f, 0.20f}},  // yellow sphere
+                {{ 1.4f, 0.75f, 1.6f}, 0.75f,true,  {0.85f, 0.35f, 0.90f}},  // magenta cube
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky pipelines (UNCHANGED shaders). ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- post (tonemap) + color_grade fullscreen pipelines (reuse post.vert). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            // Push-constant layout — MUST match GradeParams in shaders/color_grade.frag.hlsl (each Vec3
+            // padded to a float4 for cbuffer alignment + a float4 carrying saturation in .x). 112 bytes.
+            struct GradePC {
+                float lift[4]; float gamma[4]; float gain[4];
+                float slope[4]; float offset[4]; float power[4]; float sat[4];
+            };
+            static_assert(sizeof(GradePC) <= 128, "GradePC must fit the 128B push-constant budget");
+            auto gradeFs = loadFs("color_grade.frag.hlsl");
+            auto postFs  = loadFs("post.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc gradeD;
+            gradeD.vertex = postVsM.get(); gradeD.fragment = gradeFs.get();
+            gradeD.colorFormat = kSwap;
+            gradeD.depthTest = false; gradeD.usesTexture = true; gradeD.fullscreen = true;
+            gradeD.fragmentPushConstants = true; gradeD.pushConstantSize = sizeof(GradePC);
+            auto gradePipe = device->CreateGraphicsPipeline(gradeD);
+
+            // post.frag -> the intermediate LDR (swapchain-format) RT for the grade chain.
+            rhi::GraphicsPipelineDesc postLdrD;
+            postLdrD.vertex = postVsM.get(); postLdrD.fragment = postFs.get();
+            postLdrD.colorFormat = kSwap;
+            postLdrD.depthTest = false; postLdrD.usesTexture = true; postLdrD.fullscreen = true;
+            auto postLdrPipe = device->CreateGraphicsPipeline(postLdrD);
+
+            // post.frag -> the swapchain directly (the UNGRADED reference path).
+            rhi::GraphicsPipelineDesc postSwapD;
+            postSwapD.vertex = postVsM.get(); postSwapD.fragment = postFs.get();
+            postSwapD.colorFormat = kSwap;
+            postSwapD.depthTest = false; postSwapD.usesTexture = true; postSwapD.fullscreen = true;
+            auto postSwapPipe = device->CreateGraphicsPipeline(postSwapD);
+
+            auto rt    = device->CreateRenderTarget(w, h, kHdr);   // lit HDR scene
+            auto ldrRT = device->CreateRenderTarget(w, h, kSwap);  // tonemapped LDR (swapchain format)
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> floorPx(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+                    floorPx[idx + 2] = (uint8_t)(v + 8); floorPx[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+
+            const Vec3 eye{0.0f, 1.9f, 5.2f};
+            const Vec3 center{0.0f, 0.7f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.6f; fd.lightDir[1] = -0.75f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.5f; fd.lightColor[1] = 1.42f; fd.lightColor[2] = 1.3f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.6f, -0.75f, -0.3f});
+                Vec3 sc{0.0f, 0.6f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            // Record the lit scene (shadow + scene) into the HDR rt.
+            auto recordScene = [&](render::RenderGraph& graph, render::RgResource rgShadow,
+                                   render::RgResource rgScene) {
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*objTex[o], *flatNormal);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+            };
+
+            // Pack the GradeParams push constant (Vec3 -> float4, saturation in sat.x).
+            auto packGrade = [](const render::grade::GradeParams& g) {
+                GradePC pc{};
+                pc.lift[0]=g.lift.x;     pc.lift[1]=g.lift.y;     pc.lift[2]=g.lift.z;
+                pc.gamma[0]=g.gamma.x;   pc.gamma[1]=g.gamma.y;   pc.gamma[2]=g.gamma.z;
+                pc.gain[0]=g.gain.x;     pc.gain[1]=g.gain.y;     pc.gain[2]=g.gain.z;
+                pc.slope[0]=g.slope.x;   pc.slope[1]=g.slope.y;   pc.slope[2]=g.slope.z;
+                pc.offset[0]=g.offset.x; pc.offset[1]=g.offset.y; pc.offset[2]=g.offset.z;
+                pc.power[0]=g.power.x;   pc.power[1]=g.power.y;   pc.power[2]=g.power.z;
+                pc.sat[0]=g.saturation;
+                return pc;
+            };
+
+            // GRADED chain: scene -> post.frag tonemap -> ldrRT -> color_grade.frag(params) -> swapchain.
+            auto renderGraded = [&](const render::grade::GradeParams& g,
+                                    std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgLdr = graph.ImportTarget(
+                    "tonemapLdr", render::RgResourceKind::SceneColor, *ldrRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                recordScene(graph, rgShadow, rgScene);
+                graph.AddPass("tonemap", {rgScene}, {rgLdr},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postLdrPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                GradePC gpc = packGrade(g);
+                graph.AddPass("grade", {rgLdr}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*gradePipe);
+                        cmd.BindTexture(*ldrRT);
+                        cmd.PushConstants(&gpc, sizeof(gpc));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // UNGRADED reference: scene -> post.frag tonemap -> swapchain directly (no grade pass).
+            auto renderUngraded = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                recordScene(graph, rgShadow, rgScene);
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postSwapPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE IDENTITY-GRADE NO-OP PROOF.
+            //   gradedPx  — the REAL cinematic grade: the golden.
+            //   idPx      — the IDENTITY grade (color_grade.frag's pure pass-through of the tonemapped LDR).
+            //   ungrPx    — the UNGRADED render (post.frag DIRECTLY to the swapchain).
+            // idPx and ungrPx both display the SAME tonemapped LDR (the identity grade adds nothing), so
+            // they MUST be BYTE-IDENTICAL — proving the grade pass is a pure pass-through at identity (no
+            // rounding/clamp bias).
+            std::vector<uint8_t> gradedPx, idPx, ungrPx;
+            uint32_t gw = 0, gh = 0, iw = 0, ih = 0, uw = 0, uh = 0;
+            if (!renderGraded(gp, gradedPx, gw, gh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (cinematic grade)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderGraded(render::grade::GradeParams::Identity(), idPx, iw, ih)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (identity grade)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderUngraded(ungrPx, uw, uh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ungraded reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t idHash = fnv(idPx), ungrHash = fnv(ungrPx), gradedHash = fnv(gradedPx);
+            std::printf("color-grade identity hash: %016llx  ungraded hash: %016llx\n",
+                        (unsigned long long)idHash, (unsigned long long)ungrHash);
+            const bool idEquivalent = (iw == uw) && (ih == uh) && (idPx.size() == ungrPx.size()) &&
+                                      (std::memcmp(idPx.data(), ungrPx.data(), ungrPx.size()) == 0);
+            if (!idEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: identity-grade render != ungraded render — the color grade is NOT a pure "
+                    "pass-through at the identity params (rounding/clamp/pow bias). identity %016llx vs "
+                    "ungraded %016llx\n",
+                    (unsigned long long)idHash, (unsigned long long)ungrHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("color-grade identity == ungraded scene: BYTE-IDENTICAL (identity-grade no-op proof)\n");
+            std::printf("color-grade: {sat:%.4g, gamma:%.4g}\n",
+                        (double)gp.saturation, (double)gp.gamma.x);
+            // Sanity: the real grade must DIFFER from the ungraded render (the look is visible).
+            if (gradedHash == ungrHash)
+                std::fprintf(stderr, "WARNING: graded render is identical to the ungraded render "
+                                     "(no visible grade) — check the grade params\n");
+
+            bool ok = WriteBMP(colorGradeShotPath, gradedPx, gw, gh);
+            if (ok) std::printf("wrote %s (%ux%u) — color grade, sat %.4g, gamma %.4g, %d objects\n",
+                                colorGradeShotPath, gw, gh, (double)gp.saturation,
+                                (double)gp.gamma.x, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", colorGradeShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

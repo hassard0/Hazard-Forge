@@ -228,6 +228,13 @@ hf_gen_msl(gtao.frag              gtao.frag.hlsl              frag gtao_fragment
 # untouched.
 hf_gen_msl(sss_mask.frag          sss_mask.frag.hlsl          frag sss_mask_fragment)
 hf_gen_msl(sss_blur.frag          sss_blur.frag.hlsl          frag sss_blur_fragment)
+# Color Grading (Slice DB): color_grade.frag is a fullscreen pass (reuses post.vert) that reads the
+# resolved TONEMAPPED scene color and applies render/color_grade.h's Grade (analytic lift/gamma/gain +
+# ASC-CDL slope/offset/power + luma-preserving saturation, mirrored in-shader) from a small GradeParams
+# push constant. The SAME render/color_grade.h math compiled here makes the grade bit-identical to the
+# Vulkan/CPU path; at the IDENTITY params the grade is a pure pass-through -> byte-identical to the
+# ungraded tonemap render. Behind --colorgrade only; existing shaders + goldens untouched.
+hf_gen_msl(color_grade.frag       color_grade.frag.hlsl       frag color_grade_fragment)
 # Screen-Space Contact Shadows (Slice CT): contact_shadows.frag reconstructs the view position from the
 # SSAO/GTAO g-buffer and marches a SHORT ray TOWARD the sun through the depth field (render/
 # contact_shadows.h RayMarchShadow mirrored in-shader) with a baked per-pixel dither, outputting the

@@ -210,6 +210,17 @@ hf_add_pure_test(gtao_test)
 # The same sss.h math is mirrored VERBATIM in sss_blur.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(sss_test)
 
+# Color Grading (Slice DB): the analytic lift/gamma/gain wheels (out = (gain*(c+lift*(1-c)))^(1/gamma)),
+# the ASC-CDL slope/offset/power primary (out = max(c*slope+offset,0)^power), the luma-preserving
+# Saturate (lerp(Rec.709 luma, c, saturation)), and the composed Grade (render/color_grade.h,
+# header-only). The CORE proof: Grade(c, IDENTITY) == c EXACTLY (lift 0/gamma 1/gain 1/slope 1/offset 0/
+# power 1/saturation 1) and each sub-op at its identity -> c EXACTLY — the CPU half of the byte-identical
+# identity-grade == ungraded render proof. Also pins the monotone controls (gain brightens, lift raises
+# blacks more than brights, gamma>1 brightens mids, ASC-CDL SOP hand-checks, saturation 0->greyscale &
+# >1->more saturated), range/no-NaN (c=0 with power/gamma terms, the clamp>=0), and determinism. The
+# same color_grade.h math is mirrored VERBATIM in color_grade.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(color_grade_test)
+
 # Box-Projected Cubemap Reflections (Slice DA): the slab-method ray-box EXIT t (RayBoxExitT: analytic
 # exit for axis-aligned + diagonal rays, always positive) and the box-projected reflection direction
 # (BoxProject, render/reflection_probe.h, header-only). The CORE proof: BoxProject(parallaxStrength=0)
