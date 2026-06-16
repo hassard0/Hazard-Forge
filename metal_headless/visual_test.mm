@@ -5962,6 +5962,287 @@ static int RunDofShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Motion blur showcase (Slice CN). Mirrors the Vulkan --motionblur-shot path EXACTLY: a ground + a
+// row of raised colored objects, lit + shadowed, rendered into an HDR RGBA16F scene target PLUS the
+// view-space normal+linear-depth g-buffer (the SAME gbuffer shaders SSR/SSGI/DoF use). The CAMERA PANS
+// laterally at a FIXED per-frame rate (the prev camera is the cur camera shifted by a fixed amount); a
+// fullscreen velocity-gather pass (motion_blur.frag) reconstructs each pixel's view position, computes
+// the screen-space velocity from prevViewProj/curViewProj (render::motionblur::ScreenVelocity, mirrored
+// in-shader), clamps it to maxBlurPx and gathers N taps along it weighted by the depth-aware TapWeight,
+// then tonemaps. The IDENTICAL scene + params as the Vulkan path; the SAME render/motion_blur.h math
+// compiled here makes the velocity field bit-identical cross-backend. SEPARATE motion-blur pipeline +
+// shader; existing pipelines/shaders/goldens untouched. Two runs DIFF 0.0000. -----------------------
+static int RunMotionBlurShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    // FIXED motion-blur params (IDENTICAL to the Vulkan --motionblur-shot path).
+    const float kMaxBlurPx = 28.0f;
+    const int   kTaps      = 24;
+    const float kVelScale  = 1.0f;
+    const Vec3  kPanPerFrame{0.85f, 0.0f, 0.0f};
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Scene objects: a row of raised cubes/spheres. IDENTICAL to the Vulkan path.
+    struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+    const Obj objs[] = {
+        {{-3.0f, 0.9f, -2.0f}, 0.9f, true,  {0.95f, 0.30f, 0.25f}},
+        {{-1.0f, 0.9f, -3.5f}, 0.9f, false, {0.30f, 0.85f, 0.40f}},
+        {{ 1.2f, 0.9f, -2.5f}, 0.9f, true,  {0.30f, 0.55f, 0.95f}},
+        {{ 3.1f, 0.9f, -4.0f}, 0.9f, false, {0.95f, 0.80f, 0.25f}},
+        {{ 0.1f, 1.4f, -6.0f}, 0.9f, true,  {0.85f, 0.40f, 0.90f}},
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+    // Lit / shadow / sky / g-buffer pipelines (UNCHANGED shaders), same as the DoF showcase.
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    // Motion-blur fullscreen pipeline (fragment push constants) writing the swapchain.
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct MbParams {
+        float prevClip[16];   // prevViewProj * inverse(curView), column-major
+        float texel[2]; float tanHalfFovY; float aspect;
+        float maxBlurPx; float taps; float velScale; float pad;
+    };
+    auto mbFs = loadMSL("motion_blur.frag.gen.metal", "motion_blur_fragment");
+    rhi::GraphicsPipelineDesc mbD;
+    mbD.vertex = postVs.get(); mbD.fragment = mbFs.get();
+    mbD.colorFormat = device->Swapchain().ColorFormat();
+    mbD.depthTest = false; mbD.usesTexture = true; mbD.fullscreen = true;
+    mbD.fragmentPushConstants = true; mbD.pushConstantSize = sizeof(MbParams);
+    auto mbPipe = device->CreateGraphicsPipeline(mbD);
+
+    auto rt   = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // Neutral mid-grey checker floor (IDENTICAL to the Vulkan path).
+    std::vector<uint8_t> floorTexels(256 * 256 * 4);
+    for (uint32_t y = 0; y < 256; ++y)
+        for (uint32_t x = 0; x < 256; ++x) {
+            bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+            uint8_t v = dark ? 70 : 110;
+            size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+            floorTexels[idx + 0] = v; floorTexels[idx + 1] = v;
+            floorTexels[idx + 2] = v; floorTexels[idx + 3] = 255;
+        }
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, floorTexels.data(), floorTexels.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+    for (int o = 0; o < kNumObjs; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+        objTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+
+    Mat4 groundModel = Mat4::Scale({16.0f, 1.0f, 16.0f});
+    std::vector<Mat4> objModel(kNumObjs);
+    for (int o = 0; o < kNumObjs; ++o)
+        objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+            {objs[o].scale, objs[o].scale, objs[o].scale});
+
+    const Vec3 eye{0.0f, 2.4f, 8.0f};
+    const Vec3 center{0.0f, 0.9f, -3.0f};
+    const float aspect = (float)W / (float)H;
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 prevViewM = Mat4::LookAt(eye - kPanPerFrame, center - kPanPerFrame, {0, 1, 0});
+    // FlipProjY for Metal clip space; the motion_blur shader's HF_YS (+1 on Metal) reconstructs to match.
+    Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+    Mat4 curVP  = proj * viewM;
+    Mat4 prevVP = proj * prevViewM;
+    Mat4 invView = viewM.Inverse();
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = curVP.m[k];
+        fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+        Vec3 sc{0.0f, 0.7f, -3.0f};
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-11.0f, 11.0f, -11.0f, 11.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    MbParams mbp{};
+    {
+        Mat4 prevClip = prevVP * invView;   // prevViewProj * inverse(curView)
+        for (int k = 0; k < 16; ++k) mbp.prevClip[k] = prevClip.m[k];
+        mbp.texel[0] = 1.0f / (float)W; mbp.texel[1] = 1.0f / (float)H;
+        mbp.tanHalfFovY = std::tan(0.5f * kFovY); mbp.aspect = aspect;
+        mbp.maxBlurPx = kMaxBlurPx; mbp.taps = (float)kTaps; mbp.velScale = kVelScale;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgGbuf = graph.ImportTarget(
+        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+        const scene::Mesh& m = objs[o].cube ? cube : sphere;
+        cmd.BindVertexBuffer(m.vertices());
+        cmd.BindIndexBuffer(m.indices());
+        cmd.DrawIndexed(m.indexCount());
+    };
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            for (int o = 0; o < kNumObjs; ++o) {
+                cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.8f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*objTex[o], *flatNormal);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("gbuffer", {}, {rgGbuf},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*gbStaticPipeline);
+            {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("motionblur", {rgScene, rgGbuf}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*mbPipe);
+            cmd.BindTexturePair(*rt, *gbuf);
+            cmd.PushConstants(&mbp, sizeof(mbp));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — motion blur, %d objects, camera pan\n", outPath, cw, ch, kNumObjs);
+    return 0;
+}
+
 // --- Water rendering showcase (Slice CF). Mirrors the Vulkan --water-shot path EXACTLY: a few objects
 // partially submerged at the water level + a procedural sky + directional light. The opaque scene
 // renders into an HDR RT + the SSAO/SSR view-space normal+linear-depth g-buffer; then a Gerstner WATER
@@ -13309,6 +13590,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--dof") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_dof.png";
             try { return RunDofShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --motionblur <out.png>: per-object + camera motion blur showcase (Slice CN) — a ground + a row
+        // of raised objects with the camera panning at a FIXED rate, a view-space normal+linear-depth
+        // g-buffer, and a fullscreen velocity-gather pass (motion_blur.frag) that streaks the moving
+        // content along its screen-space velocity while static content stays sharp, then tonemap. Mirrors
+        // the Vulkan --motionblur-shot exactly (same scene/params; the SAME render/motion_blur.h math
+        // makes the velocity field bit-identical). Two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--motionblur") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_motion_blur.png";
+            try { return RunMotionBlurShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --water <out.png>: water-rendering showcase (Slice CF) — objects partially submerged at the

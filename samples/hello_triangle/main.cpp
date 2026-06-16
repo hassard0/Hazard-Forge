@@ -347,6 +347,7 @@ int main(int argc, char** argv) {
     const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
     const char* dofShotPath = nullptr;       // --dof-shot <out.bmp> (Slice CG: depth of field)
+    const char* motionBlurShotPath = nullptr;// --motionblur-shot <out.bmp> (Slice CN: motion blur)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -630,6 +631,17 @@ int main(int argc, char** argv) {
             // objects blur, then tonemaps. One BMP -> exit. New golden; existing lit/ssao/ssr/bloom
             // paths/shaders/goldens are untouched.
             dofShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--motionblur-shot") == 0 && i + 1 < argc) {
+            // Slice CN: per-object + camera motion blur showcase. A ground + raised objects, lit +
+            // shadowed, rendered into an HDR RGBA16F target PLUS the view-space normal+linear-depth
+            // g-buffer (the SAME gbuffer shaders SSR/SSGI/DoF use). A fullscreen velocity-gather pass
+            // (motion_blur.frag) computes each pixel's screen-space velocity from the prev/cur view-proj
+            // (the camera pans at a FIXED rate), clamps it, and gathers N taps along it so the moving
+            // content streaks while static content stays sharp, then tonemaps. INTERNALLY also renders
+            // the zero-motion version (prevViewProj := curViewProj) + a no-blur reference and asserts
+            // they are BYTE-IDENTICAL (SHA) — the pass-through proof. One BMP -> exit. New golden;
+            // existing lit/ssao/ssr/dof/bloom paths/shaders/goldens are untouched.
+            motionBlurShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -8577,6 +8589,362 @@ int main(int argc, char** argv) {
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Motion blur showcase (--motionblur-shot, Slice CN): a ground + a row of raised objects,
+        // lit + shadowed, rendered into an HDR RGBA16F scene target PLUS the view-space normal+linear-
+        // depth g-buffer (the SAME gbuffer shaders SSR/SSGI/DoF use). The CAMERA PANS laterally at a
+        // FIXED per-frame rate, so the previous-frame camera is the current camera shifted by a fixed
+        // amount; a fullscreen velocity-gather pass (motion_blur.frag) reconstructs each pixel's view
+        // position, computes the screen-space velocity from prevViewProj/curViewProj (render::motionblur
+        // ::ScreenVelocity, mirrored in-shader), clamps it to maxBlurPx, and gathers N taps along it
+        // weighted by the depth-aware TapWeight so the static scene visibly streaks horizontally under
+        // the camera pan, then tonemaps (same displayed pipeline as ssr_composite/dof). SEPARATE motion-
+        // blur pipeline + shader; existing lit/gbuffer/ssr/dof + goldens untouched.
+        //
+        // THE EQUIVALENCE PROOF: the pass is ALSO run with prevViewProj := curViewProj (zero motion) AND
+        // with velScale := 0 (a no-blur reference); BOTH hit the shader's zero-velocity short-circuit and
+        // output the tonemapped center color, so the two captures are asserted BYTE-IDENTICAL (SHA) —
+        // proving the gather is a pure pass-through when nothing moves.
+        if (motionBlurShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+
+            // FIXED motion-blur params (deterministic). maxBlurPx caps the streak; taps is the gather
+            // count; velScale folds in the shutter strength (so the FIXED camera-pan dt reads clearly).
+            const float kMaxBlurPx = 28.0f;
+            const int   kTaps      = 24;
+            const float kVelScale  = 1.0f;
+            // The FIXED per-frame camera pan (the prev camera is the cur camera translated by this).
+            const Vec3  kPanPerFrame{0.85f, 0.0f, 0.0f};
+
+            // --- Scene objects: a row of raised cubes/spheres across the view so the horizontal pan
+            // streak reads against the static ground. Distinct colors. ---
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-3.0f, 0.9f, -2.0f}, 0.9f, true,  {0.95f, 0.30f, 0.25f}},
+                {{-1.0f, 0.9f, -3.5f}, 0.9f, false, {0.30f, 0.85f, 0.40f}},
+                {{ 1.2f, 0.9f, -2.5f}, 0.9f, true,  {0.30f, 0.55f, 0.95f}},
+                {{ 3.1f, 0.9f, -4.0f}, 0.9f, false, {0.95f, 0.80f, 0.25f}},
+                {{ 0.1f, 1.4f, -6.0f}, 0.9f, true,  {0.85f, 0.40f, 0.90f}},
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky / g-buffer pipelines (UNCHANGED shaders), same as --dof-shot. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs  = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs  = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- Motion-blur fullscreen pipeline (fragment push constants) writing the swapchain. ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            struct MbParams {
+                float prevClip[16];   // prevViewProj * inverse(curView), column-major
+                float texel[2]; float tanHalfFovY; float aspect;
+                float maxBlurPx; float taps; float velScale; float pad;
+            };
+            static_assert(sizeof(MbParams) <= 128, "MbParams must fit the 128B push-constant budget");
+            auto mbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/motion_blur.frag.hlsl.spv");
+            auto mbFs  = device->CreateShaderModule({std::span<const uint32_t>(mbFsW)});
+            rhi::GraphicsPipelineDesc mbD;
+            mbD.vertex = postVsM.get(); mbD.fragment = mbFs.get();
+            mbD.colorFormat = device->Swapchain().ColorFormat();
+            mbD.depthTest = false; mbD.usesTexture = true; mbD.fullscreen = true;
+            mbD.fragmentPushConstants = true; mbD.pushConstantSize = sizeof(MbParams);
+            auto mbPipe = device->CreateGraphicsPipeline(mbD);
+
+            auto rt   = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // A neutral mid-grey checker floor (so the streak reads against it).
+            std::vector<uint8_t> floorTexels(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorTexels[idx + 0] = v; floorTexels[idx + 1] = v;
+                    floorTexels[idx + 2] = v; floorTexels[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorTexels.data(), floorTexels.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({16.0f, 1.0f, 16.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+
+            // Camera: looks at the row of objects. The PREV camera is the cur camera panned by a fixed
+            // amount (a constant lateral velocity) — the source of the camera motion-blur velocity.
+            const Vec3 eye{0.0f, 2.4f, 8.0f};
+            const Vec3 center{0.0f, 0.9f, -3.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 prevViewM = Mat4::LookAt(eye - kPanPerFrame, center - kPanPerFrame, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+            Mat4 curVP  = proj * viewM;
+            Mat4 prevVP = proj * prevViewM;
+            Mat4 invView = viewM.Inverse();
+
+            FrameData fd{};
+            {
+                Mat4 vp = curVP;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+                Vec3 sc{0.0f, 0.7f, -3.0f};
+                Vec3 lightEye = sc - lightDir * 22.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-11.0f, 11.0f, -11.0f, 11.0f, 1.0f, 48.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            // Build the MbParams for a given prev-clip-from-view matrix + velScale.
+            auto makeMb = [&](const Mat4& prevClipFromView, float velScale) {
+                MbParams p{};
+                for (int k = 0; k < 16; ++k) p.prevClip[k] = prevClipFromView.m[k];
+                p.texel[0] = 1.0f / (float)w; p.texel[1] = 1.0f / (float)h;
+                p.tanHalfFovY = std::tan(0.5f * kFovY); p.aspect = aspect;
+                p.maxBlurPx = kMaxBlurPx; p.taps = (float)kTaps; p.velScale = velScale;
+                return p;
+            };
+            // The real (moving-camera) blur: prevViewProj * inverse(curView).
+            MbParams mbBlur = makeMb(prevVP * invView, kVelScale);
+            // Zero-motion: prevViewProj := curViewProj -> prevClip == curVP*invView (reprojects to self).
+            MbParams mbZero = makeMb(curVP * invView, kVelScale);
+            // No-blur reference: any prev-clip, velScale 0 -> the shader's zero-velocity short-circuit.
+            MbParams mbRef  = makeMb(curVP * invView, 0.0f);
+
+            // Render the scene + g-buffer ONCE, then run the motion-blur pass with the given params.
+            auto renderWith = [&](const MbParams& mb, std::vector<uint8_t>& outPx,
+                                  uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgGbuf = graph.ImportTarget(
+                    "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.8f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*objTex[o], *flatNormal);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("gbuffer", {}, {rgGbuf},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*gbStaticPipeline);
+                        {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("motionblur", {rgScene, rgGbuf}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*mbPipe);
+                        cmd.BindTexturePair(*rt, *gbuf);
+                        cmd.PushConstants(&mb, sizeof(mb));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            std::vector<uint8_t> blurPx, zeroPx, refPx;
+            uint32_t bw = 0, bh = 0, zw = 0, zh = 0, rw = 0, rh = 0;
+            if (!renderWith(mbBlur, blurPx, bw, bh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (motion-blur render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderWith(mbZero, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (zero-motion render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderWith(mbRef, refPx, rw, rh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (no-blur reference render)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+            uint64_t zeroHash = fnv(zeroPx), refHash = fnv(refPx), blurHash = fnv(blurPx);
+            const bool passthrough = (zw == rw) && (zh == rh) && (zeroPx.size() == refPx.size()) &&
+                                     (std::memcmp(zeroPx.data(), refPx.data(), zeroPx.size()) == 0);
+            std::printf("motion-blur zero-motion-hash: %016llx  no-blur-ref-hash: %016llx  blur-hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)refHash,
+                        (unsigned long long)blurHash);
+            if (!passthrough) {
+                std::fprintf(stderr,
+                    "FATAL: zero-motion blur != the no-blur scene color — a normalization/centering bug "
+                    "(the gather is NOT a pure pass-through when nothing moves). zeroVel %016llx vs scene %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)refHash);
+                device->WaitIdle(); return 1;
+            }
+            // The blurred capture MUST visibly differ from the static scene (proves the streak is real).
+            const bool blurDiffers = (blurPx.size() != refPx.size()) ||
+                                     (std::memcmp(blurPx.data(), refPx.data(), blurPx.size()) != 0);
+            if (!blurDiffers) {
+                std::fprintf(stderr,
+                    "FATAL: the motion-blur capture is identical to the static scene — no blur was applied "
+                    "(the camera pan produced no velocity).\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("motion-blur zeroVel==scene-color: BYTE-IDENTICAL (pure pass-through proof)\n");
+            std::printf("motion-blur: {maxBlurPx:%.0f, taps:%d, velScale:%.1f}\n",
+                        kMaxBlurPx, kTaps, kVelScale);
+
+            bool ok = WriteBMP(motionBlurShotPath, blurPx, bw, bh);
+            if (ok) std::printf("wrote %s (%ux%u) — motion blur, %d objects, camera pan\n",
+                                motionBlurShotPath, bw, bh, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", motionBlurShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

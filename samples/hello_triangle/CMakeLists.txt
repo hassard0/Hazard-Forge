@@ -148,6 +148,14 @@ hf_compile_shaders(
     # the focal plane stays sharp while fore/background blur, then tonemaps to the swapchain. Fullscreen
     # (reuses post.vert), behind --dof-shot ONLY; existing post/ssr/ssgi shaders + goldens untouched.
     "shaders/dof.frag.hlsl:ps"
+    # Per-object + camera motion blur (Slice CN): reuses the SSAO/SSR/DoF g-buffer (view normal + linear
+    # depth) + the resolved HDR scene. motion_blur.frag reconstructs each pixel's view position, computes
+    # the screen-space velocity from the prev/cur view-proj (render/motion_blur.h math, mirrored in-shader),
+    # clamps it to maxBlurPx and gathers N taps along it weighted by the depth-aware TapWeight so moving
+    # content streaks while static content stays sharp, then tonemaps. Fullscreen (reuses post.vert), behind
+    # --motionblur-shot ONLY; with zero motion the gather short-circuits to a byte-identical pass-through.
+    # Existing post/ssr/ssgi/dof shaders + goldens untouched.
+    "shaders/motion_blur.frag.hlsl:ps"
     # Water rendering (Slice CF): water.vert displaces a flat NxN grid by the summed Gerstner waves at a
     # FIXED time (render/water.h math, mirrored in-shader); water.frag recomputes the analytic wave
     # normal and shades a fresnel blend of a SKY reflection (reusing SkyColor) and a REFRACTED scene

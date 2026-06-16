@@ -180,6 +180,13 @@ hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite
 # focal plane stays sharp while fore/background blur, then tonemaps. Same scene/g-buffer pair bindings
 # as SSR; existing shaders + goldens untouched.
 hf_gen_msl(dof.frag               dof.frag.hlsl               frag dof_fragment)
+# Per-object + camera motion blur (Slice CN): reuses the SSAO/SSR/DoF g-buffer (view normal + linear
+# depth) + the resolved HDR scene; motion_blur.frag reconstructs each pixel's view position, computes the
+# screen-space velocity from the prev/cur view-proj (render/motion_blur.h math, mirrored in-shader),
+# clamps it to maxBlurPx and gathers N taps along it weighted by the depth-aware TapWeight, then tonemaps.
+# Same scene/g-buffer pair bindings as DoF; the SAME render/motion_blur.h math makes the velocity field
+# bit-identical cross-backend. Existing shaders + goldens untouched.
+hf_gen_msl(motion_blur.frag       motion_blur.frag.hlsl       frag motion_blur_fragment)
 # Water rendering (Slice CF): water.vert displaces a 128x128 grid by the Gerstner field (render/water.h
 # math, mirrored in-shader); water.frag fresnel-blends a SKY reflection + a depth-tinted REFRACTION of
 # the scene-color RT (G-buffer depth like SSR) + a sun glint; water_composite blends + tonemaps. Same

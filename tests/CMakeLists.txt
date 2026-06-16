@@ -159,6 +159,17 @@ hf_add_pure_test(ssgi_denoise_test)
 # (render/dof.h, header-only), ASan-eligible.
 hf_add_pure_test(dof_test)
 
+# Per-object + camera motion blur (Slice CN): the screen-space velocity (cur-prev pixel delta from a
+# prev/cur view-proj pair; EXACTLY (0,0) when the two projections are identical -> the zero-velocity
+# pass-through proof), the length clamp (caps at maxBlurPx, preserves direction, zero stays zero), and
+# the depth-aware gather TapWeight (an in-extent foreground/co-planar tap weight 1, a beyond-extent or
+# farther-background tap 0 -> a near moving object streaks over a static background but a moving
+# background does not smear a static foreground; normalized so zero velocity -> center weight 1). The
+# render-invariance proof (motionblur(zeroVel) == sceneColor byte-identical) lives in --motionblur-shot;
+# this pins the CPU math both the shader + the showcase read. Pure C++ (render/motion_blur.h,
+# header-only), ASan-eligible.
+hf_add_pure_test(motion_blur_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so
