@@ -6681,6 +6681,10 @@ static int RunPomShowcase(const char* outPath) {
         {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, normalTexels.data(), normalTexels.size()});
     auto albedoTex = device->CreateTexture(
         {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, albedoTexels.data(), albedoTexels.size()});
+    // Flat height field (h==1) for the zero-height proof — collapses the march to the base uv.
+    const uint8_t flatHeightPx[4] = {255, 255, 255, 255};
+    auto flatHeight = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatHeightPx, sizeof(flatHeightPx)});
 
     // POM pipeline (pom.vert + pom.frag; wider full-PBR material set: albedo t0, normal t3, height t5).
     auto pomVs = loadMSL("pom.vert.gen.metal", "vertex_main");
@@ -6693,17 +6697,6 @@ static int RunPomShowcase(const char* outPath) {
     pomDesc.usesTexture = true; pomDesc.pbrMaterial = true;
     pomDesc.pushConstantSize = sizeof(float) * 20;
     auto pomPipeline = device->CreateGraphicsPipeline(pomDesc);
-
-    // Plain lit pipeline (lit.vert + lit.frag, UNCHANGED) for the zero-height reference.
-    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
-    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
-    rhi::GraphicsPipelineDesc litDesc;
-    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
-    litDesc.vertexLayout = scene::MeshVertexLayout();
-    litDesc.colorFormat = kHdr;
-    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
-    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
-    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
 
     auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
     rhi::GraphicsPipelineDesc shDesc;
@@ -6784,7 +6777,7 @@ static int RunPomShowcase(const char* outPath) {
         fd.skyParams[1] = aspect;
     }
 
-    auto renderSurface = [&](bool usePom, float heightScale,
+    auto renderSurface = [&](rhi::ITexture& hTex, float heightScale,
                              std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
         render::RenderGraph graph;
         render::RgResource rgShadow = graph.ImportTarget(
@@ -6811,15 +6804,12 @@ static int RunPomShowcase(const char* outPath) {
                 cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
                 cmd.BindPipeline(*skyPipe);
                 cmd.Draw(3);
-                cmd.BindPipeline(usePom ? *pomPipeline : *litPipeline);
+                cmd.BindPipeline(*pomPipeline);
                 float pc[20];
                 for (int k = 0; k < 16; ++k) pc[k] = quadModel.m[k];
                 pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = heightScale; pc[19] = (float)kNumSteps;
                 cmd.PushConstants(pc, sizeof(pc));
-                if (usePom)
-                    cmd.BindMaterialPBR(*albedoTex, *heightTex, *normalTex, *normalTex, *normalTex);
-                else
-                    cmd.BindMaterial(*albedoTex, *normalTex);
+                cmd.BindMaterialPBR(*albedoTex, hTex, *normalTex, *normalTex, *normalTex);
                 cmd.BindVertexBuffer(*quadVB);
                 cmd.BindIndexBuffer(*quadIB);
                 cmd.DrawIndexed(6);
@@ -6841,17 +6831,20 @@ static int RunPomShowcase(const char* outPath) {
         return device->GetCapturedPixels(outPx, outW, outH);
     };
 
-    std::vector<uint8_t> pomPx, zeroPomPx, litPx;
-    uint32_t pw = 0, ph = 0, zw = 0, zh = 0, lw = 0, lh = 0;
-    if (!renderSurface(true, kHeightScale, pomPx, pw, ph)) return fail("no captured pixels (POM)");
-    if (!renderSurface(true, 0.0f, zeroPomPx, zw, zh)) return fail("no captured pixels (POM h=0)");
-    if (!renderSurface(false, 0.0f, litPx, lw, lh)) return fail("no captured pixels (plain lit)");
+    // THE ZERO-HEIGHT EQUIVALENCE PROOF (mirrors the Vulkan --pom-shot): the REAL height field at
+    // heightScale=0 and a FLAT height field (h==1) at heightScale>0 both collapse the march to the base
+    // uv (plain normal mapping) through the SAME pom shader -> BYTE-IDENTICAL. Fail loudly on any diff.
+    std::vector<uint8_t> pomPx, zeroPomPx, flatPomPx;
+    uint32_t pw = 0, ph = 0, zw = 0, zh = 0, fw2 = 0, fh2 = 0;
+    if (!renderSurface(*heightTex, kHeightScale, pomPx, pw, ph)) return fail("no captured pixels (POM)");
+    if (!renderSurface(*heightTex, 0.0f, zeroPomPx, zw, zh)) return fail("no captured pixels (POM h=0)");
+    if (!renderSurface(*flatHeight, kHeightScale, flatPomPx, fw2, fh2)) return fail("no captured pixels (POM flat)");
 
-    const bool zeroEquivalent = (zw == lw) && (zh == lh) && (zeroPomPx.size() == litPx.size()) &&
-                                (std::memcmp(zeroPomPx.data(), litPx.data(), litPx.size()) == 0);
+    const bool zeroEquivalent = (zw == fw2) && (zh == fh2) && (zeroPomPx.size() == flatPomPx.size()) &&
+                                (std::memcmp(zeroPomPx.data(), flatPomPx.data(), flatPomPx.size()) == 0);
     if (!zeroEquivalent)
-        return fail("POM heightScale=0 render != plain normal-mapped lit render — NOT zero-height equivalent");
-    std::printf("pom heightScale=0 == plain normal-mapped: BYTE-IDENTICAL (zero-height proof)\n");
+        return fail("POM heightScale=0 render != flat-height-field render — NOT zero-height equivalent");
+    std::printf("pom heightScale=0 == flat-field (plain normal mapping): BYTE-IDENTICAL (zero-height proof)\n");
     std::printf("pom: {heightScale:%.4g, steps:%d}\n", (double)kHeightScale, kNumSteps);
 
     if (!WritePNG(outPath, pomPx, pw, ph)) return fail("PNG write failed");

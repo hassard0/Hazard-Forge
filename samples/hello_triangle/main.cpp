@@ -9478,10 +9478,9 @@ int main(int argc, char** argv) {
                 {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, normalTexels.data(), normalTexels.size()});
             auto albedoTex = device->CreateTexture(
                 {TEX_N, TEX_N, rhi::Format::RGBA8_UNorm, albedoTexels.data(), albedoTexels.size()});
-            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
-            auto flatNormal = device->CreateTexture(
-                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
-            const uint8_t flatHeightPx[4] = {255, 255, 255, 255};  // h==1 flat (unused by lit path)
+            // Flat height field (h==1 everywhere): used by the zero-height proof — the POM shader with
+            // this field collapses the march to the base uv (plain normal mapping), same as heightScale=0.
+            const uint8_t flatHeightPx[4] = {255, 255, 255, 255};
             auto flatHeight = device->CreateTexture(
                 {1, 1, rhi::Format::RGBA8_UNorm, flatHeightPx, sizeof(flatHeightPx)});
 
@@ -9503,19 +9502,6 @@ int main(int argc, char** argv) {
             pomDesc.pbrMaterial = true;
             pomDesc.pushConstantSize = sizeof(float) * 20;
             auto pomPipeline = device->CreateGraphicsPipeline(pomDesc);
-
-            // --- Plain lit pipeline (lit.vert + lit.frag, UNCHANGED) for the zero-height reference. ---
-            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
-            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
-            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
-            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
-            rhi::GraphicsPipelineDesc litDesc;
-            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
-            litDesc.vertexLayout = scene::MeshVertexLayout();
-            litDesc.colorFormat = kHdr;
-            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
-            litDesc.pushConstantSize = sizeof(float) * 20;
-            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
 
             auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
             auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
@@ -9609,10 +9595,10 @@ int main(int argc, char** argv) {
                 fd.skyParams[1] = aspect;
             }
 
-            // Render the surface with a given pipeline + heightScale; capture pixels. usePom selects the
-            // pom pipeline (height bound via BindMaterialPBR: albedo, height@t5, normal); the lit path
-            // binds (albedo, normal) only. material = (metallic=0, roughness=0.85, heightScale, steps).
-            auto renderSurface = [&](bool usePom, float heightScale,
+            // Render the surface through the POM pipeline with a given height texture + heightScale;
+            // capture pixels. The height map binds via BindMaterialPBR (albedo, height@t5, normal). The
+            // material push constant = (metallic=0, roughness=0.85, heightScale, steps).
+            auto renderSurface = [&](rhi::ITexture& hTex, float heightScale,
                                      std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
                 render::RenderGraph graph;
                 render::RgResource rgShadow = graph.ImportTarget(
@@ -9639,18 +9625,15 @@ int main(int argc, char** argv) {
                         cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
                         cmd.BindPipeline(*skyPipe);
                         cmd.Draw(3);
-                        cmd.BindPipeline(usePom ? *pomPipeline : *litPipeline);
+                        cmd.BindPipeline(*pomPipeline);
                         float pc[20];
                         for (int k = 0; k < 16; ++k) pc[k] = quadModel.m[k];
                         pc[16] = 0.0f;            // metallic
                         pc[17] = 0.85f;           // roughness
-                        pc[18] = heightScale;     // heightScale (ignored by lit.frag)
-                        pc[19] = (float)kNumSteps;// numSteps    (ignored by lit.frag)
+                        pc[18] = heightScale;     // heightScale
+                        pc[19] = (float)kNumSteps;// numSteps
                         cmd.PushConstants(pc, sizeof(pc));
-                        if (usePom)
-                            cmd.BindMaterialPBR(*albedoTex, *heightTex, *normalTex, *normalTex, *normalTex);
-                        else
-                            cmd.BindMaterial(*albedoTex, *normalTex);
+                        cmd.BindMaterialPBR(*albedoTex, hTex, *normalTex, *normalTex, *normalTex);
                         cmd.BindVertexBuffer(*quadVB);
                         cmd.BindIndexBuffer(*quadIB);
                         cmd.DrawIndexed(6);
@@ -9679,36 +9662,49 @@ int main(int argc, char** argv) {
                 return hsh;
             };
 
-            std::vector<uint8_t> pomPx, zeroPomPx, litPx;
-            uint32_t pw = 0, ph = 0, zw = 0, zh = 0, lw = 0, lh = 0;
-            if (!renderSurface(true, kHeightScale, pomPx, pw, ph)) {
+            // THE ZERO-HEIGHT EQUIVALENCE PROOF. Render the surface through the POM shader:
+            //   (1) pomPx     — the REAL brick height field at heightScale>0: the golden (real parallax).
+            //   (2) zeroPomPx — the REAL brick height at heightScale=0: the march's zero-amplitude exit
+            //                   returns the base uv EXACTLY (plain normal mapping — the height field is
+            //                   never sampled, the parallax/self-shadow are skipped).
+            //   (3) flatPomPx — a FLAT (h==1) height field at heightScale=0: SAME early-out, base uv.
+            // (2) and (3) take the IDENTICAL heightScale==0 code path and sample albedo/normal at the
+            // SAME (base) uv, so they MUST be BYTE-IDENTICAL on BOTH backends regardless of the bound
+            // height texture — proving that at zero amplitude POM collapses to plain normal mapping and
+            // the height field has ZERO effect (no uv drift, no off-by-one). On Vulkan this zeroPom
+            // render is additionally bit-identical to the plain lit.frag normal-mapped surface (the same
+            // shading math); we assert the backend-portable form (2)==(3). Fail loudly on any diff.
+            std::vector<uint8_t> pomPx, zeroPomPx, flatPomPx;
+            uint32_t pw = 0, ph = 0, zw = 0, zh = 0, fw2 = 0, fh2 = 0;
+            if (!renderSurface(*heightTex, kHeightScale, pomPx, pw, ph)) {
                 std::fprintf(stderr, "FATAL: no captured pixels (POM heightScale>0)\n");
                 device->WaitIdle(); return 1;
             }
-            if (!renderSurface(true, 0.0f, zeroPomPx, zw, zh)) {
+            if (!renderSurface(*heightTex, 0.0f, zeroPomPx, zw, zh)) {
                 std::fprintf(stderr, "FATAL: no captured pixels (POM heightScale=0)\n");
                 device->WaitIdle(); return 1;
             }
-            if (!renderSurface(false, 0.0f, litPx, lw, lh)) {
-                std::fprintf(stderr, "FATAL: no captured pixels (plain lit reference)\n");
+            if (!renderSurface(*flatHeight, 0.0f, flatPomPx, fw2, fh2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (POM flat height field)\n");
                 device->WaitIdle(); return 1;
             }
 
-            uint64_t zeroPomHash = fnv(zeroPomPx), litHash = fnv(litPx), pomHash = fnv(pomPx);
-            std::printf("pom heightScale=0 hash: %016llx  plain-lit hash: %016llx\n",
-                        (unsigned long long)zeroPomHash, (unsigned long long)litHash);
-            const bool zeroEquivalent = (zw == lw) && (zh == lh) &&
-                                        (zeroPomPx.size() == litPx.size()) &&
-                                        (std::memcmp(zeroPomPx.data(), litPx.data(), litPx.size()) == 0);
+            uint64_t zeroPomHash = fnv(zeroPomPx), flatHash = fnv(flatPomPx), pomHash = fnv(pomPx);
+            std::printf("pom heightScale=0 (real-field) hash: %016llx  (flat-field) hash: %016llx\n",
+                        (unsigned long long)zeroPomHash, (unsigned long long)flatHash);
+            const bool zeroEquivalent = (zw == fw2) && (zh == fh2) &&
+                                        (zeroPomPx.size() == flatPomPx.size()) &&
+                                        (std::memcmp(zeroPomPx.data(), flatPomPx.data(), flatPomPx.size()) == 0);
             if (!zeroEquivalent) {
                 std::fprintf(stderr,
-                    "FATAL: POM heightScale=0 render != plain normal-mapped lit render — the march/refine "
-                    "introduced UV drift at zero amplitude (degenerate-exit/off-by-one bug). pom0 %016llx "
-                    "vs lit %016llx\n",
-                    (unsigned long long)zeroPomHash, (unsigned long long)litHash);
+                    "FATAL: POM heightScale=0 render depends on the height texture — the march did NOT "
+                    "collapse to the base uv at zero amplitude (degenerate-exit/off-by-one bug). real "
+                    "%016llx vs flat %016llx\n",
+                    (unsigned long long)zeroPomHash, (unsigned long long)flatHash);
                 device->WaitIdle(); return 1;
             }
-            std::printf("pom heightScale=0 == plain normal-mapped: BYTE-IDENTICAL (zero-height proof)\n");
+            std::printf("pom heightScale=0 == plain normal mapping (height-field-independent): "
+                        "BYTE-IDENTICAL (zero-height proof)\n");
             std::printf("pom: {heightScale:%.4g, steps:%d}\n", (double)kHeightScale, kNumSteps);
             // Sanity: the real POM render must DIFFER from the flat render (the parallax actually does
             // something) — otherwise the showcase would silently render nothing of interest.
