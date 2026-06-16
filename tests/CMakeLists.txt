@@ -209,6 +209,20 @@ hf_add_pure_test(gtao_test)
 # froxel_inject/integrate/apply. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(froxel_test)
 
+# Per-Froxel Clustered-Light Injection (Slice CV): the ADDED clustered-point-light in-scatter term
+# froxel::InjectClusteredLights the inject pass (froxel_inject.comp.hlsl behind the injectLights flag)
+# accumulates on top of the CS sun in-scatter — the marquee CS (froxel fog) + CL (clustered lights)
+# fusion. The CORE proofs: lightCount==0 -> (0,0,0) EXACTLY (the additive lights-off identity that makes
+# the inject pass reduce to CS sun-only fog -> the byte-identical lights-off proof) and density==0 ->
+# (0,0,0) EXACTLY (the density=0==no-fog foundation). Also pins: a reaching light scatters POSITIVE +
+# LINEAR in density, falls with distance (windowed), a light BEYOND radius -> 0 (the windowed hard cutoff
+# IDENTICAL to CL's atten, incl. the d==radius boundary), color tint + HG forward-peak phase, additive
+# accumulation, lightOffset slicing of the shared light-index buffer, the froxel->cluster Z map (froxel
+# view-Z -> the correct cluster slice via cluster::SliceForViewZ; froxel/cluster XY tiles align 16x9),
+# and determinism. The same froxel.h math is mirrored VERBATIM in froxel_inject.comp's light loop. Pure
+# C++ (hf_core; reuses render/cluster.h), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(froxel_lights_test)
+
 # Screen-Space Contact Shadows (Slice CT): the screen-space depth ray-march toward the sun
 # (render/contact_shadows.h, header-only). The CORE proof: RayMarchShadow(maxDist=0) == 1 and
 # (steps=0) == 1 EXACTLY (no march -> no occluder -> the maxDist=0 contact-shadow render is byte-

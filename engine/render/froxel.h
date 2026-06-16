@@ -46,10 +46,13 @@
 //     (the in-scatter at this froxel is attenuated by the transmittance ACCUMULATED IN FRONT of it), then
 //     T *= exp(-stepExtinction*stepLen). Order matters: a near scatterer contributes at full T==1.
 
+#include "cluster.h"
 #include "math/math.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <span>
 
 namespace hf::render::froxel {
 
@@ -127,6 +130,68 @@ inline void IntegrateStep(const math::Vec3& stepScatter, float stepExtinction, f
                           math::Vec3& accumInScatter, float& transmittance) {
     accumInScatter = accumInScatter + (stepScatter * (transmittance * stepLen));
     transmittance *= std::exp(-stepExtinction * stepLen);
+}
+
+// --- Slice CV — Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion) -----------------------
+// The ADDED clustered-point-light in-scatter term for one froxel: iterate the lights this froxel's
+// cluster lists and sum each light's in-scattered contribution into the fog. This is ADDED to the sun
+// in-scatter computed in the inject pass (scatter = sunScatter + InjectClusteredLights(...)), so it is a
+// PURELY ADDITIVE term: with lightCount==0 (or all lights off) it returns (0,0,0) EXACTLY and the inject
+// pass reduces to the CS sun-only fog — the byte-identical lights-off proof. It is also multiplied by the
+// froxel `density`, so at density==0 the whole scatter is 0 — the density=0==no-fog proof still holds.
+//
+// Per light i in [0,lightCount): light = lights[clusterLightIndices[lightOffset + i]]; the light's
+// VIEW-space position is view * light.posWorld (the SAME world->view transform cluster::AssignLights uses
+// for culling); d = |froxelViewPos - lightViewPos|; the WINDOWED HARD-RADIUS attenuation is IDENTICAL to
+// CL's lit_clustered_cl.frag:  atten = (1/(d²+0.01)) * clamp(1 - (d/radius)⁴, 0, 1)²  — EXACTLY 0 at and
+// beyond `radius`, so a froxel only ever gains light from a light whose sphere reaches it (the same hard
+// cutoff that makes CL clustered==brute-force; here it bounds the per-froxel glow to the light's radius).
+// The HG `Phase(cos(viewDir, dirToLight), g)` weights forward-scatter toward each light: the in-scatter
+// peaks when the view ray points along the light direction (a colored volumetric shaft/glow toward the
+// light) for g>0. The accumulated term is  Σ light.color * light.intensity * atten * phase  * density.
+//
+// `viewDir` is the (unit) VIEW-space direction the camera ray travels for this froxel — for the apply
+// this is normalize(froxelViewPos) (eye at origin looking toward the froxel). `dirToLight` is the unit
+// view-space direction from the froxel TOWARD the light. Both endpoints are in VIEW space, so the cosine
+// is taken consistently in view space (the froxel and lights are all transformed to view space).
+//
+// MIRRORED VERBATIM in froxel_inject.comp.hlsl behind the `injectLights` flag, so the unit test exercises
+// the EXACT math the GPU inject pass adds. Pure CPU, ZERO backend symbols (reuses cluster::PointLight).
+inline math::Vec3 InjectClusteredLights(const math::Vec3& froxelViewPos, float density,
+                                        const math::Vec3& viewDir, float g,
+                                        std::span<const cluster::PointLight> lights,
+                                        std::span<const uint32_t> clusterLightIndices,
+                                        uint32_t lightOffset, uint32_t lightCount,
+                                        const math::Mat4& view) {
+    math::Vec3 accum{0.0f, 0.0f, 0.0f};
+    if (lightCount == 0) return accum;   // lights-off additive identity -> CS sun-only fog
+    for (uint32_t i = 0; i < lightCount; ++i) {
+        uint32_t li = clusterLightIndices[(size_t)lightOffset + i];
+        const cluster::PointLight& L = lights[(size_t)li];
+        math::Vec3 lvpos = math::MulPoint(view, L.posWorld);   // world -> view (same as AssignLights)
+
+        math::Vec3 toLight{lvpos.x - froxelViewPos.x, lvpos.y - froxelViewPos.y,
+                           lvpos.z - froxelViewPos.z};
+        float dist = std::sqrt(toLight.x * toLight.x + toLight.y * toLight.y + toLight.z * toLight.z);
+
+        // WINDOWED HARD-RADIUS attenuation IDENTICAL to CL (lit_clustered_cl.frag): EXACTLY 0 at d>=radius.
+        float r4 = dist / L.radius; r4 = r4 * r4; r4 = r4 * r4;        // (d/radius)^4
+        float win = 1.0f - r4; win = win < 0.0f ? 0.0f : (win > 1.0f ? 1.0f : win);
+        win = win * win;
+        float atten = (1.0f / (dist * dist + 0.01f)) * win;
+
+        // HG phase toward this light: cos(viewDir, dirToLight). dirToLight = toLight/dist (unit).
+        float invD = (dist > 1e-9f) ? (1.0f / dist) : 0.0f;
+        float cosTheta = viewDir.x * toLight.x * invD + viewDir.y * toLight.y * invD +
+                         viewDir.z * toLight.z * invD;
+        float phase = Phase(cosTheta, g);
+
+        float w = L.intensity * atten * phase * density;
+        accum.x += L.color.x * w;
+        accum.y += L.color.y * w;
+        accum.z += L.color.z * w;
+    }
+    return accum;
 }
 
 // --- GPU-facing std430 record the showcase uploads/reads. ----------------------------------------------

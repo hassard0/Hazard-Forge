@@ -6,14 +6,29 @@
 // scatter (sunColor * Phase(cos(viewDir,sunDir), g) * density) and the extinction (density), and writes
 // (scatterRGB, extinction) into float4 #0 of the FLAT SSBO froxel volume cell [fx + fy*dimX + fz*dimX*dimY].
 //
-// The math (exponential Z slices, NDC-corner unprojection via invProj, height density, HG phase) is the
-// verbatim mirror of engine/render/froxel.h. With baseDensity==0 every cell's density is 0 -> scatter 0,
-// extinction 0 -> the integrate pass is a per-step no-op -> the apply is a pure pass-through (the
-// zero-density == no-fog-scene proof).
+// Slice CV — Per-Froxel Clustered-Light Injection (the CS+CL fusion): if injectLights (gParams.clusterDims.w)
+// is set, AFTER the sun in-scatter this pass maps the froxel to its CLUSTER (XY tile from the froxel XY,
+// which align — both 16x9; Z via SliceForViewZ of the froxel center's view-Z, cluster dimZ=24), reads
+// clusterLightGrid[clusterIdx] = {count, idx[96]}, iterates that cluster's lights from the SAME light SSBO
+// the clustered-lights (CL) pass uses (VIEW-space pos), and ADDS each light's windowed-attenuation * HG
+// phase * density in-scatter (render::froxel::InjectClusteredLights mirrored VERBATIM). This is a PURELY
+// ADDITIVE term: with injectLights=false the loop is SKIPPED and the code is the EXACT CS path -> the
+// lights-off render is BYTE-IDENTICAL to the CS sun-only froxel fog (the lights-off proof). It is also
+// ×density, so at baseDensity=0 the whole scatter is 0 -> the density=0 == no-fog proof still holds.
 //
-// Buffers (storage, bound at compute bindings 0..1; on Metal they land at buffer(kCsStorage+0..1)):
-//   b0 gVolume : the flat FroxelCell[dimX*dimY*dimZ] volume, WRITE (float4 #0 = scatter.rgb + extinction).
-//   b1 gParams : grid dims + zNear/zFar + sun + fog params + invProj + invView, READ.
+// The math (exponential Z slices, NDC-corner unprojection via invProj, height density, HG phase, the
+// windowed point-light attenuation) is the verbatim mirror of engine/render/froxel.h + cluster.h. With
+// baseDensity==0 every cell's density is 0 -> scatter 0, extinction 0 -> the integrate pass is a per-step
+// no-op -> the apply is a pure pass-through (the zero-density == no-fog-scene proof).
+//
+// Buffers (storage, bound at compute bindings 0..3; on Metal they land at buffer(kCsStorage+0..3)):
+//   b0 gVolume          : the flat FroxelCell[dimX*dimY*dimZ] volume, WRITE (float4 #0 = scatter+ext).
+//   b1 gParams          : grid dims + zNear/zFar + sun + fog + cluster dims/range + injectLights, READ.
+//   b2 gClusterLightGrid: the per-cluster {count, idx[96]} ordered light lists the CL pass fills, READ.
+//   b3 gLights          : the point lights (VIEW-space pos+radius, color+intensity) the CL pass uses, READ.
+// (b2/b3 are bound for both the lights-off and lights-on renders; the injectLights=false path never reads
+//  them — the showcase binds the dummy buffer there for the CS-equivalent render — so the disabled path
+//  is the EXACT CS code.)
 //
 // SEAM DISCIPLINE: this shader is ABOVE the RHI seam; the only mentions of vk/MSL are the HF_MSL_GEN
 // generation-path guards + [[vk::binding]] decorations (same as cluster_assign / gtao.frag), not backend
@@ -21,6 +36,7 @@
 // HLSL feeds Vulkan (DXC) and Metal (glslang->spirv-cross): bit-identical math.
 
 #define HF_FROXEL_THREADS 64
+#define HF_MAX_LIGHTS_PER_CLUSTER 96
 
 static const float HF_PI = 3.14159265358979323846;
 
@@ -31,19 +47,41 @@ struct FroxelCell {
     float4 resultT;      // xyz = integrated in-scatter, w = transmittance
 };
 
-// Froxel-grid + camera + fog params (std430). Shared by all three froxel passes.
+// Froxel-grid + camera + fog params (std430). Shared by all three froxel passes (the integrate pass only
+// reads dims+range; the trailing CV cluster fields are appended after the CS layout, so the integrate
+// pass — which never reads them — is unaffected and froxel_fog stays byte-identical).
 struct FroxelParams {
-    uint4    dims;        // x=dimX, y=dimY, z=dimZ, w=unused
-    float4   range;       // x=zNear, y=zFar, z/w unused
-    float4   sunDir;      // xyz = directional-light TRAVEL direction (world space), w unused
-    float4   sunColor;    // rgb = sun color * intensity, w unused
-    float4   fog;         // x=baseDensity, y=heightFalloff, z=heightRef, w=g (HG anisotropy)
-    float4x4 invProj;     // proj.Inverse(), column-major (recovers view-space XY from NDC)
-    float4x4 invView;     // view.Inverse(), column-major (view -> world for density height)
+    uint4    dims;          // x=dimX, y=dimY, z=dimZ, w=unused
+    float4   range;         // x=zNear, y=zFar, z/w unused
+    float4   sunDir;        // xyz = directional-light TRAVEL direction (world space), w unused
+    float4   sunColor;      // rgb = sun color * intensity, w unused
+    float4   fog;           // x=baseDensity, y=heightFalloff, z=heightRef, w=g (HG anisotropy)
+    float4x4 invProj;       // proj.Inverse(), column-major (recovers view-space XY from NDC)
+    float4x4 invView;       // view.Inverse(), column-major (view -> world for density height)
+    // --- Slice CV cluster-light-injection params (appended; CS-only renders leave injectLights 0). ---
+    uint4    clusterDims;   // x=cDimX, y=cDimY, z=cDimZ, w=injectLights (1=add clustered lights, 0=CS)
+    float4   clusterRange;  // x=cZNear, y=cZFar, z/w unused (the cluster grid's exponential Z slicing)
+    float4x4 view;          // world -> view, column-major (transforms cluster math + the apply's view ray)
 };
 
-[[vk::binding(0, 0)]] RWStructuredBuffer<FroxelCell>   gVolume : register(u0);
-[[vk::binding(1, 0)]] RWStructuredBuffer<FroxelParams> gParams : register(u1);
+// One cluster's fixed-cap ordered light list — matches cluster_assign.comp / lit_clustered_cl.frag
+// (std430): uint count + uint pad[3] + uint idx[96].
+struct ClusterList {
+    uint count;
+    uint pad0, pad1, pad2;
+    uint idx[HF_MAX_LIGHTS_PER_CLUSTER];
+};
+
+// One point light — matches the CL light SSBO (GpuLight): VIEW-space pos + radius, color + intensity.
+struct GpuLight {
+    float4 posRadius;   // xyz = VIEW-space position, w = radius
+    float4 color;       // rgb = color, w = intensity
+};
+
+[[vk::binding(0, 0)]] RWStructuredBuffer<FroxelCell>   gVolume          : register(u0);
+[[vk::binding(1, 0)]] RWStructuredBuffer<FroxelParams> gParams          : register(u1);
+[[vk::binding(2, 0)]] RWStructuredBuffer<ClusterList>  gClusterLightGrid : register(u2);
+[[vk::binding(3, 0)]] RWStructuredBuffer<GpuLight>     gLights          : register(u3);
 
 // SliceZ(k): positive view-distance of exponential slice boundary at REAL k. Mirrors froxel.h::SliceZ.
 float SliceZ(float k, uint dimZ, float zNear, float zFar) {
@@ -72,6 +110,17 @@ float Phase(float cosTheta, float g) {
     float denom = 1.0 + g2 - 2.0 * g * cosTheta;
     if (denom < 1e-6) denom = 1e-6;
     return (1.0 - g2) / (4.0 * HF_PI * denom * sqrt(denom));
+}
+
+// Positive view-distance -> cluster z-slice index. Mirrors cluster.h::SliceForViewZ EXACTLY (the froxel
+// center's view-Z maps to its cluster's exponential Z slice; XY tiles already align). Used by the CV
+// light loop to find each froxel's cluster.
+uint ClusterSliceForViewZ(float viewZ, uint cDimZ, float cZNear, float cZFar) {
+    if (viewZ <= cZNear) return 0u;
+    if (viewZ >= cZFar)  return cDimZ - 1u;
+    float t = log(viewZ / cZNear) / log(cZFar / cZNear);   // [0,1)
+    int s = (int)floor(t * (float)cDimZ);
+    return (uint)(s < 0 ? 0 : (s > (int)cDimZ - 1 ? (int)cDimZ - 1 : s));
 }
 
 [numthreads(HF_FROXEL_THREADS, 1, 1)]
@@ -124,6 +173,52 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
     float3 scatter = sunColor * (phase * density);
     float extinction = density;
+
+    // --- Slice CV: ADD the clustered point lights' in-scatter (purely additive; skipped when off). ---
+    uint injectLights = gParams[0].clusterDims.w;
+    if (injectLights != 0u) {
+        uint cDimX = gParams[0].clusterDims.x;
+        uint cDimY = gParams[0].clusterDims.y;
+        uint cDimZ = gParams[0].clusterDims.z;
+        float cZNear = gParams[0].clusterRange.x;
+        float cZFar  = gParams[0].clusterRange.y;
+
+        // Map the froxel to its cluster: XY tiles align (froxel fx/fy == cluster cx/cy, both 16x9); the
+        // Z slice is the cluster's exponential slice for the froxel center's view-Z (vzCenter is the
+        // positive view-distance). idx = cx + cy*cDimX + cz*(cDimX*cDimY) (cluster cx-major order).
+        uint cx = fx;
+        uint cy = fy;
+        uint cz = ClusterSliceForViewZ(vzCenter, cDimZ, cZNear, cZFar);
+        uint clusterIdx = cx + cy * cDimX + cz * (cDimX * cDimY);
+
+        // The view-space direction the camera ray travels for this froxel (eye at origin -> froxel),
+        // mirroring render::froxel::InjectClusteredLights's viewDir == normalize(froxelViewPos).
+        float3 viewDir = normalize(viewCenter);
+
+        uint count = gClusterLightGrid[clusterIdx].count;
+        [loop] for (uint i = 0; i < count; ++i) {
+            uint li = gClusterLightGrid[clusterIdx].idx[i];
+            float4 pr = gLights[li].posRadius;
+            float3 lvpos  = pr.xyz;          // VIEW-space light position (the CL light SSBO)
+            float  radius = pr.w;
+            float3 lcolor    = gLights[li].color.rgb;
+            float  intensity = gLights[li].color.w;
+
+            float3 toLight = lvpos - viewCenter;
+            float  dist = length(toLight);
+
+            // WINDOWED HARD-RADIUS attenuation IDENTICAL to CL (lit_clustered_cl.frag): 0 at d>=radius.
+            float r4  = dist / radius; r4 = r4 * r4; r4 = r4 * r4;   // (d/radius)^4
+            float win = saturate(1.0 - r4); win = win * win;
+            float atten = (1.0 / (dist * dist + 0.01)) * win;
+
+            float  invD = (dist > 1e-9) ? (1.0 / dist) : 0.0;
+            float  cosL = dot(viewDir, toLight * invD);
+            float  phaseL = Phase(cosL, g);
+
+            scatter += lcolor * (intensity * atten * phaseL * density);
+        }
+    }
 
     gVolume[c].scatterExt = float4(scatter, extinction);
     // Leave resultT untouched here; the integrate pass overwrites it. (Initialize for safety/determinism.)
