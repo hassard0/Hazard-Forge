@@ -174,6 +174,8 @@ int main() {
             bool sawPostStackFeature = false;
             // Slice BP: the screen-space global-illumination capability is advertised.
             bool sawSsgiFeature = false;
+            // Slice CG: the depth-of-field capability is advertised in the feature manifest.
+            bool sawDofFeature = false;
             // Slice CF: the water-rendering capability is advertised in the feature manifest.
             bool sawWaterFeature = false;
             // Slice BQ: the state-replication capability is advertised in the feature manifest.
@@ -212,6 +214,7 @@ int main() {
                     if (AsString(el->value) == "animation-state-machine") sawAnimFsmFeature = true;
                     if (AsString(el->value) == "post-process-stack") sawPostStackFeature = true;
                     if (AsString(el->value) == "screen-space-global-illumination") sawSsgiFeature = true;
+                    if (AsString(el->value) == "depth-of-field") sawDofFeature = true;
                     if (AsString(el->value) == "water-rendering") sawWaterFeature = true;
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
                     if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
@@ -242,6 +245,7 @@ int main() {
             check(sawAnimFsmFeature, "engine.features includes animation-state-machine");
             check(sawPostStackFeature, "engine.features includes post-process-stack");
             check(sawSsgiFeature, "engine.features includes screen-space-global-illumination");
+            check(sawDofFeature, "engine.features includes depth-of-field");
             check(sawWaterFeature, "engine.features includes water-rendering");
             check(sawReplicationFeature, "engine.features includes state-replication");
             check(sawNetsimFeature, "engine.features includes network-transport-sim");
@@ -316,6 +320,8 @@ int main() {
         bool sawPostStackShot = false;
         // Slice BP: the --ssgi-shot showcase flag is listed in the showcase manifest.
         bool sawSsgiShot = false;
+        // Slice CG: the --dof-shot showcase flag is listed in the showcase manifest.
+        bool sawDofShot = false;
         // Slice CF: the --water-shot showcase flag is listed in the showcase manifest.
         bool sawWaterShot = false;
         // Slice BR: the --ssgi-denoise-shot showcase flag is listed in the showcase manifest.
@@ -361,6 +367,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--anim-fsm-shot") sawAnimFsmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--poststack-shot") sawPostStackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-shot") sawSsgiShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--dof-shot") sawDofShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--water-shot") sawWaterShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-temporal-shot") sawSsgiTemporalShot = true;
@@ -395,6 +402,7 @@ int main() {
         check(sawAnimFsmShot, "showcases manifest includes --anim-fsm-shot");
         check(sawPostStackShot, "showcases manifest includes --poststack-shot");
         check(sawSsgiShot, "showcases manifest includes --ssgi-shot");
+        check(sawDofShot, "showcases manifest includes --dof-shot");
         check(sawWaterShot, "showcases manifest includes --water-shot");
         check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
         check(sawSsgiTemporalShot, "showcases manifest includes --ssgi-temporal-shot");

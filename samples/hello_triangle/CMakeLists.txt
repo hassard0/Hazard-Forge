@@ -142,6 +142,12 @@ hf_compile_shaders(
     # tonemaps. Existing gbuffer/ssao/bloom shaders + their goldens untouched.
     "shaders/ssr.frag.hlsl:ps"
     "shaders/ssr_composite.frag.hlsl:ps"
+    # Depth of field (Slice CG): reuses the SSAO/SSR g-buffer (view normal + linear depth) + the resolved
+    # HDR scene. dof.frag computes the thin-lens circle of confusion per pixel (render/dof.h math,
+    # mirrored in-shader) and gathers a Vogel-spiral disk weighted by the scatter-as-gather BlurWeight so
+    # the focal plane stays sharp while fore/background blur, then tonemaps to the swapchain. Fullscreen
+    # (reuses post.vert), behind --dof-shot ONLY; existing post/ssr/ssgi shaders + goldens untouched.
+    "shaders/dof.frag.hlsl:ps"
     # Water rendering (Slice CF): water.vert displaces a flat NxN grid by the summed Gerstner waves at a
     # FIXED time (render/water.h math, mirrored in-shader); water.frag recomputes the analytic wave
     # normal and shades a fresnel blend of a SKY reflection (reusing SkyColor) and a REFRACTED scene

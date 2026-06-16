@@ -147,6 +147,13 @@ hf_add_pure_test(ssgi_test)
 # EDGE PRESERVATION across a depth/normal seam), and determinism. Pure C++ (render/ssgi.h), ASan-eligible.
 hf_add_pure_test(ssgi_denoise_test)
 
+# Depth of field (Slice CG): the thin-lens circle-of-confusion (CoC == 0 at the focal plane, grows
+# monotonically with |depth - focalDist| on the near + far sides, clamped to maxCoCpx, robust/finite at
+# depth -> 0 and depth -> focalLength) + the scatter-as-gather BlurWeight (a tap contributes iff its CoC
+# covers the center; a focal CoC~0 neighbor doesn't blur the center) + determinism. Pure C++
+# (render/dof.h, header-only), ASan-eligible.
+hf_add_pure_test(dof_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so

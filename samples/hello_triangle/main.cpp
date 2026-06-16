@@ -343,6 +343,7 @@ int main(int argc, char** argv) {
     const char* pointShotPath = nullptr;     // --point-shadow-shot <out.bmp> (Slice AF: omni point)
     const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
+    const char* dofShotPath = nullptr;       // --dof-shot <out.bmp> (Slice CG: depth of field)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -613,6 +614,15 @@ int main(int argc, char** argv) {
             // reflections of the objects on the floor, then a composite blends + tonemaps. One BMP ->
             // exit. New golden; existing lit/ssao/bloom paths/shaders/goldens are untouched.
             ssrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--dof-shot") == 0 && i + 1 < argc) {
+            // Slice CG: depth-of-field showcase. A row of distinct colored objects RECEDING from the
+            // camera (foreground -> background) on a floor, lit + shadowed, rendered into an HDR RGBA16F
+            // target PLUS the view-space normal+linear-depth g-buffer (the SAME gbuffer shaders SSR/SSGI
+            // use). A fullscreen DoF pass (dof.frag) computes the thin-lens circle of confusion per pixel
+            // and gathers a CoC-sized disk so a MIDDLE focal object stays crisp while the nearer + farther
+            // objects blur, then tonemaps. One BMP -> exit. New golden; existing lit/ssao/ssr/bloom
+            // paths/shaders/goldens are untouched.
+            dofShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -7249,6 +7259,299 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — SSR, %d objects\n",
                                     ssrShotPath, cw, ch2, kNumObjs);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ssrShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Depth of field showcase (--dof-shot, Slice CG): a row of distinct colored objects
+        // RECEDING from the camera (a near foreground object -> a middle focal object -> a far
+        // background object) on a floor, lit + shadowed, rendered into an HDR RGBA16F scene target PLUS
+        // the view-space normal+linear-depth g-buffer (the SAME gbuffer shaders SSR/SSGI/water use). A
+        // fullscreen DoF pass (dof.frag) reconstructs each pixel's view-linear depth, computes the
+        // thin-lens circle of confusion (render::dof::CircleOfConfusion, mirrored in-shader), and
+        // gathers a CoC-sized Vogel disk weighted by the scatter-as-gather BlurWeight so the MIDDLE
+        // focal object is crisp while the foreground + background objects blur — then exposure/ACES/
+        // grade/grain/vignette tonemaps to the swapchain (the SAME displayed pipeline as ssr_composite).
+        // SEPARATE dof pipeline + shader; existing lit/gbuffer/ssr/ssgi/bloom + goldens untouched.
+        if (dofShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+
+            // FIXED lens params (deterministic). focalDist on the MIDDLE object so the near + far
+            // objects sit outside the depth of field and visibly blur. aperture folds in the
+            // view-units -> screen-pixel scale so the far field saturates the CoC clamp.
+            const float kFocalDist  = 12.0f;   // view-linear depth of the middle focal object
+            const float kAperture   = 90.0f;
+            const float kFocalLen   = 1.6f;
+            const float kMaxCoCpx   = 18.0f;
+
+            // --- Scene objects: a row receding straight back from the camera along -Z (near -> far),
+            // distinct colors so the focal sharpness vs fore/background blur reads clearly. ---
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-1.4f, 0.7f,  4.5f}, 0.7f, false, {0.95f, 0.25f, 0.20f}},  // near red sphere (blurred)
+                {{ 0.9f, 0.7f,  2.0f}, 0.7f, true,  {0.95f, 0.55f, 0.15f}},  // near-ish orange cube (blurred)
+                {{-0.3f, 0.8f, -1.0f}, 0.8f, false, {0.25f, 0.90f, 0.35f}},  // MIDDLE green sphere (FOCAL, crisp)
+                {{ 1.2f, 0.7f, -4.0f}, 0.7f, true,  {0.25f, 0.50f, 0.95f}},  // far blue cube (blurred)
+                {{-1.0f, 0.75f,-7.0f}, 0.75f,false, {0.85f, 0.35f, 0.90f}},  // far magenta sphere (blurred)
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky / g-buffer pipelines (UNCHANGED shaders), same as --ssr-shot. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs  = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs  = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- DoF fullscreen pipeline (fragment push constants) writing the swapchain. ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct DofParams {
+                float texel[2]; float focalDist; float aperture;
+                float focalLength; float maxCoCpx; float pad[2];
+            };
+            auto dofFs = loadFs("dof.frag.hlsl");
+            rhi::GraphicsPipelineDesc dofD;
+            dofD.vertex = postVsM.get(); dofD.fragment = dofFs.get();
+            dofD.colorFormat = device->Swapchain().ColorFormat();
+            dofD.depthTest = false; dofD.usesTexture = true; dofD.fullscreen = true;
+            dofD.fragmentPushConstants = true; dofD.pushConstantSize = sizeof(DofParams);
+            auto dofPipe = device->CreateGraphicsPipeline(dofD);
+
+            auto rt   = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // A neutral mid-grey checker floor (so the blurred objects read against it).
+            std::vector<uint8_t> floorTexels(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorTexels[idx + 0] = v; floorTexels[idx + 1] = v;
+                    floorTexels[idx + 2] = v; floorTexels[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorTexels.data(), floorTexels.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({14.0f, 1.0f, 14.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+
+            // Camera: looks straight down the row of receding objects so depth separation is maximal.
+            const Vec3 eye{0.0f, 1.6f, 11.0f};
+            const Vec3 center{0.0f, 0.7f, -1.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+                Vec3 sc{0.0f, 0.7f, -1.0f};
+                Vec3 lightEye = sc - lightDir * 20.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-9.0f, 9.0f, -9.0f, 9.0f, 1.0f, 44.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            DofParams dpp{};
+            dpp.texel[0] = 1.0f / (float)w; dpp.texel[1] = 1.0f / (float)h;
+            dpp.focalDist = kFocalDist; dpp.aperture = kAperture;
+            dpp.focalLength = kFocalLen; dpp.maxCoCpx = kMaxCoCpx;
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgGbuf = graph.ImportTarget(
+                "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.8f; pc[18] = 0.0f; pc[19] = 0.0f; // matte floor
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f; // matte objects
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*objTex[o], *flatNormal);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("gbuffer", {}, {rgGbuf},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*gbStaticPipeline);
+                    {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // DoF gather + tonemap -> swapchain. Scene at t0/s0, g-buffer at t3/s3 (BindTexturePair).
+            graph.AddPass("dof", {rgScene, rgGbuf}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*dofPipe);
+                    cmd.BindTexturePair(*rt, *gbuf);
+                    cmd.PushConstants(&dpp, sizeof(dpp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("dof: {focalDist:%.1f, aperture:%.1f, maxCoC:%.1f}\n",
+                        kFocalDist, kAperture, kMaxCoCpx);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(dofShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — DoF, %d objects\n",
+                                    dofShotPath, cw, ch2, kNumObjs);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", dofShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

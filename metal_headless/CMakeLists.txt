@@ -169,6 +169,12 @@ hf_gen_msl(ssao_composite.frag    ssao_composite.frag.hlsl    frag ssao_composit
 # HLSL->SPIR-V->MSL toolchain. Existing shaders + goldens untouched.
 hf_gen_msl(ssr.frag               ssr.frag.hlsl               frag ssr_fragment)
 hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite_fragment)
+# Depth of field (Slice CG): reuses the SSAO/SSR g-buffer (view normal + linear depth) + the resolved
+# HDR scene; dof.frag computes the thin-lens circle of confusion per pixel (render/dof.h math, mirrored
+# in-shader) and gathers a CoC-sized Vogel disk weighted by the scatter-as-gather BlurWeight so the
+# focal plane stays sharp while fore/background blur, then tonemaps. Same scene/g-buffer pair bindings
+# as SSR; existing shaders + goldens untouched.
+hf_gen_msl(dof.frag               dof.frag.hlsl               frag dof_fragment)
 # Water rendering (Slice CF): water.vert displaces a 128x128 grid by the Gerstner field (render/water.h
 # math, mirrored in-shader); water.frag fresnel-blends a SKY reflection + a depth-tinted REFRACTION of
 # the scene-color RT (G-buffer depth like SSR) + a sun glint; water_composite blends + tonemaps. Same
