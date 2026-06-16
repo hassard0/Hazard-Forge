@@ -57,6 +57,9 @@ public:
     VkDevice device() const { return device_; }
     VmaAllocator allocator() const { return allocator_; }
     VkSampler defaultSampler() const { return defaultSampler_; }
+    // Slice CX: the clamp-to-edge depth sampler the lit pass uses for the shadow map, exposed so the
+    // froxel inject compute can sample the SAME map via BindShadowMapCompute.
+    VkSampler shadowSampler() const { return shadowSampler_; }
     // 1x1 flat tangent-space normal (0.5,0.5,1)->(0,0,1): the default normal map bound at material
     // set binding 3/4 so every material set is complete even without an explicit normal map.
     VkImageView defaultNormalView() const { return defaultNormalView_; }

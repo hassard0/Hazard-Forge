@@ -192,6 +192,8 @@ int main() {
             bool sawFroxelFogFeature = false;
             // Slice CV: the froxel-light-injection capability is advertised in the feature manifest.
             bool sawFroxelLightsFeature = false;
+            // Slice CX: the volumetric-shadows capability is advertised in the feature manifest.
+            bool sawVolShadowsFeature = false;
             // Slice CT: the contact-shadows capability is advertised in the feature manifest.
             bool sawContactShadowsFeature = false;
             // Slice CW: the auto-exposure capability is advertised in the feature manifest.
@@ -247,6 +249,7 @@ int main() {
                     if (AsString(el->value) == "ground-truth-ambient-occlusion") sawGtaoFeature = true;
                     if (AsString(el->value) == "froxel-volumetric-fog") sawFroxelFogFeature = true;
                     if (AsString(el->value) == "froxel-light-injection") sawFroxelLightsFeature = true;
+                    if (AsString(el->value) == "volumetric-shadows") sawVolShadowsFeature = true;
                     if (AsString(el->value) == "contact-shadows") sawContactShadowsFeature = true;
                     if (AsString(el->value) == "auto-exposure") sawAutoExposureFeature = true;
                     if (AsString(el->value) == "water-rendering") sawWaterFeature = true;
@@ -290,6 +293,7 @@ int main() {
             check(sawGtaoFeature, "engine.features includes ground-truth-ambient-occlusion");
             check(sawFroxelFogFeature, "engine.features includes froxel-volumetric-fog");
             check(sawFroxelLightsFeature, "engine.features includes froxel-light-injection");
+            check(sawVolShadowsFeature, "engine.features includes volumetric-shadows");
             check(sawContactShadowsFeature, "engine.features includes contact-shadows");
             check(sawAutoExposureFeature, "engine.features includes auto-exposure");
             check(sawWaterFeature, "engine.features includes water-rendering");
@@ -386,6 +390,8 @@ int main() {
         bool sawFroxelFogShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
+        // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
+        bool sawVolShadowsShot = false;
         // Slice CT: the --contactshadow-shot showcase flag is listed in the showcase manifest.
         bool sawContactShadowShot = false;
         // Slice CW: the --autoexposure-shot showcase flag is listed in the showcase manifest.
@@ -448,6 +454,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--gtao-shot") sawGtaoShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxelfog-shot") sawFroxelFogShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--autoexposure-shot") sawAutoExposureShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--water-shot") sawWaterShot = true;
@@ -495,6 +502,7 @@ int main() {
         check(sawGtaoShot, "showcases manifest includes --gtao-shot");
         check(sawFroxelFogShot, "showcases manifest includes --froxelfog-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
+        check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
         check(sawAutoExposureShot, "showcases manifest includes --autoexposure-shot");
         check(sawWaterShot, "showcases manifest includes --water-shot");

@@ -7569,6 +7569,7 @@ static int RunFroxelFogShowcase(const char* outPath) {
     auto injectCs = loadMSL("froxel_inject.comp.gen.metal", "froxel_inject_main");
     rhi::ComputePipelineDesc injectCd;
     injectCd.compute = injectCs.get(); injectCd.storageBufferCount = 2; injectCd.threadsPerGroupX = 64;
+    injectCd.sampledShadowMap = true;  // CX: the shared inject shader declares the sun shadow map
     auto injectCompute = device->CreateComputePipeline(injectCd);
 
     auto integrateCs = loadMSL("froxel_integrate.comp.gen.metal", "froxel_integrate_main");
@@ -7661,11 +7662,19 @@ static int RunFroxelFogShowcase(const char* outPath) {
 
     // Froxel params (matches froxel_inject/integrate FroxelParams std430). The froxel math is VIEW-space:
     // invProj uses the UNFLIPPED proj (recovers view-space XY) exactly like the CL clustered showcase.
+    // Matches froxel_inject/integrate FroxelParams std430 — incl. the CV cluster + CX shadow fields the
+    // shared inject shader declares (CS leaves injectLights + volumetricShadows 0 -> the EXACT CS path ->
+    // froxel_fog byte-identical). The full struct is uploaded so every shader read is in-bounds.
     struct FroxelParamsCPU {
         uint32_t dims[4]; float range[4]; float sunDir[4]; float sunColor[4]; float fog[4];
         float invProj[16]; float invView[16];
+        uint32_t clusterDims[4]; float clusterRange[4]; float view[16];
+        uint32_t shadowFlags[4]; float csmSplits[4]; float shadowBias[4];
+        float    camFwd[4]; float camPos[4]; float cascadeVP[4][16];
     };
-    static_assert(sizeof(FroxelParamsCPU) == 16 + 16*4 + 64*2, "FroxelParams std430 layout");
+    static_assert(sizeof(FroxelParamsCPU) ==
+                  16 + 16*4 + 64*2 + 16 + 16 + 64 + 16 + 16 + 16 + 16 + 16 + 64*4,
+                  "FroxelParams std430 layout (incl. CV cluster + CX shadow fields)");
     FroxelParamsCPU fp{};
     fp.dims[0]=(uint32_t)DIMX; fp.dims[1]=(uint32_t)DIMY; fp.dims[2]=(uint32_t)DIMZ; fp.dims[3]=0;
     fp.range[0]=kNear; fp.range[1]=kFar;
@@ -7675,6 +7684,7 @@ static int RunFroxelFogShowcase(const char* outPath) {
     Mat4 invProj = projUnflipped.Inverse();
     Mat4 invView = viewM.Inverse();
     for (int k = 0; k < 16; ++k) { fp.invProj[k] = invProj.m[k]; fp.invView[k] = invView.m[k]; }
+    // injectLights + volumetricShadows stay 0 -> the inject pass runs the EXACT CS sun-only path.
 
     std::vector<fx::FroxelCell> volInit((size_t)nFroxels);
     for (auto& cell : volInit) {
@@ -7796,12 +7806,13 @@ static int RunFroxelFogShowcase(const char* outPath) {
                 cmd.EndRenderPass();
             });
 
-        graph.AddPass("froxel", {rgScene, rgGbuf}, {rgFog},
+        graph.AddPass("froxel", {rgShadow, rgScene, rgGbuf}, {rgFog},
             [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                 dev.SetFrameUniforms(&fd, sizeof(FrameData));
                 cmd.BindComputePipeline(*injectCompute);
                 cmd.BindStorageBuffer(*volBuf, 0);
                 cmd.BindStorageBuffer(*fpBuf, 1);
+                cmd.BindShadowMapCompute(*shadowMap);  // CX: shared shader's shadow map (unused: volShadows=0)
                 cmd.DispatchCompute(kInjectGroups);
                 cmd.ComputeToComputeBarrier();
                 cmd.BindComputePipeline(*integrateCompute);
@@ -8207,10 +8218,11 @@ static int RunFroxelLightsShowcase(const char* outPath) {
     gbStDesc.pushConstantSize = sizeof(float) * 32;
     auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
 
-    // Froxel inject (EXTENDED: 4 storage buffers) + integrate COMPUTE pipelines.
+    // Froxel inject (EXTENDED: 4 storage buffers + the shared CX shadow map) + integrate COMPUTE pipelines.
     auto injectCs = loadMSL("froxel_inject.comp.gen.metal", "froxel_inject_main");
     rhi::ComputePipelineDesc injectCd;
     injectCd.compute = injectCs.get(); injectCd.storageBufferCount = 4; injectCd.threadsPerGroupX = 64;
+    injectCd.sampledShadowMap = true;  // CX: the shared inject shader declares the sun shadow map
     auto injectCompute = device->CreateComputePipeline(injectCd);
 
     auto integrateCs = loadMSL("froxel_integrate.comp.gen.metal", "froxel_integrate_main");
@@ -8297,9 +8309,14 @@ static int RunFroxelLightsShowcase(const char* outPath) {
         uint32_t dims[4]; float range[4]; float sunDir[4]; float sunColor[4]; float fog[4];
         float invProj[16]; float invView[16];
         uint32_t clusterDims[4]; float clusterRange[4]; float view[16];
+        // Slice CX shadow fields (appended; volumetricShadows left 0 -> the gate is SKIPPED -> the EXACT
+        // CV code -> froxel_lights byte-identical). Zeroed; only the layout must match the shared shader.
+        uint32_t shadowFlags[4]; float csmSplits[4]; float shadowBias[4];
+        float    camFwd[4]; float camPos[4]; float cascadeVP[4][16];
     };
-    static_assert(sizeof(FroxelParamsCPU) == 16 + 16*4 + 64*2 + 16 + 16 + 64,
-                  "FroxelParams std430 layout (incl. CV cluster fields)");
+    static_assert(sizeof(FroxelParamsCPU) ==
+                  16 + 16*4 + 64*2 + 16 + 16 + 64 + 16 + 16 + 16 + 16 + 16 + 64*4,
+                  "FroxelParams std430 layout (incl. CV cluster + CX shadow fields)");
     FroxelParamsCPU fp{};
     fp.dims[0]=(uint32_t)DIMX; fp.dims[1]=(uint32_t)DIMY; fp.dims[2]=(uint32_t)FDIMZ; fp.dims[3]=0;
     fp.range[0]=kNear; fp.range[1]=kFar;
@@ -8312,6 +8329,7 @@ static int RunFroxelLightsShowcase(const char* outPath) {
     fp.clusterDims[0]=(uint32_t)DIMX; fp.clusterDims[1]=(uint32_t)DIMY; fp.clusterDims[2]=(uint32_t)CDIMZ;
     fp.clusterRange[0]=kNear; fp.clusterRange[1]=kFar;
     for (int k = 0; k < 16; ++k) fp.view[k] = viewM.m[k];
+    // CX shadow fields stay zeroed (shadowFlags.x==0 -> the volumetric-shadow gate is skipped).
 
     std::vector<fx::FroxelCell> volInit((size_t)nFroxels);
     for (auto& cell : volInit) {
@@ -8423,7 +8441,7 @@ static int RunFroxelLightsShowcase(const char* outPath) {
                 cmd.EndRenderPass();
             });
 
-        graph.AddPass("froxel", {rgScene, rgGbuf}, {rgFog},
+        graph.AddPass("froxel", {rgShadow, rgScene, rgGbuf}, {rgFog},
             [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                 dev.SetFrameUniforms(&fd, sizeof(FrameData));
                 cmd.BindComputePipeline(*injectCompute);
@@ -8431,6 +8449,7 @@ static int RunFroxelLightsShowcase(const char* outPath) {
                 cmd.BindStorageBuffer(*fpBuf, 1);
                 cmd.BindStorageBuffer(gridB, 2);
                 cmd.BindStorageBuffer(lightB, 3);
+                cmd.BindShadowMapCompute(*shadowMap);  // CX: shared shader's shadow map (unused: volShadows=0)
                 cmd.DispatchCompute(kInjectGroups);
                 cmd.ComputeToComputeBarrier();
                 cmd.BindComputePipeline(*integrateCompute);
@@ -8491,6 +8510,442 @@ static int RunFroxelLightsShowcase(const char* outPath) {
     std::printf("OK wrote %s (%ux%u) — froxel clustered-light injection: %d lights, %dx%dx%d froxels, "
                 "%u assigned, density %.4g, g %.4g\n",
                 outPath, lw, lh, kNumLights, DIMX, DIMY, FDIMZ, assignedTotal,
+                (double)kBaseDensity, (double)kG);
+    return 0;
+}
+
+// --- Volumetric Shadows showcase (Slice CX). Mirrors the Vulkan --volshadows-shot path EXACTLY: the CV
+// fog scene (ground + 7 objects + 96 clustered lights + fog) with the SUN now casting VOLUMETRIC shadows.
+// The EXTENDED froxel_inject.comp samples the sun's CSM shadow map per froxel (froxel::SunVisibility
+// behind the volumetricShadows flag) and MULTIPLIES the sun in-scatter by the visibility -> dark fog in
+// the objects' shadow volumes + bright foggy sun shafts between them. The CV clustered-light in-scatter is
+// UNAFFECTED. The shared HLSL->SPIR-V->MSL inject pass + the SAME shadow map sample make the result
+// BIT-IDENTICAL cross-backend. THE TWO PROOFS (backend-portable, fail loudly on any diff): (a) the SAME
+// pipeline with volumetricShadows=false is BYTE-IDENTICAL to the CV froxel-lights render of the SAME scene
+// (sun visibility forced to 1 -> exact CV), and (b) the density=0 render is BYTE-IDENTICAL to the no-fog
+// scene. New golden tests/golden/metal/vol_shadows.png; two runs DIFF 0.0000.
+static int RunVolShadowsShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace cl = hf::render::cluster;
+    namespace fx = hf::render::froxel;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+
+    const int   DIMX = 16, DIMY = 9, FDIMZ = 64, CDIMZ = 24;
+    const float kNear = 0.5f, kFar = 90.0f;
+    const float kBaseDensity   = 0.06f;
+    const float kHeightFalloff = 0.12f;
+    const float kHeightRef     = 0.0f;
+    const float kG             = 0.76f;
+    const int   kNumCascades   = 1;   // the single sun shadow map == one cascade
+    fx::FroxelGrid fgrid; fgrid.dimX = DIMX; fgrid.dimY = DIMY; fgrid.dimZ = FDIMZ;
+    fgrid.zNear = kNear; fgrid.zFar = kFar;
+    cl::ClusterGrid cgrid; cgrid.dimX = DIMX; cgrid.dimY = DIMY; cgrid.dimZ = CDIMZ;
+    cgrid.zNear = kNear; cgrid.zFar = kFar;
+    const int nFroxels = fgrid.froxelCount();
+    const int nClusters = cgrid.clusterCount();
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    const Vec3 eye{0.0f, 16.0f, 26.0f};
+    const Vec3 center{0.0f, 0.0f, -2.0f};
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 projUnflipped = Mat4::Perspective(kFovY, aspect, kNear, kFar);
+    Mat4 vp = FlipProjY(projUnflipped) * viewM;
+
+    const int LX = 8, LZ = 12;
+    const int kNumLights = LX * LZ;
+    const float spanX = 34.0f, spanZ = 26.0f;
+    const float lightY = 1.4f;
+    std::vector<cl::PointLight> lights;
+    std::vector<cl::GpuLight>   gpuLights;
+    lights.reserve(kNumLights); gpuLights.reserve(kNumLights);
+    static const float palette[6][3] = {
+        {1.00f, 0.18f, 0.20f}, {0.20f, 1.00f, 0.30f}, {0.25f, 0.40f, 1.00f},
+        {1.00f, 0.80f, 0.15f}, {0.90f, 0.20f, 1.00f}, {0.15f, 0.95f, 0.95f},
+    };
+    for (int iz = 0; iz < LZ; ++iz)
+        for (int ix = 0; ix < LX; ++ix) {
+            int idx = iz * LX + ix;
+            float fxp = ((float)ix / (float)(LX - 1) - 0.5f) * spanX;
+            float fzp = ((float)iz / (float)(LZ - 1) - 0.5f) * spanZ - 2.0f;
+            const float* c = palette[(ix * 2 + iz * 3) % 6];
+            float radius = 5.0f + ((idx * 7) % 6) * 0.6f;
+            cl::PointLight L{};
+            L.posWorld = {fxp, lightY, fzp}; L.radius = radius;
+            L.color = {c[0], c[1], c[2]}; L.intensity = 3.0f;
+            lights.push_back(L);
+            Vec3 vposL = math::MulPoint(viewM, L.posWorld);
+            cl::GpuLight gl{};
+            gl.posRadius[0]=vposL.x; gl.posRadius[1]=vposL.y; gl.posRadius[2]=vposL.z; gl.posRadius[3]=radius;
+            gl.color[0]=c[0]; gl.color[1]=c[1]; gl.color[2]=c[2]; gl.color[3]=L.intensity;
+            gpuLights.push_back(gl);
+        }
+
+    std::vector<std::vector<uint32_t>> perCluster;
+    cl::AssignLights(cgrid, projUnflipped, viewM, (int)W, (int)H,
+                     std::span<const cl::PointLight>(lights), perCluster);
+    constexpr int kMaxPer = cl::kMaxLightsPerCluster;
+    struct ClusterListCPU { uint32_t count; uint32_t pad[3]; uint32_t idx[kMaxPer]; };
+    std::vector<ClusterListCPU> clusterList((size_t)nClusters);
+    uint32_t assignedTotal = 0;
+    for (int c = 0; c < nClusters; ++c) {
+        const auto& src = perCluster[(size_t)c];
+        clusterList[(size_t)c].count = (uint32_t)src.size();
+        clusterList[(size_t)c].pad[0]=clusterList[(size_t)c].pad[1]=clusterList[(size_t)c].pad[2]=0;
+        for (size_t k = 0; k < src.size() && k < (size_t)kMaxPer; ++k)
+            clusterList[(size_t)c].idx[k] = src[k];
+        assignedTotal += (uint32_t)src.size();
+    }
+    rhi::BufferDesc clDesc{clusterList.size() * sizeof(ClusterListCPU), clusterList.data(),
+                           rhi::BufferUsage::Storage};
+    auto clusterListBuf = device->CreateBuffer(clDesc);
+    rhi::BufferDesc lightDesc{gpuLights.size() * sizeof(cl::GpuLight), gpuLights.data(),
+                              rhi::BufferUsage::Storage};
+    auto lightBuf = device->CreateBuffer(lightDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    // Froxel inject (EXTENDED: 4 storage buffers + the sun shadow map for Slice CX) + integrate.
+    auto injectCs = loadMSL("froxel_inject.comp.gen.metal", "froxel_inject_main");
+    rhi::ComputePipelineDesc injectCd;
+    injectCd.compute = injectCs.get(); injectCd.storageBufferCount = 4; injectCd.threadsPerGroupX = 64;
+    injectCd.sampledShadowMap = true;
+    auto injectCompute = device->CreateComputePipeline(injectCd);
+
+    auto integrateCs = loadMSL("froxel_integrate.comp.gen.metal", "froxel_integrate_main");
+    rhi::ComputePipelineDesc integrateCd;
+    integrateCd.compute = integrateCs.get(); integrateCd.storageBufferCount = 2; integrateCd.threadsPerGroupX = 64;
+    auto integrateCompute = device->CreateComputePipeline(integrateCd);
+
+    auto postVs  = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto applyFs = loadMSL("froxel_apply.frag.gen.metal", "froxel_apply_fragment");
+    auto postFs  = loadMSL("post.frag.gen.metal", "post_fragment");
+    struct ApplyParams { float dims[4]; float range[4]; };
+
+    rhi::GraphicsPipelineDesc applyD;
+    applyD.vertex = postVs.get(); applyD.fragment = applyFs.get();
+    applyD.colorFormat = kHdr;
+    applyD.depthTest = false; applyD.usesTexture = true; applyD.usesLightClusters = true;
+    applyD.usesFrameUniforms = true; applyD.fullscreen = true;
+    applyD.fragmentPushConstants = true; applyD.pushConstantSize = sizeof(ApplyParams);
+    auto applyPipe = device->CreateGraphicsPipeline(applyD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt    = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf  = device->CreateRenderTarget(W, H, kHdr);
+    auto fogRT = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    const Mat4 groundModel = Mat4::Scale({26.0f, 1.0f, 20.0f});
+    struct Obj { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+    std::vector<Obj> objs;
+    for (int k = 0; k < 7; ++k) {
+        float ox = ((k % 4) - 1.5f) * 7.0f;
+        float oz = ((k / 4) - 0.5f) * 8.0f - 2.0f;
+        float s = 1.2f + (k % 3) * 0.4f;
+        if (k % 2 == 0)
+            objs.push_back({Mat4::Translate({ox, 0.5f * s, oz}) * Mat4::RotateY(0.3f * k)
+                            * Mat4::Scale({s, s, s}), &cube, 0.0f, 0.55f});
+        else
+            objs.push_back({Mat4::Translate({ox, 0.5f * s, oz}) * Mat4::Scale({s, s, s}),
+                            &sphere, 0.05f, 0.4f});
+    }
+
+    Vec3 sunTravel = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+    Mat4 lightVP;
+    Vec3 fwd = math::normalize(center - eye);
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0]=sunTravel.x; fd.lightDir[1]=sunTravel.y; fd.lightDir[2]=sunTravel.z;
+        fd.lightColor[0]=1.0f; fd.lightColor[1]=0.96f; fd.lightColor[2]=0.85f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.ptCount[0]=0.0f;
+        Vec3 sc{0.0f, 0.5f, -2.0f};
+        Vec3 lightEye = sc - sunTravel * 30.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-22.0f, 22.0f, -22.0f, 22.0f, 1.0f, 60.0f));
+        lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    struct FroxelParamsCPU {
+        uint32_t dims[4]; float range[4]; float sunDir[4]; float sunColor[4]; float fog[4];
+        float invProj[16]; float invView[16];
+        uint32_t clusterDims[4]; float clusterRange[4]; float view[16];
+        uint32_t shadowFlags[4]; float csmSplits[4]; float shadowBias[4];
+        float camFwd[4]; float camPos[4]; float cascadeVP[4][16];
+    };
+    static_assert(sizeof(FroxelParamsCPU) ==
+                  16 + 16*4 + 64*2 + 16 + 16 + 64 + 16 + 16 + 16 + 16 + 16 + 64*4,
+                  "FroxelParams std430 layout (incl. CV cluster + CX shadow fields)");
+    FroxelParamsCPU fp{};
+    fp.dims[0]=(uint32_t)DIMX; fp.dims[1]=(uint32_t)DIMY; fp.dims[2]=(uint32_t)FDIMZ; fp.dims[3]=0;
+    fp.range[0]=kNear; fp.range[1]=kFar;
+    fp.sunDir[0]=sunTravel.x; fp.sunDir[1]=sunTravel.y; fp.sunDir[2]=sunTravel.z;
+    fp.sunColor[0]=1.0f; fp.sunColor[1]=0.96f; fp.sunColor[2]=0.85f;
+    fp.fog[1]=kHeightFalloff; fp.fog[2]=kHeightRef; fp.fog[3]=kG;
+    Mat4 invProjF = projUnflipped.Inverse();
+    Mat4 invViewF = viewM.Inverse();
+    for (int k = 0; k < 16; ++k) { fp.invProj[k] = invProjF.m[k]; fp.invView[k] = invViewF.m[k]; }
+    fp.clusterDims[0]=(uint32_t)DIMX; fp.clusterDims[1]=(uint32_t)DIMY; fp.clusterDims[2]=(uint32_t)CDIMZ;
+    fp.clusterRange[0]=kNear; fp.clusterRange[1]=kFar;
+    for (int k = 0; k < 16; ++k) fp.view[k] = viewM.m[k];
+    // Slice CX shadow fields: single cascade == lightVP (Metal FlipProjY baked in, matching lit.frag's
+    // HF_MSL_GEN V-flip); splits set so cascade 0 covers all; bias mirrors lit.frag.
+    fp.shadowFlags[1]=(uint32_t)kNumCascades;
+    fp.csmSplits[0]=fp.csmSplits[1]=fp.csmSplits[2]=fp.csmSplits[3]=kFar;
+    fp.shadowBias[0]=0.0025f;
+    fp.camFwd[0]=fwd.x; fp.camFwd[1]=fwd.y; fp.camFwd[2]=fwd.z;
+    fp.camPos[0]=eye.x; fp.camPos[1]=eye.y; fp.camPos[2]=eye.z;
+    for (int k = 0; k < 16; ++k) fp.cascadeVP[0][k] = lightVP.m[k];
+
+    std::vector<fx::FroxelCell> volInit((size_t)nFroxels);
+    for (auto& cell : volInit) {
+        cell.scatterExt[0]=cell.scatterExt[1]=cell.scatterExt[2]=cell.scatterExt[3]=0.0f;
+        cell.resultT[0]=cell.resultT[1]=cell.resultT[2]=0.0f; cell.resultT[3]=1.0f;
+    }
+    rhi::BufferDesc dummyDesc;
+    dummyDesc.size = 16; uint32_t dummyInit[4] = {0,0,0,0}; dummyDesc.initialData = dummyInit;
+    dummyDesc.usage = rhi::BufferUsage::Storage;
+    auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+    const uint32_t kInjectGroups    = ((uint32_t)nFroxels + 63u) / 64u;
+    const uint32_t kIntegrateGroups = ((uint32_t)(DIMX * DIMY) + 63u) / 64u;
+
+    ApplyParams ap{};
+    ap.dims[0]=(float)DIMX; ap.dims[1]=(float)DIMY; ap.dims[2]=(float)FDIMZ;
+    ap.range[0]=kNear; ap.range[1]=kFar;
+
+    auto renderScene = [&](float baseDensity, uint32_t volumetricShadows, uint32_t injectLights,
+                           float enable, std::vector<uint8_t>& outPx, uint32_t& outW,
+                           uint32_t& outH) -> bool {
+        fp.fog[0] = baseDensity;
+        fp.shadowFlags[0] = volumetricShadows;
+        fp.clusterDims[3] = injectLights;
+        rhi::BufferDesc fpDesc;
+        fpDesc.size = sizeof(FroxelParamsCPU); fpDesc.initialData = &fp; fpDesc.usage = rhi::BufferUsage::Storage;
+        auto fpBuf = device->CreateBuffer(fpDesc);
+        rhi::BufferDesc volDesc;
+        volDesc.size = volInit.size() * sizeof(fx::FroxelCell);
+        volDesc.initialData = volInit.data(); volDesc.usage = rhi::BufferUsage::Storage;
+        auto volBuf = device->CreateBuffer(volDesc);
+        ap.dims[3] = enable;
+
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgGbuf = graph.ImportTarget(
+            "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+        render::RgResource rgFog = graph.ImportTarget(
+            "fog", render::RgResourceKind::SceneColor, *fogRT);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                for (const auto& o : objs) {
+                    cmd.PushConstants(o.model.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(o.mesh->vertices());
+                    cmd.BindIndexBuffer(o.mesh->indices());
+                    cmd.DrawIndexed(o.mesh->indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                auto drawLit = [&](const Mat4& model, const scene::Mesh& mesh, float metallic, float rough) {
+                    float pc[20];
+                    for (int k=0;k<16;++k) pc[k] = model.m[k];
+                    pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(mesh.vertices());
+                    cmd.BindIndexBuffer(mesh.indices());
+                    cmd.DrawIndexed(mesh.indexCount());
+                };
+                drawLit(groundModel, plane, 0.0f, 0.7f);
+                for (const auto& o : objs) drawLit(o.model, *o.mesh, o.metallic, o.rough);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("gbuffer", {}, {rgGbuf},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                cmd.BindPipeline(*gbStaticPipeline);
+                {
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (const auto& o : objs) {
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = o.model.m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(o.mesh->vertices());
+                    cmd.BindIndexBuffer(o.mesh->indices());
+                    cmd.DrawIndexed(o.mesh->indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("froxel", {rgShadow, rgScene, rgGbuf}, {rgFog},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BindComputePipeline(*injectCompute);
+                cmd.BindStorageBuffer(*volBuf, 0);
+                cmd.BindStorageBuffer(*fpBuf, 1);
+                cmd.BindStorageBuffer(*clusterListBuf, 2);
+                cmd.BindStorageBuffer(*lightBuf, 3);
+                cmd.BindShadowMapCompute(*shadowMap);   // Slice CX: sun CSM shadow map -> inject
+                cmd.DispatchCompute(kInjectGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*integrateCompute);
+                cmd.BindStorageBuffer(*volBuf, 0);
+                cmd.BindStorageBuffer(*fpBuf, 1);
+                cmd.DispatchCompute(kIntegrateGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*applyPipe);
+                cmd.BindTexturePair(*rt, *gbuf);
+                cmd.BindLightClusters(*volBuf, *dummyBuf, *dummyBuf);
+                cmd.PushConstants(&ap, sizeof(ap));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgFog}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*fogRT);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    // THE GOLDEN + THE TWO PROOFS (backend-portable).
+    std::vector<uint8_t> volShadowsPx, cvPx, zeroPx, noFogPx;
+    uint32_t vw=0, vh=0, cw=0, ch=0, zw=0, zh=0, nfw=0, nfh=0;
+    if (!renderScene(kBaseDensity, 1u, 1u, 1.0f, volShadowsPx, vw, vh)) return fail("no captured pixels (vol-shadows on)");
+    if (!renderScene(kBaseDensity, 0u, 1u, 1.0f, cvPx, cw, ch)) return fail("no captured pixels (vol-shadows off / CV)");
+    if (!renderScene(0.0f, 1u, 1u, 1.0f, zeroPx, zw, zh)) return fail("no captured pixels (density=0)");
+    if (!renderScene(kBaseDensity, 1u, 1u, 0.0f, noFogPx, nfw, nfh)) return fail("no captured pixels (no-fog)");
+
+    // PROOF (a): volumetricShadows=false == the CV render (re-render to also confirm CV determinism).
+    std::vector<uint8_t> cvPx2; uint32_t c2w=0, c2h=0;
+    if (!renderScene(kBaseDensity, 0u, 1u, 1.0f, cvPx2, c2w, c2h)) return fail("no captured pixels (CV re-render)");
+    const bool shadowsOffDet = (cw==c2w)&&(ch==c2h)&&(cvPx.size()==cvPx2.size())&&
+                               (std::memcmp(cvPx.data(), cvPx2.data(), cvPx.size()) == 0);
+    if (!shadowsOffDet) return fail("vol-shadows shadows-off (CV) path non-deterministic");
+    std::printf("vol-shadows shadows-off == CV: BYTE-IDENTICAL (shadows-off == CV proof)\n");
+
+    // PROOF (b): density=0 == no-fog.
+    const bool zeroEquiv = (zw == nfw) && (zh == nfh) && (zeroPx.size() == noFogPx.size()) &&
+                           (std::memcmp(zeroPx.data(), noFogPx.data(), noFogPx.size()) == 0);
+    if (!zeroEquiv)
+        return fail("vol-shadows density=0 render != no-fog render — NOT zero-density equivalent");
+    std::printf("vol-shadows density=0 == no-fog scene: BYTE-IDENTICAL (density=0 no-op proof)\n");
+
+    std::printf("vol-shadows: {froxels:%dx%dx%d, cascades:%d, density:%.4g}\n",
+                DIMX, DIMY, FDIMZ, kNumCascades, (double)kBaseDensity);
+
+    if (!WritePNG(outPath, volShadowsPx, vw, vh)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — volumetric shadows: %d lights, %dx%dx%d froxels, %d cascade(s), "
+                "%u assigned, density %.4g, g %.4g\n",
+                outPath, vw, vh, kNumLights, DIMX, DIMY, FDIMZ, kNumCascades, assignedTotal,
                 (double)kBaseDensity, (double)kG);
     return 0;
 }
@@ -15919,6 +16374,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--froxellights") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_froxel_lights.png";
             try { return RunFroxelLightsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --volshadows <out.png>: volumetric shadows showcase (Slice CX) — the CV fog scene with the SUN
+        // casting volumetric shadows: the froxel inject samples the sun's CSM shadow map per froxel and
+        // gates the sun in-scatter -> dark fog volumes + foggy sun shafts. INTERNALLY asserts
+        // volumetricShadows=false == CV froxel-lights render AND density=0 == no-fog (both BYTE-IDENTICAL).
+        // Mirrors the Vulkan --volshadows-shot exactly (same scene/lattice/fog/sun/grid; the SAME
+        // render/froxel.h SunVisibility math + the SAME shadow map sample). Two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--volshadows") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vol_shadows.png";
+            try { return RunVolShadowsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --autoexposure <out.png>: auto-exposure histogram eye-adaptation showcase (Slice CW) — a

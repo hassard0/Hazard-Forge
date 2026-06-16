@@ -9,7 +9,8 @@ namespace hf::rhi::vk {
 VulkanComputePipeline::VulkanComputePipeline(VulkanDevice& device, const ComputePipelineDesc& desc)
     : device_(device.device()),
       storageBufferCount_(desc.storageBufferCount),
-      pushConstantSize_(desc.pushConstantSize) {
+      pushConstantSize_(desc.pushConstantSize),
+      sampledShadowMap_(desc.sampledShadowMap) {
     auto* cs = static_cast<VulkanShaderModule*>(desc.compute);
 
     // Descriptor set layout: `storageBufferCount` STORAGE_BUFFER bindings (0..N-1), compute stage.
@@ -19,6 +20,23 @@ VulkanComputePipeline::VulkanComputePipeline(VulkanDevice& device, const Compute
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    // Slice CX (ADDITIVE): a sampled depth texture (binding 4) + sampler (binding 5) for the sun's CSM
+    // shadow map, bound per dispatch via BindShadowMapCompute. Reserved ONLY when sampledShadowMap is set
+    // (the froxel inject); other compute pipelines keep the storage-buffer-only layout unchanged.
+    if (sampledShadowMap_) {
+        VkDescriptorSetLayoutBinding tex{};
+        tex.binding = 4;
+        tex.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        tex.descriptorCount = 1;
+        tex.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings.push_back(tex);
+        VkDescriptorSetLayoutBinding smp{};
+        smp.binding = 5;
+        smp.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        smp.descriptorCount = 1;
+        smp.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings.push_back(smp);
     }
     VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     // PUSH_DESCRIPTOR: the storage buffers are bound inline via vkCmdPushDescriptorSetKHR (no pool).

@@ -20,6 +20,7 @@ public:
     VkDescriptorSetLayout setLayout() const { return setLayout_; }
     uint32_t storageBufferCount() const { return storageBufferCount_; }
     uint32_t pushConstantSize() const { return pushConstantSize_; }
+    bool sampledShadowMap() const { return sampledShadowMap_; }
 
 private:
     VkDevice device_;
@@ -28,6 +29,7 @@ private:
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     uint32_t storageBufferCount_ = 0;
     uint32_t pushConstantSize_ = 0;
+    bool sampledShadowMap_ = false;
 };
 
 } // namespace hf::rhi::vk

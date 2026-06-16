@@ -238,6 +238,21 @@ hf_add_pure_test(auto_exposure_test)
 # C++ (hf_core; reuses render/cluster.h), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(froxel_lights_test)
 
+# Volumetric Shadows (Slice CX): the per-froxel sun-shadow VISIBILITY gate (render::froxel::SunVisibility)
+# the froxel inject (froxel_inject.comp.hlsl behind the volumetricShadows flag) multiplies into the SUN
+# in-scatter so the fog has shadowed gaps + visible sun light shafts, plus the CSM cascade selection
+# (render::froxel::SelectCascade) mirroring lit_csm.frag's split pick. The CORE proofs: a LIT froxel
+# (closer to the sun than the stored occluder) -> 1 and a DEGENERATE/out-of-cascade froxel -> 1 (the lit
+# pass's shadow==1 default; with volumetricShadows=false the shader skips the gate -> visibility forced 1
+# -> the byte-identical shadows-off == CV proof), a SHADOWED froxel (behind a closer occluder beyond the
+# bias) -> 0, a froxel AT the occluder depth within the bias -> 1 (no self-shadow acne). Also pins: the
+# light-space projection samples the froxel's OWN smUV tile + round-trips to in-[0,1] UV/depth, the cascade
+# selection (depth -> expected cascade; single-cascade -> 0; vs csm::CsmSplits increasing), the
+# multiplicative identity (visibility 1 leaves the sun scatter unchanged), and determinism. The same
+# froxel.h SunVisibility/SelectCascade math is mirrored VERBATIM in froxel_inject.comp's volumetricShadows
+# gate. Pure C++ (hf_core; reuses render/csm.h), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(vol_shadows_test)
+
 # Screen-Space Contact Shadows (Slice CT): the screen-space depth ray-march toward the sun
 # (render/contact_shadows.h, header-only). The CORE proof: RayMarchShadow(maxDist=0) == 1 and
 # (steps=0) == 1 EXACTLY (no march -> no occluder -> the maxDist=0 contact-shadow render is byte-

@@ -174,6 +174,11 @@ struct ComputePipelineDesc {
     // the GPU-particle kernel; the GPU-cull kernel (Slice AR) sets 1024 (one workgroup, ordered
     // prefix-sum compaction over <=1024 instances). Additive: existing pipelines keep 64.
     uint32_t threadsPerGroupX = 64;
+    // Slice CX (ADDITIVE): when true, the compute descriptor layout reserves a sampled depth-texture +
+    // sampler binding (Vulkan binding 4/5 in the compute set) for the sun's CSM shadow map, bound per
+    // dispatch via ICommandBuffer::BindShadowMapCompute. Default false -> existing compute pipelines keep
+    // the storage-buffer-only layout byte-for-byte unchanged.
+    bool sampledShadowMap = false;
 };
 
 struct TextureDesc {
@@ -382,6 +387,14 @@ public:
     virtual void BindStorageBuffer(IBuffer& /*buffer*/, uint32_t /*index*/ = 0) {}
     // Push constants for the bound compute pipeline (compute stage).
     virtual void ComputePushConstants(const void* /*data*/, uint32_t /*size*/) {}
+    // Slice CX (ADDITIVE compute-stage shadow-map bind): bind a sampled depth shadow map (the SAME
+    // CreateShadowMap depth texture the lit pass samples) + a comparison-free depth sampler to the bound
+    // compute pipeline, so the froxel inject can sample the sun's CSM shadow per froxel (volumetric
+    // shadows). Bound at the compute set's sampled-texture/sampler slot (Vulkan binding 4/5; Metal
+    // compute texture(0)/sampler(0)). Requires the compute pipeline to declare sampledShadowMap=true.
+    // Default no-op so backends/pipelines without a shadow-map compute read still link. The render graph
+    // emits the shadow-pass-write -> this-pass-read layout transition (ShaderRead) before the dispatch.
+    virtual void BindShadowMapCompute(IRenderTarget& /*shadowMap*/) {}
     // Dispatch `groupsX*groupsY*groupsZ` workgroups of the bound compute pipeline.
     virtual void DispatchCompute(uint32_t /*groupsX*/, uint32_t groupsY = 1, uint32_t groupsZ = 1) {}
     // Barrier so a later vertex stage reads the storage buffer the compute stage just wrote.

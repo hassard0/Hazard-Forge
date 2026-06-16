@@ -6,6 +6,19 @@
 // scatter (sunColor * Phase(cos(viewDir,sunDir), g) * density) and the extinction (density), and writes
 // (scatterRGB, extinction) into float4 #0 of the FLAT SSBO froxel volume cell [fx + fy*dimX + fz*dimX*dimY].
 //
+// Slice CX — Volumetric Shadows (sun light shafts through the fog): if volumetricShadows (gParams.range.z)
+// is set, AFTER the sun in-scatter this pass samples the sun's CSM shadow map at the froxel's WORLD center
+// (froxel::SunVisibility mirrored VERBATIM): project the world center by the cascade's lightViewProj
+// (cascade chosen by the froxel's camera-forward view depth, mirroring lit_csm.frag's split pick), read
+// the stored occluder depth from the shadow map (the SAME sampled depth texture the lit pass uses, bound
+// to this compute pass via the additive BindShadowMapCompute seam), and compare with a fixed bias. The
+// resulting visibility (1 lit / 0 shadowed) MULTIPLIES the SUN in-scatter ONLY (the CV clustered-light
+// in-scatter is UNAFFECTED) -> a froxel in the sun's shadow gets no sun scatter (dark fog volume), the lit
+// froxels between occluders read as bright foggy sun shafts. With volumetricShadows=false this whole gate
+// is SKIPPED (sun visibility forced to 1) -> the code is the EXACT CV path -> the byte-identical
+// shadows-off == CV proof. It is the SUN scatter (already ×density) that is gated, so density=0 -> sun
+// scatter 0 regardless -> the density=0 == no-fog proof still holds.
+//
 // Slice CV — Per-Froxel Clustered-Light Injection (the CS+CL fusion): if injectLights (gParams.clusterDims.w)
 // is set, AFTER the sun in-scatter this pass maps the froxel to its CLUSTER (XY tile from the froxel XY,
 // which align — both 16x9; Z via SliceForViewZ of the froxel center's view-Z, cluster dimZ=24), reads
@@ -29,6 +42,10 @@
 // (b2/b3 are bound for both the lights-off and lights-on renders; the injectLights=false path never reads
 //  them — the showcase binds the dummy buffer there for the CS-equivalent render — so the disabled path
 //  is the EXACT CS code.)
+//   t4/s4 gSunShadow/gSunShadowSmp (Slice CX): the sun's CSM shadow depth texture + its sampler, bound to
+//     this COMPUTE pass via the additive RHI BindShadowMapCompute seam (the SAME sampled depth map the lit
+//     pass samples). Only READ when volumetricShadows is set; the showcase always binds a valid shadow map
+//     so the disabled (volumetricShadows=false) path — which never samples it — is the EXACT CV code.
 //
 // SEAM DISCIPLINE: this shader is ABOVE the RHI seam; the only mentions of vk/MSL are the HF_MSL_GEN
 // generation-path guards + [[vk::binding]] decorations (same as cluster_assign / gtao.frag), not backend
@@ -62,6 +79,13 @@ struct FroxelParams {
     uint4    clusterDims;   // x=cDimX, y=cDimY, z=cDimZ, w=injectLights (1=add clustered lights, 0=CS)
     float4   clusterRange;  // x=cZNear, y=cZFar, z/w unused (the cluster grid's exponential Z slicing)
     float4x4 view;          // world -> view, column-major (transforms cluster math + the apply's view ray)
+    // --- Slice CX volumetric-shadow params (appended; volumetricShadows=false leaves them unread). ---
+    uint4    shadowFlags;   // x=volumetricShadows (1=gate sun by CSM shadow, 0=CV path), y=numCascades, zw unused
+    float4   csmSplits;     // x,y,z,w = view-space FAR distance of cascade 0..3 (lit_csm.frag's splits)
+    float4   shadowBias;    // x=depth bias (anti-acne, mirrors lit.frag bias=0.0025), yzw unused
+    float4   camFwd;        // xyz = camera FORWARD (world), for the cascade view-depth pick; w unused
+    float4   camPos;        // xyz = camera/eye world position (view-depth = dot(wpos-camPos, camFwd)); w unused
+    float4x4 cascadeVP[4];  // per-cascade sun lightViewProj (Ortho*LookAt); cascade 0 == the single map
 };
 
 // One cluster's fixed-cap ordered light list — matches cluster_assign.comp / lit_clustered_cl.frag
@@ -82,6 +106,11 @@ struct GpuLight {
 [[vk::binding(1, 0)]] RWStructuredBuffer<FroxelParams> gParams          : register(u1);
 [[vk::binding(2, 0)]] RWStructuredBuffer<ClusterList>  gClusterLightGrid : register(u2);
 [[vk::binding(3, 0)]] RWStructuredBuffer<GpuLight>     gLights          : register(u3);
+// Slice CX: the sun's CSM shadow depth texture + sampler (the SAME map the lit pass samples), bound to
+// this COMPUTE pass at compute-set bindings 4/5 via the additive BindShadowMapCompute seam. Only read
+// when volumetricShadows is set. spirv-cross maps these to the Metal compute texture(0)/sampler(0) slots.
+[[vk::binding(4, 0)]] Texture2D    gSunShadow    : register(t4);
+[[vk::binding(5, 0)]] SamplerState gSunShadowSmp : register(s4);
 
 // SliceZ(k): positive view-distance of exponential slice boundary at REAL k. Mirrors froxel.h::SliceZ.
 float SliceZ(float k, uint dimZ, float zNear, float zFar) {
@@ -121,6 +150,39 @@ uint ClusterSliceForViewZ(float viewZ, uint cDimZ, float cZNear, float cZFar) {
     float t = log(viewZ / cZNear) / log(cZFar / cZNear);   // [0,1)
     int s = (int)floor(t * (float)cDimZ);
     return (uint)(s < 0 ? 0 : (s > (int)cDimZ - 1 ? (int)cDimZ - 1 : s));
+}
+
+// Slice CX cascade selection — mirrors render::froxel::SelectCascade + lit_csm.frag: smallest cascade
+// whose split far-distance still contains the view depth; last cascade is the catch-all. numCascades==1
+// always returns 0 (the single sun shadow map == one cascade, the showcase case).
+uint SelectCascade(float viewDepth, float4 splits, uint numCascades) {
+    uint cascade = numCascades - 1u;
+    [unroll] for (uint ci = 0u; ci < 4u; ++ci) {
+        if (ci < numCascades && viewDepth <= splits[ci]) { cascade = ci; return cascade; }
+    }
+    return cascade;
+}
+
+// Slice CX sun visibility — mirrors render::froxel::SunVisibility VERBATIM (and the lit pass's shadow
+// sample): project worldPos by the cascade lightViewProj, derive smUV/curDepth, sample the stored
+// occluder depth, compare with the bias. Returns 1 (LIT) / 0 (SHADOWED); out-of-cascade -> 1.
+float SunVisibility(float3 worldPos, float4x4 sunViewProj, float bias) {
+    float4 lp = mul(sunViewProj, float4(worldPos, 1.0));
+    float3 proj = lp.xyz / lp.w;
+    float2 smUV = proj.xy * 0.5 + 0.5;
+    // Metal-only shadow-map texture-origin flip (same as lit.frag / lit_csm.frag): lightViewProj has the
+    // Vulkan Y-flip baked in; on Metal it's flipped CPU-side so V must be flipped to hit the matching texel.
+#ifdef HF_MSL_GEN
+    smUV.y = 1.0 - smUV.y;
+#endif
+    float curDepth = proj.z;
+    // DEGENERATE / out-of-cascade -> LIT (1): off the shadow map or behind the light's near/far plane.
+    if (smUV.x < 0.0 || smUV.x > 1.0 || smUV.y < 0.0 || smUV.y > 1.0 || curDepth < 0.0 || curDepth > 1.0)
+        return 1.0;
+    // SampleLevel (explicit LOD 0), not Sample: a compute shader has no implicit derivatives, so an
+    // implicit-LOD sample is invalid here. The shadow map is single-mip, so LOD 0 == the lit pass's sample.
+    float occluder = gSunShadow.SampleLevel(gSunShadowSmp, smUV, 0.0).r;
+    return (curDepth - bias > occluder) ? 0.0 : 1.0;
 }
 
 [numthreads(HF_FROXEL_THREADS, 1, 1)]
@@ -173,6 +235,22 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
     float3 scatter = sunColor * (phase * density);
     float extinction = density;
+
+    // --- Slice CX: gate the SUN in-scatter by the sun's CSM shadow visibility at this froxel's world
+    // center (sun-only; the CV clustered lights below are UNAFFECTED). volumetricShadows=false SKIPS this
+    // entirely -> the EXACT CV path (the byte-identical shadows-off == CV proof). ---
+    uint volumetricShadows = gParams[0].shadowFlags.x;
+    if (volumetricShadows != 0u) {
+        uint numCascades = gParams[0].shadowFlags.y;
+        float bias = gParams[0].shadowBias.x;
+        // Cascade pick by the froxel's camera-forward view depth (mirrors lit_csm.frag).
+        float3 camFwd = normalize(gParams[0].camFwd.xyz);
+        float3 camPos = gParams[0].camPos.xyz;
+        float viewDepth = dot(worldCenter - camPos, camFwd);
+        uint cascade = SelectCascade(viewDepth, gParams[0].csmSplits, numCascades);
+        float sunVis = SunVisibility(worldCenter, gParams[0].cascadeVP[cascade], bias);
+        scatter *= sunVis;   // multiplicative gate on the SUN scatter only
+    }
 
     // --- Slice CV: ADD the clustered point lights' in-scatter (purely additive; skipped when off). ---
     uint injectLights = gParams[0].clusterDims.w;

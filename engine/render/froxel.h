@@ -194,6 +194,73 @@ inline math::Vec3 InjectClusteredLights(const math::Vec3& froxelViewPos, float d
     return accum;
 }
 
+// --- Slice CX — Volumetric Shadows (the sun-shadow gate on the froxel sun in-scatter) ----------------
+// Per froxel, attenuate the SUN in-scatter by the sun's CSM-shadow VISIBILITY at the froxel's world
+// position: a froxel occluded from the sun (behind geometry in the shadow map) gets NO sun scatter (a
+// dark fog volume in the shadow), so the lit froxels between occluders read as bright shafts of foggy
+// sunlight. The CV clustered-light in-scatter is UNAFFECTED (sun-only this slice).
+//
+// SunVisibility is a multiplicative gate computed EXACTLY like the lit pass samples its directional
+// shadow (shaders/lit.frag.hlsl / lit_csm.frag.hlsl) so the volumetric shadow lines up with the SURFACE
+// shadows pixel-for-pixel:
+//   1. project worldPos by the cascade's lightViewProj (Ortho*LookAt, Vulkan clip space, Y-flip baked):
+//        lp = sunViewProj * float4(worldPos,1);  proj = lp.xyz / lp.w
+//   2. shadow-map UV:    smUV = proj.xy * 0.5 + 0.5   (Metal flips smUV.y CPU-side; see the shader)
+//   3. current depth:    curDepth = proj.z           (Vulkan/Metal Ortho depth in [0,1])
+//   4. sample the stored occluder depth at smUV (sampleOccluderDepth callable; the shader does
+//      gShadow.Sample(...).r) and compare WITH a depth bias (anti-acne, mirrors lit.frag's bias=0.0025):
+//        shadowed  <=>  curDepth - bias > occluderDepth
+//      return 1.0 (LIT — the froxel is CLOSER to the sun than the stored occluder) when NOT shadowed,
+//      0.0 (SHADOWED) when it is.
+//   5. DEGENERATE / forced visibility -> 1.0: if the froxel projects OUTSIDE the cascade [0,1] UV or its
+//      depth is outside [0,1] (off the shadow map), it is treated as LIT (the lit pass's `shadow=1`
+//      default for out-of-range fragments). With `volumetricShadows == false` the shader skips this gate
+//      entirely (sun visibility forced to 1) -> the byte-identical shadows-off == CV proof.
+//
+// The `sampleOccluderDepth` callable receives (smUV.x, smUV.y) in [0,1] and returns the stored occluder
+// depth there (the value the shadow map holds — the closest-to-sun surface depth, [0,1]). The test feeds
+// a procedural shadow field; the shader feeds gShadow.Sample. Pure CPU, ZERO backend symbols, shared
+// VERBATIM with froxel_inject.comp.hlsl's SunVisibility behind the volumetricShadows flag.
+//
+// `bias` is a FIXED depth bias (no RNG); the shader uses a single hardware tap (no PCF jitter) so the
+// volumetric shadow is deterministic + bit-identical cross-backend. (lit.frag adds a 3x3 PCF softening of
+// the SURFACE shadow; the VOLUMETRIC gate is a single hard sample — a basic sample, per the spec's YAGNI:
+// no volumetric-PCF softening this slice.)
+template <class SampleOccluderDepthFn>
+inline float SunVisibility(const math::Vec3& worldPos, const math::Mat4& sunViewProj,
+                           SampleOccluderDepthFn sampleOccluderDepth, float bias) {
+    // Project into the sun's light clip space (perspective divide; Ortho -> w==1 but divide for safety).
+    float w = 1.0f;
+    math::Vec3 proj = math::MulPointDivide(sunViewProj, worldPos, w);
+    float smU = proj.x * 0.5f + 0.5f;
+    float smV = proj.y * 0.5f + 0.5f;
+    float curDepth = proj.z;
+    // DEGENERATE / out-of-cascade -> LIT (1): off the shadow map or behind the light's near/far -> the
+    // lit pass leaves shadow==1 there, so the volumetric gate must too (no spurious dark fog off-map).
+    if (smU < 0.0f || smU > 1.0f || smV < 0.0f || smV > 1.0f || curDepth < 0.0f || curDepth > 1.0f)
+        return 1.0f;
+    float occluder = sampleOccluderDepth(smU, smV);
+    // LIT iff the froxel is NOT strictly behind the stored occluder by more than the bias.
+    return (curDepth - bias > occluder) ? 0.0f : 1.0f;
+}
+
+// CSM cascade selection by the froxel's CAMERA-FORWARD view depth — mirrors lit_csm.frag's pick:
+// the smallest cascade index whose split far-distance still contains viewDepth (the LAST cascade is the
+// catch-all). `splits[i]` is cascade i's view-space FAR distance (csm::CsmSplits / FrameData.csmSplits);
+// numCascades in [1, kMaxCsmCascades]. With numCascades==1 this always returns 0 (the single-cascade
+// case the --volshadows-shot showcase uses: one sun shadow map == one cascade). Shared VERBATIM with the
+// inject shader's cascade pick so the volumetric cascade matches the surface cascade.
+inline constexpr int kMaxCsmCascades = 4;
+inline int SelectCascade(float viewDepth, const float* splits, int numCascades) {
+    if (numCascades < 1) return 0;
+    if (numCascades > kMaxCsmCascades) numCascades = kMaxCsmCascades;
+    int cascade = numCascades - 1;
+    for (int ci = 0; ci < numCascades; ++ci) {
+        if (viewDepth <= splits[ci]) { cascade = ci; break; }
+    }
+    return cascade;
+}
+
 // --- GPU-facing std430 record the showcase uploads/reads. ----------------------------------------------
 // One froxel cell: { scatter.rgb, extinction } as float4 #0 + { inScatter.rgb, transmittance } as float4
 // #1. 32 bytes, 16-byte aligned. The inject writes float4 #0; the integrate reads #0 + writes #1; the

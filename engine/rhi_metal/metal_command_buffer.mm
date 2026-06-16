@@ -393,6 +393,17 @@ void MetalCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {
     [computeEncoder_ setBuffer:b.handle() offset:0 atIndex:kCsStorage + index];
 }
 
+void MetalCommandBuffer::BindShadowMapCompute(IRenderTarget& shadowMap) {
+    // Slice CX: bind the sun's CSM shadow depth texture + its clamp sampler to the compute encoder at
+    // texture(4)/sampler(5) (mirrors the Vulkan binding 4/5; spirv-cross --msl-decoration-binding lands
+    // them there). The SAME depth map + sampler the lit pass samples. Metal's tracked-hazard model orders
+    // the shadow-pass write -> this compute read across encoders (the shadow render encoder closed before
+    // the compute encoder opened), so no explicit barrier object is needed.
+    auto& sm = static_cast<MetalRenderTarget&>(shadowMap);
+    [computeEncoder_ setTexture:sm.sampledTexture() atIndex:kCsShadowTex];
+    [computeEncoder_ setSamplerState:sm.sampledSampler() atIndex:kCsShadowSmp];
+}
+
 void MetalCommandBuffer::ComputePushConstants(const void* data, uint32_t size) {
     // Compute params (dt/time/count) -> inline setBytes at the params buffer slot.
     [computeEncoder_ setBytes:data length:size atIndex:kCsPushConst];

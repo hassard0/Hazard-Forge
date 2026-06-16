@@ -73,6 +73,11 @@ constexpr uint32_t kFragLightBuf        = 15;  // gLights       (set3 b15 -> buf
 // HF_MSL_GEN params cbuffer (binding 1) -> buffer(1).
 constexpr uint32_t kCsStorage   = 0;  // RWStructuredBuffer (particle SSBO)
 constexpr uint32_t kCsPushConst = 1;  // params cbuffer (dt/time/count)
+// Slice CX: the froxel inject's sun CSM shadow map (Texture2D binding 4) + sampler (binding 5). With
+// spirv-cross --msl-decoration-binding the SPIR-V bindings map straight to the compute texture(4) /
+// sampler(5) slots (a separate index space from the storage buffers). Bound via BindShadowMapCompute.
+constexpr uint32_t kCsShadowTex = 4;  // gSunShadow    (binding 4 -> texture(4))
+constexpr uint32_t kCsShadowSmp = 5;  // gSunShadowSmp (binding 5 -> sampler(5))
 
 // Map an RHI vertex-attribute / color / depth format to a Metal pixel/vertex format.
 inline MTLPixelFormat ToMetalPixelFormat(Format f) {

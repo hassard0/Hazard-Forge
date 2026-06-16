@@ -370,6 +370,35 @@ void VulkanCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {
                                /*set=*/0, 1, &write);
 }
 
+void VulkanCommandBuffer::BindShadowMapCompute(IRenderTarget& shadowMap) {
+    // Slice CX: push the sun's CSM shadow depth view (binding 4, SAMPLED_IMAGE) + the shadow sampler
+    // (binding 5, SAMPLER) into the compute set so the froxel inject can sample the SAME depth map the
+    // lit pass samples. The render graph has already transitioned the map to SHADER_READ_ONLY (the
+    // ShaderRead dst scope now includes COMPUTE_SHADER) before this dispatch.
+    auto& sm = static_cast<VulkanRenderTarget&>(shadowMap);
+
+    VkDescriptorImageInfo imgInfo{};
+    imgInfo.imageView = sm.depthView();
+    imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet texWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    texWrite.dstBinding = 4;
+    texWrite.descriptorCount = 1;
+    texWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    texWrite.pImageInfo = &imgInfo;
+
+    VkDescriptorImageInfo smpInfo{};
+    smpInfo.sampler = device_.shadowSampler();
+    VkWriteDescriptorSet smpWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    smpWrite.dstBinding = 5;
+    smpWrite.descriptorCount = 1;
+    smpWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    smpWrite.pImageInfo = &smpInfo;
+
+    VkWriteDescriptorSet writes[2] = {texWrite, smpWrite};
+    device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
+                               /*set=*/0, 2, writes);
+}
+
 void VulkanCommandBuffer::ComputePushConstants(const void* data, uint32_t size) {
     vkCmdPushConstants(cmd_, boundComputeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data);
 }
@@ -452,8 +481,14 @@ VkStateMasks MapState(ResourceState s, bool depth) {
             return {VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT};
         case ResourceState::ShaderRead:
+            // Slice CX: include COMPUTE_SHADER in the dst scope so the shadow-pass-write -> froxel-inject
+            // (compute) shadow-map read layout transition completes before the compute samples it (the
+            // volumetric-shadow read). Purely additive: existing FRAGMENT readers (lit / apply) keep the
+            // same fragment-stage coverage; broadening the dst stage only makes the transition available
+            // to a compute reader too — no pixel change, no hazard for the existing passes.
             return {VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT};
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT};
         case ResourceState::Present:
             return {VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0};
     }
