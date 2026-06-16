@@ -64,6 +64,9 @@
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
 #include "runtime/parallel_record.h"  // Slice AU: deterministic parallel command-recording partition
 #include "editor/gizmo.h"    // Slice AB: transform gizmo emit (drawn through the debug-line layer)
+#include "editor/editor_panels.h"   // Slice BT: docked editor UI (Hierarchy/Inspector/Stats/Viewport)
+#include "editor/imgui_renderer.h"  // Slice BT: RHI-only Dear ImGui renderer (consumes MSL on Metal)
+#include "imgui.h"                   // Slice BT: Dear ImGui (NewFrame/Render + io setup)
 
 #include <cmath>
 #include <cstdio>
@@ -9671,7 +9674,16 @@ int main(int argc, char** argv) {
             try { return RunTaaShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
-        const char* outPath = argc > 1 ? argv[1] : "metal_scene.png";
+        // --editor <out.png>: docked editor showcase (Slice BT). Renders the SAME default Slice-F
+        // scene as the no-flag path, then draws the docked Dear ImGui editor (Scene Hierarchy /
+        // Inspector / Stats panels around a central scene Viewport) over it via the RHI-only
+        // ImGuiRenderer with a FIXED selected entity, and captures. Mirrors the Vulkan --editor-shot:
+        // identical scene + editor state + tiled layout, so editor.png is golden-comparable + two runs
+        // DIFF 0.0000 (ImGui geometry is CPU-built + deterministic). `editorMode` flows into the
+        // shared default-scene path below; the editor chrome is composited in the post pass.
+        bool editorMode = (argc > 1 && std::strcmp(argv[1], "--editor") == 0);
+        const char* outPath = editorMode ? (argc > 2 ? argv[2] : "metal_editor.png")
+                                          : (argc > 1 ? argv[1] : "metal_scene.png");
         const uint32_t W = 1280, H = 720;
 
         try {
@@ -9870,6 +9882,41 @@ int main(int argc, char** argv) {
             ecs::Registry registry;
             scene::LoadScene(registry, resources, HF_SCENE_PATH);
 
+            // ---- Docked editor (Slice BT): set up Dear ImGui + the RHI-only renderer when --editor.
+            // Deterministic: no imgui.ini (machine-dependent), fixed DisplaySize/DeltaTime, a FIXED
+            // selected entity, no cursor/time input. The ImGui pipeline shaders are the GENERATED ui
+            // MSL (ui.vert/ui.frag .gen.metal); the renderer is the SAME RHI-only class the Vulkan
+            // path uses, so the docked panels build identically + the editor.png matches cross-backend.
+            std::unique_ptr<editor::ImGuiRenderer> uiRenderer;
+            editor::EditorState editorState;
+            int editorEntityCount = 0;
+            if (editorMode) {
+                for (auto [e, tc, mc, mat] :
+                     registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
+                    (void)e; (void)tc; (void)mc; (void)mat; ++editorEntityCount;
+                }
+                editorState.selectedEntity =
+                    editorEntityCount > 0 ? editorEntityCount - 1 : -1;  // FIXED selection: the duck.
+
+                IMGUI_CHECKVERSION();
+                ImGui::CreateContext();
+                ImGuiIO& io = ImGui::GetIO();
+                io.IniFilename = nullptr;     // headless: no imgui.ini (machine-dependent layout)
+                io.LogFilename = nullptr;
+                io.DisplaySize = ImVec2((float)W, (float)H);
+                io.DeltaTime = 1.0f / 60.0f;  // fixed constant: no time/animation -> deterministic
+                ImGui::StyleColorsDark();
+
+                // Build the ImGui pipeline from the GENERATED ui MSL (entry points ui_vertex/ui_fragment
+                // per the CMake gen rules). The renderer takes ownership of these shader modules.
+                std::string uiVsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/ui.vert.gen.metal");
+                std::string uiFsMsl = LoadText(std::string(HF_GEN_SHADER_DIR) + "/ui.frag.gen.metal");
+                auto uiVs = rhi::mtl::MakeShaderModuleFromMSL(*device, uiVsMsl, "ui_vertex");
+                auto uiFs = rhi::mtl::MakeShaderModuleFromMSL(*device, uiFsMsl, "ui_fragment");
+                uiRenderer = std::make_unique<editor::ImGuiRenderer>(
+                    *device, device->Swapchain().ColorFormat(), std::move(uiVs), std::move(uiFs));
+            }
+
             // ---- Frame uniforms: same camera + light as the Vulkan Slice-F sample. ----
             using math::Mat4; using math::Vec3;
             const Vec3 eye{4.5f, 4.0f, 6.5f};
@@ -10001,6 +10048,14 @@ int main(int argc, char** argv) {
                     cmd.BindPipeline(*postPipeline);
                     cmd.BindTexture(*rt);
                     cmd.Draw(3);
+                    // Slice BT: docked editor chrome over the scene (same post pass as Vulkan). Build a
+                    // fresh ImGui frame from the live ECS registry + draw it through the RHI.
+                    if (editorMode && uiRenderer) {
+                        ImGui::NewFrame();
+                        editor::BuildEditorUI(registry, resources, editorState, W, H);
+                        ImGui::Render();
+                        uiRenderer->RenderDrawData(ImGui::GetDrawData(), cmd, W, H);
+                    }
                     cmd.EndRenderPass();
                 });
 
@@ -10014,6 +10069,15 @@ int main(int argc, char** argv) {
 
             if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
             device->WaitIdle();
+
+            if (editorMode) {
+                // Match the Vulkan --editor-shot stat line (deterministic; selection clamped + written
+                // back by BuildPanelData during BuildEditorUI).
+                std::printf("editor: {panels:[Hierarchy,Inspector,Stats,Viewport], selected:%d, "
+                            "entities:%d}\n", editorState.selectedEntity, editorEntityCount);
+                uiRenderer.reset();
+                ImGui::DestroyContext();
+            }
 
             std::printf("OK wrote %s (%ux%u)\n", outPath, cw, ch);
             return 0;

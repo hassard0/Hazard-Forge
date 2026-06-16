@@ -201,6 +201,12 @@ hf_gen_msl(decal.frag            decal.frag.hlsl            frag decal_fragment)
 # final pass from post.frag; reuses post.vert. Same HLSL->SPIR-V->MSL toolchain; shared math with
 # engine/render/post_stack.h. Existing shaders + goldens untouched.
 hf_gen_msl(post_stack.frag       post_stack.frag.hlsl       frag post_stack_fragment)
+# Docked editor UI (Slice BT): the Dear ImGui pipeline shaders (ImDrawVert -> ortho clip via a vertex
+# push constant; font-atlas sample * vertex color). Same HLSL->SPIR-V->MSL toolchain as everything
+# else; the ImGuiRenderer (RHI-only) consumes these MSL modules on the Metal --editor path exactly as
+# it consumes the SPIR-V on Vulkan.
+hf_gen_msl(ui.vert ui.vert.hlsl vert ui_vertex)
+hf_gen_msl(ui.frag ui.frag.hlsl frag ui_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 
@@ -266,6 +272,17 @@ add_executable(visual_test
     # Editor transform-gizmo emit (Slice AB): pure C++ (math + scene::Transform + debug::DebugDraw),
     # no Metal/RHI deps. Drives the --gizmo showcase's translate-gizmo line overlay.
     ${HF_ROOT}/engine/editor/gizmo.cpp
+    # Docked editor UI (Slice BT): the panel DATA model (pure C++, ImGui-free), the ECS-driven docked
+    # panels (ImGui), the RHI-only ImGui renderer, and the vendored Dear ImGui core. All
+    # backend-agnostic (the renderer uses ONLY the rhi:: seam); the --editor showcase draws the docked
+    # editor chrome over the scene exactly like the Vulkan --editor-shot path.
+    ${HF_ROOT}/engine/editor/editor_panel_data.cpp
+    ${HF_ROOT}/engine/editor/editor_panels.cpp
+    ${HF_ROOT}/engine/editor/imgui_renderer.cpp
+    ${HF_ROOT}/third_party/imgui/imgui.cpp
+    ${HF_ROOT}/third_party/imgui/imgui_draw.cpp
+    ${HF_ROOT}/third_party/imgui/imgui_tables.cpp
+    ${HF_ROOT}/third_party/imgui/imgui_widgets.cpp
 )
 
 # The generated MSL must exist before the executable's shaders are loaded at runtime; make the
@@ -280,7 +297,13 @@ target_compile_options(visual_test PRIVATE -fobjc-arc)
 target_include_directories(visual_test PRIVATE
     ${HF_ROOT}/engine
     ${HF_ROOT}/third_party
+    ${HF_ROOT}/third_party/imgui
 )
+
+# Docked editor UI (Slice BT): force 32-bit ImDrawIdx (matches the engine's RHI index binding) via the
+# SAME hf_imconfig.h the Windows build uses, so ImGui's draw data binds straight through the Metal RHI.
+target_compile_definitions(visual_test PRIVATE
+    "IMGUI_USER_CONFIG=\"${HF_ROOT}/engine/editor/hf_imconfig.h\"")
 
 # Path to the GENERATED MSL shaders (HLSL->SPIR-V->MSL), baked in as a compile definition.
 target_compile_definitions(visual_test PRIVATE

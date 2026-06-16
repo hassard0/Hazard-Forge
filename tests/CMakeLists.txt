@@ -82,6 +82,14 @@ hf_add_pure_test(runtime_test)
 # PickGizmoAxis, ApplyDrag (translate/rotate/scale), PlayState, select->translate->DumpScene
 # round-trip. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(editor_test)
+# Docked editor panel DATA model (Slice BT): BuildPanelData (engine/editor/editor_panel_data.{h,cpp})
+# computes what the Hierarchy/Inspector/Stats panels would display from the live registry, ImGui-free
+# + backend-free, so the docked editor's data is asserted headlessly (data, not pixels). Asserts the
+# hierarchy rows (ids/labels), the inspector for the selected entity (Transform/Material/Mesh), the
+# stats counts, selection follow + out-of-range clamp + empty-scene "none", determinism, and the fixed
+# code-driven dock layout VALUE. The --editor-shot capture golden-verifies the rendered chrome; this
+# pins the data behind it. Pure C++ (hf_core), no RHI/backend/ImGui symbols, ASan-eligible.
+hf_add_pure_test(editor_panels_test)
 # Cascaded shadow maps (Slice AD): frustum-split scheme (N increasing splits in (near,far]) +
 # per-cascade ortho fit (all 8 slice corners land inside the cascade clip volume). Pure C++
 # (render/csm.h, header-only), ASan-eligible.

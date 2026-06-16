@@ -30,12 +30,14 @@ struct UiPush { float scale[2]; float translate[2]; };
 
 ImGuiRenderer::ImGuiRenderer(rhi::IRHIDevice& device, rhi::Format swapchainColorFormat,
                              const std::string& shaderDir)
-    : device_(device) {
-    auto vsWords = LoadSpirv(shaderDir + "/ui.vert.hlsl.spv");
-    auto fsWords = LoadSpirv(shaderDir + "/ui.frag.hlsl.spv");
-    vs_ = device_.CreateShaderModule({std::span<const uint32_t>(vsWords)});
-    fs_ = device_.CreateShaderModule({std::span<const uint32_t>(fsWords)});
+    : ImGuiRenderer(device, swapchainColorFormat,
+                    device.CreateShaderModule({std::span<const uint32_t>(LoadSpirv(shaderDir + "/ui.vert.hlsl.spv"))}),
+                    device.CreateShaderModule({std::span<const uint32_t>(LoadSpirv(shaderDir + "/ui.frag.hlsl.spv"))})) {}
 
+ImGuiRenderer::ImGuiRenderer(rhi::IRHIDevice& device, rhi::Format swapchainColorFormat,
+                             std::unique_ptr<rhi::IShaderModule> vs,
+                             std::unique_ptr<rhi::IShaderModule> fs)
+    : device_(device), vs_(std::move(vs)), fs_(std::move(fs)) {
     // --- Font atlas -> rhi::ITexture (RGBA8). ---
     ImGuiIO& io = ImGui::GetIO();
     unsigned char* pixels = nullptr;

@@ -356,6 +356,11 @@ int main(int argc, char** argv) {
     bool introspect = false;
     const char* introspectPath = nullptr;
     bool editor = false;
+    // Slice BT (docked editor): one deterministic DOCKED editor frame (Scene Hierarchy / Inspector /
+    // Stats panels tiled around the central scene Viewport) with a FIXED selected entity, captured to
+    // a BMP and a deterministic `editor: {...}` line printed. Implies --editor (the ImGui overlay).
+    const char* editorShotPath = nullptr;
+    int editorShotSelected = -1;  // FIXED selected entity (view-order index); <0 => default below.
     // Slice AB (editor interaction): gizmo capture + headless pick test.
     const char* gizmoShotPath = nullptr;    // --gizmo-shot <objIndex> <out.bmp>
     int gizmoShotIndex = 0;                  // selected object index for --gizmo-shot
@@ -694,6 +699,15 @@ int main(int argc, char** argv) {
             // Overlay the Dear ImGui editor (hierarchy/inspector/stats) on the viewport, rendered
             // through the engine RHI. Works in interactive mode and in the --shot capture.
             editor = true;
+        } else if (std::strcmp(argv[i], "--editor-shot") == 0 && i + 1 < argc) {
+            // Slice BT: render ONE deterministic docked editor frame (scene + ImGui chrome) with a
+            // FIXED selected entity, write a BMP, print the `editor: {...}` line, exit. Implies
+            // --editor. An OPTIONAL trailing integer (when the next argv is not another flag) selects
+            // the entity by view-order index; otherwise a sensible default (the duck) is chosen.
+            editor = true;
+            editorShotPath = argv[i + 1];
+            ++i;
+            if (i + 1 < argc && argv[i + 1][0] != '-') { editorShotSelected = std::atoi(argv[i + 1]); ++i; }
         } else if (std::strcmp(argv[i], "--gizmo-shot") == 0 && i + 2 < argc) {
             // Slice AB: select object <objIndex> in a small deterministic scene, render it + the
             // selected object's translate gizmo (axis arrows) through the debug-line layer, capture.
@@ -12628,10 +12642,11 @@ int main(int argc, char** argv) {
                 IMGUI_CHECKVERSION();
                 ImGui::CreateContext();
                 ImGuiIO& io = ImGui::GetIO();
-                io.IniFilename = nullptr;   // headless: no imgui.ini side-effects
+                io.IniFilename = nullptr;   // headless: no imgui.ini side-effects (machine-dependent)
                 io.LogFilename = nullptr;
                 io.DisplaySize = ImVec2((float)window.FramebufferWidth(),
                                         (float)window.FramebufferHeight());
+                io.DeltaTime = 1.0f / 60.0f;  // fixed constant: no time/animation -> deterministic.
                 ImGui::StyleColorsDark();
                 imguiInited = true;
             }
@@ -12851,6 +12866,38 @@ int main(int argc, char** argv) {
             if (imguiInited) ImGui::DestroyContext();
 #endif
         };
+
+#ifdef HF_HAS_EDITOR
+        // --- Slice BT: docked editor capture. Render ONE deterministic frame of the default scene
+        // with the docked ImGui editor (Scene Hierarchy / Inspector / Stats around a central
+        // Viewport) over it, a FIXED selected entity, write a BMP, print the editor line, exit. The
+        // capture reuses captureToFile (scene -> post -> recordEditorOverlay), so the BMP includes the
+        // docked chrome composited over the live scene. Determinism: io.IniFilename=nullptr + a fixed
+        // io.DisplaySize/DeltaTime (set in ensureEditor) + the code-driven tiled layout + a fixed
+        // selected entity + no time/cursor input -> two runs are byte-identical. ---
+        if (editorShotPath) {
+            // Count drawable entities (view order) to pick + report the FIXED selection.
+            int entityCount = 0;
+            for (auto [e, tc, mc, mat] :
+                 registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
+                (void)e; (void)tc; (void)mc; (void)mat; ++entityCount;
+            }
+            // Default selection: the duck (the last spinning entity built after the ground/grid), a
+            // recognizable inspector target. CLI may override with an explicit index; BuildPanelData
+            // clamps any out-of-range value into the valid range.
+            int selected = editorShotSelected;
+            if (selected < 0) selected = entityCount > 0 ? entityCount - 1 : -1;
+            editorState.selectedEntity = selected;
+
+            bool ok = captureToFile(editorShotPath);
+
+            // Re-read the (possibly clamped) selection BuildPanelData wrote back during the capture.
+            std::printf("editor: {panels:[Hierarchy,Inspector,Stats,Viewport], selected:%d, "
+                        "entities:%d}\n", editorState.selectedEntity, entityCount);
+            teardownEditor();
+            return ok ? 0 : 1;
+        }
+#endif
 
         // --- Headless capture mode: render one frame of the default scene, write a BMP, exit. ---
         if (shotPath) {

@@ -27,8 +27,16 @@ class ImGuiRenderer {
 public:
     // Builds the UI pipeline + uploads the ImGui font atlas. `swapchainColorFormat` must match the
     // pass the UI draws into (the post/swapchain pass). `shaderDir` is where ui.vert/frag .spv live.
+    // (Vulkan path: loads SPIR-V ui.vert.hlsl.spv / ui.frag.hlsl.spv from disk.)
     ImGuiRenderer(rhi::IRHIDevice& device, rhi::Format swapchainColorFormat,
                   const std::string& shaderDir);
+
+    // Builds the UI pipeline from CALLER-SUPPLIED shader modules + uploads the font atlas. This keeps
+    // the renderer RHI-only (no SPIR-V vs MSL load policy baked in): the Vulkan caller passes
+    // CreateShaderModule(SPIR-V) modules, the Metal caller passes CreateShaderModuleMSL modules. The
+    // pipeline state + draw path are identical. The renderer takes ownership of the modules.
+    ImGuiRenderer(rhi::IRHIDevice& device, rhi::Format swapchainColorFormat,
+                  std::unique_ptr<rhi::IShaderModule> vs, std::unique_ptr<rhi::IShaderModule> fs);
     ~ImGuiRenderer();
 
     ImGuiRenderer(const ImGuiRenderer&) = delete;
