@@ -63,6 +63,7 @@
 #include "render/frustum.h"        // Slice AQ: Gribb-Hartmann frustum extraction + sphere cull (pure math)
 #include "render/gpu_cull.h"        // Slice AR: GPU-cull CPU mirror (ordered compaction + sphere test)
 #include "render/gpu_culled.h"      // Slice CD: compute cull+compact CPU mirror (model+material+texIndex)
+#include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
 #include "debug/debug_draw.h"
@@ -10004,6 +10005,330 @@ static int RunGpuCullDrawShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Hi-Z OCCLUSION culling showcase (Slice CJ). The TRUE pass (a CPU depth pre-pass -> Hi-Z max-depth
+// pyramid -> a compute shader frustum+occlusion-culls + compacts the survivors) is the VULKAN
+// demonstration (--hiz-cull-shot). Here Metal renders the IDENTICAL scene — a BIG occluder WALL near
+// the camera, 24 objects DIRECTLY BEHIND it (fully hidden -> occluded), and 7 objects beside/in-front
+// (visible) — via the per-object BOUND path: the SAME render::hiz CPU Hi-Z + IsOccluded (which is
+// bit-identical cross-backend) decides the VISIBLE survivors, and only those are drawn. Because the
+// occluded objects were fully hidden behind the wall, the occlusion-culled image equals a frustum-only
+// render — so the Metal image is backend-identical to the Vulkan occlusion-culled image. The cull
+// frustum + the Hi-Z depth pre-pass use the SAME FlipProjY-composed view-proj the renderer uses (Metal
+// clip), so the survivor SET matches Vulkan geometrically. New golden tests/golden/metal/hiz_cull.png;
+// two runs DIFF 0.0000. Prints the SAME stat line as Vulkan.
+static int RunHizCullShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace fr = render::frustum;
+    namespace hz = render::hiz;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+    scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+    scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+    auto makeSolid = [&](uint8_t r, uint8_t g, uint8_t b) {
+        std::vector<uint8_t> px(32 * 32 * 4);
+        for (size_t p = 0; p < 32 * 32; ++p) {
+            px[p * 4 + 0] = r; px[p * 4 + 1] = g; px[p * 4 + 2] = b; px[p * 4 + 3] = 255;
+        }
+        return device->CreateTexture({32, 32, rhi::Format::RGBA8_UNorm, px.data(), px.size()});
+    };
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto checkerTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    std::vector<std::unique_ptr<rhi::ITexture>> palette;
+    palette.push_back(makeSolid(220, 70, 70));    // red
+    palette.push_back(makeSolid(70, 200, 90));    // green
+    palette.push_back(makeSolid(80, 110, 230));   // blue
+    palette.push_back(makeSolid(230, 200, 60));   // yellow
+    std::vector<rhi::ITexture*> texList = {
+        palette[0].get(), palette[1].get(), palette[2].get(), palette[3].get(), checkerTex.get()};
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    const Vec3  localCenter{0.0f, 0.0f, 0.0f};
+    const float localRadius = std::sqrt(0.75f);
+    const Vec3  localAabbMin{-0.5f, -0.5f, -0.5f};
+    const Vec3  localAabbMax{ 0.5f,  0.5f,  0.5f};
+
+    // The scene's render objects — IDENTICAL builder to the Vulkan --hiz-cull-shot. objs[0] is the WALL.
+    struct HObj { const scene::Mesh* mesh; Mat4 model; float tint; rhi::ITexture* tex; };
+    std::vector<HObj> objs;
+    const Vec3 wallCenter{0.0f, 2.2f, 0.0f};
+    const Vec3 wallScale{9.0f, 5.0f, 0.4f};
+    Mat4 wallModel = Mat4::Translate(wallCenter) * Mat4::Scale(wallScale);
+    objs.push_back({&cubeMesh, wallModel, 0.5f, checkerTex.get()});
+
+    struct Cand { Vec3 pos; bool isSphere; int tex; };
+    std::vector<Cand> cands;
+    for (int gy = 0; gy < 4; ++gy)
+        for (int gx = 0; gx < 6; ++gx) {
+            float fx = -3.0f + (float)gx * 1.2f;
+            float fy = 0.8f + (float)gy * 1.0f;
+            float fz = -3.0f - 0.5f * (float)((gx + gy) % 4);
+            cands.push_back({Vec3{fx, fy, fz}, ((gx + gy) & 1) != 0, (gx + gy) % 5});
+        }
+    for (int s = 0; s < 3; ++s) {
+        float fy = 0.7f + (float)s * 1.1f;
+        cands.push_back({Vec3{-7.0f, fy, -1.0f}, (s & 1) != 0, s % 5});
+        cands.push_back({Vec3{ 7.0f, fy, -1.0f}, (s & 1) == 0, (s + 2) % 5});
+    }
+    cands.push_back({Vec3{4.0f, 0.8f, 5.0f}, false, 1});
+    for (const Cand& c : cands) {
+        Mat4 m = Mat4::Translate(c.pos) * Mat4::Scale({0.45f, 0.45f, 0.45f});
+        objs.push_back({c.isSphere ? &sphereMesh : &cubeMesh, m, 0.6f, texList[(size_t)c.tex]});
+    }
+    const uint32_t kCand = (uint32_t)cands.size();
+
+    // The render camera (SAME pose/FOV/clips as Vulkan; FlipProjY composes Metal clip into the view-proj
+    // so the frustum + the Hi-Z depth pre-pass are convention-correct on Metal).
+    const Vec3 eye{0.0f, 2.5f, 13.0f};
+    const Vec3 center{0.0f, 2.0f, 0.0f};
+    const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+    const float aspect = (float)W / (float)H;
+    Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 proj = FlipProjY(Mat4::Perspective(1.0471976f /*60deg*/, aspect, 0.5f, 90.0f));
+    Mat4 vp = proj * view;
+    fr::Frustum cullFrustum = fr::FromViewProj(vp);
+
+    // CPU depth pre-pass: rasterize the occluder WALL's front face into a w*h depth buffer (the SAME
+    // algorithm as the Vulkan path; the FlipProjY-composed vp gives the Metal-clip NDC z). Build the Hi-Z.
+    const int SW = (int)W, SH = (int)H;
+    std::vector<float> depthBuf((size_t)SW * SH, 1.0f);
+    auto projectToScreen = [&](const Vec3& local, float& sx, float& sy, float& sz, bool& ok) {
+        Vec3 wp = math::MulPoint(wallModel, local);
+        float cw = 0.0f;
+        Vec3 ndc = math::MulPointDivide(vp, wp, cw);
+        ok = (cw > 1e-6f);
+        sx = (ndc.x * 0.5f + 0.5f) * (float)SW;
+        sy = (ndc.y * 0.5f + 0.5f) * (float)SH;
+        sz = ndc.z;
+    };
+    const Vec3 faceLocal[4] = {{-0.5f,-0.5f,0.5f},{0.5f,-0.5f,0.5f},{0.5f,0.5f,0.5f},{-0.5f,0.5f,0.5f}};
+    float fsx[4], fsy[4], fsz[4]; bool fok[4] = {true,true,true,true};
+    for (int k = 0; k < 4; ++k) projectToScreen(faceLocal[k], fsx[k], fsy[k], fsz[k], fok[k]);
+    bool wallProjectable = fok[0] && fok[1] && fok[2] && fok[3];
+    auto rasterTri = [&](int i0, int i1, int i2) {
+        float x0 = fsx[i0], y0 = fsy[i0], z0 = fsz[i0];
+        float x1 = fsx[i1], y1 = fsy[i1], z1 = fsz[i1];
+        float x2 = fsx[i2], y2 = fsy[i2], z2 = fsz[i2];
+        float minx = std::floor(std::min(x0, std::min(x1, x2)));
+        float maxx = std::ceil (std::max(x0, std::max(x1, x2)));
+        float miny = std::floor(std::min(y0, std::min(y1, y2)));
+        float maxy = std::ceil (std::max(y0, std::max(y1, y2)));
+        int ix0 = std::max(0, (int)minx), ix1 = std::min(SW - 1, (int)maxx);
+        int iy0 = std::max(0, (int)miny), iy1 = std::min(SH - 1, (int)maxy);
+        float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if (std::fabs(area) < 1e-6f) return;
+        float invArea = 1.0f / area;
+        for (int py = iy0; py <= iy1; ++py)
+            for (int px = ix0; px <= ix1; ++px) {
+                float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
+                float w0 = ((x1 - sx) * (y2 - sy) - (x2 - sx) * (y1 - sy)) * invArea;
+                float w1 = ((x2 - sx) * (y0 - sy) - (x0 - sx) * (y2 - sy)) * invArea;
+                float w2 = 1.0f - w0 - w1;
+                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                float z = w0 * z0 + w1 * z1 + w2 * z2;
+                size_t idx = (size_t)py * SW + px;
+                if (z < depthBuf[idx]) depthBuf[idx] = z;
+            }
+    };
+    if (wallProjectable) { rasterTri(0, 1, 2); rasterTri(0, 2, 3); }
+    std::vector<hz::HiZMip> hizMips;
+    hz::BuildHiZ(depthBuf.data(), SW, SH, hizMips);
+    std::span<const hz::HiZMip> hizSpan(hizMips.data(), hizMips.size());
+
+    // CPU reference cull: frustum then occlusion. Build the VISIBLE-survivor draw list (what we render)
+    // + the counts — the SAME predicate the Vulkan compute runs.
+    std::vector<const HObj*> visibleSurvivors;
+    uint32_t cpuFrustumKept = 0, cpuOccluded = 0;
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        const HObj& ob = objs[ci + 1];
+        Vec3 wmn = math::MulPoint(ob.model, localAabbMin);
+        Vec3 wmx = math::MulPoint(ob.model, localAabbMax);
+        Vec3 amn{std::min(wmn.x, wmx.x), std::min(wmn.y, wmx.y), std::min(wmn.z, wmx.z)};
+        Vec3 amx{std::max(wmn.x, wmx.x), std::max(wmn.y, wmx.y), std::max(wmn.z, wmx.z)};
+        Vec3 sc = math::MulPoint(ob.model, localCenter);
+        float radius = localRadius * std::sqrt(ob.model.m[0]*ob.model.m[0] +
+                       ob.model.m[1]*ob.model.m[1] + ob.model.m[2]*ob.model.m[2]);
+        if (fr::SphereOutside(cullFrustum, sc, radius)) continue;
+        ++cpuFrustumKept;
+        if (hz::IsOccluded(amn, amx, vp, SW, SH, hizSpan)) { ++cpuOccluded; continue; }
+        visibleSurvivors.push_back(&ob);
+    }
+    const uint32_t drawn = (uint32_t)visibleSurvivors.size();
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true;
+    postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    scene::Transform groundXform; groundXform.scale = {20.0f, 1.0f, 20.0f};
+    Mat4 groundModel = groundXform.Matrix();
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 2.0f, 0.0f};
+        Vec3 lightEye = sc - lightDirVec * 30.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-22.0f, 22.0f, -22.0f, 22.0f, 1.0f, 70.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.0471976f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(planeMesh.vertices());
+            cmd.BindIndexBuffer(planeMesh.indices());
+            cmd.DrawIndexed(planeMesh.indexCount());
+            for (const auto& ob : objs) {
+                cmd.PushConstants(ob.model.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(ob.mesh->vertices());
+                cmd.BindIndexBuffer(ob.mesh->indices());
+                cmd.DrawIndexed(ob.mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            // Ground.
+            {
+                cmd.BindMaterial(*checkerTex, *flatNormal);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(planeMesh.vertices());
+                cmd.BindIndexBuffer(planeMesh.indices());
+                cmd.DrawIndexed(planeMesh.indexCount());
+            }
+            // The OCCLUDER WALL (never culled — it's the occluder).
+            {
+                const HObj& wall = objs[0];
+                cmd.BindMaterial(*wall.tex, *flatNormal);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = wall.model.m[k];
+                pc[16] = 0.0f; pc[17] = wall.tint; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(wall.mesh->vertices());
+                cmd.BindIndexBuffer(wall.mesh->indices());
+                cmd.DrawIndexed(wall.mesh->indexCount());
+            }
+            // The CPU-occlusion-culled VISIBLE survivors, per-object bound. The hidden objects are absent
+            // — exactly what the GPU Hi-Z cull would draw, and identical to a frustum-only render (they
+            // are fully behind the wall, so drawing-or-not yields the same pixels).
+            for (const HObj* ob : visibleSurvivors) {
+                cmd.BindMaterial(*ob->tex, *flatNormal);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = ob->model.m[k];
+                pc[16] = 0.0f; pc[17] = ob->tint; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(ob->mesh->vertices());
+                cmd.BindIndexBuffer(ob->mesh->indices());
+                cmd.DrawIndexed(ob->mesh->indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    if (cpuOccluded == 0) return fail("occluded==0 — no real occlusion (fix the occluder/scene)");
+    std::printf("hiz-cull: {total:%u, frustumKept:%u, occluded:%u, drawn:%u, cpuOccluded:%u} "
+                "(Metal: CPU Hi-Z occlusion-culled per-object bound path, image backend-identical)\n",
+                kCand, cpuFrustumKept, cpuOccluded, drawn, cpuOccluded);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — Hi-Z occlusion-culled %u/%u objects (Metal per-object bound; "
+                "Vulkan does depth-prepass -> Hi-Z -> compute cull)\n", outPath, cw, ch, cpuOccluded, kCand);
+    return 0;
+}
+
 // --- GPU-driven culling + indirect draw showcase (Slice AR). Mirrors the Vulkan --gpu-cull-shot
 // path: a compute kernel (cull.comp.gen.metal) frustum-culls a deterministic 1024-instance cube grid
 // and ORDER-compacts the survivors into a second instance buffer (single-workgroup prefix sum) +
@@ -12274,6 +12599,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gpucull-draw") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gpucull_draw.png";
             try { return RunGpuCullDrawShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hiz-cull <out.png>: render the Hi-Z OCCLUSION cull showcase (Slice CJ). The TRUE pass (a CPU
+        // depth pre-pass -> Hi-Z max-depth pyramid -> a compute shader frustum+occlusion-culls + compacts
+        // the survivors) is the VULKAN demonstration; here Metal renders the IDENTICAL occluder-wall scene
+        // via the per-object BOUND path (the SAME render::hiz CPU Hi-Z + IsOccluded decides the VISIBLE
+        // survivors), so hiz_cull.png is backend-identical to the Vulkan occlusion-culled image (which is
+        // itself byte-identical to the Vulkan frustum-only render). New golden tests/golden/metal/hiz_cull.png.
+        if (argc > 1 && std::strcmp(argv[1], "--hiz-cull") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hiz_cull.png";
+            try { return RunHizCullShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gizmo <objIndex> <out.png>: render the editor gizmo showcase (Slice AB) — a small
