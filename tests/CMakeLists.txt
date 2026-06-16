@@ -228,6 +228,17 @@ hf_add_pure_test(mdi_test)
 # index table the GPU descriptor array is filled from. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(bindless_test)
 
+# Fully-GPU-driven pass (Slice CB): the pure-CPU COMBINED builder (render/gpu_driven.h) that composes the
+# BM multi-draw-indirect command + per-draw layout with the BZ bindless texture-index table into ONE
+# batch. Asserts the COMBINED LAYOUT (N MDI commands + N GpuDrivenPerDraw, each carrying model+material+
+# texIndex where texIndex == bindless::Intern of that object's texture; drawCount==N; 96-byte std430
+# per-draw record), INDEX CONSISTENCY (distinct textures -> distinct texIndex; shared textures -> same
+# texIndex via dedup; every texIndex in range), and DETERMINISM (two builds -> bit-identical commands +
+# per-draw + bindless table). The render-invariance proof (GPU-driven image == per-object bound image)
+# lives in --gpudriven-shot; this pins the CPU layout the fully-GPU-driven path reads. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(gpu_driven_test)
+
 # Multithreaded command recording (Slice AU): the deterministic CONTIGUOUS draw-list partition
 # (PartitionDraws splits [0,K) into W gap/overlap-free ranges, run-to-run identical, degenerate
 # W>K/K=0/W=1/W=0) + the real worker-pool dispatch (RecordParallel marks each draw exactly once

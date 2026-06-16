@@ -187,6 +187,15 @@ hf_compile_shaders(
     # identical scene via the per-material bound path. Not in the Metal MSL gen list.
     "shaders/lit_bindless.vert.hlsl:vs"
     "shaders/lit_bindless.frag.hlsl:ps"
+    # Fully-GPU-driven pass (Slice CB, MDI + bindless capstone): the GPU-driven lit vertex reads the
+    # per-draw model+material+texIndex from a storage buffer indexed by gl_DrawID (SPIR-V DrawIndex, BM)
+    # and passes texIndex flat; the fragment samples the base color from the unbounded gTextures[] array
+    # via NonUniformResourceIndex(texIndex) (SPV_EXT_descriptor_indexing, BZ). ONE DrawIndexedMultiIndirect
+    # + ONE BindBindlessTextures draws the whole multi-material scene. VULKAN-ONLY (DXC emits BOTH
+    # DrawParameters AND descriptor-indexing); the Metal golden renders the identical scene via the
+    # per-object bound path. Not in the Metal MSL gen list (glslc can't lower DrawIndex).
+    "shaders/lit_gpudriven.vert.hlsl:vs"
+    "shaders/lit_gpudriven.frag.hlsl:ps"
     # Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like
     # SSR, then view->world via invView), projects it into the decal box, and alpha-blends the decal

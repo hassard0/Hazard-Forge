@@ -41,6 +41,7 @@
 #include "render/gpu_cull.h"
 #include "render/mdi.h"   // Slice BM: GPU multi-draw-indirect batch builder (pure CPU)
 #include "render/bindless.h"  // Slice BZ: bindless texture-index table (pure CPU)
+#include "render/gpu_driven.h"  // Slice CB: combined MDI+bindless GPU-driven batch builder (pure CPU)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
@@ -351,6 +352,7 @@ int main(int argc, char** argv) {
     int mtWorkers = 4;                       // --mt-shot ... --workers N (default 4)
     const char* mdiShotPath = nullptr;       // --mdi-shot <out.bmp> (Slice BM: multi-draw-indirect)
     const char* bindlessShotPath = nullptr;  // --bindless-shot <out.bmp> (Slice BZ: bindless textures)
+    const char* gpuDrivenShotPath = nullptr; // --gpudriven-shot <out.bmp> (Slice CB: MDI + bindless capstone)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -716,6 +718,17 @@ int main(int argc, char** argv) {
             // ASSERTS the two captures are BYTE-IDENTICAL (SHA) — the render-invariance proof. Prints
             // `bindless: {textures:T, draws:D, textureBinds:1, refTextureBinds:T}`. One BMP -> exit.
             bindlessShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--gpudriven-shot") == 0 && i + 1 < argc) {
+            // Slice CB: fully-GPU-driven pass (MDI + bindless capstone). A 100-object multi-material grid
+            // (5 textures) is rendered with ONE DrawIndexedMultiIndirect(drawCount=100) + ONE bindless
+            // array bind: the per-draw model+material+texIndex come from a storage buffer indexed by
+            // gl_DrawID (lit_gpudriven.vert) and the fragment samples gTextures[NonUniformResourceIndex(
+            // texIndex)] (lit_gpudriven.frag). The run ALSO renders the IDENTICAL scene via the per-object
+            // per-material BOUND path (push-constant lit.vert + BindMaterial, the SAME model+texture) and
+            // ASSERTS the two captures are BYTE-IDENTICAL (SHA) — the capstone render-invariance proof.
+            // Prints `gpudriven: {objects:100, drawCalls:1, textureBinds:1, refDrawCalls:100,
+            // refTextureBinds:101}`. One BMP -> exit. New golden gpudriven.png.
+            gpuDrivenShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             mtWorkers = std::atoi(argv[i + 1]);
             if (mtWorkers < 1) mtWorkers = 1;
@@ -5402,6 +5415,411 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — multi-texture scene via ONE bindless array\n",
                                 bindlessShotPath, bw, bh);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", bindlessShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Fully-GPU-driven pass (--gpudriven-shot <out.bmp>, Slice CB: MDI + bindless capstone): a
+        // 100-object multi-material grid (10x10 alternating cube/sphere, 5 distinct base-color textures)
+        // is rendered with ONE DrawIndexedMultiIndirect(drawCount=100) AND ONE bindless array bind. The
+        // combined builder (render/gpu_driven.h) composes BM (the N VkDrawIndexedIndirectCommand into one
+        // indirect buffer + a PerDraw[ ] storage buffer of model+material) with BZ (each PerDraw also
+        // carries a texIndex = bindless::Intern of that object's texture; the bindless array is filled
+        // with table.textures IN ORDER). lit_gpudriven.vert reads PerDraw[gl_DrawID].{model,material,
+        // texIndex} (SPIR-V DrawIndex) and passes texIndex flat; lit_gpudriven.frag samples
+        // gTextures[NonUniformResourceIndex(texIndex)] (descriptor-indexing). The run ALSO renders the
+        // IDENTICAL scene via the per-object per-material BOUND path (push-constant lit.vert + BindMaterial,
+        // the SAME model+material AND the SAME texture this texIndex selects) and ASSERTS the two captures
+        // are BYTE-IDENTICAL (the capstone proof: one MDI call + one bindless bind == N per-object per-
+        // material bound draws). Prints `gpudriven: {objects:100, drawCalls:1, textureBinds:1,
+        // refDrawCalls:100, refTextureBinds:101}`. The GPU-driven capture becomes gpudriven.png. One BMP
+        // -> exit. Existing goldens untouched. ----
+        if (gpuDrivenShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+            scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+            // --- The distinct base-color textures: 4 solid tints + the shared checkerboard = 5 distinct
+            // textures (matches the gpu_driven_test palette size). Owned for the run's lifetime. ---
+            auto makeSolid = [&](uint8_t r, uint8_t g, uint8_t b) {
+                std::vector<uint8_t> px(32 * 32 * 4);
+                for (size_t p = 0; p < 32 * 32; ++p) {
+                    px[p * 4 + 0] = r; px[p * 4 + 1] = g; px[p * 4 + 2] = b; px[p * 4 + 3] = 255;
+                }
+                return device->CreateTexture({32, 32, rhi::Format::RGBA8_UNorm, px.data(), px.size()});
+            };
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto checkerTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            std::vector<std::unique_ptr<rhi::ITexture>> palette;
+            palette.push_back(makeSolid(220, 70, 70));    // red
+            palette.push_back(makeSolid(70, 200, 90));    // green
+            palette.push_back(makeSolid(80, 110, 230));   // blue
+            palette.push_back(makeSolid(230, 200, 60));   // yellow
+            // texList[idx % 5] selects: 0..3 = the four solids, 4 = the checker.
+            std::vector<rhi::ITexture*> texList = {
+                palette[0].get(), palette[1].get(), palette[2].get(), palette[3].get(), checkerTex.get()};
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            // --- The scene objects: a 10x10 grid of alternating cube/sphere; each object's base-color
+            // texture cycles the 5-texture palette (so every texture appears AND many objects share each
+            // -> dedup). Identical placement to the gpu_driven_test scene. ---
+            struct GObj { const scene::Mesh* mesh; Mat4 model; float tint; rhi::ITexture* tex; };
+            std::vector<GObj> objs;
+            std::vector<render::gpudriven::GpuDrivenObject> drawObjs;
+            const int kGrid = 10;
+
+            // A COMBINED vertex + index buffer (cube THEN sphere), so each object's draw is one slice of
+            // the SAME buffers — exactly what ONE multi-draw-indirect reads (BM combined geometry).
+            scene::MeshGeometry cubeGeo = scene::CubeGeometry();
+            scene::MeshGeometry sphGeo  = scene::SphereGeometry();
+            const uint32_t cubeVtxCount = (uint32_t)cubeGeo.verts.size();
+            const uint32_t cubeIdxCount = (uint32_t)cubeGeo.indices.size();
+            const uint32_t sphIdxCount  = (uint32_t)sphGeo.indices.size();
+            std::vector<scene::Vertex> allVerts = cubeGeo.verts;
+            allVerts.insert(allVerts.end(), sphGeo.verts.begin(), sphGeo.verts.end());
+            std::vector<uint32_t> allIdx = cubeGeo.indices;
+            allIdx.insert(allIdx.end(), sphGeo.indices.begin(), sphGeo.indices.end());
+
+            for (int gz = 0; gz < kGrid; ++gz) {
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    int idx = gz * kGrid + gx;
+                    float fx = (float)(gx - kGrid / 2) * 1.5f + 0.75f;
+                    float fz = (float)(gz - kGrid / 2) * 1.5f + 0.75f;
+                    float bob = 0.35f * std::sin((float)idx * 0.7f);
+                    Mat4 m = Mat4::Translate({fx, 0.7f + bob, fz}) * Mat4::Scale({0.45f, 0.45f, 0.45f});
+                    float tint = 0.35f + 0.5f * (float)((idx * 37) % 100) / 100.0f;
+                    const bool isSphere = (idx & 1) != 0;
+                    rhi::ITexture* tex = texList[(size_t)idx % texList.size()];
+                    objs.push_back({isSphere ? &sphereMesh : &cubeMesh, m, tint, tex});
+
+                    render::gpudriven::GpuDrivenObject d{};
+                    d.indexCount   = isSphere ? sphIdxCount  : cubeIdxCount;
+                    d.firstIndex   = isSphere ? cubeIdxCount : 0u;
+                    d.vertexOffset = isSphere ? cubeVtxCount : 0u;
+                    for (int k = 0; k < 16; ++k) d.model[k] = m.m[k];
+                    d.material[0] = 0.0f; d.material[1] = tint; d.material[2] = 0.0f; d.material[3] = 0.0f;
+                    d.texture = tex;
+                    drawObjs.push_back(d);
+                }
+            }
+            const uint32_t kObjects = (uint32_t)objs.size();
+
+            // --- Build the combined GPU-driven batch (pure CPU): N MDI commands + N PerDraw (model+
+            // material+texIndex) + the deduplicated bindless table. The GROUND uses the checker too
+            // (interned into the SAME table so its texIndex is consistent). ---
+            render::gpudriven::GpuDrivenBatch batch = render::gpudriven::BuildBatch(drawObjs);
+            uint32_t groundTexIndex = render::bindless::Intern(batch.table, checkerTex.get());
+            const uint32_t kTextures = batch.table.size();
+
+            rhi::BufferDesc vbDesc; vbDesc.size = allVerts.size() * sizeof(scene::Vertex);
+            vbDesc.initialData = allVerts.data(); vbDesc.usage = rhi::BufferUsage::Vertex;
+            auto comboVB = device->CreateBuffer(vbDesc);
+            rhi::BufferDesc ibDesc; ibDesc.size = allIdx.size() * sizeof(uint32_t);
+            ibDesc.initialData = allIdx.data(); ibDesc.usage = rhi::BufferUsage::Index;
+            auto comboIB = device->CreateBuffer(ibDesc);
+
+            rhi::BufferDesc cmdDesc;
+            cmdDesc.size = batch.commands.size() * sizeof(render::mdi::MdiCommand);
+            cmdDesc.initialData = batch.commands.data();
+            cmdDesc.usage = rhi::BufferUsage::Indirect;
+            auto cmdBuffer = device->CreateBuffer(cmdDesc);
+
+            rhi::BufferDesc pdDesc;
+            pdDesc.size = batch.perDraw.size() * sizeof(render::gpudriven::GpuDrivenPerDraw);
+            pdDesc.initialData = batch.perDraw.data();
+            pdDesc.usage = rhi::BufferUsage::Storage;
+            auto perDrawBuffer = device->CreateBuffer(pdDesc);
+
+            // --- The ONE bindless texture set from the table's texture array (bound once). ---
+            std::vector<rhi::ITexture*> bindlessTexList(batch.table.textures.begin(),
+                                                        batch.table.textures.end());
+            auto bindlessSet = device->CreateBindlessTextureSet(
+                std::span<rhi::ITexture* const>(bindlessTexList.data(), bindlessTexList.size()));
+            if (!bindlessSet) {
+                std::fprintf(stderr, "FATAL: CreateBindlessTextureSet returned null (no bindless support)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Pipelines. The fully-GPU-driven lit (lit_gpudriven.vert reads PerDraw[gl_DrawID];
+            // lit_gpudriven.frag samples gTextures[NonUniformResourceIndex(texIndex)]) needs BOTH the
+            // per-draw set (set 2) AND the bindless set (set 4): usesPerDrawData + usesBindlessTextures.
+            // The per-object reference lit (lit.vert + lit.frag, push constant + BindMaterial). Plus the
+            // shared static shadow, sky, post. ---
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+
+            auto gdVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_gpudriven.vert.hlsl.spv");
+            auto gdVs = device->CreateShaderModule({std::span<const uint32_t>(gdVsWords)});
+            auto gdFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_gpudriven.frag.hlsl.spv");
+            auto gdFs = device->CreateShaderModule({std::span<const uint32_t>(gdFsWords)});
+
+            rhi::GraphicsPipelineDesc gdDesc;
+            gdDesc.vertex = gdVs.get(); gdDesc.fragment = gdFs.get();
+            gdDesc.vertexLayout = scene::MeshVertexLayout();
+            gdDesc.colorFormat = device->Swapchain().ColorFormat();
+            gdDesc.depthTest = true; gdDesc.usesFrameUniforms = true; gdDesc.usesTexture = true;
+            gdDesc.usesPerDrawData = true;        // set 2: the PerDraw SSBO read by gl_DrawID (BM)
+            gdDesc.usesBindlessTextures = true;   // set 4: the bindless texture array (BZ)
+            gdDesc.pushConstantSize = 0;          // model+material+texIndex all come from PerDraw
+            auto gdPipeline = device->CreateGraphicsPipeline(gdDesc);
+
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            scene::Transform groundXform; groundXform.scale = {12.0f, 1.0f, 12.0f};
+            Mat4 groundModel = groundXform.Matrix();
+
+            const Vec3 eye{0.0f, 12.0f, 15.0f};
+            const Vec3 center{0.0f, 0.5f, 0.0f};
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            FrameData fd{};
+            {
+                runtime::Camera cam;
+                cam.position = eye;
+                Vec3 dir = math::normalize(center - eye);
+                cam.yaw = std::atan2(dir.x, -dir.z);
+                cam.SetPitch(std::asin(dir.y));
+                cam.fovY = 0.9599311f;  // 55 degrees
+                cam.aspect = aspect;
+                cam.znear = 0.5f; cam.zfar = 80.0f;
+                Mat4 vp = cam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDirVec * 26.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-13.0f, 13.0f, -13.0f, 13.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            // Shadow pass (identical for both renders): ground + every object casts a shadow.
+            auto recordShadow = [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(planeMesh.vertices());
+                cmd.BindIndexBuffer(planeMesh.indices());
+                cmd.DrawIndexed(planeMesh.indexCount());
+                for (const auto& ob : objs) {
+                    cmd.PushConstants(ob.model.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(ob.mesh->vertices());
+                    cmd.BindIndexBuffer(ob.mesh->indices());
+                    cmd.DrawIndexed(ob.mesh->indexCount());
+                }
+                cmd.EndRenderPass();
+            };
+
+            // === Render ONE frame and return its captured pixels. `gpuDriven` selects the object draw
+            // path + counts draw calls / texture binds for the WHOLE object grid:
+            //   true  -> ONE BindBindlessTextures + ONE DrawIndexedMultiIndirect(N) (drawCalls=1,
+            //            textureBinds=1) over lit_gpudriven.{vert,frag}.
+            //   false -> a per-material BindMaterial + a per-object DrawIndexed (refDrawCalls=N,
+            //            refTextureBinds=N+1 incl. the ground material) over the push-constant lit path.
+            // Everything else (camera, shadow, sky, ground geometry, post, frame uniforms) is identical,
+            // so the ONLY thing under test is the fully-GPU-driven pass vs per-object per-material bound. ===
+            auto renderFrame = [&](bool gpuDriven, std::vector<uint8_t>& outPx,
+                                   uint32_t& outW, uint32_t& outH,
+                                   uint32_t& outDraws, uint32_t& outTexBinds) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow}, recordShadow);
+
+                uint32_t drawCalls = 0;
+                uint32_t texBinds = 0;
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        // Ground (identical in both paths): the per-object bound lit pipeline draws the
+                        // ground with the checker bound, the SAME push constant model+material. This is
+                        // outside the GPU-driven object grid (the grid is what the MDI call covers), so
+                        // both paths draw it the same way and it stays byte-identical.
+                        cmd.BindPipeline(*litPipeline);
+                        cmd.BindMaterial(*checkerTex, *flatNormal);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(planeMesh.vertices());
+                            cmd.BindIndexBuffer(planeMesh.indices());
+                            cmd.DrawIndexed(planeMesh.indexCount());
+                        }
+                        if (gpuDriven) {
+                            // THE fully-GPU-driven pass: ONE bindless array bind + ONE multi-draw-indirect
+                            // over the combined buffers. PerDraw[gl_DrawID] supplies model+material+texIndex.
+                            cmd.BindPipeline(*gdPipeline);
+                            // The GPU-driven frag still samples the NORMAL MAP from set 1 (binding 3/4),
+                            // like lit.frag — bind ONE material set carrying the flat normal map (its
+                            // base-color binding is ignored by the GPU-driven frag). Per-SCENE, not
+                            // per-material; not counted as a base-color texture bind.
+                            cmd.BindMaterial(*checkerTex, *flatNormal);
+                            cmd.BindBindlessTextures(*bindlessSet);
+                            ++texBinds;   // the single bindless array bind
+                            cmd.BindPerDrawData(*perDrawBuffer);
+                            cmd.BindVertexBuffer(*comboVB);
+                            cmd.BindIndexBuffer(*comboIB);
+                            cmd.DrawIndexedMultiIndirect(*cmdBuffer, kObjects,
+                                                         (uint32_t)sizeof(render::mdi::MdiCommand));
+                            drawCalls = 1;
+                        } else {
+                            // The per-object per-material BOUND reference: BindMaterial(objTex, flatNormal)
+                            // + a DrawIndexed per object, the SAME model+material pushed as the constant
+                            // and the SAME texture this object's texIndex selects -> same texels.
+                            cmd.BindPipeline(*litPipeline);
+                            cmd.BindVertexBuffer(*comboVB);
+                            cmd.BindIndexBuffer(*comboIB);
+                            for (uint32_t i = 0; i < kObjects; ++i) {
+                                const GObj& ob = objs[i];
+                                const render::gpudriven::GpuDrivenPerDraw& pd = batch.perDraw[i];
+                                const render::mdi::MdiCommand& c = batch.commands[i];
+                                cmd.BindMaterial(*ob.tex, *flatNormal);
+                                ++texBinds;
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = pd.model[k];
+                                pc[16] = pd.material[0]; pc[17] = pd.material[1];
+                                pc[18] = pd.material[2]; pc[19] = pd.material[3];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+                                ++drawCalls;
+                            }
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                outDraws = drawCalls;
+                outTexBinds = texBinds;
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // --- Render the fully-GPU-driven path AND the per-object per-material BOUND reference; assert
+            // BYTE-IDENTICAL. The ref counts ONE extra texture bind for the ground (101 = 100 + ground). ---
+            std::vector<uint8_t> gdPx, refPx;
+            uint32_t gw = 0, gh = 0, rw = 0, rh = 0;
+            uint32_t gDraws = 0, rDraws = 0, gBinds = 0, rBinds = 0;
+            if (!renderFrame(/*gpuDriven=*/true, gdPx, gw, gh, gDraws, gBinds)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (GPU-driven render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderFrame(/*gpuDriven=*/false, refPx, rw, rh, rDraws, rBinds)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (bound reference render)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+            uint64_t gdHash = fnv(gdPx), refHash = fnv(refPx);
+            // refTextureBinds: 101 = 100 per-object material binds + the ground material bind. The
+            // GPU-driven path: drawCalls=1, textureBinds=1 (the single bindless array bind for the grid).
+            const uint32_t refTexBinds = kObjects + 1;  // 101 (100 objects + ground)
+            std::printf("gpudriven: {objects:%u, drawCalls:1, textureBinds:1, refDrawCalls:%u, refTextureBinds:%u}\n",
+                        kObjects, rDraws, refTexBinds);
+            std::printf("gpudriven-hash: %016llx  ref-hash: %016llx  (textures:%u, gpuDrivenBinds:%u, refBoundBinds:%u)\n",
+                        (unsigned long long)gdHash, (unsigned long long)refHash, kTextures, gBinds, rBinds);
+            (void)groundTexIndex;
+
+            const bool identical = (gw == rw) && (gh == rh) && (gdPx.size() == refPx.size()) &&
+                                   (std::memcmp(gdPx.data(), refPx.data(), gdPx.size()) == 0);
+            if (!identical) {
+                std::fprintf(stderr,
+                    "FATAL: GPU-driven render != per-object per-material bound reference (combined per-draw "
+                    "gl_DrawID model/texIndex wrong?) — gpudriven-hash %016llx vs ref-hash %016llx\n",
+                    (unsigned long long)gdHash, (unsigned long long)refHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("gpudriven==bound: BYTE-IDENTICAL (%u objects in 1 MDI call + 1 bindless bind vs "
+                        "%u per-object per-material bound draws)\n", kObjects, rDraws);
+
+            // The GPU-driven capture is the golden (identical to the bound reference by the assert above).
+            bool ok = WriteBMP(gpuDrivenShotPath, gdPx, gw, gh);
+            if (ok) std::printf("wrote %s (%ux%u) — multi-material scene via ONE MDI call + ONE bindless bind\n",
+                                gpuDrivenShotPath, gw, gh);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gpuDrivenShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

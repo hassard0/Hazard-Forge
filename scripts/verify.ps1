@@ -97,6 +97,7 @@ $Goldens = @(
     @{ Name = 'gpu_cull';      Flag = '--gpu-cull' }             # Slice AR (GPU-driven culling + indirect draw)
     @{ Name = 'mdi';           Flag = '--mdi' }                  # Slice BM (GPU multi-draw-indirect; Metal renders the identical scene per-object)
     @{ Name = 'bindless';      Flag = '--bindless' }            # Slice BZ (bindless textures; Metal renders the identical multi-texture scene per-material bound)
+    @{ Name = 'gpudriven';     Flag = '--gpudriven' }           # Slice CB (fully-GPU-driven pass: MDI + bindless; Metal renders the identical multi-material scene per-object bound)
     @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'net';           Flag = '--net' }                 # Slice BQ (replication; replica reconstructs + renders the scene)
@@ -264,7 +265,7 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 `$env:VK_VALIDATION_FEATURE_ENABLE = 'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION'
 # Representative showcases: --shot (GPU particles + shared-base/varied-normal materials, where the
 # UPDATE_AFTER_BIND bug lived) and --csm-shot (cascaded shadow atlas, a heavy multi-pass graph path).
-`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'))
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))
