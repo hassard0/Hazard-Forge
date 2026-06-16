@@ -413,6 +413,26 @@ void MetalCommandBuffer::ComputeToVertexBarrier() {
     }
 }
 
+void MetalCommandBuffer::ComputeToComputeBarrier() {
+    // Slice CS froxel inject -> integrate. Close the compute encoder so the NEXT BindComputePipeline
+    // opens a fresh compute encoder; Metal's tracked-hazard model orders the second encoder's reads of
+    // the storage volume after the first encoder's writes. (Same ordering-by-encoder-boundary discipline
+    // as ComputeToVertexBarrier — the boundary is the dependency point, no explicit barrier object.)
+    if (computeEncoder_) {
+        [computeEncoder_ endEncoding];
+        computeEncoder_ = nil;
+    }
+}
+
+void MetalCommandBuffer::ComputeToFragmentBarrier() {
+    // Slice CS froxel integrate -> apply. Close the compute encoder so the following render encoder's
+    // fragment reads of the integrated volume are ordered after the compute writes (tracked-hazard).
+    if (computeEncoder_) {
+        [computeEncoder_ endEncoding];
+        computeEncoder_ = nil;
+    }
+}
+
 void MetalCommandBuffer::ResourceBarrier(IRenderTarget& /*resource*/, ResourceState /*from*/,
                                          ResourceState /*to*/) {
     // Slice AS: HONEST NO-OP on Metal. The render graph's barrier solver computes the same inter-pass

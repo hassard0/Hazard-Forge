@@ -218,6 +218,16 @@ hf_gen_msl(water_composite.frag   water_composite.frag.hlsl   frag water_composi
 # compiled here makes the AO bit-identical to the Vulkan/CPU path; radius==0 -> AO==1 -> byte-identical
 # to the no-AO render. Behind --gtao only; existing ssao/ssr shaders + goldens untouched.
 hf_gen_msl(gtao.frag              gtao.frag.hlsl              frag gtao_fragment)
+# Froxel Volumetric Fog (Slice CS): a true 3D view-space froxel volume. froxel_inject.comp writes
+# per-froxel (scatter, extinction) from the render/froxel.h height-density + HG phase; froxel_integrate.comp
+# marches each Z column front-to-back via IntegrateStep into (inScatter, transmittance); froxel_apply.frag
+# samples the integrated volume at each pixel's view-depth slice (ViewZToSlice) + composites scene*T +
+# inScatter. The SAME render/froxel.h math compiled here makes the fog bit-identical to the Vulkan/CPU
+# path; baseDensity==0 -> T==1, inScatter==0 -> byte-identical to the no-fog render. Behind --froxelfog
+# only; existing shaders + goldens untouched.
+hf_gen_msl(froxel_inject.comp     froxel_inject.comp.hlsl     comp froxel_inject_main)
+hf_gen_msl(froxel_integrate.comp  froxel_integrate.comp.hlsl  comp froxel_integrate_main)
+hf_gen_msl(froxel_apply.frag      froxel_apply.frag.hlsl      frag froxel_apply_fragment)
 # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer + lit HDR scene; ssgi.frag
 # traces K cosine-hemisphere rays and marches the depth buffer (same march as ssr.frag) for indirect
 # diffuse, ssgi_composite ADDS it over the scene + tonemaps. Same HLSL->SPIR-V->MSL toolchain.

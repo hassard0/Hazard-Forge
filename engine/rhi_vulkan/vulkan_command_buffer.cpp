@@ -398,6 +398,34 @@ void VulkanCommandBuffer::ComputeToVertexBarrier() {
     vkCmdPipelineBarrier2(cmd_, &di);
 }
 
+void VulkanCommandBuffer::ComputeToComputeBarrier() {
+    // Slice CS froxel inject -> integrate: the integrate pass READS the storage volume the inject pass
+    // WROTE. Compute storage-write -> compute storage-read on the whole pipeline (sync2 memory barrier).
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    b.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd_, &di);
+}
+
+void VulkanCommandBuffer::ComputeToFragmentBarrier() {
+    // Slice CS froxel integrate -> apply: the fullscreen apply FRAGMENT shader READS the integrated
+    // storage volume the integrate compute pass WROTE. Compute storage-write -> fragment storage-read.
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    b.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1;
+    di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd_, &di);
+}
+
 namespace {
 // Map a render-graph resource STATE to the Vulkan (layout, stage, access) triple for one side of an
 // image barrier. This is the backend half of the additive ResourceBarrier seam (Slice AS): the graph

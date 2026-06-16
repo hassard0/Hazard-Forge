@@ -58,6 +58,8 @@ public:
     void ComputePushConstants(const void* data, uint32_t size) override;
     void DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) override;
     void ComputeToVertexBarrier() override;
+    void ComputeToComputeBarrier() override;
+    void ComputeToFragmentBarrier() override;
     void ResourceBarrier(IRenderTarget& resource, ResourceState from, ResourceState to) override;
 
     id<MTLRenderCommandEncoder> encoder() const { return encoder_; }

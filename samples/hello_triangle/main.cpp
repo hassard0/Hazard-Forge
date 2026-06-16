@@ -38,6 +38,7 @@
 #include "render/post_stack.h"
 #include "render/clustered.h"
 #include "render/cluster.h"
+#include "render/froxel.h"
 #include "render/taa.h"
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
@@ -351,6 +352,7 @@ int main(int argc, char** argv) {
     const char* oitShotPath = nullptr;       // --oit-shot <out.bmp> (Slice CO: order-independent transparency)
     const char* pomShotPath = nullptr;       // --pom-shot <out.bmp> (Slice CP: parallax occlusion mapping)
     const char* gtaoShotPath = nullptr;      // --gtao-shot <out.bmp> (Slice CR: ground-truth ambient occlusion)
+    const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -678,6 +680,20 @@ int main(int argc, char** argv) {
             // Prints `gtao: {slices:N, steps:M, radius:R}`. One BMP -> exit. New golden; existing
             // lit/ssao/ssr/pom paths/shaders/goldens are untouched.
             gtaoShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--froxelfog-shot") == 0 && i + 1 < argc) {
+            // Slice CS: Froxel Volumetric Fog (sun single-scattering). A lit+shadowed scene (ground +
+            // objects) wrapped in a TRUE 3D view-space FROXEL volume: a compute pass (froxel_inject)
+            // writes per-froxel (scatter, extinction) from the render/froxel.h height-density + HG phase;
+            // a second compute pass (froxel_integrate) marches each Z column front-to-back via
+            // IntegrateStep into (inScatter, transmittance); a fullscreen apply (froxel_apply) samples the
+            // integrated volume at each pixel's view-depth slice (ViewZToSlice) and composites
+            // scene*T + inScatter -> distance haze + a sunlit in-scatter glow toward the sun, objects
+            // fogged by depth. CRITICAL: the SAME apply path is ALSO run at baseDensity=0 (T==1,
+            // inScatter==0) and asserted BYTE-IDENTICAL (SHA) to the no-fog render — the zero-density
+            // no-op proof (the inject->integrate->apply chain is a pure pass-through at zero density).
+            // Prints `froxel-fog: {froxels:DIMX*DIMY*DIMZ, density:D, g:G}`. One BMP -> exit. New golden
+            // froxel_fog.png; existing scene/sky/volumetric paths/shaders/goldens are untouched.
+            froxelFogShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -12298,6 +12314,450 @@ int main(int argc, char** argv) {
         // identity at zero occlusion (no bias, no off-by-one). Deterministic (fixed camera/radius/slices/
         // steps, baked per-pixel rotation, no RNG); two runs byte-identical. SEPARATE gtao pipeline +
         // the REUSED gbuffer/ssao_composite pipelines; existing ssao/ssr paths/shaders/goldens untouched.
+        // --- Froxel Volumetric Fog showcase (--froxelfog-shot, Slice CS): a lit+shadowed scene (ground +
+        // objects) wrapped in a TRUE 3D view-space FROXEL volume (the modern UE5/Frostbite architecture).
+        // Pipeline per render: shadow -> scene (HDR) -> gbuffer (view normal + linear depth) ->
+        // froxel_inject (COMPUTE, one thread per froxel: per-froxel scatter+extinction from render/froxel.h
+        // height-density + HG phase) -> [compute->compute barrier] -> froxel_integrate (COMPUTE, one thread
+        // per (x,y) column: front-to-back IntegrateStep into per-froxel inScatter+transmittance) ->
+        // [compute->fragment barrier] -> froxel_apply (fullscreen: per pixel ViewZToSlice the depth, sample
+        // the integrated volume, composite scene*T + inScatter) -> post (tonemap -> swapchain). The froxel
+        // volume is a FLAT SSBO (no new RHI seam); the apply binds it via the existing BindLightClusters
+        // fragment-storage path. THE ZERO-DENSITY NO-OP PROOF: the SAME apply chain at baseDensity=0
+        // (T==1, inScatter==0) is asserted BYTE-IDENTICAL (SHA) to a no-fog pass-through render — proving
+        // the inject->integrate->apply chain is a pure pass-through (no constant bias, no Z-slice
+        // off-by-one). Deterministic (fixed camera/sun/fog/grid, no RNG); two runs byte-identical.
+        if (froxelFogShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace fx = hf::render::froxel;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+
+            // === Froxel grid + fog params (fixed, deterministic). ===
+            const int   DIMX = 16, DIMY = 9, DIMZ = 64;
+            const float kNear = 0.5f, kFar = 80.0f;
+            const float kBaseDensity  = 0.06f;   // optical density at heightRef (1/world-distance)
+            const float kHeightFalloff = 0.12f;  // ground haze: thins with altitude
+            const float kHeightRef     = 0.0f;   // ground level
+            const float kG             = 0.76f;  // HG forward-scatter (sunlit glow toward the sun)
+            fx::FroxelGrid grid; grid.dimX = DIMX; grid.dimY = DIMY; grid.dimZ = DIMZ;
+            grid.zNear = kNear; grid.zFar = kFar;
+            const int nFroxels = grid.froxelCount();
+
+            // --- Lit / shadow / sky / gbuffer pipelines (UNCHANGED shaders, same as --gtao-shot). ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- Froxel inject + integrate COMPUTE pipelines (NEW; 2 storage buffers each). ---
+            auto injectCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/froxel_inject.comp.hlsl.spv");
+            auto injectCs = device->CreateShaderModule({std::span<const uint32_t>(injectCsW)});
+            rhi::ComputePipelineDesc injectCd;
+            injectCd.compute = injectCs.get();
+            injectCd.storageBufferCount = 2;
+            injectCd.threadsPerGroupX = 64;
+            auto injectCompute = device->CreateComputePipeline(injectCd);
+
+            auto integrateCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/froxel_integrate.comp.hlsl.spv");
+            auto integrateCs = device->CreateShaderModule({std::span<const uint32_t>(integrateCsW)});
+            rhi::ComputePipelineDesc integrateCd;
+            integrateCd.compute = integrateCs.get();
+            integrateCd.storageBufferCount = 2;
+            integrateCd.threadsPerGroupX = 64;
+            auto integrateCompute = device->CreateComputePipeline(integrateCd);
+
+            // --- Froxel apply (NEW fullscreen) + post (UNCHANGED tonemap) pipelines. ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct ApplyParams { float dims[4]; float range[4]; };   // dims.w = enable
+            auto applyFs = loadFs("froxel_apply.frag.hlsl");
+            auto postFs  = loadFs("post.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc applyD;
+            applyD.vertex = postVsM.get(); applyD.fragment = applyFs.get();
+            applyD.colorFormat = kHdr;
+            applyD.depthTest = false; applyD.usesTexture = true; applyD.usesLightClusters = true;
+            applyD.usesFrameUniforms = true;   // frame set 0 so the cluster volume set sits at index 3
+            applyD.fullscreen = true;
+            applyD.fragmentPushConstants = true; applyD.pushConstantSize = sizeof(ApplyParams);
+            auto applyPipe = device->CreateGraphicsPipeline(applyD);
+
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFs.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // --- Render targets. ---
+            auto rt    = device->CreateRenderTarget(w, h, kHdr);   // lit HDR scene
+            auto gbuf  = device->CreateRenderTarget(w, h, kHdr);   // view normal + linear depth
+            auto fogRT = device->CreateRenderTarget(w, h, kHdr);   // fog-composited HDR
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // --- Scene objects (deterministic): receding boxes/spheres so the depth-graded fog is clear. ---
+            struct Obj { Vec3 pos; Vec3 scale; bool cube; };
+            const Obj objs[] = {
+                {{-2.2f, 0.7f,  1.0f}, {0.7f, 0.7f, 0.7f}, true},    // near box
+                {{ 1.8f, 0.6f, -1.5f}, {0.6f, 0.6f, 0.6f}, false},   // mid sphere
+                {{-1.0f, 0.9f, -5.0f}, {0.9f, 0.9f, 0.9f}, true},    // far box
+                {{ 2.6f, 0.7f, -9.0f}, {0.7f, 0.7f, 0.7f}, false},   // farther sphere
+                {{-2.8f, 1.1f,-13.0f}, {1.1f, 1.1f, 1.1f}, true},    // distant box (heavy haze)
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            Mat4 groundModel = Mat4::Scale({20.0f, 1.0f, 20.0f});
+
+            // Camera looks down the -Z corridor toward the sun so the in-scatter glow is visible.
+            const Vec3 eye{0.0f, 2.4f, 7.0f};
+            const Vec3 center{0.0f, 0.8f, -8.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 projM = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+            // The sun travels toward -Z (and slightly down) so looking down the corridor faces the sun.
+            Vec3 sunTravel = math::normalize(Vec3{0.05f, -0.35f, -1.0f});
+            FrameData fd{};
+            {
+                Mat4 vp = projM * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0]=sunTravel.x; fd.lightDir[1]=sunTravel.y; fd.lightDir[2]=sunTravel.z;
+                fd.lightColor[0]=1.0f; fd.lightColor[1]=0.96f; fd.lightColor[2]=0.85f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.ptCount[0]=0.0f;
+                Vec3 sc{0.0f, 0.5f, -6.0f};
+                Vec3 lightEye = sc - sunTravel * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 44.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto objModel = [&](const Obj& o) {
+                return Mat4::Translate(o.pos) * Mat4::Scale(o.scale);
+            };
+
+            // --- Froxel params buffer (matches froxel_inject/integrate FroxelParams std430). dims(4) +
+            //     range(4) + sunDir(4) + sunColor(4) + fog(4) + invProj(16) + invView(16) floats. ---
+            struct FroxelParamsCPU {
+                uint32_t dims[4];
+                float    range[4];
+                float    sunDir[4];
+                float    sunColor[4];
+                float    fog[4];
+                float    invProj[16];
+                float    invView[16];
+            };
+            static_assert(sizeof(FroxelParamsCPU) == 16 + 16*4 + 64*2, "FroxelParams std430 layout");
+            FroxelParamsCPU fp{};
+            fp.dims[0]=(uint32_t)DIMX; fp.dims[1]=(uint32_t)DIMY; fp.dims[2]=(uint32_t)DIMZ; fp.dims[3]=0;
+            fp.range[0]=kNear; fp.range[1]=kFar;
+            fp.sunDir[0]=sunTravel.x; fp.sunDir[1]=sunTravel.y; fp.sunDir[2]=sunTravel.z;
+            fp.sunColor[0]=1.0f; fp.sunColor[1]=0.96f; fp.sunColor[2]=0.85f;
+            fp.fog[1]=kHeightFalloff; fp.fog[2]=kHeightRef; fp.fog[3]=kG;   // fog[0] set per-render
+            Mat4 invProj = projM.Inverse();
+            Mat4 invView = viewM.Inverse();
+            for (int k = 0; k < 16; ++k) { fp.invProj[k] = invProj.m[k]; fp.invView[k] = invView.m[k]; }
+
+            // The flat froxel volume SSBO (FroxelCell[nFroxels] = 32 bytes each) cleared to (0, T=1) — the
+            // inject overwrites scatterExt, the integrate overwrites resultT, so a fresh clear per render
+            // keeps the result a pure function of the params (deterministic).
+            std::vector<fx::FroxelCell> volInit((size_t)nFroxels);
+            for (auto& cell : volInit) {
+                cell.scatterExt[0]=cell.scatterExt[1]=cell.scatterExt[2]=cell.scatterExt[3]=0.0f;
+                cell.resultT[0]=cell.resultT[1]=cell.resultT[2]=0.0f; cell.resultT[3]=1.0f;
+            }
+            // A dummy storage buffer for the unused BindLightClusters slots (the apply only reads slot 0).
+            rhi::BufferDesc dummyDesc;
+            dummyDesc.size = 16; uint32_t dummyInit[4] = {0,0,0,0}; dummyDesc.initialData = dummyInit;
+            dummyDesc.usage = rhi::BufferUsage::Storage;
+            auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+            const uint32_t kInjectGroups   = ((uint32_t)nFroxels + 63u) / 64u;
+            const uint32_t kIntegrateGroups = ((uint32_t)(DIMX * DIMY) + 63u) / 64u;
+
+            ApplyParams ap{};
+            ap.dims[0]=(float)DIMX; ap.dims[1]=(float)DIMY; ap.dims[2]=(float)DIMZ;
+            ap.range[0]=kNear; ap.range[1]=kFar;
+
+            // Render the full scene through the froxel pipeline at a given baseDensity + apply-enable,
+            // capturing the swapchain pixels. baseDensity=0 -> inject writes zero scatter/extinction ->
+            // integrate is a per-step no-op -> apply T==1,L==0 -> out == scene. enable=0 -> apply passes
+            // the scene through directly (the no-fog reference). Both leave the scene untouched -> identical.
+            auto renderScene = [&](float baseDensity, float enable,
+                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                // (Re)create the params buffer with this render's fog density (the RHI has no buffer-update
+                // API; the params buffer is 192 bytes, so a fresh upload per render is cheap + deterministic).
+                fp.fog[0] = baseDensity;
+                rhi::BufferDesc fpDesc;
+                fpDesc.size = sizeof(FroxelParamsCPU);
+                fpDesc.initialData = &fp;
+                fpDesc.usage = rhi::BufferUsage::Storage;
+                auto fpBuf = device->CreateBuffer(fpDesc);
+                rhi::BufferDesc volDesc;
+                volDesc.size = volInit.size() * sizeof(fx::FroxelCell);
+                volDesc.initialData = volInit.data();
+                volDesc.usage = rhi::BufferUsage::Storage;
+                auto volBuf = device->CreateBuffer(volDesc);
+                ap.dims[3] = enable;
+
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgGbuf = graph.ImportTarget(
+                    "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+                render::RgResource rgFog = graph.ImportTarget(
+                    "fog", render::RgResourceKind::SceneColor, *fogRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            cmd.PushConstants(m.m, sizeof(float) * 16);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16]=0.0f; pc[17]=0.85f; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            pc[16]=0.0f; pc[17]=0.6f; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("gbuffer", {}, {rgGbuf},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*gbStaticPipeline);
+                        {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                // INJECT -> [barrier] -> INTEGRATE compute passes, then the fullscreen APPLY. The compute
+                // is recorded OUTSIDE a render pass; the barriers carry the SSBO write->read hazards
+                // (inject writes the volume, integrate reads+writes it, apply reads it in the fragment).
+                graph.AddPass("froxel", {rgScene, rgGbuf}, {rgFog},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));   // for the apply's frame set 0
+                        // inject: one thread per froxel.
+                        cmd.BindComputePipeline(*injectCompute);
+                        cmd.BindStorageBuffer(*volBuf, 0);
+                        cmd.BindStorageBuffer(*fpBuf, 1);
+                        cmd.DispatchCompute(kInjectGroups);
+                        cmd.ComputeToComputeBarrier();          // inject write -> integrate read
+                        // integrate: one thread per (x,y) column.
+                        cmd.BindComputePipeline(*integrateCompute);
+                        cmd.BindStorageBuffer(*volBuf, 0);
+                        cmd.BindStorageBuffer(*fpBuf, 1);
+                        cmd.DispatchCompute(kIntegrateGroups);
+                        cmd.ComputeToFragmentBarrier();         // integrate write -> apply fragment read
+                        // apply: fullscreen composite scene*T + inScatter into the fog RT.
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*applyPipe);
+                        cmd.BindTexturePair(*rt, *gbuf);        // scene (t0) + gbuffer (t3)
+                        cmd.BindLightClusters(*volBuf, *dummyBuf, *dummyBuf);   // volume SSBO (binding 13)
+                        cmd.PushConstants(&ap, sizeof(ap));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgFog}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*fogRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE ZERO-DENSITY NO-OP PROOF.
+            //   fogPx   — the REAL baseDensity>0 froxel fog: the golden (haze + sunlit in-scatter glow).
+            //   zeroPx  — baseDensity=0 (full inject->integrate->apply chain; T==1, inScatter==0), enable=1.
+            //   noFogPx — apply enable=0 (the chain runs but the apply passes the scene through).
+            // zeroPx and noFogPx both leave out == scene, so they MUST be BYTE-IDENTICAL — proving the
+            // froxel chain is a pure pass-through at zero density (no constant bias, no Z-slice off-by-one).
+            std::vector<uint8_t> fogPx, zeroPx, noFogPx;
+            uint32_t fw=0, fh=0, zw=0, zh=0, nw=0, nh=0;
+            if (!renderScene(kBaseDensity, 1.0f, fogPx, fw, fh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (froxel fog density>0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(0.0f, 1.0f, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (froxel fog density=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(kBaseDensity, 0.0f, noFogPx, nw, nh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (no-fog reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t zeroHash = fnv(zeroPx), noFogHash = fnv(noFogPx), fogHash = fnv(fogPx);
+            std::printf("froxel density=0 hash: %016llx  no-fog hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)noFogHash);
+            const bool zeroEquivalent = (zw == nw) && (zh == nh) && (zeroPx.size() == noFogPx.size()) &&
+                                        (std::memcmp(zeroPx.data(), noFogPx.data(), noFogPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: froxel density=0 render != no-fog render — the inject->integrate->apply chain "
+                    "is NOT a pure pass-through at zero density (Z-slice off-by-one / constant bias / "
+                    "integration-normalization bug). density=0 %016llx vs no-fog %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)noFogHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("froxel density=0 == no-fog scene: BYTE-IDENTICAL (zero-density no-op proof)\n");
+            std::printf("froxel-fog: {froxels:%dx%dx%d, density:%.4g, g:%.4g}\n",
+                        DIMX, DIMY, DIMZ, (double)kBaseDensity, (double)kG);
+            // Sanity: the real fog render must DIFFER from the no-fog render (the fog actually shows).
+            if (fogHash == noFogHash)
+                std::fprintf(stderr, "WARNING: froxel density>0 render is identical to the no-fog render "
+                                     "(no visible fog) — check the density / scene\n");
+
+            bool ok = WriteBMP(froxelFogShotPath, fogPx, fw, fh);
+            if (ok) std::printf("wrote %s (%ux%u) — froxel fog, %dx%dx%d froxels, density %.4g, g %.4g, "
+                                "%d objects\n",
+                                froxelFogShotPath, fw, fh, DIMX, DIMY, DIMZ,
+                                (double)kBaseDensity, (double)kG, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", froxelFogShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         if (gtaoShotPath) {
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();

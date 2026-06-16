@@ -199,6 +199,16 @@ hf_add_pure_test(pom_test)
 # ASan-eligible.
 hf_add_pure_test(gtao_test)
 
+# Froxel Volumetric Fog (Slice CS): the exponential Z-slice mapping + its EXACT inverse
+# (ViewZToSlice(SliceZ(k)) == k — the apply's depth->slice sampling correctness, an off-by-one here
+# breaks the density=0==scene proof), SliceZ monotone + [zNear,zFar] coverage, height-fog density
+# (falloff, baseDensity==0 -> 0 EXACTLY, non-negative), the Henyey-Greenstein phase (forward-peak,
+# isotropic at g=0, finite), and the front-to-back single-scatter IntegrateStep (zero-density NO-OP ->
+# T==1 & inScatter==0, constant-sigma -> exp(-sigma*L) analytic Beer-Lambert, transmittance monotone,
+# near-vs-far scatter weighting), plus determinism. The same froxel.h math is mirrored VERBATIM in
+# froxel_inject/integrate/apply. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(froxel_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so

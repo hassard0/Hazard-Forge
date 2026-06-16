@@ -298,6 +298,17 @@ hf_compile_shaders(
     # post.vert (fullscreen triangle); applies the configured effects (tonemap/colorgrade/chromatic/
     # vignette/grain) in order from a push-constant effect list. Shared math with engine/render/post_stack.h.
     "shaders/post_stack.frag.hlsl:ps"
+    # Froxel Volumetric Fog (Slice CS): a true 3D view-space froxel volume (inject -> integrate ->
+    # depth-composited apply). froxel_inject.comp writes per-froxel (scatter, extinction) from the
+    # render/froxel.h height-density + HG phase; froxel_integrate.comp marches each Z column front-to-back
+    # via IntegrateStep into (inScatter, transmittance); froxel_apply.frag (fullscreen, reuses post.vert)
+    # samples the integrated volume at each pixel's view-depth slice (ViewZToSlice) and composites
+    # scene*T + inScatter. The volume is a FLAT SSBO (no new RHI seam). With baseDensity==0 the apply is a
+    # pure pass-through (T==1, inScatter==0) -> byte-identical to the no-fog scene. New golden
+    # froxel_fog.png; existing shaders + goldens untouched (incl. the 2D light-shaft volumetric.png).
+    "shaders/froxel_inject.comp.hlsl:cs"
+    "shaders/froxel_integrate.comp.hlsl:cs"
+    "shaders/froxel_apply.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

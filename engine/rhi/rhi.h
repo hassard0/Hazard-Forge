@@ -386,6 +386,18 @@ public:
     virtual void DispatchCompute(uint32_t /*groupsX*/, uint32_t groupsY = 1, uint32_t groupsZ = 1) {}
     // Barrier so a later vertex stage reads the storage buffer the compute stage just wrote.
     virtual void ComputeToVertexBarrier() {}
+    // Barrier so a later COMPUTE stage reads the storage buffer an earlier compute stage just wrote
+    // (Slice CS froxel inject -> integrate: integrate reads the injected volume). Vulkan: a
+    // COMPUTE_SHADER write -> COMPUTE_SHADER read memory barrier. Metal: close the open compute encoder
+    // (the next BindComputePipeline opens a fresh encoder; Metal's tracked-hazard model orders the
+    // cross-encoder storage-buffer dependency). Default no-op so backends without compute still link.
+    virtual void ComputeToComputeBarrier() {}
+    // Barrier so a later FRAGMENT stage reads the storage buffer the compute stage just wrote (Slice CS
+    // froxel integrate -> apply: the fullscreen apply fragment samples the integrated volume SSBO).
+    // Vulkan: a COMPUTE_SHADER storage-write -> FRAGMENT_SHADER storage-read memory barrier. Metal:
+    // close the open compute encoder (the render encoder reads the buffer; tracked-hazard orders it).
+    // Default no-op so backends/passes without this dependency still link.
+    virtual void ComputeToFragmentBarrier() {}
 
     // --- Render-graph automatic barriers (Slice AS) --------------------------
     // Transition a render-target image from one resource STATE to another. The render graph's barrier
