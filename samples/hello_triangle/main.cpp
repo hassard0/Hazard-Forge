@@ -45,6 +45,7 @@
 #include "render/gpu_driven.h"  // Slice CB: combined MDI+bindless GPU-driven batch builder (pure CPU)
 #include "render/gpu_culled.h"  // Slice CD: compute cull+compact CPU mirror (ordered, model+material+texIndex)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
+#include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -342,6 +343,7 @@ int main(int argc, char** argv) {
     const char* pointShotPath = nullptr;     // --point-shadow-shot <out.bmp> (Slice AF: omni point)
     const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
+    const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
     const char* ssgiTemporalShotPath = nullptr; // --ssgi-temporal-shot <out.bmp> (Slice BV: temporal SSGI accumulation)
@@ -611,6 +613,15 @@ int main(int argc, char** argv) {
             // reflections of the objects on the floor, then a composite blends + tonemaps. One BMP ->
             // exit. New golden; existing lit/ssao/bloom paths/shaders/goldens are untouched.
             ssrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
+            // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
+            // at the water level + a procedural sky + directional light. The opaque scene is rendered
+            // into an HDR RGBA16F target + a view-space normal+linear-depth g-buffer (reusing the SSAO
+            // gbuffer shaders); then a Gerstner WATER grid is drawn on top (water.vert displaces it at a
+            // FIXED wave time, water.frag fresnel-blends a SKY reflection + a depth-tinted REFRACTION of
+            // the scene-color RT + a sun glint), and a composite blends + tonemaps. One BMP -> exit. New
+            // golden; existing lit/ssao/ssr/bloom paths/shaders/goldens are untouched.
+            waterShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--ssgi-shot") == 0 && i + 1 < argc) {
             // Slice BP: screen-space global illumination showcase. A Cornell-style COLOR-BLEED scene —
             // saturated red + green vertical panels flanking a neutral white floor/box — rendered into
@@ -7238,6 +7249,351 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — SSR, %d objects\n",
                                     ssrShotPath, cw, ch2, kNumObjs);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ssrShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Water rendering showcase (--water-shot, Slice CF): a few objects partially submerged at a
+        // water level, with a Gerstner water plane on top reflecting the procedural sky + refracting/
+        // absorbing the submerged scene + a sun glint. The opaque scene (sky + objects) renders into an
+        // HDR RT + a view-space normal+linear-depth g-buffer (the SAME gbuffer shaders SSR/SSGI use);
+        // then the water grid (water.vert displaces it by render::water::Displace at a FIXED time,
+        // water.frag computes render::water::Normal -> reflect view ray -> SkyColor + refract the
+        // scene-color RT tinted by render::water::RefractTint via the G-buffer depth + fresnel) draws
+        // into a water RT; a composite blends lerp(scene, water.rgb, water.a) + tonemaps. SEPARATE
+        // water/water_composite pipelines + shaders; existing lit/gbuffer/ssr/bloom + goldens untouched.
+        if (waterShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace water = render::water;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+            const float kWaterLevel = 0.0f;            // the water plane sits at y = 0
+
+            // The FIXED showcase wave set + time (deterministic; no clock/RNG). Shared with water.h.
+            water::WaveSet ws = water::ShowcaseWaves();
+            const float kWaveTime = water::kFixedTime;
+
+            // --- Scene objects: distinct colored cubes + spheres straddling the water line (so the
+            // lower part sits BELOW the water and is refracted/tinted, the top pokes above). ---
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-2.2f, 0.15f, -0.5f}, 0.8f, true,  {0.90f, 0.25f, 0.20f}},  // red cube
+                {{ 0.0f, 0.20f, -1.2f}, 0.9f, false, {0.25f, 0.85f, 0.35f}},  // green sphere
+                {{ 2.3f, 0.10f,  0.2f}, 0.7f, true,  {0.25f, 0.45f, 0.95f}},  // blue cube
+                {{-0.9f, 0.12f,  1.4f}, 0.6f, false, {0.95f, 0.80f, 0.25f}},  // yellow sphere
+                {{ 1.5f, 0.18f,  1.7f}, 0.8f, true,  {0.85f, 0.35f, 0.90f}},  // magenta cube
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky / g-buffer pipelines (UNCHANGED shaders), same as --ssr-shot. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs  = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs  = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- Water params struct (matches the shader WaterParams byte layout). ---
+            struct WaterParams {
+                float model[16];
+                float waveA[3][4];   // dir.x, dir.y, amplitude, wavelength
+                float waveB[3][4];   // steepness, speed, _, _
+                float cfg0[4];       // time, tanHalfFovY, aspect, waterLevel
+                float cfg1[4];       // fresnelF0, absorption, numWaves, _
+                float shallow[4];
+                float deep[4];
+                float texel[4];
+            };
+            struct WaterCompParams { float texel[2]; float intensity; float pad; };
+
+            // --- Water + composite pipelines. Water is a FORWARD draw (the displaced grid mesh) that
+            // ALSO reads FrameData (sky/light/camera) + the scene-color RT + g-buffer pair + fragment
+            // push constants — so usesFrameUniforms + usesTexture + fragmentPushConstants together. ---
+            auto waterVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/water.vert.hlsl.spv");
+            auto waterFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/water.frag.hlsl.spv");
+            auto waterVs = device->CreateShaderModule({std::span<const uint32_t>(waterVsW)});
+            auto waterFs = device->CreateShaderModule({std::span<const uint32_t>(waterFsW)});
+            rhi::GraphicsPipelineDesc waterD;
+            waterD.vertex = waterVs.get(); waterD.fragment = waterFs.get();
+            waterD.vertexLayout = scene::MeshVertexLayout();
+            waterD.colorFormat = kHdr;
+            waterD.depthTest = false; waterD.usesFrameUniforms = true; waterD.usesTexture = true;
+            waterD.fragmentPushConstants = true; waterD.pushConstantSize = sizeof(WaterParams);
+            auto waterPipe = device->CreateGraphicsPipeline(waterD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto wCompFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/water_composite.frag.hlsl.spv");
+            auto wCompFs = device->CreateShaderModule({std::span<const uint32_t>(wCompFsW)});
+            rhi::GraphicsPipelineDesc wCompD;
+            wCompD.vertex = postVsM.get(); wCompD.fragment = wCompFs.get();
+            wCompD.colorFormat = device->Swapchain().ColorFormat();
+            wCompD.depthTest = false; wCompD.usesTexture = true; wCompD.fullscreen = true;
+            wCompD.fragmentPushConstants = true; wCompD.pushConstantSize = sizeof(WaterCompParams);
+            auto wCompPipe = device->CreateGraphicsPipeline(wCompD);
+
+            // --- Render targets: HDR opaque scene + g-buffer + water surface. ---
+            auto rt      = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf    = device->CreateRenderTarget(w, h, kHdr);
+            auto waterRT = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            // --- Build a flat NxN water grid mesh (XZ, y=0, spanning the play area). The vertex shader
+            // displaces it by the Gerstner field. gridN=128 -> 129x129 vertices. ---
+            const int kGridN = 128;
+            const float kHalf = 9.0f;   // world half-extent of the water plane
+            std::vector<scene::Vertex> gverts;
+            gverts.reserve((size_t)(kGridN + 1) * (kGridN + 1));
+            for (int gz = 0; gz <= kGridN; ++gz) {
+                for (int gx = 0; gx <= kGridN; ++gx) {
+                    float fx = (float)gx / (float)kGridN * 2.0f - 1.0f;   // [-1,1]
+                    float fz = (float)gz / (float)kGridN * 2.0f - 1.0f;
+                    scene::Vertex v{};
+                    v.pos[0] = fx * kHalf; v.pos[1] = 0.0f; v.pos[2] = fz * kHalf;
+                    v.color[0] = v.color[1] = v.color[2] = 1.0f;
+                    v.uv[0] = (float)gx / (float)kGridN; v.uv[1] = (float)gz / (float)kGridN;
+                    v.normal[1] = 1.0f; v.tangent[0] = 1.0f;
+                    gverts.push_back(v);
+                }
+            }
+            std::vector<uint32_t> gidx;
+            gidx.reserve((size_t)kGridN * kGridN * 6);
+            auto vidx = [&](int gx, int gz) { return (uint32_t)(gz * (kGridN + 1) + gx); };
+            for (int gz = 0; gz < kGridN; ++gz)
+                for (int gx = 0; gx < kGridN; ++gx) {
+                    gidx.push_back(vidx(gx, gz));     gidx.push_back(vidx(gx + 1, gz));
+                    gidx.push_back(vidx(gx, gz + 1)); gidx.push_back(vidx(gx + 1, gz));
+                    gidx.push_back(vidx(gx + 1, gz + 1)); gidx.push_back(vidx(gx, gz + 1));
+                }
+            rhi::BufferDesc wvbD; wvbD.size = gverts.size() * sizeof(scene::Vertex);
+            wvbD.initialData = gverts.data(); wvbD.usage = rhi::BufferUsage::Vertex;
+            auto waterVB = device->CreateBuffer(wvbD);
+            rhi::BufferDesc wibD; wibD.size = gidx.size() * sizeof(uint32_t);
+            wibD.initialData = gidx.data(); wibD.usage = rhi::BufferUsage::Index;
+            auto waterIB = device->CreateBuffer(wibD);
+            const uint32_t kWaterIndexCount = (uint32_t)gidx.size();
+
+            // Per-object model matrices (translate * scale).
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+            Mat4 waterModel = Mat4::Identity();   // grid verts are already in world units
+
+            // Camera: a low grazing look across the water so the surface fills the lower screen and the
+            // sky reflection / submerged objects read clearly.
+            const Vec3 eye{0.0f, 3.4f, 6.6f};
+            const Vec3 center{0.0f, 0.1f, -0.5f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.4f; fd.lightDir[1] = -0.85f; fd.lightDir[2] = -0.45f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.4f, -0.85f, -0.45f});
+                Vec3 sc{0.0f, 0.3f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            // Water params.
+            WaterParams wp{};
+            for (int k = 0; k < 16; ++k) wp.model[k] = waterModel.m[k];
+            for (int wi = 0; wi < 3; ++wi) {
+                wp.waveA[wi][0] = ws.waves[wi].dir.x; wp.waveA[wi][1] = ws.waves[wi].dir.y;
+                wp.waveA[wi][2] = ws.waves[wi].amplitude; wp.waveA[wi][3] = ws.waves[wi].wavelength;
+                wp.waveB[wi][0] = ws.waves[wi].steepness; wp.waveB[wi][1] = ws.waves[wi].speed;
+            }
+            wp.cfg0[0] = kWaveTime; wp.cfg0[1] = std::tan(0.5f * kFovY);
+            wp.cfg0[2] = aspect; wp.cfg0[3] = kWaterLevel;
+            wp.cfg1[0] = 0.02f; wp.cfg1[1] = 0.6f; wp.cfg1[2] = (float)ws.count; wp.cfg1[3] = 0.0f;
+            wp.shallow[0] = 0.20f; wp.shallow[1] = 0.55f; wp.shallow[2] = 0.58f;
+            wp.deep[0] = 0.02f; wp.deep[1] = 0.07f; wp.deep[2] = 0.12f;
+            wp.texel[0] = 1.0f / (float)w; wp.texel[1] = 1.0f / (float)h;
+
+            const bool waterDbg = (std::getenv("HF_WATER_DBG") != nullptr);
+            WaterCompParams wcp{}; wcp.texel[0] = 1.0f / (float)w; wcp.texel[1] = 1.0f / (float)h;
+            wcp.intensity = 1.7f; wcp.pad = waterDbg ? -1.0f : 0.0f;
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgGbuf = graph.ImportTarget(
+                "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+            render::RgResource rgWater = graph.ImportTarget(
+                "water", render::RgResourceKind::SceneColor, *waterRT);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Opaque scene (sky + submerged objects) -> HDR RT.
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        pc[16] = 0.0f; pc[17] = 0.55f; pc[18] = 0.0f; pc[19] = 0.0f; // matte objects
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*objTex[o], *flatNormal);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // G-buffer prepass -> RGBA16F (view-space normal + linear depth). Clear w=0 = background.
+            graph.AddPass("gbuffer", {}, {rgGbuf},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*gbStaticPipeline);
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Water surface -> water RT (rgb = shading, a = coverage). Scene at t0/s0, gbuffer at t3/s3.
+            graph.AddPass("water", {rgScene, rgGbuf}, {rgWater},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*waterPipe);
+                    cmd.BindTexturePair(*rt, *gbuf);
+                    cmd.PushConstants(&wp, sizeof(wp));
+                    cmd.BindVertexBuffer(*waterVB);
+                    cmd.BindIndexBuffer(*waterIB);
+                    cmd.DrawIndexed(kWaterIndexCount);
+                    cmd.EndRenderPass();
+                });
+
+            // Composite: lerp(scene, water.rgb, water.a) -> tonemap -> swapchain.
+            graph.AddPass("composite", {rgScene, rgWater}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*wCompPipe);
+                    cmd.BindTexturePair(*rt, *waterRT);
+                    cmd.PushConstants(&wcp, sizeof(wcp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("water: {waves:%d, time:%g, gridN:%d}\n",
+                        (int)ws.count, (double)kWaveTime, kGridN);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(waterShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — water, %d objects\n",
+                                    waterShotPath, cw, ch2, kNumObjs);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", waterShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

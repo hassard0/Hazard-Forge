@@ -155,6 +155,14 @@ hf_add_pure_test(ssgi_denoise_test)
 # Pure C++ (render/ssgi.h, header-only), ASan-eligible.
 hf_add_pure_test(ssgi_temporal_test)
 
+# Water rendering (Slice CF): the Gerstner displacement (single-wave closed form at t=0; sum of N ==
+# sum of individuals), the ANALYTIC surface normal (unit length; flat zero-amplitude -> +Y; a known
+# wave tilts the expected direction; cross-checked against a FINITE DIFFERENCE of Displace within
+# tolerance, proving the derivative is right), Schlick fresnel (head-on==f0, grazing==1, monotone),
+# depth-based RefractTint (depth 0 -> shallow, large -> ~deep, monotone), and DETERMINISM (same
+# (x,z,t) -> bit-identical Displace/Normal). Pure CPU (render/water.h, header-only), ASan-eligible.
+hf_add_pure_test(water_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff

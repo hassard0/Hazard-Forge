@@ -142,6 +142,15 @@ hf_compile_shaders(
     # tonemaps. Existing gbuffer/ssao/bloom shaders + their goldens untouched.
     "shaders/ssr.frag.hlsl:ps"
     "shaders/ssr_composite.frag.hlsl:ps"
+    # Water rendering (Slice CF): water.vert displaces a flat NxN grid by the summed Gerstner waves at a
+    # FIXED time (render/water.h math, mirrored in-shader); water.frag recomputes the analytic wave
+    # normal and shades a fresnel blend of a SKY reflection (reusing SkyColor) and a REFRACTED scene
+    # (sampling the HDR scene-color RT + G-buffer like SSR, tinted by depth) + a sun specular glint;
+    # water_composite blends lerp(scene, water.rgb, water.a) + tonemaps. Existing shaders + goldens
+    # untouched.
+    "shaders/water.vert.hlsl:vs"
+    "shaders/water.frag.hlsl:ps"
+    "shaders/water_composite.frag.hlsl:ps"
     # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
     # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect

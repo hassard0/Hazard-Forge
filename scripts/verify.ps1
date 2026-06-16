@@ -87,6 +87,7 @@ $Goldens = @(
     @{ Name = 'point_shadow';  Flag = '--point-shadow' }         # Slice AF (omnidirectional point shadows)
     @{ Name = 'clustered';     Flag = '--clustered' }            # Slice AG (clustered / Forward+ lighting)
     @{ Name = 'ssr';           Flag = '--ssr' }                  # Slice AH (screen-space reflections)
+    @{ Name = 'water';         Flag = '--water' }                # Slice CF (Gerstner water reflect/refract + sun glint)
     @{ Name = 'ssgi';          Flag = '--ssgi' }                 # Slice BP (screen-space global illumination)
     @{ Name = 'ssgi_denoise';  Flag = '--ssgi-denoise' }         # Slice BR (SSGI bilateral spatial denoise)
     @{ Name = 'ssgi_temporal'; Flag = '--ssgi-temporal' }        # Slice BV (temporal SSGI fixed-N accumulation)
