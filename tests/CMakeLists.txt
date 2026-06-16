@@ -357,6 +357,15 @@ hf_add_pure_test(volumetric_test)
 # block). Pure C++ (render/probe.h, header-only), ASan-eligible.
 hf_add_pure_test(probe_test)
 
+# Runtime Cubemap-Capture Reflection Probe (Slice DD): the 6 cube-face view/proj matrices (FaceView
+# looks down the correct ±axis with the documented up; FaceProj's 90°-FOV square frustum projects an
+# on-axis point to the face center; depth in [0,1]) + the hardware cube lookup (DirToFaceUV: 6 axes ->
+# 6 faces at UV center, major-axis selection, off-axis UV in [0,1], the cube tiles all directions) +
+# the +Y/-Y up-vector convention hand-check (the classic flip pitfall — captured pole faces aren't
+# flipped/rotated vs how a TextureCube samples) + determinism. The same cube math is mirrored in the
+# capture path + the reflection shader. Pure C++ (render/cubemap.h, header-only), ASan-eligible.
+hf_add_pure_test(cubemap_test)
+
 # Machine-readable engine-state introspection (Slice AL): DescribeEngine builds a deterministic JSON
 # document (engine/features/showcases/commands + scene entities + camera/lights + stats). Asserts the
 # JSON parses, the entity/transform/camera/light values are present, backends == ["vulkan","metal"],

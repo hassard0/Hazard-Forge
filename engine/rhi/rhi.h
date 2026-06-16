@@ -228,6 +228,20 @@ public:
     virtual uint32_t height() const = 0;
 };
 
+// Slice DD — a sampleable CUBEMAP render target: a square color cube (6 faces, `size`x`size` each)
+// + a shared depth, rendered into FACE-BY-FACE and then sampled as a hardware TextureCube. This is
+// the ADDITIVE cubemap-render-target interface the runtime cubemap-capture reflection probe needs
+// (the engine otherwise has no cubemap RT). It is a PURE abstract handle — all the backend image /
+// per-face attachment view / cube sampling view details live ONLY inside the backend dirs
+// (rhi_vulkan/, rhi_metal/, metal_headless/); NO backend code symbol leaks above the seam.
+// Inheriting ITexture lets a pass bind it via ICommandBuffer::BindCubemapProbe (the cube source for
+// the reflection pass). Created via IRHIDevice::CreateCubemapTarget, written via
+// Begin/EndCubemapFace, read back per-face via ReadCubemapFace (the capture-correctness proof).
+class ICubemapTarget : public ITexture {
+public:
+    virtual uint32_t size() const = 0;  // per-face edge length (square)
+};
+
 // Records draw commands for one frame's swapchain image.
 class ICommandBuffer {
 public:
@@ -290,6 +304,16 @@ public:
     // accepts a render target as the source. Default no-op so passes/backends without probes are
     // unaffected; both shipping backends override it.
     virtual void BindReflectionProbe(ITexture& /*probeAtlas*/) {}
+    // Slice DD — bind a CAPTURED cubemap (ICubemapTarget, written by the per-face capture passes) as
+    // the sampleable reflection source at the SAME dedicated environment set/slot BindEnvironment /
+    // BindReflectionProbe use (Vulkan set 3 binding 11/12; Metal fragment texture(11)/sampler(12)),
+    // so the reflection fragment shader can sample it as a hardware TextureCube along the
+    // (box-projected) reflection direction. Pair with a pipeline whose usesEnvironment is true. The
+    // cube IS sampled in the reflection pass AFTER it was rendered by the capture passes, so the
+    // render graph / device emits the capture-write -> sample-read barrier (ShaderRead) first. Default
+    // no-op so passes/backends without a captured cubemap are unaffected; both shipping backends
+    // override it. The vk*/MTL* cube-view bind lives ONLY in the backend dirs.
+    virtual void BindCubemapProbe(ITexture& /*cubemap*/) {}
     // Bind the THREE clustered-lighting storage buffers (Slice AG) at the dedicated cluster set
     // (set 3 on Vulkan, bindings 0/1/2; flat fragment buffer slots on Metal), readable by the
     // clustered-lit fragment shader: `clusters` = per-cluster {offset,count}, `lightIndices` = flat
@@ -477,6 +501,48 @@ public:
     // Depth-only sampleable shadow map (size x size, D32, DEPTH_STENCIL_ATTACHMENT | SAMPLED).
     // Rendered into via Begin/EndShadowPass; sampled by the lit pass via the per-frame set (set 0).
     virtual std::unique_ptr<IRenderTarget> CreateShadowMap(uint32_t size) = 0;
+
+    // Slice DD — create a sampleable CUBEMAP render target (the runtime cubemap-capture probe): a
+    // `size`x`size`-per-face color cube (CUBE_COMPATIBLE, 6 array layers) usable both as 6 render
+    // attachments (one per face, via BeginCubemapFace) AND as a sampled hardware TextureCube (bound
+    // via ICommandBuffer::BindCubemapProbe). `format` Undefined selects the swapchain color format;
+    // RGBA16_Float yields an HDR cube. A shared depth image is used per face. Default returns nullptr
+    // so backends without cubemap RTs still link; the shipping backends override it. ALL backend image
+    // details live in the backend dirs.
+    virtual std::unique_ptr<ICubemapTarget> CreateCubemapTarget(uint32_t /*size*/,
+                                                                Format /*format*/ = Format::Undefined) {
+        return nullptr;
+    }
+
+    // Begin recording the scene into cubemap face `face` (0=+X..5=-Z) of `cube`'s color+depth
+    // (dynamic rendering, single-layer attachment view onto that face). Returns a FrameContext whose
+    // cmd records the face's draws; pair with EndCubemapFace. Mirrors BeginRenderTargetFrame but
+    // targets one cube face. The capture loop calls this 6 times (one per face) with that face's
+    // FaceView/FaceProj. Default returns a null FrameContext so backends without cubemap RTs still link.
+    virtual FrameContext BeginCubemapFace(ICubemapTarget& /*cube*/, uint32_t /*face*/) {
+        return FrameContext{nullptr};
+    }
+    // End recording + submit face `face`. After the LAST face is ended the cube's color image is
+    // transitioned to SHADER_READ_ONLY so the reflection pass can sample the whole cube; emit this on
+    // the final face only (the device tracks per-face layout). Blocks until the face pass completes.
+    virtual void EndCubemapFace(const FrameContext&) {}
+
+    // Slice DD — read face `face` of a captured cubemap back to host memory as tightly-packed BGRA8
+    // (top row first), `size`x`size`. This drives the capture-correctness proof: the showcase compares
+    // the captured face 0 to a standalone 2D render with face 0's view/proj (byte-identical SHA).
+    // Call after the capture passes completed (the cube is in SHADER_READ_ONLY). Default no-op /
+    // returns false so backends without readback still link. The vk*/MTL* copy lives in the backend dir.
+    virtual bool ReadCubemapFace(ICubemapTarget& /*cube*/, uint32_t /*face*/,
+                                 std::vector<uint8_t>& /*outBGRA*/, uint32_t& /*width*/,
+                                 uint32_t& /*height*/) { return false; }
+
+    // Slice DD — read an offscreen render target's color image back to host memory as tightly-packed
+    // BGRA8 (top row first). Companion to ReadCubemapFace: the capture-correctness proof renders face
+    // 0 directly into a 2D RT and reads it back to compare to the captured cube's face 0. Call after
+    // the RT pass completed (the color image is in SHADER_READ_ONLY). Default no-op / returns false so
+    // backends without readback still link. The vk*/MTL* copy lives in the backend dir.
+    virtual bool ReadRenderTarget(IRenderTarget& /*rt*/, std::vector<uint8_t>& /*outBGRA*/,
+                                  uint32_t& /*width*/, uint32_t& /*height*/) { return false; }
 
     // Begin recording a depth-only pass from the light into the shadow map (dynamic rendering,
     // no color attachment). Returns a FrameContext whose cmd records depth-only draws.

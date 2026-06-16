@@ -278,6 +278,12 @@ hf_compile_shaders(
     # probe reflection. Reuses the probe bake/blit/irradiance pipeline + post.vert. Existing shaders +
     # goldens untouched.
     "shaders/reflprobe.frag.hlsl:ps"
+    # Runtime cubemap-capture reflection probe (Slice DD): the reflective surface samples a CAPTURED
+    # hardware TextureCube (the scene rendered into 6 cube faces from the probe center, via the new
+    # additive cubemap-RT RHI interface) box-projected by DA's reflprobe math. The dynamic counterpart
+    # to DA's static env reflection. Reuses probe_bake.{vert,frag} for the capture + post.vert.
+    # Existing shaders + goldens untouched.
+    "shaders/captureprobe.frag.hlsl:ps"
     # Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
     # current jittered HDR scene. Reuses post.vert (fullscreen triangle) + the existing RT/RGBA16F path;
     # the only new shader for the slice. Existing post/bloom/ssao/ssr shaders + goldens untouched.

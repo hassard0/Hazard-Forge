@@ -5,6 +5,7 @@
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_render_target.h"
+#include "rhi_vulkan/vulkan_cubemap_target.h"
 #include "rhi_vulkan/vulkan_bindless.h"
 #include "rhi_vulkan/vulkan_sampled.h"
 #include "rhi_vulkan/vk_common.h"
@@ -231,6 +232,16 @@ void VulkanCommandBuffer::BindReflectionProbe(ITexture& probeAtlas) {
     // lazily allocates an env-layout descriptor set pointing at its own color view + the env sampler.
     auto& rt = static_cast<VulkanRenderTarget&>(probeAtlas);
     VkDescriptorSet s = rt.environmentSet();
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundEnvironmentSet_, 1, &s, 0, nullptr);
+}
+
+void VulkanCommandBuffer::BindCubemapProbe(ITexture& cubemap) {
+    // Slice DD — bind the CAPTURED cubemap (VulkanCubemapTarget) at the dedicated environment set
+    // (set 3) so the reflection fragment samples it as a hardware TextureCube (binding 11/12). The
+    // cube owns an env-layout descriptor set pointing at its cube view + the env sampler.
+    auto& cube = static_cast<VulkanCubemapTarget&>(cubemap);
+    VkDescriptorSet s = cube.environmentSet();
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                             boundEnvironmentSet_, 1, &s, 0, nullptr);
 }

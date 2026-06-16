@@ -40,6 +40,7 @@ public:
                          ITexture& emissive, ITexture& occlusion) override;
     void BindEnvironment(ITexture& env) override;
     void BindReflectionProbe(ITexture& probeAtlas) override;
+    void BindCubemapProbe(ITexture& cubemap) override;
     void BindLightClusters(IBuffer& clusters, IBuffer& lightIndices, IBuffer& lights) override;
     void BindPerDrawData(IBuffer& perDraw) override;
     void BindBindlessTextures(IBindlessTextureSet& set) override;

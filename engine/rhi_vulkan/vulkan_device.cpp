@@ -7,6 +7,7 @@
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_render_target.h"
+#include "rhi_vulkan/vulkan_cubemap_target.h"
 #include "rhi_vulkan/vulkan_pbr_material.h"
 #include "rhi_vulkan/vulkan_bindless.h"
 #include <cstring>
@@ -1118,6 +1119,186 @@ void VulkanDevice::EndRenderTargetFrame(const FrameContext& frame) {
     Check(vkWaitForFences(device_, 1, &rtFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(rt)");
 
     rtInFlight_ = nullptr;
+}
+
+// --- Slice DD: runtime cubemap-capture reflection probe ---
+std::unique_ptr<ICubemapTarget> VulkanDevice::CreateCubemapTarget(uint32_t size, Format colorFormat) {
+    return std::make_unique<VulkanCubemapTarget>(*this, size, colorFormat);
+}
+
+FrameContext VulkanDevice::BeginCubemapFace(ICubemapTarget& cubeBase, uint32_t face) {
+    auto& cube = static_cast<VulkanCubemapTarget&>(cubeBase);
+    cubeInFlight_ = &cube;
+    cubeFaceInFlight_ = face;
+
+    Check(vkResetCommandBuffer(rtCmd_, 0), "vkResetCommandBuffer(cubeFace)");
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(rtCmd_, &bi), "vkBeginCommandBuffer(cubeFace)");
+
+    // Transition THIS face's color layer from its current layout -> COLOR_ATTACHMENT_OPTIMAL. The
+    // first face moves the whole cube image (UNDEFINED) to color; each subsequent face transitions
+    // its own layer (still UNDEFINED until written). We track one layout for the whole image and
+    // transition the single face's array layer here (subresource baseArrayLayer = face).
+    {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        b.srcAccessMask = 0;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // each face layer starts undefined (cleared this pass)
+        b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        b.image = cube.colorImage();
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, face, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(rtCmd_, &di);
+    }
+    cube.setColorLayout(VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    // Shared depth UNDEFINED -> DEPTH_ATTACHMENT_OPTIMAL (cleared each face).
+    TransitionImage(rtCmd_, cube.depthImage(),
+                    VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                    VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                    VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    rtRecorder_->Begin(rtCmd_, cube.faceView(face), cube.depthView(),
+                       {cube.size(), cube.size()}, cube.colorVkFormat(), VK_FORMAT_D32_SFLOAT);
+    return FrameContext{rtRecorder_.get()};
+}
+
+void VulkanDevice::EndCubemapFace(const FrameContext& frame) {
+    if (!frame.cmd || !cubeInFlight_) return;
+    VulkanCubemapTarget& cube = *cubeInFlight_;
+
+    // After the LAST face (5) is recorded, transition the WHOLE cube image (all 6 layers) from
+    // COLOR_ATTACHMENT_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL so the reflection pass can sample the cube
+    // (and the per-face readback can copy it). This is the capture-write -> sample-read barrier the
+    // sync-validation layer requires. For faces 0..4 the layer just stays in COLOR (it's read again
+    // only after face 5's transition).
+    if (cubeFaceInFlight_ == 5) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        b.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.image = cube.colorImage();
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};  // all 6 faces
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(rtCmd_, &di);
+        cube.setColorLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    Check(vkEndCommandBuffer(rtCmd_), "vkEndCommandBuffer(cubeFace)");
+    VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmdSub.commandBuffer = rtCmd_;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdSub;
+    Check(vkResetFences(device_, 1, &rtFence_), "vkResetFences(cubeFace)");
+    Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, rtFence_), "vkQueueSubmit2(cubeFace)");
+    Check(vkWaitForFences(device_, 1, &rtFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(cubeFace)");
+
+    cubeInFlight_ = nullptr;
+}
+
+// Shared helper: copy a color image's single (mip 0) layer back to host memory as tightly-packed
+// pixels at `bpp` bytes/pixel. `currentLayout` is the layer's current layout; this transitions it to
+// TRANSFER_SRC for the copy (the copy is one-shot on rtCmd_; the image is not used again afterward).
+bool VulkanDevice::readImageLayer(VkImage image, uint32_t layer, uint32_t w, uint32_t h,
+                                  uint32_t bpp, VkImageLayout currentLayout,
+                                  std::vector<uint8_t>& out) {
+    Check(vkResetCommandBuffer(rtCmd_, 0), "vkResetCommandBuffer(imgRead)");
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(vkBeginCommandBuffer(rtCmd_, &bi), "vkBeginCommandBuffer(imgRead)");
+
+    // Transition this layer current -> TRANSFER_SRC_OPTIMAL so the copy is hazard-free.
+    {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        b.oldLayout = currentLayout;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1;
+        di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(rtCmd_, &di);
+    }
+
+    const VkDeviceSize bufSize = (VkDeviceSize)w * h * bpp;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bufSize;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+    VmaAllocationInfo stagingInfo{};
+    Check(vmaCreateBuffer(allocator_, &bci, &aci, &staging, &stagingAlloc, &stagingInfo),
+          "vmaCreateBuffer(imgRead)");
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+    region.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(rtCmd_, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           staging, 1, &region);
+
+    Check(vkEndCommandBuffer(rtCmd_), "vkEndCommandBuffer(imgRead)");
+    VkCommandBufferSubmitInfo cmdSub{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cmdSub.commandBuffer = rtCmd_;
+    VkSubmitInfo2 submit{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    submit.commandBufferInfoCount = 1;
+    submit.pCommandBufferInfos = &cmdSub;
+    Check(vkResetFences(device_, 1, &rtFence_), "vkResetFences(imgRead)");
+    Check(vkQueueSubmit2(graphicsQueue_, 1, &submit, rtFence_), "vkQueueSubmit2(imgRead)");
+    Check(vkWaitForFences(device_, 1, &rtFence_, VK_TRUE, UINT64_MAX), "vkWaitForFences(imgRead)");
+
+    out.resize((size_t)bufSize);
+    std::memcpy(out.data(), stagingInfo.pMappedData, out.size());
+    vmaDestroyBuffer(allocator_, staging, stagingAlloc);
+    return true;
+}
+
+// Bytes-per-pixel for the formats the cube/RT readbacks see (RGBA16F = 8, *8_UNORM = 4).
+static uint32_t BytesPerPixel(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+        default:                            return 4;
+    }
+}
+
+bool VulkanDevice::ReadCubemapFace(ICubemapTarget& cubeBase, uint32_t face,
+                                   std::vector<uint8_t>& outBGRA, uint32_t& width, uint32_t& height) {
+    auto& cube = static_cast<VulkanCubemapTarget&>(cubeBase);
+    const uint32_t n = cube.size();
+    width = n; height = n;
+    return readImageLayer(cube.colorImage(), face, n, n, BytesPerPixel(cube.colorVkFormat()),
+                          cube.colorLayout(), outBGRA);
+}
+
+bool VulkanDevice::ReadRenderTarget(IRenderTarget& rtBase, std::vector<uint8_t>& outBGRA,
+                                    uint32_t& width, uint32_t& height) {
+    auto& rt = static_cast<VulkanRenderTarget&>(rtBase);
+    width = rt.width(); height = rt.height();
+    return readImageLayer(rt.colorImage(), 0, rt.width(), rt.height(),
+                          BytesPerPixel(rt.colorVkFormat()), rt.colorLayout(), outBGRA);
 }
 
 // --- Multithreaded recording (Slice AU) ---

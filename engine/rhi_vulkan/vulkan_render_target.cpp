@@ -24,7 +24,11 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_SRC (Slice DD): lets a color RT be read back to host memory via ReadRenderTarget
+        // (the capture-correctness proof reads the face-0 direct render). A usage flag only — it does
+        // not affect rendering, so existing render targets / goldens are byte-for-byte unchanged.
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 

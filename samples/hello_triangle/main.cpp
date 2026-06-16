@@ -35,6 +35,7 @@
 #include "render/point_shadow.h"
 #include "render/probe.h"
 #include "render/reflection_probe.h"
+#include "render/cubemap.h"
 #include "render/decal.h"
 #include "render/color_grade.h"
 #include "render/post_stack.h"
@@ -371,6 +372,7 @@ int main(int argc, char** argv) {
     const char* cloudShadowsShotPath = nullptr; // --cloud-shadows-shot <out.bmp> (Slice CK: cloud shadows on the ground)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* reflProbeShotPath = nullptr; // --reflprobe-shot <out.bmp> (Slice DA: box-projected cubemap reflections)
+    const char* captureProbeShotPath = nullptr; // --captureprobe-shot <out.bmp> (Slice DD: runtime cubemap-capture reflection probe)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
     const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
     const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
@@ -896,6 +898,16 @@ int main(int argc, char** argv) {
             // reflection (the no-op proof). One BMP -> exit. New golden; existing paths/shaders/goldens
             // untouched.
             reflProbeShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--captureprobe-shot") == 0 && i + 1 < argc) {
+            // Slice DD: runtime cubemap-capture reflection probe showcase (the DYNAMIC counterpart to
+            // DA). The scene (distinct colored objects around a reflective sphere/floor) is RENDERED
+            // into the 6 faces of a real captured cubemap (via the new additive cubemap-RT RHI
+            // interface) from a fixed probe center, then the reflective surface samples the captured
+            // cube (box-projected, reusing DA) so it mirrors the actual scene. INTERNALLY renders the
+            // scene directly with face-0's view/proj and asserts it is BYTE-IDENTICAL (SHA) to the
+            // captured cube's face 0 (the capture-correctness proof). One BMP -> exit. New golden;
+            // existing paths/shaders/goldens untouched.
+            captureProbeShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--taa-shot") == 0 && i + 1 < argc) {
             // Slice AP: temporal anti-aliasing showcase. Renders a FIXED N=8 accumulation frames over
             // a static lit + shadowed scene, advancing only the deterministic Halton(2,3) sub-pixel
@@ -2624,6 +2636,308 @@ int main(int argc, char** argv) {
                                 (double)(2.0f * Rroom), (int)kParallax,
                                 kProbePos.x, kProbePos.y, kProbePos.z);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", reflProbeShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Runtime Cubemap-Capture Reflection Probe showcase (--captureprobe-shot, Slice DD). The
+        // DYNAMIC counterpart to DA: instead of a STATIC env cubemap, the scene is RENDERED into the 6
+        // faces of a REAL captured cubemap (the new additive cubemap-RT RHI interface) from a fixed
+        // probe center, then a reflective sphere + floor sample the CAPTURED cube (box-projected,
+        // reusing DA's reflprobe math) so they mirror the actual surrounding colored objects.
+        //
+        // THE CAPTURE-CORRECTNESS PROOF (backend-portable): the capture renders the scene 6× with each
+        // face's FaceView/FaceProj (engine/render/cubemap.h). So the captured +X face MUST equal a
+        // standalone render with face-0's view/proj (identical scene + bake pipeline + push constants
+        // + viewport). The showcase renders face 0 directly into a 2D RT and asserts it is
+        // BYTE-IDENTICAL (SHA) to ReadCubemapFace(0) — proving the capture is a faithful, deterministic
+        // scene render (no face-orientation, projection-skew, or RT-format bug). Avoids recursion: the
+        // captured scene EXCLUDES the reflective heroes (only the colored room is captured). Two runs
+        // byte-identical. Existing lit/probe/reflprobe paths/shaders/goldens untouched.
+        if (captureProbeShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cm = hf::render::cubemap;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Same 624-byte FrameData layout as reflprobe / captureprobe.frag (skyParams.xyz=boxMin,
+            // skyParams.w=parallaxStrength, pad0.xyz=boxMax; probePos.xyz=probe capture center).
+            struct ProbeFrameData {
+                float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+                float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+                float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Capture-probe FrameData layout");
+
+            const Vec3 kProbePos{0.0f, 2.0f, 0.0f};   // room center == box center == capture center
+            const float Rroom = 6.0f;                 // room half-extent (the probe box half-size)
+            const float kParallax = 1.0f;             // full box-projection for the golden
+            const uint32_t kCubeSize = 512;           // per-face cube edge
+            const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            // === Shaders. probe_bake.{vert,frag} (the per-face capture) + lit.vert + captureprobe.frag
+            //     (box-projected captured-cube reflection) + post.{vert,frag} (tonemap). ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto capFsW      = LoadSpirv(std::string(HF_SHADER_DIR) + "/captureprobe.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVs  = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto bakeVs = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto capFs  = device->CreateShaderModule({std::span<const uint32_t>(capFsW)});
+            auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+            // Bake pipeline (probe_bake.vert: faceViewProj + model in the 128B push constant). Used
+            // BOTH for the 6 cube-face captures AND the face-0 direct-render proof (identical pipeline).
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;   // faceViewProj(16) + model(16)
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            // Reflective-surface pipeline (captureprobe.frag samples the captured cube at the env slot).
+            rhi::GraphicsPipelineDesc capDesc;
+            capDesc.vertex = litVs.get(); capDesc.fragment = capFs.get();
+            capDesc.vertexLayout = scene::MeshVertexLayout();
+            capDesc.colorFormat = kHdr;
+            capDesc.depthTest = true; capDesc.usesFrameUniforms = true; capDesc.usesTexture = true;
+            capDesc.usesEnvironment = true;   // reserve set 3 (the captured cube)
+            capDesc.pushConstantSize = sizeof(float) * 20;  // model + material
+            auto capPipeline = device->CreateGraphicsPipeline(capDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            auto cube     = device->CreateCubemapTarget(kCubeSize, kHdr);
+            auto faceRT   = device->CreateRenderTarget(kCubeSize, kCubeSize, kHdr);  // face-0 proof RT
+            auto sceneRT  = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+            if (!cube) {
+                std::fprintf(stderr, "FATAL: cubemap render targets unavailable on this backend\n");
+                device->WaitIdle(); return 1;
+            }
+
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+            scene::Mesh sphere   = scene::Mesh::Sphere(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);   // -X wall
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);   // +X wall
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);   // -Z back wall
+            auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);   // +Z front wall (distinct in the reflection)
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);   // floor/ceiling
+
+            const float Tk = 0.2f;   // wall thickness
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+            };
+
+            // Reflective hero objects (NOT captured into the cube — avoids recursion): a glossy metallic
+            // sphere + a reflective floor slab whose mirror reflection of the colored walls is box-corrected.
+            Mat4 sphereModel = Mat4::Translate({0.0f, 1.2f, 1.0f}) * Mat4::Scale({1.6f, 1.6f, 1.6f});
+            Mat4 floorModel  = Mat4::Translate({0.0f, -3.7f, 0.0f}) * Mat4::Scale({5.0f, 0.15f, 5.0f});
+
+            const Vec3 eye{0.0f, 2.4f, 9.0f};
+            const Vec3 ctr{0.0f, 1.6f, 0.0f};
+            const float fovY = 1.04719755f;
+            Vec3 fwd   = math::normalize(ctr - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+            Vec3 up3   = math::cross(right, fwd);
+
+            // The 6 cube-face view-projs from the probe center (the SAME math the test pins).
+            Mat4 faceVPs[6];
+            for (int fi = 0; fi < 6; ++fi)
+                faceVPs[fi] = cm::FaceViewProj(fi, kProbePos, kCubeNear, kCubeFar);
+
+            // The probe BOX = the room AABB centered on the probe.
+            const Vec3 boxMin{kProbePos.x - Rroom, kProbePos.y - Rroom, kProbePos.z - Rroom};
+            const Vec3 boxMax{kProbePos.x + Rroom, kProbePos.y + Rroom, kProbePos.z + Rroom};
+
+            ProbeFrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, ctr, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int fi = 0; fi < 6; ++fi)
+                    for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.85f, -0.35f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+                fd.lightColor[0]=0.55f; fd.lightColor[1]=0.55f; fd.lightColor[2]=0.58f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.probePos[0]=kProbePos.x; fd.probePos[1]=kProbePos.y; fd.probePos[2]=kProbePos.z; fd.probePos[3]=1.0f;
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                fd.skyParams[0]=boxMin.x; fd.skyParams[1]=boxMin.y; fd.skyParams[2]=boxMin.z;
+                fd.skyParams[3]=kParallax;
+                fd.pad0[0]=boxMax.x; fd.pad0[1]=boxMax.y; fd.pad0[2]=boxMax.z; fd.pad0[3]=0.0f;
+            }
+
+            // Render the colored room into one target with `faceVP` (used for both the cube faces and
+            // the face-0 proof RT — identical draw stream). The reflective heroes are NOT drawn here.
+            auto drawRoom = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP) {
+                cmd.BindPipeline(*bakePipeline);
+                for (const auto& wl : walls) {
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindTexture(*wl.tex);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            // === Capture the scene into the 6 cube faces (probe-centered FaceView/FaceProj). ===
+            // The device transitions the cube to SHADER_READ_ONLY after face 5 (the capture-write ->
+            // sample-read barrier the sync-validation layer requires).
+            auto captureCube = [&]() {
+                for (uint32_t face = 0; face < 6; ++face) {
+                    auto fc = device->BeginCubemapFace(*cube, face);
+                    fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                    drawRoom(*fc.cmd, faceVPs[face]);
+                    fc.cmd->EndRenderPass();
+                    device->EndCubemapFace(fc);
+                }
+            };
+
+            // The full reflective render: capture the cube, then shade the room (matte) + reflective
+            // heroes sampling the captured cube, tonemap to the swapchain, capture the framebuffer.
+            auto renderScene = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+                captureCube();
+
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("capScene", {}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        cmd.BindPipeline(*capPipeline);
+                        cmd.BindCubemapProbe(*cube);
+                        auto drawSurf = [&](const Mat4& model, const scene::Mesh& mesh, rhi::ITexture& tex,
+                                            float metallic, float rough) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                            pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(tex, *flatNormal);
+                            cmd.BindCubemapProbe(*cube);
+                            cmd.BindVertexBuffer(mesh.vertices());
+                            cmd.BindIndexBuffer(mesh.indices());
+                            cmd.DrawIndexed(mesh.indexCount());
+                        };
+                        // Room walls (matte) for context — skip the front (+Z, index 5) so we see INTO
+                        // the box; they pick up the cube but read as walls.
+                        for (size_t wi = 0; wi < walls.size(); ++wi)
+                            if (wi != 5) drawSurf(walls[wi].model, cubeMesh, *walls[wi].tex, 0.0f, 0.95f);
+                        // Reflective heroes: glossy metallic sphere + reflective floor slab.
+                        drawSurf(sphereModel, sphere,   *whiteTex, 1.0f, 0.06f);
+                        drawSurf(floorModel,  cubeMesh, *whiteTex, 1.0f, 0.08f);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto sha = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // Run the full scene render (which captures the cube), then read face 0 back.
+            std::vector<uint8_t> scenePx; uint32_t sw0=0, sh0=0;
+            if (!renderScene(scenePx, sw0, sh0)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (capture-probe scene)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::vector<uint8_t> cubeFace0; uint32_t cfw=0, cfh=0;
+            if (!device->ReadCubemapFace(*cube, 0, cubeFace0, cfw, cfh)) {
+                std::fprintf(stderr, "FATAL: ReadCubemapFace(0) failed\n");
+                device->WaitIdle(); return 1;
+            }
+            // Render face 0 DIRECTLY into the 2D RT with face-0's view/proj (identical bake pipeline +
+            // push constants + viewport), then read it back. This is the standalone scene render the
+            // captured face 0 must match byte-for-byte.
+            std::vector<uint8_t> directFace0; uint32_t dfw=0, dfh=0;
+            {
+                auto fc = device->BeginRenderTargetFrame(*faceRT);
+                fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                drawRoom(*fc.cmd, faceVPs[0]);
+                fc.cmd->EndRenderPass();
+                device->EndRenderTargetFrame(fc);
+            }
+            if (!device->ReadRenderTarget(*faceRT, directFace0, dfw, dfh)) {
+                std::fprintf(stderr, "FATAL: ReadRenderTarget(faceRT) failed\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t cubeHash = sha(cubeFace0), directHash = sha(directFace0);
+            std::printf("capture-probe face-0 cube hash: %016llx  direct-render hash: %016llx\n",
+                        (unsigned long long)cubeHash, (unsigned long long)directHash);
+            const bool faceIdentical = (cfw == dfw) && (cfh == dfh) &&
+                                       (cubeFace0.size() == directFace0.size()) &&
+                                       (std::memcmp(cubeFace0.data(), directFace0.data(),
+                                                    directFace0.size()) == 0);
+            if (!faceIdentical) {
+                std::fprintf(stderr,
+                    "FATAL: captured cube face 0 != scene rendered directly with face-0 view/proj — "
+                    "face-orientation / projection / RT-format mismatch. cube %016llx vs direct %016llx\n",
+                    (unsigned long long)cubeHash, (unsigned long long)directHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("capture-probe: captured face-0 == direct face-0 render: BYTE-IDENTICAL "
+                        "(capture-correctness proof)\n");
+            std::printf("capture-probe: {faces:6, cubeSize:%u}\n", kCubeSize);
+
+            bool ok = WriteBMP(captureProbeShotPath, scenePx, sw0, sh0);
+            if (ok) std::printf("wrote %s (%ux%u) — runtime cubemap-capture reflection, cubeSize %u, "
+                                "probe (%.1f,%.1f,%.1f)\n", captureProbeShotPath, sw0, sh0, kCubeSize,
+                                kProbePos.x, kProbePos.y, kProbePos.z);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", captureProbeShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -34,6 +34,15 @@ public:
                                                       Format colorFormat) override;
     std::unique_ptr<IRenderTarget> CreateShadowMap(uint32_t size) override;
 
+    // Slice DD — runtime cubemap-capture reflection probe.
+    std::unique_ptr<ICubemapTarget> CreateCubemapTarget(uint32_t size, Format colorFormat) override;
+    FrameContext BeginCubemapFace(ICubemapTarget& cube, uint32_t face) override;
+    void EndCubemapFace(const FrameContext&) override;
+    bool ReadCubemapFace(ICubemapTarget& cube, uint32_t face, std::vector<uint8_t>& outBGRA,
+                         uint32_t& width, uint32_t& height) override;
+    bool ReadRenderTarget(IRenderTarget& rt, std::vector<uint8_t>& outBGRA,
+                          uint32_t& width, uint32_t& height) override;
+
     FrameContext BeginRenderTargetFrame(IRenderTarget& rt) override;
     void EndRenderTargetFrame(const FrameContext&) override;
 
@@ -148,6 +157,10 @@ public:
     VkDescriptorSet materialSet(VkImageView baseView, VkImageView normalView);
 
 private:
+    // Slice DD — copy a color image's (mip 0) array layer back to host memory at `bpp` bytes/pixel
+    // (the image must be in SHADER_READ_ONLY). Shared by ReadCubemapFace + ReadRenderTarget.
+    bool readImageLayer(VkImage image, uint32_t layer, uint32_t w, uint32_t h, uint32_t bpp,
+                        VkImageLayout currentLayout, std::vector<uint8_t>& out);
     void CreateSyncObjects();
     void DestroySyncObjects();
     void CreateRenderFinishedSemaphores();   // one present-wait semaphore per swapchain image
@@ -267,6 +280,12 @@ private:
     // The shadow (depth-only) pass reuses the dedicated rt command buffer/fence/recorder: the
     // shadow pass runs, waits on rtFence_, then the RT pass runs — they never overlap.
     class VulkanRenderTarget* shadowInFlight_ = nullptr;  // shadow map recorded between Begin/End
+
+    // Slice DD — the cubemap-face capture pass reuses the SAME dedicated rt command buffer/fence/
+    // recorder (the face passes run serially, one Begin/EndCubemapFace at a time, never overlapping
+    // the shadow/rt passes). The in-flight cube + the face being recorded between Begin/End.
+    class VulkanCubemapTarget* cubeInFlight_ = nullptr;
+    uint32_t cubeFaceInFlight_ = 0;
 
     // --- Multithreaded recording (Slice AU) ----------------------------------
     // One command pool + secondary command buffer + recorder PER WORKER THREAD (pools are not
