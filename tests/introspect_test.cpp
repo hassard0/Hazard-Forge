@@ -284,6 +284,8 @@ int main() {
         bool sawSsgiShot = false;
         // Slice BR: the --ssgi-denoise-shot showcase flag is listed in the showcase manifest.
         bool sawSsgiDenoiseShot = false;
+        // Slice BV: the --ssgi-temporal-shot showcase flag is listed in the showcase manifest.
+        bool sawSsgiTemporalShot = false;
         // Slice BQ: the --net-shot showcase flag is listed in the showcase manifest.
         bool sawNetShot = false;
         // Slice BU: the --netsim-shot showcase flag is listed in the showcase manifest.
@@ -315,6 +317,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--poststack-shot") sawPostStackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-shot") sawSsgiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ssgi-temporal-shot") sawSsgiTemporalShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--net-shot") sawNetShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--netsim-shot") sawNetsimShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-shot") sawEditorShot = true;
@@ -341,6 +344,7 @@ int main() {
         check(sawPostStackShot, "showcases manifest includes --poststack-shot");
         check(sawSsgiShot, "showcases manifest includes --ssgi-shot");
         check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
+        check(sawSsgiTemporalShot, "showcases manifest includes --ssgi-temporal-shot");
         check(sawNetShot, "showcases manifest includes --net-shot");
         check(sawNetsimShot, "showcases manifest includes --netsim-shot");
         check(sawEditorShot, "showcases manifest includes --editor-shot");

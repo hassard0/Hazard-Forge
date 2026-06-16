@@ -5689,6 +5689,331 @@ static int RunSsgiShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Temporal SSGI accumulation showcase (Slice BV). Mirrors the Vulkan --ssgi-temporal-shot path
+// EXACTLY: the SAME Cornell color-bleed scene + SSGI gather as --ssgi (RunSsgiShowcase), but the SSGI
+// indirect is ACCUMULATED over a FIXED N=8 frames, each with a different golden-angle-rotated
+// hemisphere kernel (the ssgi.frag `frame` param), into a running-mean HDR accumulation RT (the TAA
+// fixed-N static-accumulation pattern), then composited like BP. STATIC camera -> no reprojection
+// (just a mean of N jittered frames). Fixed N + fixed per-frame rotation + fixed accumulation order ->
+// deterministic, two runs DIFF 0.0000. The raw --ssgi path is unchanged (frame 0 == the base kernel;
+// ssgi.png stays the A baseline). SEPARATE ssgi_accum pipeline; existing pipelines/shaders/goldens
+// untouched. -------------------------------------------------------------------------------------
+static int RunSsgiTemporalShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    struct Obj { Vec3 pos; Vec3 scale; bool cube; float col[3]; float emissive; };
+    const Obj objs[] = {
+        {{-1.7f, 1.3f, 0.0f}, {0.18f, 1.3f, 1.7f}, true, {0.95f, 0.05f, 0.05f}, 1.0f},
+        {{ 1.7f, 1.3f, 0.0f}, {0.18f, 1.3f, 1.7f}, true, {0.05f, 0.95f, 0.10f}, 1.0f},
+        {{ 0.0f, 0.6f, 0.0f}, {0.6f, 0.6f, 0.6f}, true, {0.92f, 0.92f, 0.92f}, 0.0f},
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    // SsgiParams gains the Slice BV `frame` field (+ pad) — mirrors shaders/ssgi.frag.hlsl.
+    struct SsgiParams {
+        float texel[2]; float tanHalfFovY; float aspect;
+        float maxDist; float thickness; float intensity; float rayCount;
+        float frame; float pad[3];
+    };
+    struct SsgiCompParams { float texel[2]; float intensity; float pad; };
+    // Slice BV: running-mean accumulation push constant (mirrors shaders/ssgi_accum.frag.hlsl).
+    struct AccumParams { float texel[2]; float weight; float firstFrame; };
+
+    auto ssgiFs  = loadMSL("ssgi.frag.gen.metal", "ssgi_fragment");
+    auto compFs  = loadMSL("ssgi_composite.frag.gen.metal", "ssgi_composite_fragment");
+    auto accumFs = loadMSL("ssgi_accum.frag.gen.metal", "ssgi_accum_fragment");
+
+    rhi::GraphicsPipelineDesc ssgiD;
+    ssgiD.vertex = postVs.get(); ssgiD.fragment = ssgiFs.get();
+    ssgiD.colorFormat = kHdr;
+    ssgiD.depthTest = false; ssgiD.usesTexture = true; ssgiD.fullscreen = true;
+    ssgiD.fragmentPushConstants = true; ssgiD.pushConstantSize = sizeof(SsgiParams);
+    auto ssgiPipe = device->CreateGraphicsPipeline(ssgiD);
+
+    rhi::GraphicsPipelineDesc acD;
+    acD.vertex = postVs.get(); acD.fragment = accumFs.get();
+    acD.colorFormat = kHdr;
+    acD.depthTest = false; acD.usesTexture = true; acD.fullscreen = true;
+    acD.fragmentPushConstants = true; acD.pushConstantSize = sizeof(AccumParams);
+    auto accumPipe = device->CreateGraphicsPipeline(acD);
+
+    rhi::GraphicsPipelineDesc compD;
+    compD.vertex = postVs.get(); compD.fragment = compFs.get();
+    compD.colorFormat = device->Swapchain().ColorFormat();
+    compD.depthTest = false; compD.usesTexture = true; compD.fullscreen = true;
+    compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(SsgiCompParams);
+    auto compPipe = device->CreateGraphicsPipeline(compD);
+
+    auto rt      = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf    = device->CreateRenderTarget(W, H, kHdr);
+    auto ssgiRT  = device->CreateRenderTarget(W, H, kHdr);
+    auto accumA  = device->CreateRenderTarget(W, H, kHdr);
+    auto accumB  = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> greyFloor(4 * 4 * 4, 70);
+    for (size_t p = 0; p < 4 * 4; ++p) greyFloor[p * 4 + 3] = 255;
+    auto groundTex = device->CreateTexture(
+        {4, 4, rhi::Format::RGBA8_UNorm, greyFloor.data(), greyFloor.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+    for (int o = 0; o < kNumObjs; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+        objTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+
+    Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+    std::vector<Mat4> objModel(kNumObjs);
+    for (int o = 0; o < kNumObjs; ++o)
+        objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(objs[o].scale);
+
+    const Vec3 eye{0.0f, 2.2f, 6.0f};
+    const Vec3 center{0.0f, 0.7f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.25f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 0.85f; fd.lightColor[1] = 0.83f; fd.lightColor[2] = 0.78f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.25f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.7f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    const int kRays = 16;
+    SsgiParams sp{};
+    sp.texel[0] = 1.0f / (float)W; sp.texel[1] = 1.0f / (float)H;
+    sp.tanHalfFovY = std::tan(0.5f * kFovY); sp.aspect = aspect;
+    sp.maxDist = 6.0f; sp.thickness = 0.6f; sp.intensity = 5.0f;
+    sp.rayCount = (float)kRays;
+    SsgiCompParams cp{}; cp.texel[0] = 1.0f / (float)W; cp.texel[1] = 1.0f / (float)H;
+    cp.intensity = 1.3f; cp.pad = 0.0f;
+    const render::ssgi::SsgiTemporalParams stp;  // fixed N=8 accumulation
+
+    auto drawObj = [&](rhi::ICommandBuffer& cmd) {
+        cmd.BindVertexBuffer(cube.vertices());
+        cmd.BindIndexBuffer(cube.indices());
+        cmd.DrawIndexed(cube.indexCount());
+    };
+
+    // --- Static prepasses (shadow + lit HDR scene + g-buffer), rendered ONCE. ---
+    {
+        render::RenderGraph g0;
+        render::RgResource rgShadow0 = g0.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene0 = g0.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgGbuf0 = g0.ImportTarget(
+            "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+        g0.AddPass("shadow", {}, {rgShadow0},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                for (int o = 0; o < kNumObjs; ++o) {
+                    cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                    drawObj(cmd);
+                }
+                cmd.EndRenderPass();
+            });
+        g0.AddPass("scene", {rgShadow0}, {rgScene0},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.01f, 0.01f, 0.015f, 1});
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.9f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (int o = 0; o < kNumObjs; ++o) {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                    pc[16] = 0.0f; pc[17] = 0.95f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*objTex[o], *flatNormal);
+                    drawObj(cmd);
+                }
+                cmd.EndRenderPass();
+            });
+        g0.AddPass("gbuffer", {}, {rgGbuf0},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                cmd.BindPipeline(*gbStaticPipeline);
+                {
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (int o = 0; o < kNumObjs; ++o) {
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    drawObj(cmd);
+                }
+                cmd.EndRenderPass();
+            });
+        g0.Execute(*device);
+        device->WaitIdle();
+    }
+
+    // --- N=8 accumulation loop: jittered SSGI gather -> running-mean accumulate (ping-pong). ---
+    rhi::IRenderTarget* accumPrev = accumA.get();
+    rhi::IRenderTarget* accumCur  = accumB.get();
+    for (int frame = 0; frame < stp.accumFrames; ++frame) {
+        SsgiParams spf = sp;
+        spf.frame = (float)frame;
+        AccumParams ac{};
+        ac.texel[0] = 1.0f / (float)W; ac.texel[1] = 1.0f / (float)H;
+        ac.weight = 1.0f / (float)(frame + 1);
+        ac.firstFrame = (frame == 0) ? 1.0f : 0.0f;
+
+        render::RenderGraph gf;
+        render::RgResource rgScene1 = gf.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgGbuf1 = gf.ImportTarget(
+            "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+        render::RgResource rgSsgi1 = gf.ImportTarget(
+            "ssgi", render::RgResourceKind::SceneColor, *ssgiRT);
+        render::RgResource rgPrev1 = gf.ImportTarget(
+            "accumPrev", render::RgResourceKind::SceneColor, *accumPrev);
+        render::RgResource rgCur1 = gf.ImportTarget(
+            "accumCur", render::RgResourceKind::SceneColor, *accumCur);
+        gf.AddPass("ssgi", {rgScene1, rgGbuf1}, {rgSsgi1},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                cmd.BindPipeline(*ssgiPipe);
+                cmd.BindTexturePair(*rt, *gbuf);
+                cmd.PushConstants(&spf, sizeof(spf));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        gf.AddPass("ssgi_accum", {rgSsgi1, rgPrev1}, {rgCur1},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                cmd.BindPipeline(*accumPipe);
+                cmd.BindTexturePair(*ssgiRT, *accumPrev);
+                cmd.PushConstants(&ac, sizeof(ac));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        gf.Execute(*device);
+        device->WaitIdle();
+        std::swap(accumPrev, accumCur);
+    }
+
+    // --- Composite the accumulated mean (in accumPrev after the swaps) like BP. ---
+    rhi::IRenderTarget& meanIndirect = *accumPrev;
+    {
+        render::RenderGraph gc;
+        render::RgResource rgScene2 = gc.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgMean2 = gc.ImportTarget(
+            "ssgiMean", render::RgResourceKind::SceneColor, meanIndirect);
+        render::RgResource rgSwap2 = gc.ImportSwapchain("swapchain");
+        gc.AddPass("composite", {rgScene2, rgMean2}, {rgSwap2},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*compPipe);
+                cmd.BindTexturePair(*rt, meanIndirect);
+                cmd.PushConstants(&cp, sizeof(cp));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        gc.Execute(*device);
+    }
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — SSGI (temporal, %d-frame accumulation), %d objects\n",
+                outPath, cw, ch, stp.accumFrames, kNumObjs);
+    return 0;
+}
+
 // --- SSGI spatial-denoise showcase (Slice BR). Mirrors the Vulkan --ssgi-denoise-shot path EXACTLY:
 // the SAME Cornell color-bleed scene + SSGI gather as --ssgi (RunSsgiShowcase), but with an additional
 // depth+normal-guided BILATERAL DENOISE pass (ssgi_denoise.frag) of the SSGI indirect buffer inserted
@@ -9906,6 +10231,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ssgi-denoise") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ssgi_denoise.png";
             try { return RunSsgiDenoiseShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ssgi-temporal <out.png>: temporal SSGI accumulation showcase (Slice BV) — the SAME Cornell
+        // color-bleed scene + SSGI gather as --ssgi, but the indirect is ACCUMULATED over a fixed N=8
+        // golden-angle-jittered frames into a running-mean HDR RT before the composite, converging to a
+        // much cleaner indirect-diffuse result. Mirrors the Vulkan --ssgi-temporal-shot.
+        if (argc > 1 && std::strcmp(argv[1], "--ssgi-temporal") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ssgi_temporal.png";
+            try { return RunSsgiTemporalShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --decal <out.png>: screen-space projected-decals showcase (Slice BH) — the lit+shadowed scene

@@ -85,6 +85,7 @@
     { "flag": "--ssr-shot", "desc": "Screen-space reflections." },
     { "flag": "--ssgi-shot", "desc": "Screen-space global illumination (color-bleed indirect diffuse)." },
     { "flag": "--ssgi-denoise-shot", "desc": "SSGI bilateral spatial denoise (edge-preserving smoothing of the indirect-diffuse buffer)." },
+    { "flag": "--ssgi-temporal-shot", "desc": "Temporal SSGI accumulation (fixed-N golden-angle-jittered indirect-diffuse averaging)." },
     { "flag": "--decal-shot", "desc": "Screen-space projected decals (top-down decal box on the ground)." },
     { "flag": "--poststack-shot", "desc": "Data-driven post-process stack (ordered tonemap/grade/chromatic/vignette/grain chain)." },
     { "flag": "--volumetric-shot", "desc": "Volumetric fog / light shafts." },

@@ -27,6 +27,8 @@ struct SsgiParams {
     float  thickness;    // depth-compare band (view units)
     float  intensity;    // indirect-diffuse gain
     float  rayCount;     // K hemisphere rays (as a float; clamped to [1, kMaxRays])
+    float  frame;        // Slice BV: temporal accumulation frame index (0 = base kernel, no rotation)
+    float3 _pad;         // pad to a 16-byte boundary (frame + 3 floats = one float4 row)
 };
 #ifdef HF_MSL_GEN
 [[vk::binding(1, 0)]] cbuffer SsgiPC { SsgiParams sp; };
@@ -67,6 +69,12 @@ static const float kDither[16] = {
     3.0 / 16.0, 11.0 / 16.0,  1.0 / 16.0,  9.0 / 16.0,
    15.0 / 16.0,  7.0 / 16.0, 13.0 / 16.0,  5.0 / 16.0,
 };
+
+// Slice BV: golden-angle per-frame azimuth step (as a fraction of a full turn) — IDENTICAL to
+// render/ssgi.h kGoldenAngleTurns. rot(frame) = frame * this is ADDED to the per-pixel dither so the
+// spatial dither and the temporal rotation compose into the single azimuth offset. frame 0 -> 0 -> the
+// raw --ssgi-shot kernel is byte-identical.
+static const float kGoldenAngleTurns = 0.38196601125010515;
 
 static const int   kMaxRays  = 32;   // hard upper bound on hemisphere rays (loop cap)
 static const int   kSteps    = 32;   // linear march steps per ray
@@ -117,9 +125,10 @@ float4 main(PSInput i) : SV_Target {
 
     int K = (int)clamp(HF_SP.rayCount, 1.0, (float)kMaxRays);
 
-    // Per-pixel kernel rotation from the baked 4x4 dither.
+    // Per-pixel kernel rotation from the baked 4x4 dither, PLUS the Slice BV temporal per-frame
+    // golden-angle rotation (frame 0 adds 0 -> byte-identical to the raw single-frame --ssgi-shot).
     int2 px = int2(i.uv / HF_SP.texel);
-    float rot = kDither[(px.x & 3) + ((px.y & 3) << 2)];
+    float rot = kDither[(px.x & 3) + ((px.y & 3) << 2)] + HF_SP.frame * kGoldenAngleTurns;
 
     float stepLen = HF_SP.maxDist / (float)kSteps;
     float3 sum = float3(0.0, 0.0, 0.0);

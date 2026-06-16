@@ -89,6 +89,7 @@ $Goldens = @(
     @{ Name = 'ssr';           Flag = '--ssr' }                  # Slice AH (screen-space reflections)
     @{ Name = 'ssgi';          Flag = '--ssgi' }                 # Slice BP (screen-space global illumination)
     @{ Name = 'ssgi_denoise';  Flag = '--ssgi-denoise' }         # Slice BR (SSGI bilateral spatial denoise)
+    @{ Name = 'ssgi_temporal'; Flag = '--ssgi-temporal' }        # Slice BV (temporal SSGI fixed-N accumulation)
     @{ Name = 'volumetric';    Flag = '--volumetric' }          # Slice AJ (volumetric fog / light shafts)
     @{ Name = 'probe';         Flag = '--probe' }                # Slice AK (reflection + irradiance probes)
     @{ Name = 'taa';           Flag = '--taa' }                  # Slice AP (temporal anti-aliasing)

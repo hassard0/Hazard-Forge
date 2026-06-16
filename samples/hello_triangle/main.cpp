@@ -337,6 +337,7 @@ int main(int argc, char** argv) {
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
+    const char* ssgiTemporalShotPath = nullptr; // --ssgi-temporal-shot <out.bmp> (Slice BV: temporal SSGI accumulation)
     const char* volumetricShotPath = nullptr; // --volumetric-shot <out.bmp> (Slice AJ: light shafts)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
@@ -602,6 +603,16 @@ int main(int argc, char** argv) {
             // (the A/B baseline). One BMP -> exit. New golden; existing SSGI/SSR/SSAO/bloom paths +
             // shaders + goldens untouched.
             ssgiDenoiseShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ssgi-temporal-shot") == 0 && i + 1 < argc) {
+            // Slice BV: temporal SSGI accumulation showcase. The SAME Cornell color-bleed scene as
+            // --ssgi-shot, but the SSGI indirect is ACCUMULATED over a FIXED N=8 frames, each with a
+            // different golden-angle-rotated hemisphere kernel (the ssgi.frag `frame` param), into a
+            // running-mean HDR accumulation RT (reusing TAA's fixed-N static-accumulation pattern), then
+            // composited like BP. The averaged indirect is much CLEANER/less noisy than a single frame
+            // while the bleed + edges stay intact. STATIC camera -> no reprojection (just a mean of N
+            // jittered frames). The raw --ssgi-shot + spatial --ssgi-denoise-shot paths + their goldens
+            // are byte-identical (frame 0 == the base kernel). One BMP -> exit. New golden.
+            ssgiTemporalShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--decal-shot") == 0 && i + 1 < argc) {
             // Slice BH: screen-space projected decals showcase. The standard lit+shadowed scene
             // (colored objects on a floor) is rendered through the G-buffer path (reusing the SSAO/SSR
@@ -5843,13 +5854,21 @@ int main(int argc, char** argv) {
         // kernel + baked dither (NO RNG, NO temporal accumulation) -> two runs byte-identical. SEPARATE
         // ssgi/ssgi_composite pipelines + shaders; existing gbuffer/ssao/ssr/bloom paths/shaders/
         // goldens untouched.
-        if (ssgiShotPath || ssgiDenoiseShotPath) {
+        if (ssgiShotPath || ssgiDenoiseShotPath || ssgiTemporalShotPath) {
             // Slice BR: --ssgi-denoise-shot reuses this EXACT --ssgi-shot scene/camera/SSGI gather; the
             // ONLY difference is an additional bilateral-denoise pass inserted between the ssgi gather
             // and the composite (the composite then adds the DENOISED indirect). The raw --ssgi-shot path
             // is byte-identical (ssgi.png unchanged) — the denoise pass + RT only exist when denoising.
-            const bool ssgiDenoise = (ssgiDenoiseShotPath != nullptr);
-            const char* outPath = ssgiDenoise ? ssgiDenoiseShotPath : ssgiShotPath;
+            // Slice BV: --ssgi-temporal-shot reuses the SAME scene/camera/gather but ACCUMULATES a FIXED
+            // N=8 jittered SSGI gathers (each a golden-angle-rotated kernel via the ssgi.frag `frame`
+            // param) into a running-mean HDR accumulation RT (the TAA fixed-N static-accumulation
+            // pattern), then composites the mean. The raw + denoise paths stay byte-identical (frame 0 ==
+            // the base kernel; the accum pass + loop only exist on the temporal path).
+            const bool ssgiDenoise  = (ssgiDenoiseShotPath != nullptr);
+            const bool ssgiTemporal = (ssgiTemporalShotPath != nullptr);
+            const char* outPath = ssgiTemporal ? ssgiTemporalShotPath
+                                : ssgiDenoise  ? ssgiDenoiseShotPath
+                                               : ssgiShotPath;
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
@@ -5930,6 +5949,7 @@ int main(int argc, char** argv) {
             struct SsgiParams {
                 float texel[2]; float tanHalfFovY; float aspect;
                 float maxDist; float thickness; float intensity; float rayCount;
+                float frame; float pad[3];   // Slice BV: temporal accumulation frame (0 = base kernel)
             };
             struct SsgiCompParams { float texel[2]; float intensity; float pad; };
             // Slice BR: bilateral-denoise push constant (mirrors shaders/ssgi_denoise.frag.hlsl).
@@ -5938,11 +5958,17 @@ int main(int argc, char** argv) {
                 float depthSigma; float normalPower; float pad[2];
             };
 
+            // Slice BV: temporal running-mean accumulation push constant (mirrors shaders/ssgi_accum.frag.hlsl).
+            struct AccumParams { float texel[2]; float weight; float firstFrame; };
+
             auto ssgiFs = loadFs("ssgi.frag.hlsl");
             auto compFs = loadFs("ssgi_composite.frag.hlsl");
             // Slice BR: the denoise fragment shader is only loaded/built on the --ssgi-denoise-shot path.
             std::unique_ptr<rhi::IShaderModule> denoiseFs;
             if (ssgiDenoise) denoiseFs = loadFs("ssgi_denoise.frag.hlsl");
+            // Slice BV: the accumulation fragment shader is only loaded/built on the --ssgi-temporal-shot path.
+            std::unique_ptr<rhi::IShaderModule> accumFs;
+            if (ssgiTemporal) accumFs = loadFs("ssgi_accum.frag.hlsl");
 
             rhi::GraphicsPipelineDesc ssgiD;
             ssgiD.vertex = postVsM.get(); ssgiD.fragment = ssgiFs.get();
@@ -5970,6 +5996,18 @@ int main(int argc, char** argv) {
                 denoisePipe = device->CreateGraphicsPipeline(dnD);
             }
 
+            // Slice BV: temporal running-mean accumulation pipeline (writes HDR, like the SSGI gather) —
+            // only built when accumulating so the raw + denoise paths construct the EXACT same pipelines.
+            std::unique_ptr<rhi::IPipeline> accumPipe;
+            if (ssgiTemporal) {
+                rhi::GraphicsPipelineDesc acD;
+                acD.vertex = postVsM.get(); acD.fragment = accumFs.get();
+                acD.colorFormat = kHdr;
+                acD.depthTest = false; acD.usesTexture = true; acD.fullscreen = true;
+                acD.fragmentPushConstants = true; acD.pushConstantSize = sizeof(AccumParams);
+                accumPipe = device->CreateGraphicsPipeline(acD);
+            }
+
             // --- Render targets: HDR lit scene + RGBA16F g-buffer + SSGI indirect. ---
             auto rt     = device->CreateRenderTarget(w, h, kHdr);
             auto gbuf   = device->CreateRenderTarget(w, h, kHdr);
@@ -5977,6 +6015,13 @@ int main(int argc, char** argv) {
             // Slice BR: denoised-indirect RT (only created on the denoise path).
             std::unique_ptr<rhi::IRenderTarget> ssgiDenoiseRT;
             if (ssgiDenoise) ssgiDenoiseRT = device->CreateRenderTarget(w, h, kHdr);
+            // Slice BV: ping-pong HDR accumulation RTs (running mean of the N jittered SSGI frames). Only
+            // created on the temporal path; the final mean (accumA after the loop) feeds the composite.
+            std::unique_ptr<rhi::IRenderTarget> accumA, accumB;
+            if (ssgiTemporal) {
+                accumA = device->CreateRenderTarget(w, h, kHdr);
+                accumB = device->CreateRenderTarget(w, h, kHdr);
+            }
             auto shadowMap = device->CreateShadowMap(2048);
             device->SetShadowMap(*shadowMap);
 
@@ -6050,6 +6095,186 @@ int main(int argc, char** argv) {
             const bool ssgiDbg = (std::getenv("HF_SSGI_DBG") != nullptr);
             SsgiCompParams cp{}; cp.texel[0] = 1.0f / (float)w; cp.texel[1] = 1.0f / (float)h;
             cp.intensity = 1.3f; cp.pad = ssgiDbg ? -1.0f : 0.0f;
+
+            // Slice BV: temporal accumulation count (fixed N=8, matching engine/render/ssgi.h +
+            // taa::kAccumFrames). The --ssgi-temporal-shot path averages N golden-angle-rotated SSGI
+            // gathers; the raw + denoise paths effectively run only "frame 0" (sp.frame stays 0).
+            const render::ssgi::SsgiTemporalParams stp;
+
+            // === Temporal path (Slice BV): static shadow/scene/g-buffer ONCE, then a fixed-N loop of
+            // (jittered SSGI gather -> running-mean accumulate), then ONE composite of the mean. This is
+            // the TAA static-accumulation pattern; the camera is STATIC so there is no reprojection. The
+            // raw + denoise paths fall through to the single-graph flow below (byte-identical). ===
+            if (ssgiTemporal) {
+                auto drawObjT = [&](rhi::ICommandBuffer& cmd) {
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    cmd.DrawIndexed(cube.indexCount());
+                };
+                // --- Static prepasses: shadow + lit HDR scene + g-buffer (rendered once). ---
+                {
+                    render::RenderGraph g0;
+                    render::RgResource rgShadow0 = g0.ImportTarget(
+                        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                    render::RgResource rgScene0 = g0.ImportTarget(
+                        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                    render::RgResource rgGbuf0 = g0.ImportTarget(
+                        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+                    g0.AddPass("shadow", {}, {rgShadow0},
+                        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.BindPipeline(*staticShadowPipeline);
+                            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                            for (int o = 0; o < kNumObjs; ++o) {
+                                cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                                drawObjT(cmd);
+                            }
+                            cmd.EndRenderPass();
+                        });
+                    g0.AddPass("scene", {rgShadow0}, {rgScene0},
+                        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                            (void)skyPipe;
+                            cmd.BeginRenderPass(rhi::ClearColor{0.01f, 0.01f, 0.015f, 1});
+                            cmd.BindPipeline(*litPipeline);
+                            {
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                                pc[16] = 0.0f; pc[17] = 0.9f; pc[18] = 0.0f; pc[19] = 0.0f;
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindMaterial(*groundTex, *flatNormal);
+                                cmd.BindVertexBuffer(plane.vertices());
+                                cmd.BindIndexBuffer(plane.indices());
+                                cmd.DrawIndexed(plane.indexCount());
+                            }
+                            for (int o = 0; o < kNumObjs; ++o) {
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                                pc[16] = 0.0f; pc[17] = 0.95f; pc[18] = 0.0f; pc[19] = 0.0f;
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindMaterial(*objTex[o], *flatNormal);
+                                drawObjT(cmd);
+                            }
+                            cmd.EndRenderPass();
+                        });
+                    g0.AddPass("gbuffer", {}, {rgGbuf0},
+                        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                            cmd.BindPipeline(*gbStaticPipeline);
+                            {
+                                float pc[32];
+                                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindVertexBuffer(plane.vertices());
+                                cmd.BindIndexBuffer(plane.indices());
+                                cmd.DrawIndexed(plane.indexCount());
+                            }
+                            for (int o = 0; o < kNumObjs; ++o) {
+                                float pc[32];
+                                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                drawObjT(cmd);
+                            }
+                            cmd.EndRenderPass();
+                        });
+                    g0.Execute(*device);
+                    device->WaitIdle();
+                }
+
+                // --- N=8 accumulation loop: jittered SSGI gather -> running-mean accumulate (ping-pong).
+                // accumPrev holds the mean of frames 0..frame-1; accumCur receives the mean of 0..frame.
+                rhi::IRenderTarget* accumPrev = accumA.get();
+                rhi::IRenderTarget* accumCur  = accumB.get();
+                for (int frame = 0; frame < stp.accumFrames; ++frame) {
+                    SsgiParams spf = sp;
+                    spf.frame = (float)frame;     // selects the golden-angle-rotated kernel for this frame
+                    AccumParams ac{};
+                    ac.texel[0] = 1.0f / (float)w; ac.texel[1] = 1.0f / (float)h;
+                    ac.weight = 1.0f / (float)(frame + 1);          // exact running mean
+                    ac.firstFrame = (frame == 0) ? 1.0f : 0.0f;
+
+                    render::RenderGraph gf;
+                    render::RgResource rgScene1 = gf.ImportTarget(
+                        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                    render::RgResource rgGbuf1 = gf.ImportTarget(
+                        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+                    render::RgResource rgSsgi1 = gf.ImportTarget(
+                        "ssgi", render::RgResourceKind::SceneColor, *ssgiRT);
+                    render::RgResource rgPrev1 = gf.ImportTarget(
+                        "accumPrev", render::RgResourceKind::SceneColor, *accumPrev);
+                    render::RgResource rgCur1 = gf.ImportTarget(
+                        "accumCur", render::RgResourceKind::SceneColor, *accumCur);
+
+                    // Per-frame SSGI gather (golden-angle-rotated kernel) -> ssgiRT.
+                    gf.AddPass("ssgi", {rgScene1, rgGbuf1}, {rgSsgi1},
+                        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                            cmd.BindPipeline(*ssgiPipe);
+                            cmd.BindTexturePair(*rt, *gbuf);
+                            cmd.PushConstants(&spf, sizeof(spf));
+                            cmd.Draw(3);
+                            cmd.EndRenderPass();
+                        });
+                    // Running-mean accumulate: (current ssgiRT, accumPrev) -> accumCur.
+                    gf.AddPass("ssgi_accum", {rgSsgi1, rgPrev1}, {rgCur1},
+                        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                            cmd.BindPipeline(*accumPipe);
+                            cmd.BindTexturePair(*ssgiRT, *accumPrev);
+                            cmd.PushConstants(&ac, sizeof(ac));
+                            cmd.Draw(3);
+                            cmd.EndRenderPass();
+                        });
+                    gf.Execute(*device);
+                    device->WaitIdle();
+                    std::swap(accumPrev, accumCur);   // this frame's mean becomes next frame's history
+                }
+                // After N swaps the final mean is in accumPrev. Composite it like BP.
+                rhi::IRenderTarget& meanIndirect = *accumPrev;
+                {
+                    render::RenderGraph gc;
+                    render::RgResource rgScene2 = gc.ImportTarget(
+                        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                    render::RgResource rgMean2 = gc.ImportTarget(
+                        "ssgiMean", render::RgResourceKind::SceneColor, meanIndirect);
+                    render::RgResource rgSwap2 = gc.ImportSwapchain("swapchain");
+                    gc.AddPass("composite", {rgScene2, rgMean2}, {rgSwap2},
+                        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.BindPipeline(*compPipe);
+                            cmd.BindTexturePair(*rt, meanIndirect);
+                            cmd.PushConstants(&cp, sizeof(cp));
+                            cmd.Draw(3);
+                            cmd.EndRenderPass();
+                        });
+                    device->CaptureNextFrame();
+                    gc.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                    gc.Execute(*device);
+                }
+
+                std::printf("ssgi-temporal: {accumFrames:%d, rays:%d, marchDist:%.1f, intensity:%.2f}\n",
+                            stp.accumFrames, kRays, sp.maxDist, sp.intensity);
+
+                std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+                bool ok = false;
+                if (device->GetCapturedPixels(px, cw, ch2)) {
+                    ok = WriteBMP(outPath, px, cw, ch2);
+                    if (ok) std::printf("wrote %s (%ux%u) — SSGI (temporal, %d-frame accumulation), %d objects\n",
+                                        outPath, cw, ch2, stp.accumFrames, kNumObjs);
+                    else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", outPath);
+                } else {
+                    std::fprintf(stderr, "FATAL: no captured pixels\n");
+                }
+                device->WaitIdle();
+                return ok ? 0 : 1;
+            }
 
             render::RenderGraph graph;
             render::RgResource rgShadow = graph.ImportTarget(

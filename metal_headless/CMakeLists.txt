@@ -172,6 +172,10 @@ hf_gen_msl(ssgi_composite.frag    ssgi_composite.frag.hlsl    frag ssgi_composit
 # (same NxN fullscreen shape as ssao_blur, edge-stopped per tap by the g-buffer) inserted before
 # ssgi_composite on the --ssgi-denoise path only. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(ssgi_denoise.frag      ssgi_denoise.frag.hlsl      frag ssgi_denoise_fragment)
+# Temporal SSGI accumulation (Slice BV): a running-mean accumulation pass that folds N=8 jittered SSGI
+# indirect frames (each a golden-angle-rotated hemisphere kernel via ssgi.frag's `frame` param) into an
+# HDR accumulation RT before ssgi_composite, on the --ssgi-temporal path only. Same HLSL->SPIR-V->MSL.
+hf_gen_msl(ssgi_accum.frag        ssgi_accum.frag.hlsl        frag ssgi_accum_fragment)
 # Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
 # volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
 # volumetric_composite adds it over the scene + tonemaps. Same HF_MSL_GEN shadow V-flip as lit.frag.

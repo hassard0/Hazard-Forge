@@ -127,6 +127,14 @@ hf_add_pure_test(ssgi_test)
 # EDGE PRESERVATION across a depth/normal seam), and determinism. Pure C++ (render/ssgi.h), ASan-eligible.
 hf_add_pure_test(ssgi_denoise_test)
 
+# Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
+# (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
+# frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so
+# accumulation adds new samples), the fixed N=8 accumulation count, a variance-reduction mini-model
+# (averaging N frames of an unbiased noisy estimator -> ~1/N variance, same mean), and determinism.
+# Pure C++ (render/ssgi.h, header-only), ASan-eligible.
+hf_add_pure_test(ssgi_temporal_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff

@@ -110,6 +110,72 @@ inline math::Vec3 HemisphereDir(int i, int K, const math::Vec3& normal) {
     return math::normalize(dir);
 }
 
+// --- Temporal accumulation: per-frame jittered hemisphere kernel (Slice BV) ---------------------
+// For a STATIC scene + STATIC camera the SSGI grain is driven down by AVERAGING N frames, each with a
+// DIFFERENT (rotated) hemisphere kernel — exactly the fixed-N deterministic accumulation pattern TAA
+// (Slice AP) established (render N fixed-jittered frames, average; no time/RNG, two runs bit-identical;
+// the camera doesn't move so there is NO reprojection, just a running mean). HemisphereDirJittered is
+// the base HemisphereDir kernel with a FIXED per-frame AZIMUTH rotation applied to phi:
+//
+//   rot(frame) = frame * kGoldenAngleTurns                     (turns; 1 turn = 2*pi rad)
+//   phi        = 2*pi * (u2 + rot(frame))
+//
+// where kGoldenAngleTurns = (3 - sqrt(5)) / 2 (the golden angle expressed as a fraction of a full
+// turn, ~0.381966). The golden-angle step spreads successive frames' azimuths maximally evenly around
+// the circle (the same low-discrepancy spiral the Fibonacci/Vogel disk uses), so N frames sample N
+// well-separated rotated copies of the base set — maximizing the new coverage each frame adds. The
+// rotation is a pure function of `frame` (no RNG/time), so the per-(i,K,normal,frame) output is
+// deterministic and identical on Vulkan + Metal.
+//
+// frame 0 => rot == 0 => the returned direction is BYTE-IDENTICAL to HemisphereDir (documented clean
+// relationship): this keeps the single-frame raw --ssgi-shot path (which is "frame 0") unchanged.
+//
+// The in-shader counterpart is ssgi.frag.hlsl's HemisphereDir(i,K,N,rot): the showcase passes
+// rot = frame * kGoldenAngleTurns as the per-frame kernel rotation (ADDED to the per-pixel dither so
+// both the spatial dither and the temporal rotation compose into the single azimuth offset).
+inline constexpr float kGoldenAngleTurns = 0.38196601125010515f;  // (3 - sqrt(5)) / 2
+
+// Cosine-weighted hemisphere direction with an explicit azimuth rotation `rotTurns` (in turns) — the
+// shared core HemisphereDir and HemisphereDirJittered both call. rotTurns == 0 reproduces HemisphereDir
+// exactly (same arithmetic, in the same order), so frame 0 is byte-stable.
+inline math::Vec3 HemisphereDirRot(int i, int K, const math::Vec3& normal, float rotTurns) {
+    if (K < 1) K = 1;
+    if (i < 0) i = 0;
+    if (i >= K) i = K - 1;
+
+    float u1 = (static_cast<float>(i) + 0.5f) / static_cast<float>(K);
+    float u2 = RadicalInverse2(static_cast<uint32_t>(i));
+
+    float r = std::sqrt(std::max(0.0f, u1));
+    float phi = 6.2831853071795864769f * (u2 + rotTurns);
+    float lx = r * std::cos(phi);
+    float ly = r * std::sin(phi);
+    float lz = std::sqrt(std::max(0.0f, 1.0f - u1));   // cos(theta)
+
+    math::Vec3 N = math::normalize(normal);
+    math::Vec3 T, B;
+    BuildTangentBasis(N, T, B);
+    math::Vec3 dir{
+        T.x * lx + B.x * ly + N.x * lz,
+        T.y * lx + B.y * ly + N.y * lz,
+        T.z * lx + B.z * ly + N.z * lz,
+    };
+    return math::normalize(dir);
+}
+
+// i-th of K cosine-weighted hemisphere dirs for accumulation `frame`, rotated by frame*goldenAngle.
+// Deterministic per (i,K,normal,frame); frame 0 == HemisphereDir (byte-identical).
+inline math::Vec3 HemisphereDirJittered(int i, int K, const math::Vec3& normal, int frame) {
+    return HemisphereDirRot(i, K, normal, static_cast<float>(frame) * kGoldenAngleTurns);
+}
+
+// Temporal-accumulation parameters. accumFrames = the FIXED number of jittered SSGI frames averaged
+// into the running mean (N=8, matching TAA's kAccumFrames). Fixed N + fixed per-frame rotation + fixed
+// accumulation order (frame 0..N-1) = deterministic, two runs byte-identical.
+struct SsgiTemporalParams {
+    int accumFrames = 8;   // N jittered SSGI frames averaged (the showcase prints {accumFrames:8})
+};
+
 // --- Indirect-diffuse accumulation --------------------------------------------------------------
 // AccumulateIndirect = the Monte-Carlo estimator of indirect diffuse irradiance for one pixel:
 //   E_indirect = (1/K) * sum_k L_hit_k

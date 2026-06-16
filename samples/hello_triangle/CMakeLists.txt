@@ -148,6 +148,11 @@ hf_compile_shaders(
     # the floor color-bleed pool while keeping the bleed crisp at edges. Inserted on the SSGI path before
     # ssgi_composite, behind --ssgi-denoise-shot ONLY; the raw --ssgi-shot path + ssgi.png stay unchanged.
     "shaders/ssgi_denoise.frag.hlsl:ps"
+    # Temporal SSGI accumulation (Slice BV): a running-mean accumulation pass that folds N=8 jittered
+    # SSGI indirect frames (each a golden-angle-rotated hemisphere kernel, via ssgi.frag's `frame` param)
+    # into an HDR accumulation RT, then composites the mean like BP. Inserted on the --ssgi-temporal-shot
+    # path ONLY; the raw --ssgi-shot + spatial --ssgi-denoise-shot paths + their goldens stay unchanged.
+    "shaders/ssgi_accum.frag.hlsl:ps"
     # Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
     # volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
     # volumetric_composite adds it over the scene + tonemaps. Existing shaders + goldens untouched.
