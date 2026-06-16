@@ -210,6 +210,12 @@ hf_compile_shaders(
     # lit_gpudriven.{vert,frag}. Composes AR (cull+compact) + BM (MDI) + BZ (bindless) + CB (combined
     # per-draw). Existing shaders + goldens untouched.
     "shaders/gpudriven_cull.comp.hlsl:cs"
+    # Hi-Z OCCLUSION cull (Slice CJ): extends gpudriven_cull with a hierarchical-Z occlusion test —
+    # after the frustum test, an object FULLY HIDDEN behind closer geometry (its screen-rect nearest
+    # depth farther than the Hi-Z max everywhere it covers) is dropped from the compacted survivors.
+    # The Hi-Z pyramid is built CPU-side (render/hiz.h) from a depth pre-pass + uploaded; the shader
+    # runs the SAME IsOccluded math. Render-invariant: occlusion-culled == frustum-only byte-identical.
+    "shaders/hiz_cull.comp.hlsl:cs"
     # GPU multi-draw-indirect batching (Slice BM): the MDI lit vertex shader reads the per-draw model
     # matrix + material from a storage buffer indexed by gl_DrawID (SPIR-V DrawIndex). VULKAN-ONLY (the
     # DrawIndex builtin needs shaderDrawParameters); shares the existing lit.frag. Not in the Metal MSL

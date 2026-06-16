@@ -288,6 +288,19 @@ hf_add_pure_test(gpu_driven_test)
 # ASan-eligible.
 hf_add_pure_test(gpu_culled_test)
 
+# Hi-Z occlusion culling (Slice CJ): the pure-CPU Hi-Z math (render/hiz.h) the GPU cull compute
+# (shaders/hiz_cull.comp.hlsl) mirrors. Asserts the Hi-Z BUILD (each coarser mip texel == MAX of its
+# 2x2 children; dims halve to a 1x1 top; odd-dim ceil edge texels MAX their in-range child; a known
+# buffer -> the expected pyramid; deterministic), the OCCLUSION TEST true-positive (a box fully behind
+# a closer full-screen occluder is IsOccluded), the true-NEGATIVE safety cases (in-front / partially-
+# visible / near-plane-straddle / partly-off-screen -> NOT occluded — false-culling any corrupts the
+# image), the CONSERVATIVE no-false-cull parity (over 4000 random AABBs + a non-uniform Hi-Z,
+# IsOccluded never culls an AABB any of whose covered mip0 texels is at/in front of its nearest depth
+# — a brute-force per-texel check, 0 false-culls), and determinism. The render-invariance proof
+# (occlusion-culled image == frustum-only byte-identical, occluded>0, GPU occluded==CPU) lives in
+# --hiz-cull-shot; this pins the CPU math both paths read. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(hiz_test)
+
 # Multithreaded command recording (Slice AU): the deterministic CONTIGUOUS draw-list partition
 # (PartitionDraws splits [0,K) into W gap/overlap-free ranges, run-to-run identical, degenerate
 # W>K/K=0/W=1/W=0) + the real worker-pool dispatch (RecordParallel marks each draw exactly once

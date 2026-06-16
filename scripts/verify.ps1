@@ -101,6 +101,7 @@ $Goldens = @(
     @{ Name = 'bindless';      Flag = '--bindless' }            # Slice BZ (bindless textures; Metal renders the identical multi-texture scene per-material bound)
     @{ Name = 'gpudriven';     Flag = '--gpudriven' }           # Slice CB (fully-GPU-driven pass: MDI + bindless; Metal renders the identical multi-material scene per-object bound)
     @{ Name = 'gpucull_draw';  Flag = '--gpucull-draw' }        # Slice CD (fully-GPU-driven-CULLED pass: compute-cull -> MDI + bindless; Metal renders the identical CPU-frustum-culled survivor subset per-object bound)
+    @{ Name = 'hiz_cull';      Flag = '--hiz-cull' }            # Slice CJ (Hi-Z occlusion cull: depth pre-pass -> Hi-Z pyramid -> frustum+occlusion cull; Metal renders the identical CPU-occlusion-culled visible survivor subset per-object bound; occlusion-culled==frustum-only)
     @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'net';           Flag = '--net' }                 # Slice BQ (replication; replica reconstructs + renders the scene)
@@ -270,7 +271,7 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 `$env:VK_VALIDATION_FEATURE_ENABLE = 'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION'
 # Representative showcases: --shot (GPU particles + shared-base/varied-normal materials, where the
 # UPDATE_AFTER_BIND bug lived) and --csm-shot (cascaded shadow atlas, a heavy multi-pass graph path).
-`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'))
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--hiz-cull-shot'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))
