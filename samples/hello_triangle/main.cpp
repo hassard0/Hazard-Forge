@@ -353,6 +353,7 @@ int main(int argc, char** argv) {
     const char* oitShotPath = nullptr;       // --oit-shot <out.bmp> (Slice CO: order-independent transparency)
     const char* pomShotPath = nullptr;       // --pom-shot <out.bmp> (Slice CP: parallax occlusion mapping)
     const char* gtaoShotPath = nullptr;      // --gtao-shot <out.bmp> (Slice CR: ground-truth ambient occlusion)
+    const char* sssShotPath = nullptr;       // --sss-shot <out.bmp> (Slice CZ: subsurface scattering)
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
@@ -685,6 +686,19 @@ int main(int argc, char** argv) {
             // Prints `gtao: {slices:N, steps:M, radius:R}`. One BMP -> exit. New golden; existing
             // lit/ssao/ssr/pom paths/shaders/goldens are untouched.
             gtaoShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--sss-shot") == 0 && i + 1 < argc) {
+            // Slice CZ: Subsurface Scattering (screen-space separable SSS, Jimenez 2015). A scene with a
+            // clearly SUBSURFACE object (a sphere flagged subsurface, lit so one side is in shadow) beside
+            // hard NON-subsurface objects, rendered into an HDR RGBA16F target PLUS an "SSS G-buffer" RT
+            // (the subsurface MASK in .r + the view-space linear depth in .w). A fullscreen sss_blur pass
+            // run TWICE (horizontal then vertical, reusing post.vert) gathers the render/sss.h depth-aware
+            // diffusion kernel so the subsurface object shows soft under-surface light bleed wrapping the
+            // terminator while the hard objects stay sharp, then tonemaps. CRITICAL: the SAME scene is ALSO
+            // rendered with sssStrength=0 (sss_blur's no-op pass-through) and asserted BYTE-IDENTICAL (SHA)
+            // to the non-SSS lit render -- the zero-strength equivalence proof (the kernel collapses to the
+            // center tap, no normalization/centering bug). Prints `sss: {width:W, strength:S, taps:N}`.
+            // One BMP -> exit. New golden; existing lit/ssao/ssr/dof/gtao paths/shaders/goldens untouched.
+            sssShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxelfog-shot") == 0 && i + 1 < argc) {
             // Slice CS: Froxel Volumetric Fog (sun single-scattering). A lit+shadowed scene (ground +
             // objects) wrapped in a TRUE 3D view-space FROXEL volume: a compute pass (froxel_inject)
@@ -15050,6 +15064,444 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — GTAO, %d slices, %d steps, radius %.4g, %d objects\n",
                                 gtaoShotPath, gw, gh, kSlices, kSteps, (double)kRadius, kNumObjs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gtaoShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Subsurface Scattering showcase (--sss-shot, Slice CZ): screen-space separable SSS (Jimenez
+        // 2015). A subsurface sphere (flagged) lit so one side is in shadow, beside hard non-subsurface
+        // objects, rendered into an HDR RT + an "SSS G-buffer" RT (the subsurface MASK in .r + the
+        // view-space linear depth in .w, written by sss_mask.frag for ONLY the subsurface objects). Two
+        // fullscreen sss_blur passes (horizontal then vertical, reusing post.vert) gather the render/sss.h
+        // depth-aware diffusion kernel so the subsurface sphere's lit color softens (the translucent glow
+        // wrapping the terminator) while the hard objects stay crisp; a final post.frag tonemaps to the
+        // swapchain. THE sssStrength=0 EQUIVALENCE PROOF: the SAME chain at sssStrength=0 (sss_blur's no-op
+        // pass-through -> the HDR blur output is byte-identical to the lit scene) and the NON-SSS render
+        // (post.frag directly on the lit scene) are asserted BYTE-IDENTICAL (SHA) -- proving the separable
+        // blur normalizes to a true identity at zero strength (no bias, no centering/off-by-one). The
+        // proof is the SAME post.frag tonemap over (a) the strength=0 blur of the scene and (b) the scene,
+        // so it is backend-portable. Deterministic (fixed camera/lights/SSS params, no RNG); two runs
+        // byte-identical. SEPARATE sss_mask/sss_blur pipelines + the REUSED gbuffer.vert/post pipelines;
+        // existing lit/ssao/ssr/dof/gtao paths/shaders/goldens untouched.
+        if (sssShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+            // FIXED, deterministic SSS params.
+            const float kSssWidthPx  = 26.0f;  // subsurface diffusion profile width in pixels
+            const float kSssStrength = 14.0f;  // global strength (folds the view-units -> px diffusion scale)
+            const int   kTaps        = 17;     // taps per separable pass
+            const float kDepthScale  = 0.6f;   // DepthFalloff depth window (view-space linear-depth units)
+
+            // --- Scene objects: a SUBSURFACE sphere (flagged) flanked by hard NON-subsurface objects.
+            // The subsurface sphere reads its translucent terminator glow vs the hard objects' sharp
+            // terminator. `sss` flags the subsurface material (drawn into the SSS mask G-buffer). ---
+            struct Obj { Vec3 pos; float scale; bool cube; bool sss; float col[3]; };
+            const Obj objs[] = {
+                {{ 0.0f, 0.9f, -0.5f}, 0.95f, false, true,  {0.95f, 0.70f, 0.62f}},  // SUBSURFACE sphere (skin-toned)
+                {{-2.2f, 0.8f, -0.2f}, 0.8f,  false, false, {0.80f, 0.80f, 0.85f}},  // hard sphere (left)
+                {{ 2.2f, 0.8f, -0.2f}, 0.8f,  true,  false, {0.55f, 0.80f, 0.55f}},  // hard cube (right)
+                {{-1.1f, 0.6f,  1.4f}, 0.6f,  true,  false, {0.85f, 0.55f, 0.40f}},  // hard cube (front-left)
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky pipelines (UNCHANGED shaders). ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- SSS mask prepass: reuses gbuffer.vert (model+view), sss_mask.frag writes (1,0,0,linDepth)
+            // for the subsurface objects ONLY (the RT is cleared to 0 so opaque/background stays mask 0). ---
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto maskFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sss_mask.frag.hlsl.spv");
+            auto gbVs   = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto maskFs = device->CreateShaderModule({std::span<const uint32_t>(maskFsW)});
+            rhi::GraphicsPipelineDesc maskDesc;
+            maskDesc.vertex = gbVs.get(); maskDesc.fragment = maskFs.get();
+            maskDesc.vertexLayout = scene::MeshVertexLayout();
+            maskDesc.colorFormat = kHdr;
+            maskDesc.depthTest = true; maskDesc.usesFrameUniforms = true;
+            maskDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto maskPipeline = device->CreateGraphicsPipeline(maskDesc);
+
+            // --- SSS blur (fullscreen, run twice) + post tonemap pipelines. ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct SssParams {
+                float texel[2]; float sssWidthPx; float sssStrength;
+                float taps; float depthScale; float axis; float pad;
+            };
+            static_assert(sizeof(SssParams) <= 128, "SssParams must fit the 128B push-constant budget");
+            auto blurFs = loadFs("sss_blur.frag.hlsl");
+            auto postFs = loadFs("post.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc blurD;
+            blurD.vertex = postVsM.get(); blurD.fragment = blurFs.get();
+            blurD.colorFormat = kHdr;
+            blurD.depthTest = false; blurD.usesTexture = true; blurD.fullscreen = true;
+            blurD.fragmentPushConstants = true; blurD.pushConstantSize = sizeof(SssParams);
+            auto blurPipe = device->CreateGraphicsPipeline(blurD);
+
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFs.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // --- Render targets: lit HDR scene + the SSS mask/depth G-buffer + two HDR ping-pong RTs. ---
+            auto rt    = device->CreateRenderTarget(w, h, kHdr);  // lit HDR scene
+            auto sssGb = device->CreateRenderTarget(w, h, kHdr);  // mask.r + linDepth.w
+            auto tmpA  = device->CreateRenderTarget(w, h, kHdr);  // horizontal-pass output
+            auto tmpB  = device->CreateRenderTarget(w, h, kHdr);  // vertical-pass output
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+
+            // Camera + a STRONG side light so the subsurface sphere has a clear lit/shadow terminator the
+            // SSS glow wraps around.
+            const Vec3 eye{0.0f, 1.7f, 5.0f};
+            const Vec3 center{0.0f, 0.7f, -0.3f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -1.0f; fd.lightDir[1] = -0.35f; fd.lightDir[2] = -0.2f;  // strong side light
+                fd.lightColor[0] = 1.6f; fd.lightColor[1] = 1.4f; fd.lightColor[2] = 1.25f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-1.0f, -0.35f, -0.2f});
+                Vec3 sc{0.0f, 0.6f, -0.3f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            SssParams sp{};
+            sp.texel[0] = 1.0f / (float)w; sp.texel[1] = 1.0f / (float)h;
+            sp.sssWidthPx = kSssWidthPx; sp.taps = (float)kTaps; sp.depthScale = kDepthScale;
+
+            // Render the lit scene + the SSS mask/depth G-buffer ONCE, then run the SSS blur chain (H->V)
+            // at the given strength and tonemap. strength==0 -> the blur is a pure pass-through (tmpB==rt).
+            auto renderSss = [&](float strength,
+                                 std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                sp.sssStrength = strength;
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSss = graph.ImportTarget(
+                    "sssGbuffer", render::RgResourceKind::SceneColor, *sssGb);
+                render::RgResource rgTmpA = graph.ImportTarget(
+                    "sssTmpA", render::RgResourceKind::SceneColor, *tmpA);
+                render::RgResource rgTmpB = graph.ImportTarget(
+                    "sssTmpB", render::RgResourceKind::SceneColor, *tmpB);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;  // matte floor
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;  // matte objects
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*objTex[o], *flatNormal);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                // SSS mask/depth G-buffer: clear to 0, then draw ONLY the subsurface objects (mask 1).
+                graph.AddPass("sssmask", {}, {rgSss},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*maskPipeline);
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            if (!objs[o].sss) continue;
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                // Horizontal blur pass (scene t0 + SSS G-buffer t3) -> tmpA.
+                sp.axis = 0.0f;
+                graph.AddPass("sssH", {rgScene, rgSss}, {rgTmpA},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*blurPipe);
+                        cmd.BindTexturePair(*rt, *sssGb);
+                        SssParams hp = sp; hp.axis = 0.0f;
+                        cmd.PushConstants(&hp, sizeof(hp));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                // Vertical blur pass (tmpA t0 + SSS G-buffer t3) -> tmpB.
+                graph.AddPass("sssV", {rgTmpA, rgSss}, {rgTmpB},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*blurPipe);
+                        cmd.BindTexturePair(*tmpA, *sssGb);
+                        SssParams vp = sp; vp.axis = 1.0f;
+                        cmd.PushConstants(&vp, sizeof(vp));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                // Tonemap the diffused HDR scene -> swapchain.
+                graph.AddPass("post", {rgTmpB}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*tmpB);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // The NON-SSS reference: the SAME lit scene tonemapped directly (no blur passes) -> swapchain.
+            auto renderNoSss = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*objTex[o], *flatNormal);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE sssStrength=0 EQUIVALENCE PROOF.
+            //   sssPx  — the REAL sssStrength>0 SSS: the golden (the subsurface terminator glow).
+            //   zeroPx — sssStrength=0 (sss_blur's no-op pass-through -> tmpB == lit scene), tonemapped.
+            //   noPx   — the NON-SSS render (post.frag directly on the lit scene).
+            // zeroPx and noPx tonemap the SAME lit scene, so they MUST be BYTE-IDENTICAL — proving the
+            // separable blur is a pure pass-through at zero strength (no bias, no centering/off-by-one).
+            std::vector<uint8_t> sssPx, zeroPx, noPx;
+            uint32_t sw = 0, sh = 0, zw = 0, zh = 0, nw = 0, nh = 0;
+            if (!renderSss(kSssStrength, sssPx, sw, sh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (SSS strength>0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderSss(0.0f, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (SSS strength=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderNoSss(noPx, nw, nh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (non-SSS reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t zeroHash = fnv(zeroPx), noHash = fnv(noPx), sssHash = fnv(sssPx);
+            std::printf("sss strength=0 hash: %016llx  non-SSS hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)noHash);
+            const bool zeroEquivalent = (zw == nw) && (zh == nh) && (zeroPx.size() == noPx.size()) &&
+                                        (std::memcmp(zeroPx.data(), noPx.data(), noPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: SSS strength=0 render != non-SSS render — the separable blur is NOT a pure "
+                    "pass-through at zero strength (normalization/centering/off-by-one bug). strength=0 "
+                    "%016llx vs non-SSS %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)noHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("sss strength=0 == non-SSS scene: BYTE-IDENTICAL (sssStrength=0 no-op proof)\n");
+            std::printf("sss: {width:%.4g, strength:%.4g, taps:%d}\n",
+                        (double)kSssWidthPx, (double)kSssStrength, kTaps);
+            // Sanity: the real SSS render must DIFFER from the non-SSS render (the diffusion is visible).
+            if (sssHash == noHash)
+                std::fprintf(stderr, "WARNING: SSS strength>0 render is identical to the non-SSS render "
+                                     "(no visible subsurface bleed) — check the SSS params / scene\n");
+
+            bool ok = WriteBMP(sssShotPath, sssPx, sw, sh);
+            if (ok) std::printf("wrote %s (%ux%u) — SSS, width %.4g, strength %.4g, %d taps, %d objects\n",
+                                sssShotPath, sw, sh, (double)kSssWidthPx, (double)kSssStrength,
+                                kTaps, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", sssShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

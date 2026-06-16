@@ -199,6 +199,17 @@ hf_add_pure_test(pom_test)
 # ASan-eligible.
 hf_add_pure_test(gtao_test)
 
+# Subsurface Scattering (Slice CZ): the skin diffusion profile weight DiffusionWeight (positive,
+# peaks at distance 0, strictly decreasing, a wider sssWidthPx spreads weight), the depth-aware
+# silhouette-stop DepthFalloff (1 at equal depth, -> ~0 across a depth discontinuity, monotone), and one
+# separable diffusion blur BlurAxis (render/sss.h, header-only). The CORE proof: BlurAxis(sssStrength=0)
+# and BlurAxis(sssWidthPx=0) return the center color EXACTLY for ANY depth/mask field (the byte-identical
+# sssStrength=0 == non-SSS render proof's CPU half), plus a mask-0 pixel passes through unchanged. Also
+# pins the blur behavior (a bright subsurface center spreads/softens to neighbors, a dark dip fills in,
+# both normalized/energy-conserving; the depth stop blocks bleed across a silhouette) and determinism.
+# The same sss.h math is mirrored VERBATIM in sss_blur.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(sss_test)
+
 # Froxel Volumetric Fog (Slice CS): the exponential Z-slice mapping + its EXACT inverse
 # (ViewZToSlice(SliceZ(k)) == k — the apply's depth->slice sampling correctness, an off-by-one here
 # breaks the density=0==scene proof), SliceZ monotone + [zNear,zFar] coverage, height-fog density

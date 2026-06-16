@@ -7162,6 +7162,384 @@ static int RunGtaoShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Subsurface Scattering showcase (Slice CZ). Mirrors the Vulkan --sss-shot path EXACTLY: a flagged
+// SUBSURFACE sphere (skin-toned, lit so one side is in shadow) flanked by hard NON-subsurface objects,
+// rendered into an HDR RT + an "SSS G-buffer" RT (subsurface MASK.r + view linear depth.w, written by
+// sss_mask.frag for ONLY the subsurface objects). Two fullscreen sss_blur passes (horizontal then
+// vertical, reusing post.vert) gather the render/sss.h depth-aware diffusion kernel so the subsurface
+// sphere's lit color softens (the translucent terminator glow) while the hard objects stay crisp; a
+// final post.frag tonemaps to the swapchain. The SAME render/sss.h math compiled into sss_blur.frag
+// makes the diffusion bit-identical to the Vulkan/CPU path. THE sssStrength=0 EQUIVALENCE PROOF (mirrors
+// the Vulkan path, backend-portable): the SAME chain at sssStrength=0 (sss_blur's no-op pass-through ->
+// the HDR blur output equals the lit scene) and the NON-SSS render (post.frag directly on the lit scene)
+// are asserted BYTE-IDENTICAL — both tonemap the SAME lit scene, so it holds on every backend, NOT a
+// comparison across different shaders. SEPARATE sss_mask/sss_blur pipelines + the REUSED
+// gbuffer.vert/post pipelines; existing pipelines/shaders/goldens untouched. ----------------------------
+static int RunSssShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+    // FIXED SSS params (IDENTICAL to the Vulkan --sss-shot path).
+    const float kSssWidthPx  = 26.0f;
+    const float kSssStrength = 14.0f;
+    const int   kTaps        = 17;
+    const float kDepthScale  = 0.6f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Scene objects — IDENTICAL to the Vulkan --sss-shot path.
+    struct Obj { Vec3 pos; float scale; bool cube; bool sss; float col[3]; };
+    const Obj objs[] = {
+        {{ 0.0f, 0.9f, -0.5f}, 0.95f, false, true,  {0.95f, 0.70f, 0.62f}},  // SUBSURFACE sphere (skin)
+        {{-2.2f, 0.8f, -0.2f}, 0.8f,  false, false, {0.80f, 0.80f, 0.85f}},  // hard sphere (left)
+        {{ 2.2f, 0.8f, -0.2f}, 0.8f,  true,  false, {0.55f, 0.80f, 0.55f}},  // hard cube (right)
+        {{-1.1f, 0.6f,  1.4f}, 0.6f,  true,  false, {0.85f, 0.55f, 0.40f}},  // hard cube (front-left)
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+    // Lit / shadow / sky pipelines (UNCHANGED shaders).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // SSS mask prepass: reuses gbuffer.vert (model+view), sss_mask.frag writes (1,0,0,linDepth).
+    auto gbVs   = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto maskFs = loadMSL("sss_mask.frag.gen.metal", "sss_mask_fragment");
+    rhi::GraphicsPipelineDesc maskDesc;
+    maskDesc.vertex = gbVs.get(); maskDesc.fragment = maskFs.get();
+    maskDesc.vertexLayout = scene::MeshVertexLayout();
+    maskDesc.colorFormat = kHdr;
+    maskDesc.depthTest = true; maskDesc.usesFrameUniforms = true;
+    maskDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+    auto maskPipeline = device->CreateGraphicsPipeline(maskDesc);
+
+    // SSS blur (fullscreen, run twice) + post tonemap pipelines.
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct SssParams {
+        float texel[2]; float sssWidthPx; float sssStrength;
+        float taps; float depthScale; float axis; float pad;
+    };
+    auto blurFs = loadMSL("sss_blur.frag.gen.metal", "sss_blur_fragment");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+
+    rhi::GraphicsPipelineDesc blurD;
+    blurD.vertex = postVs.get(); blurD.fragment = blurFs.get();
+    blurD.colorFormat = kHdr;
+    blurD.depthTest = false; blurD.usesTexture = true; blurD.fullscreen = true;
+    blurD.fragmentPushConstants = true; blurD.pushConstantSize = sizeof(SssParams);
+    auto blurPipe = device->CreateGraphicsPipeline(blurD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt    = device->CreateRenderTarget(W, H, kHdr);
+    auto sssGb = device->CreateRenderTarget(W, H, kHdr);
+    auto tmpA  = device->CreateRenderTarget(W, H, kHdr);
+    auto tmpB  = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+    for (int o = 0; o < kNumObjs; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+        objTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+    std::vector<Mat4> objModel(kNumObjs);
+    for (int o = 0; o < kNumObjs; ++o)
+        objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+            {objs[o].scale, objs[o].scale, objs[o].scale});
+
+    const Vec3 eye{0.0f, 1.7f, 5.0f};
+    const Vec3 center{0.0f, 0.7f, -0.3f};
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -1.0f; fd.lightDir[1] = -0.35f; fd.lightDir[2] = -0.2f;
+        fd.lightColor[0] = 1.6f; fd.lightColor[1] = 1.4f; fd.lightColor[2] = 1.25f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-1.0f, -0.35f, -0.2f});
+        Vec3 sc{0.0f, 0.6f, -0.3f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+        const scene::Mesh& m = objs[o].cube ? cube : sphere;
+        cmd.BindVertexBuffer(m.vertices());
+        cmd.BindIndexBuffer(m.indices());
+        cmd.DrawIndexed(m.indexCount());
+    };
+
+    SssParams sp{};
+    sp.texel[0] = 1.0f / (float)W; sp.texel[1] = 1.0f / (float)H;
+    sp.sssWidthPx = kSssWidthPx; sp.taps = (float)kTaps; sp.depthScale = kDepthScale;
+
+    auto renderSss = [&](float strength,
+                         std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        sp.sssStrength = strength;
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSss = graph.ImportTarget(
+            "sssGbuffer", render::RgResourceKind::SceneColor, *sssGb);
+        render::RgResource rgTmpA = graph.ImportTarget(
+            "sssTmpA", render::RgResourceKind::SceneColor, *tmpA);
+        render::RgResource rgTmpB = graph.ImportTarget(
+            "sssTmpB", render::RgResourceKind::SceneColor, *tmpB);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                for (int o = 0; o < kNumObjs; ++o) {
+                    cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                    drawObj(cmd, o);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (int o = 0; o < kNumObjs; ++o) {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                    pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*objTex[o], *flatNormal);
+                    drawObj(cmd, o);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("sssmask", {}, {rgSss},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                cmd.BindPipeline(*maskPipeline);
+                for (int o = 0; o < kNumObjs; ++o) {
+                    if (!objs[o].sss) continue;
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    drawObj(cmd, o);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("sssH", {rgScene, rgSss}, {rgTmpA},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*blurPipe);
+                cmd.BindTexturePair(*rt, *sssGb);
+                SssParams hp = sp; hp.axis = 0.0f;
+                cmd.PushConstants(&hp, sizeof(hp));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("sssV", {rgTmpA, rgSss}, {rgTmpB},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*blurPipe);
+                cmd.BindTexturePair(*tmpA, *sssGb);
+                SssParams vpp = sp; vpp.axis = 1.0f;
+                cmd.PushConstants(&vpp, sizeof(vpp));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgTmpB}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*tmpB);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    auto renderNoSss = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                for (int o = 0; o < kNumObjs; ++o) {
+                    cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                    drawObj(cmd, o);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (int o = 0; o < kNumObjs; ++o) {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                    pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*objTex[o], *flatNormal);
+                    drawObj(cmd, o);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    // THE sssStrength=0 EQUIVALENCE PROOF (backend-portable: the strength=0 blur of the scene and the
+    // non-SSS render both tonemap the SAME lit scene -> byte-identical on every backend).
+    std::vector<uint8_t> sssPx, zeroPx, noPx;
+    uint32_t sw = 0, sh = 0, zw = 0, zh = 0, nw = 0, nh = 0;
+    if (!renderSss(kSssStrength, sssPx, sw, sh)) return fail("no captured pixels (SSS)");
+    if (!renderSss(0.0f, zeroPx, zw, zh)) return fail("no captured pixels (SSS strength=0)");
+    if (!renderNoSss(noPx, nw, nh)) return fail("no captured pixels (non-SSS)");
+
+    const bool zeroEquivalent = (zw == nw) && (zh == nh) && (zeroPx.size() == noPx.size()) &&
+                                (std::memcmp(zeroPx.data(), noPx.data(), noPx.size()) == 0);
+    if (!zeroEquivalent)
+        return fail("SSS strength=0 render != non-SSS render — NOT zero-strength equivalent");
+    std::printf("sss strength=0 == non-SSS scene: BYTE-IDENTICAL (sssStrength=0 no-op proof)\n");
+    std::printf("sss: {width:%.4g, strength:%.4g, taps:%d}\n",
+                (double)kSssWidthPx, (double)kSssStrength, kTaps);
+
+    if (!WritePNG(outPath, sssPx, sw, sh)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — SSS, width %.4g, strength %.4g, %d taps, %d objects\n",
+                outPath, sw, sh, (double)kSssWidthPx, (double)kSssStrength, kTaps, kNumObjs);
+    return 0;
+}
+
 // --- Screen-Space Contact Shadows showcase (Slice CT). Mirrors the Vulkan --contactshadow-shot path
 // EXACTLY: small spheres + boxes hovering a hair above a checkered ground, sun from the side. Pipeline
 // per render: shadow -> gbuffer (view normal + linear depth) -> contact (fullscreen contact_shadows.frag
@@ -16343,6 +16721,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gtao") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gtao.png";
             try { return RunGtaoShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sss <out.png>: subsurface scattering showcase (Slice CZ) — a flagged subsurface sphere lit so
+        // one side is in shadow, beside hard non-subsurface objects; sss_mask.frag writes the subsurface
+        // mask + depth, two sss_blur passes (horizontal then vertical) gather the render/sss.h depth-aware
+        // diffusion kernel so the subsurface sphere's lit color softens (the translucent terminator glow)
+        // while the hard objects stay crisp, then post tonemaps. INTERNALLY renders the SAME scene at
+        // sssStrength=0 (sss_blur's no-op pass-through) AND the non-SSS render and asserts they are
+        // BYTE-IDENTICAL — the sssStrength=0 equivalence proof. Mirrors the Vulkan --sss-shot exactly
+        // (same scene/camera/SSS params; the SAME render/sss.h math makes the diffusion bit-identical).
+        if (argc > 1 && std::strcmp(argv[1], "--sss") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sss.png";
+            try { return RunSssShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --contactshadow <out.png>: screen-space contact shadows showcase (Slice CT) — small objects

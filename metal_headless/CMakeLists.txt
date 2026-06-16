@@ -218,6 +218,16 @@ hf_gen_msl(water_composite.frag   water_composite.frag.hlsl   frag water_composi
 # compiled here makes the AO bit-identical to the Vulkan/CPU path; radius==0 -> AO==1 -> byte-identical
 # to the no-AO render. Behind --gtao only; existing ssao/ssr shaders + goldens untouched.
 hf_gen_msl(gtao.frag              gtao.frag.hlsl              frag gtao_fragment)
+# Subsurface Scattering (Slice CZ): sss_mask.frag (reuses gbuffer.vert) renders the flagged subsurface
+# objects into an "SSS G-buffer" RT (mask.r + view linear depth.w); sss_blur.frag is a fullscreen pass
+# run TWICE (horizontal then vertical) that gathers the render/sss.h diffusion profile (DiffusionWeight x
+# DepthFalloff x mask, mirrored in-shader) along the axis so subsurface pixels' lit color softens, while
+# non-subsurface pixels pass through. The SAME render/sss.h math compiled here makes the diffusion
+# bit-identical to the Vulkan/CPU path; sssStrength==0 (or sssWidth==0) -> the kernel collapses to the
+# center tap -> byte-identical to the non-SSS lit render. Behind --sss only; existing shaders + goldens
+# untouched.
+hf_gen_msl(sss_mask.frag          sss_mask.frag.hlsl          frag sss_mask_fragment)
+hf_gen_msl(sss_blur.frag          sss_blur.frag.hlsl          frag sss_blur_fragment)
 # Screen-Space Contact Shadows (Slice CT): contact_shadows.frag reconstructs the view position from the
 # SSAO/GTAO g-buffer and marches a SHORT ray TOWARD the sun through the depth field (render/
 # contact_shadows.h RayMarchShadow mirrored in-shader) with a baked per-pixel dither, outputting the

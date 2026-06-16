@@ -194,6 +194,18 @@ hf_compile_shaders(
     # --gtao-shot ONLY; with radius==0 the horizon search raises no horizon -> AO==1 -> byte-identical to
     # the no-AO render. Existing ssao/ssr shaders + their goldens untouched.
     "shaders/gtao.frag.hlsl:ps"
+    # Subsurface Scattering (Slice CZ): screen-space separable SSS (Jimenez 2015). sss_mask.frag (reuses
+    # gbuffer.vert) renders ONLY the flagged subsurface objects into an "SSS G-buffer" RT carrying the
+    # subsurface MASK in .r + the view-space linear depth in .w. sss_blur.frag is a fullscreen pass run
+    # TWICE (horizontal then vertical, a uniform selects the axis; reuses post.vert) that gathers the
+    # render/sss.h diffusion profile (DiffusionWeight x DepthFalloff x mask, mirrored in-shader) along the
+    # axis so the lit color of subsurface pixels softens (the translucent terminator glow); non-subsurface
+    # (mask 0) pixels pass through. Reuses the scene-color RT + the mask/depth G-buffer pair via
+    # BindTexturePair (no new RHI seam), behind --sss-shot ONLY; with sssStrength==0 (or sssWidth==0) the
+    # kernel collapses to the center tap -> byte-identical to the non-SSS lit render. Existing
+    # post/ssr/ssgi/dof/gtao shaders + goldens untouched.
+    "shaders/sss_mask.frag.hlsl:ps"
+    "shaders/sss_blur.frag.hlsl:ps"
     # Screen-Space Contact Shadows (Slice CT): reuses the SSAO/SSR/GTAO g-buffer (view normal + linear
     # depth). contact_shadows.frag reconstructs the view position (like gtao.frag), marches a SHORT ray
     # TOWARD the sun through the depth field (render/contact_shadows.h RayMarchShadow mirrored in-shader)
