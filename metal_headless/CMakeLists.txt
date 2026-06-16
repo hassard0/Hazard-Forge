@@ -168,6 +168,10 @@ hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite
 # diffuse, ssgi_composite ADDS it over the scene + tonemaps. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(ssgi.frag              ssgi.frag.hlsl              frag ssgi_fragment)
 hf_gen_msl(ssgi_composite.frag    ssgi_composite.frag.hlsl    frag ssgi_composite_fragment)
+# SSGI spatial denoise (Slice BR): a depth+normal-guided bilateral blur of the SSGI indirect buffer
+# (same NxN fullscreen shape as ssao_blur, edge-stopped per tap by the g-buffer) inserted before
+# ssgi_composite on the --ssgi-denoise path only. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(ssgi_denoise.frag      ssgi_denoise.frag.hlsl      frag ssgi_denoise_fragment)
 # Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
 # volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
 # volumetric_composite adds it over the scene + tonemaps. Same HF_MSL_GEN shadow V-flip as lit.frag.

@@ -274,6 +274,8 @@ int main() {
         bool sawPostStackShot = false;
         // Slice BP: the --ssgi-shot showcase flag is listed in the showcase manifest.
         bool sawSsgiShot = false;
+        // Slice BR: the --ssgi-denoise-shot showcase flag is listed in the showcase manifest.
+        bool sawSsgiDenoiseShot = false;
         // Slice BQ: the --net-shot showcase flag is listed in the showcase manifest.
         bool sawNetShot = false;
         if (showcases)
@@ -300,6 +302,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--anim-fsm-shot") sawAnimFsmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--poststack-shot") sawPostStackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-shot") sawSsgiShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--net-shot") sawNetShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
@@ -323,6 +326,7 @@ int main() {
         check(sawAnimFsmShot, "showcases manifest includes --anim-fsm-shot");
         check(sawPostStackShot, "showcases manifest includes --poststack-shot");
         check(sawSsgiShot, "showcases manifest includes --ssgi-shot");
+        check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
         check(sawNetShot, "showcases manifest includes --net-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.

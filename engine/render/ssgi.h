@@ -127,4 +127,94 @@ inline math::Vec3 AccumulateIndirect(const std::vector<math::Vec3>& hitRadiances
     return sum * inv;
 }
 
+// --- Bilateral (edge-preserving) denoise of the SSGI indirect buffer (Slice BR) ----------------
+// The single-frame SSGI gather (K=16 rays/pixel) is noisy. A bilateral blur of the indirect buffer
+// smooths the grain WITHOUT crossing geometry edges, so the floor pool stays smooth while the
+// red/green color bleed stays crisp at surface boundaries. It is the SAME shape as the SSAO blur
+// (shaders/ssao_blur.frag.hlsl) but each tap's box weight is replaced by an EDGE-STOPPING weight
+// from the G-buffer. This is a PURE function of the SSGI buffer + G-buffer (no time/RNG): two runs
+// byte-identical. The SAME math is mirrored verbatim in shaders/ssgi_denoise.frag.hlsl.
+//
+// BilateralWeight = the weight of a neighbor TAP relative to the CENTER pixel, the product of three
+// non-negative terms (so a tap that fails ANY edge test gets ~0 weight and is effectively excluded):
+//
+//   spatial  = exp(-spatialDist2 / (2 * spatialSigma^2))          // Gaussian falloff in pixels^2
+//   depth    = exp(-(depthTap-depthCenter)^2 / (2 * depthSigma^2))// edge-stop across a depth step
+//   normal   = pow(max(dot(nCenter, nTap), 0), normalPower)       // edge-stop across a normal step
+//   weight   = spatial * depth * normal
+//
+// Properties (unit-tested): weight == 1 at the center (zero spatial dist, equal depth, equal normal);
+// decays monotonically with spatial distance; -> ~0 across a large depth difference (depthDiff >>
+// depthSigma); -> 0 across opposing normals (dot(nCenter,nTap) <= 0 -> the pow term is 0); monotonic
+// (non-increasing) in each of the spatial-distance, |depth diff| and normal-divergence axes. The
+// caller (the shader) accumulates sum += weight * indirectTap and wsum += weight over the kernel and
+// outputs sum/wsum (normalized), so a denoised pixel is the edge-aware weighted mean of its window.
+//
+// `spatialSigma` is passed implicitly via SsgiDenoiseParams to the caller's spatialDist2 scaling; here
+// it is taken from the params and threaded in by the caller. To keep BilateralWeight a single pure
+// expression we pass spatialSigma as part of the precomputed spatialDist2 term? No — we keep the raw
+// inputs explicit so the test can pin every term. Signature mirrors the shader's helper exactly.
+inline float BilateralWeight(float spatialDist2, float spatialSigma,
+                             float depthCenter, float depthTap, float depthSigma,
+                             const math::Vec3& nCenter, const math::Vec3& nTap,
+                             float normalPower) {
+    float ss = (spatialSigma > 1e-6f) ? spatialSigma : 1e-6f;
+    float ds = (depthSigma   > 1e-6f) ? depthSigma   : 1e-6f;
+    float spatial = std::exp(-spatialDist2 / (2.0f * ss * ss));
+    float dDiff   = depthTap - depthCenter;
+    float depth   = std::exp(-(dDiff * dDiff) / (2.0f * ds * ds));
+    float nd      = std::max(math::dot(nCenter, nTap), 0.0f);
+    float normal  = std::pow(nd, normalPower);
+    return spatial * depth * normal;
+}
+
+// SSGI denoise parameters. Defaults: a radius-2 (5x5) bilateral window, a spatial sigma of ~2 pixels
+// (so the kernel edge taps still contribute meaningfully), a depth sigma in VIEW-space linear-depth
+// units tuned so a same-surface depth gradient passes but a geometry step (panel<->floor) is rejected,
+// and a normal power that sharply attenuates taps whose normal diverges from the center's. These are
+// the values the --ssgi-denoise-shot showcase prints + the shader uses.
+struct SsgiDenoiseParams {
+    int   radius       = 2;      // kernel half-width in pixels (window is (2*radius+1)^2 taps)
+    float spatialSigma = 2.0f;   // Gaussian spatial falloff (pixels)
+    float depthSigma   = 0.50f;  // edge-stop sigma in view-space linear-depth units
+    float normalPower  = 16.0f;  // exponent on max(dot(nC,nT),0): higher = sharper normal edge-stop
+};
+
+// CPU bilateral denoise of a single-channel scalar field (used by the unit test's blur-sanity model;
+// the shader does the same accumulation per RGB channel). `field`/`depth` are row-major width*height;
+// `normals` is the per-pixel view normal. Returns the denoised field. EDGE-PRESERVING: a tap across a
+// large depth step or an opposing normal contributes ~0, so distinct surfaces don't bleed together.
+inline std::vector<float> BilateralDenoiseScalar(const std::vector<float>& field,
+                                                 const std::vector<float>& depth,
+                                                 const std::vector<math::Vec3>& normals,
+                                                 int width, int height,
+                                                 const SsgiDenoiseParams& p) {
+    std::vector<float> out(field.size(), 0.0f);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int   ci = y * width + x;
+            float dC = depth[ci];
+            math::Vec3 nC = normals[ci];
+            float sum = 0.0f, wsum = 0.0f;
+            for (int dy = -p.radius; dy <= p.radius; ++dy) {
+                int ty = y + dy;
+                if (ty < 0 || ty >= height) continue;
+                for (int dx = -p.radius; dx <= p.radius; ++dx) {
+                    int tx = x + dx;
+                    if (tx < 0 || tx >= width) continue;
+                    int ti = ty * width + tx;
+                    float spatialDist2 = static_cast<float>(dx * dx + dy * dy);
+                    float w = BilateralWeight(spatialDist2, p.spatialSigma,
+                                              dC, depth[ti], p.depthSigma,
+                                              nC, normals[ti], p.normalPower);
+                    sum += w * field[ti];
+                    wsum += w;
+                }
+            }
+            out[ci] = (wsum > 1e-12f) ? (sum / wsum) : field[ci];
+        }
+    }
+    return out;
+}
+
 } // namespace hf::render::ssgi

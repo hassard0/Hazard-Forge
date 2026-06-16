@@ -103,6 +103,7 @@ const Showcase kShowcases[] = {
     {"--clustered-shot",    "Clustered / Forward+ many-light shading."},
     {"--ssr-shot",          "Screen-space reflections."},
     {"--ssgi-shot",         "Screen-space global illumination (color-bleed indirect diffuse)."},
+    {"--ssgi-denoise-shot", "SSGI bilateral spatial denoise (edge-preserving smoothing of the indirect-diffuse buffer)."},
     {"--decal-shot",        "Screen-space projected decals (top-down decal box on the ground)."},
     {"--poststack-shot",    "Data-driven post-process stack (ordered tonemap/grade/chromatic/vignette/grain chain)."},
     {"--volumetric-shot",   "Volumetric fog / light shafts."},

@@ -38,6 +38,7 @@
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
 #include "render/mdi.h"   // Slice BM: GPU multi-draw-indirect batch builder (pure CPU)
+#include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"
@@ -333,6 +334,7 @@ int main(int argc, char** argv) {
     const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
+    const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
     const char* volumetricShotPath = nullptr; // --volumetric-shot <out.bmp> (Slice AJ: light shafts)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
@@ -574,6 +576,14 @@ int main(int argc, char** argv) {
             // colored panels visibly bleed red/green onto the neutral neighbors. One BMP -> exit. New
             // golden; existing lit/ssao/ssr/bloom paths/shaders/goldens are untouched.
             ssgiShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ssgi-denoise-shot") == 0 && i + 1 < argc) {
+            // Slice BR: SSGI spatial-denoise showcase. The SAME Cornell color-bleed scene as --ssgi-shot,
+            // but with a depth+normal-guided BILATERAL blur (ssgi_denoise.frag) of the SSGI indirect
+            // buffer inserted BEFORE the composite — smoothing the grainy floor color-bleed pool while
+            // keeping the bleed crisp at surface edges. The raw --ssgi-shot path + ssgi.png are unchanged
+            // (the A/B baseline). One BMP -> exit. New golden; existing SSGI/SSR/SSAO/bloom paths +
+            // shaders + goldens untouched.
+            ssgiDenoiseShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--decal-shot") == 0 && i + 1 < argc) {
             // Slice BH: screen-space projected decals showcase. The standard lit+shadowed scene
             // (colored objects on a floor) is rendered through the G-buffer path (reusing the SSAO/SSR
@@ -5806,7 +5816,13 @@ int main(int argc, char** argv) {
         // kernel + baked dither (NO RNG, NO temporal accumulation) -> two runs byte-identical. SEPARATE
         // ssgi/ssgi_composite pipelines + shaders; existing gbuffer/ssao/ssr/bloom paths/shaders/
         // goldens untouched.
-        if (ssgiShotPath) {
+        if (ssgiShotPath || ssgiDenoiseShotPath) {
+            // Slice BR: --ssgi-denoise-shot reuses this EXACT --ssgi-shot scene/camera/SSGI gather; the
+            // ONLY difference is an additional bilateral-denoise pass inserted between the ssgi gather
+            // and the composite (the composite then adds the DENOISED indirect). The raw --ssgi-shot path
+            // is byte-identical (ssgi.png unchanged) — the denoise pass + RT only exist when denoising.
+            const bool ssgiDenoise = (ssgiDenoiseShotPath != nullptr);
+            const char* outPath = ssgiDenoise ? ssgiDenoiseShotPath : ssgiShotPath;
             using math::Mat4; using math::Vec3;
             uint32_t w = window.FramebufferWidth();
             uint32_t h = window.FramebufferHeight();
@@ -5889,9 +5905,17 @@ int main(int argc, char** argv) {
                 float maxDist; float thickness; float intensity; float rayCount;
             };
             struct SsgiCompParams { float texel[2]; float intensity; float pad; };
+            // Slice BR: bilateral-denoise push constant (mirrors shaders/ssgi_denoise.frag.hlsl).
+            struct DenoiseParams {
+                float texel[2]; float radius; float spatialSigma;
+                float depthSigma; float normalPower; float pad[2];
+            };
 
             auto ssgiFs = loadFs("ssgi.frag.hlsl");
             auto compFs = loadFs("ssgi_composite.frag.hlsl");
+            // Slice BR: the denoise fragment shader is only loaded/built on the --ssgi-denoise-shot path.
+            std::unique_ptr<rhi::IShaderModule> denoiseFs;
+            if (ssgiDenoise) denoiseFs = loadFs("ssgi_denoise.frag.hlsl");
 
             rhi::GraphicsPipelineDesc ssgiD;
             ssgiD.vertex = postVsM.get(); ssgiD.fragment = ssgiFs.get();
@@ -5907,10 +5931,25 @@ int main(int argc, char** argv) {
             compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(SsgiCompParams);
             auto compPipe = device->CreateGraphicsPipeline(compD);
 
+            // Slice BR: denoise fullscreen pipeline (writes HDR, like the SSGI gather) — only built when
+            // denoising so the raw --ssgi-shot path constructs the EXACT same set of pipelines as before.
+            std::unique_ptr<rhi::IPipeline> denoisePipe;
+            if (ssgiDenoise) {
+                rhi::GraphicsPipelineDesc dnD;
+                dnD.vertex = postVsM.get(); dnD.fragment = denoiseFs.get();
+                dnD.colorFormat = kHdr;
+                dnD.depthTest = false; dnD.usesTexture = true; dnD.fullscreen = true;
+                dnD.fragmentPushConstants = true; dnD.pushConstantSize = sizeof(DenoiseParams);
+                denoisePipe = device->CreateGraphicsPipeline(dnD);
+            }
+
             // --- Render targets: HDR lit scene + RGBA16F g-buffer + SSGI indirect. ---
             auto rt     = device->CreateRenderTarget(w, h, kHdr);
             auto gbuf   = device->CreateRenderTarget(w, h, kHdr);
             auto ssgiRT = device->CreateRenderTarget(w, h, kHdr);
+            // Slice BR: denoised-indirect RT (only created on the denoise path).
+            std::unique_ptr<rhi::IRenderTarget> ssgiDenoiseRT;
+            if (ssgiDenoise) ssgiDenoiseRT = device->CreateRenderTarget(w, h, kHdr);
             auto shadowMap = device->CreateShadowMap(2048);
             device->SetShadowMap(*shadowMap);
 
@@ -5994,7 +6033,19 @@ int main(int argc, char** argv) {
                 "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
             render::RgResource rgSsgi = graph.ImportTarget(
                 "ssgi", render::RgResourceKind::SceneColor, *ssgiRT);
+            // Slice BR: the denoised-indirect resource (only imported on the denoise path).
+            render::RgResource rgSsgiDenoise{};
+            if (ssgiDenoise)
+                rgSsgiDenoise = graph.ImportTarget(
+                    "ssgiDenoise", render::RgResourceKind::SceneColor, *ssgiDenoiseRT);
             render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            // Slice BR: denoise params (defaults from engine/render/ssgi.h::SsgiDenoiseParams).
+            render::ssgi::SsgiDenoiseParams dnp;
+            DenoiseParams dn{};
+            dn.texel[0] = 1.0f / (float)w; dn.texel[1] = 1.0f / (float)h;
+            dn.radius = (float)dnp.radius; dn.spatialSigma = dnp.spatialSigma;
+            dn.depthSigma = dnp.depthSigma; dn.normalPower = dnp.normalPower;
 
             auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
                 (void)o;
@@ -6092,12 +6143,31 @@ int main(int argc, char** argv) {
                     cmd.EndRenderPass();
                 });
 
-            // Composite: scene + indirect -> tonemap -> swapchain.
-            graph.AddPass("composite", {rgScene, rgSsgi}, {rgSwap},
+            // Slice BR: bilateral denoise of the SSGI indirect buffer -> denoised RT. Reads the raw SSGI
+            // indirect at t0/s0 and the g-buffer at t3/s3; each tap weighted by the depth+normal
+            // edge-stop (ssgi_denoise.frag). Inserted ONLY on the --ssgi-denoise-shot path; the composite
+            // below then reads the DENOISED indirect instead of the raw one.
+            if (ssgiDenoise) {
+                graph.AddPass("ssgi_denoise", {rgSsgi, rgGbuf}, {rgSsgiDenoise},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*denoisePipe);
+                        cmd.BindTexturePair(*ssgiRT, *gbuf);
+                        cmd.PushConstants(&dn, sizeof(dn));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+            }
+
+            // Composite: scene + indirect -> tonemap -> swapchain. On the denoise path the indirect is the
+            // DENOISED buffer; the raw path reads the raw SSGI buffer (byte-identical to --ssgi-shot).
+            rhi::IRenderTarget& compIndirect = ssgiDenoise ? *ssgiDenoiseRT : *ssgiRT;
+            render::RgResource rgCompIndirect = ssgiDenoise ? rgSsgiDenoise : rgSsgi;
+            graph.AddPass("composite", {rgScene, rgCompIndirect}, {rgSwap},
                 [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
                     cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
                     cmd.BindPipeline(*compPipe);
-                    cmd.BindTexturePair(*rt, *ssgiRT);
+                    cmd.BindTexturePair(*rt, compIndirect);
                     cmd.PushConstants(&cp, sizeof(cp));
                     cmd.Draw(3);
                     cmd.EndRenderPass();
@@ -6109,14 +6179,17 @@ int main(int argc, char** argv) {
 
             std::printf("ssgi: {rays:%d, marchDist:%.1f, intensity:%.2f}\n",
                         kRays, sp.maxDist, sp.intensity);
+            if (ssgiDenoise)
+                std::printf("ssgi-denoise: {radius:%d, spatialSigma:%.2f, depthSigma:%.2f, normalPower:%.2f}\n",
+                            dnp.radius, dnp.spatialSigma, dnp.depthSigma, dnp.normalPower);
 
             std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
             bool ok = false;
             if (device->GetCapturedPixels(px, cw, ch2)) {
-                ok = WriteBMP(ssgiShotPath, px, cw, ch2);
-                if (ok) std::printf("wrote %s (%ux%u) — SSGI, %d objects\n",
-                                    ssgiShotPath, cw, ch2, kNumObjs);
-                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ssgiShotPath);
+                ok = WriteBMP(outPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — SSGI%s, %d objects\n",
+                                    outPath, cw, ch2, ssgiDenoise ? " (denoised)" : "", kNumObjs);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", outPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

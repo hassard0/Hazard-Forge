@@ -113,6 +113,12 @@ hf_add_pure_test(ssr_test)
 # indirect). Pure C++ (render/ssgi.h, header-only; reuses render/ssr.h), ASan-eligible.
 hf_add_pure_test(ssgi_test)
 
+# SSGI spatial denoise (Slice BR): the edge-stopping BilateralWeight tap weight (1 at center, decays
+# with spatial distance, ~0 across a large depth diff / opposing normals, monotone in each term), a
+# CPU bilateral-blur mini-model (variance reduction + mean preservation on a uniform surface, and
+# EDGE PRESERVATION across a depth/normal seam), and determinism. Pure C++ (render/ssgi.h), ASan-eligible.
+hf_add_pure_test(ssgi_denoise_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff

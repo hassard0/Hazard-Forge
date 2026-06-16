@@ -143,6 +143,11 @@ hf_compile_shaders(
     # gbuffer/ssao/ssr/bloom shaders + their goldens untouched.
     "shaders/ssgi.frag.hlsl:ps"
     "shaders/ssgi_composite.frag.hlsl:ps"
+    # SSGI spatial denoise (Slice BR): a depth+normal-guided BILATERAL blur of the SSGI indirect buffer
+    # (same NxN fullscreen shape as ssao_blur, but each tap weighted by the G-buffer edge-stop) — smooths
+    # the floor color-bleed pool while keeping the bleed crisp at edges. Inserted on the SSGI path before
+    # ssgi_composite, behind --ssgi-denoise-shot ONLY; the raw --ssgi-shot path + ssgi.png stay unchanged.
+    "shaders/ssgi_denoise.frag.hlsl:ps"
     # Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
     # volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
     # volumetric_composite adds it over the scene + tonemaps. Existing shaders + goldens untouched.
