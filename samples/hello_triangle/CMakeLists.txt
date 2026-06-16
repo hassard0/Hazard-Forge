@@ -168,6 +168,11 @@ hf_compile_shaders(
     # SSR, then view->world via invView), projects it into the decal box, and alpha-blends the decal
     # texture over the scene + tonemaps. Existing gbuffer/ssao/ssr/bloom shaders + goldens untouched.
     "shaders/decal.frag.hlsl:ps"
+    # Data-driven post-process stack (Slice BN): the configurable ORDERED composite chain. A SEPARATE
+    # final pass from post.frag (the default --shot post path is byte-identical + untouched). Reuses
+    # post.vert (fullscreen triangle); applies the configured effects (tonemap/colorgrade/chromatic/
+    # vignette/grain) in order from a push-constant effect list. Shared math with engine/render/post_stack.h.
+    "shaders/post_stack.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

@@ -187,6 +187,11 @@ hf_gen_msl(taa_resolve.frag      taa_resolve.frag.hlsl      frag taa_resolve_fra
 # the scene + tonemaps. Reuses post.vert. Same HLSL->SPIR-V->MSL toolchain; existing shaders+goldens
 # untouched.
 hf_gen_msl(decal.frag            decal.frag.hlsl            frag decal_fragment)
+# Data-driven post-process stack (Slice BN): the configurable ORDERED composite chain (tonemap/
+# colorgrade/chromatic/vignette/grain applied in order from a push-constant effect list). A SEPARATE
+# final pass from post.frag; reuses post.vert. Same HLSL->SPIR-V->MSL toolchain; shared math with
+# engine/render/post_stack.h. Existing shaders + goldens untouched.
+hf_gen_msl(post_stack.frag       post_stack.frag.hlsl       frag post_stack_fragment)
 
 add_custom_target(hf_gen_shaders DEPENDS ${HF_GENERATED_MSL})
 

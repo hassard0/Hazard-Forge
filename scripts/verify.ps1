@@ -15,9 +15,9 @@
       2. Mac / Metal (headless, over SSH on the LAN)
          - tar the repo (excluding build dirs + .git + stray PNGs, KEEPING the tracked goldens),
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
-           EACH of the 39 committed Metal goldens run visual_test with its showcase flag and compare
+           EACH of the 40 committed Metal goldens run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 39 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 40 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -57,7 +57,7 @@ $SshKey     = "$env:USERPROFILE\.ssh\id_ed25519"
 $MacStage   = '~/hf-verify'                       # remote staging dir (recreated each run)
 $TarName    = 'hf-verify.tar.gz'
 
-# The 39 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
+# The 40 committed Metal goldens, each produced by a distinct visual_test invocation. Name = the
 # golden basename under tests/golden/metal/; Flag = the argv passed to visual_test BEFORE the output
 # path (empty for the default Slice-F scene). The flags are the REAL ones parsed in
 # metal_headless/visual_test.mm main() - confirmed there, not guessed. Every pair must diff 0.0000.
@@ -101,6 +101,7 @@ $Goldens = @(
     @{ Name = 'terrain';       Flag = '--terrain' }            # Slice BF (procedural terrain / heightmap)
     @{ Name = 'terrain_stream'; Flag = '--terrain-stream' }    # Slice BJ (terrain streaming + per-tile LOD)
     @{ Name = 'decal';         Flag = '--decal' }             # Slice BH (screen-space projected decals)
+    @{ Name = 'poststack';     Flag = '--poststack' }         # Slice BN (data-driven post-process stack)
 )
 
 $winResult = 'SKIP'
@@ -404,7 +405,7 @@ function Invoke-MacVerify {
     & $scp[0] $scp[1..($scp.Count-1)] $tarPath "${MacUser}@${MacHost}:$MacStage/"
     if ($LASTEXITCODE -ne 0) { throw "scp failed" }
 
-    # 3) extract + build ONCE + loop ALL 39 goldens. To avoid the login shell being zsh and to dodge
+    # 3) extract + build ONCE + loop ALL 40 goldens. To avoid the login shell being zsh and to dodge
     #    PowerShell here-string backtick-escaping fragility, the per-golden loop is generated as a
     #    standalone bash script, scp'd to the Mac, and run with an explicit `bash`. For each
     #    (flag -> golden) pair it renders visual_test <flag> /tmp/hf_<name>.png and compares to
@@ -504,7 +505,7 @@ done <<< "$PAIRS"
         return
     }
     $script:macResult = 'PASS'
-    Write-Host "Mac verification PASSED (all 39 goldens DIFF 0.0000)" -ForegroundColor Green
+    Write-Host "Mac verification PASSED (all 40 goldens DIFF 0.0000)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -525,7 +526,7 @@ function Show($label, $r) {
     Write-Host ("  {0,-22} {1}" -f $label, $r) -ForegroundColor $color
 }
 Show 'Windows / Vulkan (ctest)' $winResult
-Show 'Mac / Metal (39 goldens)'  $macResult
+Show 'Mac / Metal (40 goldens)'  $macResult
 
 # Per-golden Metal table (only when the Mac portion ran).
 if ($script:macGoldenResults -and $script:macGoldenResults.Count -gt 0) {

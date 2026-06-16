@@ -112,6 +112,14 @@ hf_add_pure_test(ssr_test)
 # (1 at center, 0 at a face, monotonic). Pure C++ (render/decal.h, header-only), ASan-eligible.
 hf_add_pure_test(decal_test)
 
+# Data-driven post-process stack (Slice BN): the JSON config loader (ordered effect list + params,
+# empty=pass-through, order preserved, unknown kind rejected), the ColorGrade lift/gamma/gain curve
+# (identity + a known grade), FilmGrain determinism (pure fn of the integer pixel coord, bounded,
+# zero-intensity no-op), ChromaticAberration (zero strength / center -> no aberration), and the
+# stack-apply CPU mirror (== composing the per-effect evaluators in order). Pure C++
+# (render/post_stack.h + post_stack.cpp), ASan-eligible.
+hf_add_pure_test(post_stack_test)
+
 # Volumetric fog / light shafts (Slice AJ): Henyey-Greenstein phase (g=0 isotropic 1/4pi, forward
 # peak > back for g>0, integrates over the sphere to ~1) + camera-basis world-ray reconstruction
 # (centered pixel == camFwd, unit camFwd projection) + Beer-Lambert transmittance. Pure C++

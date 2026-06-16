@@ -9,6 +9,7 @@ set(HF_ENGINE_COMMON_SOURCES
   runtime/hot_reload.cpp
   runtime/parallel_record.cpp
   render/render_graph.cpp
+  render/post_stack.cpp
   scene/mesh.cpp
   scene/scene_io.cpp
   scene/commands.cpp
@@ -118,6 +119,7 @@ add_library(hf_core STATIC
   runtime/hot_reload.cpp
   runtime/parallel_record.cpp
   render/render_graph.cpp
+  render/post_stack.cpp
   scene/mesh.cpp
   scene/scene_io.cpp
   scene/commands.cpp

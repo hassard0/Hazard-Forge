@@ -31,6 +31,7 @@
 #include "render/point_shadow.h"
 #include "render/probe.h"
 #include "render/decal.h"
+#include "render/post_stack.h"
 #include "render/clustered.h"
 #include "render/taa.h"
 #include "render/frustum.h"
@@ -356,6 +357,7 @@ int main(int argc, char** argv) {
     bool pickTest = false;                   // --pick-test: headless pick demo, prints picked index
     const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
     const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
+    const char* postStackShotPath = nullptr; // --poststack-shot <out.bmp> (Slice BN: data-driven post stack)
     // Slice BI: material-graph introspection (pure CPU, headless). --material-introspect <mat.json>
     // [out.json] dumps DescribeGraphJson; --dot switches the dump to a Graphviz DOT digraph.
     const char* matIntrospectPath = nullptr;   // the input .mat.json
@@ -558,6 +560,13 @@ int main(int argc, char** argv) {
             // alpha-blends a procedural crack/cross decal texture over the scene + tonemaps. One BMP ->
             // exit. New golden; existing lit/ssao/ssr/bloom paths/shaders/goldens are untouched.
             decalShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--poststack-shot") == 0 && i + 1 < argc) {
+            // Slice BN: data-driven post-process stack showcase. The standard lit+shadowed scene is
+            // rendered into an HDR RT, then a SEPARATE final pass applies a FIXED configured ORDERED
+            // effect chain (tonemap -> color grade -> chromatic aberration -> vignette -> film grain)
+            // from engine/render/post_stack.h via the post_stack.frag push constant -> swapchain. One
+            // BMP -> exit. New golden; the default --shot post path is byte-identical + untouched.
+            postStackShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--volumetric-shot") == 0 && i + 1 < argc) {
             // Slice AJ: volumetric fog / light shafts. A directional light at a grazing angle streams
             // BETWEEN shadow-casting occluders (a slotted wall + pillars), fog filling the air. The
@@ -6063,6 +6072,272 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — decal, %d objects\n",
                                     decalShotPath, cw, ch2, kNumObjs);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", decalShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Data-driven post-process stack showcase (--poststack-shot, Slice BN): the standard
+        // lit+shadowed scene (colored objects on a floor, same family as --decal/--ssr-shot) renders
+        // into an HDR (RGBA16F) RT, then a SEPARATE final pass (post_stack.frag) applies a FIXED
+        // configured ORDERED effect chain from engine/render/post_stack.h — Tonemap -> ColorGrade
+        // (warm teal-orange) -> ChromaticAberration (subtle) -> Vignette -> FilmGrain (subtle) — via a
+        // push-constant effect list, and writes the swapchain. One BMP -> exit. The default --shot post
+        // path (post.frag) is byte-identical + untouched; this is a new path with its own golden.
+        if (postStackShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-2.2f, 0.7f, -0.5f}, 0.7f, true,  {0.90f, 0.20f, 0.20f}},  // red cube
+                {{ 0.0f, 0.9f, -1.2f}, 0.9f, false, {0.20f, 0.85f, 0.30f}},  // green sphere
+                {{ 2.3f, 0.6f,  0.2f}, 0.6f, true,  {0.25f, 0.45f, 0.95f}},  // blue cube
+                {{-0.9f, 0.5f,  1.4f}, 0.5f, false, {0.95f, 0.80f, 0.20f}},  // yellow sphere
+                {{ 1.4f, 0.75f, 1.6f}, 0.75f,true,  {0.85f, 0.35f, 0.90f}},  // magenta cube
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky pipelines (static) — UNCHANGED shaders. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- Post-stack fullscreen pipeline (fragment push constants). post.vert + post_stack.frag. ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto psFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post_stack.frag.hlsl.spv");
+            auto psFs  = device->CreateShaderModule({std::span<const uint32_t>(psFsW)});
+
+            // Push-constant layout — MUST match StackParams in shaders/post_stack.frag.hlsl. A flat
+            // float STREAM (kind followed by that kind's params, per effect, in order) keeps the whole
+            // block within the 128-byte minimum guaranteed maxPushConstantsSize (a vec4-per-effect array
+            // would overflow it on a 128-byte GPU, e.g. an integrated Radeon). 28 floats (= a float4[7]
+            // in the shader, also keeping the 16-byte stride for the Metal cbuffer path) + the int4
+            // count = 128 bytes.
+            constexpr int kStreamFloats = 28;
+            struct StackParams { int32_t count[4]; float stream[kStreamFloats]; };
+            static_assert(sizeof(StackParams) == 128, "post-stack push constant must fit 128 bytes");
+
+            rhi::GraphicsPipelineDesc psD;
+            psD.vertex = postVsM.get(); psD.fragment = psFs.get();
+            psD.colorFormat = device->Swapchain().ColorFormat();
+            psD.depthTest = false; psD.usesTexture = true; psD.fullscreen = true;
+            psD.fragmentPushConstants = true; psD.pushConstantSize = sizeof(StackParams);
+            auto psPipe = device->CreateGraphicsPipeline(psD);
+
+            // Build the GPU push-constant stream from the SHARED CPU config (config + shader in lockstep).
+            render::post::PostStack stack = render::post::DefaultShowcaseStack();
+            StackParams sp{};
+            sp.count[0] = (int32_t)stack.effects.size();
+            int cur = 0;
+            auto put = [&](float v) { if (cur < kStreamFloats) sp.stream[cur++] = v; };
+            for (const render::post::PostEffect& fx : stack.effects) {
+                put((float)(int)fx.kind);
+                switch (fx.kind) {
+                    case render::post::Kind::Tonemap:
+                        put(fx.exposure); break;
+                    case render::post::Kind::ColorGrade:
+                        put(fx.lift.x);  put(fx.lift.y);  put(fx.lift.z);
+                        put(fx.gamma.x); put(fx.gamma.y); put(fx.gamma.z);
+                        put(fx.gain.x);  put(fx.gain.y);  put(fx.gain.z); break;
+                    case render::post::Kind::ChromaticAberration:
+                        put(fx.strength); break;
+                    case render::post::Kind::Vignette:
+                        put(fx.vignetteOuter); put(fx.vignetteInner); break;
+                    case render::post::Kind::FilmGrain:
+                        put(fx.intensity); break;
+                }
+            }
+
+            auto rt = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> floorPx(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+                    floorPx[idx + 2] = (uint8_t)(v + 8); floorPx[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+
+            const Vec3 eye{0.0f, 3.4f, 6.4f};
+            const Vec3 center{0.0f, 0.4f, 0.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+                Vec3 sc{0.0f, 0.7f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*objTex[o], *flatNormal);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Final pass: apply the configured post-process stack -> swapchain.
+            graph.AddPass("poststack", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*psPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.PushConstants(&sp, sizeof(sp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            // Deterministic showcase line: the effect names + count, in order.
+            std::printf("poststack: {effects:[");
+            for (size_t e = 0; e < stack.effects.size(); ++e)
+                std::printf("%s%s", render::post::KindName(stack.effects[e].kind),
+                            e + 1 < stack.effects.size() ? "," : "");
+            std::printf("], count:%zu}\n", stack.effects.size());
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(postStackShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — post-process stack, %d objects\n",
+                                    postStackShotPath, cw, ch2, kNumObjs);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", postStackShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
