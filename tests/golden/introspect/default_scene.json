@@ -44,7 +44,8 @@
       "hud-text",
       "audio-mixer",
       "scene-streaming",
-      "terrain-streaming-lod"
+      "terrain-streaming-lod",
+      "state-replication"
     ]
   },
   "showcases": [
@@ -66,6 +67,7 @@
     { "flag": "--physics-shot", "desc": "Rigid-body physics (impulse solver)." },
     { "flag": "--terrain-shot", "desc": "Procedural terrain / heightmap (deterministic NxN displaced grid, lit + shadowed)." },
     { "flag": "--game-shot", "desc": "Playable game sample (deterministic roll-a-ball collect-the-pickups)." },
+    { "flag": "--net-shot", "desc": "State replication (deterministic snapshot+delta; replica reconstructs the scene)." },
     { "flag": "--stream-shot", "desc": "Scene/asset streaming (distance-based cell residency + per-frame budget)." },
     { "flag": "--terrain-stream-shot", "desc": "Terrain streaming with per-tile LOD (distance-banded tile residency + LOD selection)." },
     { "flag": "--hud-shot", "desc": "Screen-space text / HUD overlay (baked 8x8 font, alpha-blended quads)." },

@@ -248,6 +248,10 @@ add_executable(visual_test
     # Deterministic roll-a-ball gameplay loop (Slice AX): pure C++ (math + physics, no Metal/RHI
     # deps). Drives the --game showcase's scripted playthrough + capture-step state.
     ${HF_ROOT}/engine/game/roll_game.cpp
+    # Networking / replication snapshot layer (Slice BQ): the SAME pure-C++ snapshot.cpp the Windows
+    # engine compiles, so the serialized snapshot/delta BYTES are bit-identical cross-backend. No
+    # Metal/RHI deps. Drives the --net showcase's authority->replica stream + replica-scene render.
+    ${HF_ROOT}/engine/net/snapshot.cpp
     # Text / HUD layout + baked font atlas (Slice BA): pure C++ (no Metal/RHI deps). Drives the
     # --hud + --game-hud showcases' screen-space alpha-blended text overlay.
     ${HF_ROOT}/engine/ui/text.cpp

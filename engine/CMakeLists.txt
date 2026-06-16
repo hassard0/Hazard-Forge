@@ -24,6 +24,7 @@ set(HF_ENGINE_COMMON_SOURCES
   audio/mixer.cpp
   audio/wav.cpp
   game/roll_game.cpp
+  net/snapshot.cpp
   ui/text.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp
@@ -134,6 +135,7 @@ add_library(hf_core STATIC
   audio/mixer.cpp
   audio/wav.cpp
   game/roll_game.cpp
+  net/snapshot.cpp
   ui/text.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp

@@ -223,6 +223,17 @@ hf_add_pure_test(runtime_material_test)
 # stays grounded y~=radius, no explosion via KineticEnergy). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(roll_game_test)
 
+# Networking / replication snapshot layer (Slice BQ): the deterministic, socket-free snapshot+delta+
+# replica+interpolation core (engine/net/snapshot). Asserts snapshot serialize/deserialize round-trip
+# (raw-IEEE LE, fixed field order), delta correctness (DeltaApply(prev,DeltaEncode(prev,curr))==curr for
+# no-change/moved/added/removed/combined) + compression (unchanged delta < full serialize), replica==
+# authority over a keyframe+delta stream through the Replicator (exact after every Receive, byte
+# savings, two runs deterministic), interpolation endpoints + midpoint (lerp pos + slerp orientation
+# normalized + alpha clamp), and roll-game Capture (player id 0 + uncollected pickups id 1..N at their
+# positions; collected pickup drops out keeping stable ids). Pure CPU (hf_core), no RHI/backend
+# symbols, ASan-eligible.
+hf_add_pure_test(replication_test)
+
 # Text / HUD layout + atlas (Slice BA): BuildFontAtlas determinism + shape (128x48, white with
 # coverage alpha) and LayoutText math — 6 verts/visible glyph, quad count with spaces + newline,
 # cursor advance == kGlyphPx*pxScale, atlas-cell UVs, pixel->NDC conversion, empty string => 0 quads,

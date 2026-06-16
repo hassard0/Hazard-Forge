@@ -45,6 +45,7 @@
 #include "terrain/heightmap.h"      // Slice BF: deterministic procedural terrain / heightmap (pure CPU)
 #include "terrain/terrain_stream.h" // Slice BJ: terrain-streaming LOD integration (pure CPU)
 #include "game/roll_game.h"
+#include "net/snapshot.h"          // Slice BQ: replication snapshot layer (pure CPU, shared with Vulkan)
 #include "ui/text.h"               // Slice BA: baked 8x8 font atlas + screen-space text layout (pure CPU)
 #include "render/render_graph.h"
 #include "render/csm.h"     // Slice AD: cascaded-shadow split + per-cascade ortho fit (pure math)
@@ -3223,6 +3224,255 @@ static int RunGameShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — capture step %d, %zu pickups remaining\n",
                 outPath, cw, ch, kGameCaptureStep, pickupModels.size());
+    return 0;
+}
+
+// --- Networking / replication showcase (Slice BQ). Mirrors the Vulkan --net-shot path EXACTLY: run
+// the AX roll-game as the AUTHORITY over the FULL scripted track at the engine fixed dt; each tick
+// Capture a Snapshot (player id 0 + uncollected pickups id 1..N) and Send it through the channel — a
+// FULL keyframe every kNetKeyframeInterval ticks, a per-entity DELTA otherwise — into bytes the REPLICA
+// Receives via an in-process perfect channel (NO sockets). At the IDENTICAL fixed capture step
+// (kNetCaptureStep == 250, the same as --game) assert replica.State() == the authority snapshot EXACTLY,
+// then render the REPLICA'S reconstructed scene (player + remaining pickups from its RepEntities) lit +
+// shadowed via the existing static-lit scene path. The replication core (engine/net/snapshot.cpp) is the
+// SAME pure-C++ TU the Vulkan build compiles, so the serialized bytes + the net stat line are bit-
+// identical cross-backend. The only difference vs the BMP-golden is backend-NDC handling. One PNG. -----
+static int RunNetShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Identical replication parameters + capture step to the Vulkan --net-shot.
+    const int kNetCaptureStep = 250;
+    const uint32_t kNetKeyframeInterval = 8;
+    const float dtG = 1.0f / 120.0f;
+    std::vector<game::GameInput> track = game::ScriptedTrack();
+
+    physics::World authWorld;
+    game::GameState authState = game::MakeRollGame(authWorld);
+    net::Replicator rep(kNetKeyframeInterval);
+    net::Snapshot authAtCapture, replicaAtCapture;
+    bool haveCapture = false;
+    const int totalTicks = (int)track.size();
+    for (int t = 0; t <= totalTicks; ++t) {
+        net::Snapshot snap = net::Replicator::Capture((uint32_t)t, authState, authWorld);
+        std::vector<uint8_t> packet = rep.Send(snap);
+        rep.Receive(packet);
+        if (t == kNetCaptureStep) {
+            authAtCapture = snap;
+            replicaAtCapture = rep.State();
+            haveCapture = true;
+        }
+        if (t < totalTicks) game::StepGame(authWorld, authState, track[(size_t)t], dtG);
+    }
+    const bool replicaMatch = haveCapture && (replicaAtCapture == authAtCapture);
+    if (!replicaMatch) return fail("replica state != authority at capture step");
+
+    const uint64_t fullBytes = rep.FullBytes();
+    const uint64_t deltaBytes = rep.DeltaBytes();
+    const double savingsPct = (fullBytes > 0)
+        ? 100.0 * (double)(fullBytes - deltaBytes) / (double)fullBytes : 0.0;
+
+    // Build the render models from the REPLICA'S reconstructed RepEntities (NOT the authority state).
+    Mat4 replicaPlayerModel = Mat4::Identity();
+    bool havePlayer = false;
+    std::vector<Mat4> pickupModels;
+    for (const net::RepEntity& e : replicaAtCapture.entities) {
+        if (e.flags & net::kFlagPlayer) {
+            replicaPlayerModel = math::FromTRS(
+                e.position, e.orientation,
+                {2.0f * game::kPlayerRadius, 2.0f * game::kPlayerRadius, 2.0f * game::kPlayerRadius});
+            havePlayer = true;
+        } else if (e.flags & net::kFlagPickup) {
+            pickupModels.push_back(math::FromTRS(
+                e.position, e.orientation,
+                {2.0f * game::kPickupRadius, 2.0f * game::kPickupRadius, 2.0f * game::kPickupRadius}));
+        }
+    }
+    if (!havePlayer) return fail("replica has no player entity");
+    Mat4 playerModel = replicaPlayerModel;
+
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    const uint8_t playerPx[4] = {40, 110, 230, 255};   // blue
+    auto playerTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, playerPx, sizeof(playerPx)});
+    const uint8_t pickupPx[4] = {245, 200, 40, 255};   // gold
+    auto pickupTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, pickupPx, sizeof(pickupPx)});
+
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    const Vec3 eye{9.5f, 4.0f, 6.5f};
+    const Vec3 center{5.0f, 0.4f, 1.6f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{5.0f, 0.4f, 1.6f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto litPush = [](const Mat4& model, float metallic, float roughness, float* pc) {
+        for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+        pc[16] = metallic; pc[17] = roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.PushConstants(playerModel.m, sizeof(float) * 16);
+            cmd.DrawIndexed(sphere.indexCount());
+            for (const Mat4& pm : pickupModels) {
+                cmd.PushConstants(pm.m, sizeof(float) * 16);
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20]; litPush(groundModel, 0.0f, 0.85f, pc);
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            {
+                float pc[20]; litPush(playerModel, 0.1f, 0.4f, pc);
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*playerTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            {
+                cmd.BindMaterial(*pickupTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindIndexBuffer(sphere.indices());
+                for (const Mat4& pm : pickupModels) {
+                    float pc[20]; litPush(pm, 0.3f, 0.3f, pc);
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.DrawIndexed(sphere.indexCount());
+                }
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("net: {ticks:%d, snapshots:%u, fullBytes:%llu, deltaBytes:%llu, savings:%.1f%%, replicaMatch:%s}\n",
+                totalTicks + 1, rep.SnapshotsSent(),
+                (unsigned long long)fullBytes, (unsigned long long)deltaBytes,
+                savingsPct, replicaMatch ? "true" : "false");
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — capture step %d, %zu pickups remaining (replica)\n",
+                outPath, cw, ch, kNetCaptureStep, pickupModels.size());
     return 0;
 }
 
@@ -8830,6 +9080,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--game") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_game.png";
             try { return RunGameShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --net <out.png>: render the networking / replication showcase (Slice BQ) — run the AX roll-game
+        // as the AUTHORITY, stream snapshots (keyframe + per-entity deltas) into the REPLICA via an
+        // in-process perfect channel (NO sockets), assert replica==authority at a fixed capture step, then
+        // render the REPLICA'S reconstructed scene (player + remaining pickup, lit + shadowed). Mirrors the
+        // Vulkan --net-shot; new golden tests/golden/metal/net.png. The net stat line matches Vulkan.
+        if (argc > 1 && std::strcmp(argv[1], "--net") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_net.png";
+            try { return RunNetShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --stream <out.png>: render the scene/asset streaming showcase (Slice BD) — the RESIDENT
