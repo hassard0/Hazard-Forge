@@ -92,6 +92,7 @@ $Goldens = @(
     @{ Name = 'motion_blur';   Flag = '--motionblur' }           # Slice CN (per-object + camera motion blur: velocity-gather streak; zero motion byte-identical pass-through)
     @{ Name = 'oit';           Flag = '--oit' }                  # Slice CO (order-independent transparency: Weighted Blended OIT; permuted draw order resolves byte-identically)
     @{ Name = 'pom';           Flag = '--pom' }                  # Slice CP (parallax occlusion mapping: tangent-space height-field march; heightScale=0 byte-identical to plain normal mapping)
+    @{ Name = 'gtao';          Flag = '--gtao' }                 # Slice CR (ground-truth ambient occlusion: horizon-search cosine-weighted visibility integral; radius=0 byte-identical to the no-AO scene)
     @{ Name = 'water';         Flag = '--water' }                # Slice CF (Gerstner water reflect/refract + sun glint)
     @{ Name = 'ssgi';          Flag = '--ssgi' }                 # Slice BP (screen-space global illumination)
     @{ Name = 'ssgi_denoise';  Flag = '--ssgi-denoise' }         # Slice BR (SSGI bilateral spatial denoise)

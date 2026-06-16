@@ -350,6 +350,7 @@ int main(int argc, char** argv) {
     const char* motionBlurShotPath = nullptr;// --motionblur-shot <out.bmp> (Slice CN: motion blur)
     const char* oitShotPath = nullptr;       // --oit-shot <out.bmp> (Slice CO: order-independent transparency)
     const char* pomShotPath = nullptr;       // --pom-shot <out.bmp> (Slice CP: parallax occlusion mapping)
+    const char* gtaoShotPath = nullptr;      // --gtao-shot <out.bmp> (Slice CR: ground-truth ambient occlusion)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -665,6 +666,18 @@ int main(int argc, char** argv) {
             // equivalence proof (the march introduces zero UV drift at zero amplitude). One BMP -> exit.
             // New golden; existing lit/ssao/ssr/dof/motionblur/oit paths/shaders/goldens are untouched.
             pomShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--gtao-shot") == 0 && i + 1 < argc) {
+            // Slice CR: Ground-Truth Ambient Occlusion. A scene with clear AO cues (boxes resting on the
+            // ground forming concave inner corners/creases + spheres in contact) rendered into an HDR RT
+            // + the SSAO/SSR view-space normal+linear-depth g-buffer; gtao.frag runs the render/gtao.h
+            // horizon-search visibility integral (IntegrateArc + HorizonAngle + Visibility) per pixel and
+            // the EXISTING ssao_composite.frag multiplies the ambient term by the AO so contacts +
+            // concavities darken. CRITICAL: the SAME scene is ALSO rendered with radius=0 (gtao.frag's
+            // no-horizon path -> AO==1) and asserted BYTE-IDENTICAL (SHA) to the no-AO render — the
+            // radius=0 equivalence proof (the integral normalizes to a true identity at zero occlusion).
+            // Prints `gtao: {slices:N, steps:M, radius:R}`. One BMP -> exit. New golden; existing
+            // lit/ssao/ssr/pom paths/shaders/goldens are untouched.
+            gtaoShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -12269,6 +12282,360 @@ int main(int argc, char** argv) {
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Ground-Truth Ambient Occlusion showcase (--gtao-shot, Slice CR): a scene with clear AO
+        // cues — boxes resting on the ground forming concave inner corners/creases + spheres in contact
+        // — rendered into an HDR RT + the SSAO/SSR view-space normal+linear-depth g-buffer. gtao.frag
+        // runs the render/gtao.h horizon-search visibility integral (IntegrateArc + HorizonAngle +
+        // Visibility, mirrored in-shader) per pixel; the EXISTING ssao_composite.frag MULTIPLIES the
+        // ambient term by the AO (reused unchanged). THE RADIUS=0 EQUIVALENCE PROOF: the SAME scene is
+        // rendered (1) with radius>0 (the golden), (2) with radius=0 (gtao.frag's no-horizon path ->
+        // AO==1 everywhere), and (3) with NO AO (ssao_composite aoStrength=0 -> aoFactor 1). Captures
+        // (2) and (3) are asserted BYTE-IDENTICAL (SHA) — proving the integral normalizes to a true
+        // identity at zero occlusion (no bias, no off-by-one). Deterministic (fixed camera/radius/slices/
+        // steps, baked per-pixel rotation, no RNG); two runs byte-identical. SEPARATE gtao pipeline +
+        // the REUSED gbuffer/ssao_composite pipelines; existing ssao/ssr paths/shaders/goldens untouched.
+        if (gtaoShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+            const int   kSlices = 8;       // GTAO slice directions (fixed)
+            const int   kSteps  = 8;       // steps per slice per side (fixed)
+            const float kRadius = 0.6f;    // horizon-search radius in view-space units (fixed)
+
+            // --- Lit scene pipelines (writing the HDR RT) — UNCHANGED lit shaders. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // --- Shadow pipeline (UNCHANGED). ---
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // --- Sky (UNCHANGED). ---
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- G-buffer prepass pipeline (static), writing view-space normal + linear depth (REUSED
+            // SSAO/SSR gbuffer shader). Push constant = { model, view }. ---
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- GTAO + composite fullscreen pipelines (NEW gtao.frag; REUSED ssao_composite.frag). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct GtaoParams { float texel[2]; float radius, slices, steps, tanHalfFovY, aspect, intensity; };
+            struct SsaoCompParams { float texel[2]; float aoStrength, intensity; };
+
+            auto gtaoFs = loadFs("gtao.frag.hlsl");
+            auto compFs = loadFs("ssao_composite.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc gtaoD;
+            gtaoD.vertex = postVsM.get(); gtaoD.fragment = gtaoFs.get();
+            gtaoD.colorFormat = kHdr;
+            gtaoD.depthTest = false; gtaoD.usesTexture = true; gtaoD.fullscreen = true;
+            gtaoD.fragmentPushConstants = true; gtaoD.pushConstantSize = sizeof(GtaoParams);
+            auto gtaoPipe = device->CreateGraphicsPipeline(gtaoD);
+
+            rhi::GraphicsPipelineDesc compD;
+            compD.vertex = postVsM.get(); compD.fragment = compFs.get();
+            compD.colorFormat = device->Swapchain().ColorFormat();
+            compD.depthTest = false; compD.usesTexture = true; compD.fullscreen = true;
+            compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(SsaoCompParams);
+            auto compPipe = device->CreateGraphicsPipeline(compD);
+
+            // --- Render targets: HDR lit scene + RGBA16F g-buffer + AO (full res). ---
+            auto rt   = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf = device->CreateRenderTarget(w, h, kHdr);
+            auto aoRT = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // --- Scene objects (deterministic): boxes forming a concave INNER CORNER on the ground (two
+            // walls meeting at a 90-deg crease) + a stack + spheres nestled against them, so the
+            // horizon-based AO clearly darkens the contacts + the concave creases. ---
+            struct Obj { Vec3 pos; Vec3 scale; bool cube; };
+            const Obj objs[] = {
+                {{-1.6f, 0.9f, -1.0f}, {0.45f, 0.9f, 2.2f}, true},   // tall wall (left of the corner)
+                {{ 0.0f, 0.9f, -2.2f}, {2.6f, 0.9f, 0.45f}, true},   // tall wall (back of the corner)
+                {{ 1.4f, 0.45f, 0.4f}, {0.45f, 0.45f, 0.45f}, true}, // box on the ground
+                {{ 1.4f, 1.25f, 0.4f}, {0.35f, 0.35f, 0.35f}, true}, // box stacked on it (a tight crease)
+                {{-0.5f, 0.55f, 0.3f}, {0.55f, 0.55f, 0.55f}, false},// sphere resting on the ground
+                {{ 0.3f, 0.5f, -1.2f}, {0.5f, 0.5f, 0.5f}, false},   // sphere nestled into the corner
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            const Vec3 eye{3.3f, 2.2f, 3.6f};
+            const Vec3 center{-0.2f, 0.5f, -0.7f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.5f, -1.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto objModel = [&](const Obj& o) {
+                return Mat4::Translate(o.pos) * Mat4::Scale(o.scale);
+            };
+
+            GtaoParams gp{};
+            gp.texel[0] = 1.0f / (float)w; gp.texel[1] = 1.0f / (float)h;
+            gp.slices = (float)kSlices; gp.steps = (float)kSteps;
+            gp.tanHalfFovY = std::tan(0.5f * kFovY); gp.aspect = aspect; gp.intensity = 2.0f;
+            SsaoCompParams cp{}; cp.texel[0] = 1.0f / (float)w; cp.texel[1] = 1.0f / (float)h;
+            cp.intensity = 1.7f;
+
+            // Render the full scene through the GTAO pipeline at a given radius + composite aoStrength,
+            // capturing the swapchain pixels. radius=0 -> gtao.frag returns AO=1; aoStrength=0 ->
+            // ssao_composite forces aoFactor 1. Both leave the scene untonemapped-by-AO -> identical.
+            auto renderScene = [&](float radius, float aoStrength,
+                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                gp.radius = radius;
+                cp.aoStrength = aoStrength;
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgGbuf = graph.ImportTarget(
+                    "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+                render::RgResource rgAO = graph.ImportTarget(
+                    "ao", render::RgResourceKind::SceneColor, *aoRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            cmd.PushConstants(m.m, sizeof(float) * 16);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("gbuffer", {}, {rgGbuf},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*gbStaticPipeline);
+                        {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("gtao", {rgGbuf}, {rgAO},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.BindPipeline(*gtaoPipe);
+                        cmd.BindTexture(*gbuf);
+                        cmd.PushConstants(&gp, sizeof(gp));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("composite", {rgScene, rgAO}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*compPipe);
+                        cmd.BindTexturePair(*rt, *aoRT);
+                        cmd.PushConstants(&cp, sizeof(cp));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE RADIUS=0 EQUIVALENCE PROOF.
+            //   gtaoPx  — the REAL radius>0 GTAO: the golden (contact + concavity AO).
+            //   zeroPx  — radius=0 GTAO (gtao.frag's no-horizon path -> AO==1 everywhere), aoStrength=1.
+            //   noAoPx  — NO AO (aoStrength=0 -> ssao_composite forces aoFactor 1).
+            // zeroPx and noAoPx both multiply the scene's ambient term by 1, so they MUST be
+            // BYTE-IDENTICAL — proving GTAO normalizes to a true identity at zero occlusion (no bias,
+            // no off-by-one). Fail loudly on any diff.
+            std::vector<uint8_t> gtaoPx, zeroPx, noAoPx;
+            uint32_t gw = 0, gh = 0, zw = 0, zh = 0, nw = 0, nh = 0;
+            if (!renderScene(kRadius, 1.0f, gtaoPx, gw, gh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (GTAO radius>0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(0.0f, 1.0f, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (GTAO radius=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(kRadius, 0.0f, noAoPx, nw, nh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (no-AO reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t zeroHash = fnv(zeroPx), noAoHash = fnv(noAoPx), gtaoHash = fnv(gtaoPx);
+            std::printf("gtao radius=0 hash: %016llx  no-AO hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)noAoHash);
+            const bool zeroEquivalent = (zw == nw) && (zh == nh) && (zeroPx.size() == noAoPx.size()) &&
+                                        (std::memcmp(zeroPx.data(), noAoPx.data(), noAoPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: GTAO radius=0 render != no-AO render — the visibility integral does NOT "
+                    "normalize to 1 at zero occlusion (normalization/off-by-one bug). radius=0 %016llx "
+                    "vs no-AO %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)noAoHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("gtao radius=0 == no-AO scene: BYTE-IDENTICAL (radius=0 equivalence proof)\n");
+            std::printf("gtao: {slices:%d, steps:%d, radius:%.4g}\n", kSlices, kSteps, (double)kRadius);
+            // Sanity: the real GTAO render must DIFFER from the no-AO render (the AO actually darkens).
+            if (gtaoHash == noAoHash)
+                std::fprintf(stderr, "WARNING: GTAO radius>0 render is identical to the no-AO render "
+                                     "(no visible AO) — check the radius / scene\n");
+
+            bool ok = WriteBMP(gtaoShotPath, gtaoPx, gw, gh);
+            if (ok) std::printf("wrote %s (%ux%u) — GTAO, %d slices, %d steps, radius %.4g, %d objects\n",
+                                gtaoShotPath, gw, gh, kSlices, kSteps, (double)kRadius, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gtaoShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

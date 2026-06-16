@@ -189,6 +189,16 @@ hf_add_pure_test(oit_test)
 # is mirrored VERBATIM in pom.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(pom_test)
 
+# Ground-Truth Ambient Occlusion (Slice CR): the closed-form per-slice IntegrateArc visibility integral,
+# the per-sample HorizonAngle, and the full horizon-search Visibility estimate (render/gtao.h, header-
+# only). The CORE proof: IntegrateArc(full unoccluded hemisphere) == 1, Visibility over a FLAT depth
+# field == 1 EXACTLY, and Visibility at radius == 0 == 1 EXACTLY (no horizon search -> the radius=0
+# GTAO render is byte-identical to the no-AO scene). Also pins the known-occluder analytic match +
+# monotone (closer/taller occluder -> more AO), range [0,1], IntegrateArc slice symmetry, and
+# determinism. The same gtao.h math is mirrored VERBATIM in gtao.frag.hlsl. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(gtao_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so

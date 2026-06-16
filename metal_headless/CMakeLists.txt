@@ -211,6 +211,13 @@ hf_gen_msl(pom.frag               pom.frag.hlsl               frag fragment_main
 hf_gen_msl(water.vert             water.vert.hlsl             vert water_vertex)
 hf_gen_msl(water.frag             water.frag.hlsl             frag water_fragment)
 hf_gen_msl(water_composite.frag   water_composite.frag.hlsl   frag water_composite_fragment)
+# Ground-Truth Ambient Occlusion (Slice CR): gtao.frag reconstructs the view position+normal from the
+# SSAO g-buffer (like ssao.frag) and runs the render/gtao.h horizon-search visibility integral
+# (IntegrateArc + HorizonAngle + Visibility mirrored in-shader) with a baked per-pixel slice rotation;
+# the EXISTING ssao_composite.frag multiplies the ambient term by it. The SAME render/gtao.h math
+# compiled here makes the AO bit-identical to the Vulkan/CPU path; radius==0 -> AO==1 -> byte-identical
+# to the no-AO render. Behind --gtao only; existing ssao/ssr shaders + goldens untouched.
+hf_gen_msl(gtao.frag              gtao.frag.hlsl              frag gtao_fragment)
 # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer + lit HDR scene; ssgi.frag
 # traces K cosine-hemisphere rays and marches the depth buffer (same march as ssr.frag) for indirect
 # diffuse, ssgi_composite ADDS it over the scene + tonemaps. Same HLSL->SPIR-V->MSL toolchain.

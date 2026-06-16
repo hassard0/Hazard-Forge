@@ -186,6 +186,14 @@ hf_compile_shaders(
     "shaders/water.vert.hlsl:vs"
     "shaders/water.frag.hlsl:ps"
     "shaders/water_composite.frag.hlsl:ps"
+    # Ground-Truth Ambient Occlusion (Slice CR): reuses the SSAO/SSR g-buffer (view normal + linear
+    # depth). gtao.frag reconstructs the view position + normal (like ssao.frag), runs the render/gtao.h
+    # horizon-search visibility integral (IntegrateArc + HorizonAngle + Visibility mirrored in-shader)
+    # with a baked per-pixel slice rotation, and outputs the AO factor; the EXISTING ssao_composite.frag
+    # MULTIPLIES the ambient term by it (reused unchanged). Fullscreen (reuses post.vert), behind
+    # --gtao-shot ONLY; with radius==0 the horizon search raises no horizon -> AO==1 -> byte-identical to
+    # the no-AO render. Existing ssao/ssr shaders + their goldens untouched.
+    "shaders/gtao.frag.hlsl:ps"
     # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
     # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect

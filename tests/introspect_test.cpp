@@ -186,6 +186,8 @@ int main() {
             bool sawOitFeature = false;
             // Slice CP: the parallax-occlusion-mapping capability is advertised in the feature manifest.
             bool sawPomFeature = false;
+            // Slice CR: the ground-truth-ambient-occlusion capability is advertised in the feature manifest.
+            bool sawGtaoFeature = false;
             // Slice CF: the water-rendering capability is advertised in the feature manifest.
             bool sawWaterFeature = false;
             // Slice BQ: the state-replication capability is advertised in the feature manifest.
@@ -234,6 +236,7 @@ int main() {
                     if (AsString(el->value) == "motion-blur") sawMotionBlurFeature = true;
                     if (AsString(el->value) == "order-independent-transparency") sawOitFeature = true;
                     if (AsString(el->value) == "parallax-occlusion-mapping") sawPomFeature = true;
+                    if (AsString(el->value) == "ground-truth-ambient-occlusion") sawGtaoFeature = true;
                     if (AsString(el->value) == "water-rendering") sawWaterFeature = true;
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
                     if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
@@ -272,6 +275,7 @@ int main() {
             check(sawMotionBlurFeature, "engine.features includes motion-blur");
             check(sawOitFeature, "engine.features includes order-independent-transparency");
             check(sawPomFeature, "engine.features includes parallax-occlusion-mapping");
+            check(sawGtaoFeature, "engine.features includes ground-truth-ambient-occlusion");
             check(sawWaterFeature, "engine.features includes water-rendering");
             check(sawReplicationFeature, "engine.features includes state-replication");
             check(sawNetsimFeature, "engine.features includes network-transport-sim");
@@ -360,6 +364,8 @@ int main() {
         bool sawOitShot = false;
         // Slice CP: the --pom-shot showcase flag is listed in the showcase manifest.
         bool sawPomShot = false;
+        // Slice CR: the --gtao-shot showcase flag is listed in the showcase manifest.
+        bool sawGtaoShot = false;
         // Slice CF: the --water-shot showcase flag is listed in the showcase manifest.
         bool sawWaterShot = false;
         // Slice BR: the --ssgi-denoise-shot showcase flag is listed in the showcase manifest.
@@ -415,6 +421,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--motionblur-shot") sawMotionBlurShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--oit-shot") sawOitShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--pom-shot") sawPomShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gtao-shot") sawGtaoShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--water-shot") sawWaterShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-temporal-shot") sawSsgiTemporalShot = true;
@@ -457,6 +464,7 @@ int main() {
         check(sawMotionBlurShot, "showcases manifest includes --motionblur-shot");
         check(sawOitShot, "showcases manifest includes --oit-shot");
         check(sawPomShot, "showcases manifest includes --pom-shot");
+        check(sawGtaoShot, "showcases manifest includes --gtao-shot");
         check(sawWaterShot, "showcases manifest includes --water-shot");
         check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
         check(sawSsgiTemporalShot, "showcases manifest includes --ssgi-temporal-shot");
