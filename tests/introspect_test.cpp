@@ -142,6 +142,8 @@ int main() {
             bool sawBindlessFeature = false;
             // Slice CB: the gpu-driven-rendering capability is advertised in the feature manifest.
             bool sawGpuDrivenFeature = false;
+            // Slice CD: the gpu-driven-culling-draw capability is advertised in the feature manifest.
+            bool sawGpuCullDrawFeature = false;
             // Slice AS: the automatic-barriers (render-graph resource-state tracking) capability.
             bool sawBarriersFeature = false;
             // Slice AU: the multithreaded-recording capability is advertised in the feature manifest.
@@ -192,6 +194,7 @@ int main() {
                     if (AsString(el->value) == "gpu-multi-draw-indirect") sawMdiFeature = true;
                     if (AsString(el->value) == "bindless-textures") sawBindlessFeature = true;
                     if (AsString(el->value) == "gpu-driven-rendering") sawGpuDrivenFeature = true;
+                    if (AsString(el->value) == "gpu-driven-culling-draw") sawGpuCullDrawFeature = true;
                     if (AsString(el->value) == "automatic-barriers") sawBarriersFeature = true;
                     if (AsString(el->value) == "multithreaded-recording") sawMtFeature = true;
                     if (AsString(el->value) == "material-graph") sawMatGraphFeature = true;
@@ -220,6 +223,7 @@ int main() {
             check(sawMdiFeature, "engine.features includes gpu-multi-draw-indirect");
             check(sawBindlessFeature, "engine.features includes bindless-textures");
             check(sawGpuDrivenFeature, "engine.features includes gpu-driven-rendering");
+            check(sawGpuCullDrawFeature, "engine.features includes gpu-driven-culling-draw");
             check(sawBarriersFeature, "engine.features includes automatic-barriers");
             check(sawMtFeature, "engine.features includes multithreaded-recording");
             check(sawMatGraphFeature, "engine.features includes material-graph");
@@ -274,6 +278,8 @@ int main() {
         bool sawBindlessShot = false;
         // Slice CB: the --gpudriven-shot showcase flag is listed in the showcase manifest.
         bool sawGpuDrivenShot = false;
+        // Slice CD: the --gpucull-draw-shot showcase flag is listed in the showcase manifest.
+        bool sawGpuCullDrawShot = false;
         // Slice AU: the --mt-shot showcase flag is listed in the showcase manifest.
         bool sawMtShot = false;
         // Slice AV: the --material-shot showcase flag is listed in the showcase manifest.
@@ -331,6 +337,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--mdi-shot") sawMdiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--bindless-shot") sawBindlessShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gpudriven-shot") sawGpuDrivenShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gpucull-draw-shot") sawGpuCullDrawShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mt-shot") sawMtShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-shot") sawMaterialShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-live-shot") sawMaterialLiveShot = true;
@@ -363,6 +370,7 @@ int main() {
         check(sawMdiShot, "showcases manifest includes --mdi-shot");
         check(sawBindlessShot, "showcases manifest includes --bindless-shot");
         check(sawGpuDrivenShot, "showcases manifest includes --gpudriven-shot");
+        check(sawGpuCullDrawShot, "showcases manifest includes --gpucull-draw-shot");
         check(sawMtShot, "showcases manifest includes --mt-shot");
         check(sawMaterialShot, "showcases manifest includes --material-shot");
         check(sawMaterialLiveShot, "showcases manifest includes --material-live-shot");

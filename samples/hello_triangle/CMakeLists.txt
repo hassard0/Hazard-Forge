@@ -181,6 +181,12 @@ hf_compile_shaders(
     # grid and ORDER-compacts the survivors + writes the indirect draw-args; reuses lit_instanced.vert
     # for the indirect draw. Existing shaders + goldens untouched.
     "shaders/cull.comp.hlsl:cs"
+    # Fully-GPU-driven-CULLED pass (Slice CD): a compute kernel frustum-culls the FULL per-draw list and
+    # ORDER-compacts the survivors into the GpuDrivenPerDraw SSBO + the MDI command buffer + writes the
+    # survivor count; the host reads the count back and issues ONE DrawIndexedMultiIndirect(count) over
+    # lit_gpudriven.{vert,frag}. Composes AR (cull+compact) + BM (MDI) + BZ (bindless) + CB (combined
+    # per-draw). Existing shaders + goldens untouched.
+    "shaders/gpudriven_cull.comp.hlsl:cs"
     # GPU multi-draw-indirect batching (Slice BM): the MDI lit vertex shader reads the per-draw model
     # matrix + material from a storage buffer indexed by gl_DrawID (SPIR-V DrawIndex). VULKAN-ONLY (the
     # DrawIndex builtin needs shaderDrawParameters); shares the existing lit.frag. Not in the Metal MSL

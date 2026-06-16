@@ -249,6 +249,20 @@ hf_add_pure_test(bindless_test)
 # ASan-eligible.
 hf_add_pure_test(gpu_driven_test)
 
+# Fully-GPU-driven-CULLED pass (Slice CD): the pure-CPU cull+compact MIRROR (render/gpu_culled.h) of
+# shaders/gpudriven_cull.comp.hlsl that composes the AR ordered prefix-sum compaction + frustum-sphere
+# test with the CB combined per-draw (model+material+texIndex). For the FULL per-draw list + a frustum
+# it frustum-culls each object's world bounding sphere (the SAME render::frustum::SphereOutside +
+# render::gpu_cull::InstanceWorldSphere math the validated AR cull uses) and COMPACTS the survivors in
+# SOURCE-INDEX order into the GpuDrivenPerDraw SSBO + N' MDI commands + the survivor drawCount. Asserts
+# the cull+compact == an INDEPENDENT brute-force frustum.h reference IN ORDER (count + 0 false-culls),
+# PER-DRAW CARRY (each survivor's per-draw carries the right model+material+texIndex; its command its
+# index slice), and DETERMINISM (two builds -> bit-identical compacted per-draw + drawCount) over a
+# 144-object grid + 200 random frustums. The render-invariance proof (GPU-culled image == CPU-culled
+# bound image) lives in --gpucull-draw-shot; this pins the CPU layout the path reads. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(gpu_culled_test)
+
 # Multithreaded command recording (Slice AU): the deterministic CONTIGUOUS draw-list partition
 # (PartitionDraws splits [0,K) into W gap/overlap-free ranges, run-to-run identical, degenerate
 # W>K/K=0/W=1/W=0) + the real worker-pool dispatch (RecordParallel marks each draw exactly once
