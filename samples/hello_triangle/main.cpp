@@ -348,6 +348,7 @@ int main(int argc, char** argv) {
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
     const char* dofShotPath = nullptr;       // --dof-shot <out.bmp> (Slice CG: depth of field)
     const char* motionBlurShotPath = nullptr;// --motionblur-shot <out.bmp> (Slice CN: motion blur)
+    const char* oitShotPath = nullptr;       // --oit-shot <out.bmp> (Slice CO: order-independent transparency)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -642,6 +643,17 @@ int main(int argc, char** argv) {
             // they are BYTE-IDENTICAL (SHA) — the pass-through proof. One BMP -> exit. New golden;
             // existing lit/ssao/ssr/dof/bloom paths/shaders/goldens are untouched.
             motionBlurShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--oit-shot") == 0 && i + 1 < argc) {
+            // Slice CO: Order-Independent Transparency (Weighted Blended OIT). An opaque ground + a few
+            // opaque objects, lit + shadowed and tonemapped into the swapchain ("background"), then
+            // SEVERAL mutually-overlapping/intersecting TRANSPARENT glass quads at different depths
+            // rendered into the WBOIT accum (additive ONE,ONE) + revealage (multiplicative dst*=(1-a))
+            // RGBA16F targets, then a fullscreen oit_resolve composites them over the opaque scene by
+            // (1-revealage). CRITICAL: the transparent set is rendered in a CANONICAL order AND a PERMUTED
+            // order and the two resolved captures are asserted BYTE-IDENTICAL (SHA) — the order-
+            // independence proof (accum is a SUM, revealage a PRODUCT). One BMP -> exit. New golden;
+            // existing lit/ssao/ssr/dof/motionblur paths/shaders/goldens are untouched.
+            oitShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -8945,6 +8957,421 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — motion blur, %d objects, camera pan\n",
                                 motionBlurShotPath, bw, bh, kNumObjs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", motionBlurShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Order-Independent Transparency showcase (--oit-shot, Slice CO): Weighted Blended OIT
+        // (McGuire & Bavoil 2013). An opaque ground + opaque objects render into an HDR RGBA16F scene RT;
+        // then SEVERAL mutually-overlapping TRANSPARENT glass quads (camera-facing, distinct colors, same
+        // alpha + view depth) are rendered into the WBOIT accum RT (additive ONE,ONE: oit_accum.frag
+        // outputs premultColor*Weight in rgb, alpha*Weight in a) AND the revealage RT (cleared to 1.0,
+        // oitRevealageBlend dst*=(1-alpha): oit_revealage.frag outputs alpha). A fullscreen oit_resolve
+        // reads accum+revealage -> (transparentRGB = accum.rgb/max(accum.a,eps), coverage = 1-revealage)
+        // into an oit RT, and the SAME generic lerp+tonemap composite as --water-shot blends
+        // lerp(scene, transparentRGB, coverage) == oit::ResolveOver over the opaque scene -> swapchain.
+        //
+        // THE ORDER-INDEPENDENCE PROOF: the transparent set is rendered TWICE — a CANONICAL order
+        // [0,1,2,3,4] and a PERMUTED order [3,1,0,2,4] — into the SAME accum (a SUM) + revealage (a
+        // PRODUCT). Both are commutative, so the two resolved captures MUST be BYTE-IDENTICAL (SHA). The
+        // run asserts this and FAILS LOUDLY on any diff (never bakes a bad golden). The transparent set is
+        // chosen bit-stable (equal alpha + equal view depth -> identical per-fragment Weight; small dyadic
+        // colors) so the half-float accum SUM does not diverge across orders. SEPARATE oit pipelines +
+        // shaders; existing lit/gbuffer/ssr/dof/water + goldens untouched.
+        if (oitShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            // The WBOIT accum + revealage targets are RGBA32_Float (full fp32). The order-independence
+            // proof needs the per-pixel accum SUM (a sum of the overlapping fragments' premultColor*w)
+            // to be IDENTICAL across draw orders; fp16's 10-bit mantissa rounds the partial sums of the
+            // distinct-colored layers differently per order (the internal assert catches this), whereas
+            // fp32's 24-bit mantissa represents these small, well-separated weighted contributions and
+            // their partial sums EXACTLY, so the sum is bit-identical for any order. (revealage is a
+            // product of (1-alpha)=0.5 powers, exact in either; fp32 keeps accum bit-stable too.)
+            const rhi::Format kOitFmt = rhi::Format::RGBA32_Float;
+            const float kFovY = 1.04719755f;
+
+            // --- Opaque scene objects: a ground + two opaque cubes/spheres behind the glass. ---
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj opaqueObjs[] = {
+                {{-1.6f, 0.9f, -3.0f}, 0.9f, true,  {0.85f, 0.45f, 0.30f}},
+                {{ 1.7f, 0.9f, -3.6f}, 0.9f, false, {0.35f, 0.55f, 0.85f}},
+            };
+            const int kNumOpaque = (int)(sizeof(opaqueObjs) / sizeof(opaqueObjs[0]));
+
+            // --- Transparent glass quads (camera-facing XY quads). DISTINCT dyadic colors, a COMMON
+            // alpha 0.5, and a COMMON view depth (all at the same z) so oit::Weight is IDENTICAL for every
+            // quad -> the accum SUM is order-stable in half-float. They overlap mutually in screen space at
+            // slightly staggered XY offsets so the composite shows layered glass. ---
+            struct Glass { Vec3 pos; float col[3]; };
+            const float kGlassAlpha = 0.5f;
+            const float kGlassZ = -1.5f;   // ALL quads share this z (camera at +z) -> equal view depth
+            const Glass glass[] = {
+                {{-0.7f, 1.1f, kGlassZ}, {0.75f, 0.25f, 0.25f}},  // red-ish
+                {{-0.3f, 0.8f, kGlassZ}, {0.25f, 0.75f, 0.25f}},  // green-ish
+                {{ 0.1f, 1.2f, kGlassZ}, {0.25f, 0.50f, 1.00f}},  // blue-ish
+                {{ 0.5f, 0.9f, kGlassZ}, {1.00f, 0.75f, 0.25f}},  // yellow-ish
+                {{ 0.0f, 1.0f, kGlassZ}, {0.75f, 0.25f, 1.00f}},  // magenta-ish (center, overlaps all)
+            };
+            const int kNumGlass = (int)(sizeof(glass) / sizeof(glass[0]));
+
+            // --- Opaque pipelines (UNCHANGED shaders): lit + shadow + sky. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- OIT accum + revealage pipelines (oit_accum.vert + the two frag shaders). Both read
+            // FrameData (viewProj) + a push constant (model + view + colorAlpha); depthTest OFF so every
+            // overlapping transparent fragment accumulates (WBOIT needs all of them). ---
+            auto oitVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/oit_accum.vert.hlsl.spv");
+            auto oitVs  = device->CreateShaderModule({std::span<const uint32_t>(oitVsW)});
+            struct OitPC { float model[16]; float colorAlpha[4]; };  // 80B (<= 128B push budget)
+            static_assert(sizeof(OitPC) == 80, "OitPC layout");
+            auto oitAccumFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/oit_accum.frag.hlsl.spv");
+            auto oitAccumFs  = device->CreateShaderModule({std::span<const uint32_t>(oitAccumFsW)});
+            rhi::GraphicsPipelineDesc oitAccumD;
+            oitAccumD.vertex = oitVs.get(); oitAccumD.fragment = oitAccumFs.get();
+            oitAccumD.vertexLayout = scene::MeshVertexLayout();
+            oitAccumD.colorFormat = kOitFmt;
+            oitAccumD.depthTest = false; oitAccumD.usesFrameUniforms = true;
+            oitAccumD.additiveBlend = true;                 // accum += (premult*w, alpha*w)
+            oitAccumD.pushConstantSize = sizeof(OitPC);
+            auto oitAccumPipe = device->CreateGraphicsPipeline(oitAccumD);
+
+            auto oitRevFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/oit_revealage.frag.hlsl.spv");
+            auto oitRevFs  = device->CreateShaderModule({std::span<const uint32_t>(oitRevFsW)});
+            rhi::GraphicsPipelineDesc oitRevD;
+            oitRevD.vertex = oitVs.get(); oitRevD.fragment = oitRevFs.get();
+            oitRevD.vertexLayout = scene::MeshVertexLayout();
+            oitRevD.colorFormat = kOitFmt;
+            oitRevD.depthTest = false; oitRevD.usesFrameUniforms = true;
+            oitRevD.oitRevealageBlend = true;               // revealage *= (1 - alpha)
+            oitRevD.pushConstantSize = sizeof(OitPC);
+            auto oitRevPipe = device->CreateGraphicsPipeline(oitRevD);
+
+            // --- Resolve (oit_resolve, fullscreen) + final composite (water_composite verbatim). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto oitResFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/oit_resolve.frag.hlsl.spv");
+            auto oitResFs  = device->CreateShaderModule({std::span<const uint32_t>(oitResFsW)});
+            rhi::GraphicsPipelineDesc oitResD;
+            oitResD.vertex = postVsM.get(); oitResD.fragment = oitResFs.get();
+            oitResD.colorFormat = kHdr;
+            oitResD.depthTest = false; oitResD.usesTexture = true; oitResD.fullscreen = true;
+            auto oitResPipe = device->CreateGraphicsPipeline(oitResD);
+
+            struct OitCompParams { float texel[2]; float intensity; float pad; };
+            auto compFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/water_composite.frag.hlsl.spv");
+            auto compFs  = device->CreateShaderModule({std::span<const uint32_t>(compFsW)});
+            rhi::GraphicsPipelineDesc compD;
+            compD.vertex = postVsM.get(); compD.fragment = compFs.get();
+            compD.colorFormat = device->Swapchain().ColorFormat();
+            compD.depthTest = false; compD.usesTexture = true; compD.fullscreen = true;
+            compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(OitCompParams);
+            auto compPipe = device->CreateGraphicsPipeline(compD);
+
+            // --- Render targets: opaque HDR scene + accum + revealage + resolved transparent layer. ---
+            auto rt        = device->CreateRenderTarget(w, h, kHdr);
+            auto accumRT   = device->CreateRenderTarget(w, h, kOitFmt);
+            auto revealRT  = device->CreateRenderTarget(w, h, kOitFmt);
+            auto oitRT     = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground checker texture + flat normal + per-opaque-object 1x1 color textures.
+            std::vector<uint8_t> floorTexels(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorTexels[idx + 0] = v; floorTexels[idx + 1] = v;
+                    floorTexels[idx + 2] = v; floorTexels[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorTexels.data(), floorTexels.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumOpaque; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(opaqueObjs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(opaqueObjs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(opaqueObjs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            // A unit XY quad (facing -Z, i.e. toward the +z camera) for the glass layers. pos in
+            // [-0.6,0.6]^2 so a moderate glass pane; normal = +Z, tangent = +X.
+            const float kQuadHalf = 0.6f;
+            scene::Vertex qv[4] = {};
+            auto setV = [&](scene::Vertex& v, float x, float y, float u, float vv) {
+                v.pos[0] = x; v.pos[1] = y; v.pos[2] = 0.0f;
+                v.color[0] = v.color[1] = v.color[2] = 1.0f;
+                v.uv[0] = u; v.uv[1] = vv;
+                v.normal[2] = 1.0f; v.tangent[0] = 1.0f;
+            };
+            setV(qv[0], -kQuadHalf, -kQuadHalf, 0.0f, 1.0f);
+            setV(qv[1],  kQuadHalf, -kQuadHalf, 1.0f, 1.0f);
+            setV(qv[2],  kQuadHalf,  kQuadHalf, 1.0f, 0.0f);
+            setV(qv[3], -kQuadHalf,  kQuadHalf, 0.0f, 0.0f);
+            uint32_t qidx[6] = {0, 1, 2, 0, 2, 3};
+            rhi::BufferDesc qvbD; qvbD.size = sizeof(qv); qvbD.initialData = qv;
+            qvbD.usage = rhi::BufferUsage::Vertex;
+            auto quadVB = device->CreateBuffer(qvbD);
+            rhi::BufferDesc qibD; qibD.size = sizeof(qidx); qibD.initialData = qidx;
+            qibD.usage = rhi::BufferUsage::Index;
+            auto quadIB = device->CreateBuffer(qibD);
+
+            Mat4 groundModel = Mat4::Scale({16.0f, 1.0f, 16.0f});
+            std::vector<Mat4> opaqueModel(kNumOpaque);
+            for (int o = 0; o < kNumOpaque; ++o)
+                opaqueModel[o] = Mat4::Translate(opaqueObjs[o].pos) * Mat4::Scale(
+                    {opaqueObjs[o].scale, opaqueObjs[o].scale, opaqueObjs[o].scale});
+            std::vector<Mat4> glassModel(kNumGlass);
+            for (int g = 0; g < kNumGlass; ++g)
+                glassModel[g] = Mat4::Translate(glass[g].pos);   // unit quad, no scale -> equal view depth
+
+            // Fixed camera looking at the glass stack from +z (so the XY quads face it head-on and all
+            // sit at the same view depth).
+            const Vec3 eye{0.0f, 1.0f, 4.0f};
+            const Vec3 center{0.0f, 1.0f, -3.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+            FrameData fd{};
+            {
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.4f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.35f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.4f, -1.0f, -0.35f});
+                Vec3 sc{0.0f, 0.7f, -3.0f};
+                Vec3 lightEye = sc - lightDir * 22.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-11.0f, 11.0f, -11.0f, 11.0f, 1.0f, 48.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto drawOpaque = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = opaqueObjs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+            // Draw glass quad g into the currently-bound OIT pipeline (push model+view+colorAlpha).
+            auto drawGlass = [&](rhi::ICommandBuffer& cmd, int g) {
+                OitPC pc{};
+                for (int k = 0; k < 16; ++k) pc.model[k] = glassModel[g].m[k];
+                pc.colorAlpha[0] = glass[g].col[0]; pc.colorAlpha[1] = glass[g].col[1];
+                pc.colorAlpha[2] = glass[g].col[2]; pc.colorAlpha[3] = kGlassAlpha;
+                cmd.PushConstants(&pc, sizeof(pc));
+                cmd.BindVertexBuffer(*quadVB);
+                cmd.BindIndexBuffer(*quadIB);
+                cmd.DrawIndexed(6);
+            };
+
+            OitCompParams ocp{}; ocp.texel[0] = 1.0f / (float)w; ocp.texel[1] = 1.0f / (float)h;
+            ocp.intensity = 1.7f; ocp.pad = 0.0f;
+
+            // Render the whole OIT frame with the transparent set in the GIVEN draw order; capture pixels.
+            auto renderWithOrder = [&](const std::vector<int>& order, std::vector<uint8_t>& outPx,
+                                       uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgAccum = graph.ImportTarget(
+                    "accum", render::RgResourceKind::SceneColor, *accumRT);
+                render::RgResource rgReveal = graph.ImportTarget(
+                    "revealage", render::RgResourceKind::SceneColor, *revealRT);
+                render::RgResource rgOit = graph.ImportTarget(
+                    "oit", render::RgResourceKind::SceneColor, *oitRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int o = 0; o < kNumOpaque; ++o) {
+                            cmd.PushConstants(opaqueModel[o].m, sizeof(float) * 16);
+                            drawOpaque(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.8f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumOpaque; ++o) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = opaqueModel[o].m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*objTex[o], *flatNormal);
+                            drawOpaque(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                // WBOIT accum: transparent set additively (ONE,ONE) into accum (cleared 0). DRAW ORDER.
+                graph.AddPass("oit_accum", {}, {rgAccum},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*oitAccumPipe);
+                        for (int g : order) drawGlass(cmd, g);
+                        cmd.EndRenderPass();
+                    });
+
+                // WBOIT revealage: transparent set multiplicatively into revealage (cleared 1). DRAW ORDER.
+                graph.AddPass("oit_revealage", {}, {rgReveal},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.BindPipeline(*oitRevPipe);
+                        for (int g : order) drawGlass(cmd, g);
+                        cmd.EndRenderPass();
+                    });
+
+                // Resolve: accum + revealage -> (transparentRGB, coverage) into the oit RT.
+                graph.AddPass("oit_resolve", {rgAccum, rgReveal}, {rgOit},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*oitResPipe);
+                        cmd.BindTexturePair(*accumRT, *revealRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                // Composite: lerp(scene, transparentRGB, coverage) + tonemap -> swapchain.
+                graph.AddPass("composite", {rgScene, rgOit}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*compPipe);
+                        cmd.BindTexturePair(*rt, *oitRT);
+                        cmd.PushConstants(&ocp, sizeof(ocp));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // Canonical order [0,1,2,3,4] and a PERMUTED order [3,1,0,2,4] -> the resolved images MUST be
+            // byte-identical (accum is a SUM, revealage a PRODUCT -> order-independent).
+            std::vector<int> canonical(kNumGlass);
+            for (int g = 0; g < kNumGlass; ++g) canonical[g] = g;
+            const std::vector<int> permuted = {3, 1, 0, 2, 4};
+
+            std::vector<uint8_t> canonPx, permPx;
+            uint32_t cw = 0, ch2 = 0, pw = 0, ph = 0;
+            if (!renderWithOrder(canonical, canonPx, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (OIT canonical order)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderWithOrder(permuted, permPx, pw, ph)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (OIT permuted order)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+            uint64_t canonHash = fnv(canonPx), permHash = fnv(permPx);
+            const bool orderIndependent = (cw == pw) && (ch2 == ph) &&
+                                          (canonPx.size() == permPx.size()) &&
+                                          (std::memcmp(canonPx.data(), permPx.data(), canonPx.size()) == 0);
+            std::printf("oit canonical-hash: %016llx  permuted-hash: %016llx\n",
+                        (unsigned long long)canonHash, (unsigned long long)permHash);
+            if (!orderIndependent) {
+                std::fprintf(stderr,
+                    "FATAL: OIT permuted-order resolve != canonical-order resolve — NOT order-independent "
+                    "(the WBOIT accum SUM / revealage PRODUCT diverged across draw orders). canon %016llx "
+                    "vs perm %016llx\n",
+                    (unsigned long long)canonHash, (unsigned long long)permHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("oit permuted==canonical: BYTE-IDENTICAL (order-independence proof)\n");
+            std::printf("oit: {layers:%d, orderIndependent:true}\n", kNumGlass);
+
+            bool ok = WriteBMP(oitShotPath, canonPx, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — OIT, %d glass layers, %d opaque\n",
+                                oitShotPath, cw, ch2, kNumGlass, kNumOpaque);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", oitShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -170,6 +170,16 @@ hf_add_pure_test(dof_test)
 # header-only), ASan-eligible.
 hf_add_pure_test(motion_blur_test)
 
+# Order-Independent Transparency (Slice CO): Weighted Blended OIT (McGuire & Bavoil) — the McGuire depth
+# Weight (positive/finite for all inputs, non-increasing in depth so a near transparent surface dominates
+# a far one, scales with alpha), the per-fragment Accumulate (additive accum SUM + multiplicative
+# revealage PRODUCT), and the ResolveOver composite (accum.rgb/max(accum.a,eps) over the background by
+# 1-revealage). The CORE proof: accumulate a fixed well-separated fragment set in canonical vs PERMUTED
+# orders -> the resolved color is BIT-IDENTICAL (sum + product are commutative) — true order independence.
+# The byte-identical permuted==canonical render proof lives in --oit-shot; this pins the CPU math both the
+# oit_accum/oit_resolve shaders + the showcase read. Pure C++ (render/oit.h, header-only), ASan-eligible.
+hf_add_pure_test(oit_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so

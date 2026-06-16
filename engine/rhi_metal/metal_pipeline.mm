@@ -74,6 +74,16 @@ MetalPipeline::MetalPipeline(MetalDevice& device, const GraphicsPipelineDesc& de
             rpd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
             rpd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
             rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        } else if (desc.oitRevealageBlend) {
+            // Weighted-Blended-OIT revealage (Slice CO): src*0 + dst*(1-srcAlpha) -> dst *=
+            // (1-srcAlpha), the order-independent revealage PRODUCT Π(1-alpha). Mirrors Vulkan.
+            rpd.colorAttachments[0].blendingEnabled = YES;
+            rpd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+            rpd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+            rpd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorZero;
+            rpd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            rpd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorZero;
+            rpd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
         }
     }
     if (desc.depthTest || desc.depthOnly) {

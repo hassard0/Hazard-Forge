@@ -109,6 +109,16 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
         blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
+    } else if (desc.oitRevealageBlend) {
+        // Weighted-Blended-OIT revealage (Slice CO): src*0 + dst*(1-srcAlpha) -> dst *= (1-srcAlpha),
+        // the order-independent revealage PRODUCT Π(1-alpha) over the transparent set.
+        blendAtt.blendEnable = VK_TRUE;
+        blendAtt.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blendAtt.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAtt.colorBlendOp = VK_BLEND_OP_ADD;
+        blendAtt.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        blendAtt.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blendAtt.alphaBlendOp = VK_BLEND_OP_ADD;
     }
     VkPipelineColorBlendStateCreateInfo cb{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};

@@ -100,6 +100,16 @@ struct GraphicsPipelineDesc {
                                      // pointList (line wins if both are somehow set).
     bool additiveBlend = false;      // when true: additive color blend (glowing particles over scene)
     bool alphaBlend = false;         // when true: standard src_alpha/one_minus_src_alpha blend (UI/ImGui)
+    bool oitRevealageBlend = false;  // when true (Slice CO): the Weighted-Blended-OIT REVEALAGE blend —
+                                     // src*ZERO + dst*(ONE_MINUS_SRC_ALPHA), i.e. dst *= (1 - srcAlpha).
+                                     // The revealage pass draws the transparent set into an R/RGBA16F
+                                     // target cleared to 1.0 so it accumulates the order-independent
+                                     // PRODUCT Π(1-alpha). PURE-INTERFACE additive flag: the blend
+                                     // factors are set INSIDE the backend dirs (rhi_vulkan/rhi_metal/
+                                     // metal_headless) exactly like additiveBlend/alphaBlend; no
+                                     // backend symbols leak above the seam. Existing pipelines (which
+                                     // leave it false) are byte-for-byte unchanged. Mutually exclusive
+                                     // with additiveBlend/alphaBlend (those win if somehow both set).
     bool cullNone = false;           // when true: no back-face culling (ImGui draws CW-wound quads)
     bool pbrMaterial = false;        // when true: set 1 is the WIDER full-PBR material set (5 textures:
                                      // base/metalRough/normal/emissive/occlusion) instead of the 2-texture

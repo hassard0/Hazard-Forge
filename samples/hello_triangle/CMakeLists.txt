@@ -156,6 +156,17 @@ hf_compile_shaders(
     # --motionblur-shot ONLY; with zero motion the gather short-circuits to a byte-identical pass-through.
     # Existing post/ssr/ssgi/dof shaders + goldens untouched.
     "shaders/motion_blur.frag.hlsl:ps"
+    # Order-Independent Transparency (Slice CO): Weighted Blended OIT (McGuire & Bavoil). oit_accum.vert
+    # rasterizes the transparent geometry and passes the VIEW-space linear depth; oit_accum.frag writes the
+    # premultiplied-color*Weight (additive ONE,ONE accum target, RGBA16F) and oit_revealage.frag writes the
+    # alpha that multiplies the revealage target (oitRevealageBlend: dst*=(1-srcAlpha)); oit_resolve.frag
+    # (fullscreen, reuses post.vert) reads accum+revealage and composites oit::ResolveOver over the opaque
+    # scene. render/oit.h math, mirrored in-shader. Behind --oit-shot ONLY; transparent set rendered in two
+    # permuted draw orders -> byte-identical resolve (order-independence proof). Existing shaders/goldens untouched.
+    "shaders/oit_accum.vert.hlsl:vs"
+    "shaders/oit_accum.frag.hlsl:ps"
+    "shaders/oit_revealage.frag.hlsl:ps"
+    "shaders/oit_resolve.frag.hlsl:ps"
     # Water rendering (Slice CF): water.vert displaces a flat NxN grid by the summed Gerstner waves at a
     # FIXED time (render/water.h math, mirrored in-shader); water.frag recomputes the analytic wave
     # normal and shades a fresnel blend of a SKY reflection (reusing SkyColor) and a REFRACTED scene

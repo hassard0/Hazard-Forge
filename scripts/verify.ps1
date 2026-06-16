@@ -90,6 +90,7 @@ $Goldens = @(
     @{ Name = 'ssr';           Flag = '--ssr' }                  # Slice AH (screen-space reflections)
     @{ Name = 'dof';           Flag = '--dof' }                  # Slice CG (depth of field: thin-lens CoC depth gather)
     @{ Name = 'motion_blur';   Flag = '--motionblur' }           # Slice CN (per-object + camera motion blur: velocity-gather streak; zero motion byte-identical pass-through)
+    @{ Name = 'oit';           Flag = '--oit' }                  # Slice CO (order-independent transparency: Weighted Blended OIT; permuted draw order resolves byte-identically)
     @{ Name = 'water';         Flag = '--water' }                # Slice CF (Gerstner water reflect/refract + sun glint)
     @{ Name = 'ssgi';          Flag = '--ssgi' }                 # Slice BP (screen-space global illumination)
     @{ Name = 'ssgi_denoise';  Flag = '--ssgi-denoise' }         # Slice BR (SSGI bilateral spatial denoise)
