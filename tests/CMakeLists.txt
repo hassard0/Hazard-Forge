@@ -170,6 +170,16 @@ hf_add_pure_test(ssgi_temporal_test)
 # (x,z,t) -> bit-identical Displace/Normal). Pure CPU (render/water.h, header-only), ASan-eligible.
 hf_add_pure_test(water_test)
 
+# Volumetric clouds (Slice CH): the deterministic value-noise (integer-lattice sine-fract hash +
+# trilinear interp; bit-deterministic, range [0,1], spans low/high), FBM (deterministic + bounded in
+# [0,1]), the slab Density field (0 below slabBottom / above slabTop; non-zero inside a covered region;
+# the height gradient makes mid-slab denser than the edges), COVERAGE (raising the threshold reduces
+# total density; Density == DensityCoverage at the default), Beer-Lambert (Beer(0)==1, Beer(large)->0,
+# monotone, Beer(1)==1/e), Henyey-Greenstein (peaks forward for g>0, hand-checked closed-form values,
+# g=0 isotropic), and DETERMINISM (same (p,t) -> bit-identical Density). Pure CPU (render/clouds.h,
+# header-only), ASan-eligible.
+hf_add_pure_test(clouds_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff

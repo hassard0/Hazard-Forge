@@ -200,6 +200,13 @@ hf_gen_msl(ssgi_accum.frag        ssgi_accum.frag.hlsl        frag ssgi_accum_fr
 # volumetric_composite adds it over the scene + tonemaps. Same HF_MSL_GEN shadow V-flip as lit.frag.
 hf_gen_msl(volumetric.frag           volumetric.frag.hlsl           frag volumetric_fragment)
 hf_gen_msl(volumetric_composite.frag volumetric_composite.frag.hlsl frag volumetric_composite_fragment)
+# Volumetric clouds (Slice CH): a raymarched cumulus LAYER in the sky dome (DISTINCT from the fog).
+# clouds.frag reconstructs the view ray, intersects the cloud slab, ray-marches render/clouds.h density
+# (mirrored in-shader so noise/density is bit-identical cross-backend) with a short Beer-Lambert light
+# march + a Henyey-Greenstein phase, masked to the sky background via the g-buffer depth;
+# clouds_composite blends lerp(scene, cloud.rgb, cloud.a) + tonemaps. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(clouds.frag           clouds.frag.hlsl           frag clouds_fragment)
+hf_gen_msl(clouds_composite.frag clouds_composite.frag.hlsl frag clouds_composite_fragment)
 # Reflection + irradiance probes (Slice AK): bake the local room into a cube atlas (reflection block)
 # + cosine-convolve an irradiance block, then shade with lit_probe sampling that atlas as LOCAL GI.
 # lit_probe reuses lit.vert; the blit/convolution passes reuse post.vert. Same HLSL->SPIR-V->MSL

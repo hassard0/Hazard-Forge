@@ -116,6 +116,7 @@ $Goldens = @(
     @{ Name = 'editor';        Flag = '--editor' }            # Slice BT (docked editor UI: Hierarchy/Inspector/Stats/Viewport)
     @{ Name = 'editor_edit';   Flag = '--editor-edit' }      # Slice BX (editor live-edit: edited scene + scene_io round-trip)
     @{ Name = 'vfx';           Flag = '--vfx' }              # Slice CC (CPU particle / VFX emitter: additive billboard fountain)
+    @{ Name = 'clouds';        Flag = '--clouds' }           # Slice CH (volumetric clouds: raymarched sunlit cumulus layer in the sky dome)
 )
 
 $winResult = 'SKIP'

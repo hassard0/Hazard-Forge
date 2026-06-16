@@ -179,6 +179,14 @@ hf_compile_shaders(
     # volumetric_composite adds it over the scene + tonemaps. Existing shaders + goldens untouched.
     "shaders/volumetric.frag.hlsl:ps"
     "shaders/volumetric_composite.frag.hlsl:ps"
+    # Volumetric clouds (Slice CH): a raymarched cumulus LAYER in the sky dome. clouds.frag
+    # reconstructs the view ray (like sky.frag), intersects the cloud SLAB, ray-marches density
+    # (render/clouds.h math, mirrored in-shader) with a short secondary light-march (Beer-Lambert) +
+    # a Henyey-Greenstein phase, masked to the sky background via the SSAO g-buffer depth;
+    # clouds_composite blends lerp(scene, cloud.rgb, cloud.a) + tonemaps. DISTINCT from volumetric fog.
+    # Existing sky/scene/volumetric shaders + goldens untouched (new path behind --clouds-shot).
+    "shaders/clouds.frag.hlsl:ps"
+    "shaders/clouds_composite.frag.hlsl:ps"
     # Reflection + irradiance probes (Slice AK): bake the local room into a cube atlas (reflection
     # block) + cosine-convolve an irradiance block, then shade with lit_probe sampling that atlas as
     # LOCAL GI. Reuses lit.vert + the CSM depth-only caster's vertex (probe-face VP in push const) and
