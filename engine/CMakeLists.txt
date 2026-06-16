@@ -26,6 +26,7 @@ set(HF_ENGINE_COMMON_SOURCES
   game/roll_game.cpp
   net/snapshot.cpp
   net/transport.cpp
+  net/prediction.cpp
   ui/text.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp
@@ -140,6 +141,7 @@ add_library(hf_core STATIC
   game/roll_game.cpp
   net/snapshot.cpp
   net/transport.cpp
+  net/prediction.cpp
   ui/text.cpp
   debug/debug_draw.cpp
   debug/debug_emitters.cpp

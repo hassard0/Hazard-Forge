@@ -172,6 +172,8 @@ int main() {
             bool sawReplicationFeature = false;
             // Slice BU: the network-transport-sim capability is advertised in the feature manifest.
             bool sawNetsimFeature = false;
+            // Slice BY: the client-prediction capability is advertised in the feature manifest.
+            bool sawPredictionFeature = false;
             // Slice BT: the docked-editor capability is advertised in the feature manifest.
             bool sawDockedEditorFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
@@ -199,6 +201,7 @@ int main() {
                     if (AsString(el->value) == "screen-space-global-illumination") sawSsgiFeature = true;
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
                     if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
+                    if (AsString(el->value) == "client-prediction") sawPredictionFeature = true;
                     if (AsString(el->value) == "docked-editor") sawDockedEditorFeature = true;
                     if (AsString(el->value) == "editor-live-edit") sawEditorLiveEditFeature = true;
                 }
@@ -223,6 +226,7 @@ int main() {
             check(sawSsgiFeature, "engine.features includes screen-space-global-illumination");
             check(sawReplicationFeature, "engine.features includes state-replication");
             check(sawNetsimFeature, "engine.features includes network-transport-sim");
+            check(sawPredictionFeature, "engine.features includes client-prediction");
             check(sawDockedEditorFeature, "engine.features includes docked-editor");
             check(sawEditorLiveEditFeature, "engine.features includes editor-live-edit");
         }
@@ -294,6 +298,8 @@ int main() {
         bool sawNetShot = false;
         // Slice BU: the --netsim-shot showcase flag is listed in the showcase manifest.
         bool sawNetsimShot = false;
+        // Slice BY: the --netpredict-shot showcase flag is listed in the showcase manifest.
+        bool sawNetpredictShot = false;
         // Slice BT: the --editor-shot showcase flag is listed in the showcase manifest.
         bool sawEditorShot = false;
         // Slice BX: the --editor-edit-shot showcase flag is listed in the showcase manifest.
@@ -326,6 +332,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-temporal-shot") sawSsgiTemporalShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--net-shot") sawNetShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--netsim-shot") sawNetsimShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--netpredict-shot") sawNetpredictShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-shot") sawEditorShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-edit-shot") sawEditorEditShot = true;
             }
@@ -354,6 +361,7 @@ int main() {
         check(sawSsgiTemporalShot, "showcases manifest includes --ssgi-temporal-shot");
         check(sawNetShot, "showcases manifest includes --net-shot");
         check(sawNetsimShot, "showcases manifest includes --netsim-shot");
+        check(sawNetpredictShot, "showcases manifest includes --netpredict-shot");
         check(sawEditorShot, "showcases manifest includes --editor-shot");
         check(sawEditorEditShot, "showcases manifest includes --editor-edit-shot");
 

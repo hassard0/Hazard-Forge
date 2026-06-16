@@ -100,6 +100,7 @@ $Goldens = @(
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'net';           Flag = '--net' }                 # Slice BQ (replication; replica reconstructs + renders the scene)
     @{ Name = 'netsim';        Flag = '--netsim' }              # Slice BU (transport sim: lossy/laggy channel + client jitter-buffer interpolation)
+    @{ Name = 'netpredict';    Flag = '--netpredict' }          # Slice BY (client prediction + server reconciliation: rewind+replay corrects a server-only misprediction)
     @{ Name = 'hud';           Flag = '--hud' }                 # Slice BA (text / HUD overlay)
     @{ Name = 'game_hud';      Flag = '--game-hud' }            # Slice BA (game scene + live SCORE HUD)
     @{ Name = 'stream';        Flag = '--stream' }             # Slice BD (scene/asset streaming; resident cell subset)

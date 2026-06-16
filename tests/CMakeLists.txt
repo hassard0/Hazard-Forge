@@ -277,6 +277,18 @@ hf_add_pure_test(replication_test)
 # Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(net_transport_test)
 
+# Client prediction + server reconciliation (Slice BY): the deterministic, socket-free PredictedClient
+# over the AX roll-game (engine/net/prediction). Asserts prediction advances (PredictTick moves the
+# predicted player ahead under local input without a snapshot), reconcile with NO misprediction
+# (identical authority -> OnAuthoritative leaves the predicted now unchanged, lastMisprediction ~= 0),
+# reconcile WITH a SERVER-ONLY impulse the client could not predict (before reconcile predicted differs
+# from authority; after OnAuthoritative + replay predicted now == authority's TRUE corrected state,
+# lastMisprediction > 0), input-buffer ack/drop + bounded growth + ordered replay, and convergence/
+# determinism (full run with the server-only impulse converges to authority finalError small +
+# maxMisprediction > 0; two runs byte-identical). Pure CPU (hf_core), no RHI/backend symbols,
+# ASan-eligible.
+hf_add_pure_test(prediction_test)
+
 # Text / HUD layout + atlas (Slice BA): BuildFontAtlas determinism + shape (128x48, white with
 # coverage alpha) and LayoutText math — 6 verts/visible glyph, quad count with spaces + newline,
 # cursor advance == kGlyphPx*pxScale, atlas-cell UVs, pixel->NDC conversion, empty string => 0 quads,
