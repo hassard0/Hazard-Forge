@@ -330,6 +330,7 @@ int main(int argc, char** argv) {
     const char* pointShotPath = nullptr;     // --point-shadow-shot <out.bmp> (Slice AF: omni point)
     const char* clusteredShotPath = nullptr; // --clustered-shot <out.bmp> (Slice AG: clustered lights)
     const char* ssrShotPath = nullptr;       // --ssr-shot <out.bmp> (Slice AH: screen-space reflections)
+    const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* volumetricShotPath = nullptr; // --volumetric-shot <out.bmp> (Slice AJ: light shafts)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
@@ -552,6 +553,16 @@ int main(int argc, char** argv) {
             // reflections of the objects on the floor, then a composite blends + tonemaps. One BMP ->
             // exit. New golden; existing lit/ssao/bloom paths/shaders/goldens are untouched.
             ssrShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ssgi-shot") == 0 && i + 1 < argc) {
+            // Slice BP: screen-space global illumination showcase. A Cornell-style COLOR-BLEED scene —
+            // saturated red + green vertical panels flanking a neutral white floor/box — rendered into
+            // an HDR RGBA16F target PLUS the view-space normal+linear-depth g-buffer (reusing the
+            // SSAO/SSR gbuffer shaders). An SSGI pass traces K cosine-hemisphere rays per pixel and
+            // ray-marches them against the g-buffer (the SAME march as SSR), sampling the lit scene as
+            // indirect diffuse radiance; the composite ADDS indirect over the scene + tonemaps so the
+            // colored panels visibly bleed red/green onto the neutral neighbors. One BMP -> exit. New
+            // golden; existing lit/ssao/ssr/bloom paths/shaders/goldens are untouched.
+            ssgiShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--decal-shot") == 0 && i + 1 < argc) {
             // Slice BH: screen-space projected decals showcase. The standard lit+shadowed scene
             // (colored objects on a floor) is rendered through the G-buffer path (reusing the SSAO/SSR
@@ -5763,6 +5774,338 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — SSR, %d objects\n",
                                     ssrShotPath, cw, ch2, kNumObjs);
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ssrShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Screen-space global illumination showcase (--ssgi-shot, Slice BP): a Cornell-style
+        // COLOR-BLEED scene. A neutral WHITE floor with a neutral white box in the middle, FLANKED by a
+        // saturated RED vertical panel (left) and a saturated GREEN vertical panel (right). Lit so the
+        // colored panels are bright; rendered into an HDR (RGBA16F) scene target PLUS the SAME
+        // view-space normal+linear-depth g-buffer SSR/SSAO use. An SSGI pass reconstructs each pixel's
+        // view-space P + N (EXACTLY like ssr.frag), traces K cosine-weighted hemisphere rays about N,
+        // ray-marches each in view space against the g-buffer (the SAME march + binary-search as SSR),
+        // and on a hit samples the lit HDR scene as the incoming indirect-diffuse radiance; the mean of
+        // the K hit radiances is the indirect irradiance. The composite ADDS indirect over the scene +
+        // tonemaps, so the red panel bleeds REDDISH indirect onto the left of the neutral floor/box and
+        // the green panel bleeds GREENISH onto the right — the classic GI tell. Single frame, fixed
+        // kernel + baked dither (NO RNG, NO temporal accumulation) -> two runs byte-identical. SEPARATE
+        // ssgi/ssgi_composite pipelines + shaders; existing gbuffer/ssao/ssr/bloom paths/shaders/
+        // goldens untouched.
+        if (ssgiShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+
+            // --- Scene objects: a neutral white CENTER box flanked by a saturated red + green panel
+            // (tall thin vertical walls). The panels are positioned close to the box/floor so their
+            // light bleeds onto the neutral neighbors. ---
+            struct Obj { Vec3 pos; Vec3 scale; bool cube; float col[3]; float emissive; };
+            const Obj objs[] = {
+                // Red panel: a tall thin wall on the LEFT, standing on the floor, facing +X (inward).
+                {{-1.7f, 1.3f, 0.0f}, {0.18f, 1.3f, 1.7f}, true, {0.95f, 0.05f, 0.05f}, 1.0f},
+                // Green panel: a tall thin wall on the RIGHT, facing -X (inward).
+                {{ 1.7f, 1.3f, 0.0f}, {0.18f, 1.3f, 1.7f}, true, {0.05f, 0.95f, 0.10f}, 1.0f},
+                // Neutral WHITE box in the center (the receiver the panels bleed onto).
+                {{ 0.0f, 0.6f, 0.0f}, {0.6f, 0.6f, 0.6f}, true, {0.92f, 0.92f, 0.92f}, 0.0f},
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit pipeline (static, writing HDR RT) — UNCHANGED lit shaders. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // --- Shadow pipeline (static) — UNCHANGED. ---
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // --- Sky (writing HDR RT) — UNCHANGED. ---
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- G-buffer prepass pipeline (static), view-space normal + linear depth -> RGBA16F. ---
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs  = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs  = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- SSGI + composite fullscreen pipelines (fragment push constants). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            struct SsgiParams {
+                float texel[2]; float tanHalfFovY; float aspect;
+                float maxDist; float thickness; float intensity; float rayCount;
+            };
+            struct SsgiCompParams { float texel[2]; float intensity; float pad; };
+
+            auto ssgiFs = loadFs("ssgi.frag.hlsl");
+            auto compFs = loadFs("ssgi_composite.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc ssgiD;
+            ssgiD.vertex = postVsM.get(); ssgiD.fragment = ssgiFs.get();
+            ssgiD.colorFormat = kHdr;
+            ssgiD.depthTest = false; ssgiD.usesTexture = true; ssgiD.fullscreen = true;
+            ssgiD.fragmentPushConstants = true; ssgiD.pushConstantSize = sizeof(SsgiParams);
+            auto ssgiPipe = device->CreateGraphicsPipeline(ssgiD);
+
+            rhi::GraphicsPipelineDesc compD;
+            compD.vertex = postVsM.get(); compD.fragment = compFs.get();
+            compD.colorFormat = device->Swapchain().ColorFormat();
+            compD.depthTest = false; compD.usesTexture = true; compD.fullscreen = true;
+            compD.fragmentPushConstants = true; compD.pushConstantSize = sizeof(SsgiCompParams);
+            auto compPipe = device->CreateGraphicsPipeline(compD);
+
+            // --- Render targets: HDR lit scene + RGBA16F g-buffer + SSGI indirect. ---
+            auto rt     = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf   = device->CreateRenderTarget(w, h, kHdr);
+            auto ssgiRT = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Neutral mid-GREY floor: bright enough to receive a clearly-tinted colored bleed, dark
+            // enough that the bleed is not washed out by the floor's own direct/ambient brightness
+            // (a fully-white floor under the open sky floods the bleed; a Cornell tell needs a more
+            // controlled neutral receiver).
+            std::vector<uint8_t> whiteFloor(4 * 4 * 4, 70);
+            for (size_t p = 0; p < 4 * 4; ++p) whiteFloor[p * 4 + 3] = 255;
+            auto groundTex = device->CreateTexture(
+                {4, 4, rhi::Format::RGBA8_UNorm, whiteFloor.data(), whiteFloor.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            // Per-object solid-color 1x1 textures (lit.frag multiplies gTex.Sample * vertex color).
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(objs[o].scale);
+
+            // Camera: look down the +Z axis at the box between the two panels so the red panel fills the
+            // left, the green panel the right, and the neutral floor/box sits in the middle.
+            const Vec3 eye{0.0f, 2.2f, 6.0f};
+            const Vec3 center{0.0f, 0.7f, 0.0f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.25f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 0.85f; fd.lightColor[1] = 0.83f; fd.lightColor[2] = 0.78f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.25f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.7f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            // SSGI params: K cosine-hemisphere rays, view-space march matching SSR's reconstruction.
+            const int kRays = 16;
+            SsgiParams sp{};
+            sp.texel[0] = 1.0f / (float)w; sp.texel[1] = 1.0f / (float)h;
+            sp.tanHalfFovY = std::tan(0.5f * kFovY); sp.aspect = aspect;
+            sp.maxDist = 6.0f; sp.thickness = 0.6f; sp.intensity = 5.0f;
+            sp.rayCount = (float)kRays;
+            const bool ssgiDbg = (std::getenv("HF_SSGI_DBG") != nullptr);
+            SsgiCompParams cp{}; cp.texel[0] = 1.0f / (float)w; cp.texel[1] = 1.0f / (float)h;
+            cp.intensity = 1.3f; cp.pad = ssgiDbg ? -1.0f : 0.0f;
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgGbuf = graph.ImportTarget(
+                "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+            render::RgResource rgSsgi = graph.ImportTarget(
+                "ssgi", render::RgResourceKind::SceneColor, *ssgiRT);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                (void)o;
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexed(cube.indexCount());
+            };
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // Lit scene -> HDR RT. The colored panels use a low-roughness bright material so they read
+            // as strong saturated emitters of indirect light; the neutral floor/box are matte white.
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    // DARK surround (no sky pass): a Cornell-style controlled environment so the only
+                    // strong colored light reaching the neutral floor/box is the INDIRECT bounce from
+                    // the red/green panels — that makes the bleed unambiguous instead of being washed
+                    // out by a bright open sky. (skyPipe is still built for parity but not drawn here.)
+                    (void)skyPipe;
+                    cmd.BeginRenderPass(rhi::ClearColor{0.01f, 0.01f, 0.015f, 1});
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.9f; pc[18] = 0.0f; pc[19] = 0.0f; // matte grey floor
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        // ALL surfaces matte (roughness ~1) to minimize the sky IBL sheen that would
+                        // desaturate the panels — we want the panels to stay strongly RED/GREEN in the
+                        // HDR scene so the SSGI gather carries saturated indirect onto the neutral
+                        // floor/box. (SSGI intensity, not panel gloss, drives the visible bleed.)
+                        pc[16] = 0.0f; pc[17] = 0.95f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*objTex[o], *flatNormal);
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // G-buffer prepass -> RGBA16F (view-space normal + linear depth). Clear w=0 = background.
+            graph.AddPass("gbuffer", {}, {rgGbuf},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*gbStaticPipeline);
+                    {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    for (int o = 0; o < kNumObjs; ++o) {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        drawObj(cmd, o);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            // SSGI gather -> SSGI RT (rgb = indirect diffuse). Scene at t0/s0, gbuffer at t3/s3.
+            graph.AddPass("ssgi", {rgScene, rgGbuf}, {rgSsgi},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                    cmd.BindPipeline(*ssgiPipe);
+                    cmd.BindTexturePair(*rt, *gbuf);
+                    cmd.PushConstants(&sp, sizeof(sp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            // Composite: scene + indirect -> tonemap -> swapchain.
+            graph.AddPass("composite", {rgScene, rgSsgi}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*compPipe);
+                    cmd.BindTexturePair(*rt, *ssgiRT);
+                    cmd.PushConstants(&cp, sizeof(cp));
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("ssgi: {rays:%d, marchDist:%.1f, intensity:%.2f}\n",
+                        kRays, sp.maxDist, sp.intensity);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(ssgiShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — SSGI, %d objects\n",
+                                    ssgiShotPath, cw, ch2, kNumObjs);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ssgiShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

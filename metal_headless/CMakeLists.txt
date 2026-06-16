@@ -163,6 +163,11 @@ hf_gen_msl(ssao_composite.frag    ssao_composite.frag.hlsl    frag ssao_composit
 # HLSL->SPIR-V->MSL toolchain. Existing shaders + goldens untouched.
 hf_gen_msl(ssr.frag               ssr.frag.hlsl               frag ssr_fragment)
 hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite_fragment)
+# Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer + lit HDR scene; ssgi.frag
+# traces K cosine-hemisphere rays and marches the depth buffer (same march as ssr.frag) for indirect
+# diffuse, ssgi_composite ADDS it over the scene + tonemaps. Same HLSL->SPIR-V->MSL toolchain.
+hf_gen_msl(ssgi.frag              ssgi.frag.hlsl              frag ssgi_fragment)
+hf_gen_msl(ssgi_composite.frag    ssgi_composite.frag.hlsl    frag ssgi_composite_fragment)
 # Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
 # volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
 # volumetric_composite adds it over the scene + tonemaps. Same HF_MSL_GEN shadow V-flip as lit.frag.

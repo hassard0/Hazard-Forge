@@ -166,6 +166,8 @@ int main() {
             bool sawAnimFsmFeature = false;
             // Slice BN: the data-driven post-process-stack capability is advertised.
             bool sawPostStackFeature = false;
+            // Slice BP: the screen-space global-illumination capability is advertised.
+            bool sawSsgiFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -186,6 +188,7 @@ int main() {
                     if (AsString(el->value) == "terrain-streaming-lod") sawTerrainStreamFeature = true;
                     if (AsString(el->value) == "animation-state-machine") sawAnimFsmFeature = true;
                     if (AsString(el->value) == "post-process-stack") sawPostStackFeature = true;
+                    if (AsString(el->value) == "screen-space-global-illumination") sawSsgiFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -205,6 +208,7 @@ int main() {
             check(sawTerrainStreamFeature, "engine.features includes terrain-streaming-lod");
             check(sawAnimFsmFeature, "engine.features includes animation-state-machine");
             check(sawPostStackFeature, "engine.features includes post-process-stack");
+            check(sawSsgiFeature, "engine.features includes screen-space-global-illumination");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -264,6 +268,8 @@ int main() {
         bool sawAnimFsmShot = false;
         // Slice BN: the --poststack-shot showcase flag is listed in the showcase manifest.
         bool sawPostStackShot = false;
+        // Slice BP: the --ssgi-shot showcase flag is listed in the showcase manifest.
+        bool sawSsgiShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -287,6 +293,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--material-introspect") sawMaterialIntrospectShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--anim-fsm-shot") sawAnimFsmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--poststack-shot") sawPostStackShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ssgi-shot") sawSsgiShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -308,6 +315,7 @@ int main() {
         check(sawMaterialIntrospectShot, "showcases manifest includes --material-introspect");
         check(sawAnimFsmShot, "showcases manifest includes --anim-fsm-shot");
         check(sawPostStackShot, "showcases manifest includes --poststack-shot");
+        check(sawSsgiShot, "showcases manifest includes --ssgi-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

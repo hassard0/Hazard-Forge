@@ -136,6 +136,13 @@ hf_compile_shaders(
     # tonemaps. Existing gbuffer/ssao/bloom shaders + their goldens untouched.
     "shaders/ssr.frag.hlsl:ps"
     "shaders/ssr_composite.frag.hlsl:ps"
+    # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
+    # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
+    # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect
+    # diffuse radiance; ssgi_composite ADDS indirect*albedo over the scene + tonemaps. Existing
+    # gbuffer/ssao/ssr/bloom shaders + their goldens untouched.
+    "shaders/ssgi.frag.hlsl:ps"
+    "shaders/ssgi_composite.frag.hlsl:ps"
     # Volumetric fog / light shafts (Slice AJ): reuses the directional shadow map + SSAO g-buffer;
     # volumetric.frag ray-marches the view ray sampling the shadow map per step for in-scattering,
     # volumetric_composite adds it over the scene + tonemaps. Existing shaders + goldens untouched.

@@ -106,6 +106,13 @@ hf_add_pure_test(clustered_test)
 # (render/ssr.h, header-only), ASan-eligible.
 hf_add_pure_test(ssr_test)
 
+# Screen-space global illumination (Slice BP): the cosine-weighted hemisphere kernel (K unit dirs in
+# the hemisphere of the normal, deterministic, +Z hand-checked, average ~ normal), the SHARED SSR
+# view<->screen reconstruction round-trip (guards the reuse), the AccumulateIndirect mean estimator
+# (all-miss -> 0), and a color-bleed mini-model (a red emitter in some hemisphere dirs -> reddish
+# indirect). Pure C++ (render/ssgi.h, header-only; reuses render/ssr.h), ASan-eligible.
+hf_add_pure_test(ssgi_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff
