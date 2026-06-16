@@ -57,6 +57,7 @@
 #include "render/probe.h"        // Slice AK: reflection + irradiance probe atlas math (pure math)
 #include "render/clustered.h"     // Slice AG: clustered / Forward+ light culling (pure math)
 #include "render/ssgi.h"          // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
+#include "render/water.h"         // Slice CF: Gerstner water displacement/normal + the fixed wave set
 #include "render/taa.h"           // Slice AP: temporal anti-aliasing jitter + resolve-blend (pure math)
 #include "render/frustum.h"        // Slice AQ: Gribb-Hartmann frustum extraction + sphere cull (pure math)
 #include "render/gpu_cull.h"        // Slice AR: GPU-cull CPU mirror (ordered compaction + sphere test)
@@ -5685,6 +5686,319 @@ static int RunSsrShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — SSR, %d objects\n", outPath, cw, ch, kNumObjs);
+    return 0;
+}
+
+// --- Water rendering showcase (Slice CF). Mirrors the Vulkan --water-shot path EXACTLY: a few objects
+// partially submerged at the water level + a procedural sky + directional light. The opaque scene
+// renders into an HDR RT + the SSAO/SSR view-space normal+linear-depth g-buffer; then a Gerstner WATER
+// grid (water.vert displaces it by render::water::Displace at a FIXED time, water.frag computes
+// render::water::Normal -> reflect view ray -> SkyColor + refract the scene-color RT tinted by
+// render::water::RefractTint via the G-buffer depth + fresnel + sun glint) draws into a water RT; a
+// composite blends lerp(scene, water.rgb, water.a) + tonemaps. The SAME render/water.h math compiled
+// here makes the wave field bit-identical to the Vulkan/CPU path. SEPARATE water/water_composite
+// pipelines + shaders; existing pipelines/shaders/goldens untouched. -----------------------------
+static int RunWaterShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace water = render::water;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+    const float kWaterLevel = 0.0f;
+    const float aspect = (float)W / (float)H;
+
+    water::WaveSet ws = water::ShowcaseWaves();
+    const float kWaveTime = water::kFixedTime;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+    const Obj objs[] = {
+        {{-2.2f, 0.15f, -0.5f}, 0.8f, true,  {0.90f, 0.25f, 0.20f}},
+        {{ 0.0f, 0.20f, -1.2f}, 0.9f, false, {0.25f, 0.85f, 0.35f}},
+        {{ 2.3f, 0.10f,  0.2f}, 0.7f, true,  {0.25f, 0.45f, 0.95f}},
+        {{-0.9f, 0.12f,  1.4f}, 0.6f, false, {0.95f, 0.80f, 0.25f}},
+        {{ 1.5f, 0.18f,  1.7f}, 0.8f, true,  {0.85f, 0.35f, 0.90f}},
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    struct WaterParams {
+        float model[16];
+        float waveA[3][4];
+        float waveB[3][4];
+        float cfg0[4];
+        float cfg1[4];
+        float shallow[4];
+        float deep[4];
+        float texel[4];
+    };
+    struct WaterCompParams { float texel[2]; float intensity; float pad; };
+
+    auto postVs   = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto waterVs  = loadMSL("water.vert.gen.metal", "water_vertex");
+    auto waterFs  = loadMSL("water.frag.gen.metal", "water_fragment");
+    auto wCompFs  = loadMSL("water_composite.frag.gen.metal", "water_composite_fragment");
+
+    rhi::GraphicsPipelineDesc waterD;
+    waterD.vertex = waterVs.get(); waterD.fragment = waterFs.get();
+    waterD.vertexLayout = scene::MeshVertexLayout();
+    waterD.colorFormat = kHdr;
+    waterD.depthTest = false; waterD.usesFrameUniforms = true; waterD.usesTexture = true;
+    waterD.fragmentPushConstants = true; waterD.pushConstantSize = sizeof(WaterParams);
+    auto waterPipe = device->CreateGraphicsPipeline(waterD);
+
+    rhi::GraphicsPipelineDesc wCompD;
+    wCompD.vertex = postVs.get(); wCompD.fragment = wCompFs.get();
+    wCompD.colorFormat = device->Swapchain().ColorFormat();
+    wCompD.depthTest = false; wCompD.usesTexture = true; wCompD.fullscreen = true;
+    wCompD.fragmentPushConstants = true; wCompD.pushConstantSize = sizeof(WaterCompParams);
+    auto wCompPipe = device->CreateGraphicsPipeline(wCompD);
+
+    auto rt      = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf    = device->CreateRenderTarget(W, H, kHdr);
+    auto waterRT = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+    for (int o = 0; o < kNumObjs; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+        objTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+
+    // Flat NxN water grid (XZ, y=0) — IDENTICAL construction to the Vulkan path.
+    const int kGridN = 128;
+    const float kHalf = 9.0f;
+    std::vector<scene::Vertex> gverts;
+    gverts.reserve((size_t)(kGridN + 1) * (kGridN + 1));
+    for (int gz = 0; gz <= kGridN; ++gz)
+        for (int gx = 0; gx <= kGridN; ++gx) {
+            float fx = (float)gx / (float)kGridN * 2.0f - 1.0f;
+            float fz = (float)gz / (float)kGridN * 2.0f - 1.0f;
+            scene::Vertex v{};
+            v.pos[0] = fx * kHalf; v.pos[1] = 0.0f; v.pos[2] = fz * kHalf;
+            v.color[0] = v.color[1] = v.color[2] = 1.0f;
+            v.uv[0] = (float)gx / (float)kGridN; v.uv[1] = (float)gz / (float)kGridN;
+            v.normal[1] = 1.0f; v.tangent[0] = 1.0f;
+            gverts.push_back(v);
+        }
+    std::vector<uint32_t> gidx;
+    gidx.reserve((size_t)kGridN * kGridN * 6);
+    auto vidx = [&](int gx, int gz) { return (uint32_t)(gz * (kGridN + 1) + gx); };
+    for (int gz = 0; gz < kGridN; ++gz)
+        for (int gx = 0; gx < kGridN; ++gx) {
+            gidx.push_back(vidx(gx, gz));     gidx.push_back(vidx(gx + 1, gz));
+            gidx.push_back(vidx(gx, gz + 1)); gidx.push_back(vidx(gx + 1, gz));
+            gidx.push_back(vidx(gx + 1, gz + 1)); gidx.push_back(vidx(gx, gz + 1));
+        }
+    rhi::BufferDesc wvbD; wvbD.size = gverts.size() * sizeof(scene::Vertex);
+    wvbD.initialData = gverts.data(); wvbD.usage = rhi::BufferUsage::Vertex;
+    auto waterVB = device->CreateBuffer(wvbD);
+    rhi::BufferDesc wibD; wibD.size = gidx.size() * sizeof(uint32_t);
+    wibD.initialData = gidx.data(); wibD.usage = rhi::BufferUsage::Index;
+    auto waterIB = device->CreateBuffer(wibD);
+    const uint32_t kWaterIndexCount = (uint32_t)gidx.size();
+
+    std::vector<Mat4> objModel(kNumObjs);
+    for (int o = 0; o < kNumObjs; ++o)
+        objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+            {objs[o].scale, objs[o].scale, objs[o].scale});
+    Mat4 waterModel = Mat4::Identity();
+
+    const Vec3 eye{0.0f, 3.4f, 6.6f};
+    const Vec3 center{0.0f, 0.1f, -0.5f};
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.4f; fd.lightDir[1] = -0.85f; fd.lightDir[2] = -0.45f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.4f, -0.85f, -0.45f});
+        Vec3 sc{0.0f, 0.3f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 40.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    WaterParams wp{};
+    for (int k = 0; k < 16; ++k) wp.model[k] = waterModel.m[k];
+    for (int wi = 0; wi < 3; ++wi) {
+        wp.waveA[wi][0] = ws.waves[wi].dir.x; wp.waveA[wi][1] = ws.waves[wi].dir.y;
+        wp.waveA[wi][2] = ws.waves[wi].amplitude; wp.waveA[wi][3] = ws.waves[wi].wavelength;
+        wp.waveB[wi][0] = ws.waves[wi].steepness; wp.waveB[wi][1] = ws.waves[wi].speed;
+    }
+    wp.cfg0[0] = kWaveTime; wp.cfg0[1] = std::tan(0.5f * kFovY);
+    wp.cfg0[2] = aspect; wp.cfg0[3] = kWaterLevel;
+    wp.cfg1[0] = 0.02f; wp.cfg1[1] = 0.6f; wp.cfg1[2] = (float)ws.count; wp.cfg1[3] = 0.0f;
+    wp.shallow[0] = 0.20f; wp.shallow[1] = 0.55f; wp.shallow[2] = 0.58f;
+    wp.deep[0] = 0.02f; wp.deep[1] = 0.07f; wp.deep[2] = 0.12f;
+    wp.texel[0] = 1.0f / (float)W; wp.texel[1] = 1.0f / (float)H;
+
+    WaterCompParams wcp{}; wcp.texel[0] = 1.0f / (float)W; wcp.texel[1] = 1.0f / (float)H;
+    wcp.intensity = 1.7f; wcp.pad = 0.0f;
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgGbuf = graph.ImportTarget(
+        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+    render::RgResource rgWater = graph.ImportTarget(
+        "water", render::RgResourceKind::SceneColor, *waterRT);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+        const scene::Mesh& m = objs[o].cube ? cube : sphere;
+        cmd.BindVertexBuffer(m.vertices());
+        cmd.BindIndexBuffer(m.indices());
+        cmd.DrawIndexed(m.indexCount());
+    };
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            for (int o = 0; o < kNumObjs; ++o) {
+                cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                pc[16] = 0.0f; pc[17] = 0.55f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*objTex[o], *flatNormal);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("gbuffer", {}, {rgGbuf},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*gbStaticPipeline);
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("water", {rgScene, rgGbuf}, {rgWater},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*waterPipe);
+            cmd.BindTexturePair(*rt, *gbuf);
+            cmd.PushConstants(&wp, sizeof(wp));
+            cmd.BindVertexBuffer(*waterVB);
+            cmd.BindIndexBuffer(*waterIB);
+            cmd.DrawIndexed(kWaterIndexCount);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("composite", {rgScene, rgWater}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*wCompPipe);
+            cmd.BindTexturePair(*rt, *waterRT);
+            cmd.PushConstants(&wcp, sizeof(wcp));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("water: {waves:%d, time:%g, gridN:%d}\n",
+                (int)ws.count, (double)kWaveTime, kGridN);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — water, %d objects\n", outPath, cw, ch, kNumObjs);
     return 0;
 }
 
@@ -11531,6 +11845,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ssr") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ssr.png";
             try { return RunSsrShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --water <out.png>: water-rendering showcase (Slice CF) — objects partially submerged at the
+        // water level + a Gerstner water plane reflecting the procedural sky + refracting/absorbing the
+        // submerged scene + a sun glint, at a FIXED wave time. Mirrors the Vulkan --water-shot exactly
+        // (same scene/wave set/time/camera; the SAME render/water.h math makes the field bit-identical).
+        if (argc > 1 && std::strcmp(argv[1], "--water") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_water.png";
+            try { return RunWaterShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ssgi <out.png>: screen-space global-illumination showcase (Slice BP) — a Cornell-style

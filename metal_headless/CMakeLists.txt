@@ -169,6 +169,13 @@ hf_gen_msl(ssao_composite.frag    ssao_composite.frag.hlsl    frag ssao_composit
 # HLSL->SPIR-V->MSL toolchain. Existing shaders + goldens untouched.
 hf_gen_msl(ssr.frag               ssr.frag.hlsl               frag ssr_fragment)
 hf_gen_msl(ssr_composite.frag     ssr_composite.frag.hlsl     frag ssr_composite_fragment)
+# Water rendering (Slice CF): water.vert displaces a 128x128 grid by the Gerstner field (render/water.h
+# math, mirrored in-shader); water.frag fresnel-blends a SKY reflection + a depth-tinted REFRACTION of
+# the scene-color RT (G-buffer depth like SSR) + a sun glint; water_composite blends + tonemaps. Same
+# FrameData + scene/g-buffer pair bindings as SSR; existing shaders/goldens untouched.
+hf_gen_msl(water.vert             water.vert.hlsl             vert water_vertex)
+hf_gen_msl(water.frag             water.frag.hlsl             frag water_fragment)
+hf_gen_msl(water_composite.frag   water_composite.frag.hlsl   frag water_composite_fragment)
 # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer + lit HDR scene; ssgi.frag
 # traces K cosine-hemisphere rays and marches the depth buffer (same march as ssr.frag) for indirect
 # diffuse, ssgi_composite ADDS it over the scene + tonemaps. Same HLSL->SPIR-V->MSL toolchain.
