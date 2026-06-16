@@ -353,6 +353,7 @@ int main(int argc, char** argv) {
     const char* pomShotPath = nullptr;       // --pom-shot <out.bmp> (Slice CP: parallax occlusion mapping)
     const char* gtaoShotPath = nullptr;      // --gtao-shot <out.bmp> (Slice CR: ground-truth ambient occlusion)
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
+    const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -694,6 +695,21 @@ int main(int argc, char** argv) {
             // Prints `froxel-fog: {froxels:DIMX*DIMY*DIMZ, density:D, g:G}`. One BMP -> exit. New golden
             // froxel_fog.png; existing scene/sky/volumetric paths/shaders/goldens are untouched.
             froxelFogShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--contactshadow-shot") == 0 && i + 1 < argc) {
+            // Slice CT: Screen-Space Contact Shadows. A scene with small objects resting on / nestled
+            // against surfaces (spheres + small boxes in tight contact) where the broad CSM shadow map
+            // leaves a gap that a short per-pixel screen-space depth ray-march toward the sun fills —
+            // tight dark contact lines at the bases/creases. Pipeline per render: shadow -> gbuffer
+            // (view normal + linear depth) -> contact (fullscreen contact_shadows.frag runs the
+            // render/contact_shadows.h RayMarchShadow over the G-buffer toward the FrameData sun -> a
+            // single-channel factor RT) -> scene (lit_contactshadow.frag samples the factor + multiplies
+            // ONLY the direct sun radiance by it) -> post (tonemap). CRITICAL: the SAME lit_contactshadow
+            // scene is ALSO rendered with the factor computed at maxDist=0 (RayMarchShadow -> 1 -> the
+            // factor RT is all-1) and asserted BYTE-IDENTICAL (SHA) to an all-white-factor render — the
+            // maxDist=0 no-op proof (the march + sun-apply is a pure pass-through when disabled). Prints
+            // `contact-shadows: {steps:N, maxDist:D, thickness:T}`. One BMP -> exit. New golden
+            // contact_shadows.png; existing lit/gtao/ssao/froxel paths/shaders/goldens are untouched.
+            contactShadowShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -12327,6 +12343,411 @@ int main(int argc, char** argv) {
         // (T==1, inScatter==0) is asserted BYTE-IDENTICAL (SHA) to a no-fog pass-through render — proving
         // the inject->integrate->apply chain is a pure pass-through (no constant bias, no Z-slice
         // off-by-one). Deterministic (fixed camera/sun/fog/grid, no RNG); two runs byte-identical.
+        if (contactShadowShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+            // Fixed, deterministic contact-shadow march params.
+            const int   kSteps     = 24;     // march step count
+            const float kMaxDist   = 0.9f;   // march length in view-space units
+            const float kThickness = 0.6f;   // depth-difference window (no false shadow from a far background)
+            const float kBias      = 0.02f;  // self-occlusion guard (no contact acne on flat lit surfaces)
+
+            // --- Lit (contact-shadowed) scene pipeline (NEW lit_contactshadow.frag; reuses lit.vert).
+            // Standard 2-texture material set (base t0 + normal t3 via BindMaterial); the contact-factor
+            // RENDER TARGET binds at the ENVIRONMENT slot (set 3, binding 11/12) via BindReflectionProbe
+            // (the same render-target-as-sampled-input path the AK probe atlas uses to feed an offscreen
+            // RT into a forward lit pass). usesEnvironment reserves that set. ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_contactshadow.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.usesEnvironment = true;   // reserve set 3 for the contact-factor RT (binding 11/12)
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // --- Shadow pipeline (UNCHANGED). ---
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // --- Sky (UNCHANGED). ---
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- G-buffer prepass (static) — REUSED SSAO/SSR/GTAO gbuffer shader. ---
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- Contact-shadow factor (NEW contact_shadows.frag) + post (UNCHANGED tonemap). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            // Matches contact_shadows.frag ContactParams (std140 push constant, <=128B).
+            struct ContactParams {
+                float texel[2]; float maxDist, steps, thickness, bias, tanHalfFovY, aspect;
+                float sunDirView[4];
+            };
+            static_assert(sizeof(ContactParams) <= 128, "contact push constant <= 128B");
+            auto contactFs = loadFs("contact_shadows.frag.hlsl");
+            auto postFs    = loadFs("post.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc contactD;
+            contactD.vertex = postVsM.get(); contactD.fragment = contactFs.get();
+            contactD.colorFormat = kHdr;
+            contactD.depthTest = false; contactD.usesTexture = true; contactD.fullscreen = true;
+            contactD.fragmentPushConstants = true; contactD.pushConstantSize = sizeof(ContactParams);
+            auto contactPipe = device->CreateGraphicsPipeline(contactD);
+
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFs.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // --- Render targets: HDR lit scene + RGBA16F g-buffer + contact-factor RT + an all-WHITE
+            // factor RT (cleared to {1,1,1,1} -> factor 1 everywhere) for the no-contact reference. ---
+            auto rt        = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf      = device->CreateRenderTarget(w, h, kHdr);
+            auto contactRT = device->CreateRenderTarget(w, h, kHdr);
+            auto whiteRT   = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // --- Scene objects (deterministic): small spheres + small boxes hovering a HAIR above the
+            // ground (a few cm gap) + a thin slab floating low. With a DELIBERATELY WIDE/coarse CSM the
+            // shadow map's PCF can't resolve the fine occlusion in those tight sub-texel gaps right under
+            // each object — so the ground there reads SUN-LIT in the CSM. The short screen-space contact
+            // ray-march toward the sun DOES catch the hovering geometry, filling in the tight dark contact
+            // lines the CSM misses. (A small float gap is the canonical case where contact shadows earn
+            // their keep vs. the shadow map — UE5 documents exactly this.) ---
+            struct Obj { Vec3 pos; Vec3 scale; bool cube; };
+            const Obj objs[] = {
+                {{-1.1f, 0.34f, 0.6f}, {0.30f, 0.30f, 0.30f}, false},  // small sphere, ~4cm float gap
+                {{-0.2f, 0.29f, 0.9f}, {0.25f, 0.25f, 0.25f}, true},   // small box, ~4cm float gap
+                {{ 0.7f, 0.26f, 0.5f}, {0.22f, 0.22f, 0.22f}, false},  // tiny sphere, ~4cm float gap
+                {{ 1.5f, 0.32f, 0.2f}, {0.28f, 0.28f, 0.28f}, true},   // small box, ~4cm float gap
+                {{ 0.2f, 0.50f,-1.1f}, {1.7f, 0.05f, 0.5f}, true},     // thin slab hovering low over ground
+                {{-0.7f, 0.34f,-0.7f}, {0.30f, 0.30f, 0.30f}, false},  // sphere under/near the slab edge
+                {{ 0.9f, 0.28f,-0.6f}, {0.24f, 0.24f, 0.24f}, true},   // box under/near the slab edge
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            const Vec3 eye{2.4f, 1.9f, 3.4f};
+            const Vec3 center{0.0f, 0.25f, -0.3f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            // The sun comes from the side at a moderate height: the ground +Y normal still faces it
+            // (well-lit, high NoL) AND the contacts cast their fine screen-space shadows SIDEWAYS onto the
+            // lit ground next to each object — exactly the lit-area occlusion the broad/coarse CSM misses.
+            Vec3 sunTravel = math::normalize(Vec3{-0.6f, -0.55f, -0.25f});
+            FrameData fd{};
+            {
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0]=sunTravel.x; fd.lightDir[1]=sunTravel.y; fd.lightDir[2]=sunTravel.z;
+                // A BRIGHT sun so the DIRECT term dominates the ambient/IBL — the contact shadow (which
+                // darkens only the sun) then reads clearly in the tonemapped 8-bit output.
+                fd.lightColor[0]=3.0f; fd.lightColor[1]=2.9f; fd.lightColor[2]=2.7f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.ptCount[0]=0.0f;
+                Vec3 sc{0.0f, 0.3f, -0.3f};
+                Vec3 lightEye = sc - sunTravel * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                // A DELIBERATELY WIDE shadow ortho (40x40 over a 2048 map -> ~0.02 world-units/texel +
+                // PCF) so the CSM is too COARSE to capture the fine contact occlusion right at the object
+                // bases/creases — that gap is what the screen-space contact-shadow march fills.
+                Mat4 lightOrtho = Mat4::Ortho(-20.0f, 20.0f, -20.0f, 20.0f, 1.0f, 44.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+                fd.skyParams[2] = 1.0f / (float)w;   // texel.x for lit_contactshadow's factor-UV mapping
+                fd.skyParams[3] = 1.0f / (float)h;   // texel.y
+            }
+
+            // The view-space direction the contact ray marches to find a sun occluder. We transform the
+            // WORLD light-travel direction (sunTravel, sun -> scene) into view space with the view
+            // rotation: marching a surface point along this view-space direction walks the ray along the
+            // path the sunlight took to reach neighbouring geometry, so a closer surface encountered on
+            // the way is exactly what blocks this pixel's sun — the contact occluder. (viewM is
+            // column-major; its upper-left 3x3 is the rotation, applied like math::MulPoint without the
+            // translation column.)
+            auto xformDir = [&](const Mat4& m, const Vec3& d) {
+                return Vec3{m.m[0]*d.x + m.m[4]*d.y + m.m[8]*d.z,
+                           m.m[1]*d.x + m.m[5]*d.y + m.m[9]*d.z,
+                           m.m[2]*d.x + m.m[6]*d.y + m.m[10]*d.z};
+            };
+            Vec3 sunViewDir = math::normalize(xformDir(viewM, sunTravel));
+
+            auto objModel = [&](const Obj& o) {
+                return Mat4::Translate(o.pos) * Mat4::Scale(o.scale);
+            };
+
+            ContactParams cp{};
+            cp.texel[0] = 1.0f / (float)w; cp.texel[1] = 1.0f / (float)h;
+            cp.steps = (float)kSteps; cp.thickness = kThickness; cp.bias = kBias;
+            cp.tanHalfFovY = std::tan(0.5f * kFovY); cp.aspect = aspect;
+            cp.sunDirView[0]=sunViewDir.x; cp.sunDirView[1]=sunViewDir.y; cp.sunDirView[2]=sunViewDir.z;
+
+            // Render the full scene through the contact-shadow pipeline. `maxDist` drives the factor pass;
+            // `useComputedFactor` selects whether the scene pass samples the COMPUTED factor RT (true) or
+            // the all-WHITE factor RT (false -> contact factor 1 everywhere, the no-contact reference).
+            // The scene-pass material push constant carries (metallic, roughness, 1/w, 1/h) so
+            // lit_contactshadow.frag maps SV_Position -> the factor UV.
+            auto renderScene = [&](float maxDist, bool useComputedFactor,
+                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                cp.maxDist = maxDist;
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgGbuf = graph.ImportTarget(
+                    "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+                render::RgResource rgContact = graph.ImportTarget(
+                    "contact", render::RgResourceKind::SceneColor, *contactRT);
+                render::RgResource rgWhite = graph.ImportTarget(
+                    "white", render::RgResourceKind::SceneColor, *whiteRT);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            cmd.PushConstants(m.m, sizeof(float) * 16);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("gbuffer", {}, {rgGbuf},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*gbStaticPipeline);
+                        {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                // Contact-shadow factor pass: march the G-buffer depth toward the sun -> the factor RT.
+                // (At maxDist=0 contact_shadows.frag returns 1 for every pixel -> the factor RT is all-1,
+                // which equals the cleared {1,1,1,1} whiteRT -> the byte-identical no-op proof.)
+                graph.AddPass("contact", {rgGbuf}, {rgContact},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.BindPipeline(*contactPipe);
+                        cmd.BindTexture(*gbuf);
+                        cmd.PushConstants(&cp, sizeof(cp));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                // All-white factor RT (the no-contact reference): a clear-only pass -> factor 1 everywhere.
+                graph.AddPass("white", {}, {rgWhite},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.EndRenderPass();
+                    });
+
+                // Scene pass: lit_contactshadow.frag samples the factor RT at the env slot (binding 11/12,
+                // bound via BindReflectionProbe) and multiplies ONLY the direct sun radiance by it. The
+                // computed factor RT applies the real contact shadows; the white RT is the no-contact
+                // reference (factor 1 everywhere).
+                rhi::IRenderTarget& factorRT = useComputedFactor ? *contactRT : *whiteRT;
+                render::RgResource rgFactor = useComputedFactor ? rgContact : rgWhite;
+                graph.AddPass("scene", {rgShadow, rgFactor}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        cmd.BindReflectionProbe(factorRT);   // contact factor RT at the env slot (11/12)
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16]=0.0f; pc[17]=0.85f; pc[18]=0.0f; pc[19]=0.0f;  // metallic, roughness
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindReflectionProbe(factorRT);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            pc[16]=0.0f; pc[17]=0.6f; pc[18]=0.0f; pc[19]=0.0f;   // metallic, roughness
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindReflectionProbe(factorRT);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE maxDist=0 NO-OP PROOF.
+            //   csPx   — the REAL maxDist>0 contact shadows: the golden (tight dark contact lines).
+            //   zeroPx — maxDist=0 (contact_shadows.frag's no-march path -> factor==1 everywhere),
+            //            scene samples the COMPUTED (all-1) factor RT.
+            //   noCsPx — the scene samples the all-WHITE 1x1 factor (factor 1 everywhere), no contact pass.
+            // zeroPx and noCsPx both multiply the sun radiance by 1, so they MUST be BYTE-IDENTICAL —
+            // proving the march + sun-apply is a pure pass-through at maxDist=0 (no constant bias, no
+            // self-occlusion acne, no off-by-one). Fail loudly on any diff.
+            std::vector<uint8_t> csPx, zeroPx, noCsPx;
+            uint32_t cw=0, ch=0, zw=0, zh=0, nw=0, nh=0;
+            if (!renderScene(kMaxDist, true, csPx, cw, ch)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (contact shadows maxDist>0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(0.0f, true, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (contact shadows maxDist=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(kMaxDist, false, noCsPx, nw, nh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (no-contact reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t zeroHash = fnv(zeroPx), noCsHash = fnv(noCsPx), csHash = fnv(csPx);
+            std::printf("contact maxDist=0 hash: %016llx  no-contact hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)noCsHash);
+            const bool zeroEquivalent = (zw == nw) && (zh == nh) && (zeroPx.size() == noCsPx.size()) &&
+                                        (std::memcmp(zeroPx.data(), noCsPx.data(), noCsPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: contact maxDist=0 render != no-contact render — the march + sun-apply is NOT "
+                    "a pure pass-through at maxDist=0 (constant bias / self-occlusion / off-by-one). "
+                    "maxDist=0 %016llx vs no-contact %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)noCsHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("contact maxDist=0 == no-contact scene: BYTE-IDENTICAL (maxDist=0 no-op proof)\n");
+            std::printf("contact-shadows: {steps:%d, maxDist:%.4g, thickness:%.4g}\n",
+                        kSteps, (double)kMaxDist, (double)kThickness);
+            // Sanity: the real contact-shadow render must DIFFER from the no-contact render.
+            if (csHash == noCsHash)
+                std::fprintf(stderr, "WARNING: contact maxDist>0 render is identical to the no-contact "
+                                     "render (no visible contact shadows) — check the march params / scene\n");
+
+            bool ok = WriteBMP(contactShadowShotPath, csPx, cw, ch);
+            if (ok) std::printf("wrote %s (%ux%u) — contact shadows, %d steps, maxDist %.4g, thickness "
+                                "%.4g, %d objects\n",
+                                contactShadowShotPath, cw, ch, kSteps, (double)kMaxDist,
+                                (double)kThickness, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", contactShadowShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         if (froxelFogShotPath) {
             using math::Mat4; using math::Vec3;
             namespace fx = hf::render::froxel;

@@ -194,6 +194,17 @@ hf_compile_shaders(
     # --gtao-shot ONLY; with radius==0 the horizon search raises no horizon -> AO==1 -> byte-identical to
     # the no-AO render. Existing ssao/ssr shaders + their goldens untouched.
     "shaders/gtao.frag.hlsl:ps"
+    # Screen-Space Contact Shadows (Slice CT): reuses the SSAO/SSR/GTAO g-buffer (view normal + linear
+    # depth). contact_shadows.frag reconstructs the view position (like gtao.frag), marches a SHORT ray
+    # TOWARD the sun through the depth field (render/contact_shadows.h RayMarchShadow mirrored in-shader)
+    # with a baked per-pixel dither, and outputs the single-channel contact-shadow factor; the NEW
+    # lit_contactshadow.frag (a lit.frag VARIANT) samples that factor at the pixel's screen position and
+    # MULTIPLIES the direct sun radiance by it (ambient/IBL/point lights untouched, like the CSM term).
+    # Fullscreen factor pass (reuses post.vert), behind --contactshadow-shot ONLY; with maxDist==0 the
+    # march takes no steps -> factor==1 -> byte-identical to the no-contact render. Existing lit/gtao/ssao
+    # shaders + their goldens untouched.
+    "shaders/contact_shadows.frag.hlsl:ps"
+    "shaders/lit_contactshadow.frag.hlsl:ps"
     # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
     # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect

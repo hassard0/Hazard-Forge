@@ -7161,6 +7161,334 @@ static int RunGtaoShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Screen-Space Contact Shadows showcase (Slice CT). Mirrors the Vulkan --contactshadow-shot path
+// EXACTLY: small spheres + boxes hovering a hair above a checkered ground, sun from the side. Pipeline
+// per render: shadow -> gbuffer (view normal + linear depth) -> contact (fullscreen contact_shadows.frag
+// runs render/contact_shadows.h RayMarchShadow over the G-buffer toward the sun -> a single-channel
+// factor RT) -> scene (lit_contactshadow.frag samples the factor at the env slot and multiplies ONLY the
+// direct sun radiance by it) -> post (tonemap). The SAME render/contact_shadows.h math compiled here
+// makes the factor bit-identical to the Vulkan/CPU path. THE maxDist=0 NO-OP PROOF (backend-portable,
+// per the POM/GTAO/CS lesson): the SAME lit_contactshadow scene is rendered with the factor computed at
+// maxDist=0 (RayMarchShadow -> 1 -> all-1 factor RT) AND with an all-white factor RT, and asserted
+// BYTE-IDENTICAL — the march + sun-apply is a pure pass-through when disabled.
+static int RunContactShadowShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+    const int   kSteps     = 24;
+    const float kMaxDist   = 0.9f;
+    const float kThickness = 0.6f;
+    const float kBias      = 0.02f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // Lit (contact-shadowed) scene pipeline (NEW lit_contactshadow.frag; reuses lit.vert) — env slot
+    // reserved for the factor RT (bound via BindReflectionProbe).
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit_contactshadow.frag.gen.metal", "contactshadow_fragment");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.usesEnvironment = true;
+    litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Shadow pipeline (UNCHANGED).
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    // Sky (UNCHANGED).
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    // G-buffer prepass (static) — REUSED SSAO/SSR/GTAO gbuffer shader.
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    // Contact-shadow factor (NEW contact_shadows.frag) + post (UNCHANGED tonemap).
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    struct ContactParams {
+        float texel[2]; float maxDist, steps, thickness, bias, tanHalfFovY, aspect;
+        float sunDirView[4];
+    };
+    auto contactFs = loadMSL("contact_shadows.frag.gen.metal", "contact_shadows_fragment");
+    auto postFs    = loadMSL("post.frag.gen.metal", "post_fragment");
+
+    rhi::GraphicsPipelineDesc contactD;
+    contactD.vertex = postVs.get(); contactD.fragment = contactFs.get();
+    contactD.colorFormat = kHdr;
+    contactD.depthTest = false; contactD.usesTexture = true; contactD.fullscreen = true;
+    contactD.fragmentPushConstants = true; contactD.pushConstantSize = sizeof(ContactParams);
+    auto contactPipe = device->CreateGraphicsPipeline(contactD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt        = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf      = device->CreateRenderTarget(W, H, kHdr);
+    auto contactRT = device->CreateRenderTarget(W, H, kHdr);
+    auto whiteRT   = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    // Scene objects — IDENTICAL to the Vulkan --contactshadow-shot path.
+    struct Obj { Vec3 pos; Vec3 scale; bool cube; };
+    const Obj objs[] = {
+        {{-1.1f, 0.34f, 0.6f}, {0.30f, 0.30f, 0.30f}, false},
+        {{-0.2f, 0.29f, 0.9f}, {0.25f, 0.25f, 0.25f}, true},
+        {{ 0.7f, 0.26f, 0.5f}, {0.22f, 0.22f, 0.22f}, false},
+        {{ 1.5f, 0.32f, 0.2f}, {0.28f, 0.28f, 0.28f}, true},
+        {{ 0.2f, 0.50f,-1.1f}, {1.7f, 0.05f, 0.5f}, true},
+        {{-0.7f, 0.34f,-0.7f}, {0.30f, 0.30f, 0.30f}, false},
+        {{ 0.9f, 0.28f,-0.6f}, {0.24f, 0.24f, 0.24f}, true},
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    const Vec3 eye{2.4f, 1.9f, 3.4f};
+    const Vec3 center{0.0f, 0.25f, -0.3f};
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Vec3 sunTravel = math::normalize(Vec3{-0.6f, -0.55f, -0.25f});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0]=sunTravel.x; fd.lightDir[1]=sunTravel.y; fd.lightDir[2]=sunTravel.z;
+        fd.lightColor[0]=3.0f; fd.lightColor[1]=2.9f; fd.lightColor[2]=2.7f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.ptCount[0]=0.0f;
+        Vec3 sc{0.0f, 0.3f, -0.3f};
+        Vec3 lightEye = sc - sunTravel * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-20.0f, 20.0f, -20.0f, 20.0f, 1.0f, 44.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+        fd.skyParams[2] = 1.0f / (float)W;
+        fd.skyParams[3] = 1.0f / (float)H;
+    }
+
+    auto xformDir = [&](const Mat4& m, const Vec3& d) {
+        return Vec3{m.m[0]*d.x + m.m[4]*d.y + m.m[8]*d.z,
+                   m.m[1]*d.x + m.m[5]*d.y + m.m[9]*d.z,
+                   m.m[2]*d.x + m.m[6]*d.y + m.m[10]*d.z};
+    };
+    Vec3 sunViewDir = math::normalize(xformDir(viewM, sunTravel));
+
+    auto objModel = [&](const Obj& o) {
+        return Mat4::Translate(o.pos) * Mat4::Scale(o.scale);
+    };
+
+    ContactParams cp{};
+    cp.texel[0] = 1.0f / (float)W; cp.texel[1] = 1.0f / (float)H;
+    cp.steps = (float)kSteps; cp.thickness = kThickness; cp.bias = kBias;
+    cp.tanHalfFovY = std::tan(0.5f * kFovY); cp.aspect = aspect;
+    cp.sunDirView[0]=sunViewDir.x; cp.sunDirView[1]=sunViewDir.y; cp.sunDirView[2]=sunViewDir.z;
+
+    auto renderScene = [&](float maxDist, bool useComputedFactor,
+                           std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        cp.maxDist = maxDist;
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgGbuf = graph.ImportTarget(
+            "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+        render::RgResource rgContact = graph.ImportTarget(
+            "contact", render::RgResourceKind::SceneColor, *contactRT);
+        render::RgResource rgWhite = graph.ImportTarget(
+            "white", render::RgResourceKind::SceneColor, *whiteRT);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                for (int oi = 0; oi < kNumObjs; ++oi) {
+                    Mat4 m = objModel(objs[oi]);
+                    cmd.PushConstants(m.m, sizeof(float) * 16);
+                    const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                    cmd.BindVertexBuffer(msh.vertices());
+                    cmd.BindIndexBuffer(msh.indices());
+                    cmd.DrawIndexed(msh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("gbuffer", {}, {rgGbuf},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                cmd.BindPipeline(*gbStaticPipeline);
+                {
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (int oi = 0; oi < kNumObjs; ++oi) {
+                    Mat4 m = objModel(objs[oi]);
+                    float pc[32];
+                    for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                    for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                    cmd.PushConstants(pc, sizeof(pc));
+                    const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                    cmd.BindVertexBuffer(msh.vertices());
+                    cmd.BindIndexBuffer(msh.indices());
+                    cmd.DrawIndexed(msh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("contact", {rgGbuf}, {rgContact},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                cmd.BindPipeline(*contactPipe);
+                cmd.BindTexture(*gbuf);
+                cmd.PushConstants(&cp, sizeof(cp));
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("white", {}, {rgWhite},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                cmd.EndRenderPass();
+            });
+
+        rhi::IRenderTarget& factorRT = useComputedFactor ? *contactRT : *whiteRT;
+        render::RgResource rgFactor = useComputedFactor ? rgContact : rgWhite;
+        graph.AddPass("scene", {rgShadow, rgFactor}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                cmd.BindReflectionProbe(factorRT);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16]=0.0f; pc[17]=0.85f; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindReflectionProbe(factorRT);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (int oi = 0; oi < kNumObjs; ++oi) {
+                    Mat4 m = objModel(objs[oi]);
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                    pc[16]=0.0f; pc[17]=0.6f; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindReflectionProbe(factorRT);
+                    const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                    cmd.BindVertexBuffer(msh.vertices());
+                    cmd.BindIndexBuffer(msh.indices());
+                    cmd.DrawIndexed(msh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    // THE maxDist=0 NO-OP PROOF (backend-portable: the SAME lit_contactshadow shader with a maxDist=0
+    // factor RT vs an all-white factor RT — both factor==1, byte-identical on every backend).
+    std::vector<uint8_t> csPx, zeroPx, noCsPx;
+    uint32_t cw=0, ch=0, zw=0, zh=0, nw=0, nh=0;
+    if (!renderScene(kMaxDist, true, csPx, cw, ch)) return fail("no captured pixels (contact shadows)");
+    if (!renderScene(0.0f, true, zeroPx, zw, zh)) return fail("no captured pixels (contact maxDist=0)");
+    if (!renderScene(kMaxDist, false, noCsPx, nw, nh)) return fail("no captured pixels (no-contact)");
+
+    const bool zeroEquivalent = (zw == nw) && (zh == nh) && (zeroPx.size() == noCsPx.size()) &&
+                                (std::memcmp(zeroPx.data(), noCsPx.data(), noCsPx.size()) == 0);
+    if (!zeroEquivalent)
+        return fail("contact maxDist=0 render != no-contact render — NOT a pure pass-through when disabled");
+    std::printf("contact maxDist=0 == no-contact scene: BYTE-IDENTICAL (maxDist=0 no-op proof)\n");
+    std::printf("contact-shadows: {steps:%d, maxDist:%.4g, thickness:%.4g}\n",
+                kSteps, (double)kMaxDist, (double)kThickness);
+
+    if (!WritePNG(outPath, csPx, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — contact shadows, %d steps, maxDist %.4g, thickness %.4g, %d objects\n",
+                outPath, cw, ch, kSteps, (double)kMaxDist, (double)kThickness, kNumObjs);
+    return 0;
+}
+
 // --- Froxel Volumetric Fog showcase (Slice CS). Mirrors the Vulkan --froxelfog-shot path EXACTLY: a
 // lit+shadowed scene (ground + receding objects) wrapped in a TRUE 3D view-space FROXEL volume. Two
 // COMPUTE passes (froxel_inject: per-froxel scatter+extinction from render/froxel.h height-density + HG
@@ -14919,6 +15247,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gtao") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gtao.png";
             try { return RunGtaoShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --contactshadow <out.png>: screen-space contact shadows showcase (Slice CT) — small objects
+        // hovering a hair above the ground; a short per-pixel depth ray-march toward the sun fills the
+        // tight contact occlusion the broad/coarse CSM misses. INTERNALLY renders the SAME
+        // lit_contactshadow scene with the factor at maxDist=0 (RayMarchShadow -> 1) AND with an all-white
+        // factor RT and asserts they are BYTE-IDENTICAL — the maxDist=0 no-op proof. Mirrors the Vulkan
+        // --contactshadow-shot exactly (same scene/camera/sun/march; the SAME render/contact_shadows.h math).
+        if (argc > 1 && std::strcmp(argv[1], "--contactshadow") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_contact_shadows.png";
+            try { return RunContactShadowShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --froxelfog <out.png>: froxel volumetric fog showcase (Slice CS) — a lit+shadowed scene wrapped

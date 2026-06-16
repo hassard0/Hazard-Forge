@@ -218,6 +218,16 @@ hf_gen_msl(water_composite.frag   water_composite.frag.hlsl   frag water_composi
 # compiled here makes the AO bit-identical to the Vulkan/CPU path; radius==0 -> AO==1 -> byte-identical
 # to the no-AO render. Behind --gtao only; existing ssao/ssr shaders + goldens untouched.
 hf_gen_msl(gtao.frag              gtao.frag.hlsl              frag gtao_fragment)
+# Screen-Space Contact Shadows (Slice CT): contact_shadows.frag reconstructs the view position from the
+# SSAO/GTAO g-buffer and marches a SHORT ray TOWARD the sun through the depth field (render/
+# contact_shadows.h RayMarchShadow mirrored in-shader) with a baked per-pixel dither, outputting the
+# single-channel contact-shadow factor; lit_contactshadow.frag (a lit.frag variant) samples that factor
+# at the pixel's screen position + multiplies the direct sun radiance by it (ambient/IBL/point lights
+# untouched). The SAME render/contact_shadows.h math compiled here makes the factor bit-identical to the
+# Vulkan/CPU path; maxDist==0 -> factor==1 -> byte-identical to the no-contact render. Behind
+# --contactshadow only; existing lit/gtao/ssao shaders + goldens untouched.
+hf_gen_msl(contact_shadows.frag   contact_shadows.frag.hlsl   frag contact_shadows_fragment)
+hf_gen_msl(lit_contactshadow.frag lit_contactshadow.frag.hlsl frag contactshadow_fragment)
 # Froxel Volumetric Fog (Slice CS): a true 3D view-space froxel volume. froxel_inject.comp writes
 # per-froxel (scatter, extinction) from the render/froxel.h height-density + HG phase; froxel_integrate.comp
 # marches each Z column front-to-back via IntegrateStep into (inScatter, transmittance); froxel_apply.frag

@@ -209,6 +209,17 @@ hf_add_pure_test(gtao_test)
 # froxel_inject/integrate/apply. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(froxel_test)
 
+# Screen-Space Contact Shadows (Slice CT): the screen-space depth ray-march toward the sun
+# (render/contact_shadows.h, header-only). The CORE proof: RayMarchShadow(maxDist=0) == 1 and
+# (steps=0) == 1 EXACTLY (no march -> no occluder -> the maxDist=0 contact-shadow render is byte-
+# identical to the no-contact-shadow lit render). Also pins: a clear/empty depth field -> 1, an occluder
+# within the thickness window -> < 1 (monotone: a closer/earlier occluder darkens more), an occluder
+# BEYOND the thickness window -> 1 (no false shadow / haloing), a flat surface within the bias -> 1 (no
+# self-occlusion acne), and determinism (incl. the maxDist=0 identity holding for any dither). The same
+# contact_shadows.h march is mirrored VERBATIM in contact_shadows.frag.hlsl. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(contact_shadows_test)
+
 # Temporal SSGI accumulation (Slice BV): the per-frame jittered hemisphere kernel
 # (HemisphereDirJittered = the base SSGI kernel + a FIXED per-frame golden-angle azimuth rotation;
 # frame 0 == HemisphereDir; frame>0 dirs unit-length, in-hemisphere, and DIFFER from frame 0 so

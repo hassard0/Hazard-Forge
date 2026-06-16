@@ -190,6 +190,8 @@ int main() {
             bool sawGtaoFeature = false;
             // Slice CS: the froxel-volumetric-fog capability is advertised in the feature manifest.
             bool sawFroxelFogFeature = false;
+            // Slice CT: the contact-shadows capability is advertised in the feature manifest.
+            bool sawContactShadowsFeature = false;
             // Slice CF: the water-rendering capability is advertised in the feature manifest.
             bool sawWaterFeature = false;
             // Slice BQ: the state-replication capability is advertised in the feature manifest.
@@ -240,6 +242,7 @@ int main() {
                     if (AsString(el->value) == "parallax-occlusion-mapping") sawPomFeature = true;
                     if (AsString(el->value) == "ground-truth-ambient-occlusion") sawGtaoFeature = true;
                     if (AsString(el->value) == "froxel-volumetric-fog") sawFroxelFogFeature = true;
+                    if (AsString(el->value) == "contact-shadows") sawContactShadowsFeature = true;
                     if (AsString(el->value) == "water-rendering") sawWaterFeature = true;
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
                     if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
@@ -280,6 +283,7 @@ int main() {
             check(sawPomFeature, "engine.features includes parallax-occlusion-mapping");
             check(sawGtaoFeature, "engine.features includes ground-truth-ambient-occlusion");
             check(sawFroxelFogFeature, "engine.features includes froxel-volumetric-fog");
+            check(sawContactShadowsFeature, "engine.features includes contact-shadows");
             check(sawWaterFeature, "engine.features includes water-rendering");
             check(sawReplicationFeature, "engine.features includes state-replication");
             check(sawNetsimFeature, "engine.features includes network-transport-sim");
@@ -372,6 +376,8 @@ int main() {
         bool sawGtaoShot = false;
         // Slice CS: the --froxelfog-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelFogShot = false;
+        // Slice CT: the --contactshadow-shot showcase flag is listed in the showcase manifest.
+        bool sawContactShadowShot = false;
         // Slice CF: the --water-shot showcase flag is listed in the showcase manifest.
         bool sawWaterShot = false;
         // Slice BR: the --ssgi-denoise-shot showcase flag is listed in the showcase manifest.
@@ -429,6 +435,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--pom-shot") sawPomShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gtao-shot") sawGtaoShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxelfog-shot") sawFroxelFogShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--water-shot") sawWaterShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-temporal-shot") sawSsgiTemporalShot = true;
@@ -473,6 +480,7 @@ int main() {
         check(sawPomShot, "showcases manifest includes --pom-shot");
         check(sawGtaoShot, "showcases manifest includes --gtao-shot");
         check(sawFroxelFogShot, "showcases manifest includes --froxelfog-shot");
+        check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
         check(sawWaterShot, "showcases manifest includes --water-shot");
         check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
         check(sawSsgiTemporalShot, "showcases manifest includes --ssgi-temporal-shot");
