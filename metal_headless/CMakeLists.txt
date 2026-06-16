@@ -207,6 +207,13 @@ hf_gen_msl(volumetric_composite.frag volumetric_composite.frag.hlsl frag volumet
 # clouds_composite blends lerp(scene, cloud.rgb, cloud.a) + tonemaps. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(clouds.frag           clouds.frag.hlsl           frag clouds_fragment)
 hf_gen_msl(clouds_composite.frag clouds_composite.frag.hlsl frag clouds_composite_fragment)
+# Cloud shadows on the ground (Slice CK): a VARIANT of lit.frag that ADDITIONALLY attenuates the direct
+# sun by the cloud-shadow transmittance (render/clouds.h CloudShadow, mirrored in-shader so the shadow
+# field is bit-identical cross-backend). Reuses lit.vert; the push constant is the standard lit
+# {model,material} extended with cloudParams (slab/time/steps), read in the FRAGMENT stage (HF_MSL_GEN
+# cbuffer at the fragment push-const slot, like the bloom/clouds fragment push constants). Drives the
+# --cloud-shadows showcase; lit.frag + its goldens are untouched.
+hf_gen_msl(lit_cloudshadow.frag  lit_cloudshadow.frag.hlsl  frag cloudshadow_fragment)
 # Reflection + irradiance probes (Slice AK): bake the local room into a cube atlas (reflection block)
 # + cosine-convolve an irradiance block, then shade with lit_probe sampling that atlas as LOCAL GI.
 # lit_probe reuses lit.vert; the blit/convolution passes reuse post.vert. Same HLSL->SPIR-V->MSL

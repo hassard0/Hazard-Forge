@@ -180,6 +180,15 @@ hf_add_pure_test(water_test)
 # header-only), ASan-eligible.
 hf_add_pure_test(clouds_test)
 
+# Cloud shadows on the ground (Slice CK): CloudShadow(worldPos, sunDir, t, slabBottom, slabTop, steps)
+# marches from a surface point TOWARD the sun (-sunDir) through the cloud slab, accumulating optical
+# depth from clouds::Density, and returns Beer(opticalDepth) in [0,1] (1 = full sun, 0 = fully
+# shadowed). Verifies range [0,1], FULL SUN when the sun ray never enters the slab / passes only clear
+# sky, SHADOWED (< 1) under a dense column, MONOTONE (denser column -> smaller factor),
+# Beer-CONSISTENCY (== Beer(marched OD)), and DETERMINISM (same (worldPos,sunDir,t) -> bit-identical).
+# Pure CPU (render/clouds.h, header-only), ASan-eligible. The lit_cloudshadow.frag variant mirrors this.
+hf_add_pure_test(cloud_shadows_test)
+
 # Screen-space projected decals (Slice BH): the decal-box local<->world TRS round-trip
 # (center -> local origin; center+R*halfExtents -> local corner (0.5,0.5,0.5), incl. a rotated box),
 # InsideUnitBox (boundary-inclusive), the top-down DecalUV (local.xz+0.5), and the EdgeFade falloff

@@ -187,6 +187,12 @@ hf_compile_shaders(
     # Existing sky/scene/volumetric shaders + goldens untouched (new path behind --clouds-shot).
     "shaders/clouds.frag.hlsl:ps"
     "shaders/clouds_composite.frag.hlsl:ps"
+    # Cloud shadows on the ground (Slice CK): a VARIANT of lit.frag that ADDITIONALLY attenuates the
+    # direct sun by the cloud-shadow transmittance (render/clouds.h CloudShadow, mirrored in-shader) —
+    # the surface samples the SAME CH cloud field along the ray toward the sun, casting dappled cloud
+    # shadows on the scene. Reuses lit.vert (push constant extended with the cloud slab/time/steps).
+    # Used ONLY by --cloud-shadows-shot; lit.frag + its goldens are byte-identical (new path).
+    "shaders/lit_cloudshadow.frag.hlsl:ps"
     # Reflection + irradiance probes (Slice AK): bake the local room into a cube atlas (reflection
     # block) + cosine-convolve an irradiance block, then shade with lit_probe sampling that atlas as
     # LOCAL GI. Reuses lit.vert + the CSM depth-only caster's vertex (probe-face VP in push const) and

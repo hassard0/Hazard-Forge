@@ -118,6 +118,7 @@ $Goldens = @(
     @{ Name = 'editor_edit';   Flag = '--editor-edit' }      # Slice BX (editor live-edit: edited scene + scene_io round-trip)
     @{ Name = 'vfx';           Flag = '--vfx' }              # Slice CC (CPU particle / VFX emitter: additive billboard fountain)
     @{ Name = 'clouds';        Flag = '--clouds' }           # Slice CH (volumetric clouds: raymarched sunlit cumulus layer in the sky dome)
+    @{ Name = 'cloud_shadows'; Flag = '--cloud-shadows' }    # Slice CK (cloud shadows on the ground: the cloud field attenuates the direct sun on the lit scene as dappled shadows)
 )
 
 $winResult = 'SKIP'

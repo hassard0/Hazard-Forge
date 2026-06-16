@@ -6582,6 +6582,321 @@ static int RunCloudsShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Cloud shadows on the ground showcase (Slice CK). Mirrors the Vulkan --cloud-shadows-shot path
+// EXACTLY: the SAME lit+shadowed scene + cloud field + fixed time + sun + camera as the clouds
+// showcase, but the lit ground/objects are shaded by the lit_cloudshadow VARIANT — it ADDITIONALLY
+// attenuates the direct sun by CloudShadow(surfaceWorldPos, sunDir, t) so the surfaces show FIXED
+// dappled cloud shadows matching the CH cloudscape overhead. Surface samples the SAME
+// render::clouds::Density field (mirrored in lit_cloudshadow.frag, bit-identical cross-backend) along
+// the ray toward the sun. The CH cloudscape is rendered above too. Deterministic (fixed time, fixed
+// shadow steps, integer-lattice hash noise) -> two runs DIFF 0.0000. lit.frag + its goldens untouched.
+static int RunCloudShadowsShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace clouds = render::clouds;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float kFovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+    const Obj objs[] = {
+        {{-2.4f, 0.8f, -0.5f}, 0.8f, true,  {0.90f, 0.28f, 0.22f}},
+        {{ 0.0f, 1.0f, -1.4f}, 1.0f, false, {0.28f, 0.85f, 0.38f}},
+        {{ 2.5f, 0.7f,  0.3f}, 0.7f, true,  {0.30f, 0.48f, 0.95f}},
+        {{-0.8f, 0.6f,  1.6f}, 0.6f, false, {0.95f, 0.82f, 0.28f}},
+        {{ 1.7f, 0.9f,  1.9f}, 0.9f, true,  {0.85f, 0.38f, 0.90f}},
+    };
+    const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+    const int kShadowSteps = 24;
+    const int kCloudSteps  = 64;
+
+    // Lit CLOUD-SHADOW variant: lit.vert + lit_cloudshadow.frag. Push constant = lit {model(16),
+    // material(4)} EXTENDED with cloudParams(4); fragment-visible (the FS reads cloudParams).
+    auto litVs   = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litCsFs = loadMSL("lit_cloudshadow.frag.gen.metal", "cloudshadow_fragment");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litCsFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.fragmentPushConstants = true; litDesc.pushConstantSize = sizeof(float) * 24;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = kHdr;
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto gbVs = loadMSL("gbuffer.vert.gen.metal", "gbuffer_vertex");
+    auto gbFs = loadMSL("gbuffer.frag.gen.metal", "gbuffer_fragment");
+    rhi::GraphicsPipelineDesc gbStDesc;
+    gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+    gbStDesc.vertexLayout = scene::MeshVertexLayout();
+    gbStDesc.colorFormat = kHdr;
+    gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+    gbStDesc.pushConstantSize = sizeof(float) * 32;
+    auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+    struct CloudParams {
+        float slabBottom; float slabTop;   float time;       float coverage;
+        float steps;      float lightSteps; float g;          float densityMul;
+        float sunColor[3]; float ambient;
+        float skyTop[3];   float pad0;
+        float skyBottom[3]; float pad1;
+        float texel[2];    float exposure;  float dbg;
+    };
+    static_assert(sizeof(CloudParams) == 96, "CloudParams layout drift vs clouds.frag");
+    struct CloudCompParams { float texel[2]; float intensity; float pad; };
+
+    auto postVs      = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto cloudFs     = loadMSL("clouds.frag.gen.metal", "clouds_fragment");
+    auto cloudCompFs = loadMSL("clouds_composite.frag.gen.metal", "clouds_composite_fragment");
+
+    rhi::GraphicsPipelineDesc cloudD;
+    cloudD.vertex = postVs.get(); cloudD.fragment = cloudFs.get();
+    cloudD.colorFormat = kHdr;
+    cloudD.depthTest = false; cloudD.fullscreen = true;
+    cloudD.usesFrameUniforms = true; cloudD.usesTexture = true;
+    cloudD.fragmentPushConstants = true; cloudD.pushConstantSize = sizeof(CloudParams);
+    auto cloudPipe = device->CreateGraphicsPipeline(cloudD);
+
+    rhi::GraphicsPipelineDesc cCompD;
+    cCompD.vertex = postVs.get(); cCompD.fragment = cloudCompFs.get();
+    cCompD.colorFormat = device->Swapchain().ColorFormat();
+    cCompD.depthTest = false; cCompD.usesTexture = true; cCompD.fullscreen = true;
+    cCompD.fragmentPushConstants = true; cCompD.pushConstantSize = sizeof(CloudCompParams);
+    auto cCompPipe = device->CreateGraphicsPipeline(cCompD);
+
+    auto rt      = device->CreateRenderTarget(W, H, kHdr);
+    auto gbuf    = device->CreateRenderTarget(W, H, kHdr);
+    auto cloudRT = device->CreateRenderTarget(W, H, kHdr);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+    for (int o = 0; o < kNumObjs; ++o) {
+        uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                         (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+        objTex.push_back(device->CreateTexture(
+            {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+    }
+    std::vector<uint8_t> floorPx(256 * 256 * 4);
+    for (uint32_t y = 0; y < 256; ++y)
+        for (uint32_t x = 0; x < 256; ++x) {
+            bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+            uint8_t v = dark ? 70 : 100;
+            size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+            floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+            floorPx[idx + 2] = (uint8_t)(v + 6); floorPx[idx + 3] = 255;
+        }
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+
+    std::vector<Mat4> objModel(kNumObjs);
+    for (int o = 0; o < kNumObjs; ++o)
+        objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+            {objs[o].scale, objs[o].scale, objs[o].scale});
+    Mat4 groundModel = Mat4::Scale({30.0f, 1.0f, 30.0f});
+
+    const Vec3 eye{0.0f, 3.2f, 9.0f};
+    const Vec3 center{0.0f, 3.0f, -2.0f};
+    Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+    Vec3 lightDir = math::normalize(Vec3{-0.55f, -0.62f, -0.55f});
+    FrameData fd{};
+    {
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 200.0f));
+        Mat4 vp = proj * viewM;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = lightDir.x; fd.lightDir[1] = lightDir.y; fd.lightDir[2] = lightDir.z;
+        // Bright sun so the cloud-shadow attenuation reads as CLEAR dark patches (matches the Vulkan
+        // --cloud-shadows-shot FrameData exactly).
+        fd.lightColor[0] = 3.2f; fd.lightColor[1] = 3.05f; fd.lightColor[2] = 2.8f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{0.0f, 0.6f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-9.0f, 9.0f, -9.0f, 9.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+    }
+
+    // Cloud-shadow push-constant tail (slabBottom, slabTop, time, shadowSteps).
+    const float cloudPC[4] = {clouds::kSlabBottom, clouds::kSlabTop,
+                              clouds::kFixedTime, (float)kShadowSteps};
+
+    CloudParams cprm{};
+    cprm.slabBottom = clouds::kSlabBottom; cprm.slabTop = clouds::kSlabTop;
+    cprm.time = clouds::kFixedTime; cprm.coverage = clouds::kCoverage;
+    cprm.steps = (float)kCloudSteps; cprm.lightSteps = 6.0f; cprm.g = 0.5f; cprm.densityMul = 6.0f;
+    cprm.sunColor[0] = 1.6f; cprm.sunColor[1] = 1.5f; cprm.sunColor[2] = 1.35f;
+    cprm.ambient = 0.18f;
+    cprm.skyTop[0] = 0.18f; cprm.skyTop[1] = 0.30f; cprm.skyTop[2] = 0.62f;
+    cprm.skyBottom[0] = 0.65f; cprm.skyBottom[1] = 0.72f; cprm.skyBottom[2] = 0.82f;
+    cprm.texel[0] = 1.0f / (float)W; cprm.texel[1] = 1.0f / (float)H;
+    cprm.exposure = 1.0f; cprm.dbg = 0.0f;
+
+    CloudCompParams ccp{}; ccp.texel[0] = 1.0f / (float)W; ccp.texel[1] = 1.0f / (float)H;
+    ccp.intensity = 1.4f; ccp.pad = 0.0f;
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgGbuf = graph.ImportTarget(
+        "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+    render::RgResource rgCloud = graph.ImportTarget(
+        "clouds", render::RgResourceKind::SceneColor, *cloudRT);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+        const scene::Mesh& m = objs[o].cube ? cube : sphere;
+        cmd.BindVertexBuffer(m.vertices());
+        cmd.BindIndexBuffer(m.indices());
+        cmd.DrawIndexed(m.indexCount());
+    };
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            for (int o = 0; o < kNumObjs; ++o) {
+                cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[24];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.8f; pc[18] = 0.0f; pc[19] = 0.0f;
+                for (int k = 0; k < 4; ++k) pc[20 + k] = cloudPC[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[24];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                pc[16] = 0.0f; pc[17] = 0.55f; pc[18] = 0.0f; pc[19] = 0.0f;
+                for (int k = 0; k < 4; ++k) pc[20 + k] = cloudPC[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*objTex[o], *flatNormal);
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("gbuffer", {}, {rgGbuf},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*gbStaticPipeline);
+            {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            for (int o = 0; o < kNumObjs; ++o) {
+                float pc[32];
+                for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                cmd.PushConstants(pc, sizeof(pc));
+                drawObj(cmd, o);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("clouds", {rgGbuf}, {rgCloud},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+            cmd.BindPipeline(*cloudPipe);
+            cmd.BindTexture(*gbuf);
+            cmd.PushConstants(&cprm, sizeof(cprm));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("composite", {rgScene, rgCloud}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*cCompPipe);
+            cmd.BindTexturePair(*rt, *cloudRT);
+            cmd.PushConstants(&ccp, sizeof(ccp));
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("cloud-shadows: {steps:%d, time:%g}\n",
+                kShadowSteps, (double)clouds::kFixedTime);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — cloud shadows, %d objects\n", outPath, cw, ch, kNumObjs);
+    return 0;
+}
+
 // --- Screen-space global illumination showcase (Slice BP). Mirrors the Vulkan --ssgi-shot path
 // EXACTLY: a Cornell-style COLOR-BLEED scene — a red + green vertical panel flanking a neutral grey
 // floor + white box, lit in a DARK surround (no sky pass), rendered into an HDR RT + the SSAO/SSR
@@ -12788,6 +13103,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--clouds") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clouds.png";
             try { return RunCloudsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cloud-shadows <out.png>: cloud shadows on the ground showcase (Slice CK) — the SAME
+        // lit+shadowed scene + cloud field + time + sun + camera as --clouds, but the lit ground/objects
+        // are shaded by the lit_cloudshadow VARIANT, attenuating the direct sun by CloudShadow so the
+        // surfaces show FIXED dappled cloud shadows matching the cloudscape overhead. Mirrors the Vulkan
+        // --cloud-shadows-shot exactly; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--cloud-shadows") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cloud_shadows.png";
+            try { return RunCloudShadowsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --ssgi <out.png>: screen-space global-illumination showcase (Slice BP) — a Cornell-style

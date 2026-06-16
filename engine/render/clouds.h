@@ -149,6 +149,48 @@ inline float Density(const math::Vec3& worldPos, float t, float slabBottom, floa
 // Beer-Lambert extinction: transmittance after an optical depth. Beer(0)=1, monotone decreasing to 0.
 inline float Beer(float opticalDepth) { return std::exp(-opticalDepth); }
 
+// --- Cloud shadow on the ground/scene (Slice CK) ----------------------------------------------------
+// The fraction of DIRECT SUNLIGHT that reaches `worldPos` after passing through the cloud slab — i.e.
+// the sun's transmittance to that surface point. 1 = full sun (no cloud blocks the ray), 0 = fully
+// shadowed (the sun is behind opaque cloud). Multiply the directional-light DIRECT term by this to cast
+// dappled cloud shadows on the scene; ambient/IBL/point lights are unaffected (clouds only block the
+// sun). Shared CPU/shader math (lit_cloudshadow.frag mirrors it verbatim) + unit-tested.
+//
+// CONVENTION: `sunDir` is the DIRECTIONAL-LIGHT direction — the direction the sunlight TRAVELS (same as
+// FrameData.lightDir). The direction FROM the surface TOWARD the sun is therefore `-sunDir`. We march
+// from `worldPos` along `-sunDir` toward the sun, clipped to the cloud slab [slabBottom, slabTop],
+// accumulating optical depth = sum(Density * stepLen) over `steps` uniform samples, and return
+// Beer(opticalDepth). DETERMINISTIC: fixed `t`, fixed `steps`, the CH integer-lattice hash noise (no
+// RNG/clock) -> two runs bit-identical and the CPU test + the shader agree.
+//
+// If the toward-sun ray never crosses the slab (e.g. pointing away/parallel, or the slab is entirely
+// behind the start), there is no cloud along the ray -> optical depth 0 -> full sun (returns 1).
+inline float CloudShadow(const math::Vec3& worldPos, const math::Vec3& sunDir, float t,
+                         float slabBottom, float slabTop, int steps) {
+    // Direction from the surface toward the sun (opposite the light's travel direction).
+    math::Vec3 toSun = math::normalize(sunDir * -1.0f);
+
+    // Intersect the toward-sun ray with the two horizontal slab planes (y = slabBottom, y = slabTop).
+    // A near-horizontal ray (|toSun.y| ~ 0) never meaningfully enters/leaves the slab.
+    if (std::fabs(toSun.y) <= 1e-4f) return 1.0f;
+    float t0 = (slabBottom - worldPos.y) / toSun.y;
+    float t1 = (slabTop    - worldPos.y) / toSun.y;
+    float tEnter = std::fmin(t0, t1);
+    float tExit  = std::fmax(t0, t1);
+    tEnter = std::fmax(tEnter, 0.0f);          // never march behind the surface (toward the ground)
+    if (tExit <= tEnter) return 1.0f;          // the slab is not in front along the toward-sun ray
+
+    int   n = (steps > 0) ? steps : 1;
+    float stepLen = (tExit - tEnter) / (float)n;
+    float opticalDepth = 0.0f;
+    for (int s = 0; s < n; ++s) {
+        float ts = tEnter + ((float)s + 0.5f) * stepLen;
+        math::Vec3 p = worldPos + toSun * ts;
+        opticalDepth += Density(p, t, slabBottom, slabTop) * stepLen;
+    }
+    return Beer(opticalDepth);
+}
+
 // Henyey-Greenstein phase function. cosAngle is between the view ray and the light direction; g>0
 // forward-scatters (peaks at cosAngle=1) so looking toward the sun through the cloud glows. g=0 is
 // isotropic 1/(4*pi). Matches the volumetric fog HG (engine/render/volumetric.h) form.

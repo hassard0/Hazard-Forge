@@ -192,6 +192,8 @@ int main() {
             bool sawVfxFeature = false;
             // Slice CH: the volumetric-clouds capability is advertised in the feature manifest.
             bool sawCloudsFeature = false;
+            // Slice CK: the cloud-shadows capability is advertised in the feature manifest.
+            bool sawCloudShadowsFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -228,6 +230,7 @@ int main() {
                     if (AsString(el->value) == "editor-live-edit") sawEditorLiveEditFeature = true;
                     if (AsString(el->value) == "particle-vfx") sawVfxFeature = true;
                     if (AsString(el->value) == "volumetric-clouds") sawCloudsFeature = true;
+                    if (AsString(el->value) == "cloud-shadows") sawCloudShadowsFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -261,6 +264,7 @@ int main() {
             check(sawEditorLiveEditFeature, "engine.features includes editor-live-edit");
             check(sawVfxFeature, "engine.features includes particle-vfx");
             check(sawCloudsFeature, "engine.features includes volumetric-clouds");
+            check(sawCloudShadowsFeature, "engine.features includes cloud-shadows");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -352,6 +356,8 @@ int main() {
         bool sawVfxShot = false;
         // Slice CH: the --clouds-shot showcase flag is listed in the showcase manifest.
         bool sawCloudsShot = false;
+        // Slice CK: the --cloud-shadows-shot showcase flag is listed in the showcase manifest.
+        bool sawCloudShadowsShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -391,6 +397,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-edit-shot") sawEditorEditShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vfx-shot") sawVfxShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--clouds-shot") sawCloudsShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--cloud-shadows-shot") sawCloudShadowsShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -428,6 +435,7 @@ int main() {
         check(sawEditorEditShot, "showcases manifest includes --editor-edit-shot");
         check(sawVfxShot, "showcases manifest includes --vfx-shot");
         check(sawCloudsShot, "showcases manifest includes --clouds-shot");
+        check(sawCloudShadowsShot, "showcases manifest includes --cloud-shadows-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));
