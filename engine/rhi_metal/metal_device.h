@@ -62,6 +62,15 @@ public:
     FrameContext BeginRenderTargetFrame(IRenderTarget& rt) override;
     void EndRenderTargetFrame(const FrameContext&) override;
 
+    // Slice DD — runtime cubemap-capture reflection probe.
+    std::unique_ptr<ICubemapTarget> CreateCubemapTarget(uint32_t size, Format colorFormat) override;
+    FrameContext BeginCubemapFace(ICubemapTarget& cube, uint32_t face) override;
+    void EndCubemapFace(const FrameContext&) override;
+    bool ReadCubemapFace(ICubemapTarget& cube, uint32_t face, std::vector<uint8_t>& outBGRA,
+                         uint32_t& width, uint32_t& height) override;
+    bool ReadRenderTarget(IRenderTarget& rt, std::vector<uint8_t>& outBGRA,
+                          uint32_t& width, uint32_t& height) override;
+
     ICommandBuffer* CreateSecondaryCommandBuffer(uint32_t threadIndex) override;
 
     FrameContext BeginFrame() override;

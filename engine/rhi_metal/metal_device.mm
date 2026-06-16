@@ -6,6 +6,7 @@
 #include "rhi_metal/metal_buffer.h"
 #include "rhi_metal/metal_texture.h"
 #include "rhi_metal/metal_render_target.h"
+#include "rhi_metal/metal_cubemap_target.h"
 #include "rhi_metal/metal_common.h"
 #import <QuartzCore/CAMetalLayer.h>
 #include <cstring>
@@ -114,6 +115,83 @@ void MetalDevice::EndRenderTargetFrame(const FrameContext& frame) {
     [rtCmd_ commit];
     [rtCmd_ waitUntilCompleted];
     rtCmd_ = nil;
+}
+
+// --- Slice DD: runtime cubemap-capture reflection probe. Mirrors the RT path but targets one cube
+// face per pass (the color attachment's array slice == the face), then samples the whole cube as a
+// hardware texturecube. The per-face passes commit+wait (Metal tracks hazards automatically, so the
+// cube is fully written before the reflection pass samples it). ----------------------------------
+
+std::unique_ptr<ICubemapTarget> MetalDevice::CreateCubemapTarget(uint32_t size, Format colorFormat) {
+    return std::make_unique<MetalCubemapTarget>(*this, size, colorFormat);
+}
+
+FrameContext MetalDevice::BeginCubemapFace(ICubemapTarget& cubeBase, uint32_t face) {
+    auto& cube = static_cast<MetalCubemapTarget&>(cubeBase);
+    rtCmd_ = [queue_ commandBuffer];
+    if (!rtCmd_) Fail("BeginCubemapFace: commandBuffer failed");
+    rtRecorder_->Begin(rtCmd_, cube.cubeTexture(), cube.depthTexture(), cube.size(), cube.size());
+    rtRecorder_->SetColorSlice(face);   // render into this cube face
+    return FrameContext{rtRecorder_.get()};
+}
+
+void MetalDevice::EndCubemapFace(const FrameContext& frame) {
+    if (!frame.cmd || !rtCmd_) return;
+    // The caller already issued EndRenderPass(); commit + wait so the face is fully written. After the
+    // last face the cube is complete and sampleable (no explicit barrier needed on Metal).
+    [rtCmd_ commit];
+    [rtCmd_ waitUntilCompleted];
+    rtCmd_ = nil;
+}
+
+// Blit one (texture, slice) back to host memory as tightly-packed pixels at `bpp` bytes/pixel.
+static bool BlitReadLayer(id<MTLCommandQueue> queue, id<MTLDevice> dev, id<MTLTexture> tex,
+                          uint32_t slice, uint32_t w, uint32_t h, uint32_t bpp,
+                          std::vector<uint8_t>& out) {
+    const NSUInteger bytesPerRow = (NSUInteger)w * bpp;
+    const NSUInteger bufSize = bytesPerRow * h;
+    id<MTLBuffer> staging = [dev newBufferWithLength:bufSize options:MTLResourceStorageModeShared];
+    if (!staging) return false;
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromTexture:tex
+              sourceSlice:slice
+              sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(w, h, 1)
+                 toBuffer:staging
+        destinationOffset:0
+   destinationBytesPerRow:bytesPerRow
+ destinationBytesPerImage:bufSize];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    out.resize(bufSize);
+    std::memcpy(out.data(), [staging contents], bufSize);
+    return true;
+}
+
+static uint32_t MetalBpp(Format f) { return (f == Format::RGBA16_Float) ? 8u : 4u; }
+
+bool MetalDevice::ReadCubemapFace(ICubemapTarget& cubeBase, uint32_t face,
+                                  std::vector<uint8_t>& outBGRA, uint32_t& width, uint32_t& height) {
+    auto& cube = static_cast<MetalCubemapTarget&>(cubeBase);
+    width = cube.size(); height = cube.size();
+    // The cube's color pixel format determines bpp; CreateCubemapTarget in the showcase uses RGBA16F.
+    Format fmt = (cube.cubeTexture().pixelFormat == MTLPixelFormatRGBA16Float) ? Format::RGBA16_Float
+                                                                               : Format::BGRA8_UNorm;
+    return BlitReadLayer(queue_, device_, cube.cubeTexture(), face, cube.size(), cube.size(),
+                         MetalBpp(fmt), outBGRA);
+}
+
+bool MetalDevice::ReadRenderTarget(IRenderTarget& rtBase, std::vector<uint8_t>& outBGRA,
+                                   uint32_t& width, uint32_t& height) {
+    auto& rt = static_cast<MetalRenderTarget&>(rtBase);
+    width = rt.width(); height = rt.height();
+    Format fmt = (rt.colorTexture().pixelFormat == MTLPixelFormatRGBA16Float) ? Format::RGBA16_Float
+                                                                              : Format::BGRA8_UNorm;
+    return BlitReadLayer(queue_, device_, rt.colorTexture(), 0, rt.width(), rt.height(),
+                         MetalBpp(fmt), outBGRA);
 }
 
 // --- Directional shadow mapping. Mirrors the Vulkan backend: a depth-only sampleable shadow map

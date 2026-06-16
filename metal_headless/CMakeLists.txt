@@ -313,6 +313,12 @@ hf_gen_msl(probe_irradiance.frag probe_irradiance.frag.hlsl frag probe_irradianc
 # reflection cubemap. Reuses lit.vert + the probe bake/blit/irradiance + post.vert passes. Same
 # HLSL->SPIR-V->MSL toolchain -> bit-identical to the Vulkan path; new golden refl_probe.png.
 hf_gen_msl(reflprobe.frag        reflprobe.frag.hlsl        frag reflprobe_fragment)
+# Runtime cubemap-capture reflection probe (Slice DD): a reflective-surface variant of reflprobe.frag
+# that samples a CAPTURED hardware TextureCube (the scene rendered into 6 cube faces from the probe
+# center, via the additive cubemap-RT interface) box-projected by DA's reflprobe math. Reuses lit.vert
+# + probe_bake.{vert,frag} (the per-face capture) + post.vert. Same HLSL->SPIR-V->MSL toolchain ->
+# bit-identical to the Vulkan path; new golden capture_probe.png.
+hf_gen_msl(captureprobe.frag     captureprobe.frag.hlsl     frag captureprobe_fragment)
 # Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
 # current jittered HDR scene. Reuses post.vert (fullscreen triangle). Same HLSL->SPIR-V->MSL toolchain;
 # existing shaders + goldens untouched.
@@ -347,6 +353,7 @@ add_executable(visual_test
     ${HF_ROOT}/engine/rhi_metal/metal_compute_pipeline.mm
     ${HF_ROOT}/engine/rhi_metal/metal_texture.mm
     ${HF_ROOT}/engine/rhi_metal/metal_render_target.mm
+    ${HF_ROOT}/engine/rhi_metal/metal_cubemap_target.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader.mm
     ${HF_ROOT}/engine/rhi_metal/metal_shader_load.mm
     ${HF_ROOT}/engine/rhi_metal/metal_buffer.mm

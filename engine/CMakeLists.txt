@@ -61,6 +61,7 @@ if(APPLE)
     rhi_metal/metal_command_buffer.mm
     rhi_metal/metal_texture.mm
     rhi_metal/metal_render_target.mm
+    rhi_metal/metal_cubemap_target.mm
     rhi_metal/metal_shader_load.mm
   )
 else()

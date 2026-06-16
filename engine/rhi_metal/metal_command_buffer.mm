@@ -6,6 +6,7 @@
 #include "rhi_metal/metal_texture.h"
 #include "rhi_metal/metal_sampled.h"
 #include "rhi_metal/metal_render_target.h"
+#include "rhi_metal/metal_cubemap_target.h"
 #include "rhi_metal/metal_common.h"
 
 namespace hf::rhi::mtl {
@@ -25,6 +26,7 @@ void MetalCommandBuffer::Begin(id<MTLCommandBuffer> cmd, id<MTLTexture> colorTex
     indexBuffer_ = nil;
     boundFrameUniforms_ = false;
     boundPointList_ = false;
+    colorSlice_ = 0;  // Slice DD: normal 2D target (no cube-face slice) unless a face is selected
 }
 
 // Build the render-pass descriptor shared by the single-encoder and parallel-encoder paths.
@@ -55,6 +57,9 @@ void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear) {
 
 void MetalCommandBuffer::BeginRenderPass(const ClearColor& clear, bool expectsSecondaries) {
     MTLRenderPassDescriptor* rpd = MakeRenderPassDescriptor(colorTex_, depthTex_, clear);
+    // Slice DD: render into a specific cube FACE by selecting the color attachment's array slice.
+    if (colorTex_ != nil && colorSlice_ != 0)
+        rpd.colorAttachments[0].slice = colorSlice_;
 
     if (expectsSecondaries) {
         // Slice AU: open a PARALLEL render command encoder. It vends N sub-encoders (one per worker)
@@ -239,6 +244,17 @@ void MetalCommandBuffer::BindReflectionProbe(ITexture& probeAtlas) {
     // as gProbe/gProbeSmp. A render target is an IMetalSampled, so this is identical to BindEnvironment.
     auto* s = dynamic_cast<IMetalSampled*>(&probeAtlas);
     if (!s) Fail("BindReflectionProbe: texture is not an IMetalSampled");
+    [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragEnvTex];
+    [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragEnvSmp];
+}
+
+void MetalCommandBuffer::BindCubemapProbe(ITexture& cubemap) {
+    // Slice DD — bind the CAPTURED cubemap (a MetalCubemapTarget) at the SAME flat fragment env
+    // texture(11)/sampler(12) as BindReflectionProbe, so the generated captureprobe MSL reads it as a
+    // texturecube<float> gCube/gCubeSmp. A MetalCubemapTarget is an IMetalSampled whose sampledTexture
+    // is the cube, so this is identical to BindReflectionProbe.
+    auto* s = dynamic_cast<IMetalSampled*>(&cubemap);
+    if (!s) Fail("BindCubemapProbe: texture is not an IMetalSampled");
     [encoder_ setFragmentTexture:s->sampledTexture() atIndex:kFragEnvTex];
     [encoder_ setFragmentSamplerState:s->sampledSampler() atIndex:kFragEnvSmp];
 }

@@ -56,6 +56,7 @@
 #include "render/point_shadow.h" // Slice AF: omnidirectional point-light 6-face cube shadow (pure math)
 #include "render/probe.h"        // Slice AK: reflection + irradiance probe atlas math (pure math)
 #include "render/reflection_probe.h" // Slice DA: box-projected cubemap reflection math (pure math)
+#include "render/cubemap.h"       // Slice DD: runtime cubemap-capture reflection probe math (pure math)
 #include "render/color_grade.h"      // Slice DB: analytic color-grade math (lift/gamma/gain + ASC-CDL + saturation)
 #include "render/clustered.h"     // Slice AG: clustered / Forward+ light culling (pure math)
 #include "render/cluster.h"       // Slice CL: clustered light culling (cluster-grid assignment math)
@@ -16907,6 +16908,258 @@ static int RunReflProbeShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Runtime Cubemap-Capture Reflection Probe showcase (Slice DD). Mirrors the Vulkan
+// --captureprobe-shot path EXACTLY: the scene (distinct colored walls around a reflective sphere +
+// floor) is RENDERED into the 6 faces of a REAL captured cubemap (the additive cubemap-RT interface)
+// from a fixed probe center, then the reflective heroes sample the captured cube (box-projected,
+// reusing DA) so they mirror the actual surrounding objects. The SAME captureprobe.frag compiled here
+// (HLSL->SPIR-V->MSL) makes the result bit-identical to the Vulkan path. THE CAPTURE-CORRECTNESS PROOF
+// (backend-portable): face 0 rendered DIRECTLY into a 2D RT with face-0's view/proj is asserted
+// BYTE-IDENTICAL to ReadCubemapFace(0). New golden capture_probe.png; existing goldens untouched.
+static int RunCaptureProbeShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace cm = hf::render::cubemap;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    struct ProbeFrameData {
+        float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+        float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+        float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+    };
+    static_assert(sizeof(ProbeFrameData) == 624, "Capture-probe FrameData layout");
+
+    const Vec3 kProbePos{0.0f, 2.0f, 0.0f};
+    const float Rroom = 6.0f;
+    const float kParallax = 1.0f;
+    const uint32_t kCubeSize = 512;
+    const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float aspect = (float)W / (float)H;
+
+    auto litVs  = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto bakeVs = loadMSL("probe_bake.vert.gen.metal", "probe_bake_vertex");
+    auto bakeFs = loadMSL("probe_bake.frag.gen.metal", "probe_bake_fragment");
+    auto capFs  = loadMSL("captureprobe.frag.gen.metal", "captureprobe_fragment");
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+
+    rhi::GraphicsPipelineDesc bakeDesc;
+    bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+    bakeDesc.vertexLayout = scene::MeshVertexLayout();
+    bakeDesc.colorFormat = kHdr;
+    bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+    bakeDesc.pushConstantSize = sizeof(float) * 32;
+    auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+    rhi::GraphicsPipelineDesc capDesc;
+    capDesc.vertex = litVs.get(); capDesc.fragment = capFs.get();
+    capDesc.vertexLayout = scene::MeshVertexLayout();
+    capDesc.colorFormat = kHdr;
+    capDesc.depthTest = true; capDesc.usesFrameUniforms = true; capDesc.usesTexture = true;
+    capDesc.usesEnvironment = true;
+    capDesc.pushConstantSize = sizeof(float) * 20;
+    auto capPipeline = device->CreateGraphicsPipeline(capDesc);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+    auto faceRT  = device->CreateRenderTarget(kCubeSize, kCubeSize, kHdr);
+    auto sceneRT = device->CreateRenderTarget(W, H, kHdr);
+    auto dummyShadow = device->CreateShadowMap(64);
+    device->SetShadowMap(*dummyShadow);
+    if (!cube) return fail("cubemap render targets unavailable");
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+    scene::Mesh sphere   = scene::Mesh::Sphere(*device);
+
+    auto colorTex = [&](float r, float g, float b) {
+        uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+        return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+    };
+    auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+    auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+    auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+    auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+    auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+
+    const float Tk = 0.2f;
+    struct Wall { Mat4 model; rhi::ITexture* tex; };
+    std::vector<Wall> walls = {
+        {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+        {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+        {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+        {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+        {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+        {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+    };
+    Mat4 sphereModel = Mat4::Translate({0.0f, 1.2f, 1.0f}) * Mat4::Scale({1.6f, 1.6f, 1.6f});
+    Mat4 floorModel  = Mat4::Translate({0.0f, -3.7f, 0.0f}) * Mat4::Scale({5.0f, 0.15f, 5.0f});
+
+    const Vec3 eye{0.0f, 2.4f, 9.0f};
+    const Vec3 ctr{0.0f, 1.6f, 0.0f};
+    const float fovY = 1.04719755f;
+    Vec3 fwd   = math::normalize(ctr - eye);
+    Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+    Vec3 up3   = math::cross(right, fwd);
+
+    // The 6 cube-face view-projs from the probe center, Y-flipped for Metal clip space (matches how a
+    // Metal texturecube samples). The capture==face-0 proof uses the SAME FlipProjY(faceVP[0]) for both
+    // the cube face and the direct RT, so they match regardless of the flip.
+    Mat4 faceVPs[6];
+    for (int fi = 0; fi < 6; ++fi)
+        faceVPs[fi] = FlipProjY(cm::FaceViewProj(fi, kProbePos, kCubeNear, kCubeFar));
+
+    const Vec3 boxMin{kProbePos.x - Rroom, kProbePos.y - Rroom, kProbePos.z - Rroom};
+    const Vec3 boxMax{kProbePos.x + Rroom, kProbePos.y + Rroom, kProbePos.z + Rroom};
+
+    ProbeFrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, ctr, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+        for (int fi = 0; fi < 6; ++fi)
+            for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+        Vec3 ld = math::normalize(Vec3{-0.3f, -0.85f, -0.35f});
+        fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+        fd.lightColor[0]=0.55f; fd.lightColor[1]=0.55f; fd.lightColor[2]=0.58f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.probePos[0]=kProbePos.x; fd.probePos[1]=kProbePos.y; fd.probePos[2]=kProbePos.z; fd.probePos[3]=1.0f;
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.skyParams[0]=boxMin.x; fd.skyParams[1]=boxMin.y; fd.skyParams[2]=boxMin.z;
+        fd.skyParams[3]=kParallax;
+        fd.pad0[0]=boxMax.x; fd.pad0[1]=boxMax.y; fd.pad0[2]=boxMax.z; fd.pad0[3]=0.0f;
+    }
+
+    auto drawRoom = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP) {
+        cmd.BindPipeline(*bakePipeline);
+        for (const auto& wl : walls) {
+            float pc[32];
+            for (int k = 0; k < 16; ++k) pc[k]      = faceVP.m[k];
+            for (int k = 0; k < 16; ++k) pc[16 + k] = wl.model.m[k];
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.BindTexture(*wl.tex);
+            cmd.BindVertexBuffer(cubeMesh.vertices());
+            cmd.BindIndexBuffer(cubeMesh.indices());
+            cmd.DrawIndexed(cubeMesh.indexCount());
+        }
+    };
+
+    // Capture the colored room into the 6 cube faces.
+    auto captureCube = [&]() {
+        for (uint32_t face = 0; face < 6; ++face) {
+            auto fc = device->BeginCubemapFace(*cube, face);
+            fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+            drawRoom(*fc.cmd, faceVPs[face]);
+            fc.cmd->EndRenderPass();
+            device->EndCubemapFace(fc);
+        }
+    };
+
+    auto renderScene = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+        captureCube();
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+        render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("capScene", {}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                cmd.BindPipeline(*capPipeline);
+                cmd.BindCubemapProbe(*cube);
+                auto drawSurf = [&](const Mat4& model, const scene::Mesh& mesh, rhi::ITexture& tex,
+                                    float metallic, float rough) {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                    pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(tex, *flatNormal);
+                    cmd.BindCubemapProbe(*cube);
+                    cmd.BindVertexBuffer(mesh.vertices());
+                    cmd.BindIndexBuffer(mesh.indices());
+                    cmd.DrawIndexed(mesh.indexCount());
+                };
+                for (size_t wi = 0; wi < walls.size(); ++wi)
+                    if (wi != 5) drawSurf(walls[wi].model, cubeMesh, *walls[wi].tex, 0.0f, 0.95f);
+                drawSurf(sphereModel, sphere,   *whiteTex, 1.0f, 0.06f);
+                drawSurf(floorModel,  cubeMesh, *whiteTex, 1.0f, 0.08f);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneRT);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    auto sha = [](const std::vector<uint8_t>& px) {
+        uint64_t hsh = 1469598103934665603ull;
+        for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+        return hsh;
+    };
+
+    std::vector<uint8_t> scenePx; uint32_t sw0=0, sh0=0;
+    if (!renderScene(scenePx, sw0, sh0)) return fail("no captured pixels (capture-probe scene)");
+
+    std::vector<uint8_t> cubeFace0; uint32_t cfw=0, cfh=0;
+    if (!device->ReadCubemapFace(*cube, 0, cubeFace0, cfw, cfh)) return fail("ReadCubemapFace(0) failed");
+
+    // Face 0 rendered DIRECTLY into the 2D RT with face-0's view/proj.
+    {
+        auto fc = device->BeginRenderTargetFrame(*faceRT);
+        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+        drawRoom(*fc.cmd, faceVPs[0]);
+        fc.cmd->EndRenderPass();
+        device->EndRenderTargetFrame(fc);
+    }
+    std::vector<uint8_t> directFace0; uint32_t dfw=0, dfh=0;
+    if (!device->ReadRenderTarget(*faceRT, directFace0, dfw, dfh)) return fail("ReadRenderTarget failed");
+
+    const bool faceIdentical = (cfw == dfw) && (cfh == dfh) &&
+                               (cubeFace0.size() == directFace0.size()) &&
+                               (std::memcmp(cubeFace0.data(), directFace0.data(), directFace0.size()) == 0);
+    if (!faceIdentical)
+        return fail("captured cube face 0 != scene rendered directly with face-0 view/proj — NOT identical");
+    std::printf("capture-probe: captured face-0 == direct face-0 render: BYTE-IDENTICAL "
+                "(capture-correctness proof) [cube %016llx direct %016llx]\n",
+                (unsigned long long)sha(cubeFace0), (unsigned long long)sha(directFace0));
+    std::printf("capture-probe: {faces:6, cubeSize:%u}\n", kCubeSize);
+
+    if (!WritePNG(outPath, scenePx, sw0, sh0)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — runtime cubemap-capture reflection, cubeSize %u\n",
+                outPath, sw0, sh0, kCubeSize);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
@@ -17520,6 +17773,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--reflprobe") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_refl_probe.png";
             try { return RunReflProbeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --captureprobe <out.png>: runtime cubemap-capture reflection probe showcase (Slice DD). The
+        // scene is rendered into a real captured cubemap from the probe center; reflective heroes sample
+        // the captured cube box-projected. INTERNALLY asserts the captured face 0 == a direct render with
+        // face-0's view/proj (BYTE-IDENTICAL). Mirrors the Vulkan --captureprobe-shot; new golden
+        // capture_probe.png.
+        if (argc > 1 && std::strcmp(argv[1], "--captureprobe") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_capture_probe.png";
+            try { return RunCaptureProbeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --taa <out.png>: temporal anti-aliasing showcase (Slice AP). The settled sphere-pyramid scene

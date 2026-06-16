@@ -41,6 +41,7 @@ public:
                          ITexture& emissive, ITexture& occlusion) override;
     void BindEnvironment(ITexture& env) override;
     void BindReflectionProbe(ITexture& probeAtlas) override;
+    void BindCubemapProbe(ITexture& cubemap) override;
     void BindLightClusters(IBuffer& clusters, IBuffer& lightIndices, IBuffer& lights) override;
     void Draw(uint32_t vertexCount, uint32_t firstVertex) override;
     void DrawIndexed(uint32_t indexCount, uint32_t firstIndex, int32_t vertexOffset) override;
@@ -66,6 +67,9 @@ public:
     id<MTLRenderCommandEncoder> encoder() const { return encoder_; }
     uint32_t width() const { return width_; }
     uint32_t height() const { return height_; }
+    // Slice DD — select the color-attachment ARRAY SLICE for the next BeginRenderPass (the cube face
+    // to render into). 0 for normal 2D targets; set per face by BeginCubemapFace. Reset to 0 by Begin.
+    void SetColorSlice(uint32_t slice) { colorSlice_ = slice; }
 
 private:
     MetalDevice& device_;
@@ -84,6 +88,7 @@ private:
     bool boundLineList_ = false;       // current graphics pipeline draws lines (debug-draw, Slice W)
     bool boundFragmentPushConst_ = false;  // current pipeline reads push constants in fragment (bloom)
     uint32_t computeThreadsPerGroup_ = 64;  // [numthreads(64,1,1)] in particles.comp.hlsl
+    uint32_t colorSlice_ = 0;  // Slice DD: color-attachment array slice (cube face) for BeginRenderPass
     uint32_t width_ = 0;
     uint32_t height_ = 0;
 };
