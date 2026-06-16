@@ -174,6 +174,8 @@ int main() {
             bool sawNetsimFeature = false;
             // Slice BT: the docked-editor capability is advertised in the feature manifest.
             bool sawDockedEditorFeature = false;
+            // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
+            bool sawEditorLiveEditFeature = false;
             if (features)
                 for (const json_array_element_s* el = features->start; el; el = el->next) {
                     if (AsString(el->value) == "temporal-anti-aliasing") sawTaaFeature = true;
@@ -198,6 +200,7 @@ int main() {
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
                     if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
                     if (AsString(el->value) == "docked-editor") sawDockedEditorFeature = true;
+                    if (AsString(el->value) == "editor-live-edit") sawEditorLiveEditFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -221,6 +224,7 @@ int main() {
             check(sawReplicationFeature, "engine.features includes state-replication");
             check(sawNetsimFeature, "engine.features includes network-transport-sim");
             check(sawDockedEditorFeature, "engine.features includes docked-editor");
+            check(sawEditorLiveEditFeature, "engine.features includes editor-live-edit");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -292,6 +296,8 @@ int main() {
         bool sawNetsimShot = false;
         // Slice BT: the --editor-shot showcase flag is listed in the showcase manifest.
         bool sawEditorShot = false;
+        // Slice BX: the --editor-edit-shot showcase flag is listed in the showcase manifest.
+        bool sawEditorEditShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -321,6 +327,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--net-shot") sawNetShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--netsim-shot") sawNetsimShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-shot") sawEditorShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--editor-edit-shot") sawEditorEditShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -348,6 +355,7 @@ int main() {
         check(sawNetShot, "showcases manifest includes --net-shot");
         check(sawNetsimShot, "showcases manifest includes --netsim-shot");
         check(sawEditorShot, "showcases manifest includes --editor-shot");
+        check(sawEditorEditShot, "showcases manifest includes --editor-edit-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));

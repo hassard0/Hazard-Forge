@@ -66,6 +66,7 @@
 #include "runtime/parallel_record.h"  // Slice AU: deterministic parallel command-recording partition
 #include "editor/gizmo.h"    // Slice AB: transform gizmo emit (drawn through the debug-line layer)
 #include "editor/editor_panels.h"   // Slice BT: docked editor UI (Hierarchy/Inspector/Stats/Viewport)
+#include "editor/edit_ops.h"        // Slice BX: pure-CPU editor live-edit ops (ApplyTransform/Material)
 #include "editor/imgui_renderer.h"  // Slice BT: RHI-only Dear ImGui renderer (consumes MSL on Metal)
 #include "imgui.h"                   // Slice BT: Dear ImGui (NewFrame/Render + io setup)
 
@@ -10293,8 +10294,17 @@ int main(int argc, char** argv) {
         // DIFF 0.0000 (ImGui geometry is CPU-built + deterministic). `editorMode` flows into the
         // shared default-scene path below; the editor chrome is composited in the post pass.
         bool editorMode = (argc > 1 && std::strcmp(argv[1], "--editor") == 0);
-        const char* outPath = editorMode ? (argc > 2 ? argv[2] : "metal_editor.png")
-                                          : (argc > 1 ? argv[1] : "metal_scene.png");
+        // --editor-edit <out.png>: editor LIVE-EDIT showcase (Slice BX). Same default scene + docked
+        // editor as --editor, but a FIXED edit sequence is applied to the registry first (the moved
+        // duck + recolored sphere) and the round-trip through scene_io is asserted — the IDENTICAL
+        // sequence + selection + layout the Vulkan --editor-edit-shot uses, so editor_edit.png is
+        // golden-comparable cross-backend + two runs DIFF 0.0000.
+        bool editEditorMode = (argc > 1 && std::strcmp(argv[1], "--editor-edit") == 0);
+        if (editEditorMode) editorMode = true;  // edit mode is editor mode + a pre-render edit.
+        const char* outPath = (editorMode || editEditorMode)
+                                  ? (argc > 2 ? argv[2] : (editEditorMode ? "metal_editor_edit.png"
+                                                                          : "metal_editor.png"))
+                                  : (argc > 1 ? argv[1] : "metal_scene.png");
         const uint32_t W = 1280, H = 720;
 
         try {
@@ -10493,6 +10503,49 @@ int main(int argc, char** argv) {
             ecs::Registry registry;
             scene::LoadScene(registry, resources, HF_SCENE_PATH);
 
+            // ---- Slice BX: editor LIVE-EDIT. Apply the IDENTICAL fixed edit sequence the Vulkan
+            // --editor-edit-shot uses BEFORE building the editor frame: translate the duck (view index
+            // 9) +1.0 on Y (relative ADD), recolor a sphere (index 8) to the duck_basecolor swatch +
+            // make it matte (metallic 0.0, roughness 0.9; absolute SETs). The editor then renders over
+            // the EDITED scene + the round-trip is asserted below. ----
+            const int kBxDuckIndex = 9;
+            const int kBxSphereIndex = 8;
+            std::string bxDump;
+            bool bxSaved = false, bxReloadMatch = false;
+            if (editEditorMode) {
+                editor::TransformEdit duckMove;
+                duckMove.addPosition = true;
+                duckMove.positionDelta = {0.0f, 1.0f, 0.0f};
+                editor::ApplyTransformEdit(registry, kBxDuckIndex, duckMove);
+
+                editor::MaterialEdit sphereRecolor;
+                sphereRecolor.setBaseColor = true;
+                sphereRecolor.baseColor = resources.FindTexture("duck_basecolor");
+                sphereRecolor.setMetallic = true;  sphereRecolor.metallic = 0.0f;
+                sphereRecolor.setRoughness = true; sphereRecolor.roughness = 0.9f;
+                editor::ApplyMaterialEdit(registry, kBxSphereIndex, sphereRecolor);
+
+                // scene_io round-trip (persistence proof): DumpScene the edited registry, reload into a
+                // fresh registry, assert the edited values survive.
+                bxDump = scene::DumpScene(registry, resources);
+                bxSaved = !bxDump.empty();
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << bxDump; }
+                ecs::Registry reloaded;
+                std::vector<ecs::Entity> rents =
+                    scene::LoadScene(reloaded, resources, tmpScene.c_str());
+                if (rents.size() > static_cast<size_t>(kBxDuckIndex)) {
+                    const auto& reloadedT = reloaded.get<scene::TransformC>(rents[kBxDuckIndex]).t;
+                    const auto& reloadedM = reloaded.get<scene::MaterialC>(rents[kBxSphereIndex]);
+                    bool duckOk = std::fabs(reloadedT.position.y - 2.35f) < 1e-3f;
+                    bool sphereOk = (reloadedM.base == resources.FindTexture("duck_basecolor")) &&
+                                    std::fabs(reloadedM.metallic - 0.0f) < 1e-4f &&
+                                    std::fabs(reloadedM.roughness - 0.9f) < 1e-4f;
+                    bxReloadMatch = duckOk && sphereOk;
+                }
+                std::remove(tmpScene.c_str());
+            }
+
             // ---- Docked editor (Slice BT): set up Dear ImGui + the RHI-only renderer when --editor.
             // Deterministic: no imgui.ini (machine-dependent), fixed DisplaySize/DeltaTime, a FIXED
             // selected entity, no cursor/time input. The ImGui pipeline shaders are the GENERATED ui
@@ -10506,8 +10559,11 @@ int main(int argc, char** argv) {
                      registry.view<scene::TransformC, scene::MeshC, scene::MaterialC>()) {
                     (void)e; (void)tc; (void)mc; (void)mat; ++editorEntityCount;
                 }
-                editorState.selectedEntity =
-                    editorEntityCount > 0 ? editorEntityCount - 1 : -1;  // FIXED selection: the duck.
+                // FIXED selection: the duck (last entity) for --editor; the recolored sphere for
+                // --editor-edit so the Inspector shows the edited material (matching Vulkan).
+                editorState.selectedEntity = editEditorMode
+                    ? kBxSphereIndex
+                    : (editorEntityCount > 0 ? editorEntityCount - 1 : -1);
 
                 IMGUI_CHECKVERSION();
                 ImGui::CreateContext();
@@ -10682,10 +10738,17 @@ int main(int argc, char** argv) {
             device->WaitIdle();
 
             if (editorMode) {
-                // Match the Vulkan --editor-shot stat line (deterministic; selection clamped + written
-                // back by BuildPanelData during BuildEditorUI).
-                std::printf("editor: {panels:[Hierarchy,Inspector,Stats,Viewport], selected:%d, "
-                            "entities:%d}\n", editorState.selectedEntity, editorEntityCount);
+                if (editEditorMode) {
+                    // Match the Vulkan --editor-edit-shot stat line.
+                    std::printf("editor-edit: {edits:%d, entity:%d, saved:%s, reloadMatch:%s}\n",
+                                2, kBxSphereIndex, bxSaved ? "true" : "false",
+                                bxReloadMatch ? "true" : "false");
+                } else {
+                    // Match the Vulkan --editor-shot stat line (deterministic; selection clamped +
+                    // written back by BuildPanelData during BuildEditorUI).
+                    std::printf("editor: {panels:[Hierarchy,Inspector,Stats,Viewport], selected:%d, "
+                                "entities:%d}\n", editorState.selectedEntity, editorEntityCount);
+                }
                 uiRenderer.reset();
                 ImGui::DestroyContext();
             }

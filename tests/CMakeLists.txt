@@ -90,6 +90,16 @@ hf_add_pure_test(editor_test)
 # code-driven dock layout VALUE. The --editor-shot capture golden-verifies the rendered chrome; this
 # pins the data behind it. Pure C++ (hf_core), no RHI/backend/ImGui symbols, ASan-eligible.
 hf_add_pure_test(editor_panels_test)
+# Docked editor LIVE-EDIT ops + scene_io round-trip (Slice BX): ApplyTransformEdit / ApplyMaterialEdit
+# (engine/editor/edit_ops.{h,cpp}) mutate the selected entity's TransformC/MaterialC on the live
+# registry — the WRITE path behind the BT read-only inspector. Asserts SET-vs-ADD transform semantics
+# (absolute replace vs relative delta; set wins same-field; others unchanged), out-of-range/component-
+# less safe no-ops, material SET (metallic/roughness/baseColor pointer), BuildPanelData reflection (the
+# read path sees the write), the scene_io round-trip (edits -> DumpScene JSON carries them -> LoadScene
+# into a fresh registry reloads them), and edit-sequence determinism (twice -> identical dump). The
+# --editor-edit-shot capture golden-verifies the rendered EDITED scene; this pins the ops behind it.
+# Pure C++ (hf_core), no RHI/backend/ImGui symbols, ASan-eligible.
+hf_add_pure_test(editor_edit_test)
 # Cascaded shadow maps (Slice AD): frustum-split scheme (N increasing splits in (near,far]) +
 # per-cascade ortho fit (all 8 slice corners land inside the cascade clip volume). Pure C++
 # (render/csm.h, header-only), ASan-eligible.

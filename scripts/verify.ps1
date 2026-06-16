@@ -108,6 +108,7 @@ $Goldens = @(
     @{ Name = 'decal';         Flag = '--decal' }             # Slice BH (screen-space projected decals)
     @{ Name = 'poststack';     Flag = '--poststack' }         # Slice BN (data-driven post-process stack)
     @{ Name = 'editor';        Flag = '--editor' }            # Slice BT (docked editor UI: Hierarchy/Inspector/Stats/Viewport)
+    @{ Name = 'editor_edit';   Flag = '--editor-edit' }      # Slice BX (editor live-edit: edited scene + scene_io round-trip)
 )
 
 $winResult = 'SKIP'

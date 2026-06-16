@@ -33,6 +33,7 @@ set(HF_ENGINE_COMMON_SOURCES
   editor/gizmo.cpp
   editor/introspect.cpp
   editor/editor_panel_data.cpp
+  editor/edit_ops.cpp
   material/shader_graph.cpp
   material/codegen.cpp
   material/material_loader.cpp
@@ -146,6 +147,7 @@ add_library(hf_core STATIC
   editor/gizmo.cpp
   editor/introspect.cpp
   editor/editor_panel_data.cpp
+  editor/edit_ops.cpp
   material/shader_graph.cpp
   material/codegen.cpp
   material/material_loader.cpp

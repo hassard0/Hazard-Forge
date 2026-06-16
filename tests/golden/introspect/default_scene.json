@@ -37,6 +37,7 @@
       "interactive-runtime",
       "editor-selection-gizmos",
       "docked-editor",
+      "editor-live-edit",
       "automatic-barriers",
       "material-graph",
       "material-graph-introspection",
@@ -96,6 +97,7 @@
     { "flag": "--mdi-shot", "desc": "GPU multi-draw-indirect batching (144 objects in 1 draw; MDI==per-draw byte-identical)." },
     { "flag": "--mt-shot", "desc": "Multithreaded command recording (per-thread secondaries, 1-vs-N identical)." },
     { "flag": "--editor-shot", "desc": "Docked editor UI (Scene Hierarchy / Inspector / Stats panels around a central scene Viewport, fixed selected entity)." },
+    { "flag": "--editor-edit-shot", "desc": "Editor live-edit: apply a fixed transform+material edit to the selected entity, render the EDITED docked scene, round-trip through scene_io (DumpScene/LoadScene)." },
     { "flag": "--gizmo-shot", "desc": "Editor selection + translate gizmo overlay." },
     { "flag": "--camera-shot", "desc": "Scripted-pose interactive-runtime capture." },
     { "flag": "--audio-render", "desc": "Deterministic audio mixer (integer/fixed-point voices -> 16-bit PCM WAV)." }

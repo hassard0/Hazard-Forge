@@ -52,6 +52,7 @@
 #include "editor/picking.h"
 #include "editor/gizmo.h"
 #include "editor/introspect.h"
+#include "editor/edit_ops.h"  // Slice BX: pure-CPU editor live-edit ops (ApplyTransformEdit/Material).
 // Slice AW (live runtime material authoring): in-process graph load + runtime dxc-subprocess compile
 // + the live-swap controller. Pure host logic (no backend symbols) above the RHI seam.
 #include "material/material_loader.h"
@@ -364,6 +365,10 @@ int main(int argc, char** argv) {
     // a BMP and a deterministic `editor: {...}` line printed. Implies --editor (the ImGui overlay).
     const char* editorShotPath = nullptr;
     int editorShotSelected = -1;  // FIXED selected entity (view-order index); <0 => default below.
+    // Slice BX (editor live-edit): apply a FIXED transform+material edit to the default scene, render
+    // the EDITED docked editor frame, and round-trip through scene_io (DumpScene/LoadScene). New
+    // showcase; the BT --editor-shot (unedited) golden is untouched.
+    const char* editorEditShotPath = nullptr;
     // Slice AB (editor interaction): gizmo capture + headless pick test.
     const char* gizmoShotPath = nullptr;    // --gizmo-shot <objIndex> <out.bmp>
     int gizmoShotIndex = 0;                  // selected object index for --gizmo-shot
@@ -732,6 +737,16 @@ int main(int argc, char** argv) {
             editorShotPath = argv[i + 1];
             ++i;
             if (i + 1 < argc && argv[i + 1][0] != '-') { editorShotSelected = std::atoi(argv[i + 1]); ++i; }
+        } else if (std::strcmp(argv[i], "--editor-edit-shot") == 0 && i + 1 < argc) {
+            // Slice BX: render ONE deterministic docked editor frame over the EDITED default scene.
+            // Apply a FIXED edit sequence (translate the duck +1.0 Y; recolor a sphere + set its
+            // material), render the docked editor (BT layout) over the edited scene, then round-trip
+            // the edited scene through scene_io (DumpScene -> assert the JSON; LoadScene into a fresh
+            // registry -> assert reloadMatch), print the `editor-edit: {...}` line, exit. Implies
+            // --editor. NEW showcase: the unedited --editor-shot golden (editor.png) stays untouched.
+            editor = true;
+            editorEditShotPath = argv[i + 1];
+            ++i;
         } else if (std::strcmp(argv[i], "--gizmo-shot") == 0 && i + 2 < argc) {
             // Slice AB: select object <objIndex> in a small deterministic scene, render it + the
             // selected object's translate gizmo (axis arrows) through the debug-line layer, capture.
@@ -13432,6 +13447,80 @@ int main(int argc, char** argv) {
                         "entities:%d}\n", editorState.selectedEntity, entityCount);
             teardownEditor();
             return ok ? 0 : 1;
+        }
+
+        // --- Slice BX: editor LIVE-EDIT capture. Apply a FIXED deterministic edit sequence to the
+        // default scene through the pure-CPU editor edit ops, render ONE docked editor frame over the
+        // EDITED scene (the moved duck + recolored sphere in the viewport, the new values in the
+        // Inspector), then ROUND-TRIP the edited scene through scene_io: DumpScene -> assert the JSON
+        // reflects the edits; LoadScene that dump into a FRESH registry -> assert the reloaded entity
+        // carries the edited values (reloadMatch). Print the `editor-edit: {...}` line, exit. The edit
+        // is programmatic + the render/scene are static -> two runs are byte-identical. This is a NEW
+        // showcase: the unedited --editor-shot golden (editor.png) is untouched (additive edit path). ---
+        if (editorEditShotPath) {
+            // The drawable view order == scene-file order: index 8 = the second sphere, 9 = the duck
+            // (see assets/scenes/default.json). The FIXED edit sequence (documented + deterministic):
+            //   1. Select the DUCK (index 9) and translate it +1.0 on Y  (relative ADD delta).
+            //   2. Select a SPHERE (index 8): recolor it (baseColor -> duck_basecolor swatch),
+            //      make it matte (metallic 0.0, roughness 0.9)  (absolute SETs).
+            const int kDuckIndex   = 9;
+            const int kSphereIndex = 8;
+
+            editor::TransformEdit duckMove;
+            duckMove.addPosition = true;
+            duckMove.positionDelta = {0.0f, 1.0f, 0.0f};
+            editor::ApplyTransformEdit(registry, kDuckIndex, duckMove);
+
+            editor::MaterialEdit sphereRecolor;
+            sphereRecolor.setBaseColor = true;
+            sphereRecolor.baseColor = resources.FindTexture("duck_basecolor");
+            sphereRecolor.setMetallic = true;  sphereRecolor.metallic = 0.0f;
+            sphereRecolor.setRoughness = true; sphereRecolor.roughness = 0.9f;
+            editor::ApplyMaterialEdit(registry, kSphereIndex, sphereRecolor);
+
+            const int kEdits = 2;
+
+            // Inspector shows the recolored sphere's NEW material values (the duck move is visible in
+            // the viewport regardless of selection).
+            editorState.selectedEntity = kSphereIndex;
+
+            bool ok = captureToFile(editorEditShotPath);
+
+            // --- scene_io ROUND-TRIP: the persistence proof. DumpScene the EDITED registry; assert the
+            // dumped JSON carries the duck's new Y + the sphere's recolor; LoadScene the dump into a
+            // FRESH registry and assert the reloaded values match (reloadMatch). ---
+            std::string dump = scene::DumpScene(registry, resources);
+            bool saved = !dump.empty();
+
+            bool reloadMatch = false;
+            {
+                // Write the dump to a temp file LoadScene can read (LoadScene takes a path). The dump
+                // names a 'duck' mesh + 'duck_basecolor'/'checker' textures all registered in
+                // `resources`, so LoadScene resolves them straight back.
+                std::string tmpScene = std::string(std::tmpnam(nullptr)) + ".json";
+                { std::ofstream f(tmpScene, std::ios::binary); f << dump; }
+
+                ecs::Registry reloaded;
+                std::vector<ecs::Entity> rents =
+                    scene::LoadScene(reloaded, resources, tmpScene.c_str());
+                if (rents.size() > static_cast<size_t>(kDuckIndex)) {
+                    const auto& reloadedT = reloaded.get<scene::TransformC>(rents[kDuckIndex]).t;
+                    const auto& reloadedM = reloaded.get<scene::MaterialC>(rents[kSphereIndex]);
+                    // The duck started at y=1.35 (default.json); +1.0 -> 2.35.
+                    bool duckOk = std::fabs(reloadedT.position.y - 2.35f) < 1e-3f;
+                    bool sphereOk = (reloadedM.base == resources.FindTexture("duck_basecolor")) &&
+                                    std::fabs(reloadedM.metallic - 0.0f) < 1e-4f &&
+                                    std::fabs(reloadedM.roughness - 0.9f) < 1e-4f;
+                    reloadMatch = duckOk && sphereOk;
+                }
+                std::remove(tmpScene.c_str());
+            }
+
+            std::printf("editor-edit: {edits:%d, entity:%d, saved:%s, reloadMatch:%s}\n",
+                        kEdits, kSphereIndex, saved ? "true" : "false",
+                        reloadMatch ? "true" : "false");
+            teardownEditor();
+            return (ok && saved && reloadMatch) ? 0 : 1;
         }
 #endif
 

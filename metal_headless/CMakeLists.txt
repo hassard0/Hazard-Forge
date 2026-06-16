@@ -286,6 +286,7 @@ add_executable(visual_test
     # backend-agnostic (the renderer uses ONLY the rhi:: seam); the --editor showcase draws the docked
     # editor chrome over the scene exactly like the Vulkan --editor-shot path.
     ${HF_ROOT}/engine/editor/editor_panel_data.cpp
+    ${HF_ROOT}/engine/editor/edit_ops.cpp
     ${HF_ROOT}/engine/editor/editor_panels.cpp
     ${HF_ROOT}/engine/editor/imgui_renderer.cpp
     ${HF_ROOT}/third_party/imgui/imgui.cpp
