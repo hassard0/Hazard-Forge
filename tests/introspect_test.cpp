@@ -190,6 +190,8 @@ int main() {
             bool sawGtaoFeature = false;
             // Slice CZ: the subsurface-scattering capability is advertised in the feature manifest.
             bool sawSssFeature = false;
+            // Slice DA: the reflection-probe (box-projected reflections) capability is advertised.
+            bool sawReflProbeFeature = false;
             // Slice CS: the froxel-volumetric-fog capability is advertised in the feature manifest.
             bool sawFroxelFogFeature = false;
             // Slice CV: the froxel-light-injection capability is advertised in the feature manifest.
@@ -250,6 +252,7 @@ int main() {
                     if (AsString(el->value) == "parallax-occlusion-mapping") sawPomFeature = true;
                     if (AsString(el->value) == "ground-truth-ambient-occlusion") sawGtaoFeature = true;
                     if (AsString(el->value) == "subsurface-scattering") sawSssFeature = true;
+                    if (AsString(el->value) == "reflection-probe") sawReflProbeFeature = true;
                     if (AsString(el->value) == "froxel-volumetric-fog") sawFroxelFogFeature = true;
                     if (AsString(el->value) == "froxel-light-injection") sawFroxelLightsFeature = true;
                     if (AsString(el->value) == "volumetric-shadows") sawVolShadowsFeature = true;
@@ -295,6 +298,7 @@ int main() {
             check(sawPomFeature, "engine.features includes parallax-occlusion-mapping");
             check(sawGtaoFeature, "engine.features includes ground-truth-ambient-occlusion");
             check(sawSssFeature, "engine.features includes subsurface-scattering");
+        check(sawReflProbeFeature, "engine.features includes reflection-probe");
             check(sawFroxelFogFeature, "engine.features includes froxel-volumetric-fog");
             check(sawFroxelLightsFeature, "engine.features includes froxel-light-injection");
             check(sawVolShadowsFeature, "engine.features includes volumetric-shadows");
@@ -392,6 +396,8 @@ int main() {
         bool sawGtaoShot = false;
         // Slice CZ: the --sss-shot showcase flag is listed in the showcase manifest.
         bool sawSssShot = false;
+        // Slice DA: the --reflprobe-shot showcase flag is listed in the showcase manifest.
+        bool sawReflProbeShot = false;
         // Slice CS: the --froxelfog-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelFogShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
@@ -459,6 +465,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--pom-shot") sawPomShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gtao-shot") sawGtaoShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--sss-shot") sawSssShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--reflprobe-shot") sawReflProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxelfog-shot") sawFroxelFogShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
@@ -508,6 +515,7 @@ int main() {
         check(sawPomShot, "showcases manifest includes --pom-shot");
         check(sawGtaoShot, "showcases manifest includes --gtao-shot");
         check(sawSssShot, "showcases manifest includes --sss-shot");
+        check(sawReflProbeShot, "showcases manifest includes --reflprobe-shot");
         check(sawFroxelFogShot, "showcases manifest includes --froxelfog-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");

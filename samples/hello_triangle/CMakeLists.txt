@@ -262,6 +262,13 @@ hf_compile_shaders(
     "shaders/lit_probe.frag.hlsl:ps"
     "shaders/probe_blit.frag.hlsl:ps"
     "shaders/probe_irradiance.frag.hlsl:ps"
+    # Box-Projected Cubemap Reflections (Slice DA): a reflective-surface variant of lit_probe.frag that
+    # parallax-corrects the specular reflection direction to the local probe BOX (render/reflection_probe.h
+    # ray-box exit + box-project, copied verbatim) before sampling the EXISTING reflection cubemap, so the
+    # reflected room walls line up with the geometry. parallaxStrength=0 -> byte-identical to the plain
+    # probe reflection. Reuses the probe bake/blit/irradiance pipeline + post.vert. Existing shaders +
+    # goldens untouched.
+    "shaders/reflprobe.frag.hlsl:ps"
     # Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
     # current jittered HDR scene. Reuses post.vert (fullscreen triangle) + the existing RT/RGBA16F path;
     # the only new shader for the slice. Existing post/bloom/ssao/ssr shaders + goldens untouched.

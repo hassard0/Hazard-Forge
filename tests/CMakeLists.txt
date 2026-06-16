@@ -210,6 +210,16 @@ hf_add_pure_test(gtao_test)
 # The same sss.h math is mirrored VERBATIM in sss_blur.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(sss_test)
 
+# Box-Projected Cubemap Reflections (Slice DA): the slab-method ray-box EXIT t (RayBoxExitT: analytic
+# exit for axis-aligned + diagonal rays, always positive) and the box-projected reflection direction
+# (BoxProject, render/reflection_probe.h, header-only). The CORE proof: BoxProject(parallaxStrength=0)
+# == normalize(R) EXACTLY for ANY R/P/box (the byte-identical parallaxStrength=0 == standard-reflection
+# render proof's CPU half), plus the infinite-box convergence (a huge box -> ≈ normalize(R), the
+# correction vanishes) and a hand-computed finite-box correction (the corrected dir leans toward the
+# box-exit relative to the probe center). The same reflprobe math is mirrored VERBATIM in
+# reflprobe.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(reflection_probe_test)
+
 # Froxel Volumetric Fog (Slice CS): the exponential Z-slice mapping + its EXACT inverse
 # (ViewZToSlice(SliceZ(k)) == k — the apply's depth->slice sampling correctness, an off-by-one here
 # breaks the density=0==scene proof), SliceZ monotone + [zNear,zFar] coverage, height-fog density

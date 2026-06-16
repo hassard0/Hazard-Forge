@@ -34,6 +34,7 @@
 #include "render/spot.h"
 #include "render/point_shadow.h"
 #include "render/probe.h"
+#include "render/reflection_probe.h"
 #include "render/decal.h"
 #include "render/post_stack.h"
 #include "render/clustered.h"
@@ -367,6 +368,7 @@ int main(int argc, char** argv) {
     const char* cloudsShotPath = nullptr;    // --clouds-shot <out.bmp> (Slice CH: volumetric clouds)
     const char* cloudShadowsShotPath = nullptr; // --cloud-shadows-shot <out.bmp> (Slice CK: cloud shadows on the ground)
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
+    const char* reflProbeShotPath = nullptr; // --reflprobe-shot <out.bmp> (Slice DA: box-projected cubemap reflections)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
     const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
     const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
@@ -869,6 +871,16 @@ int main(int argc, char** argv) {
             // green color BLEED from the irradiance. One BMP -> exit. New golden; existing paths/
             // shaders/goldens untouched.
             probeShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--reflprobe-shot") == 0 && i + 1 < argc) {
+            // Slice DA: box-projected cubemap reflection (local reflection probe) showcase. The SAME
+            // Cornell-style box room is baked into the reflection cubemap (reused via BindReflectionProbe),
+            // and a reflective floor + glossy sphere are shaded by reflprobe.frag, which PARALLAX-CORRECTS
+            // the specular reflection direction to the local probe BOX so the reflected colored walls line
+            // up with the room geometry (vs the infinite-cubemap smear). INTERNALLY also renders with
+            // parallaxStrength=0 and asserts it is BYTE-IDENTICAL (SHA) to the standard infinite-cubemap
+            // reflection (the no-op proof). One BMP -> exit. New golden; existing paths/shaders/goldens
+            // untouched.
+            reflProbeShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--taa-shot") == 0 && i + 1 < argc) {
             // Slice AP: temporal anti-aliasing showcase. Renders a FIXED N=8 accumulation frames over
             // a static lit + shadowed scene, advancing only the deterministic Halton(2,3) sub-pixel
@@ -2230,6 +2242,373 @@ int main(int argc, char** argv) {
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels (probe)\n");
             }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Box-Projected Cubemap Reflections showcase (--reflprobe-shot, Slice DA). The SAME
+        // Cornell-style box room (red -X wall, green +X wall, neutral floor/ceiling/back) is baked from a
+        // fixed probe at the room center into the reflection cubemap atlas (REUSED via BindReflectionProbe),
+        // and reflective hero objects inside — a glossy metallic SPHERE + a reflective FLOOR slab — are
+        // shaded by reflprobe.frag, which PARALLAX-CORRECTS the specular reflection direction to the local
+        // probe BOX (render/reflection_probe.h ray-box exit + box-project) so the reflected colored walls
+        // line up with the room geometry (the local-reflection-probe hallmark) instead of the
+        // infinite-cubemap smear.
+        //
+        // THE parallaxStrength=0 NO-OP PROOF (backend-portable): the SAME scene is rendered three ways:
+        //   * boxPx  — the REAL finite-box, parallaxStrength=1 render (the golden).
+        //   * zeroPx — reflprobe.frag at parallaxStrength=0 (BoxProject's early-out -> normalize(R)).
+        //   * stdPx  — the STANDARD infinite-cubemap reflection (the existing lit_probe.frag, which samples
+        //              SampleProbe(reflect(-V,N),0) along the un-corrected R).
+        // zeroPx and stdPx sample the reflection cubemap along the SAME direction (normalize(R)), so they
+        // MUST be BYTE-IDENTICAL — proving the box-projection is a pure identity at zero parallax (no
+        // constant bias, no direction drift, no normalization error). Asserted internally, fail loudly.
+        // Deterministic (fixed room/probe/camera/box, no RNG); two runs byte-identical. Reuses the probe
+        // bake/blit/irradiance machinery + post.vert; existing lit/probe/IBL paths/shaders/goldens untouched.
+        if (reflProbeShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace prb = hf::render::probe;
+            namespace rpb = hf::render::reflprobe;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Same 624-byte FrameData layout as lit_probe / reflprobe (skyParams.xyz=boxMin,
+            // skyParams.w=parallaxStrength, pad0.xyz=boxMax).
+            struct ProbeFrameData {
+                float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+                float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+                float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Refl-probe FrameData layout");
+
+            const Vec3 kProbePos{0.0f, 2.0f, 0.0f};   // room center == box center
+            const float Rroom = 6.0f;                 // room half-extent (the probe box half-size)
+            const float kParallax = 1.0f;             // full box-projection for the golden
+
+            // === Shaders. lit.vert (scene) + probe_bake (room bake) + reflprobe.frag (box-projected
+            //     reflection) + lit_probe.frag (the STANDARD infinite-cubemap reflection, for the proof). ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto reflFsW     = LoadSpirv(std::string(HF_SHADER_DIR) + "/reflprobe.frag.hlsl.spv");
+            auto stdFsW      = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_probe.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto blitFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_blit.frag.hlsl.spv");
+            auto irrFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_irradiance.frag.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVs   = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto bakeVs  = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs  = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto reflFs  = device->CreateShaderModule({std::span<const uint32_t>(reflFsW)});
+            auto stdFs   = device->CreateShaderModule({std::span<const uint32_t>(stdFsW)});
+            auto postVs  = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto blitFs  = device->CreateShaderModule({std::span<const uint32_t>(blitFsWords)});
+            auto irrFs   = device->CreateShaderModule({std::span<const uint32_t>(irrFsWords)});
+            auto postFs  = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+            const rhi::Format kHdr  = rhi::Format::RGBA16_Float;
+
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            rhi::GraphicsPipelineDesc blitDesc;
+            blitDesc.vertex = postVs.get(); blitDesc.fragment = blitFs.get();
+            blitDesc.colorFormat = kHdr;
+            blitDesc.depthTest = false; blitDesc.usesTexture = true; blitDesc.fullscreen = true;
+            blitDesc.fragmentPushConstants = true; blitDesc.pushConstantSize = sizeof(float) * 4;
+            auto blitPipeline = device->CreateGraphicsPipeline(blitDesc);
+
+            rhi::GraphicsPipelineDesc irrDesc;
+            irrDesc.vertex = postVs.get(); irrDesc.fragment = irrFs.get();
+            irrDesc.colorFormat = kHdr;
+            irrDesc.depthTest = false; irrDesc.usesFrameUniforms = true; irrDesc.usesTexture = true;
+            irrDesc.fullscreen = true; irrDesc.fragmentPushConstants = true;
+            irrDesc.pushConstantSize = sizeof(float) * 20;
+            auto irrPipeline = device->CreateGraphicsPipeline(irrDesc);
+
+            // Reflective-surface pipeline (reflprobe.frag) + the standard-reflection pipeline
+            // (lit_probe.frag) — identical descs, different fragment shaders.
+            auto makeSurfacePipe = [&](rhi::IShaderModule* fs) {
+                rhi::GraphicsPipelineDesc d;
+                d.vertex = litVs.get(); d.fragment = fs;
+                d.vertexLayout = scene::MeshVertexLayout();
+                d.colorFormat = kHdr;
+                d.depthTest = true; d.usesFrameUniforms = true; d.usesTexture = true;
+                d.usesEnvironment = true;
+                d.pushConstantSize = sizeof(float) * 20;
+                return device->CreateGraphicsPipeline(d);
+            };
+            auto reflPipeline = makeSurfacePipe(reflFs.get());
+            auto stdPipeline  = makeSurfacePipe(stdFs.get());
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            auto reflRT     = device->CreateRenderTarget(prb::kAtlasW, prb::kReflBlockH, kHdr);
+            auto probeAtlas = device->CreateRenderTarget(prb::kAtlasW, prb::kAtlasH, kHdr);
+            auto sceneRT    = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);   // -X wall
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);   // +X wall
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);   // -Z back wall (distinct, so the box-aligned
+                                                               //   reflection of the back wall is visible)
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);   // floor/ceiling/front
+
+            const float Tk = 0.2f;   // wall thickness
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), neutralTex.get()},
+            };
+
+            // Hero reflective objects: a glossy metallic sphere + a reflective floor slab (a thin, wide
+            // metallic box on the room floor whose mirror reflection of the colored walls is box-corrected).
+            Mat4 sphereModel = Mat4::Translate({0.0f, 1.2f, 1.0f}) * Mat4::Scale({1.6f, 1.6f, 1.6f});
+            Mat4 floorModel  = Mat4::Translate({0.0f, -3.7f, 0.0f}) * Mat4::Scale({5.0f, 0.15f, 5.0f});
+
+            const Vec3 eye{0.0f, 2.4f, 9.0f};
+            const Vec3 center{0.0f, 1.6f, 0.0f};
+            const float fovY = 1.04719755f;
+            Vec3 fwd   = math::normalize(center - eye);
+            Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+            Vec3 up3   = math::cross(right, fwd);
+
+            auto faceVPs = prb::FaceViewProjs(kProbePos);
+
+            // The probe BOX = the room AABB centered on the probe.
+            const Vec3 boxMin{kProbePos.x - Rroom, kProbePos.y - Rroom, kProbePos.z - Rroom};
+            const Vec3 boxMax{kProbePos.x + Rroom, kProbePos.y + Rroom, kProbePos.z + Rroom};
+
+            // Fill the shared FrameData. `parallax` is set per-render (boxPx=kParallax, zeroPx=0).
+            auto fillFrame = [&](float parallax) {
+                ProbeFrameData fd{};
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int fi = 0; fi < prb::kFaces; ++fi)
+                    for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.85f, -0.35f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+                fd.lightColor[0]=0.55f; fd.lightColor[1]=0.55f; fd.lightColor[2]=0.58f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.probePos[0]=kProbePos.x; fd.probePos[1]=kProbePos.y; fd.probePos[2]=kProbePos.z; fd.probePos[3]=1.0f;
+                fd.atlasParams[0]=(float)prb::kReflTile/(float)prb::kAtlasW;
+                fd.atlasParams[1]=(float)prb::kReflTile/(float)prb::kAtlasH;
+                fd.atlasParams[2]=(float)prb::kIrrTile/(float)prb::kAtlasW;
+                fd.atlasParams[3]=(float)prb::kIrrTile/(float)prb::kAtlasH;
+                fd.atlasParams2[0]=(float)prb::kReflBlockH/(float)prb::kAtlasH;
+                fd.atlasParams2[1]=1.0f/(float)prb::kAtlasW;
+                fd.atlasParams2[2]=1.0f/(float)prb::kAtlasH;
+                fd.atlasParams2[3]=(float)prb::kTilesPerRow;
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+                // Probe box: skyParams.xyz=boxMin, skyParams.w=parallaxStrength, pad0.xyz=boxMax.
+                fd.skyParams[0]=boxMin.x; fd.skyParams[1]=boxMin.y; fd.skyParams[2]=boxMin.z;
+                fd.skyParams[3]=parallax;
+                fd.pad0[0]=boxMax.x; fd.pad0[1]=boxMax.y; fd.pad0[2]=boxMax.z; fd.pad0[3]=0.0f;
+                return fd;
+            };
+
+            // Render the scene with `surfacePipe` (reflprobe or lit_probe) into an HDR scene RT, tonemap
+            // to the swapchain, and capture. `parallax` fills the frame box param. Bakes the room atlas
+            // each call so each render is fully self-contained + deterministic.
+            auto renderScene = [&](rhi::IPipeline& surfacePipe, float parallax,
+                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+                ProbeFrameData fd = fillFrame(parallax);
+                render::RenderGraph graph;
+                render::RgResource rgRefl  = graph.ImportTarget("reflRT", render::RgResourceKind::SceneColor, *reflRT);
+                render::RgResource rgAtlas = graph.ImportTarget("probeAtlas", render::RgResourceKind::SceneColor, *probeAtlas);
+                render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("probeBake", {}, {rgRefl},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        cmd.BindPipeline(*bakePipeline);
+                        for (int face = 0; face < prb::kFaces; ++face) {
+                            auto tile = prb::FaceTile(face);
+                            cmd.SetViewport((int32_t)(tile.col * prb::kReflTile),
+                                            (int32_t)(tile.row * prb::kReflTile),
+                                            prb::kReflTile, prb::kReflTile);
+                            for (const auto& wl : walls) {
+                                float pc[32];
+                                for (int k = 0; k < 16; ++k) pc[k]      = faceVPs[face].m[k];
+                                for (int k = 0; k < 16; ++k) pc[16 + k] = wl.model.m[k];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindTexture(*wl.tex);
+                                cmd.BindVertexBuffer(cube.vertices());
+                                cmd.BindIndexBuffer(cube.indices());
+                                cmd.DrawIndexed(cube.indexCount());
+                            }
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("probeCompose", {rgRefl}, {rgAtlas},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*blitPipeline);
+                        cmd.BindTexture(*reflRT);
+                        for (int face = 0; face < prb::kFaces; ++face) {
+                            auto tile = prb::FaceTile(face);
+                            cmd.SetViewport((int32_t)(tile.col * prb::kReflTile),
+                                            (int32_t)(tile.row * prb::kReflTile),
+                                            prb::kReflTile, prb::kReflTile);
+                            float srcRect[4] = {
+                                (float)tile.col / (float)prb::kTilesPerRow,
+                                (float)tile.row / (float)prb::kTilesPerCol,
+                                1.0f / (float)prb::kTilesPerRow,
+                                1.0f / (float)prb::kTilesPerCol,
+                            };
+                            cmd.PushConstants(srcRect, sizeof(srcRect));
+                            cmd.Draw(3);
+                        }
+                        cmd.BindPipeline(*irrPipeline);
+                        dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                        cmd.BindTexture(*reflRT);
+                        for (int face = 0; face < prb::kFaces; ++face) {
+                            auto tile = prb::FaceTile(face);
+                            cmd.SetViewport((int32_t)(tile.col * prb::kIrrTile),
+                                            (int32_t)(prb::kReflBlockH + tile.row * prb::kIrrTile),
+                                            prb::kIrrTile, prb::kIrrTile);
+                            Mat4 invVP = faceVPs[face].Inverse();
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = invVP.m[k];
+                            pc[16]=kProbePos.x; pc[17]=kProbePos.y; pc[18]=kProbePos.z; pc[19]=1.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.Draw(3);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("reflScene", {rgAtlas}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        cmd.BindPipeline(surfacePipe);
+                        cmd.BindReflectionProbe(*probeAtlas);
+                        auto drawSurf = [&](const Mat4& model, const scene::Mesh& mesh, rhi::ITexture& tex,
+                                            float metallic, float rough) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                            pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(tex, *flatNormal);
+                            cmd.BindReflectionProbe(*probeAtlas);
+                            cmd.BindVertexBuffer(mesh.vertices());
+                            cmd.BindIndexBuffer(mesh.indices());
+                            cmd.DrawIndexed(mesh.indexCount());
+                        };
+                        // Room walls (matte) for context — skip the front (+Z, index 5) so we see INTO the
+                        // box; they reflect too but read as walls.
+                        for (size_t wi = 0; wi < walls.size(); ++wi)
+                            if (wi != 5) drawSurf(walls[wi].model, cube, *walls[wi].tex, 0.0f, 0.95f);
+                        // Reflective heroes: glossy metallic sphere + reflective floor slab.
+                        drawSurf(sphereModel, sphere, *whiteTex, 1.0f, 0.06f);
+                        drawSurf(floorModel,  cube,   *whiteTex, 1.0f, 0.08f);
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // Quantify the box-projection direction shift on the CPU for the stat line / sanity (a
+            // surface point near the floor reflecting toward the blue back wall is parallax-corrected).
+            rpb::ProbeBox cpuBox{kProbePos, boxMin, boxMax};
+            (void)cpuBox;
+
+            std::vector<uint8_t> boxPx, zeroPx, stdPx;
+            uint32_t bw=0, bh=0, zw=0, zh=0, sw=0, sh=0;
+            if (!renderScene(*reflPipeline, kParallax, boxPx, bw, bh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (refl-probe box-projected)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(*reflPipeline, 0.0f, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (refl-probe parallax=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(*stdPipeline, 0.0f, stdPx, sw, sh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (standard reflection reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t boxHash = fnv(boxPx), zeroHash = fnv(zeroPx), stdHash = fnv(stdPx);
+            std::printf("refl-probe parallax=0 hash: %016llx  standard-reflection hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)stdHash);
+            const bool zeroEquivalent = (zw == sw) && (zh == sh) && (zeroPx.size() == stdPx.size()) &&
+                                        (std::memcmp(zeroPx.data(), stdPx.data(), stdPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: refl-probe parallaxStrength=0 render != standard infinite-cubemap reflection — "
+                    "BoxProject is NOT a pure identity at zero parallax (direction-drift/normalization bug). "
+                    "parallax=0 %016llx vs standard %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)stdHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("refl-probe parallax=0 == standard infinite-cubemap reflection: BYTE-IDENTICAL "
+                        "(parallaxStrength=0 no-op proof)\n");
+            std::printf("refl-probe: {boxSize:%.4g, parallax:%d}\n",
+                        (double)(2.0f * Rroom), (int)kParallax);
+            // Sanity: the finite-box render must DIFFER from the standard reflection (the parallax is visible).
+            if (boxHash == stdHash)
+                std::fprintf(stderr, "WARNING: box-projected render is identical to the standard reflection "
+                                     "(no visible parallax) — check the box / scene\n");
+
+            bool ok = WriteBMP(reflProbeShotPath, boxPx, bw, bh);
+            if (ok) std::printf("wrote %s (%ux%u) — box-projected cubemap reflection, box %.4g, parallax %d, "
+                                "probe (%.1f,%.1f,%.1f)\n", reflProbeShotPath, bw, bh,
+                                (double)(2.0f * Rroom), (int)kParallax,
+                                kProbePos.x, kProbePos.y, kProbePos.z);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", reflProbeShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

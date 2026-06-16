@@ -55,6 +55,7 @@
 #include "render/spot.h"    // Slice AE: spot-light perspective shadow projection + cone (pure math)
 #include "render/point_shadow.h" // Slice AF: omnidirectional point-light 6-face cube shadow (pure math)
 #include "render/probe.h"        // Slice AK: reflection + irradiance probe atlas math (pure math)
+#include "render/reflection_probe.h" // Slice DA: box-projected cubemap reflection math (pure math)
 #include "render/clustered.h"     // Slice AG: clustered / Forward+ light culling (pure math)
 #include "render/cluster.h"       // Slice CL: clustered light culling (cluster-grid assignment math)
 #include "render/froxel.h"         // Slice CS: froxel volumetric fog (grid + density + phase + integrate math)
@@ -16287,6 +16288,305 @@ static int RunProbeShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Box-Projected Cubemap Reflections showcase (Slice DA). Mirrors the Vulkan --reflprobe-shot path
+// EXACTLY: the SAME Cornell-style box room (red -X / green +X / blue -Z back / neutral) is baked into the
+// reflection cubemap atlas (reused via BindReflectionProbe), and reflective heroes (a glossy metallic
+// sphere + a reflective floor slab) are shaded by reflprobe.frag, which PARALLAX-CORRECTS the specular
+// reflection direction to the local probe BOX (render/reflection_probe.h ray-box exit + box-project,
+// copied verbatim into the shader) so the reflected colored walls line up with the room geometry. The
+// SAME reflprobe math compiled into reflprobe.frag here makes the box projection bit-identical to the
+// Vulkan/CPU path. THE parallaxStrength=0 EQUIVALENCE PROOF (backend-portable): the SAME scene at
+// parallaxStrength=0 (reflprobe's BoxProject early-out -> normalize(R)) and the STANDARD infinite-cubemap
+// reflection (the existing lit_probe.frag, sampling along the un-corrected R) are asserted BYTE-IDENTICAL
+// — proving the box-projection is a pure identity at zero parallax. New golden refl_probe.png; the
+// existing 68 goldens stay byte-identical.
+static int RunReflProbeShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace prb = hf::render::probe;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    struct ProbeFrameData {
+        float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+        float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+        float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+    };
+    static_assert(sizeof(ProbeFrameData) == 624, "Refl-probe FrameData layout");
+
+    const Vec3 kProbePos{0.0f, 2.0f, 0.0f};
+    const float Rroom = 6.0f;
+    const float kParallax = 1.0f;
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float aspect = (float)W / (float)H;
+
+    auto litVs   = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto bakeVs  = loadMSL("probe_bake.vert.gen.metal", "probe_bake_vertex");
+    auto bakeFs  = loadMSL("probe_bake.frag.gen.metal", "probe_bake_fragment");
+    auto reflFs  = loadMSL("reflprobe.frag.gen.metal", "reflprobe_fragment");
+    auto stdFs   = loadMSL("lit_probe.frag.gen.metal", "probe_fragment");
+    auto postVs  = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto blitFs  = loadMSL("probe_blit.frag.gen.metal", "probe_blit_fragment");
+    auto irrFs   = loadMSL("probe_irradiance.frag.gen.metal", "probe_irradiance_fragment");
+    auto postFs  = loadMSL("post.frag.gen.metal", "post_fragment");
+
+    rhi::GraphicsPipelineDesc bakeDesc;
+    bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+    bakeDesc.vertexLayout = scene::MeshVertexLayout();
+    bakeDesc.colorFormat = kHdr;
+    bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+    bakeDesc.pushConstantSize = sizeof(float) * 32;
+    auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+    rhi::GraphicsPipelineDesc blitDesc;
+    blitDesc.vertex = postVs.get(); blitDesc.fragment = blitFs.get();
+    blitDesc.colorFormat = kHdr;
+    blitDesc.depthTest = false; blitDesc.usesTexture = true; blitDesc.fullscreen = true;
+    blitDesc.fragmentPushConstants = true; blitDesc.pushConstantSize = sizeof(float) * 4;
+    auto blitPipeline = device->CreateGraphicsPipeline(blitDesc);
+
+    rhi::GraphicsPipelineDesc irrDesc;
+    irrDesc.vertex = postVs.get(); irrDesc.fragment = irrFs.get();
+    irrDesc.colorFormat = kHdr;
+    irrDesc.depthTest = false; irrDesc.usesFrameUniforms = true; irrDesc.usesTexture = true;
+    irrDesc.fullscreen = true; irrDesc.fragmentPushConstants = true;
+    irrDesc.pushConstantSize = sizeof(float) * 20;
+    auto irrPipeline = device->CreateGraphicsPipeline(irrDesc);
+
+    auto makeSurfacePipe = [&](rhi::IShaderModule* fs) {
+        rhi::GraphicsPipelineDesc d;
+        d.vertex = litVs.get(); d.fragment = fs;
+        d.vertexLayout = scene::MeshVertexLayout();
+        d.colorFormat = kHdr;
+        d.depthTest = true; d.usesFrameUniforms = true; d.usesTexture = true;
+        d.usesEnvironment = true;
+        d.pushConstantSize = sizeof(float) * 20;
+        return device->CreateGraphicsPipeline(d);
+    };
+    auto reflPipeline = makeSurfacePipe(reflFs.get());
+    auto stdPipeline  = makeSurfacePipe(stdFs.get());
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto reflRT     = device->CreateRenderTarget(prb::kAtlasW, prb::kReflBlockH, kHdr);
+    auto probeAtlas = device->CreateRenderTarget(prb::kAtlasW, prb::kAtlasH, kHdr);
+    auto sceneRT    = device->CreateRenderTarget(W, H, kHdr);
+    auto dummyShadow = device->CreateShadowMap(64);
+    device->SetShadowMap(*dummyShadow);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    auto colorTex = [&](float r, float g, float b) {
+        uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+        return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+    };
+    auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+    auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+    auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+    auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+
+    const float Tk = 0.2f;
+    struct Wall { Mat4 model; rhi::ITexture* tex; };
+    std::vector<Wall> walls = {
+        {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+        {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+        {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+        {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+        {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+        {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), neutralTex.get()},
+    };
+    Mat4 sphereModel = Mat4::Translate({0.0f, 1.2f, 1.0f}) * Mat4::Scale({1.6f, 1.6f, 1.6f});
+    Mat4 floorModel  = Mat4::Translate({0.0f, -3.7f, 0.0f}) * Mat4::Scale({5.0f, 0.15f, 5.0f});
+
+    const Vec3 eye{0.0f, 2.4f, 9.0f};
+    const Vec3 center{0.0f, 1.6f, 0.0f};
+    const float fovY = 1.04719755f;
+    Vec3 fwd   = math::normalize(center - eye);
+    Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+    Vec3 up3   = math::cross(right, fwd);
+
+    std::array<Mat4, prb::kFaces> faceVPs;
+    for (int fi = 0; fi < prb::kFaces; ++fi)
+        faceVPs[fi] = FlipProjY(prb::FaceViewProj(kProbePos, fi));
+
+    const Vec3 boxMin{kProbePos.x - Rroom, kProbePos.y - Rroom, kProbePos.z - Rroom};
+    const Vec3 boxMax{kProbePos.x + Rroom, kProbePos.y + Rroom, kProbePos.z + Rroom};
+
+    auto fillFrame = [&](float parallax) {
+        ProbeFrameData fd{};
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+        for (int fi = 0; fi < prb::kFaces; ++fi)
+            for (int k = 0; k < 16; ++k) fd.faceVP[fi][k] = faceVPs[fi].m[k];
+        Vec3 ld = math::normalize(Vec3{-0.3f, -0.85f, -0.35f});
+        fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z;
+        fd.lightColor[0]=0.55f; fd.lightColor[1]=0.55f; fd.lightColor[2]=0.58f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.probePos[0]=kProbePos.x; fd.probePos[1]=kProbePos.y; fd.probePos[2]=kProbePos.z; fd.probePos[3]=1.0f;
+        fd.atlasParams[0]=(float)prb::kReflTile/(float)prb::kAtlasW;
+        fd.atlasParams[1]=(float)prb::kReflTile/(float)prb::kAtlasH;
+        fd.atlasParams[2]=(float)prb::kIrrTile/(float)prb::kAtlasW;
+        fd.atlasParams[3]=(float)prb::kIrrTile/(float)prb::kAtlasH;
+        fd.atlasParams2[0]=(float)prb::kReflBlockH/(float)prb::kAtlasH;
+        fd.atlasParams2[1]=1.0f/(float)prb::kAtlasW;
+        fd.atlasParams2[2]=1.0f/(float)prb::kAtlasH;
+        fd.atlasParams2[3]=(float)prb::kTilesPerRow;
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up3.x; fd.camUp[1]=up3.y; fd.camUp[2]=up3.z;
+        fd.skyParams[0]=boxMin.x; fd.skyParams[1]=boxMin.y; fd.skyParams[2]=boxMin.z;
+        fd.skyParams[3]=parallax;
+        fd.pad0[0]=boxMax.x; fd.pad0[1]=boxMax.y; fd.pad0[2]=boxMax.z; fd.pad0[3]=0.0f;
+        return fd;
+    };
+
+    auto renderScene = [&](rhi::IPipeline& surfacePipe, float parallax,
+                           std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+        ProbeFrameData fd = fillFrame(parallax);
+        render::RenderGraph graph;
+        render::RgResource rgRefl  = graph.ImportTarget("reflRT", render::RgResourceKind::SceneColor, *reflRT);
+        render::RgResource rgAtlas = graph.ImportTarget("probeAtlas", render::RgResourceKind::SceneColor, *probeAtlas);
+        render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+        render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("probeBake", {}, {rgRefl},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                cmd.BindPipeline(*bakePipeline);
+                for (int face = 0; face < prb::kFaces; ++face) {
+                    auto tile = prb::FaceTile(face);
+                    cmd.SetViewport((int32_t)(tile.col * prb::kReflTile),
+                                    (int32_t)(tile.row * prb::kReflTile),
+                                    prb::kReflTile, prb::kReflTile);
+                    for (const auto& wl : walls) {
+                        float pc[32];
+                        for (int k = 0; k < 16; ++k) pc[k]      = faceVPs[face].m[k];
+                        for (int k = 0; k < 16; ++k) pc[16 + k] = wl.model.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindTexture(*wl.tex);
+                        cmd.BindVertexBuffer(cube.vertices());
+                        cmd.BindIndexBuffer(cube.indices());
+                        cmd.DrawIndexed(cube.indexCount());
+                    }
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("probeCompose", {rgRefl}, {rgAtlas},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*blitPipeline);
+                cmd.BindTexture(*reflRT);
+                for (int face = 0; face < prb::kFaces; ++face) {
+                    auto tile = prb::FaceTile(face);
+                    cmd.SetViewport((int32_t)(tile.col * prb::kReflTile),
+                                    (int32_t)(tile.row * prb::kReflTile),
+                                    prb::kReflTile, prb::kReflTile);
+                    float srcRect[4] = {
+                        (float)tile.col / (float)prb::kTilesPerRow,
+                        (float)tile.row / (float)prb::kTilesPerCol,
+                        1.0f / (float)prb::kTilesPerRow,
+                        1.0f / (float)prb::kTilesPerCol,
+                    };
+                    cmd.PushConstants(srcRect, sizeof(srcRect));
+                    cmd.Draw(3);
+                }
+                cmd.BindPipeline(*irrPipeline);
+                dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                cmd.BindTexture(*reflRT);
+                for (int face = 0; face < prb::kFaces; ++face) {
+                    auto tile = prb::FaceTile(face);
+                    cmd.SetViewport((int32_t)(tile.col * prb::kIrrTile),
+                                    (int32_t)(prb::kReflBlockH + tile.row * prb::kIrrTile),
+                                    prb::kIrrTile, prb::kIrrTile);
+                    Mat4 invVP = faceVPs[face].Inverse();
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = invVP.m[k];
+                    pc[16]=kProbePos.x; pc[17]=kProbePos.y; pc[18]=kProbePos.z; pc[19]=1.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.Draw(3);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("reflScene", {rgAtlas}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(ProbeFrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                cmd.BindPipeline(surfacePipe);
+                cmd.BindReflectionProbe(*probeAtlas);
+                auto drawSurf = [&](const Mat4& model, const scene::Mesh& mesh, rhi::ITexture& tex,
+                                    float metallic, float rough) {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                    pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(tex, *flatNormal);
+                    cmd.BindReflectionProbe(*probeAtlas);
+                    cmd.BindVertexBuffer(mesh.vertices());
+                    cmd.BindIndexBuffer(mesh.indices());
+                    cmd.DrawIndexed(mesh.indexCount());
+                };
+                for (size_t wi = 0; wi < walls.size(); ++wi)
+                    if (wi != 5) drawSurf(walls[wi].model, cube, *walls[wi].tex, 0.0f, 0.95f);
+                drawSurf(sphereModel, sphere, *whiteTex, 1.0f, 0.06f);
+                drawSurf(floorModel,  cube,   *whiteTex, 1.0f, 0.08f);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneRT);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    std::vector<uint8_t> boxPx, zeroPx, stdPx;
+    uint32_t bw=0, bh=0, zw=0, zh=0, sw=0, sh=0;
+    if (!renderScene(*reflPipeline, kParallax, boxPx, bw, bh)) return fail("no captured pixels (refl-probe box)");
+    if (!renderScene(*reflPipeline, 0.0f, zeroPx, zw, zh)) return fail("no captured pixels (refl-probe parallax=0)");
+    if (!renderScene(*stdPipeline, 0.0f, stdPx, sw, sh)) return fail("no captured pixels (standard reflection)");
+
+    const bool zeroEquivalent = (zw == sw) && (zh == sh) && (zeroPx.size() == stdPx.size()) &&
+                                (std::memcmp(zeroPx.data(), stdPx.data(), stdPx.size()) == 0);
+    if (!zeroEquivalent)
+        return fail("refl-probe parallaxStrength=0 render != standard infinite-cubemap reflection — NOT identity");
+    std::printf("refl-probe parallax=0 == standard infinite-cubemap reflection: BYTE-IDENTICAL "
+                "(parallaxStrength=0 no-op proof)\n");
+    std::printf("refl-probe: {boxSize:%.4g, parallax:%d}\n", (double)(2.0f * Rroom), (int)kParallax);
+
+    if (!WritePNG(outPath, boxPx, bw, bh)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — box-projected cubemap reflection, box %.4g, parallax %d\n",
+                outPath, bw, bh, (double)(2.0f * Rroom), (int)kParallax);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
@@ -16877,6 +17177,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--probe") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_probe.png";
             try { return RunProbeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --reflprobe <out.png>: box-projected cubemap reflections showcase (Slice DA). The SAME box room
+        // baked into the reflection cubemap; reflective heroes shaded by reflprobe.frag with the specular
+        // reflection direction parallax-corrected to the local probe box. The parallaxStrength=0 render is
+        // BYTE-IDENTICAL to the standard infinite-cubemap reflection (lit_probe.frag). Mirrors the Vulkan
+        // --reflprobe-shot exactly; new golden refl_probe.png.
+        if (argc > 1 && std::strcmp(argv[1], "--reflprobe") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_refl_probe.png";
+            try { return RunReflProbeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --taa <out.png>: temporal anti-aliasing showcase (Slice AP). The settled sphere-pyramid scene
