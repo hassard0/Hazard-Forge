@@ -27,6 +27,8 @@ public:
     std::unique_ptr<IComputePipeline> CreateComputePipeline(const ComputePipelineDesc&) override;
     std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) override;
     std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) override;
+    std::unique_ptr<IBindlessTextureSet> CreateBindlessTextureSet(
+        std::span<ITexture* const> textures) override;
     std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) override;
     std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height,
                                                       Format colorFormat) override;
@@ -111,6 +113,17 @@ public:
     // layouts so existing pipelines are byte-for-byte unchanged.
     VkDescriptorSetLayout perDrawSetLayout() const { return perDrawSetLayout_; }
 
+    // Bindless texture set layout (set 4, FRAGMENT stage, Slice BZ): binding 0 = an UNBOUNDED runtime
+    // sampled-image ARRAY (PARTIALLY_BOUND + VARIABLE_DESCRIPTOR_COUNT, max kBindlessMaxTextures) holding
+    // every scene texture; binding 1 = a shared sampler. Created with UPDATE_AFTER_BIND so the array is
+    // written after allocation. Separate from the material/frame/joint/env/cluster/perDraw layouts so
+    // existing pipelines are byte-for-byte unchanged. The CreateBindlessTextureSet path allocates a set
+    // from this layout + the dedicated update-after-bind pool.
+    VkDescriptorSetLayout bindlessSetLayout() const { return bindlessSetLayout_; }
+    // Upper bound on the bindless array's descriptor count (the layout's array size). The showcase scene
+    // has a handful of textures; this is the variable-count ceiling.
+    static constexpr uint32_t kBindlessMaxTextures = 256;
+
     // Return (building + caching on first use) the descriptor set for a full-PBR material — the
     // wider set 1 pointing at the five textures' views. Keyed on the base-texture pointer (a
     // material binds a fixed 5-texture set), so the command-buffer BindMaterialPBR path re-binds an
@@ -163,6 +176,7 @@ private:
     VkDescriptorSetLayout environmentSetLayout_ = VK_NULL_HANDLE;  // dedicated set 3 for HDR IBL
     VkDescriptorSetLayout clusterSetLayout_ = VK_NULL_HANDLE;      // dedicated set 3 for clustered lights
     VkDescriptorSetLayout perDrawSetLayout_ = VK_NULL_HANDLE;      // dedicated set 2 for MDI per-draw (Slice BM)
+    VkDescriptorSetLayout bindlessSetLayout_ = VK_NULL_HANDLE;     // dedicated set 4 for bindless textures (Slice BZ)
     VkDescriptorPool      descriptorPool_    = VK_NULL_HANDLE;
 
     // 1x1 flat tangent-space normal map (RGBA 128,128,255,255 -> (0,0,1) after decode), used as the

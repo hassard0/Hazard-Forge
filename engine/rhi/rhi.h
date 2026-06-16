@@ -122,6 +122,16 @@ struct GraphicsPipelineDesc {
                                      // Existing pipelines (which leave this false) are byte-for-byte
                                      // unchanged. Mutually exclusive with usesJointPalette/usesEnvironment/
                                      // usesLightClusters (those also claim set 2/3).
+    bool usesBindlessTextures = false; // when true (Slice BZ): the layout includes a DEDICATED bindless
+                                     // texture set placed at index 4 — ONE unbounded fragment-stage
+                                     // sampled-image ARRAY (+ a shared sampler) holding every scene
+                                     // texture, which lit_bindless.frag samples as
+                                     // gTextures[NonUniformResourceIndex(texIndex)]. Bound via
+                                     // BindBindlessTextures. Pairs with usesFrameUniforms + usesTexture
+                                     // (set 1 still carries the normal map); sets 2/3 are filled with
+                                     // placeholders so the bindless set sits at index 4. Only the
+                                     // bindless lit pipeline sets this; existing pipelines (which leave
+                                     // it false) are byte-for-byte unchanged.
     bool usesLightClusters = false;  // when true: the layout includes a DEDICATED light-cluster set
                                      // (set 3) — THREE fragment-stage STORAGE buffers (clusters /
                                      // lightIndices / lights) — for clustered Forward+ shading
@@ -186,6 +196,14 @@ class IPipeline        { public: virtual ~IPipeline() = default; };
 class IComputePipeline { public: virtual ~IComputePipeline() = default; };
 class IBuffer          { public: virtual ~IBuffer() = default; };
 class ITexture         { public: virtual ~ITexture() = default; };
+
+// Opaque handle for a BINDLESS texture set (Slice BZ): a single large sampled-image ARRAY holding all
+// the scene textures (index i -> the i-th texture passed to CreateBindlessTextureSet), bound ONCE and
+// indexed per-draw by a `texIndex` push constant. Vulkan: a descriptor set with a runtime/partially-
+// bound sampled-image array + a shared sampler (VK_EXT_descriptor_indexing). Metal: a no-op/fallback
+// (the Metal golden renders via the per-material bound path). The vk*/MTL* details live ONLY in the
+// backend dirs; the seam exposes only this abstract handle.
+class IBindlessTextureSet { public: virtual ~IBindlessTextureSet() = default; };
 
 // A sampleable offscreen color image (+ its own depth) you render into. Inheriting ITexture
 // lets the post pass bind it via the existing ICommandBuffer::BindTexture.
@@ -272,6 +290,14 @@ public:
     // DrawIndexedMultiIndirect. Default no-op so passes/backends without MDI are unaffected; both
     // shipping backends override it (Vulkan: push-descriptor SSBO; Metal: a bound vertex buffer slot).
     virtual void BindPerDrawData(IBuffer& /*perDraw*/) {}
+    // Bind the BINDLESS texture array (Slice BZ) ONCE at its dedicated set (set 4 on Vulkan), so the
+    // following draws can sample any scene texture by INDEX — gTextures[NonUniformResourceIndex(texIndex)]
+    // in lit_bindless.frag — with the per-draw `texIndex` arriving via the existing PushConstants (the
+    // bindless vertex shader's push constant). The handle comes from CreateBindlessTextureSet. Pair with
+    // a pipeline whose usesBindlessTextures is true; call before the bindless draws. Default no-op so
+    // passes/backends without bindless are unaffected (Metal no-ops/falls back to the bound path). The
+    // vk* descriptor-array bind lives ONLY in the backend dir.
+    virtual void BindBindlessTextures(IBindlessTextureSet& /*set*/) {}
     virtual void Draw(uint32_t vertexCount, uint32_t firstVertex = 0) = 0;
     // `vertexOffset` is added to every index before vertex fetch (ImGui draws share one combined
     // vertex+index buffer per cmd-list and offset into it). Defaults to 0 for the existing scene draws.
@@ -391,6 +417,16 @@ public:
     }
     virtual std::unique_ptr<IBuffer> CreateBuffer(const BufferDesc&) = 0;
     virtual std::unique_ptr<ITexture> CreateTexture(const TextureDesc&) = 0;
+
+    // Create a BINDLESS texture set (Slice BZ): one large sampled-image ARRAY filled with `textures`
+    // IN ORDER (index i -> textures[i]) + a shared sampler, bound ONCE via
+    // ICommandBuffer::BindBindlessTextures and indexed per-draw by a `texIndex` push constant. Vulkan:
+    // a descriptor set with VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT + VARIABLE_DESCRIPTOR_COUNT over
+    // runtimeDescriptorArray (VK_EXT_descriptor_indexing), updated once with the textures' views. Metal:
+    // returns nullptr (the Metal golden uses the per-material bound path). Default returns nullptr so
+    // backends without bindless still link; only the Vulkan backend overrides it.
+    virtual std::unique_ptr<IBindlessTextureSet> CreateBindlessTextureSet(
+        std::span<ITexture* const> /*textures*/) { return nullptr; }
 
     // Offscreen render target: a sampleable color image (swapchain format) + its own depth.
     virtual std::unique_ptr<IRenderTarget> CreateRenderTarget(uint32_t width, uint32_t height) = 0;

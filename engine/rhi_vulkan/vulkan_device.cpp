@@ -8,6 +8,7 @@
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_render_target.h"
 #include "rhi_vulkan/vulkan_pbr_material.h"
+#include "rhi_vulkan/vulkan_bindless.h"
 #include <cstring>
 
 #define VMA_IMPLEMENTATION
@@ -86,11 +87,30 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     f10.multiDrawIndirect = VK_TRUE;
     f10.drawIndirectFirstInstance = VK_TRUE;
 
+    // Slice BZ (bindless textures): the bindless fragment samples one large runtime sampled-image array
+    // by a per-draw index — gTextures[NonUniformResourceIndex(texIndex)]. That needs the
+    // descriptor-indexing features (core in Vulkan 1.2, exposed via VkPhysicalDeviceVulkan12Features):
+    //   - runtimeDescriptorArray: an unbounded Texture2D gTextures[] (no compile-time size);
+    //   - shaderSampledImageArrayNonUniformIndexing: the NonUniformResourceIndex(texIndex) the shader
+    //     uses (a potentially-non-uniform index across a wavefront);
+    //   - descriptorBindingPartiallyBound + descriptorBindingVariableDescriptorCount: the bindless set's
+    //     array binding is PARTIALLY_BOUND + VARIABLE_DESCRIPTOR_COUNT (only the live textures written).
+    // Without these the validation layer flags the unbounded array + NonUniform indexing. (sampledImage
+    // array + variable count are confirmed available on the engine's VK 1.3 target GPUs.)
+    VkPhysicalDeviceVulkan12Features f12{};
+    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    f12.runtimeDescriptorArray = VK_TRUE;
+    f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    f12.descriptorBindingPartiallyBound = VK_TRUE;
+    f12.descriptorBindingVariableDescriptorCount = VK_TRUE;
+    f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+
     vkb::PhysicalDeviceSelector selector{vkbInstance_};
     auto physRet = selector
         .set_surface(surface_)
         .set_minimum_version(1, 3)
         .set_required_features_13(f13)
+        .set_required_features_12(f12)
         .set_required_features_11(f11)
         .set_required_features(f10)
         .select();
@@ -323,6 +343,48 @@ void VulkanDevice::CreateTextureResources() {
         pdci.pBindings = &perDrawBinding;
         Check(vkCreateDescriptorSetLayout(device_, &pdci, nullptr, &perDrawSetLayout_),
               "vkCreateDescriptorSetLayout(perDraw)");
+    }
+
+    // --- Bindless texture set layout (set 4, Slice BZ): binding 0 = an UNBOUNDED runtime sampled-image
+    // ARRAY (descriptorCount = kBindlessMaxTextures ceiling; PARTIALLY_BOUND + VARIABLE_DESCRIPTOR_COUNT
+    // + UPDATE_AFTER_BIND so only the live textures are written), binding 1 = a shared sampler. The
+    // bindless fragment samples gTextures[NonUniformResourceIndex(texIndex)] (binding 0) with gBindlessSmp
+    // (binding 1). Binding numbers match lit_bindless.frag's [[vk::binding(0,4)]]/[[vk::binding(1,4)]].
+    // UPDATE_AFTER_BIND is required because the array is written after the set is allocated; the
+    // VARIABLE_DESCRIPTOR_COUNT binding MUST be the HIGHEST-numbered (VUID-03004), so the single sampler
+    // is binding 0 and the runtime array is binding 1. Kept separate from every other layout so existing
+    // pipelines are byte-for-byte unchanged. ---
+    {
+        VkDescriptorSetLayoutBinding bl[2]{};
+        bl[0].binding = 0;
+        bl[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bl[0].descriptorCount = 1;
+        bl[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bl[1].binding = 1;
+        bl[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bl[1].descriptorCount = kBindlessMaxTextures;   // array ceiling (variable count caps it)
+        bl[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        // Per-binding flags: the sampler (binding 0) gets no flags; the array (binding 1, highest) is
+        // PARTIALLY_BOUND + UPDATE_AFTER_BIND + VARIABLE_DESCRIPTOR_COUNT.
+        VkDescriptorBindingFlags bflags[2] = {
+            0,
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT,
+        };
+        VkDescriptorSetLayoutBindingFlagsCreateInfo bfci{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        bfci.bindingCount = 2;
+        bfci.pBindingFlags = bflags;
+
+        VkDescriptorSetLayoutCreateInfo blci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        blci.pNext = &bfci;
+        blci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        blci.bindingCount = 2;
+        blci.pBindings = bl;
+        Check(vkCreateDescriptorSetLayout(device_, &blci, nullptr, &bindlessSetLayout_),
+              "vkCreateDescriptorSetLayout(bindless)");
     }
 
     // --- Default flat normal map: a 1x1 RGBA8 image encoding the tangent-space normal (0,0,1) as
@@ -652,6 +714,7 @@ void VulkanDevice::DestroyTextureResources() {
     if (environmentSetLayout_) vkDestroyDescriptorSetLayout(device_, environmentSetLayout_, nullptr);
     if (clusterSetLayout_) vkDestroyDescriptorSetLayout(device_, clusterSetLayout_, nullptr);
     if (perDrawSetLayout_) vkDestroyDescriptorSetLayout(device_, perDrawSetLayout_, nullptr);
+    if (bindlessSetLayout_) vkDestroyDescriptorSetLayout(device_, bindlessSetLayout_, nullptr);
     if (defaultSampler_) vkDestroySampler(device_, defaultSampler_, nullptr);
     if (shadowSampler_) vkDestroySampler(device_, shadowSampler_, nullptr);
     if (environmentSampler_) vkDestroySampler(device_, environmentSampler_, nullptr);
@@ -661,6 +724,7 @@ void VulkanDevice::DestroyTextureResources() {
     environmentSetLayout_ = VK_NULL_HANDLE;
     clusterSetLayout_ = VK_NULL_HANDLE;
     perDrawSetLayout_ = VK_NULL_HANDLE;
+    bindlessSetLayout_ = VK_NULL_HANDLE;
     defaultSampler_ = VK_NULL_HANDLE;
     shadowSampler_ = VK_NULL_HANDLE;
     environmentSampler_ = VK_NULL_HANDLE;
@@ -895,6 +959,13 @@ std::unique_ptr<IBuffer> VulkanDevice::CreateBuffer(const BufferDesc& d) {
 }
 std::unique_ptr<ITexture> VulkanDevice::CreateTexture(const TextureDesc& d) {
     return std::make_unique<VulkanTexture>(*this, d);
+}
+std::unique_ptr<IBindlessTextureSet> VulkanDevice::CreateBindlessTextureSet(
+    std::span<ITexture* const> textures) {
+    // Slice BZ — one descriptor set (bindless layout, set 4) whose array binding is filled with the
+    // textures' views in order + a shared sampler. The VulkanBindlessTextureSet allocates from its own
+    // update-after-bind pool, writes the array once, and lives until the caller drops it.
+    return std::make_unique<VulkanBindlessTextureSet>(*this, textures);
 }
 std::unique_ptr<IRenderTarget> VulkanDevice::CreateRenderTarget(uint32_t w, uint32_t h) {
     return std::make_unique<VulkanRenderTarget>(*this, w, h);

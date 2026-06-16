@@ -5,6 +5,7 @@
 #include "rhi_vulkan/vulkan_buffer.h"
 #include "rhi_vulkan/vulkan_texture.h"
 #include "rhi_vulkan/vulkan_render_target.h"
+#include "rhi_vulkan/vulkan_bindless.h"
 #include "rhi_vulkan/vulkan_sampled.h"
 #include "rhi_vulkan/vk_common.h"
 
@@ -122,6 +123,7 @@ void VulkanCommandBuffer::BindPipeline(IPipeline& pipeline) {
     boundEnvironmentSet_ = p.hasEnvironmentSet() ? p.environmentSetIndex() : 0;
     boundClusterSet_ = p.hasClusterSet() ? p.clusterSetIndex() : 0;
     boundPerDrawSet_ = p.hasPerDrawSet() ? p.perDrawSetIndex() : 0;
+    boundBindlessSet_ = p.hasBindlessSet() ? p.bindlessSetIndex() : 0;
     boundPushStages_ = p.pushConstantStages();
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, p.handle());
     // If the pipeline declares a per-frame set, bind the device's current frame set at set 0.
@@ -272,6 +274,18 @@ void VulkanCommandBuffer::BindPerDrawData(IBuffer& perDraw) {
     write.pBufferInfo = &info;
     device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
                                boundPerDrawSet_, 1, &write);
+}
+
+void VulkanCommandBuffer::BindBindlessTextures(IBindlessTextureSet& set) {
+    // Slice BZ — bind the bindless texture array's descriptor set ONCE at the bound pipeline's bindless
+    // set index (set 4). The following draws sample any scene texture by INDEX
+    // (gTextures[NonUniformResourceIndex(texIndex)]) with texIndex arriving via PushConstants. One bind
+    // for the whole scene (vs. N per-material BindMaterial binds on the reference path) — the texture-
+    // binding-count half of the proof.
+    auto& b = static_cast<VulkanBindlessTextureSet&>(set);
+    VkDescriptorSet s = b.descriptorSet();
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, boundLayout_,
+                            boundBindlessSet_, 1, &s, 0, nullptr);
 }
 
 void VulkanCommandBuffer::Draw(uint32_t vertexCount, uint32_t firstVertex) {

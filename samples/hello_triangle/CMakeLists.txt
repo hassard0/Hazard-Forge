@@ -180,6 +180,13 @@ hf_compile_shaders(
     # DrawIndex builtin needs shaderDrawParameters); shares the existing lit.frag. Not in the Metal MSL
     # gen list (glslc can't lower DrawIndex; the Metal golden uses the per-object path).
     "shaders/lit_mdi.vert.hlsl:vs"
+    # Bindless textures (Slice BZ): the bindless lit vertex (lit.vert + a uint texIndex push constant
+    # passed flat to the fragment) + fragment (lit.frag with the base-color source swapped for an
+    # unbounded gTextures[] array sampled via NonUniformResourceIndex(texIndex), space4). VULKAN-ONLY
+    # (DXC emits SPV_EXT_descriptor_indexing / runtimeDescriptorArray); the Metal golden renders the
+    # identical scene via the per-material bound path. Not in the Metal MSL gen list.
+    "shaders/lit_bindless.vert.hlsl:vs"
+    "shaders/lit_bindless.frag.hlsl:ps"
     # Screen-space projected decals (Slice BH): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. decal.frag reconstructs the world position (view-space recon like
     # SSR, then view->world via invView), projects it into the decal box, and alpha-blends the decal

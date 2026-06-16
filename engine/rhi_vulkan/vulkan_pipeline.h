@@ -33,6 +33,12 @@ public:
     bool hasPerDrawSet() const { return hasPerDrawSet_; }
     // The per-draw set's index in the pipeline layout (always 2: frame 0, material 1, per-draw 2).
     uint32_t perDrawSetIndex() const { return 2u; }
+    // True when the pipeline declares the dedicated bindless texture set (set 4, Slice BZ);
+    // BindBindlessTextures binds the array there.
+    bool hasBindlessSet() const { return hasBindlessSet_; }
+    // The bindless set's index in the pipeline layout (always 4: frame 0, material 1, set-2/3
+    // placeholders, bindless 4).
+    uint32_t bindlessSetIndex() const { return 4u; }
     // Stage flags the push-constant range is visible to (VERTEX, or VERTEX|FRAGMENT for the bloom
     // fullscreen passes). PushConstants pushes to exactly these stages.
     uint32_t pushConstantStages() const { return pushConstantStages_; }
@@ -46,6 +52,7 @@ private:
     bool hasEnvironmentSet_ = false;
     bool hasClusterSet_ = false;
     bool hasPerDrawSet_ = false;
+    bool hasBindlessSet_ = false;
     uint32_t pushConstantStages_ = VK_SHADER_STAGE_VERTEX_BIT;
 };
 

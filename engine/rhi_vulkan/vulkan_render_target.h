@@ -40,6 +40,7 @@ public:
 
     VkDescriptorSet descriptorSet() const { return set_; }
     VkDescriptorSet vkDescriptorSet() const override { return set_; }
+    VkImageView vkImageView() const override { return colorView_; }  // Slice BZ: bindless array source
 
     // Slice AK — a descriptor set on the dedicated ENVIRONMENT set layout (set 3, binding 11 = this
     // RT's color view, binding 12 = the env sampler) so a baked probe atlas RT can be bound at the

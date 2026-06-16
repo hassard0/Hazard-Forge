@@ -9,7 +9,8 @@ namespace hf::rhi::vk {
 VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc& desc)
     : device_(device.device()), hasFrameSet_(desc.usesFrameUniforms),
       hasJointSet_(desc.usesJointPalette), hasEnvironmentSet_(desc.usesEnvironment),
-      hasClusterSet_(desc.usesLightClusters), hasPerDrawSet_(desc.usesPerDrawData) {
+      hasClusterSet_(desc.usesLightClusters), hasPerDrawSet_(desc.usesPerDrawData),
+      hasBindlessSet_(desc.usesBindlessTextures) {
     auto* vs = static_cast<VulkanShaderModule*>(desc.vertex);
     auto* fs = static_cast<VulkanShaderModule*>(desc.fragment);
 
@@ -168,12 +169,16 @@ VulkanPipeline::VulkanPipeline(VulkanDevice& device, const GraphicsPipelineDesc&
     // descriptor sets stay at consecutive indices.
     if (desc.usesJointPalette) setLayouts.push_back(device.jointPaletteSetLayout()); // set 2
     else if (desc.usesPerDrawData) setLayouts.push_back(device.perDrawSetLayout());  // set 2 (MDI per-draw)
-    else if (desc.usesEnvironment || desc.usesLightClusters)
+    else if (desc.usesEnvironment || desc.usesLightClusters || desc.usesBindlessTextures)
         setLayouts.push_back(device.jointPaletteSetLayout());                       // set 2 placeholder
     // set 3: the dedicated HDR environment set (Slice R) OR the clustered-lighting set (Slice AG).
-    // They are mutually exclusive (both occupy index 3); a pipeline declares at most one.
+    // They are mutually exclusive (both occupy index 3); a pipeline declares at most one. The bindless
+    // pipeline (Slice BZ) needs a set-3 placeholder so its bindless set sits at index 4.
     if (desc.usesEnvironment) setLayouts.push_back(device.environmentSetLayout()); // set 3 (env)
     else if (desc.usesLightClusters) setLayouts.push_back(device.clusterSetLayout()); // set 3 (clusters)
+    else if (desc.usesBindlessTextures) setLayouts.push_back(device.environmentSetLayout()); // set 3 placeholder
+    // set 4: the dedicated bindless texture array set (Slice BZ). Only the bindless lit pipeline.
+    if (desc.usesBindlessTextures) setLayouts.push_back(device.bindlessSetLayout());  // set 4 (bindless)
     if (!setLayouts.empty()) {
         lci.setLayoutCount = (uint32_t)setLayouts.size();
         lci.pSetLayouts = setLayouts.data();

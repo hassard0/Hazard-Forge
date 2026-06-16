@@ -15,6 +15,7 @@ public:
     ~VulkanTexture() override;
     VkDescriptorSet descriptorSet() const { return set_; }
     VkDescriptorSet vkDescriptorSet() const override { return set_; }
+    VkImageView vkImageView() const override { return view_; }
     VkImageView view() const { return view_; }
 
     // Point this material set's normal-map slot (binding 3/4) at `normalView` (+ the default

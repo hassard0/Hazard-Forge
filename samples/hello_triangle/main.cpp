@@ -40,6 +40,7 @@
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
 #include "render/mdi.h"   // Slice BM: GPU multi-draw-indirect batch builder (pure CPU)
+#include "render/bindless.h"  // Slice BZ: bindless texture-index table (pure CPU)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
@@ -349,6 +350,7 @@ int main(int argc, char** argv) {
     const char* mtShotPath = nullptr;        // --mt-shot <out.bmp> (Slice AU: multithreaded recording)
     int mtWorkers = 4;                       // --mt-shot ... --workers N (default 4)
     const char* mdiShotPath = nullptr;       // --mdi-shot <out.bmp> (Slice BM: multi-draw-indirect)
+    const char* bindlessShotPath = nullptr;  // --bindless-shot <out.bmp> (Slice BZ: bindless textures)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -706,6 +708,14 @@ int main(int argc, char** argv) {
             // ASSERTS the two captures are BYTE-IDENTICAL (SHA) — the render-invariance proof. Prints
             // `mdi: {objects:144, drawCalls:1, refDrawCalls:144}`. One BMP -> exit. New golden mdi.png.
             mdiShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--bindless-shot") == 0 && i + 1 < argc) {
+            // Slice BZ: bindless textures. A multi-texture scene is rendered via ONE bindless
+            // sampled-image array (bound ONCE) indexed per-draw by a texIndex push constant
+            // (lit_bindless.frag samples gTextures[NonUniformResourceIndex(texIndex)]). The run ALSO
+            // renders the IDENTICAL scene via the per-material BOUND path (lit.frag + BindMaterial) and
+            // ASSERTS the two captures are BYTE-IDENTICAL (SHA) — the render-invariance proof. Prints
+            // `bindless: {textures:T, draws:D, textureBinds:1, refTextureBinds:T}`. One BMP -> exit.
+            bindlessShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             mtWorkers = std::atoi(argv[i + 1]);
             if (mtWorkers < 1) mtWorkers = 1;
@@ -5019,6 +5029,379 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — 144-object scene via ONE multi-draw-indirect\n",
                                 mdiShotPath, mw, mh);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mdiShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Bindless textures (--bindless-shot <out.bmp>, Slice BZ): a multi-texture scene (a grid of
+        // distinct objects, each carrying ONE of several procedural base-color textures) is rendered via
+        // ONE bindless sampled-image array (bound ONCE) indexed per-draw by a `texIndex` push constant
+        // (lit_bindless.frag samples gTextures[NonUniformResourceIndex(texIndex)]). render::bindless
+        // interns each material's texture into a deterministic index table; the Vulkan descriptor array
+        // is filled with table.textures IN ORDER. The run ALSO renders the IDENTICAL scene via the
+        // per-material BOUND path (lit.frag + BindMaterial(tex, flatNormal), the SAME texture) and
+        // ASSERTS the two captures are BYTE-IDENTICAL (FNV) — the render-invariance proof: same texel
+        // from the array vs the bound set -> same image; if the index mapping or array fill is wrong the
+        // images differ and we fail loudly. Prints `bindless: {textures:T, draws:D, textureBinds:1,
+        // refTextureBinds:T}`. The bindless capture becomes bindless.png. Existing goldens untouched. ----
+        if (bindlessShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            scene::Mesh planeMesh  = scene::Mesh::Plane(*device);
+            scene::Mesh cubeMesh   = scene::Mesh::Cube(*device);
+            scene::Mesh sphereMesh = scene::Mesh::Sphere(*device);
+
+            // --- The distinct base-color textures the scene samples. A solid 32x32 RGBA8 tint per
+            // texture (deterministic), plus the shared checkerboard, so the bindless array holds SEVERAL
+            // distinct textures. Owned here for the run's lifetime. ---
+            auto makeSolid = [&](uint8_t r, uint8_t g, uint8_t b) {
+                std::vector<uint8_t> px(32 * 32 * 4);
+                for (size_t p = 0; p < 32 * 32; ++p) {
+                    px[p * 4 + 0] = r; px[p * 4 + 1] = g; px[p * 4 + 2] = b; px[p * 4 + 3] = 255;
+                }
+                return device->CreateTexture({32, 32, rhi::Format::RGBA8_UNorm, px.data(), px.size()});
+            };
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto checkerTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            // Six distinct solid tints + the checker = 7 distinct textures.
+            std::vector<std::unique_ptr<rhi::ITexture>> palette;
+            palette.push_back(makeSolid(220, 70, 70));    // red
+            palette.push_back(makeSolid(70, 200, 90));    // green
+            palette.push_back(makeSolid(80, 110, 230));   // blue
+            palette.push_back(makeSolid(230, 200, 60));   // yellow
+            palette.push_back(makeSolid(210, 110, 220));  // magenta
+            palette.push_back(makeSolid(90, 210, 220));   // cyan
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            // --- The scene objects. A 10x10 grid of alternating cube/sphere; each object's base-color
+            // texture is chosen deterministically from {checker} + the 6 solid tints. We build the
+            // render::bindless table over the per-object materials: Intern dedupes to the unique-texture
+            // set + records each object's index. ---
+            struct BObj { const scene::Mesh* mesh; Mat4 model; float tint; rhi::ITexture* tex; };
+            std::vector<BObj> objs;
+            std::vector<render::bindless::Material> mats;
+            const int kGrid = 10;
+            for (int gz = 0; gz < kGrid; ++gz) {
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    int idx = gz * kGrid + gx;
+                    float fx = (float)(gx - kGrid / 2) * 1.5f + 0.75f;
+                    float fz = (float)(gz - kGrid / 2) * 1.5f + 0.75f;
+                    float bob = 0.35f * std::sin((float)idx * 0.7f);
+                    Mat4 m = Mat4::Translate({fx, 0.7f + bob, fz}) * Mat4::Scale({0.45f, 0.45f, 0.45f});
+                    float tint = 0.35f + 0.5f * (float)((idx * 37) % 100) / 100.0f;
+                    // Texture choice: every 3rd object uses the checker, the rest cycle the 6 tints.
+                    rhi::ITexture* tex = (idx % 3 == 0)
+                        ? checkerTex.get()
+                        : palette[(size_t)(idx % palette.size())].get();
+                    objs.push_back({(idx & 1) ? &sphereMesh : &cubeMesh, m, tint, tex});
+                    mats.push_back({tex});
+                }
+            }
+            const uint32_t kObjects = (uint32_t)objs.size();
+
+            // --- Build the bindless index table (pure CPU). table.textures is the deduplicated texture
+            // array (in first-insertion order) the Vulkan descriptor array is filled with; texIndices[i]
+            // is object i's index into it. The GROUND uses the checker too (interned same as the grid). ---
+            std::vector<uint32_t> texIndices;
+            render::bindless::BindlessTable table = render::bindless::BuildTable(mats, texIndices);
+            // The ground's base color is the checker; resolve its index from the same table.
+            uint32_t groundTexIndex = render::bindless::Intern(table, checkerTex.get());
+            const uint32_t kTextures = table.size();
+
+            // --- Create the ONE bindless texture set from the table's texture array (bound once). ---
+            std::vector<rhi::ITexture*> bindlessTexList(table.textures.begin(), table.textures.end());
+            auto bindlessSet = device->CreateBindlessTextureSet(
+                std::span<rhi::ITexture* const>(bindlessTexList.data(), bindlessTexList.size()));
+            if (!bindlessSet) {
+                std::fprintf(stderr, "FATAL: CreateBindlessTextureSet returned null (no bindless support)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Pipelines. Bindless lit (lit_bindless.vert reads texIndex push const; lit_bindless.frag
+            // samples gTextures[NonUniformResourceIndex(texIndex)]) + the per-material reference lit
+            // (lit.vert + lit.frag, BindMaterial). Plus shared shadow, sky, post. ---
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+
+            auto blVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_bindless.vert.hlsl.spv");
+            auto blVs = device->CreateShaderModule({std::span<const uint32_t>(blVsWords)});
+            auto blFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_bindless.frag.hlsl.spv");
+            auto blFs = device->CreateShaderModule({std::span<const uint32_t>(blFsWords)});
+
+            rhi::GraphicsPipelineDesc blDesc;
+            blDesc.vertex = blVs.get(); blDesc.fragment = blFs.get();
+            blDesc.vertexLayout = scene::MeshVertexLayout();
+            blDesc.colorFormat = device->Swapchain().ColorFormat();
+            blDesc.depthTest = true; blDesc.usesFrameUniforms = true; blDesc.usesTexture = true;
+            blDesc.usesBindlessTextures = true;            // set 4: the bindless texture array
+            blDesc.pushConstantSize = sizeof(float) * 20 + sizeof(uint32_t);  // model + material + texIndex
+            auto bindlessPipeline = device->CreateGraphicsPipeline(blDesc);
+
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            scene::Transform groundXform; groundXform.scale = {12.0f, 1.0f, 12.0f};
+            Mat4 groundModel = groundXform.Matrix();
+
+            const Vec3 eye{0.0f, 12.0f, 15.0f};
+            const Vec3 center{0.0f, 0.5f, 0.0f};
+            const Vec3 lightDirVec = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+            FrameData fd{};
+            {
+                runtime::Camera cam;
+                cam.position = eye;
+                Vec3 dir = math::normalize(center - eye);
+                cam.yaw = std::atan2(dir.x, -dir.z);
+                cam.SetPitch(std::asin(dir.y));
+                cam.fovY = 0.9599311f;  // 55 degrees
+                cam.aspect = aspect;
+                cam.znear = 0.5f; cam.zfar = 80.0f;
+                Mat4 vp = cam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f;
+                fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDirVec * 26.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-13.0f, 13.0f, -13.0f, 13.0f, 1.0f, 60.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            // Shadow pass (identical for both renders): ground + every object casts a shadow.
+            auto recordShadow = [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(planeMesh.vertices());
+                cmd.BindIndexBuffer(planeMesh.indices());
+                cmd.DrawIndexed(planeMesh.indexCount());
+                for (const auto& ob : objs) {
+                    cmd.PushConstants(ob.model.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(ob.mesh->vertices());
+                    cmd.BindIndexBuffer(ob.mesh->indices());
+                    cmd.DrawIndexed(ob.mesh->indexCount());
+                }
+                cmd.EndRenderPass();
+            };
+
+            // === Render ONE frame and return its captured pixels. `bindless` selects the object draw
+            // path AND counts texture binds:
+            //   true  -> ONE BindBindlessTextures for the whole scene; each object pushes its texIndex.
+            //   false -> a per-material BindMaterial(tex, flatNormal) before each object (T binds).
+            // Everything else (camera, shadow, sky, ground geometry, post, frame uniforms) is identical,
+            // so the ONLY thing under test is bindless-array sampling vs per-material bound sampling. ===
+            auto renderFrame = [&](bool bindless, std::vector<uint8_t>& outPx,
+                                   uint32_t& outW, uint32_t& outH,
+                                   uint32_t& outDraws, uint32_t& outTexBinds) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow}, recordShadow);
+
+                uint32_t objectDraws = 0;
+                uint32_t texBinds = 0;
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        if (bindless) {
+                            // ONE bindless array bind for the entire scene (ground + all objects). The
+                            // ground + each object push their model+material+texIndex; the fragment
+                            // samples gTextures[texIndex].
+                            cmd.BindPipeline(*bindlessPipeline);
+                            cmd.BindBindlessTextures(*bindlessSet);
+                            ++texBinds;   // the single array bind
+                            // The bindless frag still samples the NORMAL MAP from set 1 (binding 3/4),
+                            // exactly like lit.frag — so bind ONE material set carrying the flat normal
+                            // map (its base-color binding 0/1 is ignored by the bindless frag). This is
+                            // a per-SCENE bind (not per-material): the normal map is the SAME flat
+                            // normal for every object, so the base-color array is the only per-draw
+                            // texture state. Bound ONCE here; not counted as a base-color texture bind.
+                            cmd.BindMaterial(*checkerTex, *flatNormal);
+                            // Ground.
+                            {
+                                struct { float pc[20]; uint32_t ti; } gpc{};
+                                for (int k = 0; k < 16; ++k) gpc.pc[k] = groundModel.m[k];
+                                gpc.pc[16] = 0.0f; gpc.pc[17] = 0.7f; gpc.pc[18] = 0.0f; gpc.pc[19] = 0.0f;
+                                gpc.ti = groundTexIndex;
+                                cmd.PushConstants(&gpc, sizeof(gpc));
+                                cmd.BindVertexBuffer(planeMesh.vertices());
+                                cmd.BindIndexBuffer(planeMesh.indices());
+                                cmd.DrawIndexed(planeMesh.indexCount());
+                            }
+                            for (uint32_t i = 0; i < kObjects; ++i) {
+                                const BObj& ob = objs[i];
+                                struct { float pc[20]; uint32_t ti; } opc{};
+                                for (int k = 0; k < 16; ++k) opc.pc[k] = ob.model.m[k];
+                                opc.pc[16] = 0.0f; opc.pc[17] = ob.tint; opc.pc[18] = 0.0f; opc.pc[19] = 0.0f;
+                                opc.ti = texIndices[i];
+                                cmd.PushConstants(&opc, sizeof(opc));
+                                cmd.BindVertexBuffer(ob.mesh->vertices());
+                                cmd.BindIndexBuffer(ob.mesh->indices());
+                                cmd.DrawIndexed(ob.mesh->indexCount());
+                                ++objectDraws;
+                            }
+                        } else {
+                            // The per-material BOUND reference: BindMaterial(tex, flatNormal) for the
+                            // ground + before EACH object (T distinct material binds). Same texture,
+                            // same flat normal, same push constant (model + material) -> same texels.
+                            cmd.BindPipeline(*litPipeline);
+                            // Ground.
+                            {
+                                cmd.BindMaterial(*checkerTex, *flatNormal);
+                                ++texBinds;
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                                pc[16] = 0.0f; pc[17] = 0.7f; pc[18] = 0.0f; pc[19] = 0.0f;
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindVertexBuffer(planeMesh.vertices());
+                                cmd.BindIndexBuffer(planeMesh.indices());
+                                cmd.DrawIndexed(planeMesh.indexCount());
+                            }
+                            for (uint32_t i = 0; i < kObjects; ++i) {
+                                const BObj& ob = objs[i];
+                                cmd.BindMaterial(*ob.tex, *flatNormal);
+                                ++texBinds;
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = ob.model.m[k];
+                                pc[16] = 0.0f; pc[17] = ob.tint; pc[18] = 0.0f; pc[19] = 0.0f;
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindVertexBuffer(ob.mesh->vertices());
+                                cmd.BindIndexBuffer(ob.mesh->indices());
+                                cmd.DrawIndexed(ob.mesh->indexCount());
+                                ++objectDraws;
+                            }
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                outDraws = objectDraws;
+                outTexBinds = texBinds;
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // --- Render the BINDLESS path AND the per-material BOUND reference; assert BYTE-IDENTICAL. ---
+            std::vector<uint8_t> bindlessPx, refPx;
+            uint32_t bw = 0, bh = 0, rw = 0, rh = 0;
+            uint32_t bDraws = 0, rDraws = 0, bBinds = 0, rBinds = 0;
+            if (!renderFrame(/*bindless=*/true, bindlessPx, bw, bh, bDraws, bBinds)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (bindless render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderFrame(/*bindless=*/false, refPx, rw, rh, rDraws, rBinds)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (bound reference render)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+            uint64_t bindlessHash = fnv(bindlessPx), refHash = fnv(refPx);
+            // textureBinds: 1 (the single array bind) for the bindless path; refTextureBinds: T (one
+            // per object + ground material bind) -- we report kTextures (the distinct-texture count) as
+            // the conceptual per-material bind cost of the bound path.
+            std::printf("bindless: {textures:%u, draws:%u, textureBinds:1, refTextureBinds:%u}\n",
+                        kTextures, bDraws, kTextures);
+            std::printf("bindless-hash: %016llx  ref-hash: %016llx  (boundBinds:%u)\n",
+                        (unsigned long long)bindlessHash, (unsigned long long)refHash, rBinds);
+
+            const bool identical = (bw == rw) && (bh == rh) && (bindlessPx.size() == refPx.size()) &&
+                                   (std::memcmp(bindlessPx.data(), refPx.data(), bindlessPx.size()) == 0);
+            if (!identical) {
+                std::fprintf(stderr,
+                    "FATAL: bindless render != per-material bound reference (index mapping / array fill "
+                    "wrong?) — bindless-hash %016llx vs ref-hash %016llx\n",
+                    (unsigned long long)bindlessHash, (unsigned long long)refHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("bindless==bound: BYTE-IDENTICAL (%u textures in 1 array bind vs %u per-material binds)\n",
+                        kTextures, rBinds);
+
+            // The bindless capture is the golden (identical to the bound reference by the assert above).
+            bool ok = WriteBMP(bindlessShotPath, bindlessPx, bw, bh);
+            if (ok) std::printf("wrote %s (%ux%u) — multi-texture scene via ONE bindless array\n",
+                                bindlessShotPath, bw, bh);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", bindlessShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

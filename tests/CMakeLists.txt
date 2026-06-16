@@ -218,6 +218,16 @@ hf_add_pure_test(gpu_cull_test)
 # ASan-eligible.
 hf_add_pure_test(mdi_test)
 
+# Bindless textures (Slice BZ): the pure-CPU texture-index TABLE / interner (render/bindless.h) that
+# assigns each UNIQUE scene texture a stable index in one large descriptor array and maps each material
+# to its index. Asserts INTERNING (Intern returns stable indices, dedups identical textures, distinct
+# textures -> distinct indices, first-insertion order), MATERIAL COVERAGE (BuildTable over a known
+# material set covers every texture; each material resolves to the right index; shared textures collapse
+# to one index), and DETERMINISM (two builds -> identical textures array + per-material indices). The
+# render-invariance proof (bindless image == bound image) lives in --bindless-shot; this pins the CPU
+# index table the GPU descriptor array is filled from. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(bindless_test)
+
 # Multithreaded command recording (Slice AU): the deterministic CONTIGUOUS draw-list partition
 # (PartitionDraws splits [0,K) into W gap/overlap-free ranges, run-to-run identical, degenerate
 # W>K/K=0/W=1/W=0) + the real worker-pool dispatch (RecordParallel marks each draw exactly once
