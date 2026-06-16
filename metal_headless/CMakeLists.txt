@@ -238,6 +238,18 @@ hf_gen_msl(lit_contactshadow.frag lit_contactshadow.frag.hlsl frag contactshadow
 hf_gen_msl(froxel_inject.comp     froxel_inject.comp.hlsl     comp froxel_inject_main)
 hf_gen_msl(froxel_integrate.comp  froxel_integrate.comp.hlsl  comp froxel_integrate_main)
 hf_gen_msl(froxel_apply.frag      froxel_apply.frag.hlsl      frag froxel_apply_fragment)
+# Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
+# (flat float4 SSBO), Luminance -> LumToBin -> InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER
+# SSBO (order-independent counts -> deterministic; Metal threadgroup atomic_uint maps from the SPIR-V
+# integer atomic). autoexposure_reduce.comp reduces -> AverageLuminance (black-bin excluded) ->
+# ExposureFromAverage -> writes the exposure float (gated by adaptationEnabled: false -> E0).
+# tonemap_autoexp.frag is post.frag with kExposure replaced by that SSBO value (cluster binding 13). The
+# SAME render/auto_exposure.h math compiled here makes the result bit-identical to the Vulkan/CPU path;
+# adaptationEnabled=false -> E0 -> byte-identical to the standard tonemap. Behind --autoexposure only;
+# existing shaders + goldens untouched.
+hf_gen_msl(autoexposure_histogram.comp autoexposure_histogram.comp.hlsl comp autoexposure_histogram_main)
+hf_gen_msl(autoexposure_reduce.comp    autoexposure_reduce.comp.hlsl    comp autoexposure_reduce_main)
+hf_gen_msl(tonemap_autoexp.frag        tonemap_autoexp.frag.hlsl        frag tonemap_autoexp_fragment)
 # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer + lit HDR scene; ssgi.frag
 # traces K cosine-hemisphere rays and marches the depth buffer (same march as ssr.frag) for indirect
 # diffuse, ssgi_composite ADDS it over the scene + tonemaps. Same HLSL->SPIR-V->MSL toolchain.

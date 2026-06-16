@@ -58,6 +58,7 @@
 #include "render/clustered.h"     // Slice AG: clustered / Forward+ light culling (pure math)
 #include "render/cluster.h"       // Slice CL: clustered light culling (cluster-grid assignment math)
 #include "render/froxel.h"         // Slice CS: froxel volumetric fog (grid + density + phase + integrate math)
+#include "render/auto_exposure.h"  // Slice CW: auto-exposure histogram eye-adaptation math (luminance/bins/exposure)
 #include "render/ssgi.h"          // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"         // Slice CF: Gerstner water displacement/normal + the fixed wave set
 #include "render/clouds.h"        // Slice CH: deterministic cloud noise/density/Beer/HG (mirrored in clouds.frag)
@@ -7851,6 +7852,216 @@ static int RunFroxelFogShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — froxel fog, %dx%dx%d froxels, density %.4g, g %.4g, %d objects\n",
                 outPath, fw, fh, DIMX, DIMY, DIMZ, (double)kBaseDensity, (double)kG, kNumObjs);
+    return 0;
+}
+
+// --- Auto-Exposure showcase (Slice CW). Mirrors the Vulkan --autoexposure-shot path EXACTLY: a
+// high-dynamic-range scene (a thin bright emissive sky band + a dark shadowed foreground) built as the
+// SAME deterministic HDR float image — exposed BOTH as a flat float4 storage buffer (for the histogram
+// compute) AND as an RGBA16F texture (for the tonemap to sample). Pipeline: clear the INTEGER histogram
+// SSBO -> autoexposure_histogram (one thread per pixel: Rec.709 Luminance -> render::autoexp::LumToBin ->
+// InterlockedAdd(histogram[bin],1)) -> [compute->compute barrier] -> autoexposure_reduce (AverageLuminance
+// black-bin-excluded -> ExposureFromAverage; gated by adaptationEnabled) -> [compute->fragment barrier] ->
+// tonemap_autoexp (applies the exposure SSBO before the ACES curve, otherwise identical to post.frag). The
+// SAME render/auto_exposure.h math compiled here (shared HLSL->SPIR-V->MSL) makes the result bit-identical
+// to the Vulkan/CPU path. THE ADAPTATION-OFF NO-OP PROOF (backend-portable: the SAME tonemap_autoexp chain
+// at adaptationEnabled=false (exposure == E0) vs the standard post.frag render of the same HDR texture):
+// asserted BYTE-IDENTICAL on THIS backend. The integer histogram (atomicAdd of 1) is order-independent ->
+// deterministic; Metal's atomic_uint maps from the SPIR-V integer atomic. New golden
+// tests/golden/metal/auto_exposure.png; two runs DIFF 0.0000.
+static int RunAutoExposureShowcase(const char* outPath) {
+    namespace ae = hf::render::autoexp;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+    const int   kBins        = 256;
+    const float kMinLogLum   = -8.0f;
+    const float kLogLumRange = 12.0f;
+    const float kKeyValue    = 0.18f;
+    const float kE0          = 1.7f;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // === Build the HDR scene on the CPU (deterministic) — IDENTICAL formula to the Vulkan path. ===
+    const uint32_t pixelCount = W * H;
+    std::vector<float> sceneF((size_t)pixelCount * 4);
+    for (uint32_t y = 0; y < H; ++y) {
+        float v = (float)y / (float)(H > 1 ? H - 1 : 1);
+        for (uint32_t x = 0; x < W; ++x) {
+            float u = (float)x / (float)(W > 1 ? W - 1 : 1);
+            float r, g, b;
+            if (v < 0.18f) {
+                float sky = 4.0f + 6.0f * (0.18f - v) / 0.18f + 3.0f * u;
+                r = sky * 1.00f; g = sky * 0.92f; b = sky * 0.78f;
+            } else {
+                float d = (v - 0.18f) / 0.82f;
+                float base = 0.10f + 0.30f * (1.0f - d);
+                float lit  = 0.18f * (0.35f + 0.65f * u);
+                float vign = 1.0f - 0.35f * d;
+                r = (base + lit) * vign * 0.85f;
+                g = (base + lit) * vign * 0.95f;
+                b = (base + lit) * vign * 1.10f;
+            }
+            size_t p = ((size_t)y * W + x) * 4;
+            sceneF[p + 0] = r; sceneF[p + 1] = g; sceneF[p + 2] = b; sceneF[p + 3] = 1.0f;
+        }
+    }
+    auto floatToHalf = [](float f) -> uint16_t {
+        uint32_t x; std::memcpy(&x, &f, sizeof(x));
+        uint32_t sign = (x >> 16) & 0x8000u;
+        int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+        uint32_t mant = x & 0x7FFFFFu;
+        if (((x >> 23) & 0xFF) == 0xFF) return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u));
+        if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+        if (exp <= 0) {
+            if (exp < -10) return (uint16_t)sign;
+            mant |= 0x800000u; int shift = 14 - exp;
+            return (uint16_t)(sign | (mant >> shift));
+        }
+        return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+    };
+    std::vector<uint16_t> sceneH((size_t)pixelCount * 4);
+    for (size_t k = 0; k < sceneF.size(); ++k) sceneH[k] = floatToHalf(sceneF[k]);
+    auto sceneTex = device->CreateTexture(
+        {W, H, kHdr, sceneH.data(), sceneH.size() * sizeof(uint16_t)});
+
+    rhi::BufferDesc sceneDesc;
+    sceneDesc.size = sceneF.size() * sizeof(float);
+    sceneDesc.initialData = sceneF.data();
+    sceneDesc.usage = rhi::BufferUsage::Storage;
+    auto sceneBuf = device->CreateBuffer(sceneDesc);
+
+    std::vector<uint32_t> histZero((size_t)kBins, 0u);
+
+    struct AeParamsCPU { uint32_t dims[4]; float lum[4]; };
+    static_assert(sizeof(AeParamsCPU) == 16 + 16, "AeParams std430 layout");
+
+    auto histCs = loadMSL("autoexposure_histogram.comp.gen.metal", "autoexposure_histogram_main");
+    rhi::ComputePipelineDesc histCd;
+    histCd.compute = histCs.get(); histCd.storageBufferCount = 3; histCd.threadsPerGroupX = 64;
+    auto histCompute = device->CreateComputePipeline(histCd);
+
+    auto reduceCs = loadMSL("autoexposure_reduce.comp.gen.metal", "autoexposure_reduce_main");
+    rhi::ComputePipelineDesc reduceCd;
+    reduceCd.compute = reduceCs.get(); reduceCd.storageBufferCount = 3; reduceCd.threadsPerGroupX = 1;
+    auto reduceCompute = device->CreateComputePipeline(reduceCd);
+
+    auto postVs    = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto autoexpFs = loadMSL("tonemap_autoexp.frag.gen.metal", "tonemap_autoexp_fragment");
+    auto postFs    = loadMSL("post.frag.gen.metal", "post_fragment");
+
+    rhi::GraphicsPipelineDesc autoexpD;
+    autoexpD.vertex = postVs.get(); autoexpD.fragment = autoexpFs.get();
+    autoexpD.colorFormat = device->Swapchain().ColorFormat();
+    autoexpD.depthTest = false; autoexpD.usesTexture = true; autoexpD.usesLightClusters = true;
+    autoexpD.usesFrameUniforms = true; autoexpD.fullscreen = true;
+    auto autoexpPipe = device->CreateGraphicsPipeline(autoexpD);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    rhi::BufferDesc dummyDesc;
+    dummyDesc.size = 16; uint32_t dummyInit[4] = {0,0,0,0}; dummyDesc.initialData = dummyInit;
+    dummyDesc.usage = rhi::BufferUsage::Storage;
+    auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+    const uint32_t kHistGroups = (pixelCount + 63u) / 64u;
+    FrameData fdAe{};
+
+    auto renderAuto = [&](uint32_t adaptationEnabled, std::vector<uint8_t>& outPx,
+                          uint32_t& outW, uint32_t& outH, float* outExposure) -> bool {
+        AeParamsCPU ap{};
+        ap.dims[0] = W; ap.dims[1] = H; ap.dims[2] = (uint32_t)kBins; ap.dims[3] = adaptationEnabled;
+        ap.lum[0] = kMinLogLum; ap.lum[1] = kLogLumRange; ap.lum[2] = kKeyValue; ap.lum[3] = kE0;
+        rhi::BufferDesc apDesc;
+        apDesc.size = sizeof(AeParamsCPU); apDesc.initialData = &ap; apDesc.usage = rhi::BufferUsage::Storage;
+        auto apBuf = device->CreateBuffer(apDesc);
+        rhi::BufferDesc histDesc;
+        histDesc.size = histZero.size() * sizeof(uint32_t);
+        histDesc.initialData = histZero.data(); histDesc.usage = rhi::BufferUsage::Storage;
+        auto histBuf = device->CreateBuffer(histDesc);
+        float exposureInit = kE0;
+        rhi::BufferDesc expDesc;
+        expDesc.size = sizeof(float); expDesc.initialData = &exposureInit; expDesc.usage = rhi::BufferUsage::Storage;
+        auto expBuf = device->CreateBuffer(expDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+        graph.AddPass("autoexp", {}, {rgSwap},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fdAe, sizeof(FrameData));
+                cmd.BindComputePipeline(*histCompute);
+                cmd.BindStorageBuffer(*sceneBuf, 0);
+                cmd.BindStorageBuffer(*histBuf, 1);
+                cmd.BindStorageBuffer(*apBuf, 2);
+                cmd.DispatchCompute(kHistGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*reduceCompute);
+                cmd.BindStorageBuffer(*histBuf, 0);
+                cmd.BindStorageBuffer(*expBuf, 1);
+                cmd.BindStorageBuffer(*apBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*autoexpPipe);
+                cmd.BindTexture(*sceneTex);
+                cmd.BindLightClusters(*expBuf, *dummyBuf, *dummyBuf);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        if (outExposure) device->ReadBuffer(*expBuf, outExposure, sizeof(float), 0);
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    auto renderStandard = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+        graph.AddPass("post", {}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneTex);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    // THE ADAPTATION-OFF NO-OP PROOF (backend-portable: adaptationEnabled=false (exposure==E0) vs the
+    // standard post.frag render of the same scene -> BYTE-IDENTICAL).
+    std::vector<uint8_t> autoPx, offPx, stdPx;
+    uint32_t aw=0, ah=0, ow=0, oh=0, sw=0, sh=0;
+    float evAuto = 0.0f;
+    if (!renderAuto(1u, autoPx, aw, ah, &evAuto)) return fail("no captured pixels (auto-exposure ON)");
+    if (!renderAuto(0u, offPx, ow, oh, nullptr)) return fail("no captured pixels (auto-exposure OFF)");
+    if (!renderStandard(stdPx, sw, sh)) return fail("no captured pixels (standard render)");
+
+    const bool offEquivalent = (ow == sw) && (oh == sh) && (offPx.size() == stdPx.size()) &&
+                               (std::memcmp(offPx.data(), stdPx.data(), stdPx.size()) == 0);
+    if (!offEquivalent)
+        return fail("auto-exposure adaptationEnabled=false render != standard render — NOT a pass-through");
+    std::printf("auto-exposure adaptationEnabled=false == standard render: BYTE-IDENTICAL "
+                "(adaptation-off no-op proof)\n");
+    float ev = std::log2(evAuto > 1e-6f ? evAuto : 1e-6f);
+    std::printf("auto-exposure: {bins:%d, EV:%.4g, keyValue:%.2f}\n", kBins, (double)ev, (double)kKeyValue);
+
+    if (!WritePNG(outPath, autoPx, aw, ah)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — auto-exposure, %d bins, EV %.4g, keyValue %.2f\n",
+                outPath, aw, ah, kBins, (double)ev, (double)kKeyValue);
     return 0;
 }
 
@@ -15708,6 +15919,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--froxellights") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_froxel_lights.png";
             try { return RunFroxelLightsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --autoexposure <out.png>: auto-exposure histogram eye-adaptation showcase (Slice CW) — a
+        // high-dynamic-range scene metered by an INTEGER luminance histogram -> key-value target exposure
+        // -> tonemap applies it. INTERNALLY renders adaptationEnabled=false (exposure == E0) and asserts it
+        // is BYTE-IDENTICAL to the standard fixed-exposure post.frag render of the same scene (the
+        // adaptation-off no-op proof). Mirrors the Vulkan --autoexposure-shot exactly (same HDR scene /
+        // bins / keyValue; the SAME render/auto_exposure.h math). Two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--autoexposure") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_auto_exposure.png";
+            try { return RunAutoExposureShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --water <out.png>: water-rendering showcase (Slice CF) — objects partially submerged at the

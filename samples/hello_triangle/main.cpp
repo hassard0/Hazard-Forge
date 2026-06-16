@@ -39,6 +39,7 @@
 #include "render/clustered.h"
 #include "render/cluster.h"
 #include "render/froxel.h"
+#include "render/auto_exposure.h"   // Slice CW: histogram eye-adaptation math (pure CPU)
 #include "render/taa.h"
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
@@ -355,6 +356,7 @@ int main(int argc, char** argv) {
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
+    const char* autoExposureShotPath = nullptr;  // --autoexposure-shot <out.bmp> (Slice CW: histogram eye adaptation)
     const char* waterShotPath = nullptr;     // --water-shot <out.bmp> (Slice CF: Gerstner water reflect/refract)
     const char* ssgiShotPath = nullptr;      // --ssgi-shot <out.bmp> (Slice BP: screen-space global illumination)
     const char* ssgiDenoiseShotPath = nullptr; // --ssgi-denoise-shot <out.bmp> (Slice BR: SSGI bilateral denoise)
@@ -724,6 +726,22 @@ int main(int argc, char** argv) {
             // `contact-shadows: {steps:N, maxDist:D, thickness:T}`. One BMP -> exit. New golden
             // contact_shadows.png; existing lit/gtao/ssao/froxel paths/shaders/goldens are untouched.
             contactShadowShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--autoexposure-shot") == 0 && i + 1 < argc) {
+            // Slice CW: Auto-Exposure (histogram eye adaptation). A high-dynamic-range scene (a bright
+            // emissive sky region + a dark shadowed region) where a FIXED exposure clips the bright or
+            // crushes the dark; auto-exposure balances it. Pipeline per render: clear the INTEGER
+            // histogram SSBO -> autoexposure_histogram (COMPUTE, one thread per pixel: Rec.709 Luminance
+            // -> render/auto_exposure.h::LumToBin -> InterlockedAdd(histogram[bin],1)) -> [compute->compute
+            // barrier] -> autoexposure_reduce (COMPUTE: AverageLuminance (black-bin excluded) ->
+            // ExposureFromAverage -> the single exposure float; gated by adaptationEnabled) ->
+            // [compute->fragment barrier] -> tonemap_autoexp (fullscreen: applies the exposure SSBO before
+            // the ACES curve, otherwise identical to post.frag). CRITICAL: the SAME tonemap_autoexp chain
+            // is ALSO run with adaptationEnabled=false (exposure = E0, the default's fixed 1.7) and
+            // asserted BYTE-IDENTICAL (SHA) to the engine's standard fixed-exposure post.frag render of the
+            // same scene — the adaptation-off no-op proof (the histogram/reduce/apply is a pure pass-through
+            // when off). Prints `auto-exposure: {bins:N, EV:X, keyValue:0.18}`. One BMP -> exit. New golden
+            // auto_exposure.png; existing post.frag/tonemap paths/shaders/goldens are untouched.
+            autoExposureShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--water-shot") == 0 && i + 1 < argc) {
             // Slice CF: water rendering showcase. A few objects (cubes/spheres/duck) partially submerged
             // at the water level + a procedural sky + directional light. The opaque scene is rendered
@@ -13200,6 +13218,299 @@ int main(int argc, char** argv) {
                                 froxelFogShotPath, fw, fh, DIMX, DIMY, DIMZ,
                                 (double)kBaseDensity, (double)kG, kNumObjs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", froxelFogShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Auto-Exposure (--autoexposure-shot, Slice CW): a luminance-histogram eye-adaptation pass.
+        // A high-dynamic-range scene (a bright emissive sky band + a dark shadowed foreground) built as a
+        // deterministic HDR float image — exposed BOTH as a flat float4 storage buffer (for the histogram
+        // compute) AND as an RGBA16F texture (for the tonemap to sample). Pipeline per render: clear the
+        // INTEGER histogram SSBO -> autoexposure_histogram (one thread per pixel: Rec.709 Luminance ->
+        // render::autoexp::LumToBin -> InterlockedAdd(histogram[bin],1)) -> [compute->compute barrier] ->
+        // autoexposure_reduce (AverageLuminance black-bin-excluded -> ExposureFromAverage; gated by
+        // adaptationEnabled — writes E0 when off) -> [compute->fragment barrier] -> tonemap_autoexp
+        // (applies the exposure SSBO before the ACES curve, otherwise identical to post.frag). THE
+        // ADAPTATION-OFF NO-OP PROOF: the SAME tonemap_autoexp chain at adaptationEnabled=false (exposure
+        // == E0 == 1.7, the default's fixed exposure) is asserted BYTE-IDENTICAL (SHA) to the engine's
+        // standard post.frag render of the same HDR texture — proving the histogram/reduce/apply is a pure
+        // pass-through when off (no constant bias, no exposure drift). Deterministic (fixed scene/keyValue/
+        // bins, integer histogram, no RNG); two runs byte-identical.
+        if (autoExposureShotPath) {
+            namespace ae = hf::render::autoexp;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+            // === Auto-exposure params (fixed, deterministic). ===
+            const int   kBins        = 256;
+            const float kMinLogLum   = -8.0f;    // 2^-8 ~= 0.0039 luminance floor
+            const float kLogLumRange = 12.0f;    // up to 2^4 == 16
+            const float kKeyValue    = 0.18f;    // 18%-grey middle-grey key
+            const float kE0          = 1.7f;     // the FIXED reference exposure (== post.frag's kExposure)
+
+            // === Build the HDR scene on the CPU (deterministic): a bright emissive sky band across the top
+            // (HDR luminances > 1) and a dark shadowed foreground (luminances << 0.18) so a fixed exposure
+            // would clip the sky or crush the floor and auto-exposure pulls the average toward middle-grey.
+            // The SAME float data feeds the histogram SSBO + the sampled HDR texture (so the metered scene
+            // == the displayed scene). ===
+            const uint32_t pixelCount = w * h;
+            std::vector<float> sceneF((size_t)pixelCount * 4);   // float4 per pixel (xyz color, w=1)
+            for (uint32_t y = 0; y < h; ++y) {
+                float v = (float)y / (float)(h > 1 ? h - 1 : 1);   // 0 top -> 1 bottom
+                for (uint32_t x = 0; x < w; ++x) {
+                    float u = (float)x / (float)(w > 1 ? w - 1 : 1);
+                    float r, g, b;
+                    if (v < 0.18f) {
+                        // A THIN bright emissive sky band across the top (HDR, luminances well above 1) —
+                        // the kind of small highlight a FIXED exposure must either clip or expose for. A
+                        // warm gradient, brighter toward the top + toward a "sun" on the right.
+                        float sky = 4.0f + 6.0f * (0.18f - v) / 0.18f + 3.0f * u;   // up to ~13 nits
+                        r = sky * 1.00f; g = sky * 0.92f; b = sky * 0.78f;
+                    } else {
+                        // The DARK shadowed scene that fills most of the frame: a dim lit floor with detail
+                        // (a soft side light + a gentle horizon-to-bottom falloff). Luminances ~0.05..0.5 —
+                        // a fixed exposure tuned for the bright sky CRUSHES this to black, but auto-exposure
+                        // meters the (dominant) dark content and OPENS UP so the shadow detail is revealed.
+                        float d = (v - 0.18f) / 0.82f;                 // 0 at the horizon -> 1 at bottom
+                        float base = 0.10f + 0.30f * (1.0f - d);       // brighter near the horizon
+                        float lit  = 0.18f * (0.35f + 0.65f * u);      // a soft side light reveals detail
+                        float vign = 1.0f - 0.35f * d;                 // a gentle vertical falloff
+                        r = (base + lit) * vign * 0.85f;
+                        g = (base + lit) * vign * 0.95f;
+                        b = (base + lit) * vign * 1.10f;
+                    }
+                    size_t p = ((size_t)y * w + x) * 4;
+                    sceneF[p + 0] = r; sceneF[p + 1] = g; sceneF[p + 2] = b; sceneF[p + 3] = 1.0f;
+                }
+            }
+
+            // Self-contained float -> half (IEEE binary16) for the RGBA16F HDR texture upload.
+            auto floatToHalf = [](float f) -> uint16_t {
+                uint32_t x; std::memcpy(&x, &f, sizeof(x));
+                uint32_t sign = (x >> 16) & 0x8000u;
+                int32_t  exp  = (int32_t)((x >> 23) & 0xFF) - 127 + 15;
+                uint32_t mant = x & 0x7FFFFFu;
+                if (((x >> 23) & 0xFF) == 0xFF) return (uint16_t)(sign | 0x7C00u | (mant ? 0x200u : 0u));
+                if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+                if (exp <= 0) {
+                    if (exp < -10) return (uint16_t)sign;
+                    mant |= 0x800000u; int shift = 14 - exp;
+                    return (uint16_t)(sign | (mant >> shift));
+                }
+                return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+            };
+            std::vector<uint16_t> sceneH((size_t)pixelCount * 4);
+            for (size_t k = 0; k < sceneF.size(); ++k) sceneH[k] = floatToHalf(sceneF[k]);
+            auto sceneTex = device->CreateTexture(
+                {w, h, kHdr, sceneH.data(), sceneH.size() * sizeof(uint16_t)});
+
+            // === Auto-exposure storage buffers (std430). ===
+            // The scene color SSBO the histogram pass reads (float4 per pixel, row-major), from the SAME
+            // float data the texture was built from.
+            rhi::BufferDesc sceneDesc;
+            sceneDesc.size = sceneF.size() * sizeof(float);
+            sceneDesc.initialData = sceneF.data();
+            sceneDesc.usage = rhi::BufferUsage::Storage;
+            auto sceneBuf = device->CreateBuffer(sceneDesc);
+
+            // The bins-entry INTEGER histogram, freshly cleared to 0 per render (so the count is a pure
+            // function of the scene -> deterministic).
+            std::vector<uint32_t> histZero((size_t)kBins, 0u);
+
+            // The 1-entry exposure float SSBO (the reduce writes it; the tonemap reads it).
+            // The AeParams std430 buffer: dims(width,height,bins,adaptationEnabled) + lum(minLogLum,
+            // logLumRange,keyValue,E0). Matches autoexposure_histogram/reduce AeParams.
+            struct AeParamsCPU { uint32_t dims[4]; float lum[4]; };
+            static_assert(sizeof(AeParamsCPU) == 16 + 16, "AeParams std430 layout");
+
+            // === Compute pipelines: histogram (3 SSBOs) + reduce (3 SSBOs). ===
+            auto histCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/autoexposure_histogram.comp.hlsl.spv");
+            auto histCs = device->CreateShaderModule({std::span<const uint32_t>(histCsW)});
+            rhi::ComputePipelineDesc histCd;
+            histCd.compute = histCs.get(); histCd.storageBufferCount = 3; histCd.threadsPerGroupX = 64;
+            auto histCompute = device->CreateComputePipeline(histCd);
+
+            auto reduceCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/autoexposure_reduce.comp.hlsl.spv");
+            auto reduceCs = device->CreateShaderModule({std::span<const uint32_t>(reduceCsW)});
+            rhi::ComputePipelineDesc reduceCd;
+            reduceCd.compute = reduceCs.get(); reduceCd.storageBufferCount = 3; reduceCd.threadsPerGroupX = 1;
+            auto reduceCompute = device->CreateComputePipeline(reduceCd);
+
+            // === Tonemap pipelines: tonemap_autoexp (reads the exposure SSBO) + the standard post.frag. ===
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            auto autoexpFs = loadFs("tonemap_autoexp.frag.hlsl");
+            auto postFs    = loadFs("post.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc autoexpD;
+            autoexpD.vertex = postVsM.get(); autoexpD.fragment = autoexpFs.get();
+            autoexpD.colorFormat = device->Swapchain().ColorFormat();
+            autoexpD.depthTest = false; autoexpD.usesTexture = true; autoexpD.usesLightClusters = true;
+            autoexpD.usesFrameUniforms = true;   // frame set 0 so the exposure SSBO set sits at index 3
+            autoexpD.fullscreen = true;
+            auto autoexpPipe = device->CreateGraphicsPipeline(autoexpD);
+
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFs.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // A dummy storage buffer for the unused BindLightClusters slots (the tonemap reads slot 0).
+            rhi::BufferDesc dummyDesc;
+            dummyDesc.size = 16; uint32_t dummyInit[4] = {0,0,0,0}; dummyDesc.initialData = dummyInit;
+            dummyDesc.usage = rhi::BufferUsage::Storage;
+            auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+            const uint32_t kHistGroups = (pixelCount + 63u) / 64u;
+
+            FrameData fdAe{};   // declared so the tonemap pipeline's frame set 0 has uniforms bound (unused)
+
+            // Render the HDR scene through the auto-exposure chain at a given adaptationEnabled, capturing
+            // the swapchain pixels. The reduce reads `exposureBuf` back so we can print the computed EV.
+            auto renderAuto = [&](uint32_t adaptationEnabled, std::vector<uint8_t>& outPx,
+                                  uint32_t& outW, uint32_t& outH, float* outExposure) -> bool {
+                AeParamsCPU ap{};
+                ap.dims[0] = w; ap.dims[1] = h; ap.dims[2] = (uint32_t)kBins; ap.dims[3] = adaptationEnabled;
+                ap.lum[0] = kMinLogLum; ap.lum[1] = kLogLumRange; ap.lum[2] = kKeyValue; ap.lum[3] = kE0;
+                rhi::BufferDesc apDesc;
+                apDesc.size = sizeof(AeParamsCPU); apDesc.initialData = &ap;
+                apDesc.usage = rhi::BufferUsage::Storage;
+                auto apBuf = device->CreateBuffer(apDesc);
+
+                rhi::BufferDesc histDesc;
+                histDesc.size = histZero.size() * sizeof(uint32_t);
+                histDesc.initialData = histZero.data();   // fresh clear to 0
+                histDesc.usage = rhi::BufferUsage::Storage;
+                auto histBuf = device->CreateBuffer(histDesc);
+
+                float exposureInit = kE0;
+                rhi::BufferDesc expDesc;
+                expDesc.size = sizeof(float); expDesc.initialData = &exposureInit;
+                expDesc.usage = rhi::BufferUsage::Storage;
+                auto expBuf = device->CreateBuffer(expDesc);
+
+                render::RenderGraph graph;
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                // The histogram -> reduce compute + the tonemap apply in one pass (compute recorded
+                // OUTSIDE a render pass; the barriers carry the SSBO write->read hazards).
+                graph.AddPass("autoexp", {}, {rgSwap},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fdAe, sizeof(FrameData));   // for the tonemap's frame set 0
+                        // histogram: one thread per pixel -> integer atomicAdd into histBuf.
+                        cmd.BindComputePipeline(*histCompute);
+                        cmd.BindStorageBuffer(*sceneBuf, 0);
+                        cmd.BindStorageBuffer(*histBuf, 1);
+                        cmd.BindStorageBuffer(*apBuf, 2);
+                        cmd.DispatchCompute(kHistGroups);
+                        cmd.ComputeToComputeBarrier();         // histogram write -> reduce read
+                        // reduce: histogram -> average -> exposure (or E0 when adaptation off).
+                        cmd.BindComputePipeline(*reduceCompute);
+                        cmd.BindStorageBuffer(*histBuf, 0);
+                        cmd.BindStorageBuffer(*expBuf, 1);
+                        cmd.BindStorageBuffer(*apBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToFragmentBarrier();        // reduce write -> tonemap fragment read
+                        // tonemap_autoexp: sample the HDR texture, apply the exposure SSBO, ACES, etc.
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*autoexpPipe);
+                        cmd.BindTexture(*sceneTex);
+                        cmd.BindLightClusters(*expBuf, *dummyBuf, *dummyBuf);  // exposure SSBO (binding 13)
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                if (outExposure) device->ReadBuffer(*expBuf, outExposure, sizeof(float), 0);
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // The engine's STANDARD fixed-exposure render of the same HDR texture (post.frag, the default
+            // tonemap path — UNTOUCHED). This is the reference the adaptation-off render must equal.
+            auto renderStandard = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("post", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*sceneTex);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE ADAPTATION-OFF NO-OP PROOF.
+            //   autoPx  — the REAL adaptationEnabled=true auto-exposed render: the golden.
+            //   offPx   — adaptationEnabled=false (full histogram->reduce->tonemap chain; exposure == E0).
+            //   stdPx   — the engine's standard fixed-exposure post.frag render of the same scene.
+            // offPx and stdPx both apply EXACTLY E0 before the SAME tonemap curve, so they MUST be
+            // BYTE-IDENTICAL — proving the histogram/reduce/apply plumbing is a pure pass-through when
+            // adaptation is off (no constant bias, no exposure drift). Fail loudly on any diff.
+            std::vector<uint8_t> autoPx, offPx, stdPx;
+            uint32_t aw=0, ah=0, ow=0, oh=0, sw=0, sh=0;
+            float evAuto = 0.0f;
+            if (!renderAuto(1u, autoPx, aw, ah, &evAuto)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (auto-exposure adaptation ON)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderAuto(0u, offPx, ow, oh, nullptr)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (auto-exposure adaptation OFF)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderStandard(stdPx, sw, sh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (standard fixed-exposure render)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t offHash = fnv(offPx), stdHash = fnv(stdPx), autoHash = fnv(autoPx);
+            std::printf("auto-exposure adaptationEnabled=false hash: %016llx  standard hash: %016llx\n",
+                        (unsigned long long)offHash, (unsigned long long)stdHash);
+            const bool offEquivalent = (ow == sw) && (oh == sh) && (offPx.size() == stdPx.size()) &&
+                                       (std::memcmp(offPx.data(), stdPx.data(), stdPx.size()) == 0);
+            if (!offEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: auto-exposure adaptationEnabled=false render != standard fixed-exposure render "
+                    "— the histogram->reduce->tonemap chain is NOT a pure pass-through at E0 (constant bias "
+                    "/ exposure drift). off %016llx vs standard %016llx\n",
+                    (unsigned long long)offHash, (unsigned long long)stdHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("auto-exposure adaptationEnabled=false == standard render: BYTE-IDENTICAL "
+                        "(adaptation-off no-op proof)\n");
+            // The exposure value as an EV (log2 of the multiplier) for the stat line.
+            float ev = std::log2(evAuto > 1e-6f ? evAuto : 1e-6f);
+            std::printf("auto-exposure: {bins:%d, EV:%.4g, keyValue:%.2f}\n", kBins, (double)ev,
+                        (double)kKeyValue);
+            // Sanity: the auto-exposed render must DIFFER from the standard fixed-exposure render.
+            if (autoHash == stdHash)
+                std::fprintf(stderr, "WARNING: auto-exposed render is identical to the standard render "
+                                     "(no visible adaptation) — check the scene / keyValue\n");
+
+            bool ok = WriteBMP(autoExposureShotPath, autoPx, aw, ah);
+            if (ok) std::printf("wrote %s (%ux%u) — auto-exposure, %d bins, EV %.4g, keyValue %.2f\n",
+                                autoExposureShotPath, aw, ah, kBins, (double)ev, (double)kKeyValue);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", autoExposureShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

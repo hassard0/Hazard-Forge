@@ -209,6 +209,21 @@ hf_add_pure_test(gtao_test)
 # froxel_inject/integrate/apply. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(froxel_test)
 
+# Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
+# autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
+# black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,
+# above-ceiling -> top bin, monotone) and its inverse BinToLum (monotone increasing,
+# BinToLum(LumToBin(lum)) ~= lum within one bin width), the black-bin-EXCLUDED weighted AverageLuminance
+# (single bin -> that bin's center luminance; two-bin -> count-weighted average; a huge black pile is
+# excluded so it meters the lit content; all-black -> a finite non-zero floor), the key-value
+# ExposureFromAverage (== keyValue/avg, avg==keyValue -> EV 1, monotone DECREASING so a bright scene
+# darkens + a dark scene brightens, near-black -> a finite eps-floored exposure), the uniform-image exact
+# EV (avg == the bin center -> exposure == keyValue/binCenter), and DETERMINISM (same histogram ->
+# bit-identical average + exposure). The adaptation-off byte-identical proof lives in --autoexposure-shot;
+# this pins the CPU math both the shaders + the showcase read. Pure C++ (hf_core), no RHI/backend
+# symbols, ASan-eligible.
+hf_add_pure_test(auto_exposure_test)
+
 # Per-Froxel Clustered-Light Injection (Slice CV): the ADDED clustered-point-light in-scatter term
 # froxel::InjectClusteredLights the inject pass (froxel_inject.comp.hlsl behind the injectLights flag)
 # accumulates on top of the CS sun in-scatter — the marquee CS (froxel fog) + CL (clustered lights)

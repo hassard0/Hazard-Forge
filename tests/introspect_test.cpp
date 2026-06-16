@@ -194,6 +194,8 @@ int main() {
             bool sawFroxelLightsFeature = false;
             // Slice CT: the contact-shadows capability is advertised in the feature manifest.
             bool sawContactShadowsFeature = false;
+            // Slice CW: the auto-exposure capability is advertised in the feature manifest.
+            bool sawAutoExposureFeature = false;
             // Slice CF: the water-rendering capability is advertised in the feature manifest.
             bool sawWaterFeature = false;
             // Slice BQ: the state-replication capability is advertised in the feature manifest.
@@ -246,6 +248,7 @@ int main() {
                     if (AsString(el->value) == "froxel-volumetric-fog") sawFroxelFogFeature = true;
                     if (AsString(el->value) == "froxel-light-injection") sawFroxelLightsFeature = true;
                     if (AsString(el->value) == "contact-shadows") sawContactShadowsFeature = true;
+                    if (AsString(el->value) == "auto-exposure") sawAutoExposureFeature = true;
                     if (AsString(el->value) == "water-rendering") sawWaterFeature = true;
                     if (AsString(el->value) == "state-replication") sawReplicationFeature = true;
                     if (AsString(el->value) == "network-transport-sim") sawNetsimFeature = true;
@@ -288,6 +291,7 @@ int main() {
             check(sawFroxelFogFeature, "engine.features includes froxel-volumetric-fog");
             check(sawFroxelLightsFeature, "engine.features includes froxel-light-injection");
             check(sawContactShadowsFeature, "engine.features includes contact-shadows");
+            check(sawAutoExposureFeature, "engine.features includes auto-exposure");
             check(sawWaterFeature, "engine.features includes water-rendering");
             check(sawReplicationFeature, "engine.features includes state-replication");
             check(sawNetsimFeature, "engine.features includes network-transport-sim");
@@ -384,6 +388,8 @@ int main() {
         bool sawFroxelLightsShot = false;
         // Slice CT: the --contactshadow-shot showcase flag is listed in the showcase manifest.
         bool sawContactShadowShot = false;
+        // Slice CW: the --autoexposure-shot showcase flag is listed in the showcase manifest.
+        bool sawAutoExposureShot = false;
         // Slice CF: the --water-shot showcase flag is listed in the showcase manifest.
         bool sawWaterShot = false;
         // Slice BR: the --ssgi-denoise-shot showcase flag is listed in the showcase manifest.
@@ -443,6 +449,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--froxelfog-shot") sawFroxelFogShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--autoexposure-shot") sawAutoExposureShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--water-shot") sawWaterShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-denoise-shot") sawSsgiDenoiseShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ssgi-temporal-shot") sawSsgiTemporalShot = true;
@@ -489,6 +496,7 @@ int main() {
         check(sawFroxelFogShot, "showcases manifest includes --froxelfog-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
+        check(sawAutoExposureShot, "showcases manifest includes --autoexposure-shot");
         check(sawWaterShot, "showcases manifest includes --water-shot");
         check(sawSsgiDenoiseShot, "showcases manifest includes --ssgi-denoise-shot");
         check(sawSsgiTemporalShot, "showcases manifest includes --ssgi-temporal-shot");

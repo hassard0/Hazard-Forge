@@ -320,6 +320,19 @@ hf_compile_shaders(
     "shaders/froxel_inject.comp.hlsl:cs"
     "shaders/froxel_integrate.comp.hlsl:cs"
     "shaders/froxel_apply.frag.hlsl:ps"
+    # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
+    # color (flat float4 SSBO), computes the Rec.709 Luminance, maps it to a log2-luminance bin via
+    # render/auto_exposure.h::LumToBin, and InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER SSBO
+    # (order-independent counts -> deterministic). autoexposure_reduce.comp reduces the histogram ->
+    # AverageLuminance (black-bin excluded) -> ExposureFromAverage (key-value) -> writes the single exposure
+    # float (gated by adaptationEnabled: when false it writes the fixed E0). tonemap_autoexp.frag is the
+    # post.frag tonemap with the fixed kExposure replaced by that exposure SSBO value (read via the cluster
+    # binding 13/space3 — no new RHI seam). With adaptationEnabled=false the exposure is E0 -> byte-identical
+    # to the standard fixed-exposure tonemap. New golden auto_exposure.png; existing post.frag + goldens
+    # untouched (a NEW path behind --autoexposure-shot).
+    "shaders/autoexposure_histogram.comp.hlsl:cs"
+    "shaders/autoexposure_reduce.comp.hlsl:cs"
+    "shaders/tonemap_autoexp.frag.hlsl:ps"
 )
 target_compile_definitions(hello_triangle PRIVATE
   "HF_SHADER_DIR=\"${SHADER_OUT}\"")

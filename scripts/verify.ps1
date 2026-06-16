@@ -96,6 +96,7 @@ $Goldens = @(
     @{ Name = 'froxel_fog';    Flag = '--froxelfog' }            # Slice CS (froxel volumetric fog: inject->integrate->depth-composited apply; baseDensity=0 byte-identical to the no-fog scene)
     @{ Name = 'froxel_lights'; Flag = '--froxellights' }         # Slice CV (per-froxel clustered-light injection: the 96 clustered point lights scatter through the fog as colored volumetric shafts; injectLights=false byte-identical to the CS sun-only fog + density=0 byte-identical to the no-fog scene)
     @{ Name = 'contact_shadows'; Flag = '--contactshadow' }      # Slice CT (screen-space contact shadows: short depth ray-march toward the sun fills the fine contact occlusion the CSM misses; maxDist=0 byte-identical to the no-contact scene)
+    @{ Name = 'auto_exposure'; Flag = '--autoexposure' }         # Slice CW (auto-exposure histogram eye adaptation: integer-histogram luminance metering -> key-value exposure -> tonemap applies it; adaptationEnabled=false uses the fixed E0 and is byte-identical to the standard fixed-exposure tonemap)
     @{ Name = 'water';         Flag = '--water' }                # Slice CF (Gerstner water reflect/refract + sun glint)
     @{ Name = 'ssgi';          Flag = '--ssgi' }                 # Slice BP (screen-space global illumination)
     @{ Name = 'ssgi_denoise';  Flag = '--ssgi-denoise' }         # Slice BR (SSGI bilateral spatial denoise)
