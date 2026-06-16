@@ -222,6 +222,14 @@ hf_compile_shaders(
     # The Hi-Z pyramid is built CPU-side (render/hiz.h) from a depth pre-pass + uploaded; the shader
     # runs the SAME IsOccluded math. Render-invariant: occlusion-culled == frustum-only byte-identical.
     "shaders/hiz_cull.comp.hlsl:cs"
+    # Clustered Light Culling (Slice CL): cluster_assign.comp assigns each point light to the clusters
+    # its hard-radius view-sphere intersects (the SAME ClusterViewAABB + SphereAABBIntersect math as
+    # engine/render/cluster.h), writing a DETERMINISTIC ORDERED per-cluster light list. lit_clustered_cl
+    # is the clustered lit variant (windowed hard-radius point lights on top of the default sun+IBL),
+    # asserted BYTE-IDENTICAL to a brute-force all-lights render. Distinct from Slice AG's clustered
+    # path; separate golden (clustered_lights.png); existing shaders + goldens untouched.
+    "shaders/cluster_assign.comp.hlsl:cs"
+    "shaders/lit_clustered_cl.frag.hlsl:ps"
     # GPU multi-draw-indirect batching (Slice BM): the MDI lit vertex shader reads the per-draw model
     # matrix + material from a storage buffer indexed by gl_DrawID (SPIR-V DrawIndex). VULKAN-ONLY (the
     # DrawIndex builtin needs shaderDrawParameters); shares the existing lit.frag. Not in the Metal MSL

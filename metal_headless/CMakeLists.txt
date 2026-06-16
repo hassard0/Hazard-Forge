@@ -81,6 +81,11 @@ hf_gen_msl(lit_point.frag  lit_point.frag.hlsl  frag point_fragment)
 # point lights from three fragment-stage storage buffers (space3 -> flat Metal fragment buffers).
 # Reuses lit.vert. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(lit_clustered.frag  lit_clustered.frag.hlsl  frag clustered_fragment)
+# Clustered LIGHT-CULLING lit fragment (Slice CL): windowed hard-radius point lights from this pixel's
+# cluster's fixed-slot ordered list (the SAME ClusterList layout the cluster_assign compute fills on
+# Vulkan; on Metal the list is assigned CPU-side via render/cluster.h). Reuses lit.vert. Shared
+# HLSL->SPIR-V->MSL toolchain -> the light field is bit-identical cross-backend.
+hf_gen_msl(lit_clustered_cl.frag  lit_clustered_cl.frag.hlsl  frag clustered_lights_fragment)
 # Full-PBR fragment shader (Slice P): reuses lit.vert; samples the 5-texture glTF material set.
 hf_gen_msl(lit_pbr.frag lit_pbr.frag.hlsl frag pbr_fragment)
 # Data-driven material graph (Slice AV): the COMMITTED build-time-generated fragment shader

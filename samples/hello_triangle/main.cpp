@@ -37,6 +37,7 @@
 #include "render/decal.h"
 #include "render/post_stack.h"
 #include "render/clustered.h"
+#include "render/cluster.h"
 #include "render/taa.h"
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
@@ -364,6 +365,7 @@ int main(int argc, char** argv) {
     const char* gpuDrivenShotPath = nullptr; // --gpudriven-shot <out.bmp> (Slice CB: MDI + bindless capstone)
     const char* gpuCullDrawShotPath = nullptr; // --gpucull-draw-shot <out.bmp> (Slice CD: compute-cull -> MDI + bindless)
     const char* hizCullShotPath = nullptr;   // --hiz-cull-shot <out.bmp> (Slice CJ: Hi-Z occlusion cull)
+    const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
     const char* cameraShotPath = nullptr;   // --camera-shot <yaw,pitch,x,y,z> <out.bmp>
@@ -812,6 +814,19 @@ int main(int argc, char** argv) {
             // `hiz-cull: {total:N, frustumKept:K, occluded:O, drawn:D, cpuOccluded:O}`. New golden
             // hiz_cull.png; existing goldens untouched.
             hizCullShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
+            // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
+            // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
+            // assigns each light to the clusters its hard-radius view-sphere intersects (the SAME
+            // ClusterViewAABB + SphereAABBIntersect math as render/cluster.h), writing a DETERMINISTIC
+            // ORDERED per-cluster light list; the clustered lit shader sums ONLY each pixel's cluster's
+            // lights (windowed hard-radius atten). The run ALSO renders an INTERNAL brute-force
+            // all-96-lights version (a 1x1x1 grid -> one cluster with every light) and ASSERTS the
+            // clustered capture is BYTE-IDENTICAL (SHA) to it, AND the GPU assigned-total == the CPU
+            // cluster::AssignLights reference, AND 1 < maxPerCluster < 96 (real culling). Prints
+            // `clustered-lights: {lights:96, clusters:N, maxPerCluster:M, avgPerCluster:A,
+            // brimByteIdentical:true}`. New golden clustered_lights.png; existing goldens untouched.
+            clusteredLightsShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             mtWorkers = std::atoi(argv[i + 1]);
             if (mtWorkers < 1) mtWorkers = 1;
@@ -7048,6 +7063,382 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — Hi-Z occlusion-culled %u of %u candidates (frustum %u)\n",
                                 hizCullShotPath, ow, oh, gpuOccluded, kCand, gpuFrustumKept);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", hizCullShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Clustered Light Culling (--clustered-lights-shot <out.bmp>, Slice CL). The many-lights
+        // flagship: a ground plane + a few raised objects lit by 96 deterministically-placed colored
+        // point lights + the directional sun. A COMPUTE pass (cluster_assign.comp) assigns each light to
+        // the clusters its hard-radius VIEW-sphere intersects (the SAME ClusterViewAABB +
+        // SphereAABBIntersect math as render/cluster.h), writing a DETERMINISTIC ORDERED per-cluster
+        // light list (fixed cap, no atomics). The clustered lit shader (lit_clustered_cl.frag) sums ONLY
+        // each pixel's cluster's lights with a WINDOWED HARD-RADIUS attenuation.
+        //
+        // RENDER-INVARIANCE PROOF: render the clustered shade (16x9x24 grid), then render an INTERNAL
+        // BRUTE-FORCE all-96-lights version (a 1x1x1 grid -> one cluster holding EVERY light, the SAME
+        // shader), and ASSERT the two captures are BYTE-IDENTICAL (SHA). Because a light contributes
+        // EXACTLY 0 beyond `radius` and is assigned iff its sphere intersects a cluster AABB, the
+        // clustered sum equals the all-lights sum. ALSO assert the GPU assigned-total == the CPU
+        // cluster::AssignLights reference AND 1 < maxPerCluster < 96 (real culling). New golden
+        // clustered_lights.png; all existing paths/shaders/goldens untouched. ----
+        if (clusteredLightsShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cl = hf::render::cluster;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Clustered FrameData (matches shaders/lit_clustered_cl.frag). 208 bytes < kFrameUboSize.
+            struct ClusteredFrameData {
+                float viewProj[16];      //   0
+                float view[16];          //  64  world -> view
+                float lightDir[4];       // 128  directional sun
+                float lightColor[4];     // 144
+                float viewPos[4];        // 160  world-space camera
+                float clusterParams[4];  // 176  x=dimX y=dimY z=dimZ w=zNear
+                float clusterParams2[4]; // 192  x=zFar y=screenW z=screenH w=ambient(unused)
+            };
+            static_assert(sizeof(ClusteredFrameData) == 208, "Clustered (CL) FrameData layout");
+
+            // === Cluster grid + camera. Fixed, deterministic. ===
+            const int   DIMX = 16, DIMY = 9, DIMZ = 24;
+            const float kNear = 0.5f, kFar = 90.0f;
+            const float fovY = 1.04719755f;  // 60deg
+            const Vec3 eye{0.0f, 16.0f, 26.0f};
+            const Vec3 center{0.0f, 0.0f, -2.0f};
+            Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 proj = Mat4::Perspective(fovY, aspect, kNear, kFar);
+            Mat4 vp = proj * view;
+            cl::ClusterGrid grid; grid.dimX = DIMX; grid.dimY = DIMY; grid.dimZ = DIMZ;
+            grid.zNear = kNear; grid.zFar = kFar;
+
+            // === 96 deterministic point lights: an 8x12 lattice hovering just above a wide floor. No
+            // RNG — positions/colors/radii are pure functions of the index, so the result is bit-stable.
+            const int   LX = 8, LZ = 12;
+            const int   kNumLights = LX * LZ;   // 96
+            const float spanX = 34.0f, spanZ = 26.0f;
+            const float lightY = 1.4f;
+            std::vector<cl::PointLight> lights;       // WORLD-space (cluster::AssignLights view-transforms)
+            std::vector<cl::GpuLight>   gpuLights;    // VIEW-space records the shaders consume
+            lights.reserve(kNumLights);
+            gpuLights.reserve(kNumLights);
+            static const float palette[6][3] = {
+                {1.00f, 0.18f, 0.20f}, {0.20f, 1.00f, 0.30f}, {0.25f, 0.40f, 1.00f},
+                {1.00f, 0.80f, 0.15f}, {0.90f, 0.20f, 1.00f}, {0.15f, 0.95f, 0.95f},
+            };
+            for (int iz = 0; iz < LZ; ++iz)
+                for (int ix = 0; ix < LX; ++ix) {
+                    int idx = iz * LX + ix;
+                    float fx = ((float)ix / (float)(LX - 1) - 0.5f) * spanX;
+                    float fz = ((float)iz / (float)(LZ - 1) - 0.5f) * spanZ - 2.0f;
+                    const float* c = palette[(ix * 2 + iz * 3) % 6];
+                    float radius = 5.0f + ((idx * 7) % 6) * 0.6f;   // 5.0 .. 8.0 (moderate -> real culling)
+                    cl::PointLight L{};
+                    L.posWorld = {fx, lightY, fz};
+                    L.radius = radius;
+                    L.color = {c[0], c[1], c[2]};
+                    L.intensity = 3.0f;
+                    lights.push_back(L);
+
+                    Vec3 vposL = math::MulPoint(view, L.posWorld);  // affine world->view
+                    cl::GpuLight gl{};
+                    gl.posRadius[0]=vposL.x; gl.posRadius[1]=vposL.y; gl.posRadius[2]=vposL.z; gl.posRadius[3]=radius;
+                    gl.color[0]=c[0]; gl.color[1]=c[1]; gl.color[2]=c[2]; gl.color[3]=L.intensity;
+                    gpuLights.push_back(gl);
+                }
+
+            // === CPU REFERENCE assignment (the count + maxPerCluster truth the GPU must match). ===
+            std::vector<std::vector<uint32_t>> cpuPerCluster;
+            cl::AssignLights(grid, proj, view, (int)w, (int)h,
+                             std::span<const cl::PointLight>(lights), cpuPerCluster);
+            uint32_t cpuAssignedTotal = 0;
+            size_t   cpuMaxPerCluster = 0;
+            for (const auto& list : cpuPerCluster) {
+                cpuAssignedTotal += (uint32_t)list.size();
+                cpuMaxPerCluster = std::max(cpuMaxPerCluster, list.size());
+            }
+
+            // === GPU light buffer (shared by the compute + both renders). ===
+            rhi::BufferDesc lightDesc;
+            lightDesc.size = gpuLights.size() * sizeof(cl::GpuLight);
+            lightDesc.initialData = gpuLights.data();
+            lightDesc.usage = rhi::BufferUsage::Storage;
+            auto lightBuf = device->CreateBuffer(lightDesc);
+
+            // === Cluster-assign compute buffers. ClusterList must match cluster_assign.comp's std430
+            // layout: uint count + uint pad[3] + uint idx[64] = 272 bytes. ===
+            constexpr int kMaxPer = cl::kMaxLightsPerCluster;  // 64
+            struct ClusterListCPU { uint32_t count; uint32_t pad[3]; uint32_t idx[kMaxPer]; };
+            static_assert(sizeof(ClusterListCPU) == 16 + 4 * kMaxPer, "ClusterList std430 layout");
+            const int nClusters = grid.clusterCount();
+
+            std::vector<ClusterListCPU> clusterListInit((size_t)nClusters);  // zero count
+            for (auto& c : clusterListInit) { c.count = 0; c.pad[0]=c.pad[1]=c.pad[2]=0; }
+            rhi::BufferDesc clDesc;
+            clDesc.size = clusterListInit.size() * sizeof(ClusterListCPU);
+            clDesc.initialData = clusterListInit.data();
+            clDesc.usage = rhi::BufferUsage::Storage;
+            auto clusterListBuf = device->CreateBuffer(clDesc);
+
+            uint32_t totalsInit[2] = {0, 0};  // [0]=assignedTotal, [1]=overflow
+            rhi::BufferDesc totalsDesc;
+            totalsDesc.size = sizeof(totalsInit);
+            totalsDesc.initialData = totalsInit;
+            totalsDesc.usage = rhi::BufferUsage::Storage;
+            auto totalsBuf = device->CreateBuffer(totalsDesc);
+
+            // Params (matches cluster_assign.comp Params): dims(dimX,dimY,dimZ,lightCount) +
+            // range(zNear,zFar,_,_) + invProj (column-major float4x4).
+            struct AssignParams { uint32_t dims[4]; float range[4]; float invProj[16]; };
+            static_assert(sizeof(AssignParams) == 16 + 16 + 64, "AssignParams std430 layout");
+            AssignParams ap{};
+            ap.dims[0]=(uint32_t)DIMX; ap.dims[1]=(uint32_t)DIMY; ap.dims[2]=(uint32_t)DIMZ;
+            ap.dims[3]=(uint32_t)kNumLights;
+            ap.range[0]=kNear; ap.range[1]=kFar; ap.range[2]=0.0f; ap.range[3]=0.0f;
+            Mat4 invProj = proj.Inverse();
+            for (int k = 0; k < 16; ++k) ap.invProj[k] = invProj.m[k];
+            rhi::BufferDesc apDesc;
+            apDesc.size = sizeof(AssignParams);
+            apDesc.initialData = &ap;
+            apDesc.usage = rhi::BufferUsage::Storage;
+            auto apBuf = device->CreateBuffer(apDesc);
+
+            // Compute pipeline: 4 storage buffers; one thread per cluster (256/group).
+            auto assignCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cluster_assign.comp.hlsl.spv");
+            auto assignCs = device->CreateShaderModule({std::span<const uint32_t>(assignCsWords)});
+            rhi::ComputePipelineDesc assignCdesc;
+            assignCdesc.compute = assignCs.get();
+            assignCdesc.storageBufferCount = 4;
+            assignCdesc.pushConstantSize = 0;
+            assignCdesc.threadsPerGroupX = 256;
+            auto assignCompute = device->CreateComputePipeline(assignCdesc);
+
+            // === Run the assign compute alone; read back the totals + the cluster lists. ===
+            const uint32_t kGroups = ((uint32_t)nClusters + 255u) / 256u;
+            {
+                render::RenderGraph pre;
+                render::RgResource rgSwapPre = pre.ImportSwapchain("swapchain");
+                pre.AddPass("assign", {}, {rgSwapPre},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*assignCompute);
+                        cmd.BindStorageBuffer(*lightBuf, 0);
+                        cmd.BindStorageBuffer(*clusterListBuf, 1);
+                        cmd.BindStorageBuffer(*totalsBuf, 2);
+                        cmd.BindStorageBuffer(*apBuf, 3);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                pre.Execute(*device);
+                device->WaitIdle();
+            }
+            uint32_t gpuTotals[2] = {0, 0};
+            device->ReadBuffer(*totalsBuf, gpuTotals, sizeof(gpuTotals), 0);
+            std::vector<ClusterListCPU> gpuLists((size_t)nClusters);
+            device->ReadBuffer(*clusterListBuf, gpuLists.data(),
+                               gpuLists.size() * sizeof(ClusterListCPU), 0);
+
+            const uint32_t gpuAssignedTotal = gpuTotals[0];
+            const uint32_t gpuOverflow = gpuTotals[1];
+            uint32_t gpuMaxPerCluster = 0;
+            for (const auto& c : gpuLists) gpuMaxPerCluster = std::max(gpuMaxPerCluster, c.count);
+            float avgPerCluster = (float)gpuAssignedTotal / (float)nClusters;
+
+            std::printf("clustered-lights: {lights:%d, clusters:%d, maxPerCluster:%u, avgPerCluster:%.2f, "
+                        "brimByteIdentical:pending}\n",
+                        kNumLights, nClusters, gpuMaxPerCluster, avgPerCluster);
+
+            if (gpuOverflow != 0) {
+                std::fprintf(stderr, "FATAL: cluster light cap overflow (%u) — increase kMaxLightsPerCluster\n",
+                             gpuOverflow);
+                device->WaitIdle(); return 1;
+            }
+            if (gpuAssignedTotal != cpuAssignedTotal) {
+                std::fprintf(stderr, "FATAL: GPU assigned total %u != CPU cluster::AssignLights total %u\n",
+                             gpuAssignedTotal, cpuAssignedTotal);
+                device->WaitIdle(); return 1;
+            }
+            if (gpuMaxPerCluster != (uint32_t)cpuMaxPerCluster) {
+                std::fprintf(stderr, "FATAL: GPU maxPerCluster %u != CPU %zu\n",
+                             gpuMaxPerCluster, cpuMaxPerCluster);
+                device->WaitIdle(); return 1;
+            }
+            if (!(gpuMaxPerCluster > 1u && gpuMaxPerCluster < (uint32_t)kNumLights)) {
+                std::fprintf(stderr, "FATAL: maxPerCluster %u not in (1, %d) — no real culling happened\n",
+                             gpuMaxPerCluster, kNumLights);
+                device->WaitIdle(); return 1;
+            }
+            // Per-cluster list parity: GPU lists must equal the CPU reference exactly (ordered).
+            {
+                bool listsMatch = true;
+                for (int c = 0; c < nClusters && listsMatch; ++c) {
+                    const auto& cpuL = cpuPerCluster[(size_t)c];
+                    const ClusterListCPU& g = gpuLists[(size_t)c];
+                    if (g.count != cpuL.size()) { listsMatch = false; break; }
+                    for (uint32_t k = 0; k < g.count; ++k)
+                        if (g.idx[k] != cpuL[k]) { listsMatch = false; break; }
+                }
+                if (!listsMatch) {
+                    std::fprintf(stderr, "FATAL: GPU per-cluster lists != CPU reference (order/content)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            // === BRUTE-FORCE cluster list: a SINGLE cluster (the 1x1x1 collapse) listing ALL 96 lights
+            // in index order. The clustered render uses the GPU lists (16x9x24); the brute-force render
+            // uses this all-lights list with a 1x1x1 grid in its FrameData -> the SAME shader sums every
+            // light per pixel. The 96-slot ClusterList cap fits all 96 lights, so it shares the layout. ==
+            ClusterListCPU bl{}; bl.count = (uint32_t)kNumLights;
+            for (int li = 0; li < kNumLights; ++li) bl.idx[li] = (uint32_t)li;
+            rhi::BufferDesc bruteDesc;
+            bruteDesc.size = sizeof(ClusterListCPU);
+            bruteDesc.initialData = &bl;
+            bruteDesc.usage = rhi::BufferUsage::Storage;
+            auto bruteListBuf = device->CreateBuffer(bruteDesc);
+
+            // Dummy unused buffer for cluster binding slot 14 (the lit shader never reads it).
+            uint32_t dummyU = 0;
+            rhi::BufferDesc dummyDesc;
+            dummyDesc.size = sizeof(uint32_t);
+            dummyDesc.initialData = &dummyU;
+            dummyDesc.usage = rhi::BufferUsage::Storage;
+            auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+            // === Shaders + pipeline (lit.vert + lit_clustered_cl.frag). ===
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto cluFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_clustered_cl.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto cluFs = device->CreateShaderModule({std::span<const uint32_t>(cluFsWords)});
+
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = cluFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.usesLightClusters = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // === Scene (matches the AG showcase layout for a rich many-lights look). ===
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            const Mat4 groundModel = Mat4::Scale({26.0f, 1.0f, 20.0f});
+            struct Obj { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+            std::vector<Obj> objs;
+            for (int k = 0; k < 7; ++k) {
+                float ox = ((k % 4) - 1.5f) * 7.0f;
+                float oz = ((k / 4) - 0.5f) * 8.0f - 2.0f;
+                float s = 1.2f + (k % 3) * 0.4f;
+                if (k % 2 == 0)
+                    objs.push_back({Mat4::Translate({ox, 0.5f * s, oz}) * Mat4::RotateY(0.3f * k)
+                                    * Mat4::Scale({s, s, s}), &cube, 0.0f, 0.55f});
+                else
+                    objs.push_back({Mat4::Translate({ox, 0.5f * s, oz}) * Mat4::Scale({s, s, s}),
+                                    &sphere, 0.05f, 0.4f});
+            }
+
+            // Build FrameData for a given grid (clustered = real grid; brute = 1x1x1).
+            auto makeFrame = [&](int dimX, int dimY, int dimZ) {
+                ClusteredFrameData fd{};
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+                for (int k = 0; k < 16; ++k) fd.view[k] = view.m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z; fd.lightDir[3]=0.0f;
+                fd.lightColor[0]=0.05f; fd.lightColor[1]=0.05f; fd.lightColor[2]=0.06f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.clusterParams[0]=(float)dimX; fd.clusterParams[1]=(float)dimY;
+                fd.clusterParams[2]=(float)dimZ; fd.clusterParams[3]=kNear;
+                fd.clusterParams2[0]=kFar; fd.clusterParams2[1]=(float)w; fd.clusterParams2[2]=(float)h;
+                fd.clusterParams2[3]=0.0f;
+                return fd;
+            };
+
+            // Render the scene with the given cluster-list buffer + grid params, capturing pixels.
+            auto renderClustered = [&](rhi::IBuffer& clBuf, int dimX, int dimY, int dimZ,
+                                       std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                ClusteredFrameData fd = makeFrame(dimX, dimY, dimZ);
+                render::RenderGraph graph;
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("clusteredScene", {}, {rgSwap},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(ClusteredFrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.01f, 0.01f, 0.02f, 1});  // near-black night
+                        cmd.BindPipeline(*litPipeline);
+                        cmd.BindLightClusters(clBuf, *dummyBuf, *lightBuf);
+                        auto drawLit = [&](const Mat4& model, const scene::Mesh& mesh, float metallic,
+                                           float rough) {
+                            float pc[20];
+                            for (int k=0;k<16;++k) pc[k] = model.m[k];
+                            pc[16]=metallic; pc[17]=rough; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(mesh.vertices());
+                            cmd.BindIndexBuffer(mesh.indices());
+                            cmd.DrawIndexed(mesh.indexCount());
+                        };
+                        drawLit(groundModel, plane, 0.0f, 0.7f);
+                        for (const auto& o : objs) drawLit(o.model, *o.mesh, o.metallic, o.rough);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // === Render clustered (GPU lists, real grid) + brute-force (all lights, 1x1x1) -> SHA. ===
+            std::vector<uint8_t> cluPx, brutePx;
+            uint32_t cwid = 0, chgt = 0, bw = 0, bh = 0;
+            if (!renderClustered(*clusterListBuf, DIMX, DIMY, DIMZ, cluPx, cwid, chgt)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (clustered render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderClustered(*bruteListBuf, 1, 1, 1, brutePx, bw, bh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (brute-force render)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+            uint64_t cluHash = fnv(cluPx), bruteHash = fnv(brutePx);
+            const bool identical = (cwid == bw) && (chgt == bh) && (cluPx.size() == brutePx.size()) &&
+                                   (std::memcmp(cluPx.data(), brutePx.data(), cluPx.size()) == 0);
+            std::printf("clustered-lights-hash: %016llx  brute-force-hash: %016llx\n",
+                        (unsigned long long)cluHash, (unsigned long long)bruteHash);
+            if (!identical) {
+                std::fprintf(stderr,
+                    "FATAL: clustered image != brute-force all-lights image — a CULLING bug (a light "
+                    "wrongly excluded from a cluster it contributes to). clustered %016llx vs brute %016llx\n",
+                    (unsigned long long)cluHash, (unsigned long long)bruteHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("clustered-lights: {lights:%d, clusters:%d, maxPerCluster:%u, avgPerCluster:%.2f, "
+                        "brimByteIdentical:true}\n",
+                        kNumLights, nClusters, gpuMaxPerCluster, avgPerCluster);
+            std::printf("clustered==brute-force: BYTE-IDENTICAL (GPU assigned %u == CPU ref %u; "
+                        "maxPerCluster %u in (1,%d))\n",
+                        gpuAssignedTotal, cpuAssignedTotal, gpuMaxPerCluster, kNumLights);
+
+            bool ok = WriteBMP(clusteredLightsShotPath, cluPx, cwid, chgt);
+            if (ok) std::printf("wrote %s (%ux%u) — clustered Forward+: %d point lights, %dx%dx%d grid "
+                                "(%d clusters), %u assigned\n",
+                                clusteredLightsShotPath, cwid, chgt, kNumLights, DIMX, DIMY, DIMZ,
+                                nClusters, gpuAssignedTotal);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clusteredLightsShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

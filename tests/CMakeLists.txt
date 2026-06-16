@@ -128,6 +128,11 @@ hf_add_pure_test(point_shadow_test)
 # BuildClusters consistency (offsets == prefix sum, sum(count) == lightIndices.size()). Pure C++
 # (render/clustered.h, header-only), ASan-eligible.
 hf_add_pure_test(clustered_test)
+# Slice CL — Clustered Light Culling (Forward+): SphereAABBIntersect (inside/touching/outside),
+# ClusterViewAABB frustum tiling, AssignLights correctness + the no-false-negative brute-force parity
+# (the render-invariance safety property), real-culling reduction (maxPerCluster<totalLights), and
+# determinism. Pure C++ (render/cluster.h, header-only), ASan-eligible.
+hf_add_pure_test(cluster_test)
 # Screen-space reflections (Slice AH): view<->screen projection round-trip (ViewToScreenUV and
 # ReconstructViewPos are mutual inverses, with the Vulkan/Metal yFlip sign) + the view-space
 # reflection ray (ReflectView matches HLSL reflect; down ray off a floor goes up). Pure C++

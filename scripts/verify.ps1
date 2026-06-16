@@ -86,6 +86,7 @@ $Goldens = @(
     @{ Name = 'spot';          Flag = '--spot' }                 # Slice AE (spot-light shadows)
     @{ Name = 'point_shadow';  Flag = '--point-shadow' }         # Slice AF (omnidirectional point shadows)
     @{ Name = 'clustered';     Flag = '--clustered' }            # Slice AG (clustered / Forward+ lighting)
+    @{ Name = 'clustered_lights'; Flag = '--clustered-lights' }  # Slice CL (clustered light culling: clustered==brute-force byte-identical)
     @{ Name = 'ssr';           Flag = '--ssr' }                  # Slice AH (screen-space reflections)
     @{ Name = 'dof';           Flag = '--dof' }                  # Slice CG (depth of field: thin-lens CoC depth gather)
     @{ Name = 'water';         Flag = '--water' }                # Slice CF (Gerstner water reflect/refract + sun glint)

@@ -146,6 +146,8 @@ int main() {
             bool sawGpuCullDrawFeature = false;
             // Slice CJ: the hiz-occlusion-culling capability is advertised in the feature manifest.
             bool sawHizFeature = false;
+            // Slice CL: the clustered-light-culling capability is advertised in the feature manifest.
+            bool sawClusteredLightCullingFeature = false;
             // Slice AS: the automatic-barriers (render-graph resource-state tracking) capability.
             bool sawBarriersFeature = false;
             // Slice AU: the multithreaded-recording capability is advertised in the feature manifest.
@@ -206,6 +208,7 @@ int main() {
                     if (AsString(el->value) == "gpu-driven-rendering") sawGpuDrivenFeature = true;
                     if (AsString(el->value) == "gpu-driven-culling-draw") sawGpuCullDrawFeature = true;
                     if (AsString(el->value) == "hiz-occlusion-culling") sawHizFeature = true;
+                    if (AsString(el->value) == "clustered-light-culling") sawClusteredLightCullingFeature = true;
                     if (AsString(el->value) == "automatic-barriers") sawBarriersFeature = true;
                     if (AsString(el->value) == "multithreaded-recording") sawMtFeature = true;
                     if (AsString(el->value) == "material-graph") sawMatGraphFeature = true;
@@ -240,6 +243,7 @@ int main() {
             check(sawGpuDrivenFeature, "engine.features includes gpu-driven-rendering");
             check(sawGpuCullDrawFeature, "engine.features includes gpu-driven-culling-draw");
             check(sawHizFeature, "engine.features includes hiz-occlusion-culling");
+            check(sawClusteredLightCullingFeature, "engine.features includes clustered-light-culling");
             check(sawBarriersFeature, "engine.features includes automatic-barriers");
             check(sawMtFeature, "engine.features includes multithreaded-recording");
             check(sawMatGraphFeature, "engine.features includes material-graph");
@@ -302,6 +306,8 @@ int main() {
         bool sawGpuCullDrawShot = false;
         // Slice CJ: the --hiz-cull-shot showcase flag is listed in the showcase manifest.
         bool sawHizCullShot = false;
+        // Slice CL: the --clustered-lights-shot showcase flag is listed in the showcase manifest.
+        bool sawClusteredLightsShot = false;
         // Slice AU: the --mt-shot showcase flag is listed in the showcase manifest.
         bool sawMtShot = false;
         // Slice AV: the --material-shot showcase flag is listed in the showcase manifest.
@@ -369,6 +375,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--gpudriven-shot") sawGpuDrivenShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gpucull-draw-shot") sawGpuCullDrawShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--hiz-cull-shot") sawHizCullShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--clustered-lights-shot") sawClusteredLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mt-shot") sawMtShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-shot") sawMaterialShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--material-live-shot") sawMaterialLiveShot = true;
@@ -407,6 +414,7 @@ int main() {
         check(sawGpuDrivenShot, "showcases manifest includes --gpudriven-shot");
         check(sawGpuCullDrawShot, "showcases manifest includes --gpucull-draw-shot");
         check(sawHizCullShot, "showcases manifest includes --hiz-cull-shot");
+        check(sawClusteredLightsShot, "showcases manifest includes --clustered-lights-shot");
         check(sawMtShot, "showcases manifest includes --mt-shot");
         check(sawMaterialShot, "showcases manifest includes --material-shot");
         check(sawMaterialLiveShot, "showcases manifest includes --material-live-shot");
