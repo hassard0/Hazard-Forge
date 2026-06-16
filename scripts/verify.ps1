@@ -112,6 +112,7 @@ $Goldens = @(
     @{ Name = 'poststack';     Flag = '--poststack' }         # Slice BN (data-driven post-process stack)
     @{ Name = 'editor';        Flag = '--editor' }            # Slice BT (docked editor UI: Hierarchy/Inspector/Stats/Viewport)
     @{ Name = 'editor_edit';   Flag = '--editor-edit' }      # Slice BX (editor live-edit: edited scene + scene_io round-trip)
+    @{ Name = 'vfx';           Flag = '--vfx' }              # Slice CC (CPU particle / VFX emitter: additive billboard fountain)
 )
 
 $winResult = 'SKIP'

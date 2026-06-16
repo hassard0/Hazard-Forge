@@ -31,6 +31,22 @@ inline Vec3 normalize(const Vec3& v) {
     return len > 0 ? Vec3{v.x/len, v.y/len, v.z/len} : v;
 }
 
+// Scalar linear interpolation: a at t==0, b at t==1. Used by the VFX lifetime curves (Slice CC).
+inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
+
+// 4-component vector (RGBA colors / homogeneous). Minimal: the VFX emitter (Slice CC) stores
+// start/end colors as Vec4 and the billboard vertices carry a per-particle Vec4 color.
+struct Vec4 {
+    float x = 0, y = 0, z = 0, w = 0;
+    Vec4() = default;
+    Vec4(float x_, float y_, float z_, float w_) : x(x_), y(y_), z(z_), w(w_) {}
+};
+
+inline Vec4 operator+(const Vec4& a, const Vec4& b) { return {a.x+b.x, a.y+b.y, a.z+b.z, a.w+b.w}; }
+inline Vec4 operator-(const Vec4& a, const Vec4& b) { return {a.x-b.x, a.y-b.y, a.z-b.z, a.w-b.w}; }
+inline Vec4 operator*(const Vec4& a, float s) { return {a.x*s, a.y*s, a.z*s, a.w*s}; }
+inline Vec4 lerp(const Vec4& a, const Vec4& b, float t) { return a + (b - a) * t; }
+
 // Column-major 4x4: element(row, col) == m[col*4 + row].
 struct Mat4 {
     float m[16] = {0};

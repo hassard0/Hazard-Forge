@@ -149,6 +149,12 @@ hf_gen_msl(debug_line.frag debug_line.frag.hlsl frag debug_line_fragment)
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.
 hf_gen_msl(text.vert text.vert.hlsl vert text_vertex)
 hf_gen_msl(text.frag text.frag.hlsl frag text_fragment)
+# CPU particle / VFX emitter billboards (Slice CC): world-space camera-facing quad vertex (frame UBO,
+# no push constant -> the FrameData cbuffer at the flat Metal frame slot) + procedural soft-sprite
+# fragment modulated by the per-particle color. Additive-blended over the scene. DISTINCT from the
+# gpu-particles fountain. Drives the --vfx showcase.
+hf_gen_msl(vfx.vert vfx.vert.hlsl vert vfx_vertex)
+hf_gen_msl(vfx.frag vfx.frag.hlsl frag vfx_fragment)
 # SSAO chain (Slice Y): view-space normal+linear-depth g-buffer prepass (static + instanced vertex
 # variants + shared fragment), hemisphere-kernel AO pass, box blur, composite/apply. Same
 # HLSL->SPIR-V->MSL toolchain as the others.
@@ -279,6 +285,11 @@ add_executable(visual_test
     # Text / HUD layout + baked font atlas (Slice BA): pure C++ (no Metal/RHI deps). Drives the
     # --hud + --game-hud showcases' screen-space alpha-blended text overlay.
     ${HF_ROOT}/engine/ui/text.cpp
+    # CPU particle / VFX emitter system (Slice CC): the SAME pure-C++ particles.cpp the Windows engine
+    # compiles, so the simulated particle state + camera-facing billboards are BIT-IDENTICAL
+    # cross-backend (the vfx stat line matches Vulkan). No Metal/RHI deps. Drives the --vfx showcase's
+    # additive-blended billboard fountain. DISTINCT from the gpu-particles compute fountain.
+    ${HF_ROOT}/engine/vfx/particles.cpp
     # Immediate-mode debug-draw collector + engine-object emitters (Slice W): pure C++ (math +
     # scene + physics), no Metal/RHI deps. Drives the LINE_LIST debug overlay.
     ${HF_ROOT}/engine/debug/debug_draw.cpp

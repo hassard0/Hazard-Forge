@@ -70,6 +70,16 @@ hf_add_pure_test(streaming_test)
 # bit-identical), mix math + clamp, the linear pan law (endpoint-exact), ADSR Q15 at known offsets,
 # and the WAV header fields. Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(audio_test)
+# CPU particle / VFX emitter system (Slice CC): the authorable emitter (spawn rate, lifetime, init
+# velocity + spread, gravity, drag, size/color over life) simulated at a fixed timestep with a
+# fixed-seed integer LCG for the spread jitter (engine/vfx/particles.{h,cpp}) — DISTINCT from the
+# fixed gpu-particles compute fountain. Asserts spawn rate (~R*T over T sec, capped at maxParticles),
+# lifetime/retirement (age >= lifetime), gravity+drag integration (hand-checked semi-implicit Euler;
+# no-gravity/no-drag == linear), the SizeAt/ColorAt lifetime curves (endpoints + midpoint),
+# DETERMINISM (same seed+steps -> bit-identical particle state two runs), and BuildBillboards (6
+# camera-facing verts/particle spanning cameraRight/cameraUp, centered on pos, sized by SizeAt,
+# colored by ColorAt). Pure CPU (hf_core), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(vfx_test)
 # Scene-graph hierarchy composition (Slice V): parent*local world-transform walk. Pure C++, ASan.
 hf_add_pure_test(scene_import_test)
 # Immediate-mode debug-draw collector + emitters (Slice W): primitive->line-vertex counts +

@@ -119,6 +119,12 @@ hf_compile_shaders(
     # text color in a fragment push constant). Alpha-blended screen-space overlay drawn after post.
     "shaders/text.vert.hlsl:vs"
     "shaders/text.frag.hlsl:ps"
+    # CPU particle / VFX emitter billboards (Slice CC): world-space camera-facing quad verts (built
+    # CPU-side by vfx::BuildBillboards) projected by FrameData.viewProj, carrying a per-vertex color +
+    # corner UV; the fragment computes a procedural soft round sprite (like the decal) modulated by the
+    # particle color, additively blended over the lit scene. DISTINCT from the gpu-particles fountain.
+    "shaders/vfx.vert.hlsl:vs"
+    "shaders/vfx.frag.hlsl:ps"
     # Immediate-mode debug-draw line pipeline (Slice W): world-space line verts projected by
     # FrameData.viewProj, flat per-vertex color. LINE_LIST topology.
     "shaders/debug_line.vert.hlsl:vs"

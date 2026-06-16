@@ -23,6 +23,7 @@ set(HF_ENGINE_COMMON_SOURCES
   terrain/terrain_stream.cpp
   audio/mixer.cpp
   audio/wav.cpp
+  vfx/particles.cpp
   game/roll_game.cpp
   net/snapshot.cpp
   net/transport.cpp
@@ -139,6 +140,7 @@ add_library(hf_core STATIC
   terrain/terrain_stream.cpp
   audio/mixer.cpp
   audio/wav.cpp
+  vfx/particles.cpp
   game/roll_game.cpp
   net/snapshot.cpp
   net/transport.cpp

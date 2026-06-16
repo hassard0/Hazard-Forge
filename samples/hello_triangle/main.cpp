@@ -28,6 +28,7 @@
 #include "net/transport.h"           // Slice BU: simulated transport + client jitter-buffer/interp (pure CPU)
 #include "net/prediction.h"          // Slice BY: client prediction + server reconciliation (pure CPU)
 #include "ui/text.h"
+#include "vfx/particles.h"           // Slice CC: CPU particle / VFX emitter system (pure CPU)
 #include "render/render_graph.h"
 #include "render/csm.h"
 #include "render/spot.h"
@@ -382,6 +383,7 @@ int main(int argc, char** argv) {
     const char* audioRenderPath = nullptr;   // --audio-render <out.wav> (Slice BB: deterministic audio)
     const char* decalShotPath = nullptr;     // --decal-shot <out.bmp> (Slice BH: screen-space decals)
     const char* postStackShotPath = nullptr; // --poststack-shot <out.bmp> (Slice BN: data-driven post stack)
+    const char* vfxShotPath = nullptr;       // --vfx-shot <out.bmp> (Slice CC: CPU particle/VFX emitter)
     // Slice BI: material-graph introspection (pure CPU, headless). --material-introspect <mat.json>
     // [out.json] dumps DescribeGraphJson; --dot switches the dump to a Graphviz DOT digraph.
     const char* matIntrospectPath = nullptr;   // the input .mat.json
@@ -650,6 +652,14 @@ int main(int argc, char** argv) {
             // from engine/render/post_stack.h via the post_stack.frag push constant -> swapchain. One
             // BMP -> exit. New golden; the default --shot post path is byte-identical + untouched.
             postStackShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vfx-shot") == 0 && i + 1 < argc) {
+            // Slice CC: CPU particle / VFX emitter showcase. A FIXED fountain emitter (ground origin,
+            // upward initVel + spread, gravity arcing particles back down, color hot->cool, size
+            // shrinking) is simulated for a FIXED number of fixed-dt steps so a full plume is in
+            // flight, then rendered as camera-facing ADDITIVE-blended billboards over the lit +
+            // shadowed scene from a fixed camera. Deterministic (fixed seed + fixed steps). Prints the
+            // vfx stat line. One BMP -> exit. New golden; DISTINCT from the gpu-particles fountain.
+            vfxShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--volumetric-shot") == 0 && i + 1 < argc) {
             // Slice AJ: volumetric fog / light shafts. A directional light at a grazing angle streams
             // BETWEEN shadow-casting occluders (a slotted wall + pillars), fog filling the air. The
@@ -11738,6 +11748,290 @@ int main(int argc, char** argv) {
                 if (ok) std::printf("wrote %s (%ux%u) — %zu glass + %zu opaque\n",
                                     transparencyShotPath, cw, ch2, glass.size(), opaques.size());
                 else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", transparencyShotPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- CPU particle / VFX emitter showcase (--vfx-shot, Slice CC): a self-contained capture
+        // path that does NOT touch the default scene. Checkerboard ground + procedural sky + a few
+        // opaque lit cubes, lit + shadowed; then a FIXED FOUNTAIN emitter (engine/vfx/particles.h —
+        // the authorable CPU emitter, DISTINCT from the gpu-particles compute fountain) is simulated
+        // for a FIXED number of fixed-dt steps so a full plume is in flight, and its camera-facing
+        // billboards (vfx::BuildBillboards, uploaded as a dynamic vertex buffer) are drawn ADDITIVELY
+        // blended over the scene (depth-test ON, depth-write OFF) via shaders/vfx.{vert,frag}. Prints a
+        // deterministic `vfx: {emitters:1, alive:K, spawned:S}` line. One frame -> BMP -> exit. Reuses
+        // the existing additive-blend + dynamic-vertex-buffer infra; NO new RHI seam symbols. --
+        if (vfxShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Opaque lit pipeline (ground + cubes): shared lit.vert + lit.frag, 80-byte push.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // VFX billboard pipeline: vfx.vert + vfx.frag, ADDITIVE blend, depth-test ON, depth-write
+            // OFF, double-sided. The dynamic billboard verts are { pos RGB32F, uv RG32F, color RGBA32F }
+            // (== vfx::BillboardVertex, 36 bytes). No push constant (world-space verts + frame UBO).
+            auto vfxVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vfx.vert.hlsl.spv");
+            auto vfxFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vfx.frag.hlsl.spv");
+            auto vfxVs = device->CreateShaderModule({std::span<const uint32_t>(vfxVsWords)});
+            auto vfxFs = device->CreateShaderModule({std::span<const uint32_t>(vfxFsWords)});
+            rhi::GraphicsPipelineDesc vfxDesc;
+            vfxDesc.vertex = vfxVs.get();
+            vfxDesc.fragment = vfxFs.get();
+            vfxDesc.vertexLayout.stride = sizeof(vfx::BillboardVertex);
+            vfxDesc.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, (uint32_t)offsetof(vfx::BillboardVertex, pos)},
+                {1, rhi::Format::RG32_Float,  (uint32_t)offsetof(vfx::BillboardVertex, uv)},
+                {2, rhi::Format::RGBA32_Float,(uint32_t)offsetof(vfx::BillboardVertex, color)},
+            };
+            vfxDesc.colorFormat = device->Swapchain().ColorFormat();
+            vfxDesc.depthTest = true;
+            vfxDesc.depthWrite = false;     // read opaque depth, do NOT write (particles don't occlude)
+            vfxDesc.additiveBlend = true;   // src*1 + dst*1 — order-independent glow
+            vfxDesc.cullNone = true;        // billboards: don't back-face cull
+            vfxDesc.usesFrameUniforms = true;
+            vfxDesc.usesTexture = false;    // procedural sprite in the fragment; no texture bind
+            vfxDesc.pushConstantSize = 0;
+            auto vfxPipeline = device->CreateGraphicsPipeline(vfxDesc);
+
+            // Static depth-only shadow pipeline (ground + cubes cast shadows; particles do not).
+            auto shVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto shVs = device->CreateShaderModule({std::span<const uint32_t>(shVsWords)});
+            auto shFs = device->CreateShaderModule({std::span<const uint32_t>(shFsWords)});
+            rhi::GraphicsPipelineDesc shDesc;
+            shDesc.vertex = shVs.get();
+            shDesc.fragment = shFs.get();
+            shDesc.vertexLayout = scene::MeshVertexLayout();
+            shDesc.depthTest = true;
+            shDesc.depthOnly = true;
+            shDesc.usesFrameUniforms = true;
+            shDesc.pushConstantSize = sizeof(float) * 16;
+            auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+            // Sky + post.
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh cube = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // A couple of opaque lit cubes flanking the fountain so the additive plume reads against
+            // solid geometry + the floor (and depth-tests against them).
+            struct Opaque { Mat4 model; };
+            std::vector<Opaque> opaques = {
+                {Mat4::Translate({-2.6f, 0.6f, -1.4f}) * Mat4::RotateY(0.4f) * Mat4::Scale({0.6f,0.6f,0.6f})},
+                {Mat4::Translate({ 2.6f, 0.6f, -1.4f}) * Mat4::RotateY(-0.5f) * Mat4::Scale({0.6f,0.6f,0.6f})},
+            };
+
+            // --- The FIXED fountain emitter (deterministic). Origin on the ground, upward initVel with
+            // spread, gravity pulling particles back down, color fading hot (orange) -> cool (deep red,
+            // fading alpha), size shrinking. Simulated for a FIXED number of fixed-dt steps so a full
+            // arcing plume is in flight at capture. (Distinct from the gpu-particles compute fountain.)
+            vfx::EmitterConfig emitter;
+            emitter.origin    = {0.0f, 0.05f, 0.0f};
+            emitter.spawnRate = 600.0f;
+            emitter.lifetime  = 1.6f;
+            emitter.initVel   = {0.0f, 6.0f, 0.0f};
+            emitter.velSpread = 1.8f;
+            emitter.gravity   = {0.0f, -9.8f, 0.0f};
+            emitter.drag      = 0.05f;
+            emitter.startSize = 0.16f;
+            emitter.endSize   = 0.03f;
+            emitter.startColor = {1.0f, 0.75f, 0.25f, 1.0f};   // hot orange
+            emitter.endColor   = {0.7f, 0.08f, 0.02f, 0.0f};   // cool deep-red, fading out
+            emitter.seed      = 1337u;
+            emitter.maxParticles = 4096;
+
+            const float vfxDt = 1.0f / 120.0f;
+            const int   vfxSteps = 360;   // 3 seconds — a steady-state plume in flight
+            vfx::ParticleSystem psys;
+            for (int s = 0; s < vfxSteps; ++s) psys.Step(emitter, vfxDt);
+
+            // Camera + light + sky frame data (fixed, deterministic). Side-on, slightly elevated to
+            // read the upward spray arcing under gravity.
+            const Vec3 eye{0.0f, 3.4f, 8.5f};
+            const Vec3 center{0.0f, 1.8f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.6f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-11.0f, 11.0f, -11.0f, 11.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            // Build the camera-facing billboards from the live particles (CPU, deterministic). The quad
+            // spans the camera right/up basis so every particle faces the camera.
+            const Vec3 camRight{fd.camRight[0], fd.camRight[1], fd.camRight[2]};
+            const Vec3 camUp{fd.camUp[0], fd.camUp[1], fd.camUp[2]};
+            std::vector<vfx::BillboardVertex> billboards;
+            vfx::BuildBillboards(psys.Alive(), emitter, camRight, camUp, billboards);
+
+            const int aliveK = psys.AliveCount();
+            const uint64_t spawnedS = psys.SpawnedCount();
+
+            std::unique_ptr<rhi::IBuffer> vfxVB;
+            if (!billboards.empty()) {
+                rhi::BufferDesc bd;
+                bd.size = billboards.size() * sizeof(vfx::BillboardVertex);
+                bd.initialData = billboards.data();
+                bd.usage = rhi::BufferUsage::Vertex;
+                vfxVB = device->CreateBuffer(bd);
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*shadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    for (const auto& o : opaques) {
+                        cmd.PushConstants(o.model.m, sizeof(float) * 16);
+                        cmd.DrawIndexed(cube.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    // --- Opaque pass (writes depth): ground + cubes. ---
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    for (const auto& o : opaques) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = o.model.m[k];
+                        pc[16] = 0.1f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.DrawIndexed(cube.indexCount());
+                    }
+                    // --- VFX particle pass (additive, depth-test, NO depth write). The billboards glow
+                    // over the opaque scene and are occluded by geometry in front (depth read). ---
+                    if (vfxVB) {
+                        cmd.BindPipeline(*vfxPipeline);
+                        cmd.BindVertexBuffer(*vfxVB);
+                        cmd.Draw((uint32_t)billboards.size());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("vfx: {emitters:1, alive:%d, spawned:%llu}\n",
+                        aliveK, (unsigned long long)spawnedS);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(vfxShotPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) - fountain plume, %d particles\n",
+                                    vfxShotPath, cw, ch2, aliveK);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vfxShotPath);
             } else {
                 std::fprintf(stderr, "FATAL: no captured pixels\n");
             }

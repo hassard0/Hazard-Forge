@@ -180,6 +180,8 @@ int main() {
             bool sawPredictionFeature = false;
             // Slice BT: the docked-editor capability is advertised in the feature manifest.
             bool sawDockedEditorFeature = false;
+            // Slice CC: the CPU particle / VFX emitter capability is advertised in the feature manifest.
+            bool sawVfxFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -210,6 +212,7 @@ int main() {
                     if (AsString(el->value) == "client-prediction") sawPredictionFeature = true;
                     if (AsString(el->value) == "docked-editor") sawDockedEditorFeature = true;
                     if (AsString(el->value) == "editor-live-edit") sawEditorLiveEditFeature = true;
+                    if (AsString(el->value) == "particle-vfx") sawVfxFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -237,6 +240,7 @@ int main() {
             check(sawPredictionFeature, "engine.features includes client-prediction");
             check(sawDockedEditorFeature, "engine.features includes docked-editor");
             check(sawEditorLiveEditFeature, "engine.features includes editor-live-edit");
+            check(sawVfxFeature, "engine.features includes particle-vfx");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -316,6 +320,8 @@ int main() {
         bool sawEditorShot = false;
         // Slice BX: the --editor-edit-shot showcase flag is listed in the showcase manifest.
         bool sawEditorEditShot = false;
+        // Slice CC: the --vfx-shot showcase flag is listed in the showcase manifest.
+        bool sawVfxShot = false;
         if (showcases)
             for (const json_array_element_s* el = showcases->start; el; el = el->next) {
                 const json_object_s* s = AsObject(el->value);
@@ -349,6 +355,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--netpredict-shot") sawNetpredictShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-shot") sawEditorShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--editor-edit-shot") sawEditorEditShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--vfx-shot") sawVfxShot = true;
             }
         check(sawTaaShot, "showcases manifest includes --taa-shot");
         check(sawCullShot, "showcases manifest includes --cull-shot");
@@ -380,6 +387,7 @@ int main() {
         check(sawNetpredictShot, "showcases manifest includes --netpredict-shot");
         check(sawEditorShot, "showcases manifest includes --editor-shot");
         check(sawEditorEditShot, "showcases manifest includes --editor-edit-shot");
+        check(sawVfxShot, "showcases manifest includes --vfx-shot");
 
         // scene.entities: count == 2 + entity 0's transform values.
         const json_object_s* scene = AsObject(MemberOf(top, "scene"));
