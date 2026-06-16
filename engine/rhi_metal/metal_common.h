@@ -80,6 +80,10 @@ inline MTLPixelFormat ToMetalPixelFormat(Format f) {
         case Format::RGBA8_UNorm: return MTLPixelFormatRGBA8Unorm;
         case Format::BGRA8_UNorm: return MTLPixelFormatBGRA8Unorm;
         case Format::RGBA16_Float: return MTLPixelFormatRGBA16Float;
+        // RGBA32_Float renderable/blendable target (Slice CO: the WBOIT accum + revealage targets use
+        // full fp32 so the order-independent accum SUM is bit-identical across draw orders). Mirrors the
+        // Vulkan VK_FORMAT_R32G32B32A32_SFLOAT mapping; backend-dir only, no above-seam symbol.
+        case Format::RGBA32_Float: return MTLPixelFormatRGBA32Float;
         case Format::D32_Float:   return MTLPixelFormatDepth32Float;
         default:                  return MTLPixelFormatInvalid;
     }

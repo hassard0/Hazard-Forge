@@ -187,6 +187,16 @@ hf_gen_msl(dof.frag               dof.frag.hlsl               frag dof_fragment)
 # Same scene/g-buffer pair bindings as DoF; the SAME render/motion_blur.h math makes the velocity field
 # bit-identical cross-backend. Existing shaders + goldens untouched.
 hf_gen_msl(motion_blur.frag       motion_blur.frag.hlsl       frag motion_blur_fragment)
+# Order-Independent Transparency (Slice CO): Weighted Blended OIT (McGuire & Bavoil). oit_accum.vert
+# rasterizes the transparent geometry + passes the view-space linear depth (clip.w); oit_accum.frag emits
+# premultColor*Weight (additive ONE,ONE accum) and oit_revealage.frag emits alpha (multiplicative
+# oitRevealageBlend dst*=(1-alpha)); oit_resolve.frag composites accum.rgb/max(accum.a,eps) + coverage,
+# and water_composite lerps it over the opaque scene (== oit::ResolveOver) + tonemaps. The SAME
+# render/oit.h Weight makes the result bit-identical cross-backend. Existing shaders/goldens untouched.
+hf_gen_msl(oit_accum.vert         oit_accum.vert.hlsl         vert oit_accum_vertex)
+hf_gen_msl(oit_accum.frag         oit_accum.frag.hlsl         frag oit_accum_fragment)
+hf_gen_msl(oit_revealage.frag     oit_revealage.frag.hlsl     frag oit_revealage_fragment)
+hf_gen_msl(oit_resolve.frag       oit_resolve.frag.hlsl       frag oit_resolve_fragment)
 # Water rendering (Slice CF): water.vert displaces a 128x128 grid by the Gerstner field (render/water.h
 # math, mirrored in-shader); water.frag fresnel-blends a SKY reflection + a depth-tinted REFRACTION of
 # the scene-color RT (G-buffer depth like SSR) + a sun glint; water_composite blends + tonemaps. Same
