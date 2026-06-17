@@ -451,6 +451,15 @@ hf_compile_shaders(
     # Pure integer compute over an SSBO + ReadBuffer (the vsm_mark/vt_feedback surface) -> bit-exact
     # GPU==CPU case set + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/mc_classify.comp.hlsl:cs"
+    # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6):
+    # fpx_integrate.comp runs the Q16.16 semi-implicit-Euler INTEGRATOR — ONE thread per body runs
+    # `steps` iterations of (vel += gravity*dt; pos += vel*dt; ground floor-clamp) on its OWN body, the
+    # fxmul ((int64)a*b >> 16, the swraster int64 pattern) + integrate + clamp copied VERBATIM from
+    # engine/sim/fpx.h::IntegrateBody, and writes gBodies[i] back (each body independent -> race-free,
+    # NO atomics). integrateEnabled=0 -> write the input back UNCHANGED. Pure integer SSBO compute +
+    # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing
+    # shaders + goldens untouched.
+    "shaders/fpx_integrate.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table
