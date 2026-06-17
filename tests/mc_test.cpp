@@ -172,6 +172,102 @@ int main() {
         check(cleared.size() == a.size(), "the disabled (cleared) buffer is sized cellCount()");
     }
 
+    // ================= MC2: kTriTable well-formedness =================
+    {
+        // Every row: a run of valid edge triplets (each edge in [0,11]) followed by -1 padding to the
+        // end; the number of non-negative entries is a multiple of 3 (whole triangles).
+        bool wellFormed = true;
+        for (int c = 0; c < 256; ++c) {
+            int n = 0;             // count of non-negative (edge) entries
+            bool seenTerminator = false;
+            for (int e = 0; e < 16; ++e) {
+                int8_t v = mc::kTriTable[c][e];
+                if (v == -1) { seenTerminator = true; continue; }
+                // A real edge index must come BEFORE any -1 terminator (no edge after a -1).
+                if (seenTerminator) wellFormed = false;
+                if (v < 0 || v > 11) wellFormed = false;   // valid edge range
+                ++n;
+            }
+            if (n % 3 != 0) wellFormed = false;            // whole triangles only
+            if (n / 3 > 5) wellFormed = false;             // a cell emits at most 5 triangles
+        }
+        check(wellFormed, "kTriTable rows well-formed (groups of 3, edges in [0,11], <=5 tris, -1 padded)");
+    }
+
+    // ================= MC2: kTriCount == derived-from-kTriTable for ALL 256 cases =================
+    {
+        bool consistent = true;
+        for (int c = 0; c < 256; ++c) {
+            int derived = 0;
+            for (int e = 0; e < 16; ++e) if (mc::kTriTable[c][e] >= 0) ++derived;
+            derived /= 3;
+            if (mc::kTriCount[c] != derived) consistent = false;
+            if (mc::kTriCount[c] < 0 || mc::kTriCount[c] > 5) consistent = false;   // range [0,5]
+        }
+        check(consistent, "kTriCount[c] == (#non-neg kTriTable[c])/3 for all 256, each in [0,5]");
+        check(mc::kTriCount[0x00] == 0, "kTriCount[0x00] == 0 (fully-out cell emits no triangles)");
+        check(mc::kTriCount[0xFF] == 0, "kTriCount[0xFF] == 0 (fully-in cell emits no triangles)");
+        // CountTriangles is the kTriCount accessor.
+        check(mc::CountTriangles(0x00) == 0 && mc::CountTriangles(0xFF) == 0,
+              "CountTriangles(0x00)==CountTriangles(0xFF)==0");
+        // A single-corner case emits exactly 1 triangle (one corner cut off by 3 edges).
+        check(mc::CountTriangles(0x01) == 1, "single-corner case 0x01 -> 1 triangle");
+    }
+
+    // ================= MC2: CountCells over a known tiny field -> known counts =================
+    {
+        // The same planar-boundary 3x2x2 field as the ClassifyCells test: cell0 case 0x66, cell1 0xFF.
+        mc::VoxelField f; f.nx = 3; f.ny = 2; f.nz = 2;
+        f.scalar.assign((size_t)3*2*2, 0);
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 3; ++x)
+                    f.scalar[(size_t)(z*2 + y)*3 + x] = (x == 0) ? -1 : +1;
+        std::vector<uint8_t> cases;
+        mc::ClassifyCells(f, 0, cases);
+        std::vector<uint32_t> counts;
+        mc::CountCells(f, 0, counts);
+        check(counts.size() == 2, "planar field -> 2 cell counts");
+        // counts[cellId] must equal CountTriangles(case[cellId]) by construction.
+        check(counts[0] == (uint32_t)mc::CountTriangles(cases[0]),
+              "count[0] == CountTriangles(case[0]) (cell cx=0)");
+        check(counts[1] == (uint32_t)mc::CountTriangles(cases[1]),
+              "count[1] == CountTriangles(case[1]) (cell cx=1, full -> 0 tris)");
+        check(counts[1] == 0u, "the FULL cell (0xFF) emits 0 triangles");
+
+        // TotalTriangles == Σ counts.
+        uint32_t total = mc::TotalTriangles(std::span<const uint32_t>(counts));
+        check(total == counts[0] + counts[1], "TotalTriangles == Σ counts (tiny field)");
+    }
+
+    // ================= MC2: countEnabled-off modeled (all-zero + total 0) + determinism =========
+    {
+        mc::VoxelField f = mc::MakeSphereField(33, 12);
+        std::vector<uint32_t> a, b;
+        mc::CountCells(f, 0, a);
+        mc::CountCells(f, 0, b);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(uint32_t)) == 0,
+              "determinism: two CountCells passes BYTE-IDENTICAL");
+        // The disabled (countEnabled=false) path is modeled as the cleared all-zero buffer + total 0.
+        std::vector<uint32_t> cleared((size_t)f.cellCount(), 0u);
+        check(mc::TotalTriangles(std::span<const uint32_t>(cleared)) == 0u,
+              "the disabled (cleared) counts sum to total 0");
+        // A real sphere field counts to a NON-zero total (so the disabled no-op is meaningful) and
+        // every per-cell count is in [0,5].
+        uint32_t total = mc::TotalTriangles(std::span<const uint32_t>(a));
+        check(total > 0u, "a real sphere field has a NON-zero total triangle count");
+        bool inRange = true;
+        for (uint32_t c : a) if (c > 5u) inRange = false;
+        check(inRange, "every per-cell count is in [0,5]");
+        // Total consistency: Σ_cells CountTriangles(case) == TotalTriangles(counts).
+        std::vector<uint8_t> cases;
+        mc::ClassifyCells(f, 0, cases);
+        uint32_t totalFromCases = 0u;
+        for (uint8_t cs : cases) totalFromCases += (uint32_t)mc::CountTriangles(cs);
+        check(totalFromCases == total, "Σ CountTriangles(case) == TotalTriangles(counts) (sphere field)");
+    }
+
     if (g_fail == 0) std::printf("mc_test: ALL PASS\n");
     else std::printf("mc_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;
