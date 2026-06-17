@@ -4,6 +4,15 @@ add_executable(hello_triangle main.cpp)
 target_link_libraries(hello_triangle PRIVATE hf_engine hf_editor)
 target_compile_definitions(hello_triangle PRIVATE HF_HAS_EDITOR=1)
 
+# main() is one monolithic function with ~190 inline `--*-shot` showcase blocks; their locals are all
+# reserved together in main()'s stack frame, which grew past the default 1 MB Windows stack under the
+# debug /RTC1 stack-frame checks (release is fine), crashing EVERY showcase at main() entry with
+# STATUS_STACK_OVERFLOW (0xC00000FD). Reserve a larger stack so the debug build runs. Pure build-config
+# (no logic / RHI / shader change); harmless on release.
+if (MSVC)
+    target_link_options(hello_triangle PRIVATE /STACK:16777216)
+endif()
+
 # --- Material graph (Slice AV): regenerate the showcase fragment shader from its *.mat.json at build
 # time via the material_codegen host tool. The JSON is the source of truth; the generated HLSL is
 # committed (shaders/generated/) for diff transparency + so the standalone Metal build has it without
