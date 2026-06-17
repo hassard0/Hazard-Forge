@@ -80,6 +80,7 @@
 #include "render/gpu_cull.h"        // Slice AR: GPU-cull CPU mirror (ordered compaction + sphere test)
 #include "render/gpu_culled.h"      // Slice CD: compute cull+compact CPU mirror (model+material+texIndex)
 #include "render/cluster_cull.h"    // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
+#include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -15225,6 +15226,214 @@ static int RunClusterCullShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual-geometry discrete cluster-LOD selection showcase (Slice DV: discrete cluster-LOD selection by
+// projected SCREEN-SPACE ERROR — the FINAL slice of the virtual-geometry CORE). The TRUE pass (a compute
+// shader cluster_lod_select.comp computes each instance's squared view distance + SelectLod, then
+// ORDER-compacts the selected LOD's clusters into the MDI command buffer + the per-draw SSBO + writes the
+// per-instance selected-LOD int + the total command count, then ONE DrawIndexedMultiIndirect) is the VULKAN
+// demonstration (--cluster-lod-shot), which ALSO carries the GPU==CPU selected-LOD BIT-EXACT proof. Here
+// Metal renders the IDENTICAL scene — a row of DS-clustered spheres marching AWAY from the camera, each
+// drawing one of 3 pre-baked LOD tessellations selected by the SAME render::vg::SelectLod (the exact mirror
+// of the GPU compute) — via the CPU per-cluster BOUND path (the meshlet_viz push-constant shader, the
+// selected LOD's clusters in instance-major / cluster-minor source order). The image is backend-identical to
+// the Vulkan GPU-selected image (cluster_lod_select.comp is NOT in the Metal MSL-gen list — same DT/CJ
+// convention). The view-DISTANCE used by SelectLod is view-space (backend-independent); the RENDER view-proj
+// composes the Metal FlipProjY. Passes: sky + cluster + post (no shadow/lit). Prints the SAME stat line as
+// Vulkan. New golden tests/golden/metal/cluster_lod.png; two runs DIFF 0.0000.
+static int RunClusterLodShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace vg = render::vg;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- The 3 pre-baked LOD tessellations (IDENTICAL builder to the Vulkan --cluster-lod-shot). ---
+    const std::array<std::pair<uint32_t, uint32_t>, vg::kNumLods> kTess = {{
+        {48, 32}, {24, 16}, {12, 8},
+    }};
+    std::array<scene::MeshGeometry, vg::kNumLods> geos;
+    for (uint32_t n = 0; n < vg::kNumLods; ++n)
+        geos[n] = scene::SphereGeometry(kTess[n].first, kTess[n].second);
+    vg::LodMeshes lm = vg::BuildLodMeshes(geos, kTess);
+
+    // --- The instance row (IDENTICAL builder to the Vulkan path: marching away + fanned across +X). ---
+    const int kInstances = 6;
+    std::vector<Mat4> instanceModels;
+    std::vector<Vec3> instanceCenters;
+    {
+        const float z0 = -4.0f, dz = -12.0f;
+        for (int gi = 0; gi < kInstances; ++gi) {
+            float z = z0 + (float)gi * dz;
+            float x = (float)gi * 3.0f - 7.5f;
+            instanceModels.push_back(Mat4::Translate({x, 0.0f, z}));
+            instanceCenters.push_back(Vec3{x, 0.0f, z});
+        }
+    }
+
+    // --- The camera (SAME pose/FOV/clips as the Vulkan path). The LOD distance uses the plain VIEW matrix
+    // (view-space distance is backend-independent); the render uses the FlipProjY-composed view-proj. ---
+    runtime::Camera cam;
+    cam.position = {0.0f, 0.0f, 2.0f};
+    cam.yaw = 0.0f; cam.SetPitch(0.0f);
+    cam.fovY = 1.0471976f;  // 60 degrees
+    cam.aspect = aspect;
+    cam.znear = 0.1f; cam.zfar = 200.0f;
+    Mat4 view = cam.View();
+    Mat4 viewProj = FlipProjY(cam.Proj()) * cam.View();
+    const float projScale = vg::ProjectionScaleForScreenError(cam.fovY, (int)H);
+    const float errorThreshold = 1.0f, errorScale = 1.0f;
+
+    std::array<float, vg::kNumLods> errs{};
+    for (uint32_t n = 0; n < vg::kNumLods; ++n) errs[n] = lm.lods[n].geometricError;
+    std::span<const float> errSpan(errs.data(), errs.size());
+
+    // --- CPU SelectLod per instance (the exact mirror of the GPU compute) + the per-LOD counts. ---
+    std::vector<uint32_t> cpuLod(kInstances);
+    uint32_t lodCounts[vg::kNumLods] = {0, 0, 0};
+    for (int i = 0; i < kInstances; ++i) {
+        cpuLod[i] = vg::SelectLod(errSpan, instanceCenters[i], view, projScale, errorThreshold,
+                                  errorScale, /*forceLod0=*/false);
+        lodCounts[cpuLod[i]]++;
+    }
+    uint32_t distinctLods = 0;
+    for (uint32_t n = 0; n < vg::kNumLods; ++n) if (lodCounts[n] > 0) ++distinctLods;
+    if (distinctLods < 2)
+        return fail("cluster-lod: selected < 2 distinct LODs (camera/threshold framing wrong)");
+    for (int i = 1; i < kInstances; ++i)
+        if (cpuLod[i] < cpuLod[i - 1]) return fail("cluster-lod: NOT distance-monotonic");
+
+    // --- Per-cluster hash color (cluster-in-LOD index, so LODs share the --meshlet-viz palette). ---
+    auto clusterHashColor = [&](uint32_t lod, uint32_t k) { return vg::hashColor(k); (void)lod; };
+
+    // --- Upload the combined vertex + index buffers (one shared buffer, all LODs concatenated). ---
+    rhi::BufferDesc vbd;
+    vbd.size = lm.verts.size() * sizeof(scene::Vertex);
+    vbd.initialData = lm.verts.data();
+    vbd.usage = rhi::BufferUsage::Vertex;
+    auto vbuf = device->CreateBuffer(vbd);
+    rhi::BufferDesc ibd;
+    ibd.size = lm.combined.indices.size() * sizeof(uint32_t);
+    ibd.initialData = lm.combined.indices.data();
+    ibd.usage = rhi::BufferUsage::Index;
+    auto ibuf = device->CreateBuffer(ibd);
+
+    // --- Meshlet viz pipeline (the per-cluster bound path) + sky + post (the SAME shaders the Vulkan CPU
+    // reference uses). NO texture/shadow. ---
+    auto mvVs = loadMSL("meshlet_viz.vert.gen.metal", "meshlet_viz_vertex");
+    auto mvFs = loadMSL("meshlet_viz.frag.gen.metal", "meshlet_viz_fragment");
+    rhi::GraphicsPipelineDesc mvDesc;
+    mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+    rhi::VertexLayout vizLayout;
+    vizLayout.stride = sizeof(scene::Vertex);  // 56
+    vizLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {3, rhi::Format::RGB32_Float, 32},
+    };
+    mvDesc.vertexLayout = vizLayout;
+    mvDesc.colorFormat = device->Swapchain().ColorFormat();
+    mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+    mvDesc.pushConstantSize = sizeof(float) * 20;   // float4x4 model + float4 color
+    auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = viewProj.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = cam.position.x; fd.viewPos[1] = cam.position.y;
+        fd.viewPos[2] = cam.position.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        runtime::CameraBasis cb = cam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("scene", {}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*mvPipeline);
+            cmd.BindVertexBuffer(*vbuf);
+            cmd.BindIndexBuffer(*ibuf);
+            // The CPU-selected LOD's clusters per instance, per-cluster bound, in instance-major /
+            // cluster-minor source order (the Metal equivalent of the Vulkan one-MDI-call over the compacted
+            // selected-LOD buffer).
+            for (int i = 0; i < kInstances; ++i) {
+                uint32_t lod = cpuLod[i];
+                uint32_t first = lm.lods[lod].firstCluster;
+                uint32_t cnt = lm.lods[lod].clusterCount;
+                for (uint32_t k = 0; k < cnt; ++k) {
+                    const vg::Meshlet& m = lm.combined.meshlets[first + k];
+                    Vec3 col = clusterHashColor(lod, k);
+                    float pc[20];
+                    for (int q = 0; q < 16; ++q) pc[q] = instanceModels[i].m[q];
+                    pc[16] = col.x; pc[17] = col.y; pc[18] = col.z; pc[19] = 1.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.DrawIndexed(m.triCount * 3u, m.triOffset * 3u, 0);
+                }
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("cluster-lod: {instances:%u, lods:3, lod0:%u, lod1:%u, lod2:%u} "
+                "(Metal: CPU-selected-LOD per-cluster bound path, image backend-identical)\n",
+                (uint32_t)kInstances, lodCounts[0], lodCounts[1], lodCounts[2]);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — per-instance LOD-selected (Metal per-cluster bound; Vulkan does "
+                "compute-select -> MDI + the GPU==CPU bit-exact proof)\n", outPath, cw, ch);
+    return 0;
+}
+
 // --- Hi-Z OCCLUSION culling showcase (Slice CJ). The TRUE pass (a CPU depth pre-pass -> Hi-Z max-depth
 // pyramid -> a compute shader frustum+occlusion-culls + compacts the survivors) is the VULKAN
 // demonstration (--hiz-cull-shot). Here Metal renders the IDENTICAL scene — a BIG occluder WALL near
@@ -21984,6 +22193,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cluster-hiz") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cluster_hiz.png";
             try { return RunClusterHizShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cluster-lod <out.png>: render the virtual-geometry discrete cluster-LOD selection showcase
+        // (Slice DV: discrete cluster-LOD selection by projected screen-space error — the FINAL slice of the
+        // virtual-geometry CORE). The TRUE pass (a compute shader cluster_lod_select.comp computes each
+        // instance's squared view distance + SelectLod -> ORDER-compacts the selected LOD's clusters into the
+        // MDI buffer + writes the per-instance selected-LOD int (the GPU==CPU bit-exact proof) + the command
+        // count, then ONE DrawIndexedMultiIndirect) is the VULKAN demonstration (--cluster-lod-shot); here
+        // Metal renders the IDENTICAL row of DS-clustered spheres marching away via the CPU per-cluster BOUND
+        // path (the SAME render::vg::SelectLod picks each instance's LOD, the selected LOD's clusters drawn
+        // per-cluster), so cluster_lod.png is backend-identical to the Vulkan GPU-selected image. The view
+        // distance is view-space (backend-independent); the render view-proj composes the Metal FlipProjY.
+        // New golden tests/golden/metal/cluster_lod.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--cluster-lod") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cluster_lod.png";
+            try { return RunClusterLodShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gizmo <objIndex> <out.png>: render the editor gizmo showcase (Slice AB) — a small

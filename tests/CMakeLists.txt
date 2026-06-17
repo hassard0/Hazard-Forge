@@ -547,6 +547,15 @@ hf_add_pure_test(cluster_cull_test)
 # field preservation. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(cluster_hiz_test)
 
+# Virtual-geometry discrete cluster-LOD selection (Slice DV): the CPU MIRROR of
+# shaders/cluster_lod_select.comp.hlsl (render/cluster_lod.h::BuildLodMeshes + SelectLod). Pins the 3
+# pre-baked LODs' contiguous cluster ranges + conservative errors (LOD0 error 0, coarser = larger error +
+# fewer clusters, combined buffer covered exactly), SelectLod near->LOD0 / far->coarser / forceLod0 ->
+# LOD0 / distance-monotonicity / threshold boundaries (squared form) / clamp [0,2], the host-precomputed
+# ProjectionScaleForScreenError == screenH/(2 tan(fovY/2)), and determinism. The squared-distance form
+# (no sqrt) is the bit-exact GPU==CPU select the showcase proves. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(cluster_lod_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)

@@ -365,6 +365,14 @@ hf_compile_shaders(
     # occlusion-culled == frustum-only byte-identical. CPU mirror: render/cluster_cull.h::CullClusterInstancesHiZ.
     # NO new RHI; existing shaders + goldens untouched.
     "shaders/cluster_hiz_cull.comp.hlsl:cs"
+    # Virtual-geometry discrete cluster-LOD selection (Slice DV): ONE thread/instance computes the squared
+    # view distance + SelectLod (copied VERBATIM from render/cluster_lod.h) to pick one of 3 pre-baked LODs
+    # by projected screen-space error, then ORDER-compacts the selected LOD's clusters into the MdiCommand
+    # buffer + the compacted (model+hashColor) per-draw SSBO + writes the per-instance selected-LOD int (the
+    # GPU==CPU bit-exact proof) + the total command count. reuses cluster_viz.vert + meshlet_viz.frag for the
+    # draw. CPU mirror: render/cluster_lod.h. NOT in the Metal MSL-gen list (Metal renders the selected set
+    # via the CPU bound path; Vulkan carries the GPU==CPU select proof). NO new RHI; goldens untouched.
+    "shaders/cluster_lod_select.comp.hlsl:cs"
     # Hi-Z OCCLUSION cull (Slice CJ): extends gpudriven_cull with a hierarchical-Z occlusion test —
     # after the frustum test, an object FULLY HIDDEN behind closer geometry (its screen-rect nearest
     # depth farther than the Hi-Z max everywhere it covers) is dropped from the compacted survivors.
