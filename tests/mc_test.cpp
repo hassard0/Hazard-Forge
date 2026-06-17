@@ -629,6 +629,102 @@ int main() {
         }
     }
 
+    // ================= MC6: BuildSmoothRenderMesh (smooth field-gradient per-vertex normals) ==========
+    // The 6th and FINAL MC slice: replace MC5's FLAT per-face normal with the SDF field-gradient normal
+    // at each vertex's own grid position -> the sphere shades SMOOTH instead of faceted. Positions +
+    // indices stay EXACTLY MarchCellsInterp / BuildRenderMesh (provenance unchanged); ONLY normals differ.
+    {
+        mc::VoxelField f = mc::MakeSphereField(33, 12);
+        std::vector<mc::McVertex> verts; std::vector<uint32_t> idx; uint32_t triCount = 0u;
+        mc::MarchCellsInterp(f, 0, verts, idx, triCount);
+
+        const float kExtent = 6.0f;
+        std::vector<mc::RenderVertex> flat;
+        mc::BuildRenderMesh(std::span<const mc::McVertex>(verts), kExtent, flat);
+        std::vector<mc::RenderVertex> smooth;
+        mc::BuildSmoothRenderMesh(std::span<const mc::McVertex>(verts), f, kExtent, smooth);
+
+        // (a) same vertex count + the MC4 bit-exact provenance count.
+        check(smooth.size() == verts.size(), "BuildSmoothRenderMesh: one RenderVertex per MC4 vertex");
+        check(smooth.size() == (size_t)triCount * 3u, "BuildSmoothRenderMesh: vert count == 3*tris == MC4");
+
+        // (b) POSITIONS are BYTE-IDENTICAL to BuildRenderMesh (only the normal slot differs) -> the mesh
+        // fed to the render is provably the SAME MC4 bit-exact geometry as MC5.
+        {
+            bool posSame = true;
+            for (size_t i = 0; i < smooth.size(); ++i) {
+                if (std::memcmp(&smooth[i].px, &flat[i].px, sizeof(float) * 3) != 0) posSame = false;
+            }
+            check(posSame, "BuildSmoothRenderMesh: positions BYTE-IDENTICAL to BuildRenderMesh (MC4 mesh)");
+        }
+
+        // (c) the normal SET DIFFERS from MC5's flat normals (the smooth refinement is real, not a copy).
+        {
+            bool normalsDiffer = false;
+            for (size_t i = 0; i < smooth.size() && !normalsDiffer; ++i) {
+                if (std::memcmp(&smooth[i].nx, &flat[i].nx, sizeof(float) * 3) != 0) normalsDiffer = true;
+            }
+            check(normalsDiffer, "BuildSmoothRenderMesh: gradient normals DIFFER from MC5 flat normals (refinement is real)");
+        }
+
+        // (d) gradient normals are UNIT length + OUTWARD-oriented for the sphere. After centering, the
+        // mesh center is the origin, so an outward normal satisfies dot(N, vertexPos) > 0. A handful of
+        // verts sit in a flat field neighbourhood (zero gradient -> zero normal); those are degenerate.
+        {
+            bool unit = true; int outwardN = 0, nonDegen = 0, zeroN = 0;
+            for (size_t i = 0; i < smooth.size(); ++i) {
+                const auto& v = smooth[i];
+                float len = std::sqrt(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
+                if (len < 1e-6f) { ++zeroN; continue; }  // zero-gradient neighbourhood: legit zero normal
+                ++nonDegen;
+                if (std::abs(len - 1.0f) > 1e-3f) unit = false;
+                if (v.px*v.nx + v.py*v.ny + v.pz*v.nz > 0.0f) ++outwardN;
+            }
+            check(unit, "BuildSmoothRenderMesh: every non-degenerate gradient normal is unit length");
+            check(zeroN < (int)smooth.size() / 4, "BuildSmoothRenderMesh: zero-gradient verts are a small minority");
+            check(outwardN * 10 >= nonDegen * 9,
+                  "BuildSmoothRenderMesh: gradient normals outward-oriented for the sphere (>90% of non-degenerate)");
+        }
+
+        // (e) GradientNormal sign check at a hand-picked surface vertex: the outward normal points AWAY
+        // from the field center (in GRID space). Pick a vertex with large |x| from center and confirm
+        // N.x has the same sign as (gridX - center).
+        {
+            const int gxCenter = (33 - 1) / 2;  // field center grid coord
+            bool signOk = true; int checked = 0;
+            for (size_t i = 0; i < verts.size() && checked < 200; ++i) {
+                const int gx = verts[i].x / mc::kSub;
+                float nx, ny, nz; mc::GradientNormal(verts[i], f, nx, ny, nz);
+                if (std::sqrt(nx*nx + ny*ny + nz*nz) < 1e-6f) continue;  // degenerate
+                const int dxFromCenter = gx - gxCenter;
+                if (std::abs(dxFromCenter) >= 6) {  // clearly off-center in X
+                    ++checked;
+                    // outward (-grad) X-component should agree in sign with the offset from center.
+                    if ((dxFromCenter > 0 && nx < -1e-3f) || (dxFromCenter < 0 && nx > 1e-3f))
+                        signOk = false;
+                }
+            }
+            check(checked > 0, "GradientNormal sign-check: found off-center surface verts to test");
+            check(signOk, "GradientNormal: outward normal points AWAY from field center (sign verified)");
+        }
+
+        // (f) determinism: a second smooth build is byte-identical (pure function of mesh + field).
+        {
+            std::vector<mc::RenderVertex> smooth2;
+            mc::BuildSmoothRenderMesh(std::span<const mc::McVertex>(verts), f, kExtent, smooth2);
+            bool same = smooth.size() == smooth2.size() &&
+                        std::memcmp(smooth.data(), smooth2.data(), smooth.size() * sizeof(mc::RenderVertex)) == 0;
+            check(same, "BuildSmoothRenderMesh determinism: two builds BYTE-IDENTICAL");
+        }
+
+        // (g) empty mesh -> empty render mesh (the no-op the showcase's empty-field proof renders).
+        {
+            std::vector<mc::RenderVertex> smoothEmpty;
+            mc::BuildSmoothRenderMesh(std::span<const mc::McVertex>(), f, kExtent, smoothEmpty);
+            check(smoothEmpty.empty(), "BuildSmoothRenderMesh: empty mesh -> empty render mesh (no-op)");
+        }
+    }
+
     if (g_fail == 0) std::printf("mc_test: ALL PASS\n");
     else std::printf("mc_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;

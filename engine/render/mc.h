@@ -788,4 +788,106 @@ inline void BuildRenderMesh(std::span<const McVertex> verts, float targetExtent,
     }
 }
 
+// ===== MC6: SMOOTH field-gradient per-vertex normals (the finishing quality step) =================
+// MC5 gave every vertex of a triangle the FLAT FACE normal (faceted). MC6 gives each vertex the SDF
+// FIELD-GRADIENT normal at its OWN position — the standard Marching-Cubes smooth-normal technique — so
+// adjacent triangles share consistent vertex normals and the extracted sphere shades SMOOTH (Gouraud)
+// instead of faceted. Positions + indices stay EXACTLY the MC4 bit-exact mesh (MarchCellsInterp) — only
+// the per-vertex NORMAL changes (provenance unchanged). Pure host float (the same float class as MC5's
+// flat normal; the render is float regardless). NO new backend / RHI / shader.
+//
+// THE SIGN CONVENTION (verified against the sphere, documented): for the scalar field the gradient ∇f
+// points along INCREASING f. MakeSphereField sets scalar = (radius - dist)*kFixed, so f is LARGEST at
+// the centre and DECREASES outward -> ∇f points INWARD (toward the centre). The OUTWARD surface normal
+// (the face the camera sees, the one MC5 lit) is therefore -∇f. We NEGATE the central-difference
+// gradient to get the outward normal — the SAME outward convention MC5 used (it negated the inward MC
+// winding cross). Verified outward on the sphere: dot(N, vertexPos - centre) > 0 (N points away from the
+// centre), asserted in the showcase + tests for >90% of non-degenerate surface verts.
+
+// GradientNormal(vert, field): the unit OUTWARD field-gradient normal at the grid neighbourhood of the
+// fixed-point vertex `vert` (in 1/kSub units). The vertex's integer grid cell is vert.xyz / kSub (floor
+// toward zero; MC verts are non-negative so this is a true floor). Sample f at the 6 axis neighbours via
+// SampleField (clamped at borders), central difference grad = (fx+ - fx-, fy+ - fy-, fz+ - fz-), then
+// OUTWARD = normalize(-grad) (see the sign note above). A zero gradient (flat field neighbourhood)
+// returns {0,0,0} (a degenerate normal — the showcase/test treat it the same as MC5's zero face normal).
+// std::fma in the length so a CPU shade mirror reproduces the exact host floats (the visresolve FP
+// discipline). Pure + deterministic: same vert + field -> same normal every run.
+inline void GradientNormal(const McVertex& vert, const VoxelField& field,
+                           float& outNx, float& outNy, float& outNz) {
+    // The vertex's integer grid coords from its fixed-point (1/kSub) position. MC verts are >= 0 so
+    // integer divide (truncation) == floor — the deterministic grid cell the vertex sits in.
+    const int gx = vert.x / kSub;
+    const int gy = vert.y / kSub;
+    const int gz = vert.z / kSub;
+
+    // Central difference of the integer field at the 6 axis neighbours (SampleField clamps at borders).
+    const int32_t fxp = SampleField(field, gx + 1, gy, gz);
+    const int32_t fxm = SampleField(field, gx - 1, gy, gz);
+    const int32_t fyp = SampleField(field, gx, gy + 1, gz);
+    const int32_t fym = SampleField(field, gx, gy - 1, gz);
+    const int32_t fzp = SampleField(field, gx, gy, gz + 1);
+    const int32_t fzm = SampleField(field, gx, gy, gz - 1);
+
+    // grad = ∇f (points toward INCREASING f = INWARD for this sphere field). OUTWARD normal = -grad.
+    float nx = -(float)(fxp - fxm);
+    float ny = -(float)(fyp - fym);
+    float nz = -(float)(fzp - fzm);
+
+    const float len2 = std::fma(nx, nx, std::fma(ny, ny, nz * nz));
+    const float invLen = (len2 > 0.0f) ? (1.0f / std::sqrt(len2)) : 0.0f;
+    outNx = nx * invLen; outNy = ny * invLen; outNz = nz * invLen;
+}
+
+// BuildSmoothRenderMesh: MC5's BuildRenderMesh with per-vertex SMOOTH field-gradient normals instead of
+// the flat per-face normal. POSITIONS + the (implicit identity) INDICES are BYTE-IDENTICAL to
+// BuildRenderMesh / MarchCellsInterp (the bit-exact mesh — provenance unchanged); ONLY outVerts[i].n*
+// differs. `verts` is the SAME fixed-point (1/kSub) MarchCellsInterp soup; `field` is the SAME field it
+// was meshed from (the gradient is sampled from it). Pure + deterministic; std::fma where it helps.
+inline void BuildSmoothRenderMesh(std::span<const McVertex> verts, const VoxelField& field,
+                                  float targetExtent, std::vector<RenderVertex>& outVerts) {
+    const size_t n = verts.size();
+    outVerts.assign(n, RenderVertex{0, 0, 0, 0, 0, 0});
+    if (n == 0) return;
+
+    // 1) fixed-point -> float world units (the ONE documented host float divide) + the mesh's AABB.
+    //    IDENTICAL to BuildRenderMesh so the positions are byte-for-byte the same.
+    const float inv = 1.0f / (float)kSub;
+    float minx = 1e30f, miny = 1e30f, minz = 1e30f;
+    float maxx = -1e30f, maxy = -1e30f, maxz = -1e30f;
+    for (size_t i = 0; i < n; ++i) {
+        const float x = (float)verts[i].x * inv;
+        const float y = (float)verts[i].y * inv;
+        const float z = (float)verts[i].z * inv;
+        outVerts[i].px = x; outVerts[i].py = y; outVerts[i].pz = z;
+        if (x < minx) minx = x; if (x > maxx) maxx = x;
+        if (y < miny) miny = y; if (y > maxy) maxy = y;
+        if (z < minz) minz = z; if (z > maxz) maxz = z;
+    }
+
+    // 2) center on the AABB midpoint + scale the largest extent to targetExtent — IDENTICAL math.
+    const float cx = 0.5f * (minx + maxx);
+    const float cy = 0.5f * (miny + maxy);
+    const float cz = 0.5f * (minz + maxz);
+    const float ex = maxx - minx, ey = maxy - miny, ez = maxz - minz;
+    float ext = ex; if (ey > ext) ext = ey; if (ez > ext) ext = ez;
+    const float scale = (ext > 0.0f) ? (targetExtent / ext) : 1.0f;
+    for (size_t i = 0; i < n; ++i) {
+        outVerts[i].px = std::fma(outVerts[i].px - cx, scale, 0.0f);
+        outVerts[i].py = std::fma(outVerts[i].py - cy, scale, 0.0f);
+        outVerts[i].pz = std::fma(outVerts[i].pz - cz, scale, 0.0f);
+    }
+
+    // 3) SMOOTH per-vertex normal: each vertex gets the OUTWARD field-gradient normal at ITS OWN grid
+    //    position (NOT the flat face normal). The gradient is computed in field GRID space from the
+    //    ORIGINAL fixed-point vert (the world transform above is a uniform scale + translation, which
+    //    does NOT change a normal's direction, so the grid-space gradient direction is already the
+    //    correct world-space normal direction). Adjacent triangles' shared-edge verts sit at the same
+    //    grid position -> the same gradient -> the seams shade smooth.
+    for (size_t i = 0; i < n; ++i) {
+        float nx, ny, nz;
+        GradientNormal(verts[i], field, nx, ny, nz);
+        outVerts[i].nx = nx; outVerts[i].ny = ny; outVerts[i].nz = nz;
+    }
+}
+
 }  // namespace hf::render::mc
