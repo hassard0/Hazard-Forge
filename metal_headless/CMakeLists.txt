@@ -204,6 +204,14 @@ hf_gen_msl(vt_feedback.comp      vt_feedback.comp.hlsl      comp vt_feedback_mai
 # texture.read) -> the default MSL gen suffices (NO --msl-version 20200). The indirection table is bit-exact
 # GPU==CPU + cross-backend by construction. Behind --vt-alloc only; existing shaders + goldens untouched.
 hf_gen_msl(vt_alloc.comp         vt_alloc.comp.hlsl         comp vt_alloc_main)
+# Runtime Virtual Texturing Slice 3 (Slice VT3): vt_pagegen.comp GENERATES each allocated virtual page's
+# procedural CONTENT into its physical tile in the atlas — ONE thread per atlas texel (race-free parallel MAP,
+# NO atomics). Each thread reads the host-built reverse table gTilePageId, UnpackPageId's the owning pageId,
+# and writes PageTexel(pageId,mip,localXY) (the PURE-INTEGER per-texel generator copied VERBATIM from
+# render/vt.h) into gAtlas; unallocated -> kAtlasClear; genEnabled=0 -> all kAtlasClear. Pure integer SSBO
+# compute (no atomics, no integer texture.read) -> the default MSL gen suffices (NO --msl-version 20200). The
+# atlas is bit-exact GPU==CPU + cross-backend by construction. Behind --vt-pagegen only; goldens untouched.
+hf_gen_msl(vt_pagegen.comp       vt_pagegen.comp.hlsl       comp vt_pagegen_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

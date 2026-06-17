@@ -16231,6 +16231,201 @@ static int RunVtAllocShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Runtime Virtual Texturing procedural PAGE GENERATION into the PHYSICAL ATLAS showcase (Slice VT3).
+// The TRUE pass is identical on both backends: VT2's indirection -> a host reverse table tilePageId ->
+// shaders/vt_pagegen.comp (here vt_pagegen.comp.gen.metal) — ONE thread per atlas texel (a race-free MAP,
+// NO atomics) — generates each allocated page's content into its physical tile: PageTexel(pageId,mip,
+// localXY), the PURE-INTEGER per-texel generator copied VERBATIM from render/vt.h; unallocated -> kAtlas-
+// Clear. ReadBuffer reads the RGBA8-packed atlas and it is PROVEN BIT-EXACT vs the CPU
+// vt::GeneratePhysicalAtlas reference (memcmp, NO FP tolerance) — the same GPU==CPU proof the Vulkan
+// --vt-pagegen-shot runs; genEnabled=false -> all kAtlasClear; two runs byte-identical. The image golden
+// is the atlas decoded directly from the RGBA8-packed uints (each allocated tile a tinted patterned page,
+// unallocated dark) -> identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). New
+// golden tests/golden/metal/vt_atlas.png; two runs DIFF 0.0000. NO rendering, NO new RHI.
+static int RunVtPagegenShowcase(const char* outPath) {
+    namespace vt = render::vt;
+    // The fixed virtual texture (== the Vulkan --vt-pagegen-shot config): 340 pages over 4 mips.
+    vt::VtTexture vtx;
+    vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+    const int nPages = vtx.pageCount();
+
+    // The SAME fixed deterministic (UV,mip) sample-request set as VT1/VT2 (24x24 = 576 requests).
+    std::vector<vt::SampleRequest> requests;
+    const int kGrid = 24;
+    for (int gy = 0; gy < kGrid; ++gy)
+        for (int gx = 0; gx < kGrid; ++gx) {
+            float u = (float)gx / (float)kGrid;
+            float v = (float)gy / (float)kGrid;
+            int mip = (gx + gy) % vtx.mipLevels;
+            requests.push_back({u, v, mip});
+        }
+
+    // VT1 feedback (host) -> VT2 indirection (host) — the allocated set we GENERATE.
+    std::vector<uint32_t> feedback((size_t)nPages, 0u);
+    vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                          std::span<uint32_t>(feedback.data(), feedback.size()));
+
+    // VT3's own showcase pool: tilesPerSide=16 -> 256 physical tiles, pageSize=64 -> a 1024×1024 atlas.
+    // resident(212) < capacity(256): 212 tiles ALLOCATED (each a distinct tinted patterned page), the
+    // remaining 44 physical tiles FREE (kAtlasClear, dark) — the golden shows BOTH page content AND the
+    // cleared unallocated regions. (== the Vulkan --vt-pagegen-shot config.)
+    vt::VtTilePool pool; pool.tilesPerSide = 16;
+    vt::VtAtlasDims dims; dims.tilesPerSide = pool.tilesPerSide; dims.pageSize = 64;
+    const int atlasW = dims.atlasW(), atlasH = dims.atlasH();
+    const int atlasTexels = dims.atlasTexels();
+
+    std::vector<int32_t> indirection =
+        vt::AllocatePhysicalTiles(std::span<const uint32_t>(feedback.data(), feedback.size()), pool);
+    uint32_t allocated = 0;
+    for (int32_t t : indirection) if (t != vt::kNoTile) ++allocated;
+
+    std::vector<uint32_t> tilePageId = vt::BuildTilePageId(
+        std::span<const int32_t>(indirection.data(), indirection.size()), pool);
+
+    const uint32_t W = (uint32_t)atlasW, H = (uint32_t)atlasH;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    rhi::BufferDesc tpDesc;
+    tpDesc.size = tilePageId.size() * sizeof(uint32_t);
+    tpDesc.initialData = tilePageId.data();
+    tpDesc.usage = rhi::BufferUsage::Storage;
+    auto tilePageIdBuf = device->CreateBuffer(tpDesc);
+
+    std::vector<uint32_t> atlasInit((size_t)atlasTexels, vt::kAtlasClear);
+    auto makeAtlasBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = atlasInit.size() * sizeof(uint32_t);
+        d.initialData = atlasInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct VtPgParams {
+        uint32_t dims[4];          // atlasW, atlasH, tilesPerSide, genEnabled
+        uint32_t dims2[4];         // pageSize, mipLevels, _, _
+        uint32_t pagesPerSide[16];
+        uint32_t mipOffset[16];
+    };
+    static_assert(sizeof(VtPgParams) == 16 + 16 + 64 + 64, "VtPgParams std430 layout");
+    auto makeParams = [&](uint32_t genEnabled) {
+        VtPgParams p{};
+        p.dims[0] = (uint32_t)atlasW; p.dims[1] = (uint32_t)atlasH;
+        p.dims[2] = (uint32_t)pool.tilesPerSide; p.dims[3] = genEnabled;
+        p.dims2[0] = (uint32_t)dims.pageSize; p.dims2[1] = (uint32_t)vtx.mipLevels;
+        for (int m = 0; m < vtx.mipLevels; ++m) {
+            p.pagesPerSide[m] = (uint32_t)vtx.pagesPerSide(m);
+            p.mipOffset[m]    = (uint32_t)vtx.mipPageOffset(m);
+        }
+        return p;
+    };
+
+    auto pgCs = loadMSL("vt_pagegen.comp.gen.metal", "vt_pagegen_main");
+    rhi::ComputePipelineDesc pgDesc;
+    pgDesc.compute = pgCs.get(); pgDesc.storageBufferCount = 3; pgDesc.threadsPerGroupX = 64;
+    auto pgCompute = device->CreateComputePipeline(pgDesc);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    const uint32_t kGroups = ((uint32_t)atlasTexels + 63u) / 64u;
+
+    auto runPagegen = [&](uint32_t genEnabled, std::vector<uint32_t>& outAtlas) {
+        auto atlasBuf = makeAtlasBuf();
+        VtPgParams params = makeParams(genEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(VtPgParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("vt_pagegen", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*pgCompute);
+                cmd.BindStorageBuffer(*tilePageIdBuf, 0);
+                cmd.BindStorageBuffer(*atlasBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kGroups);   // one thread per atlas texel (1D)
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outAtlas.assign((size_t)atlasTexels, 0u);
+        device->ReadBuffer(*atlasBuf, outAtlas.data(), outAtlas.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU generation (enabled).
+    std::vector<uint32_t> gpuAtlas;
+    runPagegen(1u, gpuAtlas);
+
+    // CPU reference over the SAME indirection.
+    std::vector<uint32_t> cpuAtlas((size_t)atlasTexels, 0u);
+    vt::GeneratePhysicalAtlas(std::span<const int32_t>(indirection.data(), indirection.size()), vtx,
+                              pool, dims, std::span<uint32_t>(cpuAtlas.data(), cpuAtlas.size()), true);
+
+    if (gpuAtlas.size() != cpuAtlas.size() ||
+        std::memcmp(gpuAtlas.data(), cpuAtlas.data(), (size_t)atlasTexels * sizeof(uint32_t)) != 0)
+        return fail("vt-pagegen: GPU atlas != CPU GeneratePhysicalAtlas (per-texel generator diverged?)");
+    std::printf("vt-pagegen GPU==CPU atlas: %dx%d BIT-EXACT\n", atlasW, atlasH);
+
+    // coverage / correctness.
+    uint32_t generated = 0;
+    bool coverageOk = true;
+    for (int ty = 0; ty < pool.tilesPerSide && coverageOk; ++ty)
+        for (int tx = 0; tx < pool.tilesPerSide && coverageOk; ++tx) {
+            const int tileIndex = ty * pool.tilesPerSide + tx;
+            const bool tileAllocated = (tilePageId[(size_t)tileIndex] != vt::kNoTileU32);
+            const int ox = tx * dims.pageSize, oy = ty * dims.pageSize;
+            for (int ly = 0; ly < dims.pageSize && coverageOk; ++ly)
+                for (int lx = 0; lx < dims.pageSize; ++lx) {
+                    const uint32_t texel = gpuAtlas[(size_t)(oy + ly) * atlasW + (ox + lx)];
+                    const bool clear = (texel == vt::kAtlasClear);
+                    if (tileAllocated) { if (clear) { coverageOk = false; break; } ++generated; }
+                    else               { if (!clear) { coverageOk = false; break; } }
+                }
+        }
+    const uint32_t expectGenerated = allocated * (uint32_t)(dims.pageSize * dims.pageSize);
+    if (!coverageOk || generated != expectGenerated)
+        return fail("vt-pagegen: coverage wrong (hole in an allocated tile or stray non-clear texel)");
+    std::printf("vt-pagegen: {allocated:%u tiles, atlas:%dx%d, generated:%u texels}\n",
+                allocated, atlasW, atlasH, generated);
+
+    // genEnabled=false -> all kAtlasClear.
+    std::vector<uint32_t> disabledAtlas;
+    runPagegen(0u, disabledAtlas);
+    for (uint32_t t : disabledAtlas) if (t != vt::kAtlasClear) return fail("vt-pagegen: disabled path not all clear");
+    std::printf("vt-pagegen disabled: all clear (no-op)\n");
+
+    // two-run determinism.
+    std::vector<uint32_t> gpuAtlas2;
+    runPagegen(1u, gpuAtlas2);
+    if (gpuAtlas.size() != gpuAtlas2.size() ||
+        std::memcmp(gpuAtlas.data(), gpuAtlas2.data(), gpuAtlas.size() * sizeof(uint32_t)) != 0)
+        return fail("vt-pagegen: two dispatches differ (nondeterministic)");
+    std::printf("vt-pagegen determinism: two dispatches BYTE-IDENTICAL\n");
+
+    // --- Golden: the physical atlas decoded directly from the RGBA8-packed uints (IDENTICAL to the Vulkan
+    // --vt-pagegen-shot by construction — same integer bits). 0xAABBGGRR -> BGRA bytes for WritePNG. ---
+    std::vector<uint8_t> bgra((size_t)atlasW * atlasH * 4, 0);
+    for (size_t p = 0; p < (size_t)atlasW * atlasH; ++p) {
+        const uint32_t t = gpuAtlas[p];
+        const uint8_t r = (uint8_t)(t & 0xFFu);
+        const uint8_t g = (uint8_t)((t >> 8) & 0xFFu);
+        const uint8_t b = (uint8_t)((t >> 16) & 0xFFu);
+        bgra[p * 4 + 0] = b; bgra[p * 4 + 1] = g; bgra[p * 4 + 2] = r; bgra[p * 4 + 3] = 255;
+    }
+    if (!WritePNG(outPath, bgra, (uint32_t)atlasW, (uint32_t)atlasH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%dx%d) — VT physical-atlas pagegen (%u allocated tiles, %u generated texels)\n",
+                outPath, atlasW, atlasH, allocated, generated);
+    return 0;
+}
+
 // --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
 // backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
 // shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
@@ -24816,6 +25011,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vt-alloc") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vt_alloc.png";
             try { return RunVtAllocShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vt-pagegen <out.png>: render the Runtime Virtual Texturing procedural PAGE GENERATION into the
+        // PHYSICAL ATLAS showcase (Slice VT3, the 3rd RVT slice). VT2's indirection -> a host reverse table
+        // tilePageId -> vt_pagegen.comp (ONE thread per atlas texel, a race-free MAP, NO atomics) generates
+        // each allocated page's content into its physical tile via PageTexel(pageId,mip,localXY) (the PURE-
+        // INTEGER per-texel generator copied VERBATIM from render/vt.h); unallocated -> kAtlasClear. ReadBuffer
+        // reads the RGBA8-packed atlas, PROVEN BIT-EXACT vs the CPU vt::GeneratePhysicalAtlas reference
+        // (memcmp, no FP tol — the same GPU==CPU proof the Vulkan --vt-pagegen-shot runs); genEnabled=false ->
+        // all kAtlasClear; two runs byte-identical. The image golden is the atlas decoded directly from the
+        // RGBA8-packed uints (each allocated tile a tinted patterned page, unallocated dark), identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/vt_atlas.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--vt-pagegen") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vt_atlas.png";
+            try { return RunVtPagegenShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vsm-render <out.png>: render the Virtual Shadow Maps PHYSICAL-PAGE DEPTH showcase (Slice VB).

@@ -400,6 +400,15 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> the GPU indirection table is bit-exact GPU==CPU, proven memcmp. NO new
     # RHI; existing shaders + goldens untouched.
     "shaders/vt_alloc.comp.hlsl:cs"
+    # Runtime Virtual Texturing Slice 3 (Slice VT3): vt_pagegen.comp GENERATES each allocated virtual page's
+    # procedural CONTENT into its physical tile in the atlas — ONE thread per atlas texel (race-free parallel
+    # MAP, NO atomics). Each thread finds its tile, reads the host-built reverse table gTilePageId to recover
+    # the owning pageId, UnpackPageId's it -> (mip,px,py) (verbatim render/vt.h), and writes
+    # PageTexel(pageId,mip,localXY) (the PURE-INTEGER per-texel generator copied VERBATIM from render/vt.h)
+    # into gAtlas; unallocated tiles -> kAtlasClear. genEnabled=0 -> all kAtlasClear (no-op). Pure integer
+    # SSBO compute + ReadBuffer -> the physical atlas is bit-exact GPU==CPU + cross-backend, proven memcmp.
+    # NO new RHI; existing shaders + goldens untouched.
+    "shaders/vt_pagegen.comp.hlsl:cs"
     # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer —
     # ONE thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO
     # via InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied
