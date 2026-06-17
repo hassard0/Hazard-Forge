@@ -473,6 +473,18 @@ hf_compile_shaders(
     "shaders/fpx_pair_count.comp.hlsl:cs"
     "shaders/fpx_pair_scan.comp.hlsl:cs"
     "shaders/fpx_pair_emit.comp.hlsl:cs"
+    # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6):
+    # fpx_solve.comp is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)],
+    # the mc_scan/vt_alloc allocator pattern) runs `steps` of StepWorld = IntegrateStep then SolveContacts
+    # (K=solveIters Gauss-Seidel sweeps: ALL ground contacts then ALL sphere-sphere pair contacts in the
+    # FIXED FPX2 pair order). The fxdiv/FxNormalize/ground + sphere-sphere math is copied VERBATIM from
+    # engine/sim/fpx.h; contact resolution is inherently sequential -> one thread -> bit-exact GPU==CPU +
+    # cross-backend, NO atomics. solveEnabled=0 -> bodies UNCHANGED. UNLIKE the int32 FPX2 broadphase, this
+    # is int64 (fxdiv/FxISqrt for the sphere-sphere normal), so it is VULKAN-SPIR-V-ONLY (DXC compiles
+    # int64; glslc cannot) and is NOT MSL-gen'd — the Metal --fpx-solve showcase runs the CPU StepWorld
+    # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU
+    # body array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/fpx_solve.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

@@ -16986,6 +16986,183 @@ static int RunFpxPairsShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver showcase (Slice FPX3, the
+// MAKE-OR-BREAK of FLAGSHIP #6). On Metal this runs the CPU SOLVER, NOT a GPU compute dispatch.
+// fpx_solve.comp is int64/Vulkan-only (glslc can't parse int64 — fxdiv/FxISqrt for the sphere-sphere
+// normal); Metal runs the CPU fpx::StepWorld — byte-identical to the Vulkan GPU result by construction (the
+// fpx_integrate.comp / swraster.comp convention). The CPU bound path IS engine/sim/fpx.h::StepWorld, the
+// EXACT bit-exact reference the Vulkan --fpx-solve-shot GPU==CPU memcmp already compares against. So this
+// builds the SAME deterministic CLUSTER (a 6x6 loose stack above the ground, radii so neighbors collide,
+// gravity (0,-9.8,0) host-snapped to Q16.16, groundY=0, dt=kOne/60), builds the FPX2 pair list ONCE from
+// the initial config, runs fpx::StepWorld K=180 steps (solveIters=8 Gauss-Seidel sweeps), and CPU-colors a
+// PURE-INTEGER settled-pile side-view debug-viz -> BYTE-IDENTICAL to the Vulkan GPU result BY CONSTRUCTION.
+// New golden tests/golden/metal/fpx_solve.png; two runs DIFF 0.0000. NO GPU compute, NO new RHI.
+static int RunFpxSolveShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic CLUSTER (== the Vulkan --fpx-solve-shot config). gravity -9.8 host-snapped.
+    const fpx::fx kGravY = (fpx::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const fpx::fx kDt = fpx::kOne / 60;
+    const int kGrid = 6;
+    const int kBodyCount = kGrid * kGrid;     // 36
+    const int kSteps = 180;
+    const int kSolveIters = 8;
+    const fpx::fx kGroundY = 0;
+    const fpx::fx kSpacing = (fpx::fx)(fpx::kOne * 9 / 10);   // 0.9
+    const fpx::fx kRadius  = (fpx::fx)(fpx::kOne * 55 / 100); // 0.55
+
+    fpx::FxWorld world;
+    world.gravity = {0, kGravY, 0};
+    world.groundY = kGroundY;
+    for (int i = 0; i < kBodyCount; ++i) {
+        fpx::FxBody b;
+        const int gx = i % kGrid;
+        const int gz = i / kGrid;
+        b.pos = {(fpx::fx)(gx * (int)kSpacing),
+                 (fpx::fx)((2 + (i % 4)) * (int)fpx::kOne),
+                 (fpx::fx)(gz * (int)kSpacing)};
+        b.vel = {0, 0, 0};
+        b.invMass = fpx::kOne;
+        b.flags = fpx::kFlagDynamic;
+        b.radius = kRadius;
+        world.bodies.push_back(b);
+    }
+
+    // Build the FPX2 candidate-pair list ONCE from the INITIAL config (== the Vulkan path; broadphase
+    // radius 1.1 so falling bodies that drift into contact are covered).
+    fpx::FxWorld bpWorld = world;
+    for (auto& b : bpWorld.bodies) b.radius = (fpx::fx)(fpx::kOne * 11 / 10);
+    std::vector<uint32_t> bpOffset; std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(bpWorld, bpOffset, pairs);
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    struct FpxBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+    static_assert(sizeof(FpxBodyGpu) == 36, "FpxBodyGpu std430 layout");
+    auto packBodies = [&](const fpx::FxWorld& w) {
+        std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+        for (size_t i = 0; i < w.bodies.size(); ++i) {
+            const fpx::FxBody& b = w.bodies[i];
+            out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                b.invMass, b.flags, b.radius};
+        }
+        return out;
+    };
+    const std::vector<FpxBodyGpu> bodiesInit = packBodies(world);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --fpx-solve-shot).
+    const int kPxPerUnit = 40, kMargin = 24, kWorldW = 6, kWorldH = 7;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+
+    // CPU solver (== the bit-exact reference the Vulkan --fpx-solve-shot GPU==CPU memcmp compares against).
+    // solveEnabled=false -> bodies UNCHANGED (the no-op path).
+    auto runSolve = [&](bool solveEnabled, std::vector<FpxBodyGpu>& outBodies) {
+        if (!solveEnabled) { outBodies = bodiesInit; return; }
+        fpx::FxWorld w = world;
+        for (int s = 0; s < kSteps; ++s)
+            fpx::StepWorld(w, std::span<const fpx::FxPair>(pairs), kDt, kSolveIters);
+        outBodies = packBodies(w);
+    };
+
+    // CPU solve (enabled, K steps) — the Metal showcase body array.
+    std::vector<FpxBodyGpu> gpuBodies;
+    runSolve(true, gpuBodies);
+
+    // GPU==CPU is N/A on the Metal CPU path: this body array IS the CPU StepWorld reference the Vulkan
+    // --fpx-solve-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("fpx-solve GPU==CPU bodies: %d bodies BIT-EXACT (%d steps, %d iters) [Metal: CPU StepWorld, "
+                "byte-identical by construction]\n", kBodyCount, kSteps, kSolveIters);
+
+    // {...} stat line: residual-overlap + above-ground (recompute the world for the residual count).
+    {
+        fpx::FxWorld w = world;
+        for (int s = 0; s < kSteps; ++s)
+            fpx::StepWorld(w, std::span<const fpx::FxPair>(pairs), kDt, kSolveIters);
+        const uint32_t residual = fpx::CountResidualOverlaps(w, std::span<const fpx::FxPair>(pairs));
+        int aboveGround = 0;
+        for (const auto& gb : gpuBodies) if (gb.py - gb.radius >= kGroundY) ++aboveGround;
+        if (aboveGround != kBodyCount) return fail("fpx-solve: bodies below ground after solve");
+        std::printf("fpx-solve: {bodies:%d, contacts:%u, residual-overlap:%u, above-ground:%d/%d}\n",
+                    kBodyCount, kPairCount, residual, aboveGround, kBodyCount);
+    }
+
+    // hand-checked contact: two overlapping bodies, unit invMass -> after 1 iter each moves pen/2.
+    {
+        const fpx::fx r = (fpx::fx)(fpx::kOne * 6 / 10);
+        const fpx::fx D = fpx::kOne;
+        fpx::FxWorld two;
+        fpx::FxBody a; a.pos = {0, 0, 0};   a.radius = r; a.invMass = fpx::kOne; a.flags = fpx::kFlagDynamic;
+        fpx::FxBody bb; bb.pos = {D, 0, 0}; bb.radius = r; bb.invMass = fpx::kOne; bb.flags = fpx::kFlagDynamic;
+        two.bodies = {a, bb};
+        two.groundY = (fpx::fx)(-100 * (int)fpx::kOne);
+        std::vector<fpx::FxPair> pr = {fpx::FxPair{0u, 1u}};
+        const fpx::fx pen = (r + r) - fpx::FxLength(fpx::FxVec3{D, 0, 0});
+        const fpx::fx half = fpx::fxmul(pen, fpx::fxdiv(fpx::kOne, fpx::kOne + fpx::kOne));
+        fpx::SolveContacts(two, std::span<const fpx::FxPair>(pr), 1);
+        if (two.bodies[0].pos.x != -half || two.bodies[1].pos.x != D + half)
+            return fail("fpx-solve: hand-check split wrong");
+        std::printf("fpx-solve hand-check: pen%d -> split %d/%d OK\n", pen, -half, half);
+    }
+
+    // disabled-path no-op.
+    std::vector<FpxBodyGpu> disabledBodies;
+    runSolve(false, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                    bodiesInit.size() * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx-solve: solveEnabled=false changed the bodies");
+    std::printf("fpx-solve disabled: bodies UNCHANGED (no-op)\n");
+
+    // two-run determinism.
+    std::vector<FpxBodyGpu> gpuBodies2;
+    runSolve(true, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx-solve: two runs differ (nondeterministic)");
+    std::printf("fpx-solve determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: a PURE-INTEGER settled-pile side-view (IDENTICAL to the Vulkan --fpx-solve-shot by
+    // construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    {
+        int gx0, gy0; worldToPx(0, 0, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) {
+            if (gy0 < 0 || gy0 >= (int)imgH) break;
+            uint8_t* dst = &bgra[((size_t)gy0 * imgW + x) * 4];
+            dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+        }
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = gpuBodies[(size_t)i].px >> fpx::kFrac;
+        const int wy = gpuBodies[(size_t)i].py >> fpx::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fixed-point PBD settled pile (%u contacts)\n",
+                outPath, imgW, imgH, kPairCount);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
 // of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
 // corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
@@ -27515,6 +27692,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fpx-pairs") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fpx_pairs.png";
             try { return RunFpxPairsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fpx-solve <out.png>: render the Deterministic Fixed-Point Physics PBD POSITIONAL
+        // collision-response solver showcase (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6). On Metal this
+        // runs the CPU SOLVER: fpx_solve.comp is int64/Vulkan-only (glslc can't parse the fxdiv/FxISqrt
+        // int64), so Metal runs the CPU fpx::StepWorld — byte-identical to the Vulkan GPU result by
+        // construction (the fpx_integrate.comp convention). A deterministic CLUSTER (a 6x6 loose stack,
+        // radii so neighbors collide) falls + collides into a settled PILE over the FPX2 pairs (built ONCE
+        // from the initial config) via fpx::StepWorld K=180 steps (solveIters=8) — the EXACT bit-exact
+        // reference the Vulkan --fpx-solve-shot GPU==CPU memcmp compares against; solveEnabled=false ->
+        // bodies unchanged; two runs byte-identical. The image golden is a PURE-INTEGER settled-pile
+        // side-view, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/fpx_solve.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fpx-solve") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fpx_solve.png";
+            try { return RunFpxSolveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mc-count <out.png>: render the GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT

@@ -450,6 +450,7 @@ int main(int argc, char** argv) {
     const char* mcRenderShotPath = nullptr; // --mc-render-shot <out.bmp> (Slice MC5: GPU Isosurface Meshing RENDER — MarchCellsInterp's bit-exact fixed-point mesh -> BuildRenderMesh (position=vert/kSub + flat per-face normals) -> the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO) -> a lit 3D extracted-sphere render. The MC arc's FIRST FLOAT slice: the golden is the visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof), NOT the integer zero-diff bar. NO new RHI / shader)
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
+    const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxPairsShotPath = nullptr; // --fpx-pairs-shot <out.bmp> (Slice FPX2: Deterministic Fixed-Point Physics integer-AABB BROADPHASE — a clustered 8x8 grid meshed by INT32 count->scan->emit (fpx_pair_count/scan/emit.comp) into the deterministic candidate-pair list, GPU==CPU pair list bit-exact, integer N×N pair-matrix viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
@@ -488,6 +489,18 @@ int main(int argc, char** argv) {
     const char* matIntrospectOut = nullptr;    // optional output file (stdout if omitted)
     bool matIntrospectDot = false;             // --dot: emit DOT instead of JSON
     for (int i = 1; i < argc; ++i) {
+        // Slice FPX3: --fpx-solve-shot <out.bmp> — the Deterministic Fixed-Point Physics PBD POSITIONAL
+        // collision-response solver (the MAKE-OR-BREAK of FLAGSHIP #6). A deterministic CLUSTER falls +
+        // collides into a settled PILE over the FPX2 pairs (built ONCE on the host), stepped K=180 by a
+        // SINGLE-THREAD compute (shaders/fpx_solve.comp; each step = IntegrateStep then SolveContacts,
+        // solveIters=8), GPU==CPU body array bit-exact vs fpx.h::StepWorld. int64 fxdiv/FxISqrt ->
+        // fpx_solve.comp is Vulkan-only; Metal --fpx-solve runs the CPU StepWorld. NO new RHI. Handled as a
+        // STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse limit.
+        if (std::strcmp(argv[i], "--fpx-solve-shot") == 0 && i + 1 < argc) {
+            fpxSolveShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
         if (std::strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
             shotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--pbr-shot") == 0 && i + 1 < argc) {
@@ -15195,6 +15208,284 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — integer broadphase pair-matrix (%u pairs)\n",
                                 fpxPairsShotPath, imgW, imgH, totalPairs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxPairsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver (--fpx-solve-shot
+        // <out.bmp>, Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6). A deterministic CLUSTER of bodies (a
+        // loose grid stacked above the ground, radii so neighbors collide), gravity (0,-9.8,0) host-snapped
+        // to Q16.16, groundY=0, dt=kOne/60, is stepped K=180 times by a SINGLE-THREAD compute
+        // (shaders/fpx_solve.comp): each step = IntegrateStep then SolveContacts (solveIters=8 Gauss-Seidel
+        // sweeps — ALL ground contacts then ALL sphere-sphere pair contacts in the FIXED FPX2 pair order)
+        // -> a settled PILE. The candidate-pair list is built ONCE on the host (fpx::BuildPairs from the
+        // initial config) + uploaded; the fxdiv/FxNormalize/ground + sphere-sphere resolution copied
+        // VERBATIM from engine/sim/fpx.h. ReadBuffer reads the integer Q16.16 body array; the CPU
+        // fpx.h::StepWorld over the SAME world must match it BIT-EXACT (memcmp, NO tol — the GPU==CPU
+        // make-or-break). solveEnabled=false -> bodies UNCHANGED (no-op). The golden is a PURE-INTEGER
+        // settled-pile side-view (each body's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel, a
+        // hashColor(bodyIndex) dot, the groundY line) -> identical both backends by construction. int64
+        // fxdiv/FxISqrt -> fpx_solve.comp is VULKAN-ONLY (Metal --fpx-solve runs the CPU StepWorld). NO new RHI.
+        if (fpxSolveShotPath) {
+            using math::Vec3;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic CLUSTER (== the Metal --fpx-solve config). gravity -9.8 host-snapped.
+            const fpx::fx kGravY = (fpx::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const fpx::fx kDt = fpx::kOne / 60;
+            const int kGrid = 6;                       // 6x6 = 36-body loose stack
+            const int kBodyCount = kGrid * kGrid;      // 36
+            const int kSteps = 180;
+            const int kSolveIters = 8;
+            const fpx::fx kGroundY = 0;
+            // Spacing 0.9 world unit with radius 0.55 -> 2*0.55=1.1 > 0.9 -> neighbors overlap (they must
+            // be pushed apart). Stacked starting heights so the cluster falls + collides into a pile.
+            const fpx::fx kSpacing = (fpx::fx)(fpx::kOne * 9 / 10);   // 0.9
+            const fpx::fx kRadius  = (fpx::fx)(fpx::kOne * 55 / 100); // 0.55
+
+            fpx::FxWorld world;
+            world.gravity = {0, kGravY, 0};
+            world.groundY = kGroundY;
+            for (int i = 0; i < kBodyCount; ++i) {
+                fpx::FxBody b;
+                const int gx = i % kGrid;
+                const int gz = i / kGrid;
+                b.pos = {(fpx::fx)(gx * (int)kSpacing),
+                         (fpx::fx)((2 + (i % 4)) * (int)fpx::kOne),   // staggered heights 2..5
+                         (fpx::fx)(gz * (int)kSpacing)};
+                b.vel = {0, 0, 0};
+                b.invMass = fpx::kOne;                 // unit inverse mass (dynamic)
+                b.flags = fpx::kFlagDynamic;
+                b.radius = kRadius;
+                world.bodies.push_back(b);
+            }
+
+            // Build the FPX2 candidate-pair list ONCE from the INITIAL config (the spec's locked decision:
+            // a FIXED candidate set; per-step rebroadphase is FPX4+). Use a generous radius for broadphase
+            // so falling bodies that drift into contact are covered (the AABB is conservative).
+            fpx::FxWorld bpWorld = world;
+            for (auto& b : bpWorld.bodies) b.radius = (fpx::fx)(fpx::kOne * 11 / 10);  // 1.1 broadphase extent
+            std::vector<uint32_t> bpOffset; std::vector<fpx::FxPair> pairs;
+            fpx::BuildPairs(bpWorld, bpOffset, pairs);
+            const uint32_t kPairCount = (uint32_t)pairs.size();
+            const uint32_t kPairAlloc = kPairCount > 0u ? kPairCount : 1u;
+
+            // std430 FpxBody mirror (matches shaders/fpx_solve.comp FpxBody): 9 x int32 (36 bytes).
+            struct FpxBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+            static_assert(sizeof(FpxBodyGpu) == 36, "FpxBodyGpu std430 layout");
+            auto packBodies = [&](const fpx::FxWorld& w) {
+                std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+                for (size_t i = 0; i < w.bodies.size(); ++i) {
+                    const fpx::FxBody& b = w.bodies[i];
+                    out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                        b.invMass, b.flags, b.radius};
+                }
+                return out;
+            };
+            const std::vector<FpxBodyGpu> bodiesInit = packBodies(world);
+
+            auto makeBodiesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = bodiesInit.size() * sizeof(FpxBodyGpu);
+                d.initialData = bodiesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // std430 FxPair mirror: 2 x uint32 (8 bytes). Built once, shared (read-only) across runs.
+            struct FxPairGpu { uint32_t i, j; };
+            static_assert(sizeof(FxPairGpu) == 8, "FxPairGpu std430 layout");
+            std::vector<FxPairGpu> pairsInit((size_t)kPairAlloc, FxPairGpu{0u, 0u});
+            for (uint32_t p = 0; p < kPairCount; ++p) pairsInit[p] = FxPairGpu{pairs[p].i, pairs[p].j};
+            rhi::BufferDesc prDesc;
+            prDesc.size = pairsInit.size() * sizeof(FxPairGpu);
+            prDesc.initialData = pairsInit.data();
+            prDesc.usage = rhi::BufferUsage::Storage;
+            auto pairsBuf = device->CreateBuffer(prDesc);
+
+            // Params (matches fpx_solve.comp FpxParams std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, bodyCount, pairCount, steps} + int4 cfg2 {solveIters, solveEnabled, _, _}.
+            struct FpxParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(FpxParams) == 48, "FpxParams std430 layout");
+            auto makeParams = [&](int32_t solveEnabled) {
+                FpxParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = (int32_t)kPairCount; p.cfg[3] = kSteps;
+                p.cfg2[0] = kSolveIters; p.cfg2[1] = solveEnabled; p.cfg2[2] = 0; p.cfg2[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (bodies, pairs, params); SINGLE thread.
+            auto fpxCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_solve.comp.hlsl.spv");
+            auto fpxCs = device->CreateShaderModule({std::span<const uint32_t>(fpxCsWords)});
+            rhi::ComputePipelineDesc fpxCdesc;
+            fpxCdesc.compute = fpxCs.get();
+            fpxCdesc.storageBufferCount = 3;
+            fpxCdesc.pushConstantSize = 0;
+            fpxCdesc.threadsPerGroupX = 1;
+            auto fpxCompute = device->CreateComputePipeline(fpxCdesc);
+
+            // Run the solve compute over a fresh bodies buffer + params, read back gBodies.
+            auto runSolve = [&](int32_t solveEnabled, std::vector<FpxBodyGpu>& outBodies) {
+                auto bodiesBuf = makeBodiesBuf();
+                FpxParams params = makeParams(solveEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(FpxParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fpx_solve", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*fpxCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*pairsBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outBodies.assign((size_t)kBodyCount, FpxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FpxBodyGpu), 0);
+            };
+
+            // === GPU solve (enabled, K steps) ===
+            std::vector<FpxBodyGpu> gpuBodies;
+            runSolve(1, gpuBodies);
+
+            // === CPU reference: StepWorld K times over the SAME world + the SAME pair list ===
+            fpx::FxWorld cpuWorld = world;
+            for (int s = 0; s < kSteps; ++s)
+                fpx::StepWorld(cpuWorld, std::span<const fpx::FxPair>(pairs), kDt, kSolveIters);
+            std::vector<FpxBodyGpu> cpuBodies = packBodies(cpuWorld);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K integrate+solve steps (integer memcmp, NO tol) —
+            // the MAKE-OR-BREAK.
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx-solve GPU body array != CPU StepWorld "
+                             "(a float/overflow crept into the fixed-point solver?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-solve GPU==CPU bodies: %d bodies BIT-EXACT (%d steps, %d iters)\n",
+                        kBodyCount, kSteps, kSolveIters);
+
+            // PROOF (2) the {...} stat line: residual-overlap (deterministic count after K iters — bit-exact,
+            // NOT necessarily 0) + above-ground (all pos.y - radius >= groundY).
+            const uint32_t residual =
+                fpx::CountResidualOverlaps(cpuWorld, std::span<const fpx::FxPair>(pairs));
+            int aboveGround = 0;
+            for (const auto& gb : gpuBodies) if (gb.py - gb.radius >= kGroundY) ++aboveGround;
+            if (aboveGround != kBodyCount) {
+                std::fprintf(stderr, "FATAL: fpx-solve %d/%d bodies BELOW ground after solve\n",
+                             aboveGround, kBodyCount);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-solve: {bodies:%d, contacts:%u, residual-overlap:%u, above-ground:%d/%d}\n",
+                        kBodyCount, kPairCount, residual, aboveGround, kBodyCount);
+
+            // PROOF (3) hand-checked contact: two bodies overlapping by a known pen, unit invMass each ->
+            // after 1 solve iteration each is pushed apart by exactly pen/2 (the equal inverse-mass split),
+            // computed in Q16.16. a at x=0, b at x=D where D < 2*r so pen = 2r - D > 0; normal = +x.
+            {
+                const fpx::fx r = (fpx::fx)(fpx::kOne * 6 / 10);          // 0.6
+                const fpx::fx D = fpx::kOne;                              // 1.0 apart; pen = 1.2 - 1.0 = 0.2
+                fpx::FxWorld two;
+                fpx::FxBody a; a.pos = {0, 0, 0};          a.radius = r; a.invMass = fpx::kOne; a.flags = fpx::kFlagDynamic;
+                fpx::FxBody bb; bb.pos = {D, 0, 0};        bb.radius = r; bb.invMass = fpx::kOne; bb.flags = fpx::kFlagDynamic;
+                two.bodies = {a, bb};
+                two.groundY = (fpx::fx)(-100 * (int)fpx::kOne);  // ground far below so only the pair resolves
+                std::vector<fpx::FxPair> pr = {fpx::FxPair{0u, 1u}};
+                // Expected: pen = 2r - D; wi = 0.5 -> each moves pen/2 along +x. a.x -= pen/2; b.x += pen/2.
+                const fpx::fx pen = (r + r) - fpx::FxLength(fpx::FxVec3{D, 0, 0});
+                const fpx::fx half = fpx::fxmul(pen, fpx::fxdiv(fpx::kOne, fpx::kOne + fpx::kOne));
+                fpx::SolveContacts(two, std::span<const fpx::FxPair>(pr), 1);
+                const fpx::fx ax = two.bodies[0].pos.x, bx = two.bodies[1].pos.x;
+                if (ax != -half || bx != D + half) {
+                    std::fprintf(stderr, "FATAL: fpx-solve hand-check split wrong (ax=%d bx=%d half=%d)\n",
+                                 ax, bx, half);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx-solve hand-check: pen%d -> split %d/%d OK\n", pen, -half, half);
+            }
+
+            // PROOF (4) disabled-path no-op: solveEnabled=false -> bodies UNCHANGED (byte-identical upload).
+            std::vector<FpxBodyGpu> disabledBodies;
+            runSolve(0, disabledBodies);
+            if (disabledBodies.size() != bodiesInit.size() ||
+                std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                            bodiesInit.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx-solve solveEnabled=false changed the bodies\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-solve disabled: bodies UNCHANGED (no-op)\n");
+
+            // PROOF (5) determinism: two full runs byte-identical.
+            std::vector<FpxBodyGpu> gpuBodies2;
+            runSolve(1, gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx-solve two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-solve determinism: two runs BYTE-IDENTICAL\n");
+
+            // --- Golden: a PURE-INTEGER settled-pile side-view debug-viz. Project each body's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) to a pixel via a FIXED integer transform (y up), splat a small
+            // hashColor(bodyIndex) dot, draw the groundY line. CPU-colored from the read-back integers ->
+            // identical both backends by construction. ---
+            const int kPxPerUnit = 40;   // integer world-units -> pixels
+            const int kMargin = 24;
+            const int kWorldW = 6;       // x spans 0..~5 (6 grid columns spaced 0.9)
+            const int kWorldH = 7;       // y spans 0..6 (staggered start max 5 + headroom)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            // groundY line (worldY == 0).
+            {
+                int gx0, gy0; worldToPx(0, 0, gx0, gy0);
+                for (int x = 0; x < (int)imgW; ++x) {
+                    if (gy0 < 0 || gy0 >= (int)imgH) break;
+                    uint8_t* dst = &bgra[((size_t)gy0 * imgW + x) * 4];
+                    dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+                }
+            }
+            // Each body as a small 3x3 dot at its integer (pos.x>>kFrac, pos.y>>kFrac).
+            for (int i = 0; i < kBodyCount; ++i) {
+                const int wx = gpuBodies[(size_t)i].px >> fpx::kFrac;
+                const int wy = gpuBodies[(size_t)i].py >> fpx::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(fpxSolveShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fixed-point PBD settled pile (%u contacts, residual %u)\n",
+                                fpxSolveShotPath, imgW, imgH, kPairCount, residual);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxSolveShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

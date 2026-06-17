@@ -265,6 +265,17 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 hf_gen_msl(fpx_pair_count.comp   fpx_pair_count.comp.hlsl   comp fpx_pair_count_main)
 hf_gen_msl(fpx_pair_scan.comp    fpx_pair_scan.comp.hlsl    comp fpx_pair_scan_main)
 hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_main)
+# Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6): fpx_solve.comp
+# is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)]) runs `steps` of
+# StepWorld = IntegrateStep then SolveContacts (K=solveIters Gauss-Seidel sweeps: ground then sphere-sphere
+# pairs in the FIXED FPX2 order), the fxdiv/FxNormalize/ground + sphere-sphere math copied VERBATIM from
+# engine/sim/fpx.h. UNLIKE the int32 FPX2 broadphase shaders above (which MSL-gen natively), this is int64
+# (fxdiv/FxISqrt for the sphere-sphere normal — GENUINELY required for the Q16.16 divide + integer sqrt),
+# compiled fine by DXC on the Vulkan path but glslc CANNOT parse int64_t in HLSL. Same Vulkan-only
+# convention as fpx_integrate.comp / swraster.comp: on Metal the --fpx-solve showcase runs the CPU
+# fpx::StepWorld (the SAME bit-exact reference the Vulkan GPU==CPU proof compares against) -> the Metal
+# result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the
+# GPU==CPU bit-identity proof. So fpx_solve.comp gets NO hf_gen_msl line.
 # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits —
 # ONE thread per cell runs CaseIndex (VERBATIM render/mc.h), looks up triCount = gTriCount[caseIdx] from
 # the host-uploaded 256-entry count table (built from render/mc.h::kTriTable), writes gCounts[cell] and
