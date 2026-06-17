@@ -444,6 +444,7 @@ int main(int argc, char** argv) {
     const char* vtCacheShotPath = nullptr; // --vt-cache-shot <out.bmp> (Slice VT5: runtime virtual texturing per-page CACHING across frames — a per-page content key + per-tile cache skips regenerating unchanged pages over a PERSISTENT atlas SSBO; cached==fresh + cached==full BYTE-IDENTICAL, GPU==CPU bit-exact; cache-status viz golden)
     const char* mcClassifyShotPath = nullptr; // --mc-classify-shot <out.bmp> (Slice MC1: GPU Isosurface Meshing per-cell MARCHING-CUBES CASE CLASSIFICATION, integer compute over an SDF VoxelField, GPU==CPU case-set bit-exact, case-index Z-slice debug-viz)
     const char* mcCountShotPath = nullptr; // --mc-count-shot <out.bmp> (Slice MC2: GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT — 256-case kTriTable lookup + InterlockedAdd grand total, integer compute over an SDF VoxelField, GPU==CPU counts+total bit-exact, count-grid Z-slice debug-viz)
+    const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1476,6 +1477,19 @@ int main(int argc, char** argv) {
             // counts all-zero + total 0. The golden is the per-cell count field CPU-colored as a grid of
             // Z-slices (a fixed count->color ramp 0..5, NOT hashColor). NO new RHI. One BMP -> exit.
             mcCountShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--mc-emit-shot") == 0 && i + 1 < argc) {
+            // Slice MC3: GPU Isosurface Meshing Slice 3 — prefix-sum compaction + triangle EMISSION. The
+            // SAME MC1/MC2 sphere VoxelField (33³ corners -> 32³ cells, radius 12, iso 0) is meshed by two
+            // pure-integer compute passes: shaders/mc_scan.comp (single-thread exclusive prefix-sum of the
+            // MC2 per-cell counts -> each cell's write offset) then shaders/mc_emit.comp (one thread per
+            // cell: reclassify via CaseIndex, read triOffset=gOffsets[cell], walk gTriTable emitting each
+            // triangle's 3 edge-MIDPOINT vertices (EdgeMidpoint, the integer SUM of two corner coords) +
+            // the identity index into its disjoint range; meshEnabled=0 -> emit nothing). ReadBuffer reads
+            // gVerts + gIdx (+gOffsets); the CPU render/mc.h::MarchCells over the SAME field must match
+            // them BIT-EXACT (memcmp). The golden is a deterministic 2D orthographic projection of the
+            // generated mesh (each vertex's integer half-unit (x,y) splatted, hashColor by cell). NO new
+            // RHI. One BMP -> exit.
+            mcEmitShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -14771,6 +14785,326 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — MC triangle-count Z-slice viz (%u total tris)\n",
                                 mcCountShotPath, imgW, imgH, gpuTotal);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcCountShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION (--mc-emit-shot <out.bmp>,
+        // Slice MC3, the 3rd slice of FLAGSHIP #5 — the geometry-generating heart of Marching Cubes). The
+        // SAME MC1/MC2 sphere field (33³ corners -> 32³ cells, radius 12, iso 0). The host runs CountCells
+        // -> TotalTriangles (5240), preallocates gVerts/gIdx to 3*5240=15720 + clears them + gOffsets to
+        // cellCount, uploads gField + gCounts + gTriTable, then dispatches TWO compute passes:
+        // shaders/mc_scan.comp (single-thread exclusive prefix-sum of the per-cell counts -> gOffsets) then
+        // (compute->compute barrier) shaders/mc_emit.comp (one thread per cell: reclassify CaseIndex,
+        // triOffset=gOffsets[cell], walk gTriTable emitting each triangle's 3 edge-MIDPOINT vertices
+        // (EdgeMidpoint, the integer SUM of two corner coords in half-units) + the identity index into its
+        // disjoint range; meshEnabled=0 -> emit nothing). ReadBuffer reads gVerts + gIdx + gOffsets; the CPU
+        // MarchCells + PrefixSumOffsets over the SAME field must match them BIT-EXACT (memcmp). The golden
+        // is a deterministic 2D ORTHOGRAPHIC projection of the mesh (each vertex's integer half-unit (x,y)
+        // projected to a pixel, splatted as a disk, integer-hashColor by cell). NO new RHI.
+        if (mcEmitShotPath) {
+            namespace mc = hf::render::mc;
+
+            // The fixed VoxelField (== the MC1/MC2 config).
+            const int kN = 33;
+            const int kRadius = 12;
+            const int32_t kIso = 0;
+            mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+            const int nx = field.nx, ny = field.ny, nz = field.nz;
+            const int cellCount = field.cellCount();
+
+            // Host count + total -> exact output capacity (3*totalTris verts/indices).
+            std::vector<uint32_t> cpuCounts;
+            mc::CountCells(field, kIso, cpuCounts);
+            const uint32_t totalTris = mc::TotalTriangles(std::span<const uint32_t>(cpuCounts));
+            const uint32_t vertCap = totalTris * 3u;   // == idx capacity
+
+            // gField SSBO (the int32 scalar field — read-only on the GPU).
+            rhi::BufferDesc fDesc;
+            fDesc.size = field.scalar.size() * sizeof(int32_t);
+            fDesc.initialData = field.scalar.data();
+            fDesc.usage = rhi::BufferUsage::Storage;
+            auto fieldBuf = device->CreateBuffer(fDesc);
+
+            // gCounts SSBO (the MC2 per-cell counts, host-uploaded read-only).
+            rhi::BufferDesc cDesc;
+            cDesc.size = cpuCounts.size() * sizeof(uint32_t);
+            cDesc.initialData = cpuCounts.data();
+            cDesc.usage = rhi::BufferUsage::Storage;
+            auto countsBuf = device->CreateBuffer(cDesc);
+
+            // gTriTable SSBO: the 256x16 canonical triangle table as int32 (the emit walks it; -1 terminator).
+            std::vector<int32_t> triTableFlat((size_t)256 * 16);
+            for (int c = 0; c < 256; ++c)
+                for (int e = 0; e < 16; ++e)
+                    triTableFlat[(size_t)c * 16 + e] = (int32_t)mc::kTriTable[c][e];
+            rhi::BufferDesc ttDesc;
+            ttDesc.size = triTableFlat.size() * sizeof(int32_t);
+            ttDesc.initialData = triTableFlat.data();
+            ttDesc.usage = rhi::BufferUsage::Storage;
+            auto triTableBuf = device->CreateBuffer(ttDesc);
+
+            // Fresh-cleared output + offset buffers per run (so the disabled no-op reads the cleared bytes).
+            std::vector<int32_t> vertsInit((size_t)vertCap * 4, 0);     // McVertex = int4
+            std::vector<uint32_t> idxInit((size_t)vertCap, 0u);
+            std::vector<uint32_t> offsetsInit((size_t)cellCount, 0u);
+            auto makeVertsBuf = [&]() {
+                rhi::BufferDesc d; d.size = vertsInit.size() * sizeof(int32_t);
+                d.initialData = vertsInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeIdxBuf = [&]() {
+                rhi::BufferDesc d; d.size = idxInit.size() * sizeof(uint32_t);
+                d.initialData = idxInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeOffsetsBuf = [&]() {
+                rhi::BufferDesc d; d.size = offsetsInit.size() * sizeof(uint32_t);
+                d.initialData = offsetsInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Scan params (mc_scan.comp Params std430): { cellCount, _, _, _ }.
+            struct McScanParams { uint32_t cellCount; uint32_t pad0, pad1, pad2; };
+            static_assert(sizeof(McScanParams) == 16, "McScanParams std430 layout");
+            McScanParams scanParams{};
+            scanParams.cellCount = (uint32_t)cellCount;
+            rhi::BufferDesc spDesc;
+            spDesc.size = sizeof(McScanParams);
+            spDesc.initialData = &scanParams;
+            spDesc.usage = rhi::BufferUsage::Storage;
+            auto scanParamsBuf = device->CreateBuffer(spDesc);
+
+            // Emit params (mc_emit.comp Params std430): int4 dims {nx,ny,nz,iso} + int4 cfg {meshEnabled,cellCount,_,_}.
+            struct McEmitParams { int32_t dims[4]; int32_t cfg[4]; };
+            static_assert(sizeof(McEmitParams) == 32, "McEmitParams std430 layout");
+            auto makeEmitParams = [&](int32_t meshEnabled) {
+                McEmitParams p{};
+                p.dims[0] = nx; p.dims[1] = ny; p.dims[2] = nz; p.dims[3] = kIso;
+                p.cfg[0] = meshEnabled; p.cfg[1] = cellCount; p.cfg[2] = 0; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Scan pipeline (3 storage buffers: counts, offsets, params; single thread).
+            auto scanWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/mc_scan.comp.hlsl.spv");
+            auto scanCs = device->CreateShaderModule({std::span<const uint32_t>(scanWords)});
+            rhi::ComputePipelineDesc scanCdesc;
+            scanCdesc.compute = scanCs.get();
+            scanCdesc.storageBufferCount = 3;
+            scanCdesc.threadsPerGroupX = 1;
+            auto scanCompute = device->CreateComputePipeline(scanCdesc);
+
+            // Emit pipeline (6 storage buffers: field, offsets, triTable, verts, idx, params; 64 threads).
+            auto emitWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/mc_emit.comp.hlsl.spv");
+            auto emitCs = device->CreateShaderModule({std::span<const uint32_t>(emitWords)});
+            rhi::ComputePipelineDesc emitCdesc;
+            emitCdesc.compute = emitCs.get();
+            emitCdesc.storageBufferCount = 6;
+            emitCdesc.threadsPerGroupX = 64;
+            auto emitCompute = device->CreateComputePipeline(emitCdesc);
+
+            const uint32_t kEmitGroups = ((uint32_t)cellCount + 63u) / 64u;
+
+            // Run scan+emit over fresh buffers; read back verts + idx + offsets.
+            auto runMesh = [&](int32_t meshEnabled,
+                               std::vector<int32_t>& outVerts, std::vector<uint32_t>& outIdx,
+                               std::vector<uint32_t>& outOffsets) {
+                auto vertsBuf   = makeVertsBuf();
+                auto idxBuf     = makeIdxBuf();
+                auto offsetsBuf = makeOffsetsBuf();
+                McEmitParams ep = makeEmitParams(meshEnabled);
+                rhi::BufferDesc epDesc;
+                epDesc.size = sizeof(McEmitParams);
+                epDesc.initialData = &ep;
+                epDesc.usage = rhi::BufferUsage::Storage;
+                auto emitParamsBuf = device->CreateBuffer(epDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("mc_emit", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: single-thread exclusive prefix-sum -> gOffsets.
+                        cmd.BindComputePipeline(*scanCompute);
+                        cmd.BindStorageBuffer(*countsBuf, 0);
+                        cmd.BindStorageBuffer(*offsetsBuf, 1);
+                        cmd.BindStorageBuffer(*scanParamsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        // scan -> emit dependency: gOffsets written by scan, read by emit.
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 2: one thread per cell emits its triangles into its disjoint range.
+                        cmd.BindComputePipeline(*emitCompute);
+                        cmd.BindStorageBuffer(*fieldBuf, 0);
+                        cmd.BindStorageBuffer(*offsetsBuf, 1);
+                        cmd.BindStorageBuffer(*triTableBuf, 2);
+                        cmd.BindStorageBuffer(*vertsBuf, 3);
+                        cmd.BindStorageBuffer(*idxBuf, 4);
+                        cmd.BindStorageBuffer(*emitParamsBuf, 5);
+                        cmd.DispatchCompute(kEmitGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outVerts.assign((size_t)vertCap * 4, 0);
+                device->ReadBuffer(*vertsBuf, outVerts.data(), outVerts.size() * sizeof(int32_t), 0);
+                outIdx.assign((size_t)vertCap, 0u);
+                device->ReadBuffer(*idxBuf, outIdx.data(), outIdx.size() * sizeof(uint32_t), 0);
+                outOffsets.assign((size_t)cellCount, 0u);
+                device->ReadBuffer(*offsetsBuf, outOffsets.data(), outOffsets.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU mesh (enabled) ===
+            std::vector<int32_t> gpuVertsRaw; std::vector<uint32_t> gpuIdx; std::vector<uint32_t> gpuOffsets;
+            runMesh(1, gpuVertsRaw, gpuIdx, gpuOffsets);
+
+            // === CPU reference over the SAME field ===
+            std::vector<mc::McVertex> cpuVerts; std::vector<uint32_t> cpuIdx; uint32_t cpuTriCount = 0u;
+            mc::MarchCells(field, kIso, cpuVerts, cpuIdx, cpuTriCount);
+            std::vector<uint32_t> cpuOffsets((size_t)cellCount, 0u);
+            uint32_t cpuTotalChk = 0u;
+            mc::PrefixSumOffsets(std::span<const uint32_t>(cpuCounts),
+                                 std::span<uint32_t>(cpuOffsets), cpuTotalChk);
+
+            // PROOF (1) GPU==CPU prefix-sum offsets BIT-EXACT.
+            if (gpuOffsets.size() != cpuOffsets.size() ||
+                std::memcmp(gpuOffsets.data(), cpuOffsets.data(),
+                            (size_t)cellCount * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: mc-emit GPU prefix-sum != CPU PrefixSumOffsets\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mc-emit GPU==CPU prefix-sum: %d cells BIT-EXACT\n", cellCount);
+
+            // PROOF (2) GPU==CPU mesh BIT-EXACT (verts AND indices over 3*totalTris). gpuVertsRaw is int4
+            // per vertex -> reinterpret as McVertex for the memcmp.
+            const size_t vBytes = (size_t)totalTris * 3u * sizeof(mc::McVertex);
+            const size_t iBytes = (size_t)totalTris * 3u * sizeof(uint32_t);
+            bool meshOk = (cpuTriCount == totalTris) &&
+                          std::memcmp(gpuVertsRaw.data(), cpuVerts.data(), vBytes) == 0 &&
+                          std::memcmp(gpuIdx.data(), cpuIdx.data(), iBytes) == 0;
+            if (!meshOk) {
+                std::fprintf(stderr, "FATAL: mc-emit GPU mesh != CPU MarchCells "
+                             "(a float/race/offset bug crept into the emit?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mc-emit GPU==CPU mesh: %u verts + %u indices BIT-EXACT\n", vertCap, vertCap);
+
+            // PROOF (3) count consistency: totalTris==5240, verts==indices==3*tris, every index in range.
+            {
+                bool inRange = true;
+                for (uint32_t k = 0; k < vertCap; ++k) if (gpuIdx[k] >= vertCap) { inRange = false; break; }
+                if (totalTris != 5240u || cpuVerts.size() != (size_t)vertCap ||
+                    cpuIdx.size() != (size_t)vertCap || !inRange) {
+                    std::fprintf(stderr, "FATAL: mc-emit count inconsistent "
+                                 "(tris=%u verts=%zu idx=%zu)\n",
+                                 totalTris, cpuVerts.size(), cpuIdx.size());
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-emit: {tris:%u, verts:%u, indices:%u}\n", totalTris, vertCap, vertCap);
+            }
+
+            // PROOF (4) a hand-checked known cell: find the FIRST surface cell (its case + tri count + first
+            // emitted midpoint vertex). Recompute its expected emission CPU-side from the SAME field.
+            {
+                std::vector<uint8_t> cases;
+                mc::ClassifyCells(field, kIso, cases);
+                const int cxN = nx - 1, cyN = ny - 1;
+                int knownCell = -1;
+                for (int c = 0; c < cellCount; ++c)
+                    if (mc::IsSurfaceCase(cases[(size_t)c])) { knownCell = c; break; }
+                if (knownCell < 0) {
+                    std::fprintf(stderr, "FATAL: mc-emit found no surface cell (impossible for a sphere)\n");
+                    device->WaitIdle(); return 1;
+                }
+                const uint8_t kase = cases[(size_t)knownCell];
+                const int n = mc::CountTriangles(kase);
+                const int cx = knownCell % cxN;
+                const int cy = (knownCell / cxN) % cyN;
+                const int cz = knownCell / (cxN * cyN);
+                const int firstEdge = (int)mc::kTriTable[kase][0];
+                mc::McVertex v0 = mc::EdgeMidpoint(cx, cy, cz, firstEdge);
+                // Verify the GPU wrote exactly that vertex at this cell's offset slot.
+                const uint32_t base = gpuOffsets[(size_t)knownCell] * 3u;
+                const mc::McVertex* gv = reinterpret_cast<const mc::McVertex*>(gpuVertsRaw.data());
+                if (gv[base].x != v0.x || gv[base].y != v0.y || gv[base].z != v0.z) {
+                    std::fprintf(stderr, "FATAL: mc-emit known-cell v0 mismatch\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-emit known cell: case=0x%02X tris=%d v0=(%d,%d,%d) OK\n",
+                            (unsigned)kase, n, v0.x, v0.y, v0.z);
+            }
+
+            // PROOF (5) meshEnabled=false -> empty mesh (gVerts/gIdx stay cleared).
+            {
+                std::vector<int32_t> dVerts; std::vector<uint32_t> dIdx; std::vector<uint32_t> dOffsets;
+                runMesh(0, dVerts, dIdx, dOffsets);
+                bool empty = true;
+                for (int32_t v : dVerts) if (v != 0) { empty = false; break; }
+                if (empty) for (uint32_t k : dIdx) if (k != 0u) { empty = false; break; }
+                if (!empty) {
+                    std::fprintf(stderr, "FATAL: mc-emit meshEnabled=false did NOT leave the mesh cleared\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-emit disabled: empty mesh (no-op)\n");
+            }
+
+            // PROOF (6) two scan+emit runs BYTE-IDENTICAL.
+            {
+                std::vector<int32_t> gVerts2; std::vector<uint32_t> gIdx2; std::vector<uint32_t> gOff2;
+                runMesh(1, gVerts2, gIdx2, gOff2);
+                if (gpuVertsRaw.size() != gVerts2.size() ||
+                    std::memcmp(gpuVertsRaw.data(), gVerts2.data(),
+                                gpuVertsRaw.size() * sizeof(int32_t)) != 0 ||
+                    std::memcmp(gpuIdx.data(), gIdx2.data(), gpuIdx.size() * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: mc-emit two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-emit determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // --- Golden: a deterministic 2D ORTHOGRAPHIC projection of the generated mesh. Each vertex's
+            // integer half-unit (x,y) (range [0, 2*(nx-1)]) is divided to the image grid and splatted as a
+            // small filled disk, integer-hashColored by its owning cell -> the sphere surface as a filled-
+            // disk point cloud. CPU-rendered from the read-back integer vertices -> identical both backends
+            // by construction (PURE INTEGER). ---
+            const mc::McVertex* gv = reinterpret_cast<const mc::McVertex*>(gpuVertsRaw.data());
+            const int kImg = 256;                              // image side
+            const int halfMax = 2 * (nx - 1);                  // max half-unit coord (== 2*32 = 64)
+            const uint32_t imgW = (uint32_t)kImg, imgH = (uint32_t)kImg;
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 6; bgra[p * 4 + 3] = 255;
+            }
+            // Integer hashColor (keeps the golden pure-integer; the meshlet.h hash, BGR bytes).
+            auto intHashColor = [](uint32_t i, uint8_t& b, uint8_t& g2, uint8_t& r) {
+                uint32_t h = i * 2654435761u + 0x9E3779B9u;
+                h ^= h >> 15; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+                r  = (uint8_t)((h)       & 0xFFu);
+                g2 = (uint8_t)((h >> 8)  & 0xFFu);
+                b  = (uint8_t)((h >> 16) & 0xFFu);
+            };
+            for (uint32_t vtx = 0; vtx < vertCap; ++vtx) {
+                // Color by the global triangle index (vtx/3) — stable + integer; visually segments the
+                // sphere surface into per-triangle hues.
+                const uint32_t tri = vtx / 3u;
+                // Map half-unit (x,y) -> pixel. x,y in [0, halfMax]; scale to [0,kImg).
+                int px = (int)(((int64_t)gv[vtx].x * (kImg - 1)) / halfMax);
+                int py = (int)(((int64_t)gv[vtx].y * (kImg - 1)) / halfMax);
+                if (px < 0 || px >= kImg || py < 0 || py >= kImg) continue;
+                uint8_t cb, cg, cr; intHashColor(tri, cb, cg, cr);
+                // Splat a 3x3 disk.
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        int sx = px + dx, sy = py + dy;
+                        if (sx < 0 || sx >= kImg || sy < 0 || sy >= kImg) continue;
+                        uint8_t* dst = &bgra[((size_t)sy * imgW + sx) * 4];
+                        dst[0] = cb; dst[1] = cg; dst[2] = cr; dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(mcEmitShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — MC mesh 2D-projection point cloud (%u tris, %u verts)\n",
+                                mcEmitShotPath, imgW, imgH, totalTris, vertCap);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcEmitShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
