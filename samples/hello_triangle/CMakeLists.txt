@@ -256,6 +256,13 @@ hf_compile_shaders(
     # -> frame A byte-identical to the DN lit_ddgi render. Used ONLY by --ddgiocc-shot; lit_ddgi.frag +
     # lit.frag + their goldens untouched.
     "shaders/lit_ddgi_occ.frag.hlsl:ps"
+    # DDGI MULTI-BOUNCE capture-with-GI fragment (Slice DR): a SIBLING of probe_bake.frag.hlsl (the DI
+    # probe-radiance capture) with the DN lit_ddgi InterpolateIrradianceSH indirect term added LAST, so
+    # the bounce-1 capture sees the 1st-bounce GI -> SH-encoding it yields SH1 (the 2nd bounce). SH0 binds
+    # at set-3 binding 13 via the EXISTING usesLightClusters/BindLightClusters path; the grid params ride
+    # the same 208-byte lit_ddgi FrameData UBO. Used ONLY by the bounce-1 capture in --ddgimb-shot;
+    # probe_bake.frag + lit_ddgi.frag + lit.frag + their goldens stay byte-identical (sibling isolation).
+    "shaders/probe_bake_gi.frag.hlsl:ps"
     # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
     # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect

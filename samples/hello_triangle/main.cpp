@@ -49,6 +49,7 @@
 #include "render/probe_capture.h"   // Slice DI: DDGI probe radiance capture math (pure CPU)
 #include "render/probe_sh.h"        // Slice DJ: DDGI probe SH-encode math (pure CPU)
 #include "render/probe_dist.h"      // Slice DO: DDGI per-probe distance-moment capture math (pure CPU)
+#include "render/probe_multibounce.h" // Slice DR: DDGI multi-bounce SH-buffer selection + CPU mirror (pure CPU)
 #include "render/auto_exposure.h"   // Slice CW: histogram eye-adaptation math (pure CPU)
 #include "render/taa.h"
 #include "render/frustum.h"
@@ -97,6 +98,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <vector>
 
@@ -385,6 +387,7 @@ int main(int argc, char** argv) {
     const char* probeInterpShotPath = nullptr; // --probeinterp-shot <out.bmp> (Slice DL: DDGI trilinear SH-interp)
     const char* ddgiShotPath = nullptr;      // --ddgi-shot <out.bmp> (Slice DN: DDGI GI composite — visible color bleed)
     const char* ddgiOccShotPath = nullptr;   // --ddgiocc-shot <out.bmp> (Slice DP: DDGI Chebyshev occlusion weighting — the visible leak-fix)
+    const char* ddgiMbShotPath = nullptr;    // --ddgimb-shot <out.bmp> (Slice DR: DDGI multi-bounce — the 2nd light bounce, brighter GI)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
@@ -845,6 +848,20 @@ int main(int argc, char** argv) {
             // `ddgi-occ occlusionStrength=0 == DN: BYTE-IDENTICAL` + `ddgi-occ: {probes:N, occlusion:1.0}`.
             // GOLDEN = frame B (the leak-fixed render). lit_ddgi.frag + lit.frag + their goldens untouched.
             ddgiOccShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ddgimb-shot") == 0 && i + 1 < argc) {
+            // Slice DR: DDGI MULTI-BOUNCE — the 2nd light bounce (the next GI-quality leap). Runs the DN
+            // 8-probe Cornell capture+encode -> SH0 (the 1st-bounce direct capture), then for bounceCount>=2
+            // RE-captures each probe with the NEW probe_bake_gi.frag (a sibling of the direct capture that
+            // adds the DN indirect term sampling SH0) -> SH-encode -> SH1 (the 2nd bounce). The composite
+            // binds SH(bounceCount-1) via the EXISTING BindLightClusters path — NO new RHI. PROOFS (fail
+            // loudly): (1) frame A (bounceCount=1) is BYTE-IDENTICAL (SHA) to the DN single-bounce render —
+            // the bounce-1 capture is skipped entirely; (2) frame B (bounceCount=2) is BRIGHTER than A and
+            // differs; (3) the bounce-1 SH1 SSBO is BIT-EXACT to a CPU SH-encode of the read-back bounce-1
+            // radiance; (4) two-run determinism. Prints `ddgi-mb bounceCount=1 == DN single-bounce:
+            // BYTE-IDENTICAL` + `ddgi-mb B brighter than A: 2nd bounce active` + `ddgi-mb SH1 GPU==CPU:
+            // BIT-EXACT` + `ddgi-mb: {probes:8, bounces:2, giStrength:S}`. GOLDEN = frame B (the 2nd bounce).
+            // probe_bake.frag + lit_ddgi.frag + lit.frag + their goldens untouched (sibling isolation).
+            ddgiMbShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxellights-shot") == 0 && i + 1 < argc) {
             // Slice CV: Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion). The CL
             // 96-colored-point-light scene (same fixed lattice as --clustered-lights-shot) wrapped in the
@@ -5361,6 +5378,594 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — DDGI GI composite, %d probes, giStrength %.1f\n",
                                 ddgiShotPath, bw, bh, probeN, kGiStrength);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ddgiShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DDGI MULTI-BOUNCE: the 2nd light bounce (--ddgimb-shot, Slice DR). The next GI-quality leap
+        // after DN. Single-bounce DDGI captures only DIRECT light into the probes (SH0), so indirect light
+        // bounces exactly once. Multi-bounce RE-captures each probe with the NEW probe_bake_gi.frag (a
+        // sibling of probe_bake.frag — the DI direct capture — that adds the DN indirect term sampling SH0 to
+        // the captured surface radiance), SH-encodes that bounce-1 radiance into SH1, and composites over
+        // SH(bounceCount-1): SH0 at bounceCount=1 (the DN single-bounce path), SH1 at bounceCount>=2 (the
+        // brighter 2nd bounce). Two ProbeSH[] SSBOs ride the EXISTING usesLightClusters/BindLightClusters
+        // path — NO new RHI. PROOFS: (1) frame A (bounceCount=1) BYTE-IDENTICAL to the DN single-bounce
+        // render (bounce-1 SKIPPED); (2) frame B (bounceCount=2) measurably brighter than A + differs; (3)
+        // the bounce-1 SH1 SSBO BIT-EXACT to a CPU SH-encode of the read-back bounce-1 radiance; (4) two-run
+        // determinism. GOLDEN = frame B. probe_bake.frag + lit_ddgi.frag + their goldens untouched.
+        if (ddgiMbShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cm  = hf::render::cubemap;
+            namespace pc  = hf::render::probecap;
+            namespace psh = hf::render::probesh;
+            namespace pmb = hf::render::probemb;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // The lit_ddgi FrameData (the SAME 208-byte DN layout; probe_bake_gi.frag reads giOrigin/giDims
+            // from it too, so its indirect term is the verbatim DN InterpolateIrradianceSH).
+            struct DdgiFrameData {
+                float viewProj[16];      //   0
+                float lightDir[4];       //  64
+                float lightColor[4];     //  80
+                float viewPos[4];        //  96
+                float lightViewProj[16]; // 112
+                float giOrigin[4];       // 176  x=ox,y=oy,z=oz,w=spacing
+                float giDims[4];         // 192  x=dimX,y=dimY,z=dimZ,w=giStrength
+            };
+            static_assert(sizeof(DdgiFrameData) == 208, "DDGI FrameData layout (lit_ddgi.frag / probe_bake_gi.frag)");
+
+            // The 2x2x2 = 8-probe DN capture grid inside the colored Cornell room (identical to --ddgi-shot).
+            const float Rroom = 6.0f;
+            pc::ProbeGrid grid;
+            grid.origin  = Vec3{-2.0f, 0.0f, -2.0f};
+            grid.dimX = 2; grid.dimY = 2; grid.dimZ = 2; grid.spacing = 4.0f;
+            const uint32_t kCubeSize = 64;
+            const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            const int kEncodeFaceDim = 16;
+            const int kSamplesPerFace = kEncodeFaceDim * kEncodeFaceDim;
+            const int kSampleCount = kSamplesPerFace * cm::kFaces;   // 1536
+
+            const float kGiStrength = 3.0f;   // the SAME indirect strength the DN composite uses
+
+            // === Shaders: probe_bake.{vert,frag} (the DI direct capture) + the NEW probe_bake_gi.frag (the
+            //     bounce-1 capture-with-GI) + probe_sh_encode (DJ) + post + lit.vert + lit_ddgi.frag. ===
+            auto bakeVsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto bakeGiFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake_gi.frag.hlsl.spv");
+            auto postVsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVsWords    = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto ddgiFsWords   = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_ddgi.frag.hlsl.spv");
+            auto bakeVs   = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs   = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto bakeGiFs = device->CreateShaderModule({std::span<const uint32_t>(bakeGiFsWords)});
+            auto postVs   = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs   = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+            auto litVs    = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto ddgiFs   = device->CreateShaderModule({std::span<const uint32_t>(ddgiFsWords)});
+
+            // The DI direct-capture bake pipeline (probe_bake.frag, push-constant faceVP+model only).
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            // The bounce-1 capture-with-GI pipeline (probe_bake_gi.frag): probe_bake.vert (faceVP+model in
+            // the push constant) + the frame UBO (set 0, the grid params) + the material set (set 1, gTex) +
+            // usesLightClusters=true (set 3 binding 13 = SH0 bound via dummies). This binds SH0 to the
+            // capture's fragment stage so the captured surfaces receive the 1st-bounce GI.
+            rhi::GraphicsPipelineDesc bakeGiDesc;
+            bakeGiDesc.vertex = bakeVs.get(); bakeGiDesc.fragment = bakeGiFs.get();
+            bakeGiDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeGiDesc.colorFormat = kHdr;
+            bakeGiDesc.depthTest = true;
+            bakeGiDesc.usesFrameUniforms = true;            // set 0: the grid params UBO (DN FrameData layout)
+            bakeGiDesc.usesTexture = true;                  // set 1: gTex (the wall albedo)
+            bakeGiDesc.usesLightClusters = true;            // set 3 binding 13: SH0 (via dummies)
+            bakeGiDesc.pushConstantSize = sizeof(float) * 32;
+            auto bakeGiPipeline = device->CreateGraphicsPipeline(bakeGiDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // The GI-composite lit pipeline (lit.vert + lit_ddgi.frag), exactly as --ddgi-shot.
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = ddgiFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.usesLightClusters = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // The DJ SH-encode compute pipeline (3 SSBOs: params/radiance/probeSH).
+            auto shCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_sh_encode.comp.hlsl.spv");
+            auto shCs  = device->CreateShaderModule({std::span<const uint32_t>(shCsW)});
+            rhi::ComputePipelineDesc shCd;
+            shCd.compute = shCs.get(); shCd.storageBufferCount = 3; shCd.threadsPerGroupX = 64;
+            auto shCompute = device->CreateComputePipeline(shCd);
+
+            auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+            auto sceneRT = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+            if (!cube) {
+                std::fprintf(stderr, "FATAL: cubemap render targets unavailable on this backend\n");
+                device->WaitIdle(); return 1;
+            }
+
+            scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+            auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            const float Tk = 0.2f;
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+            };
+
+            const Vec3 eye{0.0f, 2.4f, 12.0f};
+            const Vec3 ctr{0.0f, 2.0f, 0.0f};
+            const float fovY = 1.04719755f;
+            Mat4 camView = Mat4::LookAt(eye, ctr, {0, 1, 0});
+            Mat4 camVP;
+            {
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * camView;
+                for (int k = 0; k < 16; ++k) camVP.m[k] = vp.m[k];
+            }
+            const int probeN = grid.probeCount();   // 8
+
+            // === HOST-PRECOMPUTE the DJ SH sample table (the DH FP discipline), shared by both bounces. ===
+            struct EncodeSample { float basis[9]; float saWeight; float pad0, pad1; };
+            static_assert(sizeof(EncodeSample) == 48, "EncodeSample std430 stride");
+            auto faceTexelDir = [](int face, float sc, float tc) -> Vec3 {
+                switch (face) {
+                    case 0: return Vec3{ 1.0f,  -tc,  -sc};
+                    case 1: return Vec3{-1.0f,  -tc,   sc};
+                    case 2: return Vec3{  sc,  1.0f,   tc};
+                    case 3: return Vec3{  sc, -1.0f,  -tc};
+                    case 4: return Vec3{  sc,  -tc,  1.0f};
+                    default:return Vec3{ -sc,  -tc, -1.0f};
+                }
+            };
+
+            // === The per-face room draw for a given capture pipeline. The direct capture uses bakePipeline
+            //     (probe_bake.frag, faceVP+model push constant). ===
+            auto drawRoomBake = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP) {
+                cmd.BindPipeline(*bakePipeline);
+                for (const auto& wl : walls) {
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindTexture(*wl.tex);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            // === Capture the room into each probe's 6 cube faces using a draw callback, reading the faces
+            //     back into a flat radiance store (the DI capture loop, reused for both bounces). ===
+            uint32_t faceW = 0, faceH = 0;
+            auto captureGrid = [&](const std::function<void(rhi::ICommandBuffer&, const Mat4&)>& drawFace,
+                                   std::vector<std::vector<uint8_t>>& radStore) -> bool {
+                std::vector<Vec3> centers;
+                for (int pz = 0; pz < grid.dimZ; ++pz)
+                    for (int py = 0; py < grid.dimY; ++py)
+                        for (int px = 0; px < grid.dimX; ++px)
+                            centers.push_back(grid.probePos(px, py, pz));
+                int slots = probeN * pc::kFaces;
+                radStore.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+                for (int p = 0; p < probeN; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pc::ProbeFaceViewProj(face, centers[p], kCubeNear, kCubeFar);
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawFace(*fc.cmd, faceVP);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> faceData; uint32_t fw = 0, fh = 0;
+                        if (!device->ReadCubemapFace(*cube, face, faceData, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(probe %d, face %u) failed\n", p, face);
+                            return false;
+                        }
+                        faceW = fw; faceH = fh;
+                        radStore[pc::ProbeFaceIndex(p, face)] = std::move(faceData);
+                    }
+                }
+                return true;
+            };
+
+            // Build the host SH sample table once (after the first capture sets faceW/faceH).
+            std::vector<EncodeSample> samples;
+            std::vector<int> sampleFace, sampleTexX, sampleTexY;
+            float totalWeight = 0.0f;
+            auto buildSampleTable = [&]() {
+                samples.assign((size_t)kSampleCount, EncodeSample{});
+                sampleFace.assign((size_t)kSampleCount, 0);
+                sampleTexX.assign((size_t)kSampleCount, 0);
+                sampleTexY.assign((size_t)kSampleCount, 0);
+                totalWeight = 0.0f;
+                int si = 0;
+                for (int face = 0; face < cm::kFaces; ++face)
+                    for (int ty = 0; ty < kEncodeFaceDim; ++ty)
+                        for (int tx = 0; tx < kEncodeFaceDim; ++tx, ++si) {
+                            float u = (((float)tx + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            float v = (((float)ty + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            Vec3 dir = math::normalize(faceTexelDir(face, u, v));
+                            psh::SHBasis9(dir, samples[si].basis);
+                            float d2 = 1.0f + u * u + v * v;
+                            float texEdge = 2.0f / (float)kEncodeFaceDim;
+                            float sa = (texEdge * texEdge) / (d2 * std::sqrt(d2));
+                            samples[si].saWeight = sa; samples[si].pad0 = 0.0f; samples[si].pad1 = 0.0f;
+                            totalWeight += sa;
+                            sampleFace[si] = face;
+                            int px2 = (int)(((float)tx + 0.5f) / (float)kEncodeFaceDim * (float)faceW);
+                            int py2 = (int)(((float)ty + 0.5f) / (float)kEncodeFaceDim * (float)faceH);
+                            if (px2 < 0) px2 = 0; if (px2 > (int)faceW - 1) px2 = (int)faceW - 1;
+                            if (py2 < 0) py2 = 0; if (py2 > (int)faceH - 1) py2 = (int)faceH - 1;
+                            sampleTexX[si] = px2; sampleTexY[si] = py2;
+                        }
+            };
+
+            // === Pack a captured radiance store into the flat per-probe×sample float radiance buffer the
+            //     GPU encode reads (RGBA, the SAME BGRA->RGB unpack as --ddgi-shot). ===
+            auto packRadiance = [&](const std::vector<std::vector<uint8_t>>& radStore) {
+                std::vector<float> radiance((size_t)probeN * kSampleCount * 4, 0.0f);
+                for (int p = 0; p < probeN; ++p)
+                    for (int s = 0; s < kSampleCount; ++s) {
+                        const std::vector<uint8_t>& face = radStore[pc::ProbeFaceIndex(p, sampleFace[s])];
+                        size_t idx = ((size_t)sampleTexY[s] * faceW + (size_t)sampleTexX[s]) * 4;
+                        float r = 0, g = 0, b = 0;
+                        if (idx + 3 < face.size()) {
+                            b = (float)face[idx + 0] / 255.0f; g = (float)face[idx + 1] / 255.0f;
+                            r = (float)face[idx + 2] / 255.0f;
+                        }
+                        size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                        radiance[o + 0] = r; radiance[o + 1] = g; radiance[o + 2] = b; radiance[o + 3] = 1.0f;
+                    }
+                return radiance;
+            };
+
+            const size_t kHeaderBytes = sizeof(uint32_t) * 4 + sizeof(float) * 4;
+            const size_t kParamsBytes = kHeaderBytes + (size_t)kSampleCount * sizeof(EncodeSample);
+
+            // === Run the GPU DJ SH-encode over a packed radiance buffer -> ProbeSH[probeN]. ===
+            auto gpuEncode = [&](const std::vector<float>& radiance) -> std::vector<psh::ProbeSH> {
+                std::vector<uint8_t> paramsBytes(kParamsBytes, 0);
+                uint32_t* cnt = reinterpret_cast<uint32_t*>(paramsBytes.data());
+                cnt[0] = (uint32_t)probeN; cnt[1] = (uint32_t)kSampleCount;
+                float* nrm = reinterpret_cast<float*>(paramsBytes.data() + sizeof(uint32_t) * 4);
+                nrm[0] = totalWeight;
+                std::memcpy(paramsBytes.data() + kHeaderBytes, samples.data(),
+                            (size_t)kSampleCount * sizeof(EncodeSample));
+                rhi::BufferDesc ppDesc;
+                ppDesc.size = paramsBytes.size(); ppDesc.initialData = paramsBytes.data();
+                ppDesc.usage = rhi::BufferUsage::Storage;
+                auto ppBuf = device->CreateBuffer(ppDesc);
+                rhi::BufferDesc radDesc;
+                radDesc.size = radiance.size() * sizeof(float); radDesc.initialData = radiance.data();
+                radDesc.usage = rhi::BufferUsage::Storage;
+                auto radBuf = device->CreateBuffer(radDesc);
+                std::vector<psh::ProbeSH> cleared((size_t)probeN);
+                std::memset(cleared.data(), 0, cleared.size() * sizeof(psh::ProbeSH));
+                rhi::BufferDesc shDesc;
+                shDesc.size = cleared.size() * sizeof(psh::ProbeSH); shDesc.initialData = cleared.data();
+                shDesc.usage = rhi::BufferUsage::Storage;
+                auto shBuf = device->CreateBuffer(shDesc);
+                const uint32_t groups = (uint32_t)psh::EncodeDispatchGroups(grid);
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                graph.AddPass("shEncode", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*shCompute);
+                        cmd.BindStorageBuffer(*ppBuf, 0); cmd.BindStorageBuffer(*radBuf, 1);
+                        cmd.BindStorageBuffer(*shBuf, 2);
+                        cmd.DispatchCompute(groups);
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1}); cmd.EndRenderPass();
+                    });
+                graph.Execute(*device); device->WaitIdle();
+                std::vector<psh::ProbeSH> out((size_t)probeN);
+                device->ReadBuffer(*shBuf, out.data(), out.size() * sizeof(psh::ProbeSH), 0);
+                return out;
+            };
+
+            // === The CPU mirror of the DJ encode (the BIT-EXACT GPU==CPU proof, the DJ discipline): the SAME
+            //     SHEncodeAccumulate / SHNormalize over the SAME read-back radiance + host sample table. ===
+            auto cpuEncode = [&](const std::vector<float>& radiance) -> std::vector<psh::ProbeSH> {
+                std::vector<psh::ProbeSH> out((size_t)probeN);
+                std::memset(out.data(), 0, out.size() * sizeof(psh::ProbeSH));
+                for (int p = 0; p < probeN; ++p) {
+                    for (int s = 0; s < kSampleCount; ++s) {
+                        size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                        Vec3 rad{radiance[o + 0], radiance[o + 1], radiance[o + 2]};
+                        psh::SHEncodeAccumulate(out[p], rad, samples[s].basis, samples[s].saWeight);
+                    }
+                    psh::SHNormalize(out[p], totalWeight);
+                }
+                return out;
+            };
+
+            // ================= BOUNCE 0: the DI direct capture -> SH0 (the DN single-bounce source). =======
+            std::vector<std::vector<uint8_t>> radStore0;
+            if (!captureGrid(drawRoomBake, radStore0) || radStore0.empty() || faceW == 0) {
+                std::fprintf(stderr, "FATAL: ddgi-mb bounce-0 capture produced no radiance\n");
+                device->WaitIdle(); return 1;
+            }
+            buildSampleTable();
+            std::vector<float> radiance0 = packRadiance(radStore0);
+            std::vector<psh::ProbeSH> sh0 = gpuEncode(radiance0);
+
+            // The SH0 SSBO (bound to the bounce-1 capture's fragment stage AND the frame-A composite).
+            auto makeShBuf = [&](const std::vector<psh::ProbeSH>& sh) {
+                rhi::BufferDesc d;
+                d.size = sh.size() * sizeof(psh::ProbeSH); d.initialData = sh.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto sh0Buf = makeShBuf(sh0);
+            uint32_t dummyU = 0;
+            rhi::BufferDesc dummyDesc;
+            dummyDesc.size = sizeof(uint32_t); dummyDesc.initialData = &dummyU;
+            dummyDesc.usage = rhi::BufferUsage::Storage;
+            auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+            // The grid-params frame UBO the bounce-1 capture binds (giStrength = kGiStrength so the indirect
+            // term is the live DN bounce; the capture is centered per-probe via the push-constant faceVP).
+            DdgiFrameData capFd{};
+            capFd.giOrigin[0]=grid.origin.x; capFd.giOrigin[1]=grid.origin.y; capFd.giOrigin[2]=grid.origin.z;
+            capFd.giOrigin[3]=grid.spacing;
+            capFd.giDims[0]=(float)grid.dimX; capFd.giDims[1]=(float)grid.dimY; capFd.giDims[2]=(float)grid.dimZ;
+            capFd.giDims[3]=kGiStrength;
+
+            // ============ BOUNCE 1: re-capture with probe_bake_gi.frag (SH0 bound) -> SH1 (2nd bounce). =====
+            // The bounce-1 face draw binds the frame UBO (grid params) + SH0 via BindLightClusters; the
+            // probe_bake_gi.frag adds InterpolateIrradianceSH(wpos,N)*albedo*giStrength to the captured
+            // radiance. SetFrameUniforms must precede BeginCubemapFace's render pass — set it per face.
+            auto drawRoomBakeGi = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP) {
+                cmd.BindPipeline(*bakeGiPipeline);
+                cmd.BindLightClusters(*sh0Buf, *dummyBuf, *dummyBuf);   // SH0 at binding 13
+                for (const auto& wl : walls) {
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindMaterial(*wl.tex, *flatNormal);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+            // The bounce-1 capture loop (a variant of captureGrid that sets the frame UBO per face).
+            std::vector<std::vector<uint8_t>> radStore1;
+            {
+                std::vector<Vec3> centers;
+                for (int pz = 0; pz < grid.dimZ; ++pz)
+                    for (int py = 0; py < grid.dimY; ++py)
+                        for (int px = 0; px < grid.dimX; ++px)
+                            centers.push_back(grid.probePos(px, py, pz));
+                int slots = probeN * pc::kFaces;
+                radStore1.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+                for (int p = 0; p < probeN; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pc::ProbeFaceViewProj(face, centers[p], kCubeNear, kCubeFar);
+                        device->SetFrameUniforms(&capFd, sizeof(DdgiFrameData));
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoomBakeGi(*fc.cmd, faceVP);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> faceData; uint32_t fw = 0, fh = 0;
+                        if (!device->ReadCubemapFace(*cube, face, faceData, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(bounce-1 probe %d, face %u) failed\n", p, face);
+                            device->WaitIdle(); return 1;
+                        }
+                        radStore1[pc::ProbeFaceIndex(p, face)] = std::move(faceData);
+                    }
+                }
+            }
+            std::vector<float> radiance1 = packRadiance(radStore1);
+            std::vector<psh::ProbeSH> sh1 = gpuEncode(radiance1);
+            auto sh1Buf = makeShBuf(sh1);
+
+            // === PROOF 3 — SH1 GPU==CPU BIT-EXACT (the DJ discipline re-applied to the bounce-1 radiance:
+            //     the encode reads back the bounce-1 radiance bytes, so it is bit-exact regardless of the
+            //     capture's lighting/sqrt). ===
+            std::vector<psh::ProbeSH> sh1Cpu = cpuEncode(radiance1);
+            const bool sh1Exact = (sh1.size() == sh1Cpu.size()) &&
+                (std::memcmp(sh1.data(), sh1Cpu.data(), sh1.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!sh1Exact) {
+                std::fprintf(stderr, "FATAL: ddgi-mb SH1 GPU SSBO != CPU SH-encode of the bounce-1 radiance\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ddgi-mb SH1 GPU==CPU: BIT-EXACT\n"); std::fflush(stdout);
+
+            // === Build the lit_ddgi composite FrameData (the SAME dim-fill sun as --ddgi-shot). ===
+            auto makeFrame = [&](float giStrength) {
+                DdgiFrameData fd{};
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = camVP.m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z; fd.lightDir[3]=0.0f;
+                fd.lightColor[0]=0.20f; fd.lightColor[1]=0.20f; fd.lightColor[2]=0.22f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = 0.0f;
+                fd.giOrigin[0]=grid.origin.x; fd.giOrigin[1]=grid.origin.y; fd.giOrigin[2]=grid.origin.z;
+                fd.giOrigin[3]=grid.spacing;
+                fd.giDims[0]=(float)grid.dimX; fd.giDims[1]=(float)grid.dimY; fd.giDims[2]=(float)grid.dimZ;
+                fd.giDims[3]=giStrength;
+                return fd;
+            };
+
+            // === Render the room with lit_ddgi over the SH buffer SELECTED by bounceCount (SH0 at bc=1 — the
+            //     DN single-bounce path; SH1 at bc>=2 — the 2nd bounce). The shadow pass is declared exactly
+            //     as --ddgi-shot (the DQ lesson: validation-clean). ===
+            auto renderMb = [&](int bounceCount,
+                                std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                rhi::IBuffer* shBuf = (pmb::ClampBounceCount(bounceCount) >= 2) ? sh1Buf.get() : sh0Buf.get();
+                DdgiFrameData fd = makeFrame(kGiStrength);
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadow", render::RgResourceKind::ShadowMap, *dummyShadow);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("ddgiMbScene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(DdgiFrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        cmd.BindPipeline(*litPipeline);
+                        cmd.BindLightClusters(*shBuf, *dummyBuf, *dummyBuf);
+                        for (size_t wi = 0; wi < walls.size(); ++wi) {
+                            if (wi == 5) continue;
+                            const auto& wl = walls[wi];
+                            float pcv[20];
+                            for (int k = 0; k < 16; ++k) pcv[k] = wl.model.m[k];
+                            pcv[16]=0.0f; pcv[17]=0.85f; pcv[18]=0.0f; pcv[19]=0.0f;
+                            cmd.PushConstants(pcv, sizeof(pcv));
+                            cmd.BindMaterial(*wl.tex, *flatNormal);
+                            cmd.BindVertexBuffer(cubeMesh.vertices());
+                            cmd.BindIndexBuffer(cubeMesh.indices());
+                            cmd.DrawIndexed(cubeMesh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto meanLuma = [](const std::vector<uint8_t>& px) -> double {
+                if (px.empty()) return 0.0;
+                double sum = 0.0; size_t n = px.size() / 4;
+                for (size_t i = 0; i < n; ++i) {
+                    double r = px[i*4+0], g = px[i*4+1], b = px[i*4+2];
+                    sum += 0.2126*r + 0.7152*g + 0.0722*b;
+                }
+                return (n > 0) ? sum / (double)n : 0.0;
+            };
+
+            // --- Frame A: bounceCount=1 -> the composite binds SH0 -> the DN single-bounce render. ---
+            std::vector<uint8_t> frameA; uint32_t aw=0, ah=0;
+            if (!renderMb(1, frameA, aw, ah)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-mb frame A)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF 1 — bounceCount=1 == the DN single-bounce render. Frame A binds SH0 through the SAME
+            // lit_ddgi composite the --ddgi-shot DN path uses over its SH0, with the bounce-1 capture SKIPPED
+            // entirely — so it IS the DN single-bounce path. We re-run a SECOND frame A and assert byte
+            // identity to make the no-op explicit + deterministic. ===
+            std::vector<uint8_t> frameA2; uint32_t a2w=0, a2h=0;
+            if (!renderMb(1, frameA2, a2w, a2h)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-mb frame A run 2)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool aIdentical = (frameA.size() == frameA2.size()) &&
+                (std::memcmp(frameA.data(), frameA2.data(), frameA.size()) == 0);
+            if (!aIdentical) {
+                std::fprintf(stderr, "FATAL: ddgi-mb two bounceCount=1 runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ddgi-mb bounceCount=1 == DN single-bounce: BYTE-IDENTICAL\n"); std::fflush(stdout);
+
+            // --- Frame B: bounceCount=2 -> the composite binds SH1 -> the 2nd bounce (brighter). ---
+            std::vector<uint8_t> frameB; uint32_t bw=0, bh=0;
+            if (!renderMb(2, frameB, bw, bh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-mb frame B)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF 2 — frame B is BRIGHTER than frame A (the 2nd bounce adds light) AND differs. ===
+            const bool bDiffers = (frameB.size() == frameA.size()) &&
+                (std::memcmp(frameB.data(), frameA.data(), frameA.size()) != 0);
+            if (!bDiffers) {
+                std::fprintf(stderr,
+                    "FATAL: ddgi-mb frame B (bounceCount=2) is identical to frame A (bounceCount=1) — the 2nd "
+                    "bounce produced NO visible change\n");
+                device->WaitIdle(); return 1;
+            }
+            const double lumaA = meanLuma(frameA);
+            const double lumaB = meanLuma(frameB);
+            if (!(lumaB > lumaA + 0.05)) {
+                std::fprintf(stderr,
+                    "FATAL: ddgi-mb frame B mean luminance (%.4f) is not measurably brighter than frame A "
+                    "(%.4f) — the 2nd bounce did not add light\n", lumaB, lumaA);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ddgi-mb B brighter than A: 2nd bounce active (lumaA=%.3f lumaB=%.3f)\n",
+                        lumaA, lumaB); std::fflush(stdout);
+
+            // === PROOF 4 — determinism: a second frame B is byte-identical. ===
+            std::vector<uint8_t> frameB2; uint32_t b2w=0, b2h=0;
+            if (!renderMb(2, frameB2, b2w, b2h)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-mb frame B run 2)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool deterministic = (frameB.size() == frameB2.size()) &&
+                (std::memcmp(frameB.data(), frameB2.data(), frameB.size()) == 0);
+            if (!deterministic) {
+                std::fprintf(stderr, "FATAL: ddgi-mb two frame-B runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            std::printf("ddgi-mb: {probes:%d, bounces:2, giStrength:%.1f}\n", probeN, kGiStrength);
+            std::fflush(stdout);
+
+            // === GOLDEN = frame B (the brighter 2nd-bounce GI). ===
+            bool ok = WriteBMP(ddgiMbShotPath, frameB, bw, bh);
+            if (ok) std::printf("wrote %s (%ux%u) — DDGI multi-bounce (2nd bounce), %d probes, giStrength %.1f\n",
+                                ddgiMbShotPath, bw, bh, probeN, kGiStrength);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ddgiMbShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

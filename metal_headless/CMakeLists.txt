@@ -271,6 +271,14 @@ hf_gen_msl(lit_ddgi.frag           lit_ddgi.frag.hlsl           frag ddgi_fragme
 # occlusion weight bit-identical to the Vulkan/CPU mirror; occlusionStrength==0 -> the VERBATIM DN path ->
 # byte-identical to the DN render. Behind --ddgiocc only; existing lit/ddgi shaders + goldens untouched.
 hf_gen_msl(lit_ddgi_occ.frag       lit_ddgi_occ.frag.hlsl       frag ddgi_occ_fragment)
+# DDGI MULTI-BOUNCE capture-with-GI fragment (Slice DR): a SIBLING of probe_bake.frag (the DI probe-radiance
+# capture) with the DN lit_ddgi InterpolateIrradianceSH indirect term added LAST, so the bounce-1 capture
+# sees the 1st-bounce GI -> SH-encoding it yields SH1 (the 2nd bounce, brighter/more-filled). SH0 binds at
+# set-3 binding 13 (Metal fragment buffer 13) via the existing usesLightClusters/BindLightClusters path; the
+# grid params ride the same 208-byte lit_ddgi FrameData UBO (fragment buffer 0). The SAME math compiled here
+# makes the bounce-1 indirect bit-identical to the Vulkan/CPU mirror. Behind --ddgimb only; probe_bake.frag +
+# lit_ddgi.frag + their goldens untouched.
+hf_gen_msl(probe_bake_gi.frag      probe_bake_gi.frag.hlsl      frag probe_bake_gi_fragment)
 # Froxel Volumetric Fog (Slice CS): a true 3D view-space froxel volume. froxel_inject.comp writes
 # per-froxel (scatter, extinction) from the render/froxel.h height-density + HG phase; froxel_integrate.comp
 # marches each Z column front-to-back via IntegrateStep into (inScatter, transmittance); froxel_apply.frag

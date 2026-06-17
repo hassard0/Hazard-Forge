@@ -340,6 +340,16 @@ hf_add_pure_test(ddgi_test)
 # + render/probe_gi.h + render/probe_sh.h + render/cubemap.h), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(probe_occlusion_test)
 
+# Slice DR — DDGI MULTI-BOUNCE (2nd light bounce). Pure CPU logic/math for the 2nd-bounce feed
+# (render/probe_multibounce.h): SelectBounceSH returns SH0 at bounceCount=1 (the byte-identical no-op the
+# make-or-break proof rests on — the bounce-1 capture is skipped) and SH1 at bounceCount>=2; ClampBounceCount
+# clamps to [1,2]; the BounceIndirect CPU mirror of probe_bake_gi.frag's added indirect (a non-negative
+# SH0-irradiance*albedo*giStrength add -> the bounce only ADDS light, SH1 irradiance >= SH0 for positive
+# albedo — 2nd-bounce monotonicity); probeCount=0 -> zero indirect (the DN zero-SH fallback); and determinism.
+# Pure C++ (hf_core; reuses render/probe_multibounce.h + probe_gi.h + probe_sh.h), no RHI/backend symbols,
+# ASan-eligible.
+hf_add_pure_test(ddgi_multibounce_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,
