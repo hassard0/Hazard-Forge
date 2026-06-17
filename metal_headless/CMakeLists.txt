@@ -220,6 +220,15 @@ hf_gen_msl(vt_pagegen.comp       vt_pagegen.comp.hlsl       comp vt_pagegen_main
 # MSL gen suffices (NO --msl-version 20200). The reconstructed image is bit-exact GPU==CPU + cross-backend by
 # construction. Behind --vt-sample only; goldens untouched.
 hf_gen_msl(vt_sample.comp        vt_sample.comp.hlsl        comp vt_sample_main)
+# Runtime Virtual Texturing Slice 5 (Slice VT5): vt_cachegen.comp is the CACHE-AWARE sibling of VT3's
+# vt_pagegen.comp (UNCHANGED) — ONE thread per atlas texel (race-free MAP, NO atomics). Each thread finds its
+# tile; if unallocated OR gNeedsGen[tileIndex]==0 (a cache hit) it RETURNS without writing (the atlas SSBO
+# PERSISTS, so cached texels carry over byte-identical); else it writes PageTexelV(pageId,mip,localXY,
+# gTileVersion[tile]) (the content-version-aware generator copied VERBATIM from render/vt.h; version 0 == VT3
+# PageTexel). Pure integer SSBO compute (no atomics, no integer texture.read) -> the default MSL gen suffices
+# (NO --msl-version 20200). The cached atlas is bit-exact GPU==CPU + cross-backend AND byte-identical to a
+# full regen by construction. Behind --vt-cache only; goldens untouched.
+hf_gen_msl(vt_cachegen.comp      vt_cachegen.comp.hlsl      comp vt_cachegen_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

@@ -417,6 +417,15 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> the reconstructed virtual image is bit-exact GPU==CPU + cross-backend.
     # NO new RHI; existing shaders + goldens untouched.
     "shaders/vt_sample.comp.hlsl:cs"
+    # Runtime Virtual Texturing Slice 5 (Slice VT5): vt_cachegen.comp is the CACHE-AWARE sibling of VT3's
+    # vt_pagegen.comp (which is UNCHANGED) — ONE thread per atlas texel (race-free MAP, NO atomics). Each
+    # thread finds its tile; if the tile is unallocated OR gNeedsGen[tileIndex]==0 (a cache hit) it RETURNS
+    # without writing (the atlas SSBO PERSISTS across passes, so cached texels carry over byte-identical);
+    # else it UnpackPageId's the owning pageId and writes PageTexelV(pageId,mip,localXY,gTileVersion[tile])
+    # (the content-version-aware generator copied VERBATIM from render/vt.h; version 0 == VT3 PageTexel).
+    # Pure integer SSBO compute + ReadBuffer -> the cached atlas is bit-exact GPU==CPU + cross-backend AND
+    # byte-identical to a full regen, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/vt_cachegen.comp.hlsl:cs"
     # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer —
     # ONE thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO
     # via InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied

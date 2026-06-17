@@ -16657,6 +16657,267 @@ static int RunVtSampleShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Runtime Virtual Texturing per-page CACHING across frames showcase (Slice VT5, the FINAL RVT slice). The
+// TRUE pass is identical on both backends: VT3/VT4's scene -> a host content-key cache builds per-tile needsGen
+// flags -> shaders/vt_cachegen.comp (here vt_cachegen.comp.gen.metal) — ONE thread per atlas texel (race-free
+// MAP, NO atomics) — over a PERSISTENT atlas SSBO: needsGen==0 (cached/unallocated) -> RETURN without writing
+// (the texel persists byte-identical); else write PageTexelV(pageId,mip,localXY,tileVersion) (the content-
+// version-aware generator copied VERBATIM from render/vt.h; version 0 == VT3 PageTexel). Pass1 populate ->
+// Pass2 all-cached (writes nothing, atlas byte-identical to Pass1) -> Pass3 bump ONE page's version (only that
+// tile regenerates). PROVEN: all-cached==fresh BYTE-IDENTICAL + misses2==0; invalidation minimal (misses3==1)
+// + transparent (cached==full BYTE-IDENTICAL); the Pass3 GPU atlas == the CPU GenerateCachedAtlas reference
+// (memcmp); two full runs byte-identical. The golden is a cache-status viz of the Pass3 state (allocated tiles
+// tinted GREEN cached / RED the 1 regenerated, dark unallocated) -> identical to the Vulkan --vt-cache-shot BY
+// CONSTRUCTION. New golden tests/golden/metal/vt_cache.png; two runs DIFF 0.0000. NO new RHI.
+static int RunVtCacheShowcase(const char* outPath) {
+    namespace vt = render::vt;
+    // The fixed virtual texture + scene == VT3/VT4 (== the Vulkan --vt-cache-shot config).
+    vt::VtTexture vtx;
+    vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+    const int nPages = vtx.pageCount();
+
+    std::vector<vt::SampleRequest> requests;
+    const int kGrid = 24;
+    for (int gy = 0; gy < kGrid; ++gy)
+        for (int gx = 0; gx < kGrid; ++gx) {
+            float u = (float)gx / (float)kGrid;
+            float v = (float)gy / (float)kGrid;
+            int mip = (gx + gy) % vtx.mipLevels;
+            requests.push_back({u, v, mip});
+        }
+
+    std::vector<uint32_t> feedback((size_t)nPages, 0u);
+    vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                          std::span<uint32_t>(feedback.data(), feedback.size()));
+
+    vt::VtTilePool pool; pool.tilesPerSide = 16;
+    vt::VtAtlasDims dims; dims.tilesPerSide = pool.tilesPerSide; dims.pageSize = 64;
+    const int atlasW = dims.atlasW(), atlasH = dims.atlasH();
+    const int atlasTexels = dims.atlasTexels();
+    const int tileCap = pool.tileCapacity();
+
+    std::vector<int32_t> indirection =
+        vt::AllocatePhysicalTiles(std::span<const uint32_t>(feedback.data(), feedback.size()), pool);
+    std::vector<uint32_t> tilePageId = vt::BuildTilePageId(
+        std::span<const int32_t>(indirection.data(), indirection.size()), pool);
+
+    std::vector<int> allocTiles;
+    std::vector<int> tileMip((size_t)tileCap, 0);
+    for (int t = 0; t < tileCap; ++t) {
+        if (tilePageId[(size_t)t] == vt::kNoTileU32) continue;
+        int mip, px, py; vt::UnpackPageId((int)tilePageId[(size_t)t], vtx, mip, px, py);
+        tileMip[(size_t)t] = mip;
+        allocTiles.push_back(t);
+    }
+    const uint32_t allocated = (uint32_t)allocTiles.size();
+
+    const uint32_t W = (uint32_t)atlasW, H = (uint32_t)atlasH;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    rhi::BufferDesc tpDesc;
+    tpDesc.size = tilePageId.size() * sizeof(uint32_t);
+    tpDesc.initialData = tilePageId.data();
+    tpDesc.usage = rhi::BufferUsage::Storage;
+    auto tilePageIdBuf = device->CreateBuffer(tpDesc);
+
+    std::vector<uint32_t> atlasInit((size_t)atlasTexels, vt::kAtlasClear);
+    auto makeAtlasBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = atlasInit.size() * sizeof(uint32_t);
+        d.initialData = atlasInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    rhi::IBuffer* curAtlas = nullptr;
+
+    struct VtCgParams {
+        uint32_t dims[4];
+        uint32_t dims2[4];
+        uint32_t pagesPerSide[16];
+        uint32_t mipOffset[16];
+    };
+    static_assert(sizeof(VtCgParams) == 16 + 16 + 64 + 64, "VtCgParams std430 layout");
+    VtCgParams params{};
+    params.dims[0] = (uint32_t)atlasW; params.dims[1] = (uint32_t)atlasH;
+    params.dims[2] = (uint32_t)pool.tilesPerSide;
+    params.dims2[0] = (uint32_t)dims.pageSize; params.dims2[1] = (uint32_t)vtx.mipLevels;
+    for (int m = 0; m < vtx.mipLevels; ++m) {
+        params.pagesPerSide[m] = (uint32_t)vtx.pagesPerSide(m);
+        params.mipOffset[m]    = (uint32_t)vtx.mipPageOffset(m);
+    }
+    rhi::BufferDesc pDesc;
+    pDesc.size = sizeof(VtCgParams); pDesc.initialData = &params;
+    pDesc.usage = rhi::BufferUsage::Storage;
+    auto paramsBuf = device->CreateBuffer(pDesc);
+
+    auto cgCs = loadMSL("vt_cachegen.comp.gen.metal", "vt_cachegen_main");
+    rhi::ComputePipelineDesc cgDesc;
+    cgDesc.compute = cgCs.get(); cgDesc.storageBufferCount = 5; cgDesc.threadsPerGroupX = 64;
+    auto cgCompute = device->CreateComputePipeline(cgDesc);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    const uint32_t kGroups = ((uint32_t)atlasTexels + 63u) / 64u;
+
+    auto runPass = [&](const std::vector<uint8_t>& needsGen, const std::vector<uint32_t>& tileVersion,
+                       std::vector<uint32_t>& outAtlas) {
+        std::vector<uint32_t> needsGenU((size_t)tileCap, 0u);
+        for (int t = 0; t < tileCap; ++t) needsGenU[(size_t)t] = needsGen[(size_t)t] ? 1u : 0u;
+        rhi::BufferDesc ngDesc; ngDesc.size = needsGenU.size() * sizeof(uint32_t);
+        ngDesc.initialData = needsGenU.data(); ngDesc.usage = rhi::BufferUsage::Storage;
+        auto needsGenBuf = device->CreateBuffer(ngDesc);
+        rhi::BufferDesc tvDesc; tvDesc.size = tileVersion.size() * sizeof(uint32_t);
+        tvDesc.initialData = tileVersion.data(); tvDesc.usage = rhi::BufferUsage::Storage;
+        auto tileVersionBuf = device->CreateBuffer(tvDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("vt_cachegen", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*cgCompute);
+                cmd.BindStorageBuffer(*tilePageIdBuf, 0);
+                cmd.BindStorageBuffer(*needsGenBuf, 1);
+                cmd.BindStorageBuffer(*tileVersionBuf, 2);
+                cmd.BindStorageBuffer(*curAtlas, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outAtlas.assign((size_t)atlasTexels, 0u);
+        device->ReadBuffer(*curAtlas, outAtlas.data(), outAtlas.size() * sizeof(uint32_t), 0);
+    };
+
+    // The 3-pass cache sequence over a PERSISTENT atlas (a fresh buffer == frame-0; RHI exposes no host
+    // buffer-write — that would be new RHI). Returns the final atlas + per-pass miss counts + the Pass3
+    // miss-per-tile (for the viz). Returns false on a failed proof (printed).
+    int seqErr = 0;
+    auto runSequence = [&](std::vector<uint32_t>& finalAtlas, uint32_t& misses1, uint32_t& misses2,
+                           uint32_t& misses3, std::vector<uint8_t>& pass3Miss) -> bool {
+        auto seqAtlas = makeAtlasBuf();
+        curAtlas = seqAtlas.get();
+
+        vt::VtPageCache cache; cache.Resize(tileCap);
+        std::vector<uint32_t> versions((size_t)tileCap, 0u);
+
+        std::vector<uint8_t> needs1((size_t)tileCap, 0u);
+        misses1 = 0;
+        for (int t : allocTiles) {
+            uint32_t key = vt::PageContentKey((int)tilePageId[(size_t)t], tileMip[(size_t)t], versions[(size_t)t]);
+            if (!vt::PageCacheHit(cache, t, key)) { needs1[(size_t)t] = 1u; ++misses1; }
+            vt::PageCacheUpdate(cache, t, key);
+        }
+        std::vector<uint32_t> a1; runPass(needs1, versions, a1);
+
+        std::vector<uint8_t> needs2((size_t)tileCap, 0u);
+        misses2 = 0;
+        for (int t : allocTiles) {
+            uint32_t key = vt::PageContentKey((int)tilePageId[(size_t)t], tileMip[(size_t)t], versions[(size_t)t]);
+            if (!vt::PageCacheHit(cache, t, key)) { needs2[(size_t)t] = 1u; ++misses2; }
+            vt::PageCacheUpdate(cache, t, key);
+        }
+        std::vector<uint32_t> a2; runPass(needs2, versions, a2);
+        if (a2.size() != a1.size() || std::memcmp(a2.data(), a1.data(), a1.size() * sizeof(uint32_t)) != 0)
+            { seqErr = 1; return false; }
+        if (misses2 != 0) { seqErr = 2; return false; }
+
+        const int bumpTile = allocTiles.front();
+        versions[(size_t)bumpTile] = 1u;
+        std::vector<uint8_t> needs3((size_t)tileCap, 0u);
+        pass3Miss.assign((size_t)tileCap, (uint8_t)0u);
+        misses3 = 0;
+        for (int t : allocTiles) {
+            uint32_t key = vt::PageContentKey((int)tilePageId[(size_t)t], tileMip[(size_t)t], versions[(size_t)t]);
+            if (!vt::PageCacheHit(cache, t, key)) { needs3[(size_t)t] = 1u; pass3Miss[(size_t)t] = 1u; ++misses3; }
+            vt::PageCacheUpdate(cache, t, key);
+        }
+        std::vector<uint32_t> a3; runPass(needs3, versions, a3);
+
+        auto fullAtlas = makeAtlasBuf();
+        curAtlas = fullAtlas.get();
+        std::vector<uint8_t> needsFull((size_t)tileCap, 0u);
+        for (int t : allocTiles) needsFull[(size_t)t] = 1u;
+        std::vector<uint32_t> aFull; runPass(needsFull, versions, aFull);
+
+        if (misses3 != 1) { seqErr = 3; return false; }
+        if (a3.size() != aFull.size() || std::memcmp(a3.data(), aFull.data(), a3.size() * sizeof(uint32_t)) != 0)
+            { seqErr = 4; return false; }
+
+        std::vector<uint32_t> cpuAtlas((size_t)atlasTexels, vt::kAtlasClear);
+        std::vector<uint8_t> cpuNeeds((size_t)tileCap, 0u);
+        for (int t : allocTiles) cpuNeeds[(size_t)t] = 1u;
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(cpuNeeds.data(), cpuNeeds.size()),
+                                std::span<const uint32_t>(versions.data(), versions.size()),
+                                vtx, pool, dims, std::span<uint32_t>(cpuAtlas.data(), cpuAtlas.size()));
+        if (cpuAtlas.size() != a3.size() || std::memcmp(cpuAtlas.data(), a3.data(), a3.size() * sizeof(uint32_t)) != 0)
+            { seqErr = 5; return false; }
+
+        finalAtlas = a3;
+        return true;
+    };
+
+    uint32_t misses1 = 0, misses2 = 0, misses3 = 0;
+    std::vector<uint8_t> pass3Miss;
+    std::vector<uint32_t> finalAtlas;
+    if (!runSequence(finalAtlas, misses1, misses2, misses3, pass3Miss)) {
+        const char* why[] = {"", "all-cached atlas != fresh", "Pass2 misses != 0", "Pass3 misses != 1",
+                             "Pass3 cached atlas != full-regen", "GPU atlas != CPU reference"};
+        return fail(std::string("vt-cache: ") + (seqErr < 6 ? why[seqErr] : "unknown"));
+    }
+    std::printf("vt-cache all-cached == fresh: BYTE-IDENTICAL (%u/%u hits)\n", allocated, allocated);
+    std::printf("vt-cache invalidation: 1 page regenerated, cached==full BYTE-IDENTICAL\n");
+    std::printf("vt-cache GPU==CPU atlas: %dx%d BIT-EXACT\n", atlasW, atlasH);
+
+    uint32_t m1b = 0, m2b = 0, m3b = 0;
+    std::vector<uint8_t> pass3MissB;
+    std::vector<uint32_t> finalAtlasB;
+    if (!runSequence(finalAtlasB, m1b, m2b, m3b, pass3MissB)) return fail("vt-cache: determinism re-run proof failed");
+    if (finalAtlasB.size() != finalAtlas.size() ||
+        std::memcmp(finalAtlasB.data(), finalAtlas.data(), finalAtlas.size() * sizeof(uint32_t)) != 0 ||
+        m1b != misses1 || m2b != misses2 || m3b != misses3)
+        return fail("vt-cache: two runs differ (nondeterministic)");
+    std::printf("vt-cache determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the CACHE-STATUS VIZ of the Pass3 state (identical to the Vulkan --vt-cache-shot by
+    // construction). Pass3 atlas content tinted GREEN cached / RED the 1 regenerated, dark unallocated. ---
+    std::vector<uint8_t> viz((size_t)atlasW * atlasH * 4, 0);
+    for (size_t p = 0; p < (size_t)atlasW * atlasH; ++p) {
+        const uint32_t t = finalAtlas[p];
+        viz[p * 4 + 0] = (uint8_t)((t >> 16) & 0xFFu);  // B
+        viz[p * 4 + 1] = (uint8_t)((t >> 8)  & 0xFFu);  // G
+        viz[p * 4 + 2] = (uint8_t)( t        & 0xFFu);  // R
+        viz[p * 4 + 3] = 255;
+    }
+    auto tintTile = [&](int tile, float tr, float tg, float tb) {
+        int ox, oy; vt::PhysicalTileOrigin(tile, pool, dims.pageSize, ox, oy);
+        for (int ty = 0; ty < dims.pageSize; ++ty)
+            for (int tx = 0; tx < dims.pageSize; ++tx) {
+                size_t i = ((size_t)(oy + ty) * atlasW + (size_t)(ox + tx)) * 4;
+                viz[i + 0] = (uint8_t)((float)viz[i + 0] * tb + 0.5f);
+                viz[i + 1] = (uint8_t)((float)viz[i + 1] * tg + 0.5f);
+                viz[i + 2] = (uint8_t)((float)viz[i + 2] * tr + 0.5f);
+            }
+    };
+    for (int t : allocTiles) {
+        if (pass3Miss[(size_t)t]) tintTile(t, 1.0f, 0.25f, 0.25f);   // RE-GENERATED -> red
+        else                      tintTile(t, 0.25f, 1.0f, 0.25f);   // CACHED -> green
+    }
+
+    if (!WritePNG(outPath, viz, (uint32_t)atlasW, (uint32_t)atlasH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%dx%d) — VT cache-status viz (%u allocated, %u cached/green, %u re-generated/red)\n",
+                outPath, atlasW, atlasH, allocated, allocated - misses3, misses3);
+    return 0;
+}
+
 // --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
 // backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
 // shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
@@ -25271,6 +25532,23 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vt-sample") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vt_sample.png";
             try { return RunVtSampleShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vt-cache <out.png>: render the Runtime Virtual Texturing per-page CACHING showcase (Slice VT5, the
+        // FINAL RVT slice — the direct analog of VSM Slice VD's PageContentKey/VsmPageCache). VT3/VT4's scene ->
+        // a host content-key cache builds per-tile needsGen flags -> vt_cachegen.comp (ONE thread per atlas texel,
+        // a race-free MAP, NO atomics) over a PERSISTENT atlas SSBO: needsGen==0 -> RETURN without writing (the
+        // cached texel persists byte-identical); else write PageTexelV(pageId,mip,localXY,tileVersion) (the
+        // content-version-aware generator copied VERBATIM from render/vt.h; version 0 == VT3 PageTexel). Pass1
+        // populate -> Pass2 all-cached (writes nothing, atlas byte-identical to Pass1) -> Pass3 bump ONE page's
+        // version (only that tile regenerates). PROVEN: all-cached==fresh BYTE-IDENTICAL + misses2==0;
+        // invalidation minimal (misses3==1) + transparent (cached==full BYTE-IDENTICAL); the Pass3 GPU atlas ==
+        // the CPU GenerateCachedAtlas reference (memcmp); two full runs byte-identical. The golden is a cache-
+        // status viz (allocated tiles GREEN cached / RED the 1 regenerated, dark unallocated) -> identical to
+        // the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/vt_cache.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--vt-cache") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vt_cache.png";
+            try { return RunVtCacheShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vsm-render <out.png>: render the Virtual Shadow Maps PHYSICAL-PAGE DEPTH showcase (Slice VB).
