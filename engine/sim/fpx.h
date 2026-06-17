@@ -484,5 +484,119 @@ inline void IntegrateBodyFull(FxBody& b, const FxVec3& gravity, fx dt) {
     IntegrateOrientation(b, dt);
 }
 
+// ===== Slice FPX5 — LOCKSTEP + ROLLBACK PROOF (FLAGSHIP #6's HEADLINE) ================================
+// The netcode primitive UE5's float Chaos cannot provide: prove that the bit-exact fixed-point sim
+// (FPX1-FPX4) is true cross-platform LOCKSTEP + ROLLBACK-ready. Two peers fed ONLY a deterministic
+// input/command STREAM (not full state) re-simulate to BIT-IDENTICAL physics state; a MISPREDICTED input
+// is corrected by ROLLING BACK to a saved snapshot + re-simulating the authoritative stream. PURE CPU,
+// 0 backend symbols, NO new shader / RHI: this is a determinism PROPERTY of the existing fpx sim — the
+// cross-backend zero-diff golden (the converged state is bit-identical on Vulkan-Windows AND Metal-Mac
+// from the same inputs) IS the cross-platform-lockstep evidence. NO <cmath>, NO RNG, NO clock.
+//
+// A FxCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full state).
+// kind=0 apply-impulse `arg` to bodyId's velocity (an integer add, the deterministic input event);
+// kind=1 set bodyId's angular velocity to `arg`. A std::vector<FxCommand> is the command STREAM. The
+// stream is processed in ARRAY ORDER for each tick (the deterministic-order contract — the same order on
+// every peer/platform), so authority + replica fed the same stream re-derive the same state exactly.
+
+inline constexpr uint32_t kCmdImpulse = 0u;   // arg added to bodyId's velocity (an input impulse)
+inline constexpr uint32_t kCmdSetAngVel = 1u; // bodyId's angVel set to arg (an input spin)
+
+struct FxCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdImpulse / kCmdSetAngVel
+    uint32_t bodyId = 0;   // the target body index
+    FxVec3   arg;          // the Q16.16 payload (impulse delta-velocity / angular velocity)
+};
+
+// ApplyCommand(w, c): apply ONE input command to the world (pure integer — add to vel / set angVel).
+// Out-of-range bodyId is a no-op (deterministic). Unknown kind is a no-op. The input event the
+// lockstep/rollback streams are made of.
+inline void ApplyCommand(FxWorld& w, const FxCommand& c) {
+    if (c.bodyId >= (uint32_t)w.bodies.size()) return;
+    FxBody& b = w.bodies[c.bodyId];
+    if (c.kind == kCmdImpulse) {
+        b.vel.x += c.arg.x;
+        b.vel.y += c.arg.y;
+        b.vel.z += c.arg.z;
+    } else if (c.kind == kCmdSetAngVel) {
+        b.angVel = c.arg;
+    }
+}
+
+// SimTick(w, stream, tick, dt, solveIters): the deterministic per-tick step. (1) apply ALL commands in
+// `stream` whose .tick == `tick`, in ARRAY ORDER (the deterministic input-order contract); (2) rebuild
+// the candidate pair list from the CURRENT positions (BuildPairs is deterministic — realistic lockstep,
+// re-broadphased each tick); (3) StepWorld (IntegrateStep + SolveContacts) THEN IntegrateBodyFull's
+// orientation integrate per body (so the per-tick step is full 6-DOF: translation+collision via
+// StepWorld, orientation via IntegrateOrientation — applied AFTER the solve so positions are settled).
+// Pure integer, fixed order -> bit-identical on every peer/platform.
+inline void SimTick(FxWorld& w, const std::vector<FxCommand>& stream, uint32_t tick, fx dt,
+                    int solveIters) {
+    for (const FxCommand& c : stream)
+        if (c.tick == tick) ApplyCommand(w, c);
+    std::vector<uint32_t> offsets;
+    std::vector<FxPair> pairs;
+    BuildPairs(w, offsets, pairs);
+    StepWorld(w, std::span<const FxPair>(pairs), dt, solveIters);
+    // Orientation integrate (the FPX4 angular step) for each body — IntegrateOrientation only, since
+    // StepWorld already did the translational integrate + the collision solve.
+    for (FxBody& b : w.bodies) IntegrateOrientation(b, dt);
+}
+
+// SnapshotWorld(w): a deep copy of the full integer world state (the std::vector<FxBody> + the scalar
+// gravity/groundY). The ROLLBACK primitive — a lossless saved tick. (std::vector copy is a deep copy.)
+inline FxWorld SnapshotWorld(const FxWorld& w) {
+    return w;   // value copy: deep-copies the bodies vector + the scalars
+}
+
+// RestoreWorld(w, snap): restore the world to a saved snapshot (the rollback). Bit-exact round-trip
+// with SnapshotWorld (RestoreWorld(w, SnapshotWorld(w0)) leaves w == w0 byte-for-byte).
+inline void RestoreWorld(FxWorld& w, const FxWorld& snap) {
+    w = snap;
+}
+
+// RunLockstep(init, stream, ticks, dt, iters): THE peer entry point. Run `ticks` SimTicks from a COPY of
+// `init`, applying the command stream -> the final world. authority = RunLockstep(init, stream, N);
+// replica = RunLockstep(init, stream, N) from the SAME init + stream (inputs ONLY — no state shared) ->
+// BIT-IDENTICAL by determinism (the lockstep proof memcmps them).
+inline FxWorld RunLockstep(const FxWorld& init, const std::vector<FxCommand>& stream, int ticks, fx dt,
+                           int iters) {
+    FxWorld w = init;
+    for (int t = 0; t < ticks; ++t)
+        SimTick(w, stream, (uint32_t)t, dt, iters);
+    return w;
+}
+
+// RunRollback(init, authStream, mispredictStream, ticks, mispredictTick, dt, iters): the rollback
+// harness. (1) run ticks 0..mispredictTick from init applying authStream, SAVING a snapshot AT
+// mispredictTick (before that tick is simulated); (2) advance a few ticks from the snapshot with the
+// MISPREDICTED stream (the wrong input) — this is the speculative client-prediction that diverges;
+// (3) "receive" the authoritative input -> RestoreWorld to the snapshot + RE-SIMULATE
+// mispredictTick..ticks with the CORRECT authStream -> the final corrected world. The proof asserts
+// this == RunLockstep(init, authStream, ticks) (rollback corrected the misprediction EXACTLY) AND that
+// the mispredicted-before-rollback state DIFFERED from the authority (a real divergence was fixed).
+inline FxWorld RunRollback(const FxWorld& init, const std::vector<FxCommand>& authStream,
+                           const std::vector<FxCommand>& mispredictStream, int ticks, int mispredictTick,
+                           fx dt, int iters) {
+    FxWorld w = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimTick(w, authStream, (uint32_t)t, dt, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point).
+    const FxWorld snap = SnapshotWorld(w);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — this is the
+    // client prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimTick(w, mispredictStream, (uint32_t)(mispredictTick + s), dt, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreWorld(w, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimTick(w, authStream, (uint32_t)t, dt, iters);
+    return w;
+}
+
 }  // namespace fpx
 }  // namespace hf::sim
