@@ -15994,6 +15994,222 @@ static int RunMcClassifyShowcase(const char* outPath) {
     return 0;
 }
 
+// --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
+// of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
+// corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
+// mc_count.comp.gen.metal). One thread per cell runs CaseIndex (verbatim render/mc.h), looks up
+// triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table (built from kTriTable),
+// writes gCounts[cell]=triCount and InterlockedAdd(gTotal[0],triCount) the grand total (the
+// autoexposure_histogram integer-atomic precedent — commutative -> order-independent -> deterministic;
+// the integer atomic lowers on Metal with NO MSL-2.2 feature). ReadBuffer reads the per-cell counts +
+// the atomic total, PROVEN BIT-EXACT vs the CPU render/mc.h::CountCells + TotalTriangles reference
+// (memcmp counts, == total) — the same proofs the Vulkan --mc-count-shot runs; countEnabled=false ->
+// counts all-zero + total 0; two runs byte-identical. The image golden is the per-cell count field
+// CPU-colored as Z-slices via a fixed count->color ramp (0=dark, 1..5 distinct hues; NOT hashColor) ->
+// identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/mc_count.png; two runs
+// DIFF 0.0000. NO rendering, NO triangle emission (MC3+), NO new RHI.
+static int RunMcCountShowcase(const char* outPath) {
+    namespace mc = render::mc;
+
+    // The fixed VoxelField (== the Vulkan --mc-count-shot config).
+    const int kN = 33;
+    const int kRadius = 12;
+    const int32_t kIso = 0;
+    mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+    const int nx = field.nx, ny = field.ny, nz = field.nz;
+    const int cellCount = field.cellCount();
+
+    const int cxN = nx - 1, cyN = ny - 1, czN = nz - 1;   // 32 x 32 x 32 cells
+    const int kTilesX = 8, kTilesY = 4, kPad = 2;
+    const uint32_t imgW = (uint32_t)(kTilesX * cxN + (kTilesX + 1) * kPad);
+    const uint32_t imgH = (uint32_t)(kTilesY * cyN + (kTilesY + 1) * kPad);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // gField SSBO (the int32 scalar field — uploaded once, read-only on the GPU).
+    rhi::BufferDesc fDesc;
+    fDesc.size = field.scalar.size() * sizeof(int32_t);
+    fDesc.initialData = field.scalar.data();
+    fDesc.usage = rhi::BufferUsage::Storage;
+    auto fieldBuf = device->CreateBuffer(fDesc);
+
+    // gTriCount SSBO: the 256-entry per-case count table, host-built from kTriTable.
+    std::vector<uint32_t> triCountTable(256);
+    for (int c = 0; c < 256; ++c) triCountTable[(size_t)c] = (uint32_t)mc::kTriCount[c];
+    rhi::BufferDesc tcDesc;
+    tcDesc.size = triCountTable.size() * sizeof(uint32_t);
+    tcDesc.initialData = triCountTable.data();
+    tcDesc.usage = rhi::BufferUsage::Storage;
+    auto triCountBuf = device->CreateBuffer(tcDesc);
+
+    std::vector<uint32_t> countsInit((size_t)cellCount, 0u);
+    auto makeCountsBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = countsInit.size() * sizeof(uint32_t);
+        d.initialData = countsInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    const uint32_t kZeroTotal = 0u;
+    auto makeTotalBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = sizeof(uint32_t);
+        d.initialData = &kZeroTotal;
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct McCountParams { int32_t dims[4]; int32_t cfg[4]; };
+    static_assert(sizeof(McCountParams) == 32, "McCountParams std430 layout");
+    auto makeParams = [&](int32_t countEnabled) {
+        McCountParams p{};
+        p.dims[0] = nx; p.dims[1] = ny; p.dims[2] = nz; p.dims[3] = kIso;
+        p.cfg[0] = countEnabled; p.cfg[1] = cellCount; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    auto mcCs = loadMSL("mc_count.comp.gen.metal", "mc_count_main");
+    rhi::ComputePipelineDesc mcCd;
+    mcCd.compute = mcCs.get(); mcCd.storageBufferCount = 5; mcCd.threadsPerGroupX = 64;
+    auto mcCompute = device->CreateComputePipeline(mcCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)cellCount + 63u) / 64u;
+
+    auto runCount = [&](int32_t countEnabled, std::vector<uint32_t>& outCounts, uint32_t& outTotal) {
+        auto countsBuf = makeCountsBuf();
+        auto totalBuf  = makeTotalBuf();
+        McCountParams params = makeParams(countEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(McCountParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("mc_count", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*mcCompute);
+                cmd.BindStorageBuffer(*fieldBuf, 0);
+                cmd.BindStorageBuffer(*triCountBuf, 1);
+                cmd.BindStorageBuffer(*countsBuf, 2);
+                cmd.BindStorageBuffer(*totalBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCounts.assign((size_t)cellCount, 0u);
+        device->ReadBuffer(*countsBuf, outCounts.data(), outCounts.size() * sizeof(uint32_t), 0);
+        outTotal = 0u;
+        device->ReadBuffer(*totalBuf, &outTotal, sizeof(uint32_t), 0);
+    };
+
+    // GPU count (enabled).
+    std::vector<uint32_t> gpuCounts; uint32_t gpuTotal = 0u;
+    runCount(1, gpuCounts, gpuTotal);
+
+    // CPU reference over the SAME field.
+    std::vector<uint32_t> cpuCounts;
+    mc::CountCells(field, kIso, cpuCounts);
+    uint32_t cpuTotal = mc::TotalTriangles(std::span<const uint32_t>(cpuCounts));
+
+    if (gpuCounts.size() != cpuCounts.size() ||
+        std::memcmp(gpuCounts.data(), cpuCounts.data(), (size_t)cellCount * sizeof(uint32_t)) != 0)
+        return fail("mc-count: GPU counts != CPU CountCells (float/transcendental crept in?)");
+    std::printf("mc-count GPU==CPU counts: %d cells BIT-EXACT\n", cellCount);
+
+    if (gpuTotal != cpuTotal) return fail("mc-count: atomic total != CPU TotalTriangles");
+    std::printf("mc-count atomic total: %u tris == CPU (order-independent)\n", gpuTotal);
+
+    {
+        bool consistent = true;
+        for (int c = 0; c < 256; ++c) {
+            int derived = 0;
+            for (int e = 0; e < 16; ++e) if (mc::kTriTable[c][e] >= 0) ++derived;
+            derived /= 3;
+            if (mc::kTriCount[c] != derived || mc::kTriCount[c] < 0 || mc::kTriCount[c] > 5)
+                consistent = false;
+        }
+        if (!consistent || mc::kTriCount[0x00] != 0 || mc::kTriCount[0xFF] != 0)
+            return fail("mc-count: tri-table inconsistent (kTriCount != derived or empty/full != 0)");
+        std::printf("mc-count tri-table: 256 cases consistent, empty/full=0 OK\n");
+    }
+
+    std::vector<uint32_t> disabledCounts; uint32_t disabledTotal = 0u;
+    runCount(0, disabledCounts, disabledTotal);
+    bool disabledZero = (disabledTotal == 0u);
+    for (uint32_t c : disabledCounts) if (c != 0u) { disabledZero = false; break; }
+    if (!disabledZero) return fail("mc-count: disabled path not zero counts + zero total");
+    std::printf("mc-count disabled: zero counts + zero total (no-op)\n");
+
+    std::vector<uint32_t> gpuCounts2; uint32_t gpuTotal2 = 0u;
+    runCount(1, gpuCounts2, gpuTotal2);
+    if (gpuCounts.size() != gpuCounts2.size() ||
+        std::memcmp(gpuCounts.data(), gpuCounts2.data(), gpuCounts.size() * sizeof(uint32_t)) != 0 ||
+        gpuTotal != gpuTotal2)
+        return fail("mc-count: two dispatches differ (nondeterministic)");
+    std::printf("mc-count determinism: two dispatches BYTE-IDENTICAL\n");
+
+    int surfaceCells = 0; uint32_t maxTris = 0u;
+    std::vector<uint8_t> cpuCases8;
+    mc::ClassifyCells(field, kIso, cpuCases8);
+    for (int c = 0; c < cellCount; ++c) {
+        if (mc::IsSurfaceCase(cpuCases8[(size_t)c])) ++surfaceCells;
+        if (gpuCounts[(size_t)c] > maxTris) maxTris = gpuCounts[(size_t)c];
+    }
+    std::printf("mc-count: {cells:%d, surface-cells:%d, total-tris:%u, max-tris/cell:%u}\n",
+                cellCount, surfaceCells, gpuTotal, maxTris);
+
+    // --- Golden: the per-cell count field CPU-colored as Z-slices via a FIXED count->color ramp
+    // (IDENTICAL to the Vulkan --mc-count-shot by construction). ---
+    static const uint8_t kCountRamp[6][3] = {
+        { 18, 18, 18},   // 0: dark grey (no triangles)
+        {200, 60, 40},   // 1: blue
+        {200,180, 40},   // 2: cyan
+        { 60,200, 60},   // 3: green
+        { 40,200,230},   // 4: yellow
+        { 50, 70,235},   // 5: red
+    };
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    for (int cz = 0; cz < czN; ++cz) {
+        const int tileX = cz % kTilesX;
+        const int tileY = cz / kTilesX;
+        const int ox = kPad + tileX * (cxN + kPad);
+        const int oy = kPad + tileY * (cyN + kPad);
+        for (int cy = 0; cy < cyN; ++cy)
+            for (int cx = 0; cx < cxN; ++cx) {
+                const int cellId = (cz * cyN + cy) * cxN + cx;
+                uint32_t cnt = gpuCounts[(size_t)cellId];
+                if (cnt > 5u) cnt = 5u;
+                const int ix = ox + cx;
+                const int iy = oy + cy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = kCountRamp[cnt][0];
+                dst[1] = kCountRamp[cnt][1];
+                dst[2] = kCountRamp[cnt][2];
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — MC triangle-count Z-slice viz (%u total tris)\n",
+                outPath, imgW, imgH, gpuTotal);
+    return 0;
+}
+
 // --- Runtime Virtual Texturing PAGE-NEEDED FEEDBACK MARKING showcase (Slice VT1, the BEACHHEAD of
 // FLAGSHIP #4). The TRUE pass is identical on both backends: a fixed virtual texture (a MIP PYRAMID) + a
 // fixed deterministic (UV,mip) sample-request set feed the SAME shaders/vt_feedback.comp (here
@@ -25685,6 +25901,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mc-classify") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mc_classify.png";
             try { return RunMcClassifyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mc-count <out.png>: render the GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT
+        // showcase (Slice MC2, the 2nd slice of FLAGSHIP #5). The SAME MC1 sphere VoxelField (33³ corners
+        // -> 32³ cells) feeds the SAME mc_count.comp (one thread per cell runs CaseIndex, looks up
+        // triCount = gTriCount[caseIdx] from the host-uploaded count table built from kTriTable, writes
+        // gCounts[cell] and InterlockedAdd(gTotal[0],triCount)) -> ReadBuffer reads the per-cell counts +
+        // the atomic total, PROVEN BIT-EXACT vs the CPU render/mc.h::CountCells + TotalTriangles reference
+        // (memcmp counts, == total — the same proofs the Vulkan --mc-count-shot runs); countEnabled=false
+        // -> all-zero + total 0; two runs byte-identical. The image golden is the per-cell count field
+        // CPU-colored as Z-slices via a fixed count->color ramp, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/mc_count.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--mc-count") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mc_count.png";
+            try { return RunMcCountShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vt-alloc <out.png>: render the Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION +

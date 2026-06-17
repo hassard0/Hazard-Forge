@@ -442,6 +442,15 @@ hf_compile_shaders(
     # Pure integer compute over an SSBO + ReadBuffer (the vsm_mark/vt_feedback surface) -> bit-exact
     # GPU==CPU case set + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/mc_classify.comp.hlsl:cs"
+    # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
+    # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
+    # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table
+    # (built from render/mc.h::kTriTable), writes gCounts[cell]=triCount (order-independent per-cell write)
+    # and InterlockedAdd(gTotal[0], triCount) the grand total (the autoexposure_histogram integer-atomic
+    # precedent — commutative -> order-independent -> deterministic). countEnabled=0 -> writes 0, no atomic.
+    # Pure integer compute over Storage SSBOs + ReadBuffer -> bit-exact GPU==CPU counts + total +
+    # cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/mc_count.comp.hlsl:cs"
     # Nanite Software-Raster RESOLVE blit (Slice SW4): swraster_resolve_blit.frag is a FULLSCREEN pass
     # (reuses post.vert) that unpacks the SW2 software rasterizer's packed depth|id visibility-buffer SSBO
     # into the R32_Uint visId render target the EXISTING visresolve.frag deferred resolve consumes, so the

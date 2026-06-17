@@ -238,6 +238,15 @@ hf_gen_msl(vt_cachegen.comp      vt_cachegen.comp.hlsl      comp vt_cachegen_mai
 # --msl-version 20200 needed). The case set is bit-exact GPU==CPU + cross-backend by construction.
 # Behind --mc-classify only; existing shaders + goldens untouched.
 hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_main)
+# GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits —
+# ONE thread per cell runs CaseIndex (VERBATIM render/mc.h), looks up triCount = gTriCount[caseIdx] from
+# the host-uploaded 256-entry count table (built from render/mc.h::kTriTable), writes gCounts[cell] and
+# InterlockedAdd(gTotal[0], triCount) the grand total (the autoexposure_histogram integer-atomic
+# precedent — commutative -> order-independent -> deterministic). countEnabled=0 -> writes 0, no atomic.
+# The integer atomic lowers on Metal with NO MSL-2.2 feature -> the default MSL gen suffices (NO
+# --msl-version 20200 needed, the mc_classify lesson). Counts + total bit-exact GPU==CPU + cross-backend
+# by construction. Behind --mc-count only; existing shaders + goldens untouched.
+hf_gen_msl(mc_count.comp         mc_count.comp.hlsl         comp mc_count_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/
