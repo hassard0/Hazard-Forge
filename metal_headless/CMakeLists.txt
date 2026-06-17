@@ -229,6 +229,15 @@ hf_gen_msl(vt_sample.comp        vt_sample.comp.hlsl        comp vt_sample_main)
 # (NO --msl-version 20200). The cached atlas is bit-exact GPU==CPU + cross-backend AND byte-identical to a
 # full regen by construction. Behind --vt-cache only; goldens untouched.
 hf_gen_msl(vt_cachegen.comp      vt_cachegen.comp.hlsl      comp vt_cachegen_main)
+# GPU Isosurface Meshing Slice 1 (Slice MC1): mc_classify.comp classifies each voxel CELL into its 8-bit
+# MARCHING-CUBES case index — ONE thread per cell gathers its 8 cube-CORNER scalars from gField at the
+# canonical kCornerOffset and writes gCases[cell] = CaseIndex(corners,isovalue) (idx = Σ (corner[i] >
+# isovalue) << i, copied VERBATIM from render/mc.h); an order-independent per-cell integer write (no
+# atomics). classifyEnabled=0 -> writes 0. A pure integer SSBO compute (like vsm_mark.comp /
+# vt_feedback.comp — no atomics, no integer texture.read) -> the default MSL gen suffices (NO
+# --msl-version 20200 needed). The case set is bit-exact GPU==CPU + cross-backend by construction.
+# Behind --mc-classify only; existing shaders + goldens untouched.
+hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

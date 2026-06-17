@@ -434,6 +434,14 @@ hf_compile_shaders(
     # reference at EVERY pixel, full-frame, on any vendor. RWStructuredBuffer<uint> + InterlockedMin (the
     # existing InterlockedAdd family) + ReadBuffer -> NO new RHI; existing shaders + goldens untouched.
     "shaders/swraster.comp.hlsl:cs"
+    # GPU Isosurface Meshing Slice 1 (Slice MC1): mc_classify.comp classifies each voxel CELL into its
+    # 8-bit MARCHING-CUBES case index — ONE thread per cell decomposes its flat id -> (cx,cy,cz), gathers
+    # the 8 cube-CORNER scalars from gField at the canonical kCornerOffset, runs CaseIndex (idx = Σ
+    # (corner[i] > isovalue) << i) copied VERBATIM from render/mc.h, and writes gCases[cell]=caseIdx (an
+    # order-independent per-cell integer write — race-free, NO atomics). classifyEnabled=0 -> writes 0.
+    # Pure integer compute over an SSBO + ReadBuffer (the vsm_mark/vt_feedback surface) -> bit-exact
+    # GPU==CPU case set + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/mc_classify.comp.hlsl:cs"
     # Nanite Software-Raster RESOLVE blit (Slice SW4): swraster_resolve_blit.frag is a FULLSCREEN pass
     # (reuses post.vert) that unpacks the SW2 software rasterizer's packed depth|id visibility-buffer SSBO
     # into the R32_Uint visId render target the EXISTING visresolve.frag deferred resolve consumes, so the
