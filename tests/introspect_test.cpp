@@ -274,6 +274,8 @@ int main() {
             bool sawMcInterpFeature = false;
             // Slice MC5: the gpu-isosurface-meshing-render capability is advertised in the manifest.
             bool sawMcRenderFeature = false;
+            // Slice MC6: the gpu-isosurface-meshing-normals capability is advertised in the manifest.
+            bool sawMcNormalsFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -371,6 +373,7 @@ int main() {
                     if (AsString(el->value) == "gpu-isosurface-meshing-emit") sawMcEmitFeature = true;
                     if (AsString(el->value) == "gpu-isosurface-meshing-interp") sawMcInterpFeature = true;
                     if (AsString(el->value) == "gpu-isosurface-meshing-render") sawMcRenderFeature = true;
+                    if (AsString(el->value) == "gpu-isosurface-meshing-normals") sawMcNormalsFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -452,6 +455,7 @@ int main() {
             check(sawMcEmitFeature, "engine.features includes gpu-isosurface-meshing-emit");
             check(sawMcInterpFeature, "engine.features includes gpu-isosurface-meshing-interp");
             check(sawMcRenderFeature, "engine.features includes gpu-isosurface-meshing-render");
+            check(sawMcNormalsFeature, "engine.features includes gpu-isosurface-meshing-normals");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -610,6 +614,8 @@ int main() {
         bool sawMcInterpShot = false;
         // Slice MC5: the --mc-render-shot showcase flag is listed in the showcase manifest.
         bool sawMcRenderShot = false;
+        // Slice MC6: the --mc-normals-shot showcase flag is listed in the showcase manifest.
+        bool sawMcNormalsShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -711,6 +717,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-emit-shot") sawMcEmitShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-interp-shot") sawMcInterpShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-render-shot") sawMcRenderShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--mc-normals-shot") sawMcNormalsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -795,6 +802,7 @@ int main() {
         check(sawMcEmitShot, "showcases manifest includes --mc-emit-shot");
         check(sawMcInterpShot, "showcases manifest includes --mc-interp-shot");
         check(sawMcRenderShot, "showcases manifest includes --mc-render-shot");
+        check(sawMcNormalsShot, "showcases manifest includes --mc-normals-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
