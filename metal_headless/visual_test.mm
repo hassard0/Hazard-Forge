@@ -75,6 +75,7 @@
 #include "render/water.h"         // Slice CF: Gerstner water displacement/normal + the fixed wave set
 #include "render/clouds.h"        // Slice CH: deterministic cloud noise/density/Beer/HG (mirrored in clouds.frag)
 #include "render/taa.h"           // Slice AP: temporal anti-aliasing jitter + resolve-blend (pure math)
+#include "render/meshlet.h"         // Slice DS: virtual-geometry meshlet/cluster decomposition (pure CPU; shared with --meshlet-viz)
 #include "render/frustum.h"        // Slice AQ: Gribb-Hartmann frustum extraction + sphere cull (pure math)
 #include "render/gpu_cull.h"        // Slice AR: GPU-cull CPU mirror (ordered compaction + sphere test)
 #include "render/gpu_culled.h"      // Slice CD: compute cull+compact CPU mirror (model+material+texIndex)
@@ -91,6 +92,8 @@
 #include "editor/imgui_renderer.h"  // Slice BT: RHI-only Dear ImGui renderer (consumes MSL on Metal)
 #include "imgui.h"                   // Slice BT: Dear ImGui (NewFrame/Render + io setup)
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
@@ -13400,6 +13403,202 @@ static int RunDebugShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual-geometry meshlet/cluster decomposition viz (Slice DS, the Nanite-style arc BEACHHEAD).
+// Metal mirror of the Vulkan --meshlet-viz path in samples/hello_triangle/main.cpp. SphereGeometry(48,
+// 32) is decomposed by engine/render/meshlet.h's pure-CPU, integer-deterministic Morton-sort
+// BuildMeshlets into ~128-triangle clusters; the REORDERED index buffer is uploaded once and each
+// cluster is drawn as an index sub-range (firstIndex=3*triOffset, indexCount=3*triCount) with its
+// deterministic hashColor(i) pushed as a flat per-cluster color (model+color push constant). The
+// decomposition is pure CPU + bit-identical cross-backend by construction, so this image matches the
+// Vulkan capture (the camera uses FlipProjY(Proj)*View, the standard Metal-clip flip the showcases
+// apply, against the SAME 50deg/z=3 fixed framing). Passes: sky + meshlet + post (no shadow/lit). Prints
+// the SAME {tris,clusters,maxTris} + partition + determinism proof lines as the Vulkan showcase. New
+// golden tests/golden/metal/meshlet_viz.png; two runs DIFF 0.0000. -------------------------------------
+static int RunMeshletVizShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace vg = render::vg;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- The input mesh + its CPU decomposition (IDENTICAL to the Vulkan showcase). ---
+    scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+    vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+    const uint32_t triCountTotal = (uint32_t)(geo.indices.size() / 3);
+    const uint32_t clusterCount  = (uint32_t)ms.meshlets.size();
+
+    // --- PROOF 1: partition completeness — Sum(triCount) == T and every triangle appears exactly once
+    // (the reordered index multiset == the original). ---
+    uint32_t sumTri = 0;
+    for (const auto& m : ms.meshlets) sumTri += m.triCount;
+    bool everyTriOnce = (ms.indices.size() == (size_t)triCountTotal * 3);
+    {
+        auto sortedTris = [](const std::vector<uint32_t>& idx) {
+            std::vector<std::array<uint32_t, 3>> tris;
+            tris.reserve(idx.size() / 3);
+            for (size_t t = 0; t + 3 <= idx.size(); t += 3)
+                tris.push_back({idx[t], idx[t + 1], idx[t + 2]});
+            std::sort(tris.begin(), tris.end());
+            return tris;
+        };
+        everyTriOnce = everyTriOnce && (sortedTris(geo.indices) == sortedTris(ms.indices));
+    }
+    // --- PROOF 2: determinism — a second build is byte-identical. ---
+    vg::MeshletSet ms2 = vg::BuildMeshlets(geo.verts, geo.indices);
+    bool deterministic =
+        ms.meshlets.size() == ms2.meshlets.size() && ms.indices.size() == ms2.indices.size() &&
+        (ms.meshlets.empty() || std::memcmp(ms.meshlets.data(), ms2.meshlets.data(),
+                                  ms.meshlets.size() * sizeof(vg::Meshlet)) == 0) &&
+        (ms.indices.empty() || std::memcmp(ms.indices.data(), ms2.indices.data(),
+                                  ms.indices.size() * sizeof(uint32_t)) == 0);
+
+    // --- Upload the shared vertex buffer + the REORDERED index buffer. ---
+    rhi::BufferDesc vbd;
+    vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+    vbd.initialData = geo.verts.data();
+    vbd.usage = rhi::BufferUsage::Vertex;
+    auto vbuf = device->CreateBuffer(vbd);
+    rhi::BufferDesc ibd;
+    ibd.size = ms.indices.size() * sizeof(uint32_t);
+    ibd.initialData = ms.indices.data();
+    ibd.usage = rhi::BufferUsage::Index;
+    auto ibuf = device->CreateBuffer(ibd);
+
+    // --- Meshlet viz pipeline: per-cluster flat color + fixed-Lambert. Consumes only pos(0)+normal(3),
+    // so we feed a 2-attribute layout over the same stride-56 scene::Vertex buffer (pos@0, normal@32) —
+    // EXACTLY the Vulkan showcase's layout. NO texture/shadow; push = float4x4 model + float4 color. ---
+    auto mvVs = loadMSL("meshlet_viz.vert.gen.metal", "meshlet_viz_vertex");
+    auto mvFs = loadMSL("meshlet_viz.frag.gen.metal", "meshlet_viz_fragment");
+    rhi::GraphicsPipelineDesc mvDesc;
+    mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+    rhi::VertexLayout mvLayout;
+    mvLayout.stride = sizeof(scene::Vertex);  // 56
+    mvLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {3, rhi::Format::RGB32_Float, 32},
+    };
+    mvDesc.vertexLayout = mvLayout;
+    mvDesc.colorFormat = device->Swapchain().ColorFormat();
+    mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+    mvDesc.pushConstantSize = sizeof(float) * 20;   // float4x4 model + float4 color
+    auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+
+    // --- Fixed camera framing the unit sphere (deterministic, no clock/RNG). IDENTICAL to the Vulkan
+    // showcase; the Metal-clip Y-flip is applied via FlipProjY(Proj)*View so the capture matches. ---
+    runtime::Camera cam;
+    cam.position = {0.0f, 0.0f, 3.0f};
+    cam.yaw = 0.0f; cam.SetPitch(0.0f);
+    cam.fovY = 0.8726646f;  // 50 degrees
+    cam.aspect = aspect;
+    cam.znear = 0.1f; cam.zfar = 50.0f;
+
+    scene::Transform sphereXform;  // identity (unit sphere at origin)
+    Mat4 sphereModel = sphereXform.Matrix();
+
+    FrameData fd{};
+    {
+        Mat4 vp = FlipProjY(cam.Proj()) * cam.View();
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = cam.position.x; fd.viewPos[1] = cam.position.y;
+        fd.viewPos[2] = cam.position.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        runtime::CameraBasis cb = cam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("scene", {}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*mvPipeline);
+            cmd.BindVertexBuffer(*vbuf);
+            cmd.BindIndexBuffer(*ibuf);
+            // Per-cluster: push { model, hashColor(i) } and draw that cluster's index sub-range.
+            for (uint32_t ci = 0; ci < clusterCount; ++ci) {
+                const vg::Meshlet& m = ms.meshlets[ci];
+                Vec3 col = vg::hashColor(ci);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = sphereModel.m[k];
+                pc[16] = col.x; pc[17] = col.y; pc[18] = col.z; pc[19] = 1.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.DrawIndexed(m.triCount * 3, m.triOffset * 3, 0);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("meshlet: {tris:%u, clusters:%u, maxTris:%u}\n",
+                triCountTotal, clusterCount, vg::kMaxTrisPerCluster);
+    if (sumTri == triCountTotal && everyTriOnce)
+        std::printf("meshlet partition: COMPLETE (\xCE\xA3triCount==T, every tri once)\n");
+    else
+        std::printf("meshlet partition: BROKEN (sumTri=%u T=%u everyTriOnce=%d)\n",
+                    sumTri, triCountTotal, (int)everyTriOnce);
+    if (deterministic)
+        std::printf("meshlet determinism: two builds BYTE-IDENTICAL\n");
+    else
+        std::printf("meshlet determinism: FAILED (two builds differ)\n");
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    if (!(sumTri == triCountTotal && everyTriOnce && deterministic))
+        return fail("meshlet proof failed (partition/determinism)");
+    std::printf("OK wrote %s (%ux%u) — %u tris in %u clusters\n",
+                outPath, cw, ch, triCountTotal, clusterCount);
+    return 0;
+}
+
 // --- Frustum-culling visualization showcase (Slice AQ). Mirrors the Vulkan --cull-shot path: a
 // deterministic ground plane + a wide row of cubes/spheres across X, rendered from a pulled-back
 // OVERVIEW camera, with the actual (narrower) RENDER camera's frustum drawn as wireframe LINES and
@@ -21206,6 +21405,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cull") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cull.png";
             try { return RunCullShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --meshlet-viz <out.png>: render the virtual-geometry meshlet/cluster decomposition showcase
+        // (Slice DS, the Nanite-style arc beachhead). SphereGeometry(48,32) is decomposed by the pure-CPU
+        // engine/render/meshlet.h BuildMeshlets into ~128-tri clusters; each cluster is drawn as an index
+        // sub-range with its deterministic hashColor flat color. The decomposition is bit-identical
+        // cross-backend, so this image matches the Vulkan --meshlet-viz capture. New golden
+        // tests/golden/metal/meshlet_viz.png.
+        if (argc > 1 && std::strcmp(argv[1], "--meshlet-viz") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_meshlet_viz.png";
+            try { return RunMeshletVizShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gpu-cull <out.png>: render the GPU-driven culling + indirect-draw showcase (Slice AR) — a
