@@ -243,6 +243,168 @@ int main() {
         check(setCount > 1u, "UV grid marks >1 resident page (a real set)");
     }
 
+    // ================= Slice VT2: AllocatePhysicalTiles + VtTilePool + PhysicalTileOrigin =========
+    {
+        // Hand-verified ascending assignment: a known small feedback set -> a known indirection. Pages
+        // 0,2,5 resident in a 9-page set; pool cap 4 (>= 3 resident) -> all 3 allocated in ascending order:
+        // page 0 -> tile 0, page 2 -> tile 1, page 5 -> tile 2; the rest kNoTile.
+        std::vector<uint32_t> fb = {1, 0, 1, 0, 0, 1, 0, 0, 0};
+        vt::VtTilePool pool; pool.tilesPerSide = 2;   // cap = 4
+        check(pool.tileCapacity() == 4, "VtTilePool{2}.tileCapacity() == 4");
+        std::vector<int32_t> ind =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        check(ind.size() == fb.size(), "indirection sized feedback.size()");
+        check(ind[0] == 0, "page 0 (first resident) -> tile 0 (ascending)");
+        check(ind[1] == vt::kNoTile, "page 1 non-resident -> kNoTile");
+        check(ind[2] == 1, "page 2 (2nd resident) -> tile 1");
+        check(ind[3] == vt::kNoTile && ind[4] == vt::kNoTile, "pages 3,4 non-resident -> kNoTile");
+        check(ind[5] == 2, "page 5 (3rd resident) -> tile 2");
+        check(ind[6] == vt::kNoTile && ind[7] == vt::kNoTile && ind[8] == vt::kNoTile,
+              "trailing non-resident -> kNoTile");
+        check(vt::kNoTile == -1, "kNoTile == -1 (int32 CPU form)");
+        check(vt::kNoTileU32 == 0xFFFFFFFFu && (uint32_t)vt::kNoTile == vt::kNoTileU32,
+              "kNoTileU32 == 0xFFFFFFFF == (uint32_t)kNoTile (SSBO sentinel round-trip)");
+
+        // BuildIndirection is the same table.
+        std::vector<int32_t> ind2 =
+            vt::BuildIndirection(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        check(std::memcmp(ind.data(), ind2.data(), ind.size() * sizeof(int32_t)) == 0,
+              "BuildIndirection == AllocatePhysicalTiles");
+    }
+
+    // overflow: cap < resident -> exactly cap allocated, the rest kNoTile, ascending wins.
+    {
+        // 6-page set all resident; pool cap 4 -> first 4 (pages 0..3) get tiles 0..3, pages 4,5 overflow.
+        std::vector<uint32_t> fb = {1, 1, 1, 1, 1, 1};
+        vt::VtTilePool pool; pool.tilesPerSide = 2;   // cap = 4
+        std::vector<int32_t> ind =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        int allocated = 0; for (int32_t t : ind) if (t != vt::kNoTile) ++allocated;
+        check(allocated == 4, "overflow: exactly cap(4) allocated when resident(6) > cap");
+        check(ind[0] == 0 && ind[1] == 1 && ind[2] == 2 && ind[3] == 3,
+              "overflow: first cap pages (ascending) get tiles 0..3");
+        check(ind[4] == vt::kNoTile && ind[5] == vt::kNoTile,
+              "overflow: pages past cap -> kNoTile (ascending priority wins)");
+    }
+
+    // cap >= resident -> all resident allocated.
+    {
+        std::vector<uint32_t> fb = {0, 1, 0, 1, 0, 0, 1, 0};   // 3 resident
+        vt::VtTilePool pool; pool.tilesPerSide = 3;   // cap = 9 >= 3
+        std::vector<int32_t> ind =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        int allocated = 0, resident = 0;
+        for (size_t i = 0; i < fb.size(); ++i) {
+            if (fb[i]) ++resident;
+            if (ind[i] != vt::kNoTile) { ++allocated; check(fb[i] != 0u, "allocated tile implies resident"); }
+            else check(fb[i] == 0u, "kNoTile implies non-resident (cap >= resident)");
+        }
+        check(allocated == resident && resident == 3, "cap >= resident -> all resident allocated");
+        check(ind[1] == 0 && ind[3] == 1 && ind[6] == 2, "ascending: resident pages -> tiles 0,1,2");
+    }
+
+    // allocEnabled-off modeled as no-alloc -> all kNoTile. (The CPU models 'disabled' as an empty/zero
+    // feedback set; the GPU writes all kNoTile explicitly. Both yield an all-kNoTile indirection.)
+    {
+        std::vector<uint32_t> empty(20, 0u);   // no resident pages
+        vt::VtTilePool pool; pool.tilesPerSide = 4;
+        std::vector<int32_t> ind =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(empty.data(), empty.size()), pool);
+        bool allNoTile = true; for (int32_t t : ind) if (t != vt::kNoTile) allNoTile = false;
+        check(allNoTile, "allocEnabled-off / empty feedback -> all kNoTile (no-op)");
+    }
+
+    // tile indices unique + in [0, cap) + ascending-priority over the VT1 showcase scene.
+    {
+        // The real showcase: VT1 scene + the SAME 576 requests -> feedback -> alloc with tilesPerSide=12.
+        std::vector<vt::SampleRequest> requests;
+        const int kGrid = 24;
+        for (int gy = 0; gy < kGrid; ++gy)
+            for (int gx = 0; gx < kGrid; ++gx) {
+                float u = (float)gx / (float)kGrid, v = (float)gy / (float)kGrid;
+                int mip = (gx + gy) % vtx.mipLevels;
+                requests.push_back({u, v, mip});
+            }
+        std::vector<uint32_t> feedback((size_t)pageCount, 0u);
+        vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                              std::span<uint32_t>(feedback.data(), feedback.size()));
+        int resident = 0; for (uint32_t f : feedback) resident += (f != 0u);
+
+        vt::VtTilePool pool; pool.tilesPerSide = 12;   // cap = 144 < resident (overflow exercised)
+        const int cap = pool.tileCapacity();
+        check(cap == 144, "showcase pool cap == 144");
+        check(resident > cap, "showcase resident > cap (overflow path exercised)");
+
+        std::vector<int32_t> ind =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(feedback.data(), feedback.size()), pool);
+
+        // Tile indices unique + in [0, cap); allocated count == min(resident, cap); ascending-priority:
+        // the first `cap` resident pages by pageId are exactly the allocated ones, tiles assigned 0..cap-1
+        // in pageId order.
+        std::vector<uint8_t> tileSeen((size_t)cap, 0);
+        int allocated = 0, expectTile = 0;
+        bool uniqueInRange = true, ascending = true, overflowKNoTile = true;
+        int residentSeen = 0;
+        for (size_t pageId = 0; pageId < feedback.size(); ++pageId) {
+            int32_t t = ind[pageId];
+            if (feedback[pageId] != 0u) {
+                ++residentSeen;
+                if (residentSeen <= cap) {
+                    // within capacity -> must be allocated, in order
+                    if (t != expectTile) ascending = false;
+                    ++expectTile;
+                } else {
+                    // overflow resident -> kNoTile
+                    if (t != vt::kNoTile) overflowKNoTile = false;
+                }
+            } else {
+                if (t != vt::kNoTile) uniqueInRange = false;  // non-resident must be kNoTile
+            }
+            if (t != vt::kNoTile) {
+                ++allocated;
+                if (t < 0 || t >= cap) uniqueInRange = false;
+                else { if (tileSeen[(size_t)t]) uniqueInRange = false; tileSeen[(size_t)t] = 1; }
+            }
+        }
+        check(allocated == cap, "showcase allocated == min(resident,cap) == cap (overflow)");
+        check(uniqueInRange, "allocated tile indices unique + in [0,cap), non-resident kNoTile");
+        check(ascending, "ascending-priority: first cap resident pages get tiles 0..cap-1 in pageId order");
+        check(overflowKNoTile, "overflow resident pages (past cap) -> kNoTile");
+    }
+
+    // PhysicalTileOrigin corners (row-major layout).
+    {
+        vt::VtTilePool pool; pool.tilesPerSide = 12;
+        const int ps = vtx.pageSize;  // 128
+        int ox, oy;
+        vt::PhysicalTileOrigin(0, pool, ps, ox, oy);
+        check(ox == 0 && oy == 0, "tile 0 origin (0,0)");
+        vt::PhysicalTileOrigin(1, pool, ps, ox, oy);
+        check(ox == ps && oy == 0, "tile 1 origin (pageSize,0)");
+        vt::PhysicalTileOrigin(11, pool, ps, ox, oy);
+        check(ox == 11 * ps && oy == 0, "tile 11 (row 0 last) origin (11*ps,0)");
+        vt::PhysicalTileOrigin(12, pool, ps, ox, oy);
+        check(ox == 0 && oy == ps, "tile 12 (row 1 first) origin (0,pageSize)");
+        vt::PhysicalTileOrigin(13, pool, ps, ox, oy);
+        check(ox == ps && oy == ps, "tile 13 origin (pageSize,pageSize)");
+        vt::PhysicalTileOrigin(143, pool, ps, ox, oy);
+        check(ox == 11 * ps && oy == 11 * ps, "tile 143 (last) origin (11*ps,11*ps)");
+    }
+
+    // determinism: two AllocatePhysicalTiles passes byte-identical.
+    {
+        std::vector<uint32_t> fb((size_t)pageCount, 0u);
+        for (int i = 0; i < pageCount; i += 3) fb[(size_t)i] = 1u;  // a deterministic resident subset
+        vt::VtTilePool pool; pool.tilesPerSide = 12;
+        std::vector<int32_t> a =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        std::vector<int32_t> b =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(int32_t)) == 0,
+              "AllocatePhysicalTiles deterministic (two passes byte-identical)");
+    }
+
     if (g_fail == 0) std::printf("vt_test: ALL PASS\n");
     else std::printf("vt_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

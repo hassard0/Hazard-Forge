@@ -191,4 +191,71 @@ inline void MarkFeedbackPages(std::span<const SampleRequest> requests, const VtT
     }
 }
 
+// ============================ Slice VT2 — physical tile pool + indirection (pure CPU) ==========
+// VT1 produced the resident page SET (feedback[pageId] in {0,1}); VT2 assigns each resident virtual
+// page a PHYSICAL tile in a finite tile pool (a deterministic integer virtual->physical indirection
+// table the future sampling pass reads). ZERO backend symbols — the same above-seam discipline as VT1;
+// the DIRECT analog of VSM Slice VB's AllocatePhysicalPages (vsm.h), applied to TEXTURE pages. The
+// allocator's ascending-priority determinism (the make-or-break for GPU==CPU + cross-backend) carries
+// over unchanged: ascending pageId == mip-major == finest-mip-first priority (the nearest/most-detailed
+// pages win the pool when it overflows). This slice produces ONLY the tile ASSIGNMENT + indirection
+// table — no pixels (procedural page CONTENT is VT3).
+
+// Sentinel: a virtual page with NO physical tile (non-resident, OR overflowed past the pool capacity).
+// kNoTile is -1 in the int32 CPU/return form; the GPU SSBO uses 0xFFFFFFFF, cast to -1 on read-back.
+// (Mirrors VSM's kNoTile (vsm.h), expressed as a signed int32 to match AllocatePhysicalTiles' return.)
+inline constexpr int32_t  kNoTile      = -1;
+inline constexpr uint32_t kNoTileU32   = 0xFFFFFFFFu;  // the SSBO sentinel (== (uint32_t)kNoTile)
+
+// The physical tile pool: a finite square of tilesPerSide² tiles, each holding one pageSize² page.
+// (e.g. tilesPerSide=12 -> 144 physical tiles for VT1's 340 virtual pages — deliberately SMALLER than
+// pageCount() so the overflow/kNoTile path is exercised.) Mirrors vsm.h::VsmAtlas.
+struct VtTilePool {
+    int tilesPerSide = 12;
+
+    int tileCapacity() const { return tilesPerSide * tilesPerSide; }
+};
+
+// The physical-atlas pixel origin (top-left) of tile `tileIndex` in the pool. Tiles are row-major:
+// ox = (tileIndex % tilesPerSide) * pageSize; oy = (tileIndex / tilesPerSide) * pageSize. Integer,
+// exact. Mirrors vsm.h::PhysicalTileOrigin (texture pages, not shadow tiles).
+inline void PhysicalTileOrigin(int tileIndex, const VtTilePool& pool, int pageSize, int& ox, int& oy) {
+    const int tps = pool.tilesPerSide;
+    ox = (tileIndex % tps) * pageSize;
+    oy = (tileIndex / tps) * pageSize;
+}
+
+// THE DETERMINISTIC ALLOCATOR (the vsm.h::AllocatePhysicalPages analog). Walk pageId 0..feedback.size()-1
+// in ASCENDING order; each resident page (feedback[pageId]==1) gets the NEXT sequential physical tile
+// index while nextTile < pool.tileCapacity(); non-resident pages — and resident pages that overflow past
+// the capacity — get kNoTile. Returns the indirection table (sized feedback.size() == pageCount()).
+//
+// PRIORITY = ascending pageId. PageId is mip-major (id = mipPageOffset(mip) + py*pps + px), so ascending
+// pageId == mip 0 (the finest, highest-detail mip) first, then mip 1, ... — i.e. the FINEST/NEAREST mip
+// pages get the lowest tile indices and are allocated FIRST. That is the sane VT priority for an overflow
+// cap (keep the near, high-detail pages; drop the far, coarse ones) — the same ascending=finest-first
+// priority VSM uses. Allocation is INHERENTLY sequential (nextTile depends on prior assignments), so the
+// GPU side mirrors this with a single-thread serial scan (shaders/vt_alloc.comp). Pure integer +
+// order-deterministic -> bit-exact two-run + a CPU reference the showcase memcmp's against.
+inline std::vector<int32_t> AllocatePhysicalTiles(std::span<const uint32_t> feedback,
+                                                  const VtTilePool& pool) {
+    std::vector<int32_t> indirection(feedback.size(), kNoTile);
+    const int cap = pool.tileCapacity();
+    int nextTile = 0;
+    for (size_t pageId = 0; pageId < feedback.size(); ++pageId) {
+        if (feedback[pageId] != 0u && nextTile < cap) {
+            indirection[pageId] = nextTile;
+            ++nextTile;
+        } else {
+            indirection[pageId] = kNoTile;  // non-resident OR overflowed past the cap
+        }
+    }
+    return indirection;
+}
+
+// Convenience alias — the indirection table IS the allocation. (Spec's BuildIndirection.)
+inline std::vector<int32_t> BuildIndirection(std::span<const uint32_t> feedback, const VtTilePool& pool) {
+    return AllocatePhysicalTiles(feedback, pool);
+}
+
 }  // namespace hf::render::vt
