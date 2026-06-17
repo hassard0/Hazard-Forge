@@ -268,6 +268,8 @@ int main() {
             bool sawMcClassifyFeature = false;
             // Slice MC2: the gpu-isosurface-meshing-count capability is advertised in the manifest.
             bool sawMcCountFeature = false;
+            // Slice MC3: the gpu-isosurface-meshing-emit capability is advertised in the manifest.
+            bool sawMcEmitFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -362,6 +364,7 @@ int main() {
                     if (AsString(el->value) == "runtime-virtual-texturing-cache") sawVtCacheFeature = true;
                     if (AsString(el->value) == "gpu-isosurface-meshing-classify") sawMcClassifyFeature = true;
                     if (AsString(el->value) == "gpu-isosurface-meshing-count") sawMcCountFeature = true;
+                    if (AsString(el->value) == "gpu-isosurface-meshing-emit") sawMcEmitFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -440,6 +443,7 @@ int main() {
             check(sawVtCacheFeature, "engine.features includes runtime-virtual-texturing-cache");
             check(sawMcClassifyFeature, "engine.features includes gpu-isosurface-meshing-classify");
             check(sawMcCountFeature, "engine.features includes gpu-isosurface-meshing-count");
+            check(sawMcEmitFeature, "engine.features includes gpu-isosurface-meshing-emit");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -592,6 +596,8 @@ int main() {
         bool sawMcClassifyShot = false;
         // Slice MC2: the --mc-count-shot showcase flag is listed in the showcase manifest.
         bool sawMcCountShot = false;
+        // Slice MC3: the --mc-emit-shot showcase flag is listed in the showcase manifest.
+        bool sawMcEmitShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -690,6 +696,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--vt-cache-shot") sawVtCacheShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-classify-shot") sawMcClassifyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-count-shot") sawMcCountShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--mc-emit-shot") sawMcEmitShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -771,6 +778,7 @@ int main() {
         check(sawVtCacheShot, "showcases manifest includes --vt-cache-shot");
         check(sawMcClassifyShot, "showcases manifest includes --mc-classify-shot");
         check(sawMcCountShot, "showcases manifest includes --mc-count-shot");
+        check(sawMcEmitShot, "showcases manifest includes --mc-emit-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
