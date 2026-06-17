@@ -150,6 +150,7 @@ const Showcase kShowcases[] = {
     {"--gpucull-draw-shot", "Fully-GPU-driven-culled pass (compute frustum-cull -> compacted MDI + bindless; GPU decides AND draws; gpu-culled==CPU-culled byte-identical, gpu drawn==cpuRef)."},
     {"--cluster-cull-shot", "Virtual-geometry per-CLUSTER frustum cull -> indirect cluster draw (Slice DT: an instance grid of DS-clustered spheres is decomposed into (instance x cluster) records each with a per-cluster world bounding sphere; a compute shader frustum-culls + ORDER-compacts the survivors into the MDI command buffer + the compacted per-draw SSBO + writes the survivor count, then ONE DrawIndexedMultiIndirect renders exactly the in-frustum cluster-instances; the per-cluster analogue of the per-OBJECT GPU cull — GPU draw-count == CPU SurvivorClusterCount frustum.h reference EXACT, GPU-culled image == CPU-CullClusterInstances image byte-identical, all-in-frustum == full unculled draw byte-identical, two-run deterministic; no new RHI)."},
     {"--hiz-cull-shot",     "Hi-Z occlusion culling (depth pre-pass -> Hi-Z max-depth pyramid -> compute frustum+occlusion cull; objects fully hidden behind a near occluder are dropped; occlusion-culled==frustum-only byte-identical, occluded>0, gpu occluded==cpu hiz reference)."},
+    {"--cluster-hiz-shot",  "Virtual-geometry per-CLUSTER Hi-Z occlusion cull -> indirect cluster draw (Slice DU: DT's per-cluster frustum cull PLUS CJ's Hi-Z occlusion test at cluster granularity; an occluder wall in front of a back row of DS-clustered spheres + non-occluded spheres; a depth pre-pass -> Hi-Z max-depth pyramid -> a compute shader frustum-culls THEN drops any cluster-instance whose bounding-sphere AABB is fully hidden behind the occluder, ORDER-compacts the survivors into the MDI buffer + writes the survivor count, then ONE DrawIndexedMultiIndirect renders exactly the visible cluster-instances; conservative -> occlusion-culled==frustum-only byte-identical, occlusion-disabled==DT byte-identical, survivor count DROPS, GPU count==CPU SurvivorClusterCountHiZ + GPU-culled==CPU-CullClusterInstancesHiZ byte-identical, two-run deterministic; no new RHI)."},
     {"--mt-shot",           "Multithreaded command recording (per-thread secondaries, 1-vs-N identical)."},
     {"--editor-shot",       "Docked editor UI (Scene Hierarchy / Inspector / Stats panels around a central scene Viewport, fixed selected entity)."},
     {"--editor-edit-shot",  "Editor live-edit: apply a fixed transform+material edit to the selected entity, render the EDITED docked scene, round-trip through scene_io (DumpScene/LoadScene)."},
@@ -241,6 +242,7 @@ const char* kFeatures[] = {
     "client-prediction",
     "virtual-geometry-meshlets",
     "virtual-geometry-cluster-cull",
+    "virtual-geometry-cluster-hiz",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

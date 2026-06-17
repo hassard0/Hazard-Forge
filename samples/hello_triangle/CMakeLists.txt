@@ -357,6 +357,14 @@ hf_compile_shaders(
     # mirror: render/cluster_cull.h. NO new RHI; existing shaders + goldens untouched.
     "shaders/cluster_cull.comp.hlsl:cs"
     "shaders/cluster_viz.vert.hlsl:vs"
+    # Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): DT's cluster_cull.comp PLUS CJ's
+    # hiz_cull.comp occlusion test. After the frustum test, a frustum-surviving cluster-instance is ALSO
+    # tested against a Hi-Z max-depth pyramid (built CPU-side from a depth pre-pass + uploaded; render/hiz.h)
+    # and dropped iff its bounding-sphere AABB is fully hidden behind closer geometry; SphereOutside +
+    # IsOccluded are copied VERBATIM; SAME ordered single-workgroup prefix-sum compaction. CONSERVATIVE ->
+    # occlusion-culled == frustum-only byte-identical. CPU mirror: render/cluster_cull.h::CullClusterInstancesHiZ.
+    # NO new RHI; existing shaders + goldens untouched.
+    "shaders/cluster_hiz_cull.comp.hlsl:cs"
     # Hi-Z OCCLUSION cull (Slice CJ): extends gpudriven_cull with a hierarchical-Z occlusion test —
     # after the frustum test, an object FULLY HIDDEN behind closer geometry (its screen-rect nearest
     # depth farther than the Hi-Z max everywhere it covers) is dropped from the compacted survivors.

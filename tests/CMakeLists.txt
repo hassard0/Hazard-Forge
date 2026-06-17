@@ -538,6 +538,15 @@ hf_add_pure_test(gpu_cull_test)
 # and the conservative-keep contract (a straddling sphere is KEPT). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(cluster_cull_test)
 
+# Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): the CPU MIRROR of
+# shaders/cluster_hiz_cull.comp.hlsl (render/cluster_cull.h::CullClusterInstancesHiZ) — DT's frustum cull
+# PLUS the Hi-Z occlusion test over the cluster's bounding-sphere AABB. Pins occlusionEnabled=false ==
+# CullClusterInstances (DT) byte-identical (the disabled-path guarantee), a cluster fully behind the Hi-Z
+# DROPPED / a cluster in front KEPT, conservative-keep (near-plane/off-screen -> KEPT), occlusion survivor
+# count <= frustum-only, the dropped set subset of the frustum-surviving set, determinism, and MdiCommand
+# field preservation. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(cluster_hiz_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)

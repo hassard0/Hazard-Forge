@@ -33,6 +33,7 @@
 #include "math/math.h"
 #include "render/frustum.h"
 #include "render/gpu_cull.h"
+#include "render/hiz.h"
 #include "render/meshlet.h"
 #include "render/mdi.h"
 
@@ -107,6 +108,68 @@ inline uint32_t SurvivorClusterCount(std::span<const ClusterInstance> clusters,
     uint32_t count = 0;
     for (const ClusterInstance& ci : clusters)
         if (!frustum::SphereOutside(f, ci.worldCenter, ci.worldRadius)) ++count;
+    return count;
+}
+
+// Slice DU — the cluster bounding-sphere AABB the Hi-Z occlusion test projects: the conservative world
+// AABB [worldCenter - worldRadius, worldCenter + worldRadius] of the cluster's bounding sphere. It encloses
+// the cluster (the sphere encloses every triangle, the AABB encloses the sphere), so hiz::IsOccluded over
+// it never false-culls a visible cluster. A tighter oriented per-cluster AABB is a later refinement (YAGNI).
+inline void ClusterAabb(const ClusterInstance& ci, math::Vec3& outMin, math::Vec3& outMax) {
+    const float r = ci.worldRadius;
+    outMin = {ci.worldCenter.x - r, ci.worldCenter.y - r, ci.worldCenter.z - r};
+    outMax = {ci.worldCenter.x + r, ci.worldCenter.y + r, ci.worldCenter.z + r};
+}
+
+// Slice DU — CULL + ORDERED COMPACT with an ADDED Hi-Z OCCLUSION test (the CPU mirror of
+// shaders/cluster_hiz_cull.comp.hlsl). DT's frustum cull (render::frustum::SphereOutside) PLUS: for each
+// frustum-SURVIVING cluster-instance, if `occlusionEnabled && hiz::IsOccluded(aabbMin,aabbMax,viewProj,w,h,
+// mips)` over the cluster's bounding-sphere AABB -> DROP it (it is fully hidden behind closer geometry);
+// else emit the MdiCommand (the SAME source-ordered compaction as DT). The Hi-Z test is CONSERVATIVE (only
+// drops clusters guaranteed fully occluded), so the occlusion-on survivor render is byte-identical to the
+// frustum-only render. `occlusionEnabled=false` -> IDENTICAL to CullClusterInstances (the disabled-path
+// guarantee: same survivors, same order, same MdiCommand fields). Pure, no GPU.
+inline std::vector<mdi::MdiCommand> CullClusterInstancesHiZ(
+        std::span<const ClusterInstance> clusters, const frustum::Frustum& f,
+        const math::Mat4& viewProj, int screenW, int screenH,
+        std::span<const hiz::HiZMip> mips, bool occlusionEnabled) {
+    std::vector<mdi::MdiCommand> out;
+    out.reserve(clusters.size());
+    for (uint32_t i = 0; i < (uint32_t)clusters.size(); ++i) {
+        const ClusterInstance& ci = clusters[i];
+        if (frustum::SphereOutside(f, ci.worldCenter, ci.worldRadius)) continue;  // outside frustum -> culled
+        if (occlusionEnabled) {
+            math::Vec3 amn, amx;
+            ClusterAabb(ci, amn, amx);
+            if (hiz::IsOccluded(amn, amx, viewProj, screenW, screenH, mips)) continue;  // fully hidden -> culled
+        }
+        mdi::MdiCommand c{};
+        c.indexCount    = ci.triCount * 3u;
+        c.instanceCount = 1u;
+        c.firstIndex    = ci.triOffset * 3u;
+        c.vertexOffset  = 0u;
+        c.firstInstance = i;            // SOURCE cluster-instance index (the per-draw fetch key)
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Slice DU — convenience: the survivor COUNT with the added Hi-Z occlusion test (same scan as
+// CullClusterInstancesHiZ). `occlusionEnabled=false` -> equals SurvivorClusterCount.
+inline uint32_t SurvivorClusterCountHiZ(std::span<const ClusterInstance> clusters,
+                                        const frustum::Frustum& f, const math::Mat4& viewProj,
+                                        int screenW, int screenH,
+                                        std::span<const hiz::HiZMip> mips, bool occlusionEnabled) {
+    uint32_t count = 0;
+    for (const ClusterInstance& ci : clusters) {
+        if (frustum::SphereOutside(f, ci.worldCenter, ci.worldRadius)) continue;
+        if (occlusionEnabled) {
+            math::Vec3 amn, amx;
+            ClusterAabb(ci, amn, amx);
+            if (hiz::IsOccluded(amn, amx, viewProj, screenW, screenH, mips)) continue;
+        }
+        ++count;
+    }
     return count;
 }
 

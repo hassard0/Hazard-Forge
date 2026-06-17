@@ -128,6 +128,7 @@ $Goldens = @(
     @{ Name = 'gpucull_draw';  Flag = '--gpucull-draw' }        # Slice CD (fully-GPU-driven-CULLED pass: compute-cull -> MDI + bindless; Metal renders the identical CPU-frustum-culled survivor subset per-object bound)
     @{ Name = 'cluster_cull';  Flag = '--cluster-cull' }        # Slice DT (virtual-geometry per-CLUSTER frustum cull -> indirect cluster draw: an instance grid of DS-clustered spheres culled at (instance x cluster) granularity on the GPU via compute-cull -> MDI; Metal renders the identical CPU-frustum-culled surviving cluster-instances per-cluster bound; gpu-culled==cpu-culled byte-identical, gpu count==cpu frustum.h)
     @{ Name = 'hiz_cull';      Flag = '--hiz-cull' }            # Slice CJ (Hi-Z occlusion cull: depth pre-pass -> Hi-Z pyramid -> frustum+occlusion cull; Metal renders the identical CPU-occlusion-culled visible survivor subset per-object bound; occlusion-culled==frustum-only)
+    @{ Name = 'cluster_hiz';   Flag = '--cluster-hiz' }         # Slice DU (virtual-geometry per-CLUSTER Hi-Z occlusion cull: DT's per-cluster frustum cull PLUS CJ's Hi-Z occlusion test; an occluder wall hides a back row of DS-clustered spheres; Metal renders the identical CPU-occlusion-culled visible cluster-instance subset per-cluster bound; occlusion-culled==frustum-only byte-identical, survivor count drops, gpu count==cpu SurvivorClusterCountHiZ)
     @{ Name = 'mt';            Flag = '--mt' }                   # Slice AU (multithreaded recording; Metal N=4 parallel encoder)
     @{ Name = 'game';          Flag = '--game' }                # Slice AX (playable roll-a-ball game sample)
     @{ Name = 'net';           Flag = '--net' }                 # Slice BQ (replication; replica reconstructs + renders the scene)
@@ -302,7 +303,7 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 # lit_ddgi pass which binds the per-frame dummy shadow map, and were never validation-gated before —
 # they emitted 8x VUID-vkCmdDraw-None-09600 (sampled-image layout) until DQ added the missing
 # SHADER_READ_ONLY transition. Gating them here keeps the GI path validation-clean permanently.
-`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--cluster-cull-shot'), @('--hiz-cull-shot'), @('--ddgi-shot'), @('--ddgimb-shot'), @('--ddgiocc-shot'), @('--probedist-shot'), @('--probegi-shot'), @('--probecapture-shot'), @('--probesh-shot'), @('--probeinterp-shot'), @('--meshlet-viz'))
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--cluster-cull-shot'), @('--hiz-cull-shot'), @('--cluster-hiz-shot'), @('--ddgi-shot'), @('--ddgimb-shot'), @('--ddgiocc-shot'), @('--probedist-shot'), @('--probegi-shot'), @('--probecapture-shot'), @('--probesh-shot'), @('--probeinterp-shot'), @('--meshlet-viz'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))

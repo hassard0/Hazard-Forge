@@ -15549,6 +15549,267 @@ static int RunHizCullShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull showcase (Slice DU). The TRUE pass (a CPU depth
+// pre-pass rasterizes an occluder wall -> Hi-Z max-depth pyramid -> a compute shader cluster_hiz_cull.comp
+// frustum-culls THEN Hi-Z-occlusion-culls the (instance x cluster) records + ORDER-compacts the survivors
+// into the MDI command buffer, then ONE DrawIndexedMultiIndirect over cluster_viz.vert + meshlet_viz.frag)
+// is the VULKAN demonstration (--cluster-hiz-shot). Here Metal renders the IDENTICAL scene — an occluder
+// WALL in front of a BACK ROW of DS-clustered spheres (fully hidden) + side spheres (visible) — via the
+// CPU per-cluster BOUND path: the SAME render::vg::CullClusterInstancesHiZ (the exact mirror of the GPU
+// compute) decides the VISIBLE survivors (frustum AND not occluded), and only those cluster-instances are
+// drawn (per-cluster, source order) via the meshlet_viz push-constant path; the wall is drawn in both. The
+// image is backend-identical to the Vulkan GPU-culled image (which is itself byte-identical to the Vulkan
+// frustum-only render — the occluded clusters were fully hidden). The cull frustum + the Hi-Z depth pre-pass
+// use the SAME FlipProjY-composed view-proj the renderer uses (Metal clip), so the survivor SET matches
+// Vulkan geometrically. Same CPU-bound convention as --cluster-cull / --hiz-cull (cluster_hiz_cull.comp is
+// NOT in the Metal MSL-gen list; the Vulkan side carries the GPU==CPU proof). New golden
+// tests/golden/metal/cluster_hiz.png; two runs DIFF 0.0000. Prints the SAME stat line as Vulkan.
+static int RunClusterHizShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace fr = render::frustum;
+    namespace hz = render::hiz;
+    namespace vg = render::vg;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    const int SW = (int)W, SH = (int)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- The shared cluster mesh + its DS decomposition (the SAME SphereGeometry(48,32) -> 24 clusters). ---
+    scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+    vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+    const uint32_t clustersPerMesh = (uint32_t)ms.meshlets.size();
+
+    // --- The instance grid: IDENTICAL builder to the Vulkan --cluster-hiz-shot (back row hidden behind the
+    // wall + side spheres visible). ---
+    std::vector<Mat4> instanceModels;
+    for (int gi = 0; gi < 3; ++gi)
+        instanceModels.push_back(Mat4::Translate({(float)(gi - 1) * 1.6f, 0.0f, -10.0f}));
+    instanceModels.push_back(Mat4::Translate({-6.5f, 0.0f, -6.0f}));
+    instanceModels.push_back(Mat4::Translate({ 6.5f, 0.0f, -6.0f}));
+    const int kInstances = (int)instanceModels.size();
+
+    std::vector<vg::ClusterInstance> clusters = vg::BuildClusterInstances(
+        std::span<const Mat4>(instanceModels.data(), instanceModels.size()), ms);
+    const uint32_t kClusterInstances = (uint32_t)clusters.size();
+
+    // --- The render/cull camera (SAME pose/FOV/clips as Vulkan; FlipProjY composes Metal clip). ---
+    const Vec3 eye{0.0f, 0.0f, 6.0f};
+    const Vec3 center{0.0f, 0.0f, -6.0f};
+    Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 proj = FlipProjY(Mat4::Perspective(1.0471976f /*60deg*/, aspect, 0.3f, 100.0f));
+    Mat4 vp = proj * view;
+    fr::Frustum cullFrustum = fr::FromViewProj(vp);
+
+    // --- The OCCLUDER WALL (IDENTICAL to Vulkan). ---
+    const Vec3 wallCenter{0.0f, 0.0f, -2.0f};
+    const Vec3 wallScale{6.0f, 5.0f, 0.3f};
+    Mat4 wallModel = Mat4::Translate(wallCenter) * Mat4::Scale(wallScale);
+
+    // CPU depth pre-pass: rasterize the wall's front face into a w*h depth buffer (the SAME algorithm as
+    // Vulkan; the FlipProjY-composed vp gives the Metal-clip NDC z). Build the Hi-Z.
+    std::vector<float> depthBuf((size_t)SW * SH, 1.0f);
+    auto projectToScreen = [&](const Vec3& local, float& sx, float& sy, float& sz, bool& ok) {
+        Vec3 wp = math::MulPoint(wallModel, local);
+        float cw = 0.0f;
+        Vec3 ndc = math::MulPointDivide(vp, wp, cw);
+        ok = (cw > 1e-6f);
+        sx = (ndc.x * 0.5f + 0.5f) * (float)SW;
+        sy = (ndc.y * 0.5f + 0.5f) * (float)SH;
+        sz = ndc.z;
+    };
+    const Vec3 faceLocal[4] = {{-0.5f,-0.5f,0.5f},{0.5f,-0.5f,0.5f},{0.5f,0.5f,0.5f},{-0.5f,0.5f,0.5f}};
+    float fsx[4], fsy[4], fsz[4]; bool fok[4] = {true,true,true,true};
+    for (int k = 0; k < 4; ++k) projectToScreen(faceLocal[k], fsx[k], fsy[k], fsz[k], fok[k]);
+    bool wallProjectable = fok[0] && fok[1] && fok[2] && fok[3];
+    auto rasterTri = [&](int i0, int i1, int i2) {
+        float x0 = fsx[i0], y0 = fsy[i0], z0 = fsz[i0];
+        float x1 = fsx[i1], y1 = fsy[i1], z1 = fsz[i1];
+        float x2 = fsx[i2], y2 = fsy[i2], z2 = fsz[i2];
+        float minx = std::floor(std::min(x0, std::min(x1, x2)));
+        float maxx = std::ceil (std::max(x0, std::max(x1, x2)));
+        float miny = std::floor(std::min(y0, std::min(y1, y2)));
+        float maxy = std::ceil (std::max(y0, std::max(y1, y2)));
+        int ix0 = std::max(0, (int)minx), ix1 = std::min(SW - 1, (int)maxx);
+        int iy0 = std::max(0, (int)miny), iy1 = std::min(SH - 1, (int)maxy);
+        float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if (std::fabs(area) < 1e-6f) return;
+        float invArea = 1.0f / area;
+        for (int py = iy0; py <= iy1; ++py)
+            for (int px = ix0; px <= ix1; ++px) {
+                float sx = (float)px + 0.5f, sy = (float)py + 0.5f;
+                float w0 = ((x1 - sx) * (y2 - sy) - (x2 - sx) * (y1 - sy)) * invArea;
+                float w1 = ((x2 - sx) * (y0 - sy) - (x0 - sx) * (y2 - sy)) * invArea;
+                float w2 = 1.0f - w0 - w1;
+                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
+                float z = w0 * z0 + w1 * z1 + w2 * z2;
+                size_t idx = (size_t)py * SW + px;
+                if (z < depthBuf[idx]) depthBuf[idx] = z;
+            }
+    };
+    if (wallProjectable) { rasterTri(0, 1, 2); rasterTri(0, 2, 3); }
+    std::vector<hz::HiZMip> hizMips;
+    hz::BuildHiZ(depthBuf.data(), SW, SH, hizMips);
+    std::span<const hz::HiZMip> hizSpan(hizMips.data(), hizMips.size());
+
+    // CPU cull (the exact mirror of the GPU compute): the occlusion-ON (Hi-Z) survivor MdiCommands + the
+    // frustum-only survivors, in source order — what we render + the counts.
+    std::span<const vg::ClusterInstance> clusterSpan(clusters.data(), clusters.size());
+    std::vector<render::mdi::MdiCommand> hizCmds =
+        vg::CullClusterInstancesHiZ(clusterSpan, cullFrustum, vp, SW, SH, hizSpan, /*occ=*/true);
+    const uint32_t frustumSurvivors =
+        vg::SurvivorClusterCountHiZ(clusterSpan, cullFrustum, vp, SW, SH, hizSpan, false);
+    const uint32_t hizSurvivors = (uint32_t)hizCmds.size();
+    const uint32_t occluded = frustumSurvivors - hizSurvivors;
+    if (!(occluded > 0 && hizSurvivors < frustumSurvivors))
+        return fail("cluster-hiz: no measurable occlusion (occluder/scene framing wrong)");
+
+    // --- Upload the shared cluster vertex + reordered index buffers + the wall mesh. ---
+    rhi::BufferDesc vbd;
+    vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+    vbd.initialData = geo.verts.data(); vbd.usage = rhi::BufferUsage::Vertex;
+    auto vbuf = device->CreateBuffer(vbd);
+    rhi::BufferDesc ibd;
+    ibd.size = ms.indices.size() * sizeof(uint32_t);
+    ibd.initialData = ms.indices.data(); ibd.usage = rhi::BufferUsage::Index;
+    auto ibuf = device->CreateBuffer(ibd);
+    scene::MeshGeometry wallGeo = scene::CubeGeometry();
+    rhi::BufferDesc wvbd; wvbd.size = wallGeo.verts.size() * sizeof(scene::Vertex);
+    wvbd.initialData = wallGeo.verts.data(); wvbd.usage = rhi::BufferUsage::Vertex;
+    auto wallVB = device->CreateBuffer(wvbd);
+    rhi::BufferDesc wibd; wibd.size = wallGeo.indices.size() * sizeof(uint32_t);
+    wibd.initialData = wallGeo.indices.data(); wibd.usage = rhi::BufferUsage::Index;
+    auto wallIB = device->CreateBuffer(wibd);
+    const uint32_t wallIdxCount = (uint32_t)wallGeo.indices.size();
+
+    auto mvVs = loadMSL("meshlet_viz.vert.gen.metal", "meshlet_viz_vertex");
+    auto mvFs = loadMSL("meshlet_viz.frag.gen.metal", "meshlet_viz_fragment");
+    rhi::GraphicsPipelineDesc mvDesc;
+    mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+    rhi::VertexLayout vizLayout;
+    vizLayout.stride = sizeof(scene::Vertex);
+    vizLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {3, rhi::Format::RGB32_Float, 32},
+    };
+    mvDesc.vertexLayout = vizLayout;
+    mvDesc.colorFormat = device->Swapchain().ColorFormat();
+    mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+    mvDesc.pushConstantSize = sizeof(float) * 20;
+    auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.0471976f); fd.skyParams[1] = aspect;
+    }
+
+    auto colorOf = [&](uint32_t clusterInstanceIdx) {
+        return vg::hashColor(clusterInstanceIdx % clustersPerMesh);
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("scene", {}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*mvPipeline);
+            // The OCCLUDER WALL (never culled).
+            cmd.BindVertexBuffer(*wallVB);
+            cmd.BindIndexBuffer(*wallIB);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = wallModel.m[k];
+                pc[16] = 0.55f; pc[17] = 0.55f; pc[18] = 0.6f; pc[19] = 1.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.DrawIndexed(wallIdxCount, 0, 0);
+            }
+            // The CPU Hi-Z-occlusion-culled VISIBLE cluster-instances, per-cluster bound, source order. The
+            // hidden back clusters are absent — exactly what the GPU Hi-Z cull would render, identical to a
+            // frustum-only render (they are fully behind the wall -> zero pixels).
+            cmd.BindVertexBuffer(*vbuf);
+            cmd.BindIndexBuffer(*ibuf);
+            for (const render::mdi::MdiCommand& c : hizCmds) {
+                const vg::ClusterInstance& ci = clusters[c.firstInstance];
+                const Mat4& model = instanceModels[ci.instanceIndex];
+                Vec3 col = colorOf(c.firstInstance);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = col.x; pc[17] = col.y; pc[18] = col.z; pc[19] = 1.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::printf("cluster-hiz: {clusterInstances:%u, frustumSurvivors:%u, hizSurvivors:%u} "
+                "(Metal: CPU Hi-Z occlusion-culled per-cluster bound path, image backend-identical)\n",
+                kClusterInstances, frustumSurvivors, hizSurvivors);
+    std::printf("cluster-hiz occluded: %u -> %u (%u culled)\n", frustumSurvivors, hizSurvivors, occluded);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — per-cluster Hi-Z-occlusion-culled %u/%u cluster-instances (%u occluded; "
+                "Metal per-cluster bound; Vulkan does depth-prepass -> Hi-Z -> compute-cull -> MDI)\n",
+                outPath, cw, ch, hizSurvivors, kClusterInstances, occluded);
+    (void)kInstances;
+    return 0;
+}
+
 // --- GPU-driven culling + indirect draw showcase (Slice AR). Mirrors the Vulkan --gpu-cull-shot
 // path: a compute kernel (cull.comp.gen.metal) frustum-culls a deterministic 1024-instance cube grid
 // and ORDER-compacts the survivors into a second instance buffer (single-workgroup prefix sum) +
@@ -21710,6 +21971,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--hiz-cull") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_hiz_cull.png";
             try { return RunHizCullShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cluster-hiz <out.png>: render the virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull showcase
+        // (Slice DU). The TRUE pass (a CPU depth pre-pass -> Hi-Z pyramid -> a compute shader
+        // cluster_hiz_cull.comp frustum+occlusion-culls the (instance x cluster) records + ORDER-compacts the
+        // survivors, then ONE DrawIndexedMultiIndirect over cluster_viz.vert + meshlet_viz.frag) is the VULKAN
+        // demonstration (--cluster-hiz-shot); here Metal renders the IDENTICAL occluder-wall scene via the CPU
+        // per-cluster BOUND path (the SAME render::vg::CullClusterInstancesHiZ decides the visible survivors),
+        // so cluster_hiz.png is backend-identical to the Vulkan GPU-culled image (itself byte-identical to the
+        // Vulkan frustum-only render). New golden tests/golden/metal/cluster_hiz.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--cluster-hiz") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cluster_hiz.png";
+            try { return RunClusterHizShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gizmo <objIndex> <out.png>: render the editor gizmo showcase (Slice AB) — a small
