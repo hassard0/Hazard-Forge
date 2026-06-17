@@ -67,6 +67,7 @@
 #include "render/vsm.h"         // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp
 #include "render/vt.h"          // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp
 #include "render/mc.h"          // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp
+#include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -448,6 +449,7 @@ int main(int argc, char** argv) {
     const char* mcInterpShotPath = nullptr; // --mc-interp-shot <out.bmp> (Slice MC4: GPU Isosurface Meshing FIXED-POINT INTERPOLATED vertex placement — mc_emit with EdgeInterp instead of EdgeMidpoint (the vertex on the ACTUAL isosurface crossing, t=((iso-s0)*kSub)/(s1-s0) on the 1/kSub=256 lattice, the same truncating integer divide both sides -> bit-exact GPU==CPU + cross-backend), reuses mc_scan UNCHANGED, GPU==CPU mesh bit-exact, a SMOOTHER 2D mesh-projection debug-viz than mc-emit)
     const char* mcRenderShotPath = nullptr; // --mc-render-shot <out.bmp> (Slice MC5: GPU Isosurface Meshing RENDER — MarchCellsInterp's bit-exact fixed-point mesh -> BuildRenderMesh (position=vert/kSub + flat per-face normals) -> the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO) -> a lit 3D extracted-sphere render. The MC arc's FIRST FLOAT slice: the golden is the visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof), NOT the integer zero-diff bar. NO new RHI / shader)
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
+    const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1468,6 +1470,21 @@ int main(int argc, char** argv) {
             // cell, empty/full dark; 32 slices tiled 8x4) -> identical both backends by construction.
             // NO rendering, NO triangle emission, NO new RHI. One BMP -> exit.
             mcClassifyShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--fpx-shot") == 0 && i + 1 < argc) {
+            // Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase
+            // (BEACHHEAD of FLAGSHIP #6). A deterministic FxWorld (an 8x8 grid of 64 dynamic bodies at
+            // staggered heights, gravity (0,-9.8,0) host-snapped to Q16.16, groundY=0, dt=kOne/60) is
+            // integrated K=120 fixed steps by shaders/fpx_integrate.comp — one GPU thread per body runs
+            // the K-step integrator (vel += gravity*dt; pos += vel*dt; ground floor-clamp, the fxmul +
+            // integrate + clamp copied VERBATIM from engine/sim/fpx.h::IntegrateBody) on its OWN body
+            // (each body independent -> race-free, NO atomics) and writes gBodies[i] back. ReadBuffer
+            // reads the integrated Q16.16 body array; the CPU fpx.h::IntegrateStep over the SAME world
+            // must match it BIT-EXACT (memcmp, NO tol). integrateEnabled=false -> bodies unchanged. The
+            // golden is a PURE-INTEGER side-view debug-viz: each body's integer (pos.x>>kFrac,
+            // pos.y>>kFrac) projected to a pixel via a fixed integer transform, splatted as a small
+            // hashColor(bodyIndex) dot, with the groundY line drawn -> identical both backends by
+            // construction. NO collision response (FPX3+), NO new RHI. One BMP -> exit.
+            fpxShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--mc-count-shot") == 0 && i + 1 < argc) {
             // Slice MC2: GPU Isosurface Meshing Slice 2 — per-cell MARCHING-CUBES TRIANGLE COUNT. The
             // SAME MC1 sphere VoxelField (33³ corners -> 32³ cells, radius 12, iso 0) feeds a pure-integer
@@ -14580,6 +14597,273 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — MC case-index Z-slice viz (%d surface cells)\n",
                                 mcClassifyShotPath, imgW, imgH, surfaceCells);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcClassifyShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase (--fpx-shot
+        // <out.bmp>, Slice FPX1, the BEACHHEAD of FLAGSHIP #6). A deterministic FxWorld (an 8x8 grid of
+        // 64 dynamic bodies at staggered heights, gravity (0,-9.8,0) host-snapped to Q16.16, groundY=0,
+        // dt=kOne/60) is integrated K=120 fixed steps by a pure-integer compute (shaders/fpx_integrate.comp):
+        // one thread per body runs the K-step semi-implicit-Euler integrator (vel += gravity*dt; pos +=
+        // vel*dt; ground floor-clamp; the fxmul ((int64)a*b >> 16) + integrate + clamp copied VERBATIM
+        // from engine/sim/fpx.h::IntegrateBody) on its OWN body — order-independent, NO atomics — and
+        // writes gBodies[i] back. ReadBuffer reads the integer Q16.16 body array; the CPU
+        // fpx.h::IntegrateStep over the SAME world must match it BIT-EXACT (memcmp, NO tol).
+        // integrateEnabled=false -> bodies UNCHANGED (no-op). The golden is a PURE-INTEGER side-view
+        // debug-viz (each body's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer
+        // transform, a hashColor(bodyIndex) dot, the groundY line) -> identical both backends by
+        // construction. NO collision response (FPX3+), NO new RHI.
+        if (fpxShotPath) {
+            using math::Vec3;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic FxWorld (== the Metal --fpx config). gravity -9.8 host-snapped to Q16.16.
+            const fpx::fx kGravY = (fpx::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const fpx::fx kDt = fpx::kOne / 60;
+            const int kGrid = 8;                      // 8x8 grid -> 64 bodies
+            const int kBodyCount = kGrid * kGrid;     // 64
+            const int kSteps = 120;
+            const fpx::fx kGroundY = 0;
+
+            fpx::FxWorld world;
+            world.gravity = {0, kGravY, 0};
+            world.groundY = kGroundY;
+            for (int i = 0; i < kBodyCount; ++i) {
+                fpx::FxBody b;
+                const int gx = i % kGrid;
+                const int gz = i / kGrid;
+                b.pos = {(fpx::fx)(gx * (int)fpx::kOne),
+                         (fpx::fx)((8 + (i % 5)) * (int)fpx::kOne),   // staggered heights 8..12
+                         (fpx::fx)(gz * (int)fpx::kOne)};
+                b.vel = {0, 0, 0};
+                b.invMass = fpx::kOne;                 // unit mass (unused by the integrator; carried)
+                b.flags = fpx::kFlagDynamic;
+                world.bodies.push_back(b);
+            }
+
+            // std430 FpxBody mirror (matches shaders/fpx_integrate.comp FpxBody): 8 x int32 (32 bytes).
+            struct FpxBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; };
+            static_assert(sizeof(FpxBodyGpu) == 32, "FpxBodyGpu std430 layout");
+            auto packBodies = [&](const fpx::FxWorld& w) {
+                std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+                for (size_t i = 0; i < w.bodies.size(); ++i) {
+                    const fpx::FxBody& b = w.bodies[i];
+                    out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                        b.invMass, b.flags};
+                }
+                return out;
+            };
+            const std::vector<FpxBodyGpu> bodiesInit = packBodies(world);
+
+            auto makeBodiesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = bodiesInit.size() * sizeof(FpxBodyGpu);
+                d.initialData = bodiesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches fpx_integrate.comp Params std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, bodyCount, steps, integrateEnabled}.
+            struct FpxParams { int32_t grav[4]; int32_t cfg[4]; };
+            static_assert(sizeof(FpxParams) == 32, "FpxParams std430 layout");
+            auto makeParams = [&](int32_t integrateEnabled) {
+                FpxParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = kSteps; p.cfg[3] = integrateEnabled;
+                return p;
+            };
+
+            // Compute pipeline: 2 storage buffers (bodies, params); 64 threads/group.
+            auto fpxCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_integrate.comp.hlsl.spv");
+            auto fpxCs = device->CreateShaderModule({std::span<const uint32_t>(fpxCsWords)});
+            rhi::ComputePipelineDesc fpxCdesc;
+            fpxCdesc.compute = fpxCs.get();
+            fpxCdesc.storageBufferCount = 2;
+            fpxCdesc.pushConstantSize = 0;
+            fpxCdesc.threadsPerGroupX = 64;
+            auto fpxCompute = device->CreateComputePipeline(fpxCdesc);
+
+            const uint32_t kGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+            // Run the integrate compute over a fresh bodies buffer + params, read back gBodies.
+            auto runIntegrate = [&](int32_t integrateEnabled, std::vector<FpxBodyGpu>& outBodies) {
+                auto bodiesBuf = makeBodiesBuf();
+                FpxParams params = makeParams(integrateEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(FpxParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fpx_integrate", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*fpxCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*paramsBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outBodies.assign((size_t)kBodyCount, FpxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FpxBodyGpu), 0);
+            };
+
+            // === GPU integrate (enabled, K steps) ===
+            std::vector<FpxBodyGpu> gpuBodies;
+            runIntegrate(1, gpuBodies);
+
+            // === CPU reference: IntegrateStep K times over the SAME world ===
+            fpx::FxWorld cpuWorld = world;
+            for (int s = 0; s < kSteps; ++s) fpx::IntegrateStep(cpuWorld, kDt);
+            std::vector<FpxBodyGpu> cpuBodies = packBodies(cpuWorld);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K steps (integer memcmp, NO tolerance).
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx GPU body array != CPU IntegrateStep "
+                             "(a float crept into the fixed-point integrator?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx GPU==CPU bodies: %d bodies BIT-EXACT (%d steps)\n", kBodyCount, kSteps);
+
+            // PROOF (2) integrateEnabled=false -> bodies UNCHANGED (byte-identical to the upload).
+            std::vector<FpxBodyGpu> disabledBodies;
+            runIntegrate(0, disabledBodies);
+            if (disabledBodies.size() != bodiesInit.size() ||
+                std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                            bodiesInit.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx integrateEnabled=false changed the bodies\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx disabled: bodies UNCHANGED (no-op)\n");
+
+            // PROOF (3) two-run determinism byte-identical.
+            std::vector<FpxBodyGpu> gpuBodies2;
+            runIntegrate(1, gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (4) hand-checked closed form: a single body at y=H*kOne, vel=0, gravity g, dt 1/60,
+            // after K steps == the hand-computed Q16.16 integer recurrence (clamped at groundY). Checked
+            // against the per-step integer ops directly so the proof is the integrator math, not the grid.
+            {
+                const fpx::fx H = (fpx::fx)(10 * (int)fpx::kOne);  // start at y=10.0
+                fpx::fx refVy = 0, refPy = H;
+                for (int s = 0; s < kSteps; ++s) {
+                    refVy += fpx::fxmul(kGravY, kDt);
+                    refPy += fpx::fxmul(refVy, kDt);
+                    if (refPy < kGroundY) { refPy = kGroundY; if (refVy < 0) refVy = 0; }
+                }
+                // Run the SAME single body through IntegrateStep K times -> must equal the recurrence.
+                fpx::FxWorld one;
+                one.gravity = {0, kGravY, 0}; one.groundY = kGroundY;
+                fpx::FxBody hb; hb.pos = {0, H, 0}; hb.vel = {0, 0, 0}; hb.flags = fpx::kFlagDynamic;
+                one.bodies.push_back(hb);
+                for (int s = 0; s < kSteps; ++s) fpx::IntegrateStep(one, kDt);
+                if (one.bodies[0].pos.y != refPy) {
+                    std::fprintf(stderr, "FATAL: fpx hand-check body.y %d != closed-form %d\n",
+                                 one.bodies[0].pos.y, refPy);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx hand-check: body.y = %d == closed-form OK\n", refPy);
+            }
+
+            // PROOF (5) broadphase bijection: BroadphaseCell/CellId/FloorDiv on known positions incl
+            // negatives. cellSize = 2 world units; check a positive + a negative-straddle position.
+            {
+                const fpx::fx cellSize = (fpx::fx)(2 * (int)fpx::kOne);
+                const fpx::FxCell grid{8, 8, 8};
+                fpx::FxVec3 pPos{(fpx::fx)(5 * (int)fpx::kOne), 0, (fpx::fx)(3 * (int)fpx::kOne)};
+                fpx::FxCell cPos = fpx::BroadphaseCell(pPos, cellSize);   // (2, 0, 1)
+                fpx::FxVec3 pNeg{-(fpx::kOne / 2), 0, 0};                 // -0.5 -> floor cell -1
+                fpx::FxCell cNeg = fpx::BroadphaseCell(pNeg, cellSize);
+                const bool floorOk = (cPos.x == 2 && cPos.y == 0 && cPos.z == 1 && cNeg.x == -1 &&
+                                      fpx::FloorDiv(-1, 2) == -1 && fpx::FloorDiv(-3, 2) == -2);
+                // Count the DISTINCT cells the 64 settled bodies occupy (a small integer broadphase exercise).
+                std::vector<uint32_t> occupied;
+                for (const auto& gb : gpuBodies) {
+                    fpx::FxVec3 p{gb.px, gb.py, gb.pz};
+                    fpx::FxCell c = fpx::BroadphaseCell(p, cellSize);
+                    uint32_t id = fpx::CellId(fpx::FxCell{c.x, c.y + 1, c.z}, grid); // +1 so y>=0
+                    bool seen = false; for (uint32_t e : occupied) if (e == id) { seen = true; break; }
+                    if (!seen) occupied.push_back(id);
+                }
+                if (!floorOk) {
+                    std::fprintf(stderr, "FATAL: fpx broadphase FloorDiv/BroadphaseCell wrong on negatives\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx broadphase: %d cells, FloorDiv neg OK\n", (int)occupied.size());
+            }
+
+            // PROOF (6) the {...} stat line: settled = bodies whose pos.y == groundY.
+            int settled = 0;
+            for (const auto& gb : gpuBodies) if (gb.py == kGroundY) ++settled;
+            std::printf("fpx: {bodies:%d, steps:%d, settled:%d/%d}\n",
+                        kBodyCount, kSteps, settled, kBodyCount);
+
+            // --- Golden: a PURE-INTEGER side-view debug-viz. Project each body's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) to a pixel via a FIXED integer transform (y up), splat a small
+            // hashColor(bodyIndex) dot, draw the groundY line. CPU-colored from the read-back integers ->
+            // identical both backends by construction. ---
+            const int kPxPerUnit = 24;   // integer world-units -> pixels
+            const int kMargin = 16;
+            const int kWorldW = 8;       // x spans 0..7
+            const int kWorldH = 13;      // y spans 0..12 (staggered start max 12)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Integer world->pixel transform (y up): px = margin + worldX*scale; py = imgH-margin - worldY*scale.
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            // groundY line (worldY == 0).
+            {
+                int gx0, gy0; worldToPx(0, 0, gx0, gy0);
+                for (int x = 0; x < (int)imgW; ++x) {
+                    if (gy0 < 0 || gy0 >= (int)imgH) break;
+                    uint8_t* dst = &bgra[((size_t)gy0 * imgW + x) * 4];
+                    dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+                }
+            }
+            // Each body as a small 3x3 dot at its integer (pos.x>>kFrac, pos.y>>kFrac).
+            for (int i = 0; i < kBodyCount; ++i) {
+                const int wx = gpuBodies[(size_t)i].px >> fpx::kFrac;
+                const int wy = gpuBodies[(size_t)i].py >> fpx::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(fpxShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fixed-point physics side-view (%d/%d settled)\n",
+                                fpxShotPath, imgW, imgH, settled, kBodyCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

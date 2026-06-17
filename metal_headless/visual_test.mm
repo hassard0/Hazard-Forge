@@ -87,6 +87,7 @@
 #include "render/vsm.h"             // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp + the Vulkan --vsm-mark-shot
 #include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
+#include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -16516,6 +16517,239 @@ static int RunMcClassifyShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase showcase (Slice FPX1,
+// the BEACHHEAD of FLAGSHIP #6). The TRUE pass is identical on both backends: a deterministic FxWorld
+// (an 8x8 grid of 64 dynamic bodies at staggered heights, gravity (0,-9.8,0) host-snapped to Q16.16,
+// groundY=0, dt=kOne/60) is integrated K=120 fixed steps by the SAME shaders/fpx_integrate.comp (here
+// fpx_integrate.comp.gen.metal). One thread per body runs the K-step semi-implicit-Euler integrator
+// (the fxmul ((int64)a*b >> 16) + integrate + ground floor-clamp copied VERBATIM from
+// engine/sim/fpx.h::IntegrateBody) on its OWN body and writes gBodies[i] back. ReadBuffer reads the
+// Q16.16 body array and it is PROVEN BIT-EXACT vs the CPU fpx.h::IntegrateStep reference (memcmp, NO
+// tolerance) — the same GPU==CPU proof the Vulkan --fpx-shot runs; integrateEnabled=false -> bodies
+// UNCHANGED; two runs byte-identical. The image golden is a PURE-INTEGER side-view debug-viz (each
+// body's integer (pos.x>>kFrac, pos.y>>kFrac) projected to a pixel via a fixed integer transform, a
+// hashColor(bodyIndex) dot, the groundY line) -> identical to the Vulkan path BY CONSTRUCTION (same
+// integer bits -> same RGB). New golden tests/golden/metal/fpx.png; two runs DIFF 0.0000. NO collision
+// response (FPX3+), NO new RHI.
+static int RunFpxShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic FxWorld (== the Vulkan --fpx-shot config). gravity -9.8 host-snapped to Q16.16.
+    const fpx::fx kGravY = (fpx::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const fpx::fx kDt = fpx::kOne / 60;
+    const int kGrid = 8;
+    const int kBodyCount = kGrid * kGrid;     // 64
+    const int kSteps = 120;
+    const fpx::fx kGroundY = 0;
+
+    fpx::FxWorld world;
+    world.gravity = {0, kGravY, 0};
+    world.groundY = kGroundY;
+    for (int i = 0; i < kBodyCount; ++i) {
+        fpx::FxBody b;
+        const int gx = i % kGrid;
+        const int gz = i / kGrid;
+        b.pos = {(fpx::fx)(gx * (int)fpx::kOne),
+                 (fpx::fx)((8 + (i % 5)) * (int)fpx::kOne),
+                 (fpx::fx)(gz * (int)fpx::kOne)};
+        b.vel = {0, 0, 0};
+        b.invMass = fpx::kOne;
+        b.flags = fpx::kFlagDynamic;
+        world.bodies.push_back(b);
+    }
+
+    struct FpxBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; };
+    static_assert(sizeof(FpxBodyGpu) == 32, "FpxBodyGpu std430 layout");
+    auto packBodies = [&](const fpx::FxWorld& w) {
+        std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+        for (size_t i = 0; i < w.bodies.size(); ++i) {
+            const fpx::FxBody& b = w.bodies[i];
+            out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass, b.flags};
+        }
+        return out;
+    };
+    const std::vector<FpxBodyGpu> bodiesInit = packBodies(world);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --fpx-shot).
+    const int kPxPerUnit = 24, kMargin = 16, kWorldW = 8, kWorldH = 13;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    auto makeBodiesBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = bodiesInit.size() * sizeof(FpxBodyGpu);
+        d.initialData = bodiesInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct FpxParams { int32_t grav[4]; int32_t cfg[4]; };
+    static_assert(sizeof(FpxParams) == 32, "FpxParams std430 layout");
+    auto makeParams = [&](int32_t integrateEnabled) {
+        FpxParams p{};
+        p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+        p.cfg[0] = kGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = kSteps; p.cfg[3] = integrateEnabled;
+        return p;
+    };
+
+    auto fpxCs = loadMSL("fpx_integrate.comp.gen.metal", "fpx_integrate_main");
+    rhi::ComputePipelineDesc fpxCd;
+    fpxCd.compute = fpxCs.get(); fpxCd.storageBufferCount = 2; fpxCd.threadsPerGroupX = 64;
+    auto fpxCompute = device->CreateComputePipeline(fpxCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+    auto runIntegrate = [&](int32_t integrateEnabled, std::vector<FpxBodyGpu>& outBodies) {
+        auto bodiesBuf = makeBodiesBuf();
+        FpxParams params = makeParams(integrateEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(FpxParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("fpx_integrate", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*fpxCompute);
+                cmd.BindStorageBuffer(*bodiesBuf, 0);
+                cmd.BindStorageBuffer(*paramsBuf, 1);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outBodies.assign((size_t)kBodyCount, FpxBodyGpu{});
+        device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FpxBodyGpu), 0);
+    };
+
+    // GPU integrate (enabled, K steps).
+    std::vector<FpxBodyGpu> gpuBodies;
+    runIntegrate(1, gpuBodies);
+
+    // CPU reference: IntegrateStep K times over the SAME world.
+    fpx::FxWorld cpuWorld = world;
+    for (int s = 0; s < kSteps; ++s) fpx::IntegrateStep(cpuWorld, kDt);
+    std::vector<FpxBodyGpu> cpuBodies = packBodies(cpuWorld);
+
+    if (gpuBodies.size() != cpuBodies.size() ||
+        std::memcmp(gpuBodies.data(), cpuBodies.data(), (size_t)kBodyCount * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx: GPU body array != CPU IntegrateStep (a float crept into the integrator?)");
+    std::printf("fpx GPU==CPU bodies: %d bodies BIT-EXACT (%d steps)\n", kBodyCount, kSteps);
+
+    // integrateEnabled=false -> bodies UNCHANGED.
+    std::vector<FpxBodyGpu> disabledBodies;
+    runIntegrate(0, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                    bodiesInit.size() * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx: integrateEnabled=false changed the bodies");
+    std::printf("fpx disabled: bodies UNCHANGED (no-op)\n");
+
+    // two-run determinism.
+    std::vector<FpxBodyGpu> gpuBodies2;
+    runIntegrate(1, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx: two dispatches differ (nondeterministic)");
+    std::printf("fpx determinism: two runs BYTE-IDENTICAL\n");
+
+    // hand-checked closed form.
+    {
+        const fpx::fx H = (fpx::fx)(10 * (int)fpx::kOne);
+        fpx::fx refVy = 0, refPy = H;
+        for (int s = 0; s < kSteps; ++s) {
+            refVy += fpx::fxmul(kGravY, kDt);
+            refPy += fpx::fxmul(refVy, kDt);
+            if (refPy < kGroundY) { refPy = kGroundY; if (refVy < 0) refVy = 0; }
+        }
+        fpx::FxWorld one;
+        one.gravity = {0, kGravY, 0}; one.groundY = kGroundY;
+        fpx::FxBody hb; hb.pos = {0, H, 0}; hb.vel = {0, 0, 0}; hb.flags = fpx::kFlagDynamic;
+        one.bodies.push_back(hb);
+        for (int s = 0; s < kSteps; ++s) fpx::IntegrateStep(one, kDt);
+        if (one.bodies[0].pos.y != refPy) return fail("fpx: hand-check body.y != closed-form");
+        std::printf("fpx hand-check: body.y = %d == closed-form OK\n", refPy);
+    }
+
+    // broadphase bijection.
+    {
+        const fpx::fx cellSize = (fpx::fx)(2 * (int)fpx::kOne);
+        const fpx::FxCell grid{8, 8, 8};
+        fpx::FxVec3 pPos{(fpx::fx)(5 * (int)fpx::kOne), 0, (fpx::fx)(3 * (int)fpx::kOne)};
+        fpx::FxCell cPos = fpx::BroadphaseCell(pPos, cellSize);
+        fpx::FxVec3 pNeg{-(fpx::kOne / 2), 0, 0};
+        fpx::FxCell cNeg = fpx::BroadphaseCell(pNeg, cellSize);
+        const bool floorOk = (cPos.x == 2 && cPos.y == 0 && cPos.z == 1 && cNeg.x == -1 &&
+                              fpx::FloorDiv(-1, 2) == -1 && fpx::FloorDiv(-3, 2) == -2);
+        std::vector<uint32_t> occupied;
+        for (const auto& gb : gpuBodies) {
+            fpx::FxVec3 p{gb.px, gb.py, gb.pz};
+            fpx::FxCell c = fpx::BroadphaseCell(p, cellSize);
+            uint32_t id = fpx::CellId(fpx::FxCell{c.x, c.y + 1, c.z}, grid);
+            bool seen = false; for (uint32_t e : occupied) if (e == id) { seen = true; break; }
+            if (!seen) occupied.push_back(id);
+        }
+        if (!floorOk) return fail("fpx: broadphase FloorDiv/BroadphaseCell wrong on negatives");
+        std::printf("fpx broadphase: %d cells, FloorDiv neg OK\n", (int)occupied.size());
+    }
+
+    int settled = 0;
+    for (const auto& gb : gpuBodies) if (gb.py == kGroundY) ++settled;
+    std::printf("fpx: {bodies:%d, steps:%d, settled:%d/%d}\n", kBodyCount, kSteps, settled, kBodyCount);
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --fpx-shot by construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    {
+        int gx0, gy0; worldToPx(0, 0, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) {
+            if (gy0 < 0 || gy0 >= (int)imgH) break;
+            uint8_t* dst = &bgra[((size_t)gy0 * imgW + x) * 4];
+            dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+        }
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = gpuBodies[(size_t)i].px >> fpx::kFrac;
+        const int wy = gpuBodies[(size_t)i].py >> fpx::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — fixed-point physics side-view (%d/%d settled)\n",
+                outPath, imgW, imgH, settled, kBodyCount);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
 // of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
 // corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
@@ -27013,6 +27247,23 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mc-classify") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mc_classify.png";
             try { return RunMcClassifyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer
+        // broadphase showcase (Slice FPX1, the beachhead of FLAGSHIP #6). A deterministic FxWorld (an
+        // 8x8 grid of 64 dynamic bodies at staggered heights, gravity (0,-9.8,0) host-snapped to
+        // Q16.16, groundY=0, dt=kOne/60) is integrated K=120 fixed steps by the SAME fpx_integrate.comp
+        // (one thread per body runs the K-step semi-implicit-Euler integrator, the fxmul + integrate +
+        // floor-clamp copied VERBATIM from engine/sim/fpx.h::IntegrateBody) -> ReadBuffer reads the
+        // Q16.16 body array, PROVEN BIT-EXACT vs the CPU fpx.h::IntegrateStep reference (memcmp, no tol
+        // — the same GPU==CPU proof the Vulkan --fpx-shot runs); integrateEnabled=false -> bodies
+        // unchanged; two runs byte-identical. The image golden is a PURE-INTEGER side-view debug-viz
+        // (each body's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer transform, a
+        // hashColor(bodyIndex) dot, the groundY line), identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/fpx.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fpx") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fpx.png";
+            try { return RunFpxShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mc-count <out.png>: render the GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT
