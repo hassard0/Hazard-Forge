@@ -366,4 +366,73 @@ inline void GeneratePhysicalAtlas(std::span<const int32_t> indirection, const Vt
     }
 }
 
+// ============================ Slice VT4 — material-pass SAMPLE through the INDIRECTION (pure CPU) ====
+// VT3 generated each allocated page's CONTENT into the physical atlas; VT4 SAMPLES the virtual texture
+// through the virtual->physical INDIRECTION — the round-trip that makes RVT a usable texture: per virtual
+// texel (vx,vy), compute its pageId, look up indirection[pageId] -> the physical tile, offset into the
+// physical atlas, and read the texel (NEAREST — a direct integer texel read, NO filtering). Kept PURE
+// INTEGER so the sample path is cross-backend BIT-IDENTICAL (the zero-differing-pixel posture of VT1-VT3);
+// bilinear filtering + perspective-mapped geometry are an explicit DEFERRED float refinement (VT5+).
+// ZERO backend symbols (the same above-seam discipline as VT1/VT2/VT3). SampleVirtualTexel below is copied
+// VERBATIM into shaders/vt_sample.comp.hlsl, so tests/vt_test.cpp exercises the EXACT math the GPU sample
+// pass runs (the GPU==CPU bit-exact crux). The reconstructed image is the virtual texture as the user
+// ADDRESSES it (pages in virtual-UV layout) — visually DISTINCT from VT3's physical-atlas (tile-alloc order).
+
+// The sampled value for a virtual texel whose page is NON-RESIDENT (indirection[pageId]==kNoTile): a flat
+// MISS color, magenta debug tint RGBA8-packed 0xAABBGGRR == (A=0xFF, B=0xFF, G=0x00, R=0xFF). Chosen
+// DISTINCT from both kAtlasClear (0xFF101010, dark grey) and any value PageTexel can emit (PageTexel's
+// green lane is forced into [0x40,0xFF] >= 0x40, so a generated texel can never have G==0x00 -> a generated
+// texel can never collide with kVtMiss). Reads clearly (bright magenta) against the generated pages.
+inline constexpr uint32_t kVtMiss = 0xFFFF00FFu;  // magenta miss tint (B=0xFF,G=0x00,R=0xFF,A=0xFF)
+
+// THE SAMPLE-THROUGH-INDIRECTION round-trip (PURE INTEGER — no float, so bit-identical CPU<->Vulkan<->Metal).
+// vx,vy = a virtual texel of the mip being reconstructed. px=vx/pageSize, py=vy/pageSize = the virtual page;
+// pageId = PageId(mip,px,py); tile = indirection[pageId]; if tile==kNoTile -> kVtMiss; else PhysicalTileOrigin
+// -> (ox,oy), local (lx,ly) = (vx%pageSize, vy%pageSize), return atlas[(oy+ly)*atlasW + (ox+lx)] (NEAREST — a
+// direct integer texel read). pageSize comes from atlasDims (the same tile/page edge VT3 generated with). The
+// SAME atlas VT3 generated + the SAME indirection VT2 built -> the read-back texel == PageTexel(pageId,mip,lx,ly)
+// (a self-consistency the proof asserts). COPIED VERBATIM into shaders/vt_sample.comp.hlsl.
+inline uint32_t SampleVirtualTexel(int vx, int vy, int mip, std::span<const int32_t> indirection,
+                                   std::span<const uint32_t> atlas, const VtTexture& vt,
+                                   const VtTilePool& pool, const VtAtlasDims& atlasDims) {
+    const int pageSize = atlasDims.pageSize;
+    const int atlasW   = atlasDims.atlasW();
+    const int px = vx / pageSize;
+    const int py = vy / pageSize;
+    const int pageId = PageId(mip, px, py, vt);
+    if (pageId < 0 || pageId >= (int)indirection.size()) return kVtMiss;
+    const int32_t tile = indirection[(size_t)pageId];
+    if (tile == kNoTile) return kVtMiss;
+    int ox, oy;
+    PhysicalTileOrigin(tile, pool, pageSize, ox, oy);
+    const int lx = vx % pageSize;
+    const int ly = vy % pageSize;
+    const size_t idx = (size_t)(oy + ly) * (size_t)atlasW + (size_t)(ox + lx);
+    if (idx >= atlas.size()) return kVtMiss;
+    return atlas[idx];
+}
+
+// CPU REFERENCE reconstruction (the EXACT virtual image the GPU vt_sample.comp produces). For each virtual
+// texel (vx,vy) in [0, pagesPerSide(mip)*pageSize)², imageOut[vy*W + vx] = SampleVirtualTexel(...). The
+// reconstructed virtual-texture image at `mip`: resident pages show their VT3 content at their virtual-UV
+// location, non-resident pages show kVtMiss. sampleEnabled=false leaves the image all-kVtMiss (the disabled
+// no-op). imageOut sized W*W where W = pagesPerSide(mip)*pageSize.
+inline void ReconstructVirtualImage(int mip, std::span<const int32_t> indirection,
+                                    std::span<const uint32_t> atlas, const VtTexture& vt,
+                                    const VtTilePool& pool, const VtAtlasDims& atlasDims,
+                                    std::span<uint32_t> imageOut, bool sampleEnabled = true) {
+    const int pageSize = atlasDims.pageSize;
+    const int W = vt.pagesPerSide(mip) * pageSize;  // virtual image is square at this mip
+    if (!sampleEnabled) {
+        for (uint32_t& t : imageOut) t = kVtMiss;
+        return;
+    }
+    for (int vy = 0; vy < W; ++vy)
+        for (int vx = 0; vx < W; ++vx) {
+            const size_t idx = (size_t)vy * (size_t)W + (size_t)vx;
+            if (idx < imageOut.size())
+                imageOut[idx] = SampleVirtualTexel(vx, vy, mip, indirection, atlas, vt, pool, atlasDims);
+        }
+}
+
 }  // namespace hf::render::vt

@@ -584,6 +584,178 @@ int main() {
         check(coverageOk, "every allocated tile fully written, every free tile all kAtlasClear");
     }
 
+    // ================= Slice VT4: SampleVirtualTexel + ReconstructVirtualImage =====================
+    // SampleVirtualTexel: a resident page -> the EXACT atlas texel (== PageTexel); a non-resident page ->
+    // kVtMiss; the (vx,vy)->(page,local) decomposition correct at page boundaries.
+    {
+        // A small virtual texture + a tiny 2×2-tile atlas. mip 0 = 2 pages/side, pageSize=4 -> 8×8 atlas.
+        vt::VtTexture small; small.mipLevels = 2; small.pageSize = 4; small.virtualPagesPerSideMip0 = 2;
+        vt::VtTilePool pool; pool.tilesPerSide = 2;       // 4 tiles
+        vt::VtAtlasDims dims; dims.tilesPerSide = 2; dims.pageSize = 4;  // 8×8 atlas
+
+        // Feedback: mip-0 pages 0 and 3 resident, page 1 and 2 NON-resident; mip-1's single page non-resident.
+        // pageCount = 4 (mip0) + 1 (mip1) = 5.
+        std::vector<uint32_t> fb((size_t)small.pageCount(), 0u);
+        fb[vt::PageId(0, 0, 0, small)] = 1u;  // page 0
+        fb[vt::PageId(0, 1, 1, small)] = 1u;  // page 3 (px=1,py=1)
+        std::vector<int32_t> indir =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        std::vector<uint32_t> atlas((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), small, pool, dims,
+                                  std::span<uint32_t>(atlas.data(), atlas.size()), true);
+
+        // A virtual texel inside resident page 0 (px=0,py=0): local (lx,ly)=(vx,vy) -> PageTexel(page0,mip0,lx,ly).
+        {
+            const int pid0 = vt::PageId(0, 0, 0, small);
+            bool page0Ok = true;
+            for (int vy = 0; vy < 4 && page0Ok; ++vy)
+                for (int vx = 0; vx < 4; ++vx) {
+                    uint32_t got = vt::SampleVirtualTexel(vx, vy, 0,
+                        std::span<const int32_t>(indir.data(), indir.size()),
+                        std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims);
+                    if (got != vt::PageTexel(pid0, 0, vx, vy)) { page0Ok = false; break; }
+                }
+            check(page0Ok, "SampleVirtualTexel resident page 0 -> exact PageTexel over its 4×4 region");
+        }
+
+        // A virtual texel inside resident page 3 (px=1,py=1): virtual (vx,vy) in [4,8)² -> local = vx%4,vy%4.
+        {
+            const int pid3 = vt::PageId(0, 1, 1, small);
+            bool page3Ok = true;
+            for (int vy = 4; vy < 8 && page3Ok; ++vy)
+                for (int vx = 4; vx < 8; ++vx) {
+                    uint32_t got = vt::SampleVirtualTexel(vx, vy, 0,
+                        std::span<const int32_t>(indir.data(), indir.size()),
+                        std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims);
+                    if (got != vt::PageTexel(pid3, 0, vx % 4, vy % 4)) { page3Ok = false; break; }
+                }
+            check(page3Ok, "SampleVirtualTexel resident page 3 (px=1,py=1) -> exact PageTexel, page boundary correct");
+        }
+
+        // A virtual texel inside NON-resident page 1 (px=1,py=0): vx in [4,8), vy in [0,4) -> kVtMiss.
+        {
+            uint32_t got = vt::SampleVirtualTexel(5, 1, 0,
+                std::span<const int32_t>(indir.data(), indir.size()),
+                std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims);
+            check(got == vt::kVtMiss, "SampleVirtualTexel non-resident page -> kVtMiss");
+        }
+
+        // kVtMiss is DISTINCT from kAtlasClear and from any PageTexel (its green lane is forced >= 0x40).
+        check(vt::kVtMiss != vt::kAtlasClear, "kVtMiss distinct from kAtlasClear");
+        {
+            bool distinctFromGen = true;
+            for (int s = 0; s < 4096 && distinctFromGen; ++s) {
+                uint32_t t = vt::PageTexel(s * 3, s % 4, (s * 7) & 63, (s * 5) & 63);
+                if (t == vt::kVtMiss) distinctFromGen = false;
+            }
+            check(distinctFromGen, "kVtMiss never collides with a generated PageTexel");
+        }
+    }
+
+    // ReconstructVirtualImage: known indirection+atlas -> known image; resident pages == PageTexel, the rest
+    // kVtMiss. sampleEnabled=false -> all kVtMiss. Two passes byte-identical.
+    {
+        vt::VtTexture small; small.mipLevels = 2; small.pageSize = 4; small.virtualPagesPerSideMip0 = 2;
+        vt::VtTilePool pool; pool.tilesPerSide = 2;
+        vt::VtAtlasDims dims; dims.tilesPerSide = 2; dims.pageSize = 4;
+        std::vector<uint32_t> fb((size_t)small.pageCount(), 0u);
+        fb[vt::PageId(0, 0, 0, small)] = 1u;  // page 0 resident
+        fb[vt::PageId(0, 1, 1, small)] = 1u;  // page 3 resident
+        std::vector<int32_t> indir =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        std::vector<uint32_t> atlas((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), small, pool, dims,
+                                  std::span<uint32_t>(atlas.data(), atlas.size()), true);
+
+        const int W = small.pagesPerSide(0) * dims.pageSize;  // 2*4 = 8
+        std::vector<uint32_t> img((size_t)W * W, 0u);
+        vt::ReconstructVirtualImage(0, std::span<const int32_t>(indir.data(), indir.size()),
+                                    std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims,
+                                    std::span<uint32_t>(img.data(), img.size()), true);
+
+        // Image == SampleVirtualTexel per texel (the definition).
+        bool imageOk = true;
+        for (int vy = 0; vy < W && imageOk; ++vy)
+            for (int vx = 0; vx < W; ++vx) {
+                uint32_t expect = vt::SampleVirtualTexel(vx, vy, 0,
+                    std::span<const int32_t>(indir.data(), indir.size()),
+                    std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims);
+                if (img[(size_t)vy * W + vx] != expect) { imageOk = false; break; }
+            }
+        check(imageOk, "ReconstructVirtualImage == SampleVirtualTexel per virtual texel");
+
+        // Resident page 0 quadrant textured, non-resident pages kVtMiss.
+        check(img[0] == vt::PageTexel(vt::PageId(0, 0, 0, small), 0, 0, 0),
+              "ReconstructVirtualImage resident page 0 origin == PageTexel");
+        check(img[(size_t)1 * W + 5] == vt::kVtMiss,
+              "ReconstructVirtualImage non-resident page 1 texel == kVtMiss");
+
+        // sampleEnabled=false -> all kVtMiss.
+        std::vector<uint32_t> off((size_t)W * W, 0u);
+        vt::ReconstructVirtualImage(0, std::span<const int32_t>(indir.data(), indir.size()),
+                                    std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims,
+                                    std::span<uint32_t>(off.data(), off.size()), false);
+        bool allMiss = true; for (uint32_t t : off) if (t != vt::kVtMiss) { allMiss = false; break; }
+        check(allMiss, "ReconstructVirtualImage sampleEnabled=false -> all kVtMiss (no-op)");
+
+        // Determinism: two passes byte-identical.
+        std::vector<uint32_t> img2((size_t)W * W, 0u);
+        vt::ReconstructVirtualImage(0, std::span<const int32_t>(indir.data(), indir.size()),
+                                    std::span<const uint32_t>(atlas.data(), atlas.size()), small, pool, dims,
+                                    std::span<uint32_t>(img2.data(), img2.size()), true);
+        check(std::memcmp(img.data(), img2.data(), img.size() * sizeof(uint32_t)) == 0,
+              "ReconstructVirtualImage deterministic (two passes byte-identical)");
+    }
+
+    // Round-trip self-consistency over the REAL showcase config (mip 0, 16 pages/side, pageSize 64): every
+    // resident virtual texel == PageTexel(pageId,0,lx,ly); every non-resident == kVtMiss; counts sane.
+    {
+        vt::VtTexture vfull; vfull.mipLevels = 4; vfull.pageSize = 128; vfull.virtualPagesPerSideMip0 = 16;
+        std::vector<vt::SampleRequest> requests;
+        const int kg = 24;
+        for (int gy = 0; gy < kg; ++gy) for (int gx = 0; gx < kg; ++gx)
+            requests.push_back({(float)gx / (float)kg, (float)gy / (float)kg, (gx + gy) % vfull.mipLevels});
+        std::vector<uint32_t> fb((size_t)vfull.pageCount(), 0u);
+        vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vfull,
+                              std::span<uint32_t>(fb.data(), fb.size()));
+        vt::VtTilePool pool; pool.tilesPerSide = 16;
+        vt::VtAtlasDims dims; dims.tilesPerSide = 16; dims.pageSize = 64;
+        std::vector<int32_t> indir =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        std::vector<uint32_t> atlas((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), vfull, pool, dims,
+                                  std::span<uint32_t>(atlas.data(), atlas.size()), true);
+
+        const int W = vfull.pagesPerSide(0) * dims.pageSize;  // 16*64 = 1024
+        std::vector<uint32_t> img((size_t)W * W, 0u);
+        vt::ReconstructVirtualImage(0, std::span<const int32_t>(indir.data(), indir.size()),
+                                    std::span<const uint32_t>(atlas.data(), atlas.size()), vfull, pool, dims,
+                                    std::span<uint32_t>(img.data(), img.size()), true);
+
+        int residentPages = 0, missPages = 0;
+        for (int py = 0; py < 16; ++py) for (int px = 0; px < 16; ++px) {
+            int pid = vt::PageId(0, px, py, vfull);
+            if (indir[(size_t)pid] != vt::kNoTile) ++residentPages; else ++missPages;
+        }
+        check(residentPages + missPages == 256, "mip-0 has 256 pages (16×16)");
+
+        bool selfConsistent = true;
+        long textured = 0;
+        for (int vy = 0; vy < W && selfConsistent; ++vy)
+            for (int vx = 0; vx < W; ++vx) {
+                uint32_t got = img[(size_t)vy * W + vx];
+                int pid = vt::PageId(0, vx / 64, vy / 64, vfull);
+                if (indir[(size_t)pid] != vt::kNoTile) {
+                    if (got != vt::PageTexel(pid, 0, vx % 64, vy % 64)) { selfConsistent = false; break; }
+                    ++textured;
+                } else if (got != vt::kVtMiss) { selfConsistent = false; break; }
+            }
+        check(selfConsistent,
+              "showcase sample: resident texel == PageTexel + non-resident == kVtMiss (round-trip self-consistent)");
+        check(textured == (long)residentPages * 64 * 64,
+              "showcase sample: textured texels == residentPages * pageSize²");
+    }
+
     if (g_fail == 0) std::printf("vt_test: ALL PASS\n");
     else std::printf("vt_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
