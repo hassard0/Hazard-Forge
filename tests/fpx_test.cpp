@@ -794,6 +794,101 @@ int main() {
               "RunRollback: mispredicted path DIFFERS from authority (negative control)");
     }
 
+    // ================= FPX6: FxBodyTransform (render-only float model matrix) =========================
+    // The render helper builds a math::Mat4 from the bit-exact FxBody state: translate(pos/kOne) *
+    // rotate(orient) * scale(radius/kOne). Column-major; element(row,col) == m[col*4 + row].
+    {
+        auto approx = [](float a, float b, float eps) { float d = a - b; return (d < 0 ? -d : d) < eps; };
+        const float kEps = 1e-4f;
+
+        // --- (1) Identity orientation -> a PURE translate + uniform scale (rotation block == scale*I). ---
+        {
+            fpx::FxBody b;
+            b.pos    = {FromInt(2), FromInt(3), FromInt(-4)};   // (2,3,-4)
+            b.radius = kOne / 2;                                 // 0.5
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};              // identity
+            math::Mat4 m = fpx::FxBodyTransform(b);
+            // Translation column (m[12..14]) == pos/kOne.
+            check(approx(m.m[12], 2.0f, kEps) && approx(m.m[13], 3.0f, kEps) && approx(m.m[14], -4.0f, kEps),
+                  "FxBodyTransform: identity -> translation == pos/kOne");
+            // Diagonal of the upper-left 3x3 == radius (uniform scale), off-diagonals 0.
+            check(approx(m.m[0], 0.5f, kEps) && approx(m.m[5], 0.5f, kEps) && approx(m.m[10], 0.5f, kEps),
+                  "FxBodyTransform: identity -> diagonal == radius/kOne (uniform scale)");
+            check(approx(m.m[1], 0.0f, kEps) && approx(m.m[2], 0.0f, kEps) && approx(m.m[4], 0.0f, kEps) &&
+                  approx(m.m[6], 0.0f, kEps) && approx(m.m[8], 0.0f, kEps) && approx(m.m[9], 0.0f, kEps),
+                  "FxBodyTransform: identity -> no rotation (off-diagonals 0)");
+        }
+
+        // --- (2) A known 90 deg rotation about Y -> the expected rotation matrix (within fp tol). ---
+        // q = (0, sin45, 0, cos45) in Q16.16 -> a +90deg yaw. With unit scale (radius==1): the upper-left
+        // 3x3 should be RotateY(pi/2): col0=(0,0,-1), col1=(0,1,0), col2=(1,0,0) (RH, the math.h convention).
+        {
+            const float s45 = 0.70710678f;
+            fpx::FxBody b;
+            b.pos    = {0, 0, 0};
+            b.radius = kOne;                                    // unit scale (read the rotation directly)
+            b.orient = fpx::FxQuat{0, (fx)(s45 * (float)kOne + 0.5f), 0,
+                                      (fx)(s45 * (float)kOne + 0.5f)};   // (0, sin45, 0, cos45)
+            math::Mat4 m = fpx::FxBodyTransform(b);
+            // Compare against math::QuatToMat4 of the SAME normalized float quat (the reference formula).
+            math::Quat qf = math::Normalize(math::Quat{0.0f, s45, 0.0f, s45});
+            math::Mat4 ref = math::QuatToMat4(qf);
+            bool ok = true;
+            for (int k = 0; k < 16; ++k) if (!approx(m.m[k], ref.m[k], 2e-3f)) ok = false;
+            check(ok, "FxBodyTransform: 90deg-Y orient == QuatToMat4 reference (within fp tol)");
+            // Spot-check the RotateY(90) columns: m(0,2)=+1, m(2,0)=-1, m(1,1)=+1.
+            check(approx(m.m[8], 1.0f, 2e-3f) && approx(m.m[2], -1.0f, 2e-3f) && approx(m.m[5], 1.0f, 2e-3f),
+                  "FxBodyTransform: 90deg-Y rotation columns correct");
+        }
+
+        // --- (3) Non-unit radius scales the rotation columns; translation is pos/kOne regardless. ---
+        {
+            fpx::FxBody b;
+            b.pos    = {FromInt(5), 0, 0};
+            b.radius = FromInt(2);                              // scale 2
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            math::Mat4 m = fpx::FxBodyTransform(b);
+            check(approx(m.m[0], 2.0f, kEps) && approx(m.m[5], 2.0f, kEps) && approx(m.m[10], 2.0f, kEps),
+                  "FxBodyTransform: radius==2 -> diagonal scale 2");
+            check(approx(m.m[12], 5.0f, kEps), "FxBodyTransform: translation == pos/kOne with scale");
+        }
+
+        // --- (4) Determinism: the same FxBody -> byte-identical transform (pure host float). ---
+        {
+            fpx::FxBody b;
+            b.pos = {FromInt(1), FromInt(2), FromInt(3)};
+            b.radius = kOne; b.orient = fpx::FxQuat{kOne / 4, kOne / 4, 0, kOne};
+            math::Mat4 m1 = fpx::FxBodyTransform(b);
+            math::Mat4 m2 = fpx::FxBodyTransform(b);
+            check(std::memcmp(m1.m, m2.m, sizeof(m1.m)) == 0,
+                  "FxBodyTransform: deterministic (two calls byte-identical)");
+        }
+    }
+
+    // ================= FPX6: the settled pile is deterministic + has vertical structure ===============
+    {
+        fpx::FpxPileConfig cfg;
+        fpx::FxWorld a = fpx::BuildPileWorld(cfg);
+        fpx::FxWorld bw = fpx::BuildPileWorld(cfg);
+        // Build is deterministic.
+        check(a.bodies.size() == bw.bodies.size() && a.bodies.size() > 0 &&
+              std::memcmp(a.bodies.data(), bw.bodies.data(), a.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "BuildPileWorld: deterministic");
+        uint32_t sa = fpx::StepPileToSettled(a, cfg);
+        uint32_t sb = fpx::StepPileToSettled(bw, cfg);
+        // Settle is deterministic (two runs byte-identical final state + equal settled count).
+        check(sa == sb && std::memcmp(a.bodies.data(), bw.bodies.data(),
+                          a.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "StepPileToSettled: deterministic (two runs byte-identical)");
+        check(sa > 0, "StepPileToSettled: some bodies settle (settled > 0)");
+        // The pile has vertical structure (a mound, not a single flat layer): some body rests above the
+        // base layer by more than a radius.
+        fx minY = a.bodies[0].pos.y, maxY = a.bodies[0].pos.y;
+        for (const auto& body : a.bodies) { if (body.pos.y < minY) minY = body.pos.y;
+                                            if (body.pos.y > maxY) maxY = body.pos.y; }
+        check((maxY - minY) > (kOne / 2), "StepPileToSettled: pile has vertical structure (a mound)");
+    }
+
     if (g_fail == 0) std::printf("fpx_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

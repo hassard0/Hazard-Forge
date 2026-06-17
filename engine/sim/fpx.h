@@ -35,6 +35,10 @@
 #include <span>
 #include <vector>
 
+#include "math/math.h"   // Slice FPX6 (render-only): math::Mat4 / math::Quat for FxBodyTransform. The
+                         // bit-exact sim (FPX1-FPX5, above) uses NONE of this — it stays pure integer,
+                         // NO <cmath>, NO float; only the FPX6 render helpers at the bottom touch float.
+
 namespace hf::sim {
 namespace fpx {
 
@@ -596,6 +600,141 @@ inline FxWorld RunRollback(const FxWorld& init, const std::vector<FxCommand>& au
     for (int t = mispredictTick; t < ticks; ++t)
         SimTick(w, authStream, (uint32_t)t, dt, iters);
     return w;
+}
+
+// ===== Slice FPX6 — LIT 3D RENDER transform helper (FLOAT, render-only — the money-shot) =============
+// The FINAL FPX slice RENDERS the bit-exact fixed-point state as lit 3D spheres. The sim above stays
+// strict integer; here — and ONLY here — we cross to float to build a per-body render transform for the
+// rasterizer. This is the documented FLOAT visresolve-bar (like MC5): the SIM is bit-exact, the final
+// raster/shade is float (cross-vendor ~the engine baseline, NOT held to the integer zero-diff bar).
+//
+// FxBodyTransform(b) builds the model matrix EXACTLY from the body's bit-exact integer state — the ONE
+// host float conversion is `value / (float)kOne` (pos -> world units, orient.xyzw -> a float quaternion,
+// radius -> world-unit scale): translate(pos/kOne) * quatToMat(normalize(orient/kOne)) * scale(radius/kOne).
+// Pure deterministic host float (no RNG, no clock). The provenance proof: every transform derives from
+// FxBody::pos + FxBody::orient (+ radius), i.e. the settled output of the bit-exact StepWorld/SimTick.
+// NOTE kOne (not kSub): fpx's Q16.16 unit scale IS kOne (1<<16); the spec's "pos/kSub" is the generic
+// "divide by the fixed-point unit scale", which for fpx is kOne.
+
+// FxToFloat(v): the single host fixed-point->float conversion, v in Q16.16 -> float world units.
+inline float FxToFloat(fx v) { return (float)v / (float)kOne; }
+
+// FxBodyTransform(b): the render-only model matrix for a body — translate(pos) * rotate(orient) *
+// scale(radius). orient is the Q16.16 quaternion converted to a normalized float quat (the fixed-point
+// normalize drifts slightly; we renormalize in float for a clean render rotation). radius==0 => a unit
+// sphere is invisible at that scale, so callers give bodies a real radius; if radius==0 we still emit a
+// valid (degenerate) transform deterministically. Mirrors physics::RigidBody::Transform() in spirit.
+inline math::Mat4 FxBodyTransform(const FxBody& b) {
+    const math::Vec3 t{FxToFloat(b.pos.x), FxToFloat(b.pos.y), FxToFloat(b.pos.z)};
+    const math::Quat q = math::Normalize(math::Quat{
+        FxToFloat(b.orient.x), FxToFloat(b.orient.y), FxToFloat(b.orient.z), FxToFloat(b.orient.w)});
+    const float r = FxToFloat(b.radius);
+    return math::FromTRS(t, q, math::Vec3{r, r, r});
+}
+
+// ----- The deterministic settled PILE (shared by the Vulkan --fpx-render-shot + the Metal --fpx-render)
+// so BOTH backends build the BYTE-IDENTICAL world + run the IDENTICAL integer sim -> identical transforms.
+// A tight CUBIC CLUSTER of N spheres dropped a short distance onto the ground; StepWorld K times with
+// enough solve iterations settles them into a packed mound (addresses the sparse-viz of FPX1-5). All
+// integer / deterministic. Returns the settled world; the caller turns each body into an FxBodyTransform.
+
+// FpxPileConfig: the locked, deterministic pile recipe (golden-stable; NO RNG). The FPX3 solver is a
+// FRICTIONLESS positional PBD — a free square-pyramid would slump flat. To get a recognizable packed
+// MOUND we CONFINE the drop: a ring of STATIC boundary spheres forms a circular CORRAL (a bowl) and a
+// grid of DYNAMIC spheres is dropped INSIDE it from a few stacked layers. The wall blocks horizontal
+// escape, so the dynamic balls settle into a heaped pile inside the bowl. Deterministic, pure integer.
+struct FpxPileConfig {
+    int dropSide  = 3;     // 3x3 dynamic balls per dropped layer
+    int dropLayers = 4;    // x4 stacked layers dropped into the corral => 36 dynamic balls (a compact dome)
+    int wallCount = 18;    // static boundary spheres forming the circular corral (overlapped, no gaps)
+    int steps  = 320;      // StepWorld iterations (enough to settle the heap)
+    int iters  = 12;       // solve iterations per step (settle the confined heap tightly)
+};
+
+// BuildPileWorld(cfg): the initial FxWorld — a ring of static corral spheres + a stacked grid of dynamic
+// spheres dropped inside. All host-snapped to Q16.16. Pure integer state; the float layout constants are
+// computed once at build time and snapped (NOT part of the per-step bit-exact sim, which is integer). The
+// static wall bodies carry invMass=0 / no kFlagDynamic so they never move (the deterministic bowl). NO RNG.
+inline FxWorld BuildPileWorld(const FpxPileConfig& cfg) {
+    FxWorld w;
+    const fx gravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));   // round-to-nearest
+    w.gravity = {0, gravY, 0};
+    w.groundY = 0;
+    auto snap = [](double v) -> fx { return (fx)(v * (double)kOne + (v < 0 ? -0.5 : 0.5)); };
+    const double R = 0.5;                  // dynamic sphere radius
+    const fx kRadius = snap(R);
+
+    // --- The static circular CORRAL: wallCount large static spheres on a ring of radius ringR, half-sunk
+    // into the ground so their tops form a low wall. They confine the dynamic drop horizontally. ---
+    const double ringR  = 1.9;             // corral radius (the dynamic dome packs inside this basin)
+    const double wallRad = 0.95;           // BIG static wall spheres (a tall, deep basin wall, no gaps)
+    const double kPi = 3.14159265358979323846;
+    for (int i = 0; i < cfg.wallCount; ++i) {
+        const double a = 2.0 * kPi * (double)i / (double)cfg.wallCount;
+        FxBody b;
+        // Centers sunk so the ball bottoms reach the ground (a deep bowl); only the upper part is the wall.
+        b.pos = {snap(ringR * std::cos(a)), snap(wallRad - 0.5), snap(ringR * std::sin(a))};
+        b.vel = {0, 0, 0};
+        b.invMass = 0;                     // static: infinite mass, never moves
+        b.flags = 0;                       // NOT dynamic
+        b.radius = snap(wallRad);
+        b.orient = FxQuat{0, 0, 0, kOne};
+        b.angVel = {0, 0, 0};
+        w.bodies.push_back(b);
+    }
+
+    // --- The DYNAMIC drop: a dropSide x dropSide grid stacked dropLayers high, centered, started above
+    // the corral so it falls in and heaps up against the wall. spacing = diameter so they pack. ---
+    const double d = 2.0 * R;
+    const double off = 0.5 * (double)(cfg.dropSide - 1) * d;
+    for (int ly = 0; ly < cfg.dropLayers; ++ly) {
+        const double y = R + 2.0 + (double)ly * d;   // start the base layer ~2 units above the ground
+        for (int gx = 0; gx < cfg.dropSide; ++gx) {
+            for (int gz = 0; gz < cfg.dropSide; ++gz) {
+                FxBody b;
+                b.pos = {snap((double)gx * d - off), snap(y), snap((double)gz * d - off)};
+                b.vel = {0, 0, 0};
+                b.invMass = kOne;
+                b.flags = kFlagDynamic;
+                b.radius = kRadius;
+                b.orient = FxQuat{0, 0, 0, kOne};
+                b.angVel = {0, 0, 0};
+                w.bodies.push_back(b);
+            }
+        }
+    }
+    return w;
+}
+
+// StepPileToSettled(w, cfg): run the deterministic fixed-point sim to a settled pile. Re-broadphases each
+// step (BuildPairs) then StepWorld (IntegrateStep + SolveContacts) — the realistic per-step contract.
+// Pure integer -> two runs byte-identical, cross-backend identical. Returns #bodies "settled" — measured
+// by POSITION stability over the final step (the FPX3 solver is positional PBD: velocities are NOT
+// reconciled, so resting bodies keep a nonzero vel.y; settling is a POSITION property — a body whose
+// position moved < ~1mm on the last step is at rest).
+inline uint32_t StepPileToSettled(FxWorld& w, const FpxPileConfig& cfg) {
+    const fx dt = kOne / 60;
+    std::vector<uint32_t> offsets;
+    std::vector<FxPair> pairs;
+    std::vector<FxVec3> prevPos;
+    for (int s = 0; s < cfg.steps; ++s) {
+        if (s == cfg.steps - 1) {   // snapshot positions just before the LAST step
+            prevPos.clear();
+            prevPos.reserve(w.bodies.size());
+            for (const FxBody& b : w.bodies) prevPos.push_back(b.pos);
+        }
+        BuildPairs(w, offsets, pairs);
+        StepWorld(w, std::span<const FxPair>(pairs), dt, cfg.iters);
+    }
+    // "settled" = the body moved < ~1mm (kOne/1000) on every axis during the final step.
+    const fx kPosEps = kOne / 1000;   // ~0.001 world units
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    uint32_t settled = 0;
+    for (size_t i = 0; i < w.bodies.size() && i < prevPos.size(); ++i) {
+        const FxVec3 dpos = FxSub(w.bodies[i].pos, prevPos[i]);
+        if (absfx(dpos.x) < kPosEps && absfx(dpos.y) < kPosEps && absfx(dpos.z) < kPosEps) ++settled;
+    }
+    return settled;
 }
 
 }  // namespace fpx
