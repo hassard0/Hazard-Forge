@@ -251,6 +251,20 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # showcase runs the CPU fpx::IntegrateStep (the SAME bit-exact reference the Vulkan GPU==CPU proof compares
 # against) -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan
 # side carries the GPU==CPU bit-identity proof. So fpx_integrate.comp gets NO hf_gen_msl line.
+# Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
+# generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp (ONE thread per body i:
+# perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) over j>i), fpx_pair_scan.comp (SINGLE-THREAD
+# exclusive prefix-sum -> perBodyOffset), fpx_pair_emit.comp (ONE thread per body i: emit each overlapping
+# (i,j) into gPairs at its DISJOINT range, NO atomics). BodyAabb + AabbOverlap copied VERBATIM from
+# engine/sim/fpx.h. Unlike fpx_integrate.comp, these are PURE INT32 (integer add/sub + six compares, NO
+# products, NO int64), so glslc CAN lower them and they MSL-generate NATIVELY (the default MSL gen
+# suffices, NO --msl-version 20200, the mc_classify/mc_count lesson). The Metal --fpx-pairs showcase
+# dispatches the GPU shaders directly (NOT a CPU fallback) -> the GPU==CPU pair-list proof runs on Metal
+# too. Pair list bit-exact GPU==CPU + cross-backend by construction. Behind --fpx-pairs only; existing
+# shaders + goldens untouched.
+hf_gen_msl(fpx_pair_count.comp   fpx_pair_count.comp.hlsl   comp fpx_pair_count_main)
+hf_gen_msl(fpx_pair_scan.comp    fpx_pair_scan.comp.hlsl    comp fpx_pair_scan_main)
+hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_main)
 # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits —
 # ONE thread per cell runs CaseIndex (VERBATIM render/mc.h), looks up triCount = gTriCount[caseIdx] from
 # the host-uploaded 256-entry count table (built from render/mc.h::kTriTable), writes gCounts[cell] and

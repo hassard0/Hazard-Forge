@@ -460,6 +460,19 @@ hf_compile_shaders(
     # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing
     # shaders + goldens untouched.
     "shaders/fpx_integrate.comp.hlsl:cs"
+    # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
+    # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp: ONE thread per body i scans j>i
+    # and writes perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) (each unordered pair counted once,
+    # i<j). fpx_pair_scan.comp: SINGLE-THREAD ([numthreads(1,1,1)]) exclusive prefix-sum -> perBodyOffset.
+    # fpx_pair_emit.comp: ONE thread per body i re-scans j>i and emits each overlapping (i,j) into gPairs at
+    # its DISJOINT [offset[i],..) range (race-free, NO atomics). enabled=0 -> count 0 / emit nothing.
+    # BodyAabb + AabbOverlap copied VERBATIM from engine/sim/fpx.h — PURE INT32 (integer add/sub + six
+    # compares, NO products, NO int64), so these MSL-generate NATIVELY on Metal (unlike fpx_integrate.comp's
+    # int64 fxmul). Pure integer SSBO compute + compute->compute barriers + ReadBuffer -> bit-exact GPU==CPU
+    # pair list + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/fpx_pair_count.comp.hlsl:cs"
+    "shaders/fpx_pair_scan.comp.hlsl:cs"
+    "shaders/fpx_pair_emit.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table
