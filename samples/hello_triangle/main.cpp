@@ -439,6 +439,7 @@ int main(int argc, char** argv) {
     const char* vtFeedbackShotPath = nullptr; // --vt-feedback-shot <out.bmp> (Slice VT1: runtime virtual texturing page-needed FEEDBACK marking, integer compute, GPU==CPU feedback-set bit-exact, per-mip page-grid debug-viz)
     const char* vtAllocShotPath = nullptr; // --vt-alloc-shot <out.bmp> (Slice VT2: runtime virtual texturing physical tile-pool allocation + virtual->physical INDIRECTION table, single-thread GPU allocator, GPU==CPU indirection bit-exact, per-mip tile-assignment debug-viz)
     const char* vtPagegenShotPath = nullptr; // --vt-pagegen-shot <out.bmp> (Slice VT3: runtime virtual texturing procedural PAGE GENERATION into the physical atlas, one-thread-per-texel GPU pass, GPU==CPU atlas bit-exact, the decoded RGBA8 atlas as the golden)
+    const char* vtSampleShotPath = nullptr; // --vt-sample-shot <out.bmp> (Slice VT4: runtime virtual texturing material-pass SAMPLE through the indirection, one-thread-per-virtual-texel GPU pass reconstructs the mip-0 virtual image NEAREST through the indirection, GPU==CPU image bit-exact, the decoded RGBA8 virtual image as the golden)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1407,6 +1408,25 @@ int main(int argc, char** argv) {
             // tile a tinted patterned page, unallocated dark) -> identical both backends by construction. NO
             // rendering, NO new RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
             vtPagegenShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vt-sample-shot") == 0 && i + 1 < argc) {
+            // Slice VT4: Runtime Virtual Texturing Slice 4 — material-pass SAMPLE through the virtual->physical
+            // INDIRECTION (the 4th RVT slice, the round-trip that makes RVT a usable texture). Reuses VT3's full
+            // pipeline (the SAME VtTexture 4mip/128/16vpps0 + 576 requests + VtTilePool{tilesPerSide=16} +
+            // VtAtlasDims{64} so the atlas + indirection MATCH VT3's --vt-pagegen): host vt::MarkFeedbackPages ->
+            // vt::AllocatePhysicalTiles -> vt::BuildTilePageId -> vt::GeneratePhysicalAtlas (host atlas), upload
+            // atlas + indirection, and dispatch shaders/vt_sample.comp — ONE thread per VIRTUAL texel (race-free
+            // MAP, NO atomics) — reconstructing the mip-0 virtual image (16 pages/side × 64-px = 1024×1024): each
+            // virtual texel computes its pageId -> gIndirection[pageId] -> the physical tile -> reads the atlas
+            // texel (NEAREST integer read, SampleVirtualTexel copied VERBATIM from render/vt.h); non-resident page
+            // -> kVtMiss. ReadBuffer reads the RGBA8-packed virtual image. PROOFS (fail loudly): (1) GPU==CPU image
+            // BIT-EXACT (vs CPU vt::ReconstructVirtualImage -> memcmp==0, integer, NO FP tol), (2) {mip:0, WxH,
+            // resident-pages, miss-pages, textured-texels} with every resident virtual texel == PageTexel(pageId,
+            // mip,lx,ly) (round-trip self-consistency) and every non-resident == kVtMiss, (3) page-lookup @interior
+            // GPU==CPU EXACT, (4) sampleEnabled=false -> all kVtMiss (no-op), (5) two-run determinism. Golden = the
+            // reconstructed virtual image decoded from the RGBA8-packed uints (resident pages textured at their UV
+            // location, non-resident pages the miss color) -> identical both backends by construction. NO
+            // rendering, NO new RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
+            vtSampleShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -14958,6 +14978,266 @@ int main(int argc, char** argv) {
                                 "generated texels)\n",
                                 vtPagegenShotPath, atlasW, atlasH, allocated, generated);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vtPagegenShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Runtime Virtual Texturing material-pass SAMPLE through the INDIRECTION (--vt-sample-shot
+        // <out.bmp>, Slice VT4). VT3 generated each allocated page's CONTENT into the physical atlas; VT4
+        // SAMPLES the virtual texture through the virtual->physical INDIRECTION — the round-trip that makes
+        // RVT a usable texture. Reuses VT3's full pipeline (the SAME VtTexture + 576 requests + VtTilePool +
+        // VtAtlasDims so the atlas + indirection MATCH): host feedback -> AllocatePhysicalTiles -> the host
+        // atlas (GeneratePhysicalAtlas). dispatch shaders/vt_sample.comp — ONE thread per VIRTUAL texel
+        // (race-free MAP, NO atomics) — reconstructing the mip-0 virtual image (16 pages/side × 64-px =
+        // 1024×1024): each virtual texel computes its pageId -> indirection[pageId] -> the physical tile ->
+        // reads the atlas texel (NEAREST integer read, SampleVirtualTexel VERBATIM from render/vt.h);
+        // non-resident page -> kVtMiss. PROVEN BIT-EXACT vs CPU vt::ReconstructVirtualImage (memcmp, NO FP).
+        if (vtSampleShotPath) {
+            namespace vt = hf::render::vt;
+            // The SAME virtual texture + request set + pool/atlas dims as VT3's --vt-pagegen (atlas + indirection match).
+            vt::VtTexture vtx;
+            vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+            const int nPages = vtx.pageCount();
+
+            std::vector<vt::SampleRequest> requests;
+            const int kGrid = 24;
+            for (int gy = 0; gy < kGrid; ++gy)
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    float u = (float)gx / (float)kGrid;
+                    float v = (float)gy / (float)kGrid;
+                    int mip = (gx + gy) % vtx.mipLevels;
+                    requests.push_back({u, v, mip});
+                }
+
+            std::vector<uint32_t> feedback((size_t)nPages, 0u);
+            vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                                  std::span<uint32_t>(feedback.data(), feedback.size()));
+
+            vt::VtTilePool pool; pool.tilesPerSide = 16;
+            vt::VtAtlasDims dims; dims.tilesPerSide = pool.tilesPerSide; dims.pageSize = 64;
+            const int atlasW = dims.atlasW();
+            const int atlasTexels = dims.atlasTexels();
+
+            std::vector<int32_t> indirection =
+                vt::AllocatePhysicalTiles(std::span<const uint32_t>(feedback.data(), feedback.size()), pool);
+
+            // The host physical atlas (VT3's GeneratePhysicalAtlas) — the SAME content VT3 wrote.
+            std::vector<uint32_t> atlas((size_t)atlasTexels, vt::kAtlasClear);
+            vt::GeneratePhysicalAtlas(std::span<const int32_t>(indirection.data(), indirection.size()), vtx,
+                                      pool, dims, std::span<uint32_t>(atlas.data(), atlas.size()), true);
+
+            // Reconstruct MIP 0: 16 pages/side × 64-px page = a 1024×1024 virtual image.
+            const int sampleMip = 0;
+            const int virtualW = vtx.pagesPerSide(sampleMip) * dims.pageSize;   // 16*64 = 1024
+            const int virtualH = virtualW;                                       // square
+            const int virtualTexels = virtualW * virtualH;
+
+            // Resident / miss MIP-0 page accounting (the proof headline).
+            int residentPagesMip0 = 0, missPagesMip0 = 0;
+            const int pps0 = vtx.pagesPerSide(sampleMip);
+            for (int py = 0; py < pps0; ++py)
+                for (int px = 0; px < pps0; ++px) {
+                    const int pid = vt::PageId(sampleMip, px, py, vtx);
+                    if (indirection[(size_t)pid] != vt::kNoTile) ++residentPagesMip0; else ++missPagesMip0;
+                }
+
+            // indirection SSBO (uint, kNoTileU32 sentinel) — read-only on the GPU.
+            std::vector<uint32_t> indirU(indirection.size());
+            for (size_t i = 0; i < indirection.size(); ++i)
+                indirU[i] = (indirection[i] == vt::kNoTile) ? vt::kNoTileU32 : (uint32_t)indirection[i];
+            rhi::BufferDesc inDesc;
+            inDesc.size = indirU.size() * sizeof(uint32_t);
+            inDesc.initialData = indirU.data();
+            inDesc.usage = rhi::BufferUsage::Storage;
+            auto indirBuf = device->CreateBuffer(inDesc);
+
+            // atlas SSBO (the VT3 content) — read-only on the GPU.
+            rhi::BufferDesc atDesc;
+            atDesc.size = atlas.size() * sizeof(uint32_t);
+            atDesc.initialData = atlas.data();
+            atDesc.usage = rhi::BufferUsage::Storage;
+            auto atlasBuf = device->CreateBuffer(atDesc);
+
+            // image SSBO (cleared to kVtMiss so a never-dispatched texel still reads the miss color).
+            std::vector<uint32_t> imageInit((size_t)virtualTexels, vt::kVtMiss);
+            auto makeImageBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = imageInit.size() * sizeof(uint32_t);
+                d.initialData = imageInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches vt_sample.comp Params std430): uint4 dims + uint4 dims2 + uint4 pagesPerSide[4]
+            // + uint4 mipOffset[4].
+            struct VtSmpParams {
+                uint32_t dims[4];          // virtualW, virtualH, atlasW, sampleEnabled
+                uint32_t dims2[4];         // mip, pageSize, tilesPerSide, mipLevels
+                uint32_t pagesPerSide[16];
+                uint32_t mipOffset[16];
+            };
+            static_assert(sizeof(VtSmpParams) == 16 + 16 + 64 + 64, "VtSmpParams std430 layout");
+            auto makeParams = [&](uint32_t sampleEnabled) {
+                VtSmpParams p{};
+                p.dims[0] = (uint32_t)virtualW; p.dims[1] = (uint32_t)virtualH;
+                p.dims[2] = (uint32_t)atlasW;   p.dims[3] = sampleEnabled;
+                p.dims2[0] = (uint32_t)sampleMip; p.dims2[1] = (uint32_t)dims.pageSize;
+                p.dims2[2] = (uint32_t)pool.tilesPerSide; p.dims2[3] = (uint32_t)vtx.mipLevels;
+                for (int m = 0; m < vtx.mipLevels; ++m) {
+                    p.pagesPerSide[m] = (uint32_t)vtx.pagesPerSide(m);
+                    p.mipOffset[m]    = (uint32_t)vtx.mipPageOffset(m);
+                }
+                return p;
+            };
+
+            // Compute pipeline: 4 storage buffers (indirection, atlas, image, params); 64 threads/group (1D).
+            auto smpWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vt_sample.comp.hlsl.spv");
+            auto smpCs = device->CreateShaderModule({std::span<const uint32_t>(smpWords)});
+            rhi::ComputePipelineDesc smpDesc;
+            smpDesc.compute = smpCs.get();
+            smpDesc.storageBufferCount = 4;
+            smpDesc.pushConstantSize = 0;
+            smpDesc.threadsPerGroupX = 64;
+            auto smpCompute = device->CreateComputePipeline(smpDesc);
+
+            const uint32_t kGroups = ((uint32_t)virtualTexels + 63u) / 64u;
+
+            auto runSample = [&](uint32_t sampleEnabled, std::vector<uint32_t>& outImage) {
+                auto imageBuf = makeImageBuf();
+                VtSmpParams params = makeParams(sampleEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(VtSmpParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("vt_sample", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*smpCompute);
+                        cmd.BindStorageBuffer(*indirBuf, 0);
+                        cmd.BindStorageBuffer(*atlasBuf, 1);
+                        cmd.BindStorageBuffer(*imageBuf, 2);
+                        cmd.BindStorageBuffer(*paramsBuf, 3);
+                        cmd.DispatchCompute(kGroups);   // one thread per virtual texel (1D)
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outImage.assign((size_t)virtualTexels, 0u);
+                device->ReadBuffer(*imageBuf, outImage.data(), outImage.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU sample (enabled) ===
+            std::vector<uint32_t> gpuImage;
+            runSample(1u, gpuImage);
+
+            // === CPU reference over the SAME atlas + indirection ===
+            std::vector<uint32_t> cpuImage((size_t)virtualTexels, 0u);
+            vt::ReconstructVirtualImage(sampleMip,
+                                        std::span<const int32_t>(indirection.data(), indirection.size()),
+                                        std::span<const uint32_t>(atlas.data(), atlas.size()), vtx, pool, dims,
+                                        std::span<uint32_t>(cpuImage.data(), cpuImage.size()), true);
+
+            // PROOF (1) GPU==CPU sampled image BIT-EXACT (integer RGBA8 memcmp, NO FP tolerance).
+            if (gpuImage.size() != cpuImage.size() ||
+                std::memcmp(gpuImage.data(), cpuImage.data(),
+                            (size_t)virtualTexels * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vt-sample GPU image != CPU ReconstructVirtualImage "
+                             "(the sample-through-indirection diverged?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-sample GPU==CPU image: %dx%d BIT-EXACT\n", virtualW, virtualH);
+
+            // PROOF (2) round-trip self-consistency: every resident virtual texel == PageTexel(pageId,mip,lx,ly)
+            // (the sample read back exactly what VT3 wrote), every non-resident virtual texel == kVtMiss.
+            uint32_t texturedTexels = 0;
+            bool selfConsistent = true;
+            for (int vy = 0; vy < virtualH && selfConsistent; ++vy)
+                for (int vx = 0; vx < virtualW; ++vx) {
+                    const uint32_t got = gpuImage[(size_t)vy * virtualW + vx];
+                    const int px = vx / dims.pageSize, py = vy / dims.pageSize;
+                    const int pid = vt::PageId(sampleMip, px, py, vtx);
+                    const int lx = vx % dims.pageSize, ly = vy % dims.pageSize;
+                    if (indirection[(size_t)pid] != vt::kNoTile) {
+                        if (got != vt::PageTexel(pid, sampleMip, lx, ly)) { selfConsistent = false; break; }
+                        ++texturedTexels;
+                    } else {
+                        if (got != vt::kVtMiss) { selfConsistent = false; break; }
+                    }
+                }
+            if (!selfConsistent) {
+                std::fprintf(stderr, "FATAL: vt-sample round-trip self-consistency FAILED (a sampled texel "
+                             "!= PageTexel, or a non-resident texel != kVtMiss)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-sample: {mip:0, %dx%d, resident-pages:%d, miss-pages:%d, textured-texels:%u}\n",
+                        virtualW, virtualH, residentPagesMip0, missPagesMip0, texturedTexels);
+
+            // PROOF (3) GPU==CPU page-lookup @interior: at a few deterministic interior virtual texels, the
+            // (pageId,tile) the shader resolves (read off gpuImage) == the CPU SampleVirtualTexel lookup.
+            const int kProbes = 5;
+            int probesOk = 0;
+            for (int k = 0; k < kProbes; ++k) {
+                const int vx = (virtualW * (2 * k + 1)) / (2 * kProbes);  // spread across the image interior
+                const int vy = (virtualH * (3 * k + 2)) / (2 * kProbes + 1);
+                const int cvx = vx < virtualW ? vx : virtualW - 1;
+                const int cvy = vy < virtualH ? vy : virtualH - 1;
+                const uint32_t cpuVal = vt::SampleVirtualTexel(
+                    cvx, cvy, sampleMip, std::span<const int32_t>(indirection.data(), indirection.size()),
+                    std::span<const uint32_t>(atlas.data(), atlas.size()), vtx, pool, dims);
+                const uint32_t gpuVal = gpuImage[(size_t)cvy * virtualW + cvx];
+                if (cpuVal == gpuVal) ++probesOk;
+            }
+            if (probesOk != kProbes) {
+                std::fprintf(stderr, "FATAL: vt-sample page-lookup @interior mismatch (%d/%d)\n",
+                             probesOk, kProbes);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-sample page-lookup @interior: %d/%d EXACT\n", probesOk, kProbes);
+
+            // PROOF (4) sampleEnabled=false -> all kVtMiss (no-op).
+            std::vector<uint32_t> disabledImage;
+            runSample(0u, disabledImage);
+            bool allMiss = true;
+            for (uint32_t t : disabledImage) if (t != vt::kVtMiss) { allMiss = false; break; }
+            if (!allMiss) {
+                std::fprintf(stderr, "FATAL: vt-sample sampleEnabled=false did NOT yield all kVtMiss\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-sample disabled: all miss (no-op)\n");
+
+            // PROOF (5) two-run determinism byte-identical.
+            std::vector<uint32_t> gpuImage2;
+            runSample(1u, gpuImage2);
+            if (gpuImage.size() != gpuImage2.size() ||
+                std::memcmp(gpuImage.data(), gpuImage2.data(),
+                            gpuImage.size() * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vt-sample two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-sample determinism: two dispatches BYTE-IDENTICAL\n");
+
+            // --- Golden: the reconstructed virtual image decoded directly from the RGBA8-packed uints
+            // (0xAABBGGRR -> BGRA bytes for WriteBMP). Resident pages textured at their UV location,
+            // non-resident pages the magenta miss color. ---
+            std::vector<uint8_t> bgra((size_t)virtualW * virtualH * 4, 0);
+            for (size_t p = 0; p < (size_t)virtualW * virtualH; ++p) {
+                const uint32_t t = gpuImage[p];
+                const uint8_t r = (uint8_t)(t & 0xFFu);
+                const uint8_t gg = (uint8_t)((t >> 8) & 0xFFu);
+                const uint8_t b = (uint8_t)((t >> 16) & 0xFFu);
+                bgra[p * 4 + 0] = b; bgra[p * 4 + 1] = gg; bgra[p * 4 + 2] = r; bgra[p * 4 + 3] = 255;
+            }
+            bool ok = WriteBMP(vtSampleShotPath, bgra, (uint32_t)virtualW, (uint32_t)virtualH);
+            if (ok) std::printf("wrote %s (%dx%d) — VT virtual-image sample (%d resident, %d miss pages, %u "
+                                "textured texels)\n",
+                                vtSampleShotPath, virtualW, virtualH, residentPagesMip0, missPagesMip0,
+                                texturedTexels);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vtSampleShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

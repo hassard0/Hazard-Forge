@@ -409,6 +409,14 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> the physical atlas is bit-exact GPU==CPU + cross-backend, proven memcmp.
     # NO new RHI; existing shaders + goldens untouched.
     "shaders/vt_pagegen.comp.hlsl:cs"
+    # Runtime Virtual Texturing Slice 4 (Slice VT4): vt_sample.comp SAMPLES the virtual texture through the
+    # virtual->physical INDIRECTION — ONE thread per VIRTUAL texel (race-free parallel MAP, NO atomics). Each
+    # thread computes its pageId, reads gIndirection[pageId] -> the physical tile, offsets into the physical
+    # atlas (PhysicalTileOrigin) and reads the texel (NEAREST integer read; non-resident -> kVtMiss);
+    # SampleVirtualTexel copied VERBATIM from render/vt.h. sampleEnabled=0 -> all kVtMiss (no-op). Pure integer
+    # SSBO compute + ReadBuffer -> the reconstructed virtual image is bit-exact GPU==CPU + cross-backend.
+    # NO new RHI; existing shaders + goldens untouched.
+    "shaders/vt_sample.comp.hlsl:cs"
     # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer —
     # ONE thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO
     # via InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied
