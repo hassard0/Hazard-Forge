@@ -17341,6 +17341,156 @@ static int RunFpxOrientShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Fixed-Point Physics LOCKSTEP + ROLLBACK proof showcase (Slice FPX5, the HEADLINE of
+// FLAGSHIP #6). PURE CPU on BOTH backends — there is NO GPU dispatch, NO new shader, NO new RHI here:
+// lockstep/rollback is a determinism PROPERTY of the fpx sim, so the harness runs the IDENTICAL CPU code
+// (engine/sim/fpx.h::RunLockstep/RunRollback) on Vulkan-Windows AND Metal-Mac -> the converged-state
+// golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the
+// cross-platform-lockstep evidence — the same simulated state on two platforms from the same inputs).
+// This builds the SAME deterministic scene + command streams as the Vulkan --fpx-lockstep-shot, runs
+// authority=RunLockstep + replica=RunLockstep + rolledBack=RunRollback, asserts authority==replica +
+// rollback-corrects-to-authority BIT-EXACT (+ determinism + snapshot round-trip), and CPU-renders the
+// converged-state side-view -> BYTE-IDENTICAL to the Vulkan path. New golden tests/golden/metal/fpx_lockstep.png.
+static int RunFpxLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    const fpx::fx kDt = fpx::kOne / 60;
+    const int kIters = 6;
+    const int kTicks = 24;
+    const int kMispredictTick = 10;
+
+    const fpx::fx kGravY = (fpx::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const int kBodyCount = 5;
+    const fpx::fx kRadius = (fpx::fx)(fpx::kOne * 55 / 100);   // 0.55
+    auto makeWorld = [&]() {
+        fpx::FxWorld w;
+        w.gravity = {0, kGravY, 0};
+        w.groundY = 0;
+        for (int i = 0; i < kBodyCount; ++i) {
+            fpx::FxBody b;
+            b.pos = {(fpx::fx)(i * (int)fpx::kOne), (fpx::fx)((3 + (i % 3)) * (int)fpx::kOne), 0};
+            b.vel = {0, 0, 0};
+            b.invMass = fpx::kOne;
+            b.flags = fpx::kFlagDynamic;
+            b.radius = kRadius;
+            b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+            b.angVel = {0, 0, 0};
+            w.bodies.push_back(b);
+        }
+        return w;
+    };
+    const fpx::FxWorld init = makeWorld();
+
+    const std::vector<fpx::FxCommand> authStream = {
+        fpx::FxCommand{2,  fpx::kCmdImpulse,   0, fpx::FxVec3{(fpx::fx)(fpx::kOne * 3),  0, 0}},
+        fpx::FxCommand{2,  fpx::kCmdImpulse,   4, fpx::FxVec3{(fpx::fx)(-fpx::kOne * 3), 0, 0}},
+        fpx::FxCommand{6,  fpx::kCmdSetAngVel, 2, fpx::FxVec3{0, fpx::kOne, 0}},
+        fpx::FxCommand{12, fpx::kCmdImpulse,   1, fpx::FxVec3{(fpx::fx)(fpx::kOne * 2),  0, 0}},
+        fpx::FxCommand{12, fpx::kCmdImpulse,   3, fpx::FxVec3{(fpx::fx)(-fpx::kOne * 2), 0, 0}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<fpx::FxCommand> mispredictStream = authStream;
+    mispredictStream.push_back(
+        fpx::FxCommand{(uint32_t)kMispredictTick, fpx::kCmdImpulse, 2,
+                       fpx::FxVec3{(fpx::fx)(fpx::kOne * 40), 0, 0}});
+
+    const fpx::FxWorld authority  = fpx::RunLockstep(init, authStream, kTicks, kDt, kIters);
+    const fpx::FxWorld replica    = fpx::RunLockstep(init, authStream, kTicks, kDt, kIters);
+    const fpx::FxWorld rolledBack = fpx::RunRollback(init, authStream, mispredictStream, kTicks,
+                                                     kMispredictTick, kDt, kIters);
+
+    auto bodiesBytes = [](const fpx::FxWorld& w) { return w.bodies.size() * sizeof(fpx::FxBody); };
+
+    // PROOF (1) LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+    if (authority.bodies.size() != replica.bodies.size() ||
+        std::memcmp(authority.bodies.data(), replica.bodies.data(), bodiesBytes(authority)) != 0)
+        return fail("fpx-lockstep: replica != authority (inputs-only re-sim diverged)");
+    std::printf("fpx-lockstep replica==authority: %d bodies BIT-EXACT (%d ticks, inputs-only)\n",
+                kBodyCount, kTicks);
+
+    // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT, AND the mispredicted state DIFFERED.
+    const fpx::FxWorld mispredicted = fpx::RunLockstep(init, mispredictStream, kTicks, kDt, kIters);
+    const bool divergenceExisted =
+        (mispredicted.bodies.size() != authority.bodies.size()) ||
+        std::memcmp(mispredicted.bodies.data(), authority.bodies.data(), bodiesBytes(authority)) != 0;
+    if (rolledBack.bodies.size() != authority.bodies.size() ||
+        std::memcmp(rolledBack.bodies.data(), authority.bodies.data(), bodiesBytes(authority)) != 0)
+        return fail("fpx-lockstep: rollback != authority (misprediction not corrected)");
+    if (!divergenceExisted)
+        return fail("fpx-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("fpx-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d "
+                "diverged then converged)\n", kMispredictTick);
+
+    // PROOF (3) determinism: two full runs byte-identical.
+    const fpx::FxWorld authority2 = fpx::RunLockstep(init, authStream, kTicks, kDt, kIters);
+    if (authority2.bodies.size() != authority.bodies.size() ||
+        std::memcmp(authority2.bodies.data(), authority.bodies.data(), bodiesBytes(authority)) != 0)
+        return fail("fpx-lockstep: two runs differ (nondeterministic)");
+    std::printf("fpx-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (4) snapshot round-trip: RestoreWorld(SnapshotWorld(w)) == w BIT-EXACT.
+    {
+        fpx::FxWorld w = fpx::RunLockstep(init, authStream, kMispredictTick, kDt, kIters);
+        const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+        fpx::SimTick(w, authStream, (uint32_t)kMispredictTick, kDt, kIters);   // mutate
+        fpx::RestoreWorld(w, snap);
+        if (w.bodies.size() != snap.bodies.size() ||
+            std::memcmp(w.bodies.data(), snap.bodies.data(), bodiesBytes(snap)) != 0 ||
+            w.groundY != snap.groundY || w.gravity.y != snap.gravity.y)
+            return fail("fpx-lockstep: snapshot round-trip != original");
+    }
+    std::printf("fpx-lockstep snapshot: round-trip BIT-EXACT\n");
+
+    // PROOF (5) stats.
+    std::printf("fpx-lockstep: {bodies:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                kBodyCount, kTicks, kCommandCount, kMispredictTick);
+
+    // --- Golden: the converged final state side-view (IDENTICAL to the Vulkan --fpx-lockstep-shot by
+    // construction; authority==replica==rolledBack so the single converged state IS the viz). ---
+    const int kPxPerUnit = 40, kMargin = 24, kWorldW = 6, kWorldH = 7;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    {
+        int gx0, gy0; worldToPx(0, 0, gx0, gy0);
+        if (gy0 >= 0 && gy0 < (int)imgH)
+            for (int x = 0; x < (int)imgW; ++x) {
+                uint8_t* dst = &bgra[((size_t)gy0 * imgW + x) * 4];
+                dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+            }
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = rolledBack.bodies[(size_t)i].pos.x >> fpx::kFrac;
+        const int wy = rolledBack.bodies[(size_t)i].pos.y >> fpx::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fixed-point lockstep+rollback converged state (%d bodies)\n",
+                outPath, imgW, imgH, kBodyCount);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
 // of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
 // corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
@@ -27900,6 +28050,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fpx-orient") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fpx_orient.png";
             try { return RunFpxOrientShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fpx-lockstep <out.png>: render the Deterministic Fixed-Point Physics LOCKSTEP + ROLLBACK proof
+        // showcase (Slice FPX5, the HEADLINE of FLAGSHIP #6). PURE CPU on BOTH backends — there is NO GPU
+        // dispatch, NO new shader, NO new RHI: lockstep/rollback is a determinism PROPERTY of the fpx sim,
+        // so this runs the IDENTICAL CPU harness (engine/sim/fpx.h::RunLockstep/RunRollback) as the Vulkan
+        // --fpx-lockstep-shot -> the converged-state golden is bit-identical cross-backend BY CONSTRUCTION
+        // (that cross-platform bit-identity IS the cross-platform-lockstep evidence). A deterministic scene
+        // + scripted command streams run authority=RunLockstep + replica=RunLockstep + rolledBack=
+        // RunRollback; authority==replica + rollback-corrects-to-authority BIT-EXACT; determinism +
+        // snapshot round-trip. The image golden is the converged-state side-view, identical to the Vulkan
+        // path BY CONSTRUCTION. New golden tests/golden/metal/fpx_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fpx-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fpx_lockstep.png";
+            try { return RunFpxLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mc-count <out.png>: render the GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT

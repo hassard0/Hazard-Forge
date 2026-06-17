@@ -12,6 +12,10 @@
 //   * integrateEnabled-off modeled (the disabled path leaves the body unchanged).
 //   * BroadphaseCell/CellId/FloorDiv incl NEGATIVE coords (correct floor, not truncate-toward-zero).
 //   * overflow bound: a fxmul at the documented +-32768 edge stays exact via the int64 intermediate.
+//   * FPX5 lockstep/rollback: ApplyCommand (impulse/angVel apply, OOB no-op); Snapshot/Restore lossless
+//     round-trip; SimTick deterministic; command stream applied in deterministic order; RunLockstep
+//     replica==authority BIT-EXACT (inputs only); RunRollback converges to authority AND the mispredicted
+//     path differs (a positive + a negative control).
 //
 // Pure C++ (hf_core), ASan-eligible like the other sim/render-math tests.
 #include "sim/fpx.h"
@@ -659,6 +663,135 @@ int main() {
         for (int s = 0; s < K; ++s) fpx::IntegrateBodyFull(stat, grav, kDt);
         check(std::memcmp(&stat, &statInit, sizeof(fpx::FxBody)) == 0,
               "IntegrateBodyFull: static+angVel=0 body unchanged (no-op)");
+    }
+
+    // ================= Slice FPX5: LOCKSTEP + ROLLBACK (the netcode primitive) ========================
+    // The headline: prove the bit-exact fixed-point sim is inputs-only LOCKSTEP + ROLLBACK-ready.
+    // ApplyCommand applies an input; Snapshot/Restore is the lossless rollback primitive; SimTick is a
+    // deterministic per-tick step; RunLockstep fed only inputs re-derives identical state; RunRollback
+    // corrects a misprediction by rolling back + re-simulating the authoritative stream.
+
+    // A small deterministic scene: 3 dynamic spheres above a ground (radii so they can collide), gravity.
+    auto makeLockstepWorld = []() {
+        fpx::FxWorld w;
+        w.gravity = {0, FromInt(-10), 0};
+        w.groundY = 0;
+        for (int i = 0; i < 3; ++i) {
+            fpx::FxBody b;
+            b.pos = {FromInt(i), FromInt(4 + i), 0};
+            b.vel = {0, 0, 0};
+            b.invMass = kOne;
+            b.flags = fpx::kFlagDynamic;
+            b.radius = (fx)(kOne * 6 / 10);   // 0.6 -> neighbors can collide
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.angVel = {0, 0, 0};
+            w.bodies.push_back(b);
+        }
+        return w;
+    };
+
+    // ----- ApplyCommand: impulse adds to velocity; set-angVel sets angVel; OOB is a no-op -----
+    {
+        fpx::FxWorld w = makeLockstepWorld();
+        const fpx::FxVec3 v0 = w.bodies[1].vel;
+        fpx::ApplyCommand(w, fpx::FxCommand{0, fpx::kCmdImpulse, 1, fpx::FxVec3{kOne, 0, 0}});
+        check(w.bodies[1].vel.x == v0.x + kOne && w.bodies[1].vel.y == v0.y && w.bodies[1].vel.z == v0.z,
+              "ApplyCommand: kCmdImpulse adds arg to velocity");
+        fpx::ApplyCommand(w, fpx::FxCommand{0, fpx::kCmdSetAngVel, 2, fpx::FxVec3{0, kOne, 0}});
+        check(w.bodies[2].angVel.x == 0 && w.bodies[2].angVel.y == kOne && w.bodies[2].angVel.z == 0,
+              "ApplyCommand: kCmdSetAngVel sets angVel");
+        // OOB bodyId is a no-op (does not crash, does not mutate).
+        fpx::FxWorld before = w;
+        fpx::ApplyCommand(w, fpx::FxCommand{0, fpx::kCmdImpulse, 99, fpx::FxVec3{kOne, kOne, kOne}});
+        check(std::memcmp(w.bodies.data(), before.bodies.data(),
+                          w.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "ApplyCommand: out-of-range bodyId is a no-op");
+    }
+
+    // ----- SnapshotWorld / RestoreWorld: a lossless round-trip == the original -----
+    {
+        fpx::FxWorld w = makeLockstepWorld();
+        // Advance it a few ticks so it's a non-trivial state.
+        std::vector<fpx::FxCommand> empty;
+        for (uint32_t t = 0; t < 10; ++t) fpx::SimTick(w, empty, t, kOne / 60, 4);
+        const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+        // Mutate w, then restore -> byte-identical to the saved state.
+        fpx::SimTick(w, empty, 10, kOne / 60, 4);
+        check(w.bodies.size() == snap.bodies.size(), "Snapshot/Restore: body count preserved");
+        fpx::RestoreWorld(w, snap);
+        check(w.bodies.size() == snap.bodies.size() &&
+              std::memcmp(w.bodies.data(), snap.bodies.data(),
+                          w.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+              w.groundY == snap.groundY && w.gravity.y == snap.gravity.y,
+              "Snapshot/Restore: round-trip BIT-EXACT == original");
+    }
+
+    // ----- SimTick: deterministic (two runs from the same state+stream are byte-identical) -----
+    {
+        std::vector<fpx::FxCommand> stream = {
+            fpx::FxCommand{1, fpx::kCmdImpulse, 0, fpx::FxVec3{FromInt(2), 0, 0}},
+            fpx::FxCommand{3, fpx::kCmdSetAngVel, 2, fpx::FxVec3{0, kOne, 0}},
+        };
+        fpx::FxWorld a = makeLockstepWorld();
+        fpx::FxWorld b = makeLockstepWorld();
+        for (uint32_t t = 0; t < 8; ++t) { fpx::SimTick(a, stream, t, kOne / 60, 6); }
+        for (uint32_t t = 0; t < 8; ++t) { fpx::SimTick(b, stream, t, kOne / 60, 6); }
+        check(std::memcmp(a.bodies.data(), b.bodies.data(),
+                          a.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "SimTick: deterministic (two runs byte-identical)");
+    }
+
+    // ----- Command stream applied in deterministic ORDER (two impulses on the same body, same tick) -----
+    {
+        // Two impulses on body0 at tick 0: applied in array order -> both add. Order independence of the
+        // SUM here (commutative add) + the deterministic processing both hold; assert both are applied.
+        std::vector<fpx::FxCommand> stream = {
+            fpx::FxCommand{0, fpx::kCmdImpulse, 0, fpx::FxVec3{kOne, 0, 0}},
+            fpx::FxCommand{0, fpx::kCmdImpulse, 0, fpx::FxVec3{FromInt(2), 0, 0}},
+        };
+        fpx::FxWorld w = makeLockstepWorld();
+        // Apply just the tick-0 commands by hand (in array order) and compare to ApplyCommand twice.
+        fpx::FxWorld ref = makeLockstepWorld();
+        for (const auto& c : stream) fpx::ApplyCommand(ref, c);
+        for (const auto& c : stream) if (c.tick == 0) fpx::ApplyCommand(w, c);
+        check(w.bodies[0].vel.x == ref.bodies[0].vel.x && ref.bodies[0].vel.x == FromInt(3),
+              "command stream: same-tick commands applied in deterministic order (sum == 3)");
+    }
+
+    // ----- RunLockstep: replica == authority BIT-EXACT (inputs ONLY) — THE HEADLINE -----
+    {
+        std::vector<fpx::FxCommand> stream = {
+            fpx::FxCommand{1, fpx::kCmdImpulse, 0, fpx::FxVec3{FromInt(3), 0, 0}},
+            fpx::FxCommand{2, fpx::kCmdImpulse, 2, fpx::FxVec3{FromInt(-2), kOne, 0}},
+            fpx::FxCommand{4, fpx::kCmdSetAngVel, 1, fpx::FxVec3{0, kOne, 0}},
+        };
+        const fpx::FxWorld init = makeLockstepWorld();
+        const int N = 20;
+        fpx::FxWorld authority = fpx::RunLockstep(init, stream, N, kOne / 60, 6);
+        fpx::FxWorld replica   = fpx::RunLockstep(init, stream, N, kOne / 60, 6);
+        check(authority.bodies.size() == replica.bodies.size() &&
+              std::memcmp(authority.bodies.data(), replica.bodies.data(),
+                          authority.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "RunLockstep: replica == authority BIT-EXACT (inputs only)");
+
+        // ----- RunRollback: converges to RunLockstep(authStream) AND the mispredicted path differs -----
+        // The mispredicted stream: a WRONG impulse at tick 8 (a different value -> a real divergence).
+        std::vector<fpx::FxCommand> mispredict = stream;
+        mispredict.push_back(fpx::FxCommand{8, fpx::kCmdImpulse, 0, fpx::FxVec3{FromInt(50), 0, 0}});
+        const int mispredictTick = 8;
+        fpx::FxWorld rolledBack = fpx::RunRollback(init, stream, mispredict, N, mispredictTick,
+                                                   kOne / 60, 6);
+        // POSITIVE: rollback converged to the authoritative lockstep state.
+        check(rolledBack.bodies.size() == authority.bodies.size() &&
+              std::memcmp(rolledBack.bodies.data(), authority.bodies.data(),
+                          authority.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "RunRollback: corrected to authority BIT-EXACT (positive)");
+        // NEGATIVE control: a pure-mispredicted run (no rollback) DIFFERS from authority — proving the
+        // misprediction is a REAL divergence the rollback actually fixed (not a no-op).
+        fpx::FxWorld mispredicted = fpx::RunLockstep(init, mispredict, N, kOne / 60, 6);
+        check(std::memcmp(mispredicted.bodies.data(), authority.bodies.data(),
+                          authority.bodies.size() * sizeof(fpx::FxBody)) != 0,
+              "RunRollback: mispredicted path DIFFERS from authority (negative control)");
     }
 
     if (g_fail == 0) std::printf("fpx_test: all checks passed\n");
