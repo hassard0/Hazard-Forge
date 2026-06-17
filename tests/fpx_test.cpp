@@ -240,6 +240,138 @@ int main() {
               "fxmul -200*150 == -30000 (int64, sign correct)");
     }
 
+    // ================= Slice FPX2: integer-AABB BROADPHASE — BodyAabb / AabbOverlap =================
+    {
+        // BodyAabb: pos ± radius per-axis (pure integer add/sub).
+        fpx::FxBody b;
+        b.pos = {FromInt(3), FromInt(-2), FromInt(5)};
+        b.radius = kOne;   // 1.0
+        fpx::FxAabb a = fpx::BodyAabb(b);
+        check(a.lo.x == FromInt(2) && a.lo.y == FromInt(-3) && a.lo.z == FromInt(4),
+              "BodyAabb lo == pos - radius");
+        check(a.hi.x == FromInt(4) && a.hi.y == FromInt(-1) && a.hi.z == FromInt(6),
+              "BodyAabb hi == pos + radius");
+        // radius 0 -> a point AABB (lo == hi == pos), the FPX1 default.
+        fpx::FxBody pt; pt.pos = {FromInt(7), 0, 0};  // radius defaults to 0
+        fpx::FxAabb pa = fpx::BodyAabb(pt);
+        check(pa.lo.x == pa.hi.x && pa.lo.x == FromInt(7), "BodyAabb radius-0 -> point AABB");
+
+        // AabbOverlap: clearly overlapping boxes (one inside the gap of the other on every axis).
+        fpx::FxAabb o1{{0, 0, 0}, {FromInt(2), FromInt(2), FromInt(2)}};
+        fpx::FxAabb o2{{FromInt(1), FromInt(1), FromInt(1)}, {FromInt(3), FromInt(3), FromInt(3)}};
+        check(fpx::AabbOverlap(o1, o2), "AabbOverlap overlapping boxes -> true");
+        check(fpx::AabbOverlap(o2, o1), "AabbOverlap is symmetric");
+
+        // Touching at a face counts as overlap (inclusive <=).
+        fpx::FxAabb t1{{0, 0, 0}, {FromInt(1), FromInt(1), FromInt(1)}};
+        fpx::FxAabb t2{{FromInt(1), 0, 0}, {FromInt(2), FromInt(1), FromInt(1)}};
+        check(fpx::AabbOverlap(t1, t2), "AabbOverlap touching faces -> true (inclusive)");
+
+        // Apart on a single axis -> NO overlap (separating axis on x).
+        fpx::FxAabb p1{{0, 0, 0}, {FromInt(1), FromInt(1), FromInt(1)}};
+        fpx::FxAabb p2{{FromInt(2), 0, 0}, {FromInt(3), FromInt(1), FromInt(1)}};
+        check(!fpx::AabbOverlap(p1, p2), "AabbOverlap separated on x -> false");
+        // Overlapping on x,y but apart on z -> NO overlap (all-axis required).
+        fpx::FxAabb z1{{0, 0, 0}, {FromInt(2), FromInt(2), FromInt(1)}};
+        fpx::FxAabb z2{{0, 0, FromInt(2)}, {FromInt(2), FromInt(2), FromInt(3)}};
+        check(!fpx::AabbOverlap(z1, z2), "AabbOverlap separated on z -> false");
+
+        // Negative-coordinate overlap (boxes straddling the origin).
+        fpx::FxAabb n1{{FromInt(-2), FromInt(-2), FromInt(-2)}, {0, 0, 0}};
+        fpx::FxAabb n2{{FromInt(-1), FromInt(-1), FromInt(-1)}, {FromInt(1), FromInt(1), FromInt(1)}};
+        check(fpx::AabbOverlap(n1, n2), "AabbOverlap negative-coord overlap -> true");
+        fpx::FxAabb n3{{FromInt(-5), FromInt(-5), FromInt(-5)}, {FromInt(-3), FromInt(-3), FromInt(-3)}};
+        check(!fpx::AabbOverlap(n1, n3), "AabbOverlap negative-coord apart -> false");
+    }
+
+    // ================= CountPairs / BuildPairs on a known scene =================
+    {
+        // 4 bodies in a row spaced 1.0, radius 0.6 -> 2*0.6=1.2 spans 1 neighbor (dist 1.0 overlaps,
+        // dist 2.0 does NOT). So pairs: (0,1),(1,2),(2,3) -> 3 pairs, grouped-by-i, i<j, no dups.
+        fpx::FxWorld w;
+        const fx r = (fx)(kOne * 6 / 10);  // 0.6
+        for (int i = 0; i < 4; ++i) {
+            fpx::FxBody b; b.pos = {FromInt(i), 0, 0}; b.radius = r; b.flags = fpx::kFlagDynamic;
+            w.bodies.push_back(b);
+        }
+        std::vector<uint32_t> counts((size_t)4, 99u);
+        const uint32_t total = fpx::CountPairs(w, std::span<uint32_t>(counts));
+        check(total == 3u, "CountPairs row-of-4 r=0.6 -> 3 pairs total");
+        check(counts[0] == 1u && counts[1] == 1u && counts[2] == 1u && counts[3] == 0u,
+              "CountPairs per-body counts {1,1,1,0}");
+
+        std::vector<uint32_t> off; std::vector<fpx::FxPair> pairs;
+        fpx::BuildPairs(w, off, pairs);
+        // Exclusive prefix-sum offsets: {0,1,2,3}.
+        check(off.size() == 4 && off[0] == 0u && off[1] == 1u && off[2] == 2u && off[3] == 3u,
+              "BuildPairs prefix-sum offsets {0,1,2,3}");
+        check(pairs.size() == 3, "BuildPairs emits 3 pairs");
+        // grouped-by-i ascending, i<j, no dups: (0,1),(1,2),(2,3).
+        check(pairs[0].i == 0u && pairs[0].j == 1u, "BuildPairs pair[0] == (0,1)");
+        check(pairs[1].i == 1u && pairs[1].j == 2u, "BuildPairs pair[1] == (1,2)");
+        check(pairs[2].i == 2u && pairs[2].j == 3u, "BuildPairs pair[2] == (2,3)");
+        // Invariants: i<j, no dups, AabbOverlap true, totalPairs == Σ counts.
+        uint32_t sum = 0; for (uint32_t c : counts) sum += c;
+        check(sum == total, "totalPairs == Σ perBodyCount");
+        bool inv = true;
+        for (size_t p = 0; p < pairs.size(); ++p) {
+            if (pairs[p].i >= pairs[p].j) inv = false;
+            if (!fpx::AabbOverlap(fpx::BodyAabb(w.bodies[pairs[p].i]),
+                                  fpx::BodyAabb(w.bodies[pairs[p].j]))) inv = false;
+        }
+        check(inv, "BuildPairs every pair i<j + AabbOverlap true");
+    }
+
+    // ================= known case: two overlapping -> 1 pair; two apart -> 0 =================
+    {
+        const fx r = (fx)(kOne * 6 / 10);  // 0.6
+        fpx::FxWorld ov;
+        fpx::FxBody a; a.pos = {0, 0, 0}; a.radius = r;
+        fpx::FxBody b; b.pos = {FromInt(1), 0, 0}; b.radius = r;
+        ov.bodies = {a, b};
+        std::vector<uint32_t> off1; std::vector<fpx::FxPair> pr1;
+        fpx::BuildPairs(ov, off1, pr1);
+        check(pr1.size() == 1 && pr1[0].i == 0u && pr1[0].j == 1u, "known: 2 overlapping -> 1 pair (0,1)");
+
+        fpx::FxWorld ap;
+        fpx::FxBody c; c.pos = {0, 0, 0}; c.radius = r;
+        fpx::FxBody d; d.pos = {FromInt(5), 0, 0}; d.radius = r;
+        ap.bodies = {c, d};
+        std::vector<uint32_t> off2; std::vector<fpx::FxPair> pr2;
+        fpx::BuildPairs(ap, off2, pr2);
+        check(pr2.empty(), "known: 2 apart -> 0 pairs");
+    }
+
+    // ================= enabled-off model -> empty; determinism =================
+    {
+        // The disabled GPU path writes 0 counts + leaves gPairs cleared. The CPU model of "disabled" is
+        // simply an EMPTY world (no bodies) -> 0 pairs, the byte-identical no-op the GPU enabled=0 mirrors.
+        fpx::FxWorld empty;
+        std::vector<uint32_t> ec((size_t)0);
+        check(fpx::CountPairs(empty, std::span<uint32_t>(ec)) == 0u, "enabled-off model: empty world -> 0");
+        std::vector<uint32_t> eo; std::vector<fpx::FxPair> ep;
+        fpx::BuildPairs(empty, eo, ep);
+        check(ep.empty() && eo.empty(), "enabled-off model: BuildPairs(empty) -> empty");
+
+        // Determinism: two BuildPairs over the SAME clustered grid -> byte-identical pair lists.
+        auto makeGrid = []() {
+            fpx::FxWorld w; const fx r = (fx)(kOne * 6 / 10);
+            for (int i = 0; i < 16; ++i) {
+                fpx::FxBody b; b.pos = {FromInt(i % 4), 0, FromInt(i / 4)}; b.radius = r;
+                b.flags = fpx::kFlagDynamic; w.bodies.push_back(b);
+            }
+            return w;
+        };
+        fpx::FxWorld g1 = makeGrid(), g2 = makeGrid();
+        std::vector<uint32_t> o1, o2; std::vector<fpx::FxPair> p1, p2;
+        fpx::BuildPairs(g1, o1, p1); fpx::BuildPairs(g2, o2, p2);
+        check(p1.size() == p2.size() && o1.size() == o2.size(), "broadphase determinism: same sizes");
+        check(!p1.empty() &&
+              std::memcmp(p1.data(), p2.data(), p1.size() * sizeof(fpx::FxPair)) == 0 &&
+              std::memcmp(o1.data(), o2.data(), o1.size() * sizeof(uint32_t)) == 0,
+              "broadphase determinism: two BuildPairs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("fpx_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

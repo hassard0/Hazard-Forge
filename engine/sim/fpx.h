@@ -32,6 +32,7 @@
 // solver's phys.png golden stays byte-identical).
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace hf::sim {
@@ -103,6 +104,10 @@ struct FxBody {
     FxVec3   vel;            // Q16.16 velocity (world units / second)
     fx       invMass = 0;    // Q16.16 inverse mass (0 => infinite mass / static)
     uint32_t flags   = 0;    // bit0 = dynamic
+    // Slice FPX2 broadphase: the body's per-axis half-extent (a Q16.16 sphere/box radius). DEFAULTED to 0
+    // so FPX1's bodies/tests/showcase are UNCHANGED in behavior (FPX1's IntegrateStep IGNORES radius — it
+    // only reads pos/vel/invMass/flags). The integer AABB BodyAabb(b) = {pos - radius, pos + radius}.
+    fx       radius  = 0;    // Q16.16 broadphase half-extent (0 => a point; FPX2's AabbOverlap input)
 };
 
 inline constexpr uint32_t kFlagDynamic = 1u;
@@ -170,6 +175,98 @@ inline FxCell BroadphaseCell(const FxVec3& p, fx cellSize) {
 // mc.h cellId pattern). Caller offsets cell into [0,gridDim) before linearizing.
 inline uint32_t CellId(const FxCell& cell, const FxCell& gridDim) {
     return (uint32_t)((cell.z * gridDim.y + cell.y) * gridDim.x + cell.x);
+}
+
+// ===== Slice FPX2 — integer AABB broadphase: the DETERMINISTIC candidate-pair generator ==============
+// Pure INT32 (no fxmul, no int64, no products — only integer add/sub + compares), so the GPU
+// fpx_pair_count/scan/emit shaders copy this VERBATIM and MSL-generate NATIVELY on Metal (unlike FPX1's
+// int64 fxmul integrator, which is Vulkan-only). The whole broadphase is bit-identical cross-vendor by
+// construction: AabbOverlap is six integer compares, the count/emit are per-body independent over j>i in
+// a fixed order, and the offset prefix-sum is a single-thread serial scan. This is the prerequisite for
+// FPX3's collision response (narrowphase + impulses run per candidate pair).
+
+// An integer (Q16.16) axis-aligned bounding box. lo/hi are inclusive corners in the SAME Q16.16 units as
+// FxBody::pos. Pure integer add/sub to build, six compares to overlap-test.
+struct FxAabb {
+    FxVec3 lo, hi;
+};
+
+// BodyAabb(b) = { pos - radius (per-axis), pos + radius (per-axis) }. Pure integer (no float, no products).
+// radius is the body's broadphase half-extent (0 => a point AABB lo==hi==pos). The shader's BodyAabb
+// copies THIS body VERBATIM.
+inline FxAabb BodyAabb(const FxBody& b) {
+    return FxAabb{
+        FxVec3{b.pos.x - b.radius, b.pos.y - b.radius, b.pos.z - b.radius},
+        FxVec3{b.pos.x + b.radius, b.pos.y + b.radius, b.pos.z + b.radius},
+    };
+}
+
+// AabbOverlap(a, b): the deterministic broadphase predicate — SIX integer compares, NO products, NO
+// int64. Two AABBs overlap iff they overlap on EVERY axis (separating-axis test on the 3 axes). Touching
+// (a.lo.x == b.hi.x) counts as overlap (<=), matching the inclusive-corner convention. Bit-identical
+// cross-vendor by construction (the strongest form). The shader copies THIS body VERBATIM.
+inline bool AabbOverlap(const FxAabb& a, const FxAabb& b) {
+    return a.lo.x <= b.hi.x && b.lo.x <= a.hi.x &&
+           a.lo.y <= b.hi.y && b.lo.y <= a.hi.y &&
+           a.lo.z <= b.hi.z && b.lo.z <= a.hi.z;
+}
+
+// CountPairs(world, perBodyCountOut): the CPU reference count. perBodyCountOut[i] = #{ j>i :
+// AabbOverlap(BodyAabb(i), BodyAabb(j)) }; returns the total over all i. Ordered j>i so each unordered
+// pair is counted ONCE, deterministically, with a canonical i<j orientation (the gpu_culled.h
+// source-order discipline). radius is carried on each body now. The shader fpx_pair_count.comp computes
+// THIS per-thread (one thread per body i).
+inline uint32_t CountPairs(const FxWorld& world, std::span<uint32_t> perBodyCountOut) {
+    const uint32_t n = (uint32_t)world.bodies.size();
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const FxAabb ai = BodyAabb(world.bodies[i]);
+        uint32_t c = 0;
+        for (uint32_t j = i + 1; j < n; ++j)
+            if (AabbOverlap(ai, BodyAabb(world.bodies[j]))) ++c;
+        if (i < perBodyCountOut.size()) perBodyCountOut[i] = c;
+        total += c;
+    }
+    return total;
+}
+
+// A candidate collision pair (i<j, canonical). std430-packable as 2 x uint32 (8 bytes) — the GPU FxPair
+// mirror.
+struct FxPair {
+    uint32_t i, j;
+};
+
+// BuildPairs(world, perBodyOffset, pairsOut): the full CPU mesher (the MC3 count->scan->emit, but on
+// bodies). (1) CountPairs -> per-body counts; (2) exclusive prefix-sum -> perBodyOffset (each body's
+// disjoint write base); (3) for each i, emit each overlapping (i, j>i) at pairsOut[perBodyOffset[i] +
+// local++]. The pair list is grouped by i (ascending) then j (ascending) -> fully deterministic, the
+// exact list the GPU memcmp's against. The GPU does the SAME three passes (count/scan/emit).
+inline void BuildPairs(const FxWorld& world, std::vector<uint32_t>& perBodyOffset,
+                       std::vector<FxPair>& pairsOut) {
+    const uint32_t n = (uint32_t)world.bodies.size();
+    std::vector<uint32_t> counts((size_t)n, 0u);
+    const uint32_t total = CountPairs(world, std::span<uint32_t>(counts));
+
+    // Exclusive prefix-sum of counts -> perBodyOffset (the single-thread serial scan, == mc_scan).
+    perBodyOffset.assign((size_t)n, 0u);
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        perBodyOffset[i] = running;
+        running += counts[i];
+    }
+
+    // Emit each overlapping (i, j>i) into i's disjoint range [offset[i], offset[i]+counts[i]).
+    pairsOut.assign((size_t)total, FxPair{0u, 0u});
+    for (uint32_t i = 0; i < n; ++i) {
+        const FxAabb ai = BodyAabb(world.bodies[i]);
+        uint32_t local = 0;
+        for (uint32_t j = i + 1; j < n; ++j) {
+            if (AabbOverlap(ai, BodyAabb(world.bodies[j]))) {
+                pairsOut[perBodyOffset[i] + local] = FxPair{i, j};
+                ++local;
+            }
+        }
+    }
 }
 
 }  // namespace fpx
