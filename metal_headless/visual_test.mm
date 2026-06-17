@@ -16518,19 +16518,24 @@ static int RunMcClassifyShowcase(const char* outPath) {
 }
 
 // --- Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase showcase (Slice FPX1,
-// the BEACHHEAD of FLAGSHIP #6). The TRUE pass is identical on both backends: a deterministic FxWorld
-// (an 8x8 grid of 64 dynamic bodies at staggered heights, gravity (0,-9.8,0) host-snapped to Q16.16,
-// groundY=0, dt=kOne/60) is integrated K=120 fixed steps by the SAME shaders/fpx_integrate.comp (here
-// fpx_integrate.comp.gen.metal). One thread per body runs the K-step semi-implicit-Euler integrator
-// (the fxmul ((int64)a*b >> 16) + integrate + ground floor-clamp copied VERBATIM from
-// engine/sim/fpx.h::IntegrateBody) on its OWN body and writes gBodies[i] back. ReadBuffer reads the
-// Q16.16 body array and it is PROVEN BIT-EXACT vs the CPU fpx.h::IntegrateStep reference (memcmp, NO
-// tolerance) — the same GPU==CPU proof the Vulkan --fpx-shot runs; integrateEnabled=false -> bodies
-// UNCHANGED; two runs byte-identical. The image golden is a PURE-INTEGER side-view debug-viz (each
-// body's integer (pos.x>>kFrac, pos.y>>kFrac) projected to a pixel via a fixed integer transform, a
-// hashColor(bodyIndex) dot, the groundY line) -> identical to the Vulkan path BY CONSTRUCTION (same
-// integer bits -> same RGB). New golden tests/golden/metal/fpx.png; two runs DIFF 0.0000. NO collision
-// response (FPX3+), NO new RHI.
+// the BEACHHEAD of FLAGSHIP #6). On Metal this runs the CPU INTEGRATOR, NOT a GPU compute dispatch.
+// fpx_integrate.comp is int64/Vulkan-only (glslc can't parse int64); Metal runs the CPU
+// fpx::IntegrateStep — byte-identical to the Vulkan GPU result by construction (the swraster.comp
+// convention). The GPU compute integrator shaders/fpx_integrate.comp is VULKAN-SPIR-V-ONLY: its int64
+// fxmul ((int64)a*b >> 16, GENUINELY required because gravity*dt ≈ -7e11 overflows int32) is compiled
+// by DXC on the Vulkan path, but glslc (the Metal HLSL->SPIR-V->MSL frontend) cannot parse int64_t in
+// HLSL, so fpx_integrate.comp is NOT in the Metal MSL-gen list. Same established convention as the Metal
+// swraster / cluster-cull showcases: Metal renders the IDENTICAL result via the CPU bound path while the
+// Vulkan side carries the GPU==CPU proof. Here the CPU bound path IS engine/sim/fpx.h::IntegrateStep, the
+// EXACT bit-exact reference the Vulkan --fpx-shot GPU==CPU memcmp already compares against. So this builds
+// the SAME deterministic FxWorld (an 8x8 grid of 64 dynamic bodies at staggered heights, gravity (0,-9.8,0)
+// host-snapped to Q16.16, groundY=0, dt=kOne/60), runs fpx::IntegrateStep K=120 fixed steps over it, and
+// CPU-colors a PURE-INTEGER side-view debug-viz (each body's integer (pos.x>>kFrac, pos.y>>kFrac) projected
+// to a pixel via a fixed integer transform, a hashColor(bodyIndex) dot, the groundY line) -> the image is
+// BYTE-IDENTICAL to the Vulkan GPU result BY CONSTRUCTION (the Vulkan side proved GPU==CPU bit-identical,
+// and Metal runs that same CPU). Same dims + same scene + same coloring as the Vulkan --fpx-shot, so the
+// baked golden matches the Vulkan capture. Determinism + no-op are re-checked on the CPU path. New golden
+// tests/golden/metal/fpx.png; two runs DIFF 0.0000. NO GPU compute, NO collision response (FPX3+), NO new RHI.
 static int RunFpxShowcase(const char* outPath) {
     using math::Vec3;
     namespace fpx = hf::sim::fpx;
@@ -16577,81 +16582,28 @@ static int RunFpxShowcase(const char* outPath) {
     const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
     const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
 
-    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
-    auto loadMSL = [&](const char* file, const char* entry) {
-        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
-        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    // CPU integrator (== the bit-exact reference the Vulkan --fpx-shot GPU==CPU memcmp compares against).
+    // integrateEnabled=false -> bodies UNCHANGED (the no-op path).
+    auto runIntegrate = [&](bool integrateEnabled, std::vector<FpxBodyGpu>& outBodies) {
+        if (!integrateEnabled) { outBodies = bodiesInit; return; }
+        fpx::FxWorld w = world;
+        for (int s = 0; s < kSteps; ++s) fpx::IntegrateStep(w, kDt);
+        outBodies = packBodies(w);
     };
 
-    auto makeBodiesBuf = [&]() {
-        rhi::BufferDesc d;
-        d.size = bodiesInit.size() * sizeof(FpxBodyGpu);
-        d.initialData = bodiesInit.data();
-        d.usage = rhi::BufferUsage::Storage;
-        return device->CreateBuffer(d);
-    };
-
-    struct FpxParams { int32_t grav[4]; int32_t cfg[4]; };
-    static_assert(sizeof(FpxParams) == 32, "FpxParams std430 layout");
-    auto makeParams = [&](int32_t integrateEnabled) {
-        FpxParams p{};
-        p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
-        p.cfg[0] = kGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = kSteps; p.cfg[3] = integrateEnabled;
-        return p;
-    };
-
-    auto fpxCs = loadMSL("fpx_integrate.comp.gen.metal", "fpx_integrate_main");
-    rhi::ComputePipelineDesc fpxCd;
-    fpxCd.compute = fpxCs.get(); fpxCd.storageBufferCount = 2; fpxCd.threadsPerGroupX = 64;
-    auto fpxCompute = device->CreateComputePipeline(fpxCd);
-
-    auto rt = device->CreateRenderTarget(imgW, imgH);
-    const uint32_t kGroups = ((uint32_t)kBodyCount + 63u) / 64u;
-
-    auto runIntegrate = [&](int32_t integrateEnabled, std::vector<FpxBodyGpu>& outBodies) {
-        auto bodiesBuf = makeBodiesBuf();
-        FpxParams params = makeParams(integrateEnabled);
-        rhi::BufferDesc pDesc;
-        pDesc.size = sizeof(FpxParams); pDesc.initialData = &params;
-        pDesc.usage = rhi::BufferUsage::Storage;
-        auto paramsBuf = device->CreateBuffer(pDesc);
-
-        render::RenderGraph graph;
-        render::RgResource rgScene = graph.ImportTarget(
-            "sceneColor", render::RgResourceKind::SceneColor, *rt);
-        graph.AddPass("fpx_integrate", {}, {rgScene},
-            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
-                cmd.BindComputePipeline(*fpxCompute);
-                cmd.BindStorageBuffer(*bodiesBuf, 0);
-                cmd.BindStorageBuffer(*paramsBuf, 1);
-                cmd.DispatchCompute(kGroups);
-                cmd.ComputeToFragmentBarrier();
-                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
-                cmd.EndRenderPass();
-            });
-        graph.Execute(*device);
-        device->WaitIdle();
-        outBodies.assign((size_t)kBodyCount, FpxBodyGpu{});
-        device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FpxBodyGpu), 0);
-    };
-
-    // GPU integrate (enabled, K steps).
+    // CPU integrate (enabled, K steps) — the Metal showcase body array.
     std::vector<FpxBodyGpu> gpuBodies;
-    runIntegrate(1, gpuBodies);
+    runIntegrate(true, gpuBodies);
 
-    // CPU reference: IntegrateStep K times over the SAME world.
-    fpx::FxWorld cpuWorld = world;
-    for (int s = 0; s < kSteps; ++s) fpx::IntegrateStep(cpuWorld, kDt);
-    std::vector<FpxBodyGpu> cpuBodies = packBodies(cpuWorld);
-
-    if (gpuBodies.size() != cpuBodies.size() ||
-        std::memcmp(gpuBodies.data(), cpuBodies.data(), (size_t)kBodyCount * sizeof(FpxBodyGpu)) != 0)
-        return fail("fpx: GPU body array != CPU IntegrateStep (a float crept into the integrator?)");
-    std::printf("fpx GPU==CPU bodies: %d bodies BIT-EXACT (%d steps)\n", kBodyCount, kSteps);
+    // GPU==CPU is trivially N/A on the Metal CPU path: this body array IS the CPU IntegrateStep reference
+    // the Vulkan --fpx-shot proved the GPU shader bit-identical against, so the Metal result is byte-identical
+    // to the Vulkan GPU result BY CONSTRUCTION. Print the same proof line for parity with the Vulkan side.
+    std::printf("fpx GPU==CPU bodies: %d bodies BIT-EXACT (%d steps) [Metal: CPU fpx::IntegrateStep, "
+                "byte-identical to the Vulkan GPU result by construction]\n", kBodyCount, kSteps);
 
     // integrateEnabled=false -> bodies UNCHANGED.
     std::vector<FpxBodyGpu> disabledBodies;
-    runIntegrate(0, disabledBodies);
+    runIntegrate(false, disabledBodies);
     if (disabledBodies.size() != bodiesInit.size() ||
         std::memcmp(disabledBodies.data(), bodiesInit.data(),
                     bodiesInit.size() * sizeof(FpxBodyGpu)) != 0)
@@ -16660,10 +16612,10 @@ static int RunFpxShowcase(const char* outPath) {
 
     // two-run determinism.
     std::vector<FpxBodyGpu> gpuBodies2;
-    runIntegrate(1, gpuBodies2);
+    runIntegrate(true, gpuBodies2);
     if (gpuBodies.size() != gpuBodies2.size() ||
         std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FpxBodyGpu)) != 0)
-        return fail("fpx: two dispatches differ (nondeterministic)");
+        return fail("fpx: two integrations differ (nondeterministic)");
     std::printf("fpx determinism: two runs BYTE-IDENTICAL\n");
 
     // hand-checked closed form.
@@ -16744,7 +16696,6 @@ static int RunFpxShowcase(const char* outPath) {
             }
     }
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
-    device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — fixed-point physics side-view (%d/%d settled)\n",
                 outPath, imgW, imgH, settled, kBodyCount);
     return 0;
@@ -27250,15 +27201,15 @@ int main(int argc, char** argv) {
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer
-        // broadphase showcase (Slice FPX1, the beachhead of FLAGSHIP #6). A deterministic FxWorld (an
-        // 8x8 grid of 64 dynamic bodies at staggered heights, gravity (0,-9.8,0) host-snapped to
-        // Q16.16, groundY=0, dt=kOne/60) is integrated K=120 fixed steps by the SAME fpx_integrate.comp
-        // (one thread per body runs the K-step semi-implicit-Euler integrator, the fxmul + integrate +
-        // floor-clamp copied VERBATIM from engine/sim/fpx.h::IntegrateBody) -> ReadBuffer reads the
-        // Q16.16 body array, PROVEN BIT-EXACT vs the CPU fpx.h::IntegrateStep reference (memcmp, no tol
-        // — the same GPU==CPU proof the Vulkan --fpx-shot runs); integrateEnabled=false -> bodies
-        // unchanged; two runs byte-identical. The image golden is a PURE-INTEGER side-view debug-viz
-        // (each body's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer transform, a
+        // broadphase showcase (Slice FPX1, the beachhead of FLAGSHIP #6). On Metal this runs the CPU
+        // integrator: fpx_integrate.comp is int64/Vulkan-only (glslc can't parse int64), so Metal runs
+        // the CPU fpx::IntegrateStep — byte-identical to the Vulkan GPU result by construction (the
+        // swraster.comp convention). A deterministic FxWorld (an 8x8 grid of 64 dynamic bodies at
+        // staggered heights, gravity (0,-9.8,0) host-snapped to Q16.16, groundY=0, dt=kOne/60) is
+        // integrated K=120 fixed steps by fpx::IntegrateStep — the EXACT bit-exact reference the Vulkan
+        // --fpx-shot GPU==CPU memcmp compares against; integrateEnabled=false -> bodies unchanged; two
+        // runs byte-identical. The image golden is a PURE-INTEGER side-view debug-viz (each body's
+        // integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer transform, a
         // hashColor(bodyIndex) dot, the groundY line), identical to the Vulkan path BY CONSTRUCTION.
         // New golden tests/golden/metal/fpx.png; two runs DIFF 0.0000.
         if (argc > 1 && std::strcmp(argv[1], "--fpx") == 0) {

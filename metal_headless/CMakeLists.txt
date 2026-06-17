@@ -242,12 +242,15 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # runs the Q16.16 semi-implicit-Euler INTEGRATOR — ONE thread per body runs `steps` iterations of
 # (vel += gravity*dt; pos += vel*dt; ground floor-clamp) on its OWN body, the fxmul ((int64)a*b >> 16) +
 # integrate + clamp copied VERBATIM from engine/sim/fpx.h::IntegrateBody, writing gBodies[i] back (each
-# body independent -> race-free, NO atomics). integrateEnabled=0 -> write the input back unchanged. The
-# int64 fxmul is a single mul+shift -> spirv-cross lowers it to MSL `long` with NO MSL-2.2 feature -> the
-# default MSL gen suffices (NO --msl-version 20200 needed, the mc_classify/swraster lesson). The body
-# array is bit-exact GPU==CPU + cross-backend by construction. Behind --fpx only; existing shaders +
-# goldens untouched.
-hf_gen_msl(fpx_integrate.comp    fpx_integrate.comp.hlsl    comp fpx_integrate_main)
+# body independent -> race-free, NO atomics).
+# It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 fxmul (int64_t in engine/sim/fpx.h,
+# GENUINELY required because gravity*dt ≈ -7e11 overflows int32) is compiled fine by DXC on the Vulkan
+# path, but glslc (glslang's HLSL frontend used for the Metal HLSL->SPIR-V->MSL chain) cannot parse
+# int64_t in HLSL (`error: 'int64_t' : unknown variable`), so it can't lower this shader. Same Vulkan-only
+# convention as swraster.comp / cluster_cull.comp (which glslc likewise can't lower): on Metal the --fpx
+# showcase runs the CPU fpx::IntegrateStep (the SAME bit-exact reference the Vulkan GPU==CPU proof compares
+# against) -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan
+# side carries the GPU==CPU bit-identity proof. So fpx_integrate.comp gets NO hf_gen_msl line.
 # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits —
 # ONE thread per cell runs CaseIndex (VERBATIM render/mc.h), looks up triCount = gTriCount[caseIdx] from
 # the host-uploaded 256-entry count table (built from render/mc.h::kTriTable), writes gCounts[cell] and
