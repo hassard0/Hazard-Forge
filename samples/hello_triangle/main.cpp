@@ -428,6 +428,7 @@ int main(int argc, char** argv) {
     const char* visbufferShotPath = nullptr; // --visbuffer-shot <out.bmp> (Slice DW: rasterize (clusterID,triID) into an R32_Uint visibility buffer + bit-exact ID readback)
     const char* visresolveShotPath = nullptr; // --visresolve-shot <out.bmp> (Slice DX: deferred material resolve — texel-fetch the vis-buffer, flat-shade the covering triangle, lit image)
     const char* vsmMarkShotPath = nullptr; // --vsm-mark-shot <out.bmp> (Slice VA: VSM virtual page table + page-needed marking, integer compute, GPU==CPU resident-set bit-exact, clipmap debug-viz)
+    const char* vsmRenderShotPath = nullptr; // --vsm-render-shot <out.bmp> (Slice VB: allocate physical atlas tiles to VA's resident pages + render each page's casters' depth into its tile; colorized depth atlas)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1264,6 +1265,19 @@ int main(int argc, char** argv) {
             // CPU-colored from the read-back integer set -> identical both backends by construction. NO
             // rendering, NO new RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
             vsmMarkShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vsm-render-shot") == 0 && i + 1 < argc) {
+            // Slice VB: Virtual Shadow Maps Slice 2 — PHYSICAL-PAGE DEPTH RENDERING. From VA's resident
+            // page set, AllocatePhysicalPages assigns each resident virtual page a PHYSICAL atlas tile (a
+            // deterministic integer virtual->physical indirection table, ascending-pageId priority), then
+            // the showcase renders each resident page's casters' depth into its tile via the CSM
+            // SetViewport atlas loop, each with that page's clipmap-level ortho (PageWorldOrtho). The
+            // colorized depth atlas is the golden. PROOFS (fail loudly): (1) indirection two-run byte-
+            // identical AND == the CPU AllocatePhysicalPages reference (memcmp); (2) {residentPages,
+            // physicalTiles, atlas WxH}; (3) the colorized atlas two-run byte-identical; (4)
+            // markingEnabled=false -> 0 resident -> 0 allocated -> empty (cleared) atlas. NO new RHI
+            // (CreateRenderTarget(atlasSize) + SetViewport + ReadRenderTarget; the integer allocation is
+            // pure CPU). One BMP -> exit.
+            vsmRenderShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -13477,6 +13491,244 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — top-down VSM clipmap page-marking viz (%u resident pages)\n",
                                 vsmMarkShotPath, imgW, imgH, residentPages);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vsmMarkShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Virtual Shadow Maps PHYSICAL-PAGE DEPTH RENDERING (--vsm-render-shot <out.bmp>, Slice VB).
+        // From VA's resident page set, AllocatePhysicalPages assigns each resident virtual page a PHYSICAL
+        // atlas tile (a deterministic integer virtual->physical indirection table, ascending-pageId
+        // priority), then we render each resident page's casters' depth into its tile via the CSM
+        // SetViewport atlas loop, each with that page's clipmap-level ortho (PageWorldOrtho). The colorized
+        // depth atlas (read back from the COLOR render target — vsm_depth.frag writes SV_Position.z ->
+        // grayscale, near=bright) is the golden. PROOFS: (1) indirection two-run byte-identical AND == the
+        // CPU AllocatePhysicalPages reference; (2) {residentPages, physicalTiles, atlas:WxH}; (3) atlas
+        // two-run byte-identical; (4) markingEnabled=false -> empty atlas. NO new RHI. ---------------------
+        if (vsmRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace vsm = hf::render::vsm;
+
+            // The fixed clipmap (== the VA --vsm-mark config) + the physical atlas (16x16 tiles of 128 ->
+            // a 2048² atlas of 256 tiles).
+            vsm::VsmClipmap cm;
+            cm.levels = 4; cm.pageSize = 128; cm.virtualPagesPerSide = 8;
+            cm.level0WorldExtent = 16.0f; cm.cameraPos = {0.0f, 0.0f, 0.0f};
+            const int nPages = cm.pageCount();
+            vsm::VsmAtlas atlas; atlas.tilesPerSide = 16; atlas.tileSize = 128;
+            const uint32_t atlasPx = (uint32_t)atlas.atlasSize();
+
+            // === A fixed caster scene: a grid of boxes + spheres seated on the y=0 ground, spanning
+            // several clipmap levels. The casters' footprints ARE the receiver samples that mark pages. ===
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            struct Caster { Mat4 model; const scene::Mesh* mesh; };
+            std::vector<Caster> casters;
+            std::vector<Vec3> receivers;   // the casters' ground footprints -> the marked pages
+            auto box = [&](float x, float z, float s) {
+                casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s}), &cube});
+                receivers.push_back(Vec3{x, 0.0f, z});
+            };
+            auto ball = [&](float x, float z, float s) {
+                casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s}), &sphere});
+                receivers.push_back(Vec3{x, 0.0f, z});
+            };
+            // Casters laid out in CONCENTRIC BANDS matched to the clipmap level extents (level L covers
+            // level0WorldExtent*2^L = {16,32,64,128} world units, i.e. world radius {8,16,32,64}), so each
+            // caster's camera distance selects a level WHOSE EXTENT CONTAINS it -> the page MarkPage marks
+            // genuinely contains the caster (no edge-clamp to a page that doesn't overlap the geometry).
+            // A grid that ignored the level extents would clamp out-of-extent footprints to edge pages,
+            // leaving resident-but-empty tiles. Inner band -> level 0, mid -> level 1, outer -> level 2.
+            auto ring = [&](float radius, int count, float s0, bool boxes) {
+                for (int k = 0; k < count; ++k) {
+                    float a = 6.28318530718f * (float)k / (float)count;
+                    float x = radius * std::cos(a), z = radius * std::sin(a);
+                    float s = s0 + 0.5f * (float)(k & 1);
+                    if (boxes) box(x, z, s); else ball(x, z, s);
+                }
+            };
+            box(0.0f, 0.0f, 2.4f);                 // level 0 center (page 36)
+            ring(5.0f,  6, 1.6f, false);           // inner ring (dist 5, level 0, within +/-8)
+            ring(12.0f, 8, 2.2f, true);            // mid ring   (dist 12, level 1, within +/-16)
+            ring(24.0f, 10, 3.2f, false);          // outer ring (dist 24, level 2, within +/-32)
+
+            // === Mark the resident pages (CPU, the VA reference) + allocate physical tiles (CPU). ===
+            auto markAndAllocate = [&](bool markingEnabled, std::vector<uint32_t>& residentOut,
+                                       std::vector<uint32_t>& indirOut) -> int {
+                residentOut.assign((size_t)nPages, 0u);
+                if (markingEnabled)
+                    vsm::MarkResidentPages(std::span<const Vec3>(receivers.data(), receivers.size()), cm,
+                                           std::span<uint32_t>(residentOut.data(), residentOut.size()));
+                indirOut.assign((size_t)nPages, vsm::kNoTile);
+                return vsm::AllocatePhysicalPages(
+                    std::span<const uint32_t>(residentOut.data(), residentOut.size()), atlas,
+                    std::span<uint32_t>(indirOut.data(), indirOut.size()));
+            };
+
+            std::vector<uint32_t> resident, indirection;
+            int allocated = markAndAllocate(true, resident, indirection);
+            uint32_t residentPages = 0; for (uint32_t r : resident) residentPages += (r != 0u);
+
+            // PROOF (1a): the indirection table == a second CPU AllocatePhysicalPages run (deterministic).
+            {
+                std::vector<uint32_t> resident2, indir2;
+                int allocated2 = markAndAllocate(true, resident2, indir2);
+                if (allocated2 != allocated ||
+                    std::memcmp(indirection.data(), indir2.data(), (size_t)nPages * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: vsm-render indirection table nondeterministic\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            if (allocated != (int)residentPages) {
+                std::fprintf(stderr, "FATAL: vsm-render allocated %d != %u resident (atlas overflow? cap %d)\n",
+                             allocated, residentPages, atlas.tileCount());
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vsm-render allocation: %d pages -> %d tiles, indirection BIT-EXACT\n",
+                        (int)residentPages, allocated);
+            std::printf("vsm-render: {residentPages:%u, physicalTiles:%d, atlas:%ux%u}\n",
+                        residentPages, allocated, atlasPx, atlasPx);
+
+            // === Per-page light-space view/proj from PageWorldOrtho. The directional clipmap maps the
+            // ground from straight above (-Y); the light view looks down with +Z as 'up'. The ortho near/
+            // far span the world height the casters occupy above the page. ===
+            // The light eye sits a modest height above the page center with the ortho near/far hugging
+            // the caster band (tops ~y<=4 down to the ground at y=0) so the normalized depth spreads the
+            // FULL [0,1] range across each caster's height -> high-contrast silhouettes (near=bright tops,
+            // dark sides/ground), not a washed-out mid-gray.
+            const float kLightHeight = 12.0f;   // light eye above the page center
+            const float kOrthoNear   = 6.0f;    // just above the tallest caster top (12 - ~6)
+            const float kOrthoFar    = 12.5f;   // just past the ground (12 - 0), small slack
+            auto pageViewProj = [&](int pageId) -> Mat4 {
+                vsm::PageOrtho po = vsm::PageWorldOrtho(pageId, cm);
+                Vec3 eye = po.center + Vec3{0.0f, kLightHeight, 0.0f};
+                Mat4 view = Mat4::LookAt(eye, po.center, Vec3{0.0f, 0.0f, 1.0f});
+                Mat4 proj = Mat4::Ortho(-po.halfExtent, po.halfExtent, -po.halfExtent, po.halfExtent,
+                                        kOrthoNear, kOrthoFar);
+                return proj * view;
+            };
+
+            // === Pipeline: shadow_csm.vert (page VP + model in the push constant) -> vsm_depth.frag
+            // (SV_Position.z -> grayscale). Renders into a COLOR atlas (swapchain format) with depth test. ===
+            auto shVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_csm.vert.hlsl.spv");
+            auto depthFsW  = LoadSpirv(std::string(HF_SHADER_DIR) + "/vsm_depth.frag.hlsl.spv");
+            auto shVs    = device->CreateShaderModule({std::span<const uint32_t>(shVsWords)});
+            auto depthFs = device->CreateShaderModule({std::span<const uint32_t>(depthFsW)});
+
+            rhi::GraphicsPipelineDesc pd;
+            pd.vertex = shVs.get(); pd.fragment = depthFs.get();
+            pd.vertexLayout = scene::MeshVertexLayout();
+            pd.colorFormat = device->Swapchain().ColorFormat();
+            pd.depthTest = true; pd.depthWrite = true;
+            pd.pushConstantSize = sizeof(float) * 32;   // pageViewProj(16) + model(16)
+            auto depthPipeline = device->CreateGraphicsPipeline(pd);
+
+            // The non-resident / empty-tile clear color (a fixed dark teal, distinct from the grayscale
+            // depth gradients so the resident tiles read clearly).
+            const rhi::ClearColor kAtlasClear{0.04f, 0.07f, 0.09f, 1.0f};
+
+            // === Render the colorized depth atlas: clear once, then for each resident page SetViewport
+            // (its physical tile) + draw the casters' depth with the page's light-space VP. A FRESH RT per
+            // render (the visbuffer-readback pattern: ReadRenderTarget leaves color in TRANSFER_SRC). ===
+            auto renderAtlas = [&](const std::vector<uint32_t>& indir, std::vector<uint8_t>& outBGRA,
+                                   uint32_t& outW, uint32_t& outH) -> bool {
+                auto rt = device->CreateRenderTarget(atlasPx, atlasPx);
+                render::RenderGraph graph;
+                render::RgResource rgAtlas = graph.ImportTarget(
+                    "vsmAtlas", render::RgResourceKind::SceneColor, *rt);
+                graph.AddPass("vsmRender", {}, {rgAtlas},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(kAtlasClear);
+                        cmd.BindPipeline(*depthPipeline);
+                        for (int pageId = 0; pageId < nPages; ++pageId) {
+                            uint32_t tile = indir[(size_t)pageId];
+                            if (tile == vsm::kNoTile) continue;
+                            int ox, oy; vsm::PhysicalTileOrigin(tile, atlas, ox, oy);
+                            cmd.SetViewport(ox, oy, (uint32_t)atlas.tileSize, (uint32_t)atlas.tileSize);
+                            Mat4 vp = pageViewProj(pageId);
+                            for (const auto& ca : casters) {
+                                float pc[32];
+                                for (int k = 0; k < 16; ++k) pc[k] = vp.m[k];
+                                for (int k = 0; k < 16; ++k) pc[16 + k] = ca.model.m[k];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindVertexBuffer(ca.mesh->vertices());
+                                cmd.BindIndexBuffer(ca.mesh->indices());
+                                cmd.DrawIndexed(ca.mesh->indexCount());
+                            }
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->ReadRenderTarget(*rt, outBGRA, outW, outH);
+            };
+
+            std::vector<uint8_t> atlasBGRA; uint32_t aw = 0, ah = 0;
+            if (!renderAtlas(indirection, atlasBGRA, aw, ah)) {
+                std::fprintf(stderr, "FATAL: vsm-render ReadRenderTarget(atlas) failed\n");
+                device->WaitIdle(); return 1;
+            }
+            if (atlasBGRA.size() != (size_t)aw * ah * 4) {
+                std::fprintf(stderr, "FATAL: vsm-render atlas readback size %zu != %ux%ux4\n",
+                             atlasBGRA.size(), aw, ah);
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF (3): two-run determinism of the colorized depth atlas (byte-identical).
+            {
+                std::vector<uint8_t> atlas2; uint32_t w2 = 0, h2 = 0;
+                if (!renderAtlas(indirection, atlas2, w2, h2)) {
+                    std::fprintf(stderr, "FATAL: vsm-render second atlas render failed\n");
+                    device->WaitIdle(); return 1;
+                }
+                if (atlas2.size() != atlasBGRA.size() ||
+                    std::memcmp(atlasBGRA.data(), atlas2.data(), atlasBGRA.size()) != 0) {
+                    std::fprintf(stderr, "FATAL: vsm-render atlas two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("vsm-render determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (4): markingEnabled=false -> 0 resident -> 0 allocated -> the cleared/empty atlas,
+            // byte-identical to a no-page render (the same all-kNoTile indirection -> nothing drawn).
+            {
+                std::vector<uint32_t> resOff, indirOff;
+                int allocOff = markAndAllocate(false, resOff, indirOff);
+                if (allocOff != 0) {
+                    std::fprintf(stderr, "FATAL: vsm-render markingEnabled=false allocated %d tiles\n", allocOff);
+                    device->WaitIdle(); return 1;
+                }
+                std::vector<uint8_t> emptyAtlas; uint32_t ew = 0, eh = 0;
+                if (!renderAtlas(indirOff, emptyAtlas, ew, eh)) {
+                    std::fprintf(stderr, "FATAL: vsm-render empty atlas render failed\n");
+                    device->WaitIdle(); return 1;
+                }
+                // The empty atlas must be the uniform clear (every pixel == the clear color, no draws).
+                bool uniformClear = true;
+                const uint8_t cb = (uint8_t)(kAtlasClear.b * 255.0f + 0.5f);
+                const uint8_t cg = (uint8_t)(kAtlasClear.g * 255.0f + 0.5f);
+                const uint8_t cr = (uint8_t)(kAtlasClear.r * 255.0f + 0.5f);
+                for (size_t p = 0; p < (size_t)ew * eh; ++p) {
+                    // Allow +/-1 LSB for the float->unorm clear rounding across drivers.
+                    int db = std::abs((int)emptyAtlas[p*4+0] - (int)cb);
+                    int dg = std::abs((int)emptyAtlas[p*4+1] - (int)cg);
+                    int dr = std::abs((int)emptyAtlas[p*4+2] - (int)cr);
+                    if (db > 1 || dg > 1 || dr > 1) { uniformClear = false; break; }
+                }
+                if (!uniformClear) {
+                    std::fprintf(stderr, "FATAL: vsm-render markingEnabled=false atlas is not a uniform clear\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("markingEnabled=false -> empty atlas\n");
+            }
+
+            // === Golden: the read-back BGRA atlas IS the colorized depth atlas (vsm_depth.frag already
+            // wrote near=bright/far=dark grayscale per resident tile; non-resident tiles are the clear
+            // color). Write it directly. ===
+            bool ok = WriteBMP(vsmRenderShotPath, atlasBGRA, aw, ah);
+            if (ok) std::printf("wrote %s (%ux%u) — VSM physical-page depth atlas (%u resident pages, "
+                                "%d tiles, %zu casters)\n", vsmRenderShotPath, aw, ah, residentPages,
+                                allocated, casters.size());
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vsmRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

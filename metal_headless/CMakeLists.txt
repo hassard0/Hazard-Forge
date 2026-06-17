@@ -188,6 +188,11 @@ hf_gen_msl(visresolve.frag      visresolve.frag.hlsl      frag visresolve_fragme
 # / atomics, so NO --msl-version 20200 needed). The resident set is bit-exact GPU==CPU + cross-backend by
 # construction. Behind --vsm-mark only; existing shaders + goldens untouched.
 hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
+# Virtual Shadow Maps Slice 2 (Slice VB): vsm_depth.frag renders each resident PHYSICAL page's casters'
+# depth into its atlas tile. Paired with shadow_csm.vert (the page's light-space ortho VP in the push
+# constant); unlike the depth-only CSM caster it renders into a COLOR atlas (SV_Position.z -> grayscale,
+# near=bright) so the per-tile depth is ReadRenderTarget'd back as the golden. Default MSL gen suffices.
+hf_gen_msl(vsm_depth.frag         vsm_depth.frag.hlsl         frag vsm_depth_fragment)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.

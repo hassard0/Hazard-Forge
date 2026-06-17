@@ -383,6 +383,12 @@ hf_compile_shaders(
     # false -> writes nothing. Pure compute over an integer SSBO + ReadBuffer (the froxel/cluster surface)
     # -> bit-exact GPU==CPU resident set, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/vsm_mark.comp.hlsl:cs"
+    # Virtual Shadow Maps Slice 2 (Slice VB): vsm_depth.frag renders each resident PHYSICAL page's
+    # casters' depth into its atlas tile (paired with shadow_csm.vert: the page's light-space ortho VP in
+    # the push constant). Unlike the depth-only CSM caster it renders into a COLOR atlas — SV_Position.z ->
+    # grayscale (near=bright) — so the per-tile depth is ReadRenderTarget'd back as the golden. NO new RHI
+    # (reuses CreateShadowMap-sized CreateRenderTarget + SetViewport + the integer AllocatePhysicalPages).
+    "shaders/vsm_depth.frag.hlsl:ps"
     # Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): DT's cluster_cull.comp PLUS CJ's
     # hiz_cull.comp occlusion test. After the frustum test, a frustum-surviving cluster-instance is ALSO
     # tested against a Hi-Z max-depth pyramid (built CPU-side from a depth pre-pass + uploaded; render/hiz.h)

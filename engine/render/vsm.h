@@ -39,6 +39,7 @@
 #include "math/math.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <span>
 
@@ -160,6 +161,100 @@ inline void MarkResidentPages(std::span<const math::Vec3> receiverSamples, const
         if (pageId >= 0 && pageId < (int)residentOut.size())
             residentOut[(size_t)pageId] = 1u;
     }
+}
+
+// ============================ Slice VB — physical-page atlas (pure CPU) =======================
+// VA produced the resident SET (resident[pageId] in {0,1}); VB assigns each resident virtual page a
+// PHYSICAL atlas tile (a deterministic integer virtual->physical indirection table) and renders that
+// page's casters' depth into the tile. ZERO backend symbols — the same above-seam discipline as VA;
+// the showcase drives the existing CSM shadow-atlas RHI (CreateShadowMap/SetViewport/BeginShadowPass)
+// from this header's integer allocation + per-page ortho.
+
+// Sentinel: a virtual page with NO physical tile (non-resident, or overflowed past the atlas cap).
+inline constexpr uint32_t kNoTile = 0xFFFFFFFFu;
+
+// The physical atlas: a CreateShadowMap(tilesPerSide*tileSize) square carved into tilesPerSide² tiles
+// of tileSize texels each (e.g. tilesPerSide=16, tileSize=128 -> a 2048² atlas of 256 tiles).
+struct VsmAtlas {
+    int tilesPerSide = 16;
+    int tileSize     = 128;
+
+    int tileCount()  const { return tilesPerSide * tilesPerSide; }
+    int atlasSize()  const { return tilesPerSide * tileSize; }
+};
+
+// The pixel origin (top-left) of physical tile `tileIndex` in the atlas. Tiles are laid out row-major:
+// col = tileIndex % tilesPerSide, row = tileIndex / tilesPerSide; origin = (col*tileSize, row*tileSize)
+// — the same row-major tile layout the CSM atlas uses (col*kTile, row*kTile). Integer, exact.
+inline void PhysicalTileOrigin(uint32_t tileIndex, const VsmAtlas& atlas, int& outX, int& outY) {
+    const int tps = atlas.tilesPerSide;
+    int col = (int)tileIndex % tps;
+    int row = (int)tileIndex / tps;
+    outX = col * atlas.tileSize;
+    outY = row * atlas.tileSize;
+}
+
+// THE DETERMINISTIC ALLOCATOR. Walk the resident[] set in ASCENDING pageId order; each resident page
+// gets the NEXT sequential physical tile index; write indirectionOut[pageId] = tileIndex. Non-resident
+// pages (and resident pages that overflow past the atlas's tileCount() cap) get kNoTile. Returns the
+// number of tiles allocated (== min(residentCount, tileCount())).
+//
+// PRIORITY = ascending pageId. PageId is level-major (id = level*vpps² + py*vpps + px), so ascending
+// pageId == level 0 first, then level 1, ... — i.e. the FINEST/NEAREST clipmap level (level 0, the
+// small central region) gets the lowest tile indices and is allocated FIRST. That is the sane priority
+// for an overflow cap (keep the near, high-detail pages; drop the far, coarse ones), so we keep the
+// natural ascending-pageId walk — no separate level-then-pageId reorder needed (it would be identical
+// for this level-major PageId layout). Pure integer + order-deterministic -> bit-exact two-run + a CPU
+// reference the showcase memcmp's against.
+inline int AllocatePhysicalPages(std::span<const uint32_t> resident, const VsmAtlas& atlas,
+                                 std::span<uint32_t> indirectionOut) {
+    const int cap = atlas.tileCount();
+    uint32_t next = 0u;
+    const size_t n = std::min(resident.size(), indirectionOut.size());
+    for (size_t pageId = 0; pageId < indirectionOut.size(); ++pageId) {
+        if (pageId < n && resident[pageId] != 0u && (int)next < cap) {
+            indirectionOut[pageId] = next;
+            ++next;
+        } else {
+            indirectionOut[pageId] = kNoTile;   // non-resident OR overflowed past the cap
+        }
+    }
+    return (int)next;
+}
+
+// The page's world sub-region + its light-space ortho extent. Level L's clipmap covers
+// level0WorldExtent*2^L world units over `vpps` pages, so each page is pageWorldSize = levelExtent/vpps
+// world units square. The page (px,py)'s world CENTER lies on the level's snapped grid (the SAME snap
+// MarkPage uses: origin = floor((cameraPos - levelExtent/2)/pageWorldSize)*pageWorldSize), so the
+// rendered depth tile aligns with the marking. The returned halfExtent is the page's half-size (the
+// ortho half-width for rendering that page's depth). center is on the y=cameraPos.y ground plane (the
+// directional clipmap maps the X/Z ground; X->px, Z->py). DH discipline: std::fma for the grid math.
+struct PageOrtho {
+    math::Vec3 center;      // world center of the page (on the clipmap's ground plane)
+    float      halfExtent;  // half the page's world size (ortho half-width == half-height)
+};
+
+inline PageOrtho PageWorldOrtho(int pageId, const VsmClipmap& cm) {
+    int level, px, py;
+    UnpackPageId(pageId, cm, level, px, py);
+    const int vpps = cm.virtualPagesPerSide;
+
+    // levelExtent = level0WorldExtent * 2^level (exact float32 power-of-two scale, transcendental-free —
+    // identical bits to MarkPage's levelExtent). pageWorldSize = levelExtent / vpps.
+    float levelExtent   = cm.level0WorldExtent * (float)(1u << (uint32_t)level);
+    float pageWorldSize = levelExtent / (float)vpps;
+
+    // The level's snapped origin (matches MarkPage's snap exactly).
+    float originX = std::floor((cm.cameraPos.x - levelExtent * 0.5f) / pageWorldSize) * pageWorldSize;
+    float originZ = std::floor((cm.cameraPos.z - levelExtent * 0.5f) / pageWorldSize) * pageWorldSize;
+
+    // Page (px,py)'s world center = origin + (page + 0.5) * pageWorldSize. fma for the offset (DH).
+    PageOrtho out;
+    out.center.x = std::fma((float)px + 0.5f, pageWorldSize, originX);
+    out.center.y = cm.cameraPos.y;
+    out.center.z = std::fma((float)py + 0.5f, pageWorldSize, originZ);
+    out.halfExtent = pageWorldSize * 0.5f;
+    return out;
 }
 
 }  // namespace hf::render::vsm
