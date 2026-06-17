@@ -580,6 +580,16 @@ hf_add_pure_test(visresolve_test)
 # C++ (hf_core), ASan-eligible.
 hf_add_pure_test(swraster_test)
 
+# GPU Isosurface Meshing Slice 1 (Slice MC1): the per-cell MARCHING-CUBES CASE CLASSIFICATION integer
+# core (render/mc.h) the GPU shaders/mc_classify.comp.hlsl copies verbatim + proves bit-identical. Pins
+# the CaseIndex truth table (empty 0x00 / full 0xFF / each single-corner (1<<i) / mixed, the strict
+# scalar>isovalue "inside" convention), kCornerOffset == the locked canonical MC numbering
+# 0=(0,0,0)..7=(0,1,1), ClassifyCells over a known planar-boundary field (-> a known per-cell case) +
+# the cellId layout, MakeSphereField's SDF shell (surface cells a non-trivial thin proper subset with
+# both inside+outside cells present), the disabled (cleared) no-op model, and determinism. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(mc_test)
+
 # Virtual Shadow Maps Slice 1 (Slice VA): the virtual clipmap PAGE TABLE + PAGE-NEEDED marking math
 # (render/vsm.h) the GPU shaders/vsm_mark.comp.hlsl copies verbatim. Pins PageId/UnpackPageId bijection
 # over [0,pageCount()), SelectClipmapLevel's INTEGER threshold-ladder edges (at-camera->level0, far->top,
