@@ -115,9 +115,12 @@ bool TraceRayToDepth(float3 originWorld, float3 dirWorld, float maxDist, int ste
     float dt = maxDist / (float)steps;
     for (int k = 1; k <= steps; ++k) {
         float t = dt * (float)k;
-        // `precise` so DXC does NOT contract origin + dir*t into a single FMA — the CPU reference does the
-        // separate multiply-then-add, so the stored hit position must be the SAME rounding to be bit-exact.
-        precise float3 pWorld = originWorld + dirWorld * t;
+        // A SINGLE correctly-rounded fused multiply-add per axis via mad(): on Metal the default fast-math
+        // contracts this to fma() (a single rounding); on Vulkan DXC's mad fuses likewise; the CPU
+        // reference uses std::fma — so all three round ONCE and agree to the bit. (A plain origin + dir*t
+        // rounds twice and diverges by ~1 ULP wherever a backend chooses to contract it, which broke the
+        // bit-exact GPU==CPU memcmp.) Mirrors render::probegi::TraceRayToDepth's std::fma.
+        float3 pWorld = mad(dirWorld, float3(t, t, t), originWorld);
         float3 pView = mul(view, float4(pWorld, 1.0)).xyz;   // world -> view (column-major)
         float3 uvd = ViewToScreenUV(pView, tanHalfFovY, aspect, yFlip);
         if (uvd.x < 0.0 || uvd.x > 1.0 || uvd.y < 0.0 || uvd.y > 1.0) continue;   // off-screen

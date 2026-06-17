@@ -172,9 +172,15 @@ inline bool TraceRayToDepth(const math::Vec3& originWorld, const math::Vec3& dir
     float dt = maxDist / (float)steps;
     for (int k = 1; k <= steps; ++k) {
         float t = dt * (float)k;
-        math::Vec3 pWorld{originWorld.x + dirWorld.x * t,
-                          originWorld.y + dirWorld.y * t,
-                          originWorld.z + dirWorld.z * t};
+        // The marched point, computed as a SINGLE correctly-rounded fused multiply-add per axis (std::fma).
+        // This is the cross-backend bit-exactness key: an IEEE fma is correctly rounded (a SINGLE rounding)
+        // on the CPU (std::fma, hardware FMA), on Vulkan (DXC mad -> SPIR-V the driver fuses) AND on Metal
+        // (the MSL mad contracts to fma() under the default fast-math), so all three agree to the bit. A
+        // plain `origin + dir*t` rounds TWICE and the result then depends on whether each backend contracts
+        // it (Metal does, Vulkan/DXC + the CPU do not) -> a 1-ULP divergence that broke the GPU==CPU memcmp.
+        math::Vec3 pWorld{std::fma(dirWorld.x, t, originWorld.x),
+                          std::fma(dirWorld.y, t, originWorld.y),
+                          std::fma(dirWorld.z, t, originWorld.z)};
         math::Vec3 pView = math::MulPoint(view, pWorld);
         math::Vec3 uvd = ViewToScreenUV(pView, tanHalfFovY, aspect, yFlip);
         if (uvd.x < 0.0f || uvd.x > 1.0f || uvd.y < 0.0f || uvd.y > 1.0f) continue;  // off-screen

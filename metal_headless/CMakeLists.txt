@@ -264,6 +264,14 @@ hf_gen_msl(lit_contactshadow.frag lit_contactshadow.frag.hlsl frag contactshadow
 hf_gen_msl(froxel_inject.comp     froxel_inject.comp.hlsl     comp froxel_inject_main)
 hf_gen_msl(froxel_integrate.comp  froxel_integrate.comp.hlsl  comp froxel_integrate_main)
 hf_gen_msl(froxel_apply.frag      froxel_apply.frag.hlsl      frag froxel_apply_fragment)
+# Probe-Grid Ray-Trace — DDGI beachhead (Slice DH): one thread per probe traces 16 deterministic
+# Fibonacci-sphere rays against the scene's view-space depth field (a FLAT float SSBO read back from the
+# G-buffer, NOT a sampled depth texture) into a flat ProbeRayHit SSBO. FibonacciSphere +
+# ViewToScreenUV/ReconstructViewPos + TraceRayToDepth are copied VERBATIM from engine/render/probe_gi.h
+# (+ ssr.h); the host precomputes the 16 Fibonacci dirs + uploads them as exact bits + the shader marks
+# the marched position `precise`, so the GPU ray-hit SSBO is BIT-EXACT to the CPU reference on BOTH
+# backends. Behind --probegi only; existing shaders + goldens untouched.
+hf_gen_msl(probe_raytrace.comp    probe_raytrace.comp.hlsl    comp probe_raytrace_main)
 # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
 # (flat float4 SSBO), Luminance -> LumToBin -> InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER
 # SSBO (order-independent counts -> deterministic; Metal threadgroup atomic_uint maps from the SPIR-V
