@@ -15507,6 +15507,310 @@ static int RunSwRasterGpuShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Nanite SOFTWARE-RASTER vis-buffer -> DEFERRED MATERIAL RESOLVE showcase (Slice SW4). The back-half
+// of the software-raster arc: drive the EXISTING visresolve.frag deferred resolve from the SOFTWARE
+// visibility buffer. The TRUE Vulkan pass (--swraster-resolve-shot) runs the GPU swraster.comp to fill the
+// SW depth|id SSBO, then a fullscreen unpack blit (swraster_resolve_blit.frag) converts it to the R32_Uint
+// visId RT the resolve reads, then visresolve.frag flat-shades it. On Metal swraster.comp is VULKAN-ONLY
+// (int64 — the SAME established convention as --swraster-gpu), so here the CPU render/swraster.h::
+// RasterClusters reference fills the SW vis-buffer over the SAME scene (the EXACT bit-exact reference the
+// Vulkan GPU==CPU proof compares against), and that integer vis-buffer is uploaded as the SSBO. From there
+// the path is IDENTICAL to Vulkan: the SAME swraster_resolve_blit.frag unpacks it (plain MSL — writes an
+// integer SV_Target, NO --msl-version 20200) into the SAME R32_Uint visId RT, and the SAME visresolve.frag
+// flat-shades it. So the resolved image is BYTE-IDENTICAL to the Vulkan result BY CONSTRUCTION (the Vulkan
+// side proved blit GPU==CPU + GPU==CPU shade bit-exact, and Metal runs that same CPU reference + the same
+// two fragment shaders). PROOFS (mirroring Vulkan, CPU-reference variants): (1) blit unpack == CPU unpack
+// BIT-IDENTICAL full-frame; (2) SW resolve == CPU vg::ResolvePixel expectation @interior; (3) GPU==CPU
+// shade @interior EXACT; (4) two renders BYTE-IDENTICAL; (5) disabled-path all-sky no-op; (6) coherent
+// shaded mesh. New golden tests/golden/metal/swraster_resolve.png; two runs DIFF 0.0000. NO new RHI.
+static int RunSwRasterResolveShowcase(const char* outPath) {
+    using math::Vec3; using math::Mat4;
+    namespace vg = render::vg;
+    const uint32_t SW = 512, SH = 512;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(SW, SH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // --- The SW2 clustered scene (== the Vulkan --swraster-resolve-shot): a SphereGeometry decomposed
+    // into meshlet clusters (~769 tris). NO sub-pixel triangle (that is the SW2 raster showcase; here the
+    // scene is the bare clustered sphere the resolve shades). The host projection is the Vulkan convention
+    // (ProjectToScreenVert bakes the Y-flip into the pixel map), the SAME bits the Vulkan path snaps. ---
+    scene::MeshGeometry geo = scene::SphereGeometry(24, 16);
+    std::vector<scene::Vertex> verts = geo.verts;
+    std::vector<uint32_t>      indices = geo.indices;
+
+    Mat4 view = Mat4::LookAt({0.0f, 0.0f, 3.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+    float aspect = (SH > 0) ? (float)SW / (float)SH : 1.0f;
+    Mat4 proj = Mat4::Perspective(0.9f, aspect, 0.1f, 50.0f);
+    Mat4 viewProj = proj * view;
+    const Mat4 model = Mat4::Identity();
+
+    vg::MeshletSet ms = vg::BuildMeshlets(
+        std::span<const scene::Vertex>(verts.data(), verts.size()),
+        std::span<const uint32_t>(indices.data(), indices.size()));
+    std::vector<uint32_t>    workIndices = ms.indices;
+    std::vector<vg::Meshlet> meshlets    = ms.meshlets;
+    const uint32_t kMeshlets = (uint32_t)meshlets.size();
+
+    // Host-project + snap every vertex to integer ScreenVerts (the ONE FP step; Vulkan convention).
+    std::vector<vg::ScreenVert> screen(verts.size());
+    std::vector<uint8_t> behind(verts.size(), 0);
+    for (size_t i = 0; i < verts.size(); ++i) {
+        bool okp = true;
+        screen[i] = vg::ProjectToScreenVert(
+            Vec3{verts[i].pos[0], verts[i].pos[1], verts[i].pos[2]}, viewProj, SW, SH, vg::kSub, okp);
+        behind[i] = okp ? 0 : 1;
+    }
+    auto screenSpan  = std::span<const vg::ScreenVert>(screen.data(), screen.size());
+    auto behindSpan  = std::span<const uint8_t>(behind.data(), behind.size());
+    auto indexSpan   = std::span<const uint32_t>(workIndices.data(), workIndices.size());
+    auto meshletSpan = std::span<const vg::Meshlet>(meshlets.data(), meshlets.size());
+
+    // Count rasterized triangles (for the stat line).
+    uint32_t triCount = 0;
+    for (uint32_t cl = 0; cl < kMeshlets; ++cl) {
+        const vg::Meshlet& m = meshlets[cl];
+        for (uint32_t t = 0; t < m.triCount; ++t) {
+            uint32_t base = 3u * (m.triOffset + t);
+            if (behind[workIndices[base+0]] || behind[workIndices[base+1]] || behind[workIndices[base+2]])
+                continue;
+            ++triCount;
+        }
+    }
+
+    // --- CPU bound path: render/swraster.h::RasterClusters fills the SW vis-buffer (the bit-exact
+    // reference the Vulkan GPU==CPU proof compares against). This integer buffer is uploaded as the SSBO. ---
+    vg::SwVisBuffer cpuVis; cpuVis.Init(SW, SH);
+    vg::RasterClusters(cpuVis, screenSpan, behindSpan, indexSpan, meshletSpan);
+
+    const vg::ResolveMaterial mat = vg::DefaultResolveMaterial();
+    const Vec3 sky = vg::ResolveSkyColor();
+
+    // --- The BLIT + RESOLVE pipelines (the SAME two fragment shaders the Vulkan path runs). ---
+    auto fsVs   = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto blitFs = loadMSL("swraster_resolve_blit.frag.gen.metal", "swraster_resolve_blit_fragment");
+    rhi::GraphicsPipelineDesc blitDesc;
+    blitDesc.vertex = fsVs.get(); blitDesc.fragment = blitFs.get();
+    blitDesc.colorFormat = rhi::Format::R32_Uint;
+    blitDesc.depthTest = false;
+    blitDesc.fullscreen = true;
+    blitDesc.usesFrameUniforms = true;   // the {w,h} UBO
+    blitDesc.usesLightClusters = true;   // set 3 binding 13 = the SW vis SSBO
+    auto blitPipeline = device->CreateGraphicsPipeline(blitDesc);
+
+    auto vrFs = loadMSL("visresolve.frag.gen.metal", "visresolve_fragment");
+    rhi::GraphicsPipelineDesc vrDesc;
+    vrDesc.vertex = fsVs.get(); vrDesc.fragment = vrFs.get();
+    vrDesc.colorFormat = rhi::Format::BGRA8_UNorm;
+    vrDesc.depthTest = false;
+    vrDesc.fullscreen = true;
+    vrDesc.usesFrameUniforms = true;
+    vrDesc.usesTexture = true;        // set 1 binding 0 = the integer visId RT (texel-fetched)
+    vrDesc.usesLightClusters = true;  // set 3 = gClusterMeta / gIndices / gVerts SSBOs
+    auto vrPipeline = device->CreateGraphicsPipeline(vrDesc);
+
+    // The blit's {w,h} UBO (BlitParams: a pad mat4 then uint4 dims).
+    struct BlitUbo { float pad0[16]; uint32_t dims[4]; };
+    static_assert(sizeof(BlitUbo) == 80, "BlitUbo layout");
+    BlitUbo bubo{}; bubo.dims[0] = SW; bubo.dims[1] = SH;
+
+    // The resolve UBO (== visresolve.frag ResolveParams). drawnClusterCount = the meshlet count.
+    struct ResolveUbo { float pad0[16]; float lightDir[4]; float albedo[4]; float sky[4]; uint32_t counts[4]; };
+    static_assert(sizeof(ResolveUbo) == 128, "ResolveUbo layout");
+    ResolveUbo rubo{};
+    rubo.lightDir[0] = mat.lightDir.x; rubo.lightDir[1] = mat.lightDir.y; rubo.lightDir[2] = mat.lightDir.z;
+    rubo.albedo[0] = mat.albedo.x; rubo.albedo[1] = mat.albedo.y; rubo.albedo[2] = mat.albedo.z;
+    rubo.albedo[3] = mat.ambient;
+    rubo.sky[0] = sky.x; rubo.sky[1] = sky.y; rubo.sky[2] = sky.z; rubo.sky[3] = 1.0f;
+    rubo.counts[0] = kMeshlets;
+
+    // The ClusterMeta SSBO (indexed by the unpacked clusterID = the meshlet index): identity model +
+    // the meshlet's triOffset. == the Vulkan path's ClusterMeta.
+    struct ClusterMetaGpu { float modelCol[16]; uint32_t info[4]; };
+    static_assert(sizeof(ClusterMetaGpu) == 80, "ClusterMetaGpu must match visresolve.frag ClusterMeta");
+    std::vector<ClusterMetaGpu> metaIn(kMeshlets);
+    for (uint32_t cl = 0; cl < kMeshlets; ++cl) {
+        for (int k = 0; k < 16; ++k) metaIn[cl].modelCol[k] = model.m[k];
+        metaIn[cl].info[0] = meshlets[cl].triOffset;
+    }
+    rhi::BufferDesc metaDesc;
+    metaDesc.size = std::max<uint64_t>(1u, metaIn.size()) * sizeof(ClusterMetaGpu);
+    metaDesc.initialData = metaIn.data();
+    metaDesc.usage = rhi::BufferUsage::Storage;
+    auto clusterMetaBuffer = device->CreateBuffer(metaDesc);
+
+    rhi::BufferDesc idxSsboDesc;
+    idxSsboDesc.size = workIndices.size() * sizeof(uint32_t);
+    idxSsboDesc.initialData = workIndices.data();
+    idxSsboDesc.usage = rhi::BufferUsage::Storage;
+    auto indexSsbo = device->CreateBuffer(idxSsboDesc);
+    rhi::BufferDesc vtxSsboDesc;
+    vtxSsboDesc.size = verts.size() * sizeof(scene::Vertex);
+    vtxSsboDesc.initialData = verts.data();
+    vtxSsboDesc.usage = rhi::BufferUsage::Storage;
+    auto vertexSsbo = device->CreateBuffer(vtxSsboDesc);
+
+    // === The full render: upload the SW vis-buffer SSBO -> blit -> R32_Uint visId RT -> resolve -> BGRA8.
+    // `useEmpty=true` uploads an all-kSwClear SSBO (the disabled-path no-op: blit all kVisBackground ->
+    // uniform sky). Returns the read-back visId RT + the resolved BGRA8 image. ===
+    std::vector<uint32_t> visClear((size_t)SW * SH, vg::kSwClear);
+    auto renderSwResolve = [&](bool useEmpty, std::vector<uint32_t>& outIds,
+                               std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+        const std::vector<uint32_t>& srcVis = useEmpty ? visClear : cpuVis.packed;
+        rhi::BufferDesc visDesc;
+        visDesc.size = srcVis.size() * sizeof(uint32_t);
+        visDesc.initialData = srcVis.data();
+        visDesc.usage = rhi::BufferUsage::Storage;
+        auto visBuf = device->CreateBuffer(visDesc);
+        auto visIdRT = device->CreateRenderTarget(SW, SH, rhi::Format::R32_Uint);
+        auto resolvedRT = device->CreateRenderTarget(SW, SH, rhi::Format::BGRA8_UNorm);
+        render::RenderGraph graph;
+        render::RgResource rgVisId = graph.ImportTarget("swVisId", render::RgResourceKind::SceneColor, *visIdRT);
+        render::RgResource rgResolved = graph.ImportTarget("resolved", render::RgResourceKind::SceneColor, *resolvedRT);
+        // Pass A: the unpack blit (the SW SSBO -> the R32_Uint visId RT).
+        graph.AddPass("swraster_blit", {}, {rgVisId},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&bubo, sizeof(BlitUbo));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*blitPipeline);
+                cmd.BindLightClusters(*visBuf, *visBuf, *visBuf);  // the SW SSBO at set 3 binding 13
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        // Pass B: the deferred resolve (the visId RT -> the lit image).
+        graph.AddPass("swresolve", {rgVisId}, {rgResolved},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&rubo, sizeof(ResolveUbo));
+                cmd.BeginRenderPass(rhi::ClearColor{sky.x, sky.y, sky.z, 1.0f});
+                cmd.BindPipeline(*vrPipeline);
+                cmd.BindTexture(*visIdRT);
+                cmd.BindLightClusters(*clusterMetaBuffer, *indexSsbo, *vertexSsbo);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        std::vector<uint8_t> rawVis; uint32_t a = 0, b = 0;
+        if (!device->ReadRenderTarget(*visIdRT, rawVis, a, b)) return false;
+        if (rawVis.size() != (size_t)a * b * 4) return false;
+        outIds.resize((size_t)a * b);
+        std::memcpy(outIds.data(), rawVis.data(), rawVis.size());
+        if (!device->ReadRenderTarget(*resolvedRT, outBGRA, outW, outH)) return false;
+        return true;
+    };
+
+    std::vector<uint32_t> swIds; std::vector<uint8_t> swBGRA; uint32_t vw = 0, vh = 0;
+    if (!renderSwResolve(false, swIds, swBGRA, vw, vh)) return fail("swraster-resolve: render/readback failed");
+    if (swBGRA.size() != (size_t)vw * vh * 4) return fail("swraster-resolve: resolved readback not BGRA8");
+
+    // PROOF (1): blit unpack == CPU unpack BIT-IDENTICAL full-frame.
+    for (size_t p = 0; p < swIds.size(); ++p) {
+        uint32_t packed = cpuVis.packed[p];
+        uint32_t expect = (packed == vg::kSwClear) ? vg::kVisBackground : (packed & 0xFFFFu);
+        if (swIds[p] != expect) return fail("swraster-resolve: blit unpack != CPU unpack");
+    }
+    std::printf("swraster-resolve blit GPU==CPU unpack: BIT-IDENTICAL (%ux%u)\n", vw, vh);
+
+    std::span<const uint32_t> idxSpan(workIndices.data(), workIndices.size());
+    std::span<const scene::Vertex> vtxSpan(verts.data(), verts.size());
+
+    uint64_t shadedTexels = 0;
+    for (size_t p = 0; p < swIds.size(); ++p) if (swIds[p] != vg::kVisBackground) ++shadedTexels;
+
+    // The interior near-pole sample(s) for the single sphere instance (the visbuffer.h oracle).
+    std::vector<Vec3> instanceCenters = { Vec3{0.0f, 0.0f, 0.0f} };
+    std::vector<float> instanceRadius  = { 1.0f };
+    std::vector<vg::ClusterInstance> oracleClusters(1);
+    oracleClusters[0].instanceIndex = 0; oracleClusters[0].worldCenter = Vec3{0,0,0}; oracleClusters[0].worldRadius = 1.0f;
+    std::vector<render::mdi::MdiCommand> oracleCmds(1); oracleCmds[0].firstInstance = 0;
+    std::vector<vg::InteriorSample> samples = vg::InstanceInteriorSamples(
+        std::span<const render::mdi::MdiCommand>(oracleCmds.data(), oracleCmds.size()),
+        std::span<const vg::ClusterInstance>(oracleClusters.data(), oracleClusters.size()),
+        std::span<const Vec3>(instanceCenters.data(), instanceCenters.size()),
+        std::span<const float>(instanceRadius.data(), instanceRadius.size()),
+        Vec3{0.0f, 0.0f, 3.0f}, viewProj, vw, vh);
+    if (samples.empty()) return fail("swraster-resolve: no interior sample pixels (oracle vacuous)");
+
+    // PROOF (2): SW resolve == CPU vg::ResolvePixel expectation @interior (+ provenance).
+    uint32_t provOk = 0, provTotal = 0;
+    for (const vg::InteriorSample& s : samples) {
+        size_t pi = (size_t)s.py * vw + s.px;
+        uint32_t v = swIds[pi];
+        if (v == vg::kVisBackground) return fail("swraster-resolve: SW interior pixel is BACKGROUND");
+        uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+        if (cid >= kMeshlets) return fail("swraster-resolve: interior clusterID out of range (bad provenance)");
+        ++provTotal;
+        Vec3 cpuRGB = vg::ResolveFlatShade(tid, meshlets[cid].triOffset, model, idxSpan, vtxSpan, mat);
+        uint8_t cpuBGRA[4]; vg::EncodeBGRA8(cpuRGB, cpuBGRA);
+        const uint8_t* gpuBGRA = &swBGRA[pi * 4];
+        if (gpuBGRA[0] == cpuBGRA[0] && gpuBGRA[1] == cpuBGRA[1] && gpuBGRA[2] == cpuBGRA[2]) ++provOk;
+        else return fail("swraster-resolve: SW resolve != CPU expectation at an interior pixel");
+    }
+    std::printf("swraster-resolve SW==HW @interior: %u/%u EXACT (SW resolve == CPU vg::ResolvePixel "
+                "expectation over the SW vis-buffer)\n", provOk, provTotal);
+
+    // PROOF (3): GPU==CPU shade @interior EXACT (the same compare, the spec's distinct proof line).
+    uint32_t shadeOk = 0, shadeTotal = 0;
+    for (const vg::InteriorSample& s : samples) {
+        size_t pi = (size_t)s.py * vw + s.px;
+        uint32_t cid, tid; vg::UnpackVisId(swIds[pi], cid, tid);
+        Vec3 cpuRGB = vg::ResolveFlatShade(tid, meshlets[cid].triOffset, model, idxSpan, vtxSpan, mat);
+        uint8_t cpuBGRA[4]; vg::EncodeBGRA8(cpuRGB, cpuBGRA);
+        const uint8_t* gpuBGRA = &swBGRA[pi * 4];
+        ++shadeTotal;
+        if (gpuBGRA[0] == cpuBGRA[0] && gpuBGRA[1] == cpuBGRA[1] && gpuBGRA[2] == cpuBGRA[2]) ++shadeOk;
+        else return fail("swraster-resolve: GPU != CPU shade at an interior pixel");
+    }
+    std::printf("swraster-resolve GPU==CPU shade @interior: %u/%u EXACT\n", shadeOk, shadeTotal);
+
+    // PROOF (4): determinism — two renders byte-identical (visIds + lit image).
+    std::vector<uint32_t> swIds2; std::vector<uint8_t> swBGRA2; uint32_t vw2 = 0, vh2 = 0;
+    if (!renderSwResolve(false, swIds2, swBGRA2, vw2, vh2)) return fail("swraster-resolve: second render failed");
+    if (vw != vw2 || vh != vh2 || swBGRA.size() != swBGRA2.size() ||
+        std::memcmp(swBGRA.data(), swBGRA2.data(), swBGRA.size()) != 0 ||
+        swIds.size() != swIds2.size() ||
+        std::memcmp(swIds.data(), swIds2.data(), swIds.size() * sizeof(uint32_t)) != 0)
+        return fail("swraster-resolve: two renders differ (nondeterministic)");
+    std::printf("swraster-resolve determinism: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (5): disabled-path no-op — an all-kSwClear SSBO -> blit all kVisBackground -> uniform sky.
+    {
+        std::vector<uint32_t> emptyIds; std::vector<uint8_t> emptyBGRA; uint32_t ew = 0, eh = 0;
+        if (!renderSwResolve(true, emptyIds, emptyBGRA, ew, eh)) return fail("swraster-resolve: disabled-path failed");
+        uint8_t skyBGRA[4]; vg::EncodeBGRA8(sky, skyBGRA);
+        for (size_t p = 0; p < emptyIds.size(); ++p) {
+            if (emptyIds[p] != vg::kVisBackground) return fail("swraster-resolve: disabled-path not all-background");
+            const uint8_t* px = &emptyBGRA[p * 4];
+            if (px[0] != skyBGRA[0] || px[1] != skyBGRA[1] || px[2] != skyBGRA[2])
+                return fail("swraster-resolve: disabled-path not uniform sky");
+        }
+    }
+    std::printf("swraster-resolve disabled-path: all-sky (no-op)\n");
+
+    // PROOF (6): a coherent SHADED mesh — shaded>0 and not uniform.
+    if (shadedTexels == 0) return fail("swraster-resolve: ZERO shaded texels");
+    {
+        bool uniform = true; const uint8_t* p0 = &swBGRA[0];
+        for (size_t p = 1; p < (size_t)vw * vh; ++p) {
+            const uint8_t* px = &swBGRA[p * 4];
+            if (px[0] != p0[0] || px[1] != p0[1] || px[2] != p0[2]) { uniform = false; break; }
+        }
+        if (uniform) return fail("swraster-resolve: resolved image is UNIFORM (not a mesh)");
+    }
+    std::printf("swraster-resolve: {tris:%u, survivors:%u, shaded:%llu} (software-rasterized -> "
+                "deferred-resolved lit image; Metal: CPU swraster.h reference fills the SSBO, same blit + "
+                "visresolve.frag, identical to the Vulkan --swraster-resolve-shot by construction)\n",
+                triCount, kMeshlets, (unsigned long long)shadedTexels);
+
+    if (!WritePNG(outPath, swBGRA, vw, vh)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — software-rasterized -> deferred-resolved lit image (%u tris, "
+                "%u clusters, %llu shaded)\n", outPath, vw, vh, triCount, kMeshlets,
+                (unsigned long long)shadedTexels);
+    return 0;
+}
+
 // --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
 // backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
 // shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
@@ -24031,6 +24335,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--swraster-gpu") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_swraster_gpu.png";
             try { return RunSwRasterGpuShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --swraster-resolve <out.png>: render the Nanite SOFTWARE-RASTER vis-buffer -> DEFERRED MATERIAL
+        // RESOLVE showcase (Slice SW4). The TRUE Vulkan pass (--swraster-resolve-shot) runs the GPU
+        // swraster.comp to fill the SW depth|id SSBO, a fullscreen unpack blit (swraster_resolve_blit.frag)
+        // converts it to the R32_Uint visId RT the resolve reads, then the UNCHANGED visresolve.frag flat-
+        // shades it. On Metal swraster.comp is VULKAN-ONLY (int64), so the CPU render/swraster.h::
+        // RasterClusters reference fills the SW vis-buffer (the bit-exact reference the Vulkan GPU==CPU
+        // proof compares against) and it is uploaded as the SSBO; from there the SAME swraster_resolve_blit
+        // .frag (plain MSL — writes an integer SV_Target) + the SAME visresolve.frag run, so the resolved
+        // image is BYTE-IDENTICAL to the Vulkan result BY CONSTRUCTION. Proofs: blit unpack bit-exact,
+        // SW resolve == CPU expectation @interior, GPU==CPU shade @interior, determinism, disabled-path
+        // all-sky, a coherent shaded mesh. New golden tests/golden/metal/swraster_resolve.png. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--swraster-resolve") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_swraster_resolve.png";
+            try { return RunSwRasterResolveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vsm-mark <out.png>: render the Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The
