@@ -188,6 +188,15 @@ hf_gen_msl(visresolve.frag      visresolve.frag.hlsl      frag visresolve_fragme
 # / atomics, so NO --msl-version 20200 needed). The resident set is bit-exact GPU==CPU + cross-backend by
 # construction. Behind --vsm-mark only; existing shaders + goldens untouched.
 hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
+# Runtime Virtual Texturing Slice 1 (Slice VT1): vt_feedback.comp marks which virtual TEXTURE PAGES a
+# set of sample-requests need — one thread per request reads its HOST-SNAPPED integer (mip,px,py) page
+# coords (the host ran the UV->page quantization; the GPU does ZERO float) + computes pageId via PageId
+# (mipPageOffset + py*pagesPerSide + px) copied VERBATIM from render/vt.h, writing feedback[pageId]=1
+# (an order-independent integer SET — a plain write, no atomics). A pure integer SSBO compute (like
+# vsm_mark.comp / froxel_inject.comp) -> the default MSL gen suffices (no integer texture.read /
+# atomics, so NO --msl-version 20200 needed). The feedback set is bit-exact GPU==CPU + cross-backend by
+# construction. Behind --vt-feedback only; existing shaders + goldens untouched.
+hf_gen_msl(vt_feedback.comp      vt_feedback.comp.hlsl      comp vt_feedback_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

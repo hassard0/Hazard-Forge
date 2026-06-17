@@ -383,6 +383,14 @@ hf_compile_shaders(
     # false -> writes nothing. Pure compute over an integer SSBO + ReadBuffer (the froxel/cluster surface)
     # -> bit-exact GPU==CPU resident set, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/vsm_mark.comp.hlsl:cs"
+    # Runtime Virtual Texturing Slice 1 (Slice VT1): vt_feedback.comp marks which virtual TEXTURE PAGES a
+    # set of sample-requests need — one thread per request reads its HOST-SNAPPED integer (mip,px,py)
+    # page coords (the host ran the UV->page quantization, GPU does ZERO float) + computes pageId via
+    # PageId (mipPageOffset + py*pagesPerSide + px) copied VERBATIM from render/vt.h, output
+    # feedback[pageId]=1 (order-independent integer SET). feedbackEnabled push flag false -> writes
+    # nothing. Pure integer compute over an SSBO + ReadBuffer (the vsm_mark/froxel surface) -> bit-exact
+    # GPU==CPU feedback set, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/vt_feedback.comp.hlsl:cs"
     # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer —
     # ONE thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO
     # via InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied
