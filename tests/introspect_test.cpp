@@ -272,6 +272,8 @@ int main() {
             bool sawVtPagegenFeature = false;
             // Slice VT4: the runtime-virtual-texturing-sample capability is advertised in the manifest.
             bool sawVtSampleFeature = false;
+            // Slice VT5: the runtime-virtual-texturing-cache capability is advertised in the manifest.
+            bool sawVtCacheFeature = false;
             // Slice SW1: the nanite-software-raster capability is advertised in the feature manifest.
             bool sawSwRasterFeature = false;
             // Slice SW2: the nanite-software-raster-gpu capability is advertised in the feature manifest.
@@ -353,6 +355,7 @@ int main() {
                     if (AsString(el->value) == "runtime-virtual-texturing-allocate") sawVtAllocFeature = true;
                     if (AsString(el->value) == "runtime-virtual-texturing-pagegen") sawVtPagegenFeature = true;
                     if (AsString(el->value) == "runtime-virtual-texturing-sample") sawVtSampleFeature = true;
+                    if (AsString(el->value) == "runtime-virtual-texturing-cache") sawVtCacheFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -428,6 +431,7 @@ int main() {
             check(sawVtAllocFeature, "engine.features includes runtime-virtual-texturing-allocate");
             check(sawVtPagegenFeature, "engine.features includes runtime-virtual-texturing-pagegen");
             check(sawVtSampleFeature, "engine.features includes runtime-virtual-texturing-sample");
+            check(sawVtCacheFeature, "engine.features includes runtime-virtual-texturing-cache");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -574,6 +578,8 @@ int main() {
         bool sawVtPagegenShot = false;
         // Slice VT4: the --vt-sample-shot showcase flag is listed in the showcase manifest.
         bool sawVtSampleShot = false;
+        // Slice VT5: the --vt-cache-shot showcase flag is listed in the showcase manifest.
+        bool sawVtCacheShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -669,6 +675,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--vt-alloc-shot") sawVtAllocShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vt-pagegen-shot") sawVtPagegenShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vt-sample-shot") sawVtSampleShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--vt-cache-shot") sawVtCacheShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -747,6 +754,7 @@ int main() {
         check(sawVtAllocShot, "showcases manifest includes --vt-alloc-shot");
         check(sawVtPagegenShot, "showcases manifest includes --vt-pagegen-shot");
         check(sawVtSampleShot, "showcases manifest includes --vt-sample-shot");
+        check(sawVtCacheShot, "showcases manifest includes --vt-cache-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
