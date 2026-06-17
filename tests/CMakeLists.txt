@@ -556,6 +556,13 @@ hf_add_pure_test(cluster_hiz_test)
 # (no sqrt) is the bit-exact GPU==CPU select the showcase proves. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(cluster_lod_test)
 
+# Virtual-geometry VISIBILITY BUFFER (Slice DW): the CPU side of the (clusterID, triangleID) ID packing
+# (render/visbuffer.h). Pins PackVisId/UnpackVisId round-trip over the full valid range, kTriIdBits>=7,
+# packing injective (collision-free) over [0,survivorCount)x[0,128), kVisBackground never equals a valid
+# packed ID, the CPU coverage reference's survivor membership == CullClusterInstances (ties DW to the
+# DT/DV contract), and determinism. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(visbuffer_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)

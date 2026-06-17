@@ -87,6 +87,14 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     VkPhysicalDeviceFeatures f10{};
     f10.multiDrawIndirect = VK_TRUE;
     f10.drawIndirectFirstInstance = VK_TRUE;
+    // Slice DW (visibility buffer): visbuffer.frag reads SV_PrimitiveID (the per-primitive triangle ID).
+    // DXC lowers a fragment-stage SV_PrimitiveID to the SPIR-V PrimitiveId builtin, which declares
+    // OpCapability Geometry — so the device must advertise the geometryShader feature or the validation
+    // layer flags VUID-VkShaderModuleCreateInfo-pCode-08740 at module creation. Enabling the feature flag
+    // is a device-capability advertisement only (no geometry-shader STAGE is ever created); existing
+    // pipelines don't use it, so every existing RT / golden is byte-for-byte unchanged. geometryShader is
+    // a core VkPhysicalDeviceFeatures capability available on the engine's VK 1.3 target GPUs.
+    f10.geometryShader = VK_TRUE;
 
     // Slice BZ (bindless textures): the bindless fragment samples one large runtime sampled-image array
     // by a per-draw index — gTextures[NonUniformResourceIndex(texIndex)]. That needs the
@@ -1276,10 +1284,11 @@ bool VulkanDevice::readImageLayer(VkImage image, uint32_t layer, uint32_t w, uin
     return true;
 }
 
-// Bytes-per-pixel for the formats the cube/RT readbacks see (RGBA16F = 8, *8_UNORM = 4).
+// Bytes-per-pixel for the formats the cube/RT readbacks see (RGBA16F = 8, R32_UINT = 4, *8_UNORM = 4).
 static uint32_t BytesPerPixel(VkFormat f) {
     switch (f) {
         case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+        case VK_FORMAT_R32_UINT:            return 4;  // Slice DW visibility buffer (explicit; default is 4)
         default:                            return 4;
     }
 }

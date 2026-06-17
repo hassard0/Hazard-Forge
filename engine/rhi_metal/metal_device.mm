@@ -171,6 +171,7 @@ static bool BlitReadLayer(id<MTLCommandQueue> queue, id<MTLDevice> dev, id<MTLTe
     return true;
 }
 
+// RGBA16F = 8 bytes; R32_Uint (Slice DW visibility buffer) + BGRA8/RGBA8 = 4 bytes.
 static uint32_t MetalBpp(Format f) { return (f == Format::RGBA16_Float) ? 8u : 4u; }
 
 bool MetalDevice::ReadCubemapFace(ICubemapTarget& cubeBase, uint32_t face,
@@ -188,8 +189,13 @@ bool MetalDevice::ReadRenderTarget(IRenderTarget& rtBase, std::vector<uint8_t>& 
                                    uint32_t& width, uint32_t& height) {
     auto& rt = static_cast<MetalRenderTarget&>(rtBase);
     width = rt.width(); height = rt.height();
-    Format fmt = (rt.colorTexture().pixelFormat == MTLPixelFormatRGBA16Float) ? Format::RGBA16_Float
-                                                                              : Format::BGRA8_UNorm;
+    // Pick the readback bpp from the color pixel format: RGBA16F = 8, R32_Uint (Slice DW
+    // visibility buffer) = 4, else BGRA8 = 4. The R32_Uint case is the one real Metal edit of DW —
+    // a bit-preserving 4-byte/texel blit of the integer IDs (no conversion).
+    const MTLPixelFormat pf = rt.colorTexture().pixelFormat;
+    Format fmt = Format::BGRA8_UNorm;
+    if (pf == MTLPixelFormatRGBA16Float) fmt = Format::RGBA16_Float;
+    else if (pf == MTLPixelFormatR32Uint) fmt = Format::R32_Uint;
     return BlitReadLayer(queue_, device_, rt.colorTexture(), 0, rt.width(), rt.height(),
                          MetalBpp(fmt), outBGRA);
 }

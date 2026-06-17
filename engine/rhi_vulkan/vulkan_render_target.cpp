@@ -80,6 +80,16 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     // (set 0) samples depthView() directly via VulkanDevice::SetShadowMap.
     if (depthOnly_) return;
 
+    // Slice DW seam-subtlety guard (additive, defaulted-no-op): an INTEGER color format (R32_Uint
+    // visibility buffer) is never bound + sampled-as-float — DW only ReadRenderTargets it. The
+    // SAMPLED_IMAGE+float-sampler material descriptor below is meaningless (and a potential
+    // validation hazard) for an integer image, so skip the per-RT material set entirely for integer
+    // formats. set_ stays VK_NULL_HANDLE (the dtor guards on it); BindTexture on a vis-buffer RT is
+    // never attempted. NO existing call site uses an integer format, so every existing RT still
+    // allocates + writes its set exactly as before (byte-for-byte unchanged).
+    const bool integerColor = (colorFormatReq == Format::R32_Uint);
+    if (integerColor) return;
+
     // Descriptor set on the material set layout (set 1) so the post pass can BindTexture(*this).
     // Same two-write pattern as VulkanTexture: binding 0 sampled image, binding 1 sampler.
     VkDescriptorSetLayout layout = device_.materialSetLayout();

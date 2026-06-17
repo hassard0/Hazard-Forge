@@ -154,6 +154,14 @@ hf_gen_msl(debug_line.frag debug_line.frag.hlsl frag debug_line_fragment)
 # + push-constant surface (no new RHI). Same HLSL->SPIR-V->MSL toolchain; behind --meshlet-viz ONLY.
 hf_gen_msl(meshlet_viz.vert meshlet_viz.vert.hlsl vert meshlet_viz_vertex)
 hf_gen_msl(meshlet_viz.frag meshlet_viz.frag.hlsl frag meshlet_viz_fragment)
+# Virtual-geometry VISIBILITY BUFFER (Slice DW): the BOUND visbuffer vertex (clusterID pushed per
+# survivor, since glslc/spirv-cross can't lower the Vulkan MDI DrawIndex builtin — same as cluster_viz)
+# + the shared visbuffer fragment (out single uint = (clusterID<<7)|(SV_PrimitiveID&0x7F) into the
+# R32_Uint visibility buffer). spirv-cross lowers SV_PrimitiveID to [[primitive_id]] in the MSL fragment;
+# the controller verifies it on the real Mac (else the fragment packs clusterID-only). Same
+# HLSL->SPIR-V->MSL toolchain; the only new RHI is the additive Format::R32_Uint. Behind --visbuffer only.
+hf_gen_msl(visbuffer_bound.vert visbuffer_bound.vert.hlsl vert visbuffer_vertex)
+hf_gen_msl(visbuffer.frag       visbuffer.frag.hlsl       frag visbuffer_fragment)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.

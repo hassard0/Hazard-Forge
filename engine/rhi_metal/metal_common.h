@@ -89,6 +89,9 @@ inline MTLPixelFormat ToMetalPixelFormat(Format f) {
         // full fp32 so the order-independent accum SUM is bit-identical across draw orders). Mirrors the
         // Vulkan VK_FORMAT_R32G32B32A32_SFLOAT mapping; backend-dir only, no above-seam symbol.
         case Format::RGBA32_Float: return MTLPixelFormatRGBA32Float;
+        // R32_Uint single-channel integer visibility-buffer target (Slice DW). Mirrors the Vulkan
+        // VK_FORMAT_R32_UINT mapping; backend-dir only, no above-seam symbol.
+        case Format::R32_Uint:    return MTLPixelFormatR32Uint;
         case Format::D32_Float:   return MTLPixelFormatDepth32Float;
         default:                  return MTLPixelFormatInvalid;
     }

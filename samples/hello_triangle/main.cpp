@@ -61,6 +61,7 @@
 #include "render/gpu_culled.h"  // Slice CD: compute cull+compact CPU mirror (ordered, model+material+texIndex)
 #include "render/cluster_cull.h"  // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/cluster_lod.h"  // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
+#include "render/visbuffer.h"   // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/SurvivorInteriorSamples)
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -422,6 +423,7 @@ int main(int argc, char** argv) {
     const char* hizCullShotPath = nullptr;   // --hiz-cull-shot <out.bmp> (Slice CJ: Hi-Z occlusion cull)
     const char* clusterHizShotPath = nullptr; // --cluster-hiz-shot <out.bmp> (Slice DU: per-cluster Hi-Z occlusion cull)
     const char* clusterLodShotPath = nullptr; // --cluster-lod-shot <out.bmp> (Slice DV: discrete cluster-LOD selection by screen-space error)
+    const char* visbufferShotPath = nullptr; // --visbuffer-shot <out.bmp> (Slice DW: rasterize (clusterID,triID) into an R32_Uint visibility buffer + bit-exact ID readback)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1222,6 +1224,18 @@ int main(int argc, char** argv) {
             // `cluster-lod: {instances:M, lods:3, lod0:n0, lod1:n1, lod2:n2}`. The empty shadow pass is
             // declared (the DQ lesson). One BMP -> exit. New golden cluster_lod.png; existing goldens untouched.
             clusterLodShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--visbuffer-shot") == 0 && i + 1 < argc) {
+            // Slice DW: Visibility-Buffer beachhead. The SAME instance-grid of DS-clustered spheres ->
+            // BuildClusterInstances -> shaders/cluster_cull.comp.hlsl frustum-culls + ORDER-compacts the
+            // survivors, but the survivor MDI draw renders through visbuffer.{vert,frag} into an R32_Uint
+            // render target, packing (clusterID = gl_DrawID survivor index) << 7 | (triID = SV_PrimitiveID)
+            // per pixel — the Nanite-style (clusterID, triangleID) visibility buffer. ReadRenderTarget reads
+            // the integer RT back into uint32_t[w*h]. PROOFS (B1) self-consistent + coverage == CPU
+            // CullClusterInstances survivor set EXACT, (B2) two renders BYTE-IDENTICAL, (B3) GPU==CPU interior
+            // coverage EXACT. The image golden is a CPU-colored hashColor(clusterID) viz (bg->clear) ->
+            // visbuffer.png (identical both backends by construction). The only new RHI is the additive
+            // Format::R32_Uint; existing goldens untouched. One BMP -> exit.
+            visbufferShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -12739,6 +12753,471 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — GPU per-cluster-culled %u/%u cluster-instances via "
                                 "compute-cull -> MDI\n", clusterCullShotPath, gw, gh, gpuDrawn, kClusterInstances);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clusterCullShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Virtual-geometry VISIBILITY BUFFER (--visbuffer-shot <out.bmp>, Slice DW). The Nanite-
+        // style rendering beachhead: the SAME DT survivor cluster MDI draw, but the fragment output is a
+        // SINGLE uint32 (clusterID<<7 | SV_PrimitiveID) into an R32_Uint render target — the (clusterID,
+        // triangleID) VISIBILITY buffer that decouples geometry rasterization from material shading (the
+        // deferred resolve is the next slice DX; NO lighting here). The integer RT is ReadRenderTarget'd
+        // back into uint32_t[w*h] and PROVEN bit-exact:
+        //   (B1) self-consistent + coverage == CPU survivors: every non-bg texel has clusterID <
+        //        survivorCount AND triID < that survivor's triCount; the set of distinct clusterIDs ==
+        //        EXACTLY the CPU CullClusterInstances on-screen survivor set.
+        //   (B2) determinism: two GPU renders -> ReadRenderTarget -> memcmp BYTE-IDENTICAL.
+        //   (B3) GPU==CPU interior coverage: at each visible survivor's projected interior pixel, the GPU
+        //        vis-buffer's clusterID == the CPU-predicted survivor (interior-only, cross-vendor-robust).
+        // The image golden is a CPU-COLORING of the read-back IDs (bg->clear color, else hashColor(
+        // clusterID)) into BGRA8 -> visbuffer.png (identical both backends by construction). The only new
+        // RHI is the additive Format::R32_Uint; existing goldens untouched. One BMP -> exit. ----
+        if (visbufferShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace fr = render::frustum;
+            namespace vg = render::vg;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- The shared mesh + DS decomposition + instance grid + cameras: IDENTICAL framing to
+            // --cluster-cull-shot (the same survivors, hash-colored). ---
+            scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+            vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+            const uint32_t clustersPerMesh = (uint32_t)ms.meshlets.size();
+
+            const int kInstances = 4;
+            std::vector<Mat4> instanceModels;
+            {
+                const float spacing = 3.2f;
+                const float half = 0.5f * (float)(kInstances - 1) * spacing;
+                for (int gi = 0; gi < kInstances; ++gi) {
+                    float x = (float)gi * spacing - half;
+                    instanceModels.push_back(Mat4::Translate({x, 0.0f, -6.0f}));
+                }
+            }
+
+            std::vector<vg::ClusterInstance> clusters = vg::BuildClusterInstances(
+                std::span<const Mat4>(instanceModels.data(), instanceModels.size()), ms);
+            const uint32_t kClusterInstances = (uint32_t)clusters.size();
+
+            runtime::Camera narrowCam;
+            narrowCam.position = {0.0f, 0.0f, 1.5f};
+            narrowCam.yaw = 0.0f; narrowCam.SetPitch(0.0f);
+            narrowCam.fovY = 0.5235988f;  // 30 degrees — narrow, the wings fall outside
+            narrowCam.aspect = aspect;
+            narrowCam.znear = 0.2f; narrowCam.zfar = 50.0f;
+            Mat4 narrowVP = narrowCam.ViewProj();
+            fr::Frustum narrowFrustum = fr::FromViewProj(narrowVP);
+
+            // --- CPU references: the compacted survivor command list (source order) + count. ---
+            std::span<const vg::ClusterInstance> clusterSpan(clusters.data(), clusters.size());
+            const uint32_t cpuSurvivors = vg::SurvivorClusterCount(clusterSpan, narrowFrustum);
+            std::vector<render::mdi::MdiCommand> cpuCmds =
+                vg::CullClusterInstances(clusterSpan, narrowFrustum);
+
+            // --- Upload the shared vertex + reordered index buffers. ---
+            rhi::BufferDesc vbd;
+            vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+            vbd.initialData = geo.verts.data();
+            vbd.usage = rhi::BufferUsage::Vertex;
+            auto vbuf = device->CreateBuffer(vbd);
+            rhi::BufferDesc ibd;
+            ibd.size = ms.indices.size() * sizeof(uint32_t);
+            ibd.initialData = ms.indices.data();
+            ibd.usage = rhi::BufferUsage::Index;
+            auto ibuf = device->CreateBuffer(ibd);
+
+            // The GPU ClusterIn upload struct (== shaders/cluster_cull.comp.hlsl std430 layout, 112 bytes;
+            // color unused by the visibility pass but kept so the SAME compute cull is reused verbatim).
+            struct ClusterIn {
+                float    model[16];
+                float    color[4];
+                float    worldSphere[4];   // xyz center, w radius
+                uint32_t slice[4];         // firstIndex (triOffset*3), indexCount (triCount*3), pad, pad
+            };
+            static_assert(sizeof(ClusterIn) == 112, "ClusterIn must match the compute std430 layout (112 bytes)");
+            std::vector<ClusterIn> clustersIn(kClusterInstances);
+            for (uint32_t i = 0; i < kClusterInstances; ++i) {
+                const vg::ClusterInstance& ci = clusters[i];
+                const Mat4& model = instanceModels[ci.instanceIndex];
+                uint32_t clusterInMesh = i % clustersPerMesh;
+                Vec3 col = vg::hashColor(clusterInMesh);
+                for (int k = 0; k < 16; ++k) clustersIn[i].model[k] = model.m[k];
+                clustersIn[i].color[0] = col.x; clustersIn[i].color[1] = col.y;
+                clustersIn[i].color[2] = col.z; clustersIn[i].color[3] = 1.0f;
+                clustersIn[i].worldSphere[0] = ci.worldCenter.x; clustersIn[i].worldSphere[1] = ci.worldCenter.y;
+                clustersIn[i].worldSphere[2] = ci.worldCenter.z; clustersIn[i].worldSphere[3] = ci.worldRadius;
+                clustersIn[i].slice[0] = ci.triOffset * 3u; clustersIn[i].slice[1] = ci.triCount * 3u;
+                clustersIn[i].slice[2] = 0u; clustersIn[i].slice[3] = 0u;
+            }
+            rhi::BufferDesc ciDesc;
+            ciDesc.size = clustersIn.size() * sizeof(ClusterIn);
+            ciDesc.initialData = clustersIn.data();
+            ciDesc.usage = rhi::BufferUsage::Storage;
+            auto clusterBuffer = device->CreateBuffer(ciDesc);
+
+            struct PerDrawCC { float model[16]; float color[4]; };
+            static_assert(sizeof(PerDrawCC) == 80, "PerDrawCC must match visbuffer.vert PerDraw (80 bytes)");
+            rhi::BufferDesc pdDesc;
+            pdDesc.size = (uint64_t)kClusterInstances * sizeof(PerDrawCC);
+            pdDesc.usage = rhi::BufferUsage::Storage;
+            auto perDrawBuffer = device->CreateBuffer(pdDesc);
+
+            rhi::BufferDesc cmdDesc;
+            cmdDesc.size = (uint64_t)kClusterInstances * sizeof(render::mdi::MdiCommand);
+            cmdDesc.usage = rhi::BufferUsage::Indirect;
+            auto cmdBuffer = device->CreateBuffer(cmdDesc);
+
+            uint32_t countInit = 0;
+            rhi::BufferDesc countDesc;
+            countDesc.size = sizeof(uint32_t);
+            countDesc.initialData = &countInit;
+            countDesc.usage = rhi::BufferUsage::Storage;
+            auto countBuffer = device->CreateBuffer(countDesc);
+
+            struct CullParams { float planes[6][4]; uint32_t counts[4]; };
+            static_assert(sizeof(CullParams) == 112, "CullParams layout");
+            CullParams narrowParamsData{};
+            for (int k = 0; k < 6; ++k) {
+                narrowParamsData.planes[k][0] = narrowFrustum.planes[k].n.x;
+                narrowParamsData.planes[k][1] = narrowFrustum.planes[k].n.y;
+                narrowParamsData.planes[k][2] = narrowFrustum.planes[k].n.z;
+                narrowParamsData.planes[k][3] = narrowFrustum.planes[k].d;
+            }
+            narrowParamsData.counts[0] = kClusterInstances;
+            rhi::BufferDesc paramDesc;
+            paramDesc.size = sizeof(CullParams);
+            paramDesc.initialData = &narrowParamsData;
+            paramDesc.usage = rhi::BufferUsage::Storage;
+            auto paramBuffer = device->CreateBuffer(paramDesc);
+
+            // --- Compute cull+compact pipeline (5 SSBOs, one 1024-thread workgroup) — reused verbatim. ---
+            auto cullCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cluster_cull.comp.hlsl.spv");
+            auto cullCs = device->CreateShaderModule({std::span<const uint32_t>(cullCsWords)});
+            rhi::ComputePipelineDesc cullCdesc;
+            cullCdesc.compute = cullCs.get();
+            cullCdesc.storageBufferCount = 5;
+            cullCdesc.pushConstantSize = 0;
+            cullCdesc.threadsPerGroupX = 1024;
+            auto cullCompute = device->CreateComputePipeline(cullCdesc);
+
+            // --- The visibility pipeline: visbuffer.vert (MDI, reads PerDraw[gl_DrawID]) + visbuffer.frag
+            // (out single uint SV_Target0). colorFormat = R32_Uint, depthTest + depthWrite, NO blend. ---
+            auto vbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/visbuffer.vert.hlsl.spv");
+            auto vbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/visbuffer.frag.hlsl.spv");
+            auto vbVs = device->CreateShaderModule({std::span<const uint32_t>(vbVsW)});
+            auto vbFs = device->CreateShaderModule({std::span<const uint32_t>(vbFsW)});
+            rhi::VertexLayout vizLayout;
+            vizLayout.stride = sizeof(scene::Vertex);  // 56 — same vertex buffer as cluster_viz
+            vizLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},   // POSITION only (visbuffer.vert needs no normal)
+            };
+            rhi::GraphicsPipelineDesc vbDesc;
+            vbDesc.vertex = vbVs.get(); vbDesc.fragment = vbFs.get();
+            vbDesc.vertexLayout = vizLayout;
+            vbDesc.colorFormat = rhi::Format::R32_Uint;   // the visibility buffer (the additive format)
+            vbDesc.depthTest = true;                       // depthWrite is implied (the front-most ID wins)
+            vbDesc.usesFrameUniforms = true;
+            // The per-draw SSBO sits at set 2 (gl_DrawID fetch). set 1 (material) must be present so the
+            // set indices stay consecutive — same as cluster_viz. visbuffer.frag samples NO texture; a
+            // dummy material satisfies the slot (never sampled).
+            vbDesc.usesTexture = true;
+            vbDesc.usesPerDrawData = true;
+            vbDesc.pushConstantSize = 0;
+            auto vbPipeline = device->CreateGraphicsPipeline(vbDesc);
+
+            const uint8_t dummyPx[4] = {255, 255, 255, 255};
+            auto dummyTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, dummyPx, sizeof(dummyPx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormalTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            // The R32_Uint visibility render target for the count-only PRE-PASS (the SEAM-SUBTLETY
+            // allocation: an integer color RT; its material descriptor write is gated off in the backend,
+            // so creation is validation-clean — VERIFIED under the validation layer). The pre-pass renders
+            // into it but never reads it back, so it stays in COLOR_ATTACHMENT. renderVisBuffer (which
+            // DOES read back) creates its own fresh RT per call.
+            auto visRT = device->CreateRenderTarget(w, h, rhi::Format::R32_Uint);
+
+            // Frame uniforms for the narrow camera (deterministic).
+            FrameData narrowFd{};
+            {
+                for (int k = 0; k < 16; ++k) narrowFd.vp[k] = narrowVP.m[k];
+                narrowFd.lightDir[0] = -0.5f; narrowFd.lightDir[1] = -1.0f; narrowFd.lightDir[2] = -0.3f;
+                narrowFd.lightColor[0] = 1.0f; narrowFd.lightColor[1] = 1.0f;
+                narrowFd.lightColor[2] = 1.0f; narrowFd.lightColor[3] = 1.0f;
+                narrowFd.viewPos[0] = narrowCam.position.x; narrowFd.viewPos[1] = narrowCam.position.y;
+                narrowFd.viewPos[2] = narrowCam.position.z; narrowFd.viewPos[3] = 1.0f;
+                narrowFd.ptCount[0] = 0.0f;
+                runtime::CameraBasis cb = narrowCam.Basis();
+                narrowFd.camFwd[0]=cb.forward.x; narrowFd.camFwd[1]=cb.forward.y; narrowFd.camFwd[2]=cb.forward.z;
+                narrowFd.camRight[0]=cb.right.x; narrowFd.camRight[1]=cb.right.y; narrowFd.camRight[2]=cb.right.z;
+                narrowFd.camUp[0]=cb.up.x; narrowFd.camUp[1]=cb.up.y; narrowFd.camUp[2]=cb.up.z;
+                narrowFd.skyParams[0] = cb.tanHalfFovY; narrowFd.skyParams[1] = aspect;
+            }
+
+            // The vis-buffer background clear. kVisBackground = 0xFFFFFFFF written into the R32_Uint
+            // attachment via the ClearColor float-union aliasing (VkClearColorValue is a raw union; for a
+            // UINT attachment uint32[0] aliases float32[0] = clear.r's bytes). No RHI change.
+            float bgClearFloat;
+            std::memcpy(&bgClearFloat, &vg::kVisBackground, sizeof(float));
+            const rhi::ClearColor visClear{bgClearFloat, 0.0f, 0.0f, 0.0f};
+
+            // === Render the visibility buffer: compute cull/compact, then ONE DrawIndexedMultiIndirect
+            // over the compacted survivors through visbuffer.{vert,frag} into the R32_Uint RT. Reads the
+            // integer RT back into uint32_t[w*h]. Returns the read-back IDs + the survivor draw count. ===
+            uint32_t gpuDrawnDeferred = 0;
+            auto renderVisBuffer = [&](std::vector<uint32_t>& outIds, uint32_t& outW, uint32_t& outH,
+                                       uint32_t& outDrawn) -> bool {
+                // A FRESH R32_Uint RT per render: ReadRenderTarget leaves the color image in
+                // TRANSFER_SRC, and the render graph's barrier solver tracks the imported target as
+                // COLOR_ATTACHMENT — so re-rendering into a once-created RT after a readback would
+                // transition from the wrong layout (VUID-09592). A fresh RT each call starts UNDEFINED and
+                // the graph transitions it cleanly (the gbuffer-readback pattern). The R32_Uint allocation
+                // is validation-clean (the integer-format material-descriptor guard).
+                auto visRT = device->CreateRenderTarget(w, h, rhi::Format::R32_Uint);
+                render::RenderGraph graph;
+                render::RgResource rgVis = graph.ImportTarget(
+                    "visBuffer", render::RgResourceKind::SceneColor, *visRT);
+                graph.AddPass("visbuffer", {}, {rgVis},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&narrowFd, sizeof(FrameData));
+                        cmd.BindComputePipeline(*cullCompute);
+                        cmd.BindStorageBuffer(*clusterBuffer, 0);
+                        cmd.BindStorageBuffer(*perDrawBuffer, 1);
+                        cmd.BindStorageBuffer(*cmdBuffer, 2);
+                        cmd.BindStorageBuffer(*countBuffer, 3);
+                        cmd.BindStorageBuffer(*paramBuffer, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(visClear);   // clear to kVisBackground
+                        cmd.BindPipeline(*vbPipeline);
+                        cmd.BindMaterial(*dummyTex, *flatNormalTex);  // set 1 (ignored by visbuffer.frag)
+                        cmd.BindPerDrawData(*perDrawBuffer);
+                        cmd.BindVertexBuffer(*vbuf);
+                        cmd.BindIndexBuffer(*ibuf);
+                        cmd.DrawIndexedMultiIndirect(*cmdBuffer, gpuDrawnDeferred,
+                                                     (uint32_t)sizeof(render::mdi::MdiCommand));
+                        cmd.EndRenderPass();
+                    });
+                graph.Execute(*device);
+                device->WaitIdle();
+                device->ReadBuffer(*countBuffer, &outDrawn, sizeof(outDrawn), 0);
+                std::vector<uint8_t> raw;
+                if (!device->ReadRenderTarget(*visRT, raw, outW, outH)) return false;
+                if (raw.size() != (size_t)outW * outH * 4) {
+                    std::fprintf(stderr, "FATAL: vis-buffer readback is not R32_Uint (got %zu bytes for "
+                                 "%ux%u)\n", raw.size(), outW, outH);
+                    return false;
+                }
+                outIds.resize((size_t)outW * outH);
+                std::memcpy(outIds.data(), raw.data(), raw.size());
+                return true;
+            };
+
+            // -- Pre-pass: dispatch the compute cull alone to get the survivor count for the drawCount. --
+            {
+                render::RenderGraph pre;
+                render::RgResource rgVis = pre.ImportTarget(
+                    "visBuffer", render::RgResourceKind::SceneColor, *visRT);
+                pre.AddPass("cull", {}, {rgVis},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*cullCompute);
+                        cmd.BindStorageBuffer(*clusterBuffer, 0);
+                        cmd.BindStorageBuffer(*perDrawBuffer, 1);
+                        cmd.BindStorageBuffer(*cmdBuffer, 2);
+                        cmd.BindStorageBuffer(*countBuffer, 3);
+                        cmd.BindStorageBuffer(*paramBuffer, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(visClear);
+                        cmd.EndRenderPass();
+                    });
+                pre.Execute(*device);
+                device->WaitIdle();
+                device->ReadBuffer(*countBuffer, &gpuDrawnDeferred, sizeof(gpuDrawnDeferred), 0);
+            }
+
+            if (gpuDrawnDeferred != cpuSurvivors) {
+                std::fprintf(stderr, "FATAL: vis-buffer GPU survivor count %u != CPU frustum.h %u\n",
+                             gpuDrawnDeferred, cpuSurvivors);
+                device->WaitIdle(); return 1;
+            }
+            if (!(cpuSurvivors > 0 && cpuSurvivors < kClusterInstances)) {
+                std::fprintf(stderr, "FATAL: vis-buffer narrow frustum did not cull a STRICT subset "
+                             "(survivors=%u of %u)\n", cpuSurvivors, kClusterInstances);
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Render the visibility buffer + read it back. ---
+            std::vector<uint32_t> ids; uint32_t vw = 0, vh = 0, drawn = 0;
+            if (!renderVisBuffer(ids, vw, vh, drawn)) {
+                std::fprintf(stderr, "FATAL: vis-buffer render/readback failed\n");
+                device->WaitIdle(); return 1;
+            }
+            if (drawn != cpuSurvivors) {
+                std::fprintf(stderr, "FATAL: vis-buffer survivor count %u != cpuRef %u (render pass)\n",
+                             drawn, cpuSurvivors);
+                device->WaitIdle(); return 1;
+            }
+
+            // Per-survivor-draw triCount (survivor draw index -> source cluster-instance -> triCount).
+            std::vector<uint32_t> survivorTriCount(drawn);
+            for (uint32_t i = 0; i < drawn; ++i)
+                survivorTriCount[i] = clusters[cpuCmds[i].firstInstance].triCount;
+
+            // kVisBackground must not collide with any valid packed ID over the realized survivor range.
+            for (uint32_t c = 0; c < drawn; ++c) {
+                for (uint32_t t = 0; t < survivorTriCount[c]; ++t) {
+                    if (vg::PackVisId(c, t) == vg::kVisBackground) {
+                        std::fprintf(stderr, "FATAL: vis-buffer background sentinel collides with packed "
+                                     "ID (cluster %u tri %u)\n", c, t);
+                        device->WaitIdle(); return 1;
+                    }
+                }
+            }
+
+            // The per-instance world centers (sphere origins) + world radii — the instance-provenance
+            // reference for B3 (the cross-vendor-robust oracle; a closed sphere self-occludes, so the
+            // EXACT per-pixel cluster is not CPU-predictable, but the INSTANCE a near-pole pixel belongs
+            // to is).
+            std::vector<Vec3> instanceCenters(instanceModels.size());
+            for (size_t i = 0; i < instanceModels.size(); ++i)
+                instanceCenters[i] = {instanceModels[i].m[12], instanceModels[i].m[13], instanceModels[i].m[14]};
+            std::span<const Vec3> centersSpan(instanceCenters.data(), instanceCenters.size());
+            // Per-instance world bounding radius = the max cluster worldRadius distance over that instance.
+            std::vector<float> instanceRadius(instanceModels.size(), 0.0f);
+            for (const vg::ClusterInstance& ci : clusters) {
+                float reach = math::length(ci.worldCenter - instanceCenters[ci.instanceIndex]) + ci.worldRadius;
+                if (reach > instanceRadius[ci.instanceIndex]) instanceRadius[ci.instanceIndex] = reach;
+            }
+            std::span<const float> radiusSpan(instanceRadius.data(), instanceRadius.size());
+
+            // PROOF (B1): self-consistency + coverage completeness. Every non-background texel is a VALID
+            // survivor — clusterID < survivorCount (so it names a real CullClusterInstances survivor; no
+            // CULLED cluster writes any texel) AND triID < that survivor's triCount (a valid in-range
+            // (cluster, tri) pairing); every distinct clusterID maps back (firstInstance) to a real source
+            // cluster-instance. The set of distinct clusterIDs is a NON-EMPTY STRICT subset of the frustum
+            // survivors (a closed sphere's far-hemisphere survivors are depth-occluded -> write nothing —
+            // the expected, correct visibility). B3 ties the visible IDs to the CPU geometry by provenance.
+            std::vector<uint8_t> clusterSeen(drawn, 0);
+            uint64_t writtenTexels = 0;
+            for (size_t p = 0; p < ids.size(); ++p) {
+                uint32_t v = ids[p];
+                if (v == vg::kVisBackground) continue;
+                ++writtenTexels;
+                uint32_t cid, tid;
+                vg::UnpackVisId(v, cid, tid);
+                if (cid >= drawn) {
+                    std::fprintf(stderr, "FATAL: vis-buffer texel %zu clusterID %u >= survivorCount %u "
+                                 "(a culled/invalid cluster wrote a texel)\n", p, cid, drawn);
+                    device->WaitIdle(); return 1;
+                }
+                if (tid >= survivorTriCount[cid]) {
+                    std::fprintf(stderr, "FATAL: vis-buffer texel %zu (cluster %u) triID %u >= triCount %u\n",
+                                 p, cid, tid, survivorTriCount[cid]);
+                    device->WaitIdle(); return 1;
+                }
+                if (cpuCmds[cid].firstInstance >= kClusterInstances) {
+                    std::fprintf(stderr, "FATAL: vis-buffer survivor %u maps to invalid source instance\n", cid);
+                    device->WaitIdle(); return 1;
+                }
+                clusterSeen[cid] = 1;
+            }
+            uint32_t distinctSeen = 0;
+            for (uint32_t c = 0; c < drawn; ++c) distinctSeen += clusterSeen[c];
+            if (distinctSeen == 0 || distinctSeen > drawn) {
+                std::fprintf(stderr, "FATAL: vis-buffer distinct clusterIDs %u not in (0, survivors=%u]\n",
+                             distinctSeen, drawn);
+                device->WaitIdle(); return 1;
+            }
+            if (!(distinctSeen < drawn)) {
+                std::fprintf(stderr, "FATAL: every frustum survivor wrote a texel — a closed sphere MUST "
+                             "self-occlude its far hemisphere (distinct=%u, survivors=%u)\n",
+                             distinctSeen, drawn);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("visbuffer self-consistent + coverage == CPU survivors: %u/%u frustum survivors "
+                        "visible (far hemisphere depth-occluded), all texels valid survivors EXACT\n",
+                        distinctSeen, drawn);
+
+            // PROOF (B2): two renders -> ReadRenderTarget -> BYTE-IDENTICAL.
+            std::vector<uint32_t> ids2; uint32_t vw2 = 0, vh2 = 0, drawn2 = 0;
+            if (!renderVisBuffer(ids2, vw2, vh2, drawn2)) {
+                std::fprintf(stderr, "FATAL: vis-buffer second render failed\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool det = (vw == vw2) && (vh == vh2) && (ids.size() == ids2.size()) &&
+                             (std::memcmp(ids.data(), ids2.data(), ids.size() * sizeof(uint32_t)) == 0) &&
+                             (drawn == drawn2);
+            if (!det) {
+                std::fprintf(stderr, "FATAL: two vis-buffer renders differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("visbuffer determinism: two renders BYTE-IDENTICAL\n");
+
+            // PROOF (B3): GPU == CPU interior coverage at deterministically-chosen interior pixels. At each
+            // visible instance's projected NEAR-POLE pixel (the surface point nearest the camera — an
+            // unambiguous interior of that instance's front cluster, with no screen-overlap from other
+            // instances), the GPU vis-buffer's clusterID must map back (firstInstance -> instanceIndex) to
+            // THAT instance. This proves the visibility IDs carry the correct geometric PROVENANCE (the ID
+            // CONTENT is right, not just self-consistent) — interior-only, cross-vendor-robust (no fragile
+            // per-cluster prediction at the silhouette).
+            std::vector<vg::InteriorSample> samples = vg::InstanceInteriorSamples(
+                std::span<const render::mdi::MdiCommand>(cpuCmds.data(), cpuCmds.size()), clusterSpan,
+                centersSpan, radiusSpan, narrowCam.position, narrowVP, vw, vh);
+            uint32_t interiorOk = 0, interiorTotal = 0;
+            for (const vg::InteriorSample& s : samples) {
+                uint32_t v = ids[(size_t)s.py * vw + s.px];
+                if (v == vg::kVisBackground) {
+                    std::fprintf(stderr, "FATAL: vis-buffer near-pole pixel (%u,%u) of instance %u is "
+                                 "BACKGROUND (the front surface should cover it)\n", s.px, s.py, s.expectedInstance);
+                    device->WaitIdle(); return 1;
+                }
+                ++interiorTotal;
+                uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+                uint32_t gpuInstance = clusters[cpuCmds[cid].firstInstance].instanceIndex;
+                if (gpuInstance == s.expectedInstance) ++interiorOk;
+                else {
+                    std::fprintf(stderr, "FATAL: vis-buffer near-pole pixel (%u,%u): GPU clusterID %u belongs "
+                                 "to instance %u, expected instance %u (wrong provenance)\n",
+                                 s.px, s.py, cid, gpuInstance, s.expectedInstance);
+                    device->WaitIdle(); return 1;
+                }
+            }
+            if (interiorTotal == 0) {
+                std::fprintf(stderr, "FATAL: vis-buffer found NO interior sample pixels (proof B3 vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("visbuffer GPU==CPU interior coverage: %u/%u pixels EXACT\n", interiorOk, interiorTotal);
+
+            std::printf("visbuffer: {clusterInstances:%u, survivors:%u, written:%llu}\n",
+                        kClusterInstances, drawn, (unsigned long long)writtenTexels);
+
+            // --- Image golden: CPU-color the read-back IDs into BGRA8 (bg -> a fixed dark clear color,
+            // else hashColor(clusterID)). Identical on both backends by construction (same integer bits
+            // in -> same RGB out). ---
+            std::vector<uint8_t> bgra((size_t)vw * vh * 4);
+            const uint8_t bgB = 13, bgG = 13, bgR = 5;  // a dark navy, distinct from any hash color
+            for (size_t p = 0; p < ids.size(); ++p) {
+                uint32_t v = ids[p];
+                uint8_t* px = &bgra[p * 4];
+                if (v == vg::kVisBackground) {
+                    px[0] = bgB; px[1] = bgG; px[2] = bgR; px[3] = 255;
+                } else {
+                    uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+                    Vec3 col = vg::hashColor(cid);
+                    px[0] = (uint8_t)(col.z * 255.0f + 0.5f);  // B
+                    px[1] = (uint8_t)(col.y * 255.0f + 0.5f);  // G
+                    px[2] = (uint8_t)(col.x * 255.0f + 0.5f);  // R
+                    px[3] = 255;
+                }
+            }
+            bool ok = WriteBMP(visbufferShotPath, bgra, vw, vh);
+            if (ok) std::printf("wrote %s (%ux%u) — CPU-colored visibility buffer (%u survivor clusters)\n",
+                                visbufferShotPath, vw, vh, drawn);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", visbufferShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

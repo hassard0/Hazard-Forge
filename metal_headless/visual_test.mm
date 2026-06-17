@@ -81,6 +81,7 @@
 #include "render/gpu_culled.h"      // Slice CD: compute cull+compact CPU mirror (model+material+texIndex)
 #include "render/cluster_cull.h"    // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
+#include "render/visbuffer.h"       // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/InstanceInteriorSamples)
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -15031,6 +15032,258 @@ static int RunGpuCullDrawShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual-geometry VISIBILITY BUFFER showcase (Slice DW). The TRUE Vulkan pass (the DT survivor
+// cluster MDI draw rasterizing (clusterID<<7 | SV_PrimitiveID) into an R32_Uint render target via
+// visbuffer.{vert,frag}) is --visbuffer-shot. Here Metal renders the IDENTICAL survivor set via the
+// per-cluster BOUND path: the SAME render::vg::CullClusterInstances decides the survivors, and each is
+// drawn (in survivor-draw order) via visbuffer_bound.vert (pushing that survivor's clusterID = its draw
+// index) sharing visbuffer.frag, into the SAME R32_Uint visibility RT. The integer RT is
+// ReadRenderTarget'd back into uint32[w*h] and PROVEN bit-exact: (B1) self-consistent + coverage (every
+// non-bg texel a valid survivor; distinct clusterIDs a non-empty strict subset — the far hemisphere is
+// depth-occluded), (B2) determinism (two renders byte-identical), (B3) GPU==CPU interior provenance (each
+// visible instance's near-pole pixel maps back to that instance). The image golden CPU-colors the
+// read-back IDs (bg->clear, else hashColor(clusterID)) — identical to the Vulkan path BY CONSTRUCTION
+// (same integer bits in -> same RGB out). New golden tests/golden/metal/visbuffer.png; two runs DIFF 0.
+static int RunVisBufferShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace fr = render::frustum;
+    namespace vg = render::vg;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- The shared mesh + DS decomposition + instance grid + narrow camera (IDENTICAL to --cluster-cull
+    // / the Vulkan --visbuffer-shot framing). ---
+    scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+    vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+    const uint32_t clustersPerMesh = (uint32_t)ms.meshlets.size();
+    (void)clustersPerMesh;  // (the stat line below reports clusterInstances; per-mesh count is implicit)
+
+    const int kInstances = 4;
+    std::vector<Mat4> instanceModels;
+    {
+        const float spacing = 3.2f;
+        const float half = 0.5f * (float)(kInstances - 1) * spacing;
+        for (int gi = 0; gi < kInstances; ++gi)
+            instanceModels.push_back(Mat4::Translate({(float)gi * spacing - half, 0.0f, -6.0f}));
+    }
+    std::vector<vg::ClusterInstance> clusters = vg::BuildClusterInstances(
+        std::span<const Mat4>(instanceModels.data(), instanceModels.size()), ms);
+    const uint32_t kClusterInstances = (uint32_t)clusters.size();
+
+    runtime::Camera narrowCam;
+    narrowCam.position = {0.0f, 0.0f, 1.5f};
+    narrowCam.yaw = 0.0f; narrowCam.SetPitch(0.0f);
+    narrowCam.fovY = 0.5235988f;
+    narrowCam.aspect = aspect;
+    narrowCam.znear = 0.2f; narrowCam.zfar = 50.0f;
+    Mat4 narrowVP = FlipProjY(narrowCam.Proj()) * narrowCam.View();
+    fr::Frustum narrowFrustum = fr::FromViewProj(narrowVP);
+
+    std::span<const vg::ClusterInstance> clusterSpan(clusters.data(), clusters.size());
+    std::vector<render::mdi::MdiCommand> cpuCmds = vg::CullClusterInstances(clusterSpan, narrowFrustum);
+    const uint32_t cpuSurvivors = vg::SurvivorClusterCount(clusterSpan, narrowFrustum);
+    if (cpuSurvivors != (uint32_t)cpuCmds.size())
+        return fail("visbuffer: SurvivorClusterCount != CullClusterInstances size (mirror mismatch)");
+    if (!(cpuSurvivors > 0 && cpuSurvivors < kClusterInstances))
+        return fail("visbuffer: narrow frustum did not cull a STRICT subset (camera framing wrong)");
+
+    // --- Upload the shared vertex + reordered index buffers. ---
+    rhi::BufferDesc vbd;
+    vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+    vbd.initialData = geo.verts.data();
+    vbd.usage = rhi::BufferUsage::Vertex;
+    auto vbuf = device->CreateBuffer(vbd);
+    rhi::BufferDesc ibd;
+    ibd.size = ms.indices.size() * sizeof(uint32_t);
+    ibd.initialData = ms.indices.data();
+    ibd.usage = rhi::BufferUsage::Index;
+    auto ibuf = device->CreateBuffer(ibd);
+
+    // --- The visibility pipeline: visbuffer_bound.vert (clusterID pushed per survivor) + visbuffer.frag
+    // (out single uint into R32_Uint). depthTest + depthWrite (the front-most surface wins), NO blend. ---
+    auto vbVs = loadMSL("visbuffer_bound.vert.gen.metal", "visbuffer_vertex");
+    auto vbFs = loadMSL("visbuffer.frag.gen.metal", "visbuffer_fragment");
+    rhi::GraphicsPipelineDesc vbDesc;
+    vbDesc.vertex = vbVs.get(); vbDesc.fragment = vbFs.get();
+    rhi::VertexLayout vizLayout;
+    vizLayout.stride = sizeof(scene::Vertex);  // 56 (only POSITION@0 consumed)
+    vizLayout.attributes = { {0, rhi::Format::RGB32_Float, 0} };
+    vbDesc.vertexLayout = vizLayout;
+    vbDesc.colorFormat = rhi::Format::R32_Uint;   // the visibility buffer (the additive format)
+    vbDesc.depthTest = true; vbDesc.usesFrameUniforms = true;
+    vbDesc.pushConstantSize = sizeof(float) * 16 + sizeof(uint32_t) * 4;  // model + clusterID(+pad) = 80
+    auto vbPipeline = device->CreateGraphicsPipeline(vbDesc);
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = narrowVP.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = narrowCam.position.x; fd.viewPos[1] = narrowCam.position.y;
+        fd.viewPos[2] = narrowCam.position.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        runtime::CameraBasis cb = narrowCam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+    }
+
+    // The vis-buffer background clear (kVisBackground = 0xFFFFFFFF). The Vulkan path writes the exact
+    // sentinel via the VkClearColorValue union (uint32[0] aliases float32[0]). On Metal MTLClearColor is
+    // DOUBLE-based and an R32Uint target converts it implementation-definedly — so the Metal background
+    // texels may NOT equal 0xFFFFFFFF exactly. CONTROLLER NOTE: when baking on the real Mac, verify the
+    // R32Uint clear lands on a value distinct from every valid packed survivor ID (clusterID<<7|tri); if it
+    // clears to 0 (== PackVisId(cluster0,tri0)), set the clear via MTLClearColorMake'ing the channels so
+    // the integer clear is 0xFFFFFFFF (or the largest representable), so background stays unambiguous. The
+    // CPU coloring + proofs below additionally treat `clusterID >= survivorCount` as background (defensive),
+    // which covers any clamped/large sentinel; only an exact clear-to-0 would need the above adjustment.
+    float bgClearFloat; std::memcpy(&bgClearFloat, &vg::kVisBackground, sizeof(float));
+    const rhi::ClearColor visClear{bgClearFloat, 0.0f, 0.0f, 0.0f};
+
+    // Render the visibility buffer into a FRESH R32_Uint RT (a fresh RT per render so the readback's
+    // layout transition never collides — same reasoning as the Vulkan showcase). Returns the read-back IDs.
+    auto renderVisBuffer = [&](std::vector<uint32_t>& outIds, uint32_t& outW, uint32_t& outH) -> bool {
+        auto visRT = device->CreateRenderTarget(W, H, rhi::Format::R32_Uint);
+        render::RenderGraph graph;
+        render::RgResource rgVis = graph.ImportTarget(
+            "visBuffer", render::RgResourceKind::SceneColor, *visRT);
+        graph.AddPass("visbuffer", {}, {rgVis},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(visClear);
+                cmd.BindPipeline(*vbPipeline);
+                cmd.BindVertexBuffer(*vbuf);
+                cmd.BindIndexBuffer(*ibuf);
+                // One DrawIndexed per survivor, in survivor-draw order; push the survivor's model matrix +
+                // its clusterID (== the survivor draw index, the value the Vulkan MDI path sets from
+                // gl_DrawID). The shared visbuffer.frag packs (clusterID<<7 | SV_PrimitiveID).
+                for (uint32_t i = 0; i < (uint32_t)cpuCmds.size(); ++i) {
+                    const render::mdi::MdiCommand& c = cpuCmds[i];
+                    const vg::ClusterInstance& ci = clusters[c.firstInstance];
+                    const Mat4& model = instanceModels[ci.instanceIndex];
+                    // 80-byte push: float4x4 model + uint clusterID + 3 pad uints (matches PushLayout).
+                    struct { float model[16]; uint32_t clusterID; uint32_t pad[3]; } pc{};
+                    for (int k = 0; k < 16; ++k) pc.model[k] = model.m[k];
+                    pc.clusterID = i;   // the survivor draw index
+                    cmd.PushConstants(&pc, sizeof(pc));
+                    cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+                }
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        std::vector<uint8_t> raw;
+        if (!device->ReadRenderTarget(*visRT, raw, outW, outH)) return false;
+        if (raw.size() != (size_t)outW * outH * 4) return false;
+        outIds.resize((size_t)outW * outH);
+        std::memcpy(outIds.data(), raw.data(), raw.size());
+        return true;
+    };
+
+    std::vector<uint32_t> ids; uint32_t vw = 0, vh = 0;
+    if (!renderVisBuffer(ids, vw, vh)) return fail("visbuffer: render/readback failed");
+
+    const uint32_t drawn = cpuSurvivors;
+    std::vector<uint32_t> survivorTriCount(drawn);
+    for (uint32_t i = 0; i < drawn; ++i)
+        survivorTriCount[i] = clusters[cpuCmds[i].firstInstance].triCount;
+
+    // (B1) self-consistency + coverage. Every non-bg texel is a VALID survivor; distinct clusterIDs a
+    // NON-EMPTY STRICT subset (far hemisphere depth-occluded).
+    std::vector<uint8_t> clusterSeen(drawn, 0);
+    uint64_t writtenTexels = 0;
+    for (size_t p = 0; p < ids.size(); ++p) {
+        uint32_t v = ids[p];
+        if (v == vg::kVisBackground) continue;
+        uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+        if (cid >= drawn) continue;                         // (also catches any stray sentinel-ish value)
+        ++writtenTexels;
+        if (tid >= survivorTriCount[cid]) return fail("visbuffer: triID >= survivor triCount");
+        clusterSeen[cid] = 1;
+    }
+    uint32_t distinctSeen = 0;
+    for (uint32_t c = 0; c < drawn; ++c) distinctSeen += clusterSeen[c];
+    if (distinctSeen == 0 || distinctSeen >= drawn)
+        return fail("visbuffer: distinct clusterIDs not a non-empty strict subset of survivors");
+    std::printf("visbuffer self-consistent + coverage == CPU survivors: %u/%u frustum survivors visible "
+                "(far hemisphere depth-occluded) EXACT\n", distinctSeen, drawn);
+
+    // (B2) determinism: two renders byte-identical.
+    std::vector<uint32_t> ids2; uint32_t vw2 = 0, vh2 = 0;
+    if (!renderVisBuffer(ids2, vw2, vh2)) return fail("visbuffer: second render failed");
+    if (vw != vw2 || vh != vh2 || ids.size() != ids2.size() ||
+        std::memcmp(ids.data(), ids2.data(), ids.size() * sizeof(uint32_t)) != 0)
+        return fail("visbuffer: two renders differ (nondeterministic)");
+    std::printf("visbuffer determinism: two renders BYTE-IDENTICAL\n");
+
+    // (B3) GPU==CPU interior provenance at each visible instance's near-pole pixel.
+    std::vector<Vec3> instanceCenters(instanceModels.size());
+    for (size_t i = 0; i < instanceModels.size(); ++i)
+        instanceCenters[i] = {instanceModels[i].m[12], instanceModels[i].m[13], instanceModels[i].m[14]};
+    std::vector<float> instanceRadius(instanceModels.size(), 0.0f);
+    for (const vg::ClusterInstance& ci : clusters) {
+        float reach = math::length(ci.worldCenter - instanceCenters[ci.instanceIndex]) + ci.worldRadius;
+        if (reach > instanceRadius[ci.instanceIndex]) instanceRadius[ci.instanceIndex] = reach;
+    }
+    std::vector<vg::InteriorSample> samples = vg::InstanceInteriorSamples(
+        std::span<const render::mdi::MdiCommand>(cpuCmds.data(), cpuCmds.size()), clusterSpan,
+        std::span<const Vec3>(instanceCenters.data(), instanceCenters.size()),
+        std::span<const float>(instanceRadius.data(), instanceRadius.size()),
+        narrowCam.position, narrowVP, vw, vh);
+    uint32_t interiorOk = 0, interiorTotal = 0;
+    for (const vg::InteriorSample& s : samples) {
+        uint32_t v = ids[(size_t)s.py * vw + s.px];
+        if (v == vg::kVisBackground) return fail("visbuffer: near-pole pixel is background");
+        uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+        if (cid >= drawn) return fail("visbuffer: near-pole clusterID out of range");
+        ++interiorTotal;
+        if (clusters[cpuCmds[cid].firstInstance].instanceIndex == s.expectedInstance) ++interiorOk;
+        else return fail("visbuffer: near-pole pixel wrong instance provenance");
+    }
+    if (interiorTotal == 0) return fail("visbuffer: no interior sample pixels (B3 vacuous)");
+    std::printf("visbuffer GPU==CPU interior coverage: %u/%u pixels EXACT\n", interiorOk, interiorTotal);
+
+    std::printf("visbuffer: {clusterInstances:%u, survivors:%u, written:%llu} (Metal: per-cluster bound "
+                "path, image backend-identical)\n",
+                kClusterInstances, drawn, (unsigned long long)writtenTexels);
+
+    // --- Image golden: CPU-color the read-back IDs into BGRA8 (bg -> dark navy, else hashColor(clusterID)).
+    // Identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). ---
+    std::vector<uint8_t> bgra((size_t)vw * vh * 4);
+    const uint8_t bgB = 13, bgG = 13, bgR = 5;
+    for (size_t p = 0; p < ids.size(); ++p) {
+        uint32_t v = ids[p];
+        uint8_t* px = &bgra[p * 4];
+        uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+        if (v == vg::kVisBackground || cid >= drawn) {
+            px[0] = bgB; px[1] = bgG; px[2] = bgR; px[3] = 255;
+        } else {
+            // hashColor(clusterID) where clusterID is the read-back SURVIVOR DRAW INDEX — the SAME keying
+            // the Vulkan --visbuffer-shot uses, so the CPU-colored image is identical both backends BY
+            // CONSTRUCTION (same integer bits in -> same RGB out).
+            Vec3 col = vg::hashColor(cid);
+            px[0] = (uint8_t)(col.z * 255.0f + 0.5f);  // B
+            px[1] = (uint8_t)(col.y * 255.0f + 0.5f);  // G
+            px[2] = (uint8_t)(col.x * 255.0f + 0.5f);  // R
+            px[3] = 255;
+        }
+    }
+    if (!WritePNG(outPath, bgra, vw, vh)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — CPU-colored visibility buffer %u/%u survivors (Metal per-cluster "
+                "bound; Vulkan does the MDI visbuffer draw)\n", outPath, vw, vh, distinctSeen, drawn);
+    return 0;
+}
+
 // --- Virtual-geometry per-CLUSTER frustum cull showcase (Slice DT: GPU per-cluster cull -> indirect
 // cluster draw). The TRUE pass (a compute shader cluster_cull.comp frustum-culls the (instance x cluster)
 // records + ORDER-compacts the survivors into the MDI command buffer + the compacted per-draw SSBO +
@@ -22169,6 +22422,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cluster-cull") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cluster_cull.png";
             try { return RunClusterCullShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --visbuffer <out.png>: render the virtual-geometry VISIBILITY BUFFER showcase (Slice DW). The
+        // TRUE Vulkan pass (the DT survivor cluster MDI draw rasterizing (clusterID<<7 | SV_PrimitiveID)
+        // into an R32_Uint render target) is --visbuffer-shot; here Metal renders the IDENTICAL survivor
+        // set via the per-cluster BOUND path (visbuffer_bound.vert pushes each survivor's clusterID; the
+        // shared visbuffer.frag packs the (clusterID, SV_PrimitiveID) pair into the same R32_Uint RT). The
+        // integer RT is ReadRenderTarget'd back into uint32[w*h] and PROVEN bit-exact (B1 self-consistent +
+        // coverage, B2 determinism, B3 GPU==CPU instance provenance). The image golden is a CPU-coloring of
+        // the read-back IDs (bg->clear, else hashColor(clusterID)), identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/visbuffer.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--visbuffer") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_visbuffer.png";
+            try { return RunVisBufferShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --hiz-cull <out.png>: render the Hi-Z OCCLUSION cull showcase (Slice CJ). The TRUE pass (a CPU

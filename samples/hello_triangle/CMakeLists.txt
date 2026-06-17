@@ -357,6 +357,16 @@ hf_compile_shaders(
     # mirror: render/cluster_cull.h. NO new RHI; existing shaders + goldens untouched.
     "shaders/cluster_cull.comp.hlsl:cs"
     "shaders/cluster_viz.vert.hlsl:vs"
+    # Virtual-geometry VISIBILITY BUFFER (Slice DW): the same DT/DV survivor cluster MDI draw, but the
+    # fragment output is a SINGLE uint (clusterID<<7 | SV_PrimitiveID) into an R32_Uint render target
+    # instead of a color — the Nanite-style (clusterID, triangleID) visibility buffer. visbuffer.vert is
+    # a thin cluster_viz.vert variant (forwards the flat gl_DrawID clusterID, no Lambert/color);
+    # visbuffer.frag packs the (clusterID, SV_PrimitiveID) pair. FIRST SV_PrimitiveID use in the repo
+    # (Vulkan DXC -> SPIR-V PrimitiveId). NOT in the Metal MSL-gen list (DrawIndex); the Metal showcase
+    # renders via the per-cluster bound path. CPU mirror: render/visbuffer.h. The only new RHI is the
+    # additive Format::R32_Uint; existing shaders + goldens untouched.
+    "shaders/visbuffer.vert.hlsl:vs"
+    "shaders/visbuffer.frag.hlsl:ps"
     # Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): DT's cluster_cull.comp PLUS CJ's
     # hiz_cull.comp occlusion test. After the frustum test, a frustum-surviving cluster-instance is ALSO
     # tested against a Hi-Z max-depth pyramid (built CPU-side from a depth pre-pass + uploaded; render/hiz.h)

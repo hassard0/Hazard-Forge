@@ -21,6 +21,7 @@ inline VkFormat ToVk(Format f) {
         case Format::RGB32_Float:  return VK_FORMAT_R32G32B32_SFLOAT;
         case Format::RGBA32_Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
         case Format::RGBA16_Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+        case Format::R32_Uint:     return VK_FORMAT_R32_UINT;  // Slice DW visibility buffer
         case Format::D32_Float:    return VK_FORMAT_D32_SFLOAT;
         default:                  return VK_FORMAT_UNDEFINED;
     }

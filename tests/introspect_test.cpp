@@ -252,6 +252,8 @@ int main() {
             bool sawClusterHizFeature = false;
             // Slice DV: the virtual-geometry-cluster-lod capability is advertised in the feature manifest.
             bool sawClusterLodFeature = false;
+            // Slice DW: the virtual-geometry-visbuffer capability is advertised in the feature manifest.
+            bool sawVisbufferFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -317,6 +319,7 @@ int main() {
                     if (AsString(el->value) == "virtual-geometry-cluster-cull") sawClusterCullFeature = true;
                     if (AsString(el->value) == "virtual-geometry-cluster-hiz") sawClusterHizFeature = true;
                     if (AsString(el->value) == "virtual-geometry-cluster-lod") sawClusterLodFeature = true;
+                    if (AsString(el->value) == "virtual-geometry-visbuffer") sawVisbufferFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -379,6 +382,7 @@ int main() {
             check(sawClusterCullFeature, "engine.features includes virtual-geometry-cluster-cull");
             check(sawClusterHizFeature, "engine.features includes virtual-geometry-cluster-hiz");
             check(sawClusterLodFeature, "engine.features includes virtual-geometry-cluster-lod");
+            check(sawVisbufferFeature, "engine.features includes virtual-geometry-visbuffer");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -496,6 +500,8 @@ int main() {
         bool sawClusterHizShot = false;
         // Slice DV: the --cluster-lod-shot showcase flag is listed in the showcase manifest.
         bool sawClusterLodShot = false;
+        // Slice DW: the --visbuffer-shot showcase flag is listed in the showcase manifest.
+        bool sawVisbufferShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -578,6 +584,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--cluster-cull-shot") sawClusterCullShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cluster-hiz-shot") sawClusterHizShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cluster-lod-shot") sawClusterLodShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--visbuffer-shot") sawVisbufferShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -643,6 +650,7 @@ int main() {
         check(sawClusterCullShot, "showcases manifest includes --cluster-cull-shot");
         check(sawClusterHizShot, "showcases manifest includes --cluster-hiz-shot");
         check(sawClusterLodShot, "showcases manifest includes --cluster-lod-shot");
+        check(sawVisbufferShot, "showcases manifest includes --visbuffer-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");

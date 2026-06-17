@@ -23,6 +23,9 @@ enum class Format {
     RGBA32_Float,  // vec4 vertex attribute (skinned joints/weights)
     RGBA16_Float,  // half4 sampled HDR texture (equirect environment map; Slice R)
     D32_Float,     // depth attachment
+    R32_Uint,      // single-channel uint32 render target (visibility buffer; Slice DW). ADDITIVE,
+                   // defaulted-no-op: selected by no existing call site, so every existing
+                   // switch(Format) hits its `default` -> existing pipelines/RTs/goldens BYTE-UNCHANGED.
 };
 
 struct ClearColor { float r = 0, g = 0, b = 0, a = 1; };
