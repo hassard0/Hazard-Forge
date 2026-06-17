@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace hf::render::vsm {
 
@@ -255,6 +256,139 @@ inline PageOrtho PageWorldOrtho(int pageId, const VsmClipmap& cm) {
     out.center.z = std::fma((float)py + 0.5f, pageWorldSize, originZ);
     out.halfExtent = pageWorldSize * 0.5f;
     return out;
+}
+
+// ============================ Slice VD — per-page CONTENT KEY + CACHE (pure CPU) ===============
+// VB renders EVERY resident page's caster depth into its tile each frame. But a page's rendered depth
+// is fully determined by (its clipmap level + its world region + the casters that overlap that region);
+// if NONE of those changed, re-rendering the page reproduces byte-identical tile depth — wasted work.
+// VD adds a per-page CONTENT KEY (a deterministic hash of exactly those inputs) + a per-page CACHE; a
+// page re-renders iff its key changed (a cache MISS), a HIT keeps the existing (already-correct) tile
+// depth untouched. This is UE5's VSM key performance property (cache static pages, re-render only the
+// invalidated ones). It is a PURE optimization — proven SAFE because a hit SKIPS work that would produce
+// identical bytes, so the cached atlas is BYTE-IDENTICAL to the fully-re-rendered atlas (the same
+// froxel.h density=0 "an optimization must be byte-identical to the unoptimized path" SHA-equality
+// discipline). ZERO backend symbols — the cache is pure host logic; "skip a page render" = the showcase
+// not issuing that page's SetViewport+draw.
+
+// A minimal POD reference to a shadow CASTER, the unit a page's content key hashes over. The page's
+// rendered depth depends on each overlapping caster's TRANSFORM (we hash its model matrix, QUANTIZED to
+// an integer grid so a sub-ULP wobble doesn't spuriously invalidate while a real move does) + its mesh
+// identity (meshId; different geometry -> different silhouette) + its world bounding sphere
+// (boundsCenter/Radius), which is what PageOverlapsCaster tests against the page's world region. The
+// showcase builds one CasterRef per scene caster from its model matrix + mesh + bounds.
+struct CasterRef {
+    uint32_t   meshId = 0u;            // mesh identity (distinct geometry -> distinct shadow silhouette)
+    uint64_t   xformHash = 0ull;       // a deterministic hash of the QUANTIZED model matrix (see MakeCasterRef)
+    math::Vec3 boundsCenter{0,0,0};    // world-space bounding-sphere center (overlap test vs the page region)
+    float      boundsRadius = 0.0f;    // world-space bounding-sphere radius
+};
+
+// FNV-1a 64-bit — the fixed, integer/bit-exact hash the content key is built from (the same documented
+// fixed-hash discipline the rest of the engine uses for deterministic keys). Pure integer mixing -> two
+// identical inputs always hash identically, cross-run + cross-backend.
+inline constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+inline constexpr uint64_t kFnvPrime  = 1099511628211ull;
+inline uint64_t FnvMix(uint64_t h, uint64_t v) {
+    // Hash the 8 bytes of v (little-endian) into the FNV accumulator.
+    for (int b = 0; b < 8; ++b) { h ^= (v & 0xFFull); h *= kFnvPrime; v >>= 8; }
+    return h;
+}
+// Quantize a float to a fixed integer grid (1/1024 world unit) then FNV-mix its INTEGER bits, so the key
+// is a pure-integer function of the quantized transform (transcendental-free, bit-exact CPU<->any
+// backend) AND a sub-quantum wobble does not change the key while a real move (>= ~1mm) does.
+inline uint64_t FnvMixQuantF(uint64_t h, float f) {
+    // round-to-nearest on a 1/1024 grid; the result is an exact integer -> bit-stable.
+    int64_t q = (int64_t)std::floor((double)f * 1024.0 + 0.5);
+    return FnvMix(h, (uint64_t)q);
+}
+
+// Build a CasterRef from a model matrix (16 floats, column-major hf::math::Mat4), mesh id, and world
+// bounds. The xformHash FNV-folds the QUANTIZED 16 matrix elements -> a real transform change flips it,
+// a sub-quantum wobble does not. Deterministic + integer -> identical scene yields identical refs.
+inline CasterRef MakeCasterRef(uint32_t meshId, const float* model16,
+                               const math::Vec3& boundsCenter, float boundsRadius) {
+    CasterRef c;
+    c.meshId = meshId;
+    uint64_t h = kFnvOffset;
+    h = FnvMix(h, (uint64_t)meshId);
+    for (int k = 0; k < 16; ++k) h = FnvMixQuantF(h, model16[k]);
+    c.xformHash = h;
+    c.boundsCenter = boundsCenter;
+    c.boundsRadius = boundsRadius;
+    return c;
+}
+
+// Does caster `c`'s world bounding sphere overlap page `pageId`'s world region? The page's region is its
+// PageWorldOrtho square (center +/- halfExtent in world X/Z, the directional clipmap's ground plane). We
+// test the caster's bounding sphere (projected to the X/Z plane) against that square, expanded by the
+// caster radius (a standard sphere-vs-AABB on the ground plane; Y is the clipmap's projection axis so the
+// page covers the full column — only X/Z gate overlap). Pure compare/abs -> integer-stable, deterministic.
+inline bool PageOverlapsCaster(int pageId, const VsmClipmap& cm, const CasterRef& c) {
+    PageOrtho po = PageWorldOrtho(pageId, cm);
+    float dx = std::abs(c.boundsCenter.x - po.center.x) - po.halfExtent;
+    float dz = std::abs(c.boundsCenter.z - po.center.z) - po.halfExtent;
+    if (dx < 0.0f) dx = 0.0f;
+    if (dz < 0.0f) dz = 0.0f;
+    // Nearest-point distance² from the sphere center to the page square (on X/Z) vs radius².
+    return (dx * dx + dz * dz) <= (c.boundsRadius * c.boundsRadius);
+}
+
+// THE CONTENT KEY: a deterministic 64-bit hash of EVERYTHING that determines page `pageId`'s rendered
+// depth tile — its clipmap level + its world region (PageWorldOrtho center/halfExtent, QUANTIZED) + the
+// set of casters whose bounds OVERLAP that region (each overlapping caster's meshId + quantized xformHash
+// folded in ASCENDING caster index order, so the key is order-deterministic over the fixed caster span).
+// Two identical scenes -> identical keys for every page; a caster move changes the key ONLY for the
+// pages its old/new bounds overlap. FNV over integer/quantized inputs -> bit-exact, transcendental-free,
+// cross-backend. (A page with no overlapping casters still gets a well-defined key from its level+region,
+// so an empty page is cached too.)
+inline uint64_t PageContentKey(int pageId, const VsmClipmap& cm, std::span<const CasterRef> casters) {
+    int level, px, py;
+    UnpackPageId(pageId, cm, level, px, py);
+    PageOrtho po = PageWorldOrtho(pageId, cm);
+
+    uint64_t h = kFnvOffset;
+    h = FnvMix(h, (uint64_t)(uint32_t)level);
+    h = FnvMix(h, (uint64_t)(uint32_t)px);
+    h = FnvMix(h, (uint64_t)(uint32_t)py);
+    h = FnvMixQuantF(h, po.center.x);
+    h = FnvMixQuantF(h, po.center.y);
+    h = FnvMixQuantF(h, po.center.z);
+    h = FnvMixQuantF(h, po.halfExtent);
+    // The overlapping casters, in ascending index order (deterministic).
+    for (size_t i = 0; i < casters.size(); ++i) {
+        const CasterRef& c = casters[i];
+        if (!PageOverlapsCaster(pageId, cm, c)) continue;
+        h = FnvMix(h, (uint64_t)c.meshId);
+        h = FnvMix(h, c.xformHash);
+    }
+    return h;
+}
+
+// The per-virtual-page cache: the last content key + a valid bit, sized clipmap.pageCount(). A fresh
+// cache is all-invalid (every page a miss on first sight).
+struct VsmPageCache {
+    std::vector<uint64_t> key;     // [pageCount()] last content key seen for each page
+    std::vector<uint8_t>  valid;   // [pageCount()] 1 iff key[pageId] holds a populated key
+
+    void Resize(int pageCount) {
+        key.assign((size_t)pageCount, 0ull);
+        valid.assign((size_t)pageCount, (uint8_t)0u);
+    }
+};
+
+// A cache HIT for `pageId` at `newKey` == the page has a valid cached key AND it equals newKey (same
+// content -> skip the re-render, the existing tile depth is already correct -> byte-identical).
+inline bool PageCacheHit(int pageId, uint64_t newKey, const VsmPageCache& cache) {
+    if (pageId < 0 || (size_t)pageId >= cache.valid.size()) return false;
+    return cache.valid[(size_t)pageId] != 0u && cache.key[(size_t)pageId] == newKey;
+}
+
+// Record `newKey` as page `pageId`'s current content (called after a (re-)render populates its tile).
+inline void PageCacheUpdate(int pageId, uint64_t newKey, VsmPageCache& cache) {
+    if (pageId < 0 || (size_t)pageId >= cache.valid.size()) return;
+    cache.key[(size_t)pageId]   = newKey;
+    cache.valid[(size_t)pageId] = (uint8_t)1u;
 }
 
 }  // namespace hf::render::vsm

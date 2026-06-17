@@ -411,6 +411,130 @@ int main() {
               "VC page-lookup deterministic (two passes byte-identical)");
     }
 
+    // ===================== Slice VD — per-page CONTENT KEY + CACHE =====================
+    // Build a small fixed caster scene + its CasterRefs, then pin: identical scene -> identical key;
+    // a moved caster -> a changed key for the overlapping page(s) ONLY (unaffected pages keep theirs);
+    // the cache hit/update lifecycle (empty->miss, after-update->hit, changed-key->miss); the
+    // invalidated-page set == the pages the moved caster's bounds overlap (correct + minimal);
+    // determinism.
+    {
+        using math::Mat4;
+        vsm::VsmClipmap cmc;   // the showcase clipmap
+        cmc.levels = 4; cmc.pageSize = 128; cmc.virtualPagesPerSide = 8;
+        cmc.level0WorldExtent = 16.0f; cmc.cameraPos = {0,0,0};
+        const int nPg = cmc.pageCount();
+
+        // A caster at (x,z) seated on y=0, half-size s, a unit-cube mesh id 1, bound radius ~s.
+        auto makeCaster = [&](float x, float z, float s) {
+            Mat4 m = Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s});
+            return vsm::MakeCasterRef(1u, m.m, math::Vec3{x, 0.5f * s, z}, s * 0.9f);
+        };
+        std::vector<vsm::CasterRef> casters = {
+            makeCaster(0.0f, 0.0f, 2.0f),   // [0] near origin (level 0)
+            makeCaster(5.0f, 0.0f, 1.5f),   // [1]
+            makeCaster(-4.0f, 3.0f, 1.6f),  // [2]
+        };
+        auto span = [&](const std::vector<vsm::CasterRef>& cs) {
+            return std::span<const vsm::CasterRef>(cs.data(), cs.size());
+        };
+
+        // Per-page keys for the base scene.
+        auto allKeys = [&](const std::vector<vsm::CasterRef>& cs) {
+            std::vector<uint64_t> k((size_t)nPg);
+            for (int p = 0; p < nPg; ++p) k[(size_t)p] = vsm::PageContentKey(p, cmc, span(cs));
+            return k;
+        };
+        std::vector<uint64_t> keysA = allKeys(casters);
+
+        // (a) identical scene -> identical key (every page), and DETERMINISM (a second pass).
+        {
+            std::vector<uint64_t> keysA2 = allKeys(casters);
+            bool same = (keysA.size() == keysA2.size()) &&
+                        std::memcmp(keysA.data(), keysA2.data(), keysA.size() * sizeof(uint64_t)) == 0;
+            check(same, "VD PageContentKey: identical scene -> identical keys (deterministic)");
+        }
+
+        // (b) PageCacheHit/Update lifecycle: empty cache -> miss; after update -> hit for the same
+        // key; a changed key -> miss.
+        {
+            vsm::VsmPageCache cache; cache.Resize(nPg);
+            int pid = 0; uint64_t k0 = keysA[0];
+            check(!vsm::PageCacheHit(pid, k0, cache), "VD PageCacheHit: empty cache -> miss");
+            vsm::PageCacheUpdate(pid, k0, cache);
+            check(vsm::PageCacheHit(pid, k0, cache), "VD PageCacheHit: after update, same key -> hit");
+            check(!vsm::PageCacheHit(pid, k0 ^ 0x1ull, cache),
+                  "VD PageCacheHit: changed key -> miss");
+        }
+
+        // (c) Move ONE caster -> exactly the pages whose region its OLD-or-NEW bounds overlap change
+        // their key; every other page keeps its key (correct + MINIMAL invalidation). The expected
+        // invalidated set is computed independently from PageOverlapsCaster on the old + new positions.
+        {
+            std::vector<vsm::CasterRef> moved = casters;
+            // Move caster [1] from (5,0) far enough that its old+new pages differ (a real >1mm move).
+            moved[1] = makeCaster(5.0f, 9.0f, 1.5f);
+            std::vector<uint64_t> keysB = allKeys(moved);
+
+            // Independently: a page is EXPECTED to change iff caster[1]'s OLD bounds or NEW bounds
+            // overlap it (the caster's footprint moved out of its old pages, into new ones; all OTHER
+            // casters are unchanged so only this caster's overlap set can flip a key).
+            int changed = 0, expectedChanged = 0, falsePos = 0, falseNeg = 0;
+            const vsm::CasterRef& oldC = casters[1];
+            const vsm::CasterRef& newC = moved[1];
+            for (int p = 0; p < nPg; ++p) {
+                bool keyChanged = keysA[(size_t)p] != keysB[(size_t)p];
+                bool expect = vsm::PageOverlapsCaster(p, cmc, oldC) ||
+                              vsm::PageOverlapsCaster(p, cmc, newC);
+                if (keyChanged) ++changed;
+                if (expect)     ++expectedChanged;
+                if (keyChanged && !expect) ++falsePos;   // a page changed that the caster doesn't touch
+                if (!keyChanged && expect) ++falseNeg;   // an overlapped page that didn't change
+            }
+            check(changed > 0, "VD invalidation: a moved caster changes at least one page key");
+            check(changed < nPg, "VD invalidation: a moved caster does NOT change every page (minimal)");
+            check(falsePos == 0,
+                  "VD invalidation: NO page outside the caster's overlap region changed (minimal/correct)");
+            // falseNeg can be >0 only if two overlap-regions hashed to the same key by accident; for this
+            // fixed scene the overlap set IS exactly the changed set (mesh id differs none, only [1] moved).
+            check(falseNeg == 0,
+                  "VD invalidation: EVERY page the caster's old/new bounds overlap changed its key");
+        }
+
+        // (d) Cache-driven re-render set: simulate a frame. Populate the cache from the base scene
+        // (all miss first time), then re-key the MOVED scene -> only the changed-key pages miss; the
+        // miss count == the changed-key count from (c)'s logic, the rest hit (the cache is correct).
+        {
+            std::vector<vsm::CasterRef> moved = casters;
+            moved[1] = makeCaster(5.0f, 9.0f, 1.5f);
+            vsm::VsmPageCache cache; cache.Resize(nPg);
+            // Pass 1: populate from base scene -> all miss, then update.
+            int firstMiss = 0;
+            for (int p = 0; p < nPg; ++p) {
+                uint64_t k = vsm::PageContentKey(p, cmc, span(casters));
+                if (!vsm::PageCacheHit(p, k, cache)) { ++firstMiss; vsm::PageCacheUpdate(p, k, cache); }
+            }
+            check(firstMiss == nPg, "VD cache: first population misses every page");
+            // Pass 2: same scene -> every page HIT (0 re-renders) — the make-or-break.
+            int hits2 = 0;
+            for (int p = 0; p < nPg; ++p) {
+                uint64_t k = vsm::PageContentKey(p, cmc, span(casters));
+                if (vsm::PageCacheHit(p, k, cache)) ++hits2;
+            }
+            check(hits2 == nPg, "VD cache: re-keying the SAME scene hits every page (0 re-renders)");
+            // Pass 3: moved scene -> only the changed-key pages miss.
+            int miss3 = 0;
+            std::vector<uint64_t> keysA3 = allKeys(casters), keysB3 = allKeys(moved);
+            int expectMiss = 0;
+            for (int p = 0; p < nPg; ++p) if (keysA3[(size_t)p] != keysB3[(size_t)p]) ++expectMiss;
+            for (int p = 0; p < nPg; ++p) {
+                uint64_t k = vsm::PageContentKey(p, cmc, span(moved));
+                if (!vsm::PageCacheHit(p, k, cache)) ++miss3;
+            }
+            check(miss3 == expectMiss && miss3 > 0 && miss3 < nPg,
+                  "VD cache: moved scene re-renders ONLY the changed pages (minimal miss set)");
+        }
+    }
+
     if (g_fail == 0) std::printf("vsm_test: ALL PASS\n");
     else std::printf("vsm_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -262,6 +262,8 @@ int main() {
             bool sawVsmRenderFeature = false;
             // Slice VC: the virtual-shadow-maps-sample capability is advertised in the feature manifest.
             bool sawVsmSampleFeature = false;
+            // Slice VD: the virtual-shadow-maps-cache capability is advertised in the feature manifest.
+            bool sawVsmCacheFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -332,6 +334,7 @@ int main() {
                     if (AsString(el->value) == "virtual-shadow-maps-marking") sawVsmMarkFeature = true;
                     if (AsString(el->value) == "virtual-shadow-maps-render") sawVsmRenderFeature = true;
                     if (AsString(el->value) == "virtual-shadow-maps-sample") sawVsmSampleFeature = true;
+                    if (AsString(el->value) == "virtual-shadow-maps-cache") sawVsmCacheFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -399,6 +402,7 @@ int main() {
             check(sawVsmMarkFeature, "engine.features includes virtual-shadow-maps-marking");
             check(sawVsmRenderFeature, "engine.features includes virtual-shadow-maps-render");
             check(sawVsmSampleFeature, "engine.features includes virtual-shadow-maps-sample");
+            check(sawVsmCacheFeature, "engine.features includes virtual-shadow-maps-cache");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -526,6 +530,8 @@ int main() {
         bool sawVsmRenderShot = false;
         // Slice VC: the --vsm-sample-shot showcase flag is listed in the showcase manifest.
         bool sawVsmSampleShot = false;
+        // Slice VD: the --vsm-cache-shot showcase flag is listed in the showcase manifest.
+        bool sawVsmCacheShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -613,6 +619,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-mark-shot") sawVsmMarkShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-render-shot") sawVsmRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-sample-shot") sawVsmSampleShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--vsm-cache-shot") sawVsmCacheShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -683,6 +690,7 @@ int main() {
         check(sawVsmMarkShot, "showcases manifest includes --vsm-mark-shot");
         check(sawVsmRenderShot, "showcases manifest includes --vsm-render-shot");
         check(sawVsmSampleShot, "showcases manifest includes --vsm-sample-shot");
+        check(sawVsmCacheShot, "showcases manifest includes --vsm-cache-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");

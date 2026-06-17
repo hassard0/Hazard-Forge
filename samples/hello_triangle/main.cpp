@@ -430,6 +430,7 @@ int main(int argc, char** argv) {
     const char* vsmMarkShotPath = nullptr; // --vsm-mark-shot <out.bmp> (Slice VA: VSM virtual page table + page-needed marking, integer compute, GPU==CPU resident-set bit-exact, clipmap debug-viz)
     const char* vsmRenderShotPath = nullptr; // --vsm-render-shot <out.bmp> (Slice VB: allocate physical atlas tiles to VA's resident pages + render each page's casters' depth into its tile; colorized depth atlas)
     const char* vsmSampleShotPath = nullptr; // --vsm-sample-shot <out.bmp> (Slice VC: lit-pass VSM indirection sample — per receiver pixel level->page->tile->tile-clamped PCF over the depth atlas -> a VSM-shadowed scene; vsmEnabled=0 byte-identical-to-unshadowed no-op)
+    const char* vsmCacheShotPath = nullptr; // --vsm-cache-shot <out.bmp> (Slice VD: per-page CACHING — content-key cache skips re-rendering unchanged physical pages; cached==fresh + cached==full BYTE-IDENTICAL; cache-status viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1289,6 +1290,20 @@ int main(int argc, char** argv) {
             // (vsmEnabled=1) != A (shadows active); (3) page-lookup GPU==CPU bit-exact at interior pixels;
             // (4) two-run determinism; (5) VSM vs CSM (1-level) smoke < eps. NO new RHI. One BMP -> exit.
             vsmSampleShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vsm-cache-shot") == 0 && i + 1 < argc) {
+            // Slice VD: Virtual Shadow Maps Slice 4 — PER-PAGE CACHING (the FINAL VSM slice). A per-page
+            // content key (vsm::PageContentKey: a fixed FNV hash of the page's clipmap level + world
+            // region + the casters whose bounds overlap it) + a per-page cache (vsm::VsmPageCache) let the
+            // physical-page render SKIP pages whose content is unchanged. Flow: Pass 1 populate (all miss)
+            // -> atlasA; Pass 2 same scene (all HIT, 0 re-renders) -> atlasB; Pass 3 move ONE caster ->
+            // only its overlapping page(s) re-render -> atlasC, plus the moved scene fully-uncached ->
+            // atlasC_full. PROOFS (fail loudly): (1) atlasB==atlasA BYTE-IDENTICAL AND hits==residentPages
+            // (the make-or-break all-cached==fresh); (2) atlasC==atlasC_full BYTE-IDENTICAL AND misses==the
+            // small affected-page count; (3) two-run determinism; prints {residentPages,hits,misses}. The
+            // golden is a cache-status viz (resident tiles CPU-tinted CACHED=green / RE-RENDERED=red). NO
+            // new RHI (the cache is pure host logic; "skip a page render" = not issuing its SetViewport+
+            // draw). One BMP -> exit.
+            vsmCacheShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -13740,6 +13755,377 @@ int main(int argc, char** argv) {
                                 "%d tiles, %zu casters)\n", vsmRenderShotPath, aw, ah, residentPages,
                                 allocated, casters.size());
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vsmRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Virtual Shadow Maps PER-PAGE CACHING (--vsm-cache-shot <out.bmp>, Slice VD — the FINAL VSM
+        // slice). VB re-renders EVERY resident page each frame; VD adds a per-page CONTENT KEY
+        // (vsm::PageContentKey: a fixed FNV hash of the page's clipmap level + world region + the casters
+        // whose bounds overlap it) + a per-page CACHE (vsm::VsmPageCache) so a page re-renders iff its key
+        // changed; an unchanged page is SKIPPED and its tile keeps its already-correct depth -> the cached
+        // atlas is BYTE-IDENTICAL to the fully-re-rendered atlas (the froxel density=0 discipline). "Skip a
+        // page render" is pure host logic — we don't issue that page's SetViewport+draw; the HIT tile's
+        // pixels carry over from the previous atlas via a CPU tile-copy (a readback memcpy, NO new RHI).
+        // PROOFS (fail loudly): (1) Pass-2 (same scene) cached atlas == Pass-1 fresh atlas BYTE-IDENTICAL
+        // AND hits==residentPages (the make-or-break all-cached==fresh); (2) Pass-3 (one caster moved)
+        // cached atlas == the fully-uncached moved-scene atlas BYTE-IDENTICAL AND misses==the small
+        // affected-page count; (3) two-run determinism. Golden = a cache-status viz (resident tiles tinted
+        // CACHED=green / RE-RENDERED=red over the Pass-3 depth). NO new RHI. ---------------------------
+        if (vsmCacheShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace vsm = hf::render::vsm;
+
+            // The fixed clipmap (== VB) + the physical atlas (16x16 tiles of 128 -> a 2048² atlas).
+            vsm::VsmClipmap cm;
+            cm.levels = 4; cm.pageSize = 128; cm.virtualPagesPerSide = 8;
+            cm.level0WorldExtent = 16.0f; cm.cameraPos = {0.0f, 0.0f, 0.0f};
+            const int nPages = cm.pageCount();
+            vsm::VsmAtlas atlas; atlas.tilesPerSide = 16; atlas.tileSize = 128;
+            const uint32_t atlasPx = (uint32_t)atlas.atlasSize();
+
+            // === The VB caster scene (concentric bands matched to the clipmap level extents). Each caster
+            // carries its (x,z,s) so we can (a) build the depth-render model matrix, (b) build a
+            // vsm::CasterRef for the content key, (c) MOVE one for the invalidation pass. ===
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            struct Caster { float x, z, s; const scene::Mesh* mesh; uint32_t meshId; };
+            std::vector<Caster> casters;
+            auto box  = [&](float x, float z, float s) { casters.push_back({x, z, s, &cube,   1u}); };
+            auto ball = [&](float x, float z, float s) { casters.push_back({x, z, s, &sphere, 2u}); };
+            auto ring = [&](float radius, int count, float s0, bool boxes) {
+                for (int k = 0; k < count; ++k) {
+                    float a = 6.28318530718f * (float)k / (float)count;
+                    float x = radius * std::cos(a), z = radius * std::sin(a);
+                    float s = s0 + 0.5f * (float)(k & 1);
+                    if (boxes) box(x, z, s); else ball(x, z, s);
+                }
+            };
+            box(0.0f, 0.0f, 2.4f);
+            ring(5.0f,  6, 1.6f, false);
+            ring(12.0f, 8, 2.2f, true);
+            ring(24.0f, 10, 3.2f, false);
+
+            auto casterModel = [&](const Caster& c) {
+                return Mat4::Translate({c.x, 0.5f * c.s, c.z}) * Mat4::Scale({c.s, c.s, c.s});
+            };
+            // The render caster list (model + mesh) + the cache CasterRef list, both from `casters`.
+            auto buildScene = [&](const std::vector<Caster>& cs,
+                                  std::vector<std::pair<Mat4, const scene::Mesh*>>& renderOut,
+                                  std::vector<vsm::CasterRef>& refsOut) {
+                renderOut.clear(); refsOut.clear();
+                for (const Caster& c : cs) {
+                    Mat4 m = casterModel(c);
+                    renderOut.push_back({m, c.mesh});
+                    // Bounds: a ground-seated box/sphere of half-size s -> center (x, s/2, z), radius ~s.
+                    refsOut.push_back(vsm::MakeCasterRef(c.meshId, m.m,
+                                      Vec3{c.x, 0.5f * c.s, c.z}, c.s * 0.95f));
+                }
+            };
+
+            // The casters' ground footprints ARE the receiver samples that mark pages (== VB).
+            auto receiversOf = [&](const std::vector<Caster>& cs) {
+                std::vector<Vec3> r; r.reserve(cs.size());
+                for (const Caster& c : cs) r.push_back(Vec3{c.x, 0.0f, c.z});
+                return r;
+            };
+
+            // Mark + allocate physical tiles for a given caster scene (CPU; == VB).
+            auto markAndAllocate = [&](const std::vector<Caster>& cs, std::vector<uint32_t>& residentOut,
+                                       std::vector<uint32_t>& indirOut) -> int {
+                std::vector<Vec3> recv = receiversOf(cs);
+                residentOut.assign((size_t)nPages, 0u);
+                vsm::MarkResidentPages(std::span<const Vec3>(recv.data(), recv.size()), cm,
+                                       std::span<uint32_t>(residentOut.data(), residentOut.size()));
+                indirOut.assign((size_t)nPages, vsm::kNoTile);
+                return vsm::AllocatePhysicalPages(
+                    std::span<const uint32_t>(residentOut.data(), residentOut.size()), atlas,
+                    std::span<uint32_t>(indirOut.data(), indirOut.size()));
+            };
+
+            std::vector<uint32_t> resident, indirection;
+            int allocated = markAndAllocate(casters, resident, indirection);
+            uint32_t residentPages = 0; for (uint32_t r : resident) residentPages += (r != 0u);
+            if (allocated != (int)residentPages) {
+                std::fprintf(stderr, "FATAL: vsm-cache allocated %d != %u resident (atlas overflow? cap %d)\n",
+                             allocated, residentPages, atlas.tileCount());
+                device->WaitIdle(); return 1;
+            }
+
+            // === Per-page light-space VP (== VB). ===
+            const float kLightHeight = 12.0f, kOrthoNear = 6.0f, kOrthoFar = 12.5f;
+            auto pageViewProj = [&](int pageId) -> Mat4 {
+                vsm::PageOrtho po = vsm::PageWorldOrtho(pageId, cm);
+                Vec3 eye = po.center + Vec3{0.0f, kLightHeight, 0.0f};
+                Mat4 view = Mat4::LookAt(eye, po.center, Vec3{0.0f, 0.0f, 1.0f});
+                Mat4 proj = Mat4::Ortho(-po.halfExtent, po.halfExtent, -po.halfExtent, po.halfExtent,
+                                        kOrthoNear, kOrthoFar);
+                return proj * view;
+            };
+
+            // === Pipeline (== VB): shadow_csm.vert + vsm_depth.frag into a COLOR atlas. ===
+            auto shVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_csm.vert.hlsl.spv");
+            auto depthFsW  = LoadSpirv(std::string(HF_SHADER_DIR) + "/vsm_depth.frag.hlsl.spv");
+            auto shVs    = device->CreateShaderModule({std::span<const uint32_t>(shVsWords)});
+            auto depthFs = device->CreateShaderModule({std::span<const uint32_t>(depthFsW)});
+            rhi::GraphicsPipelineDesc pd;
+            pd.vertex = shVs.get(); pd.fragment = depthFs.get();
+            pd.vertexLayout = scene::MeshVertexLayout();
+            pd.colorFormat = device->Swapchain().ColorFormat();
+            pd.depthTest = true; pd.depthWrite = true;
+            pd.pushConstantSize = sizeof(float) * 32;
+            auto depthPipeline = device->CreateGraphicsPipeline(pd);
+            const rhi::ClearColor kAtlasClear{0.04f, 0.07f, 0.09f, 1.0f};
+
+            // === Render a depth atlas, drawing ONLY the pages in `pagesToDraw` (a per-page bool); other
+            // resident tiles are left at the clear color (their content will be CPU-composited from the
+            // previous atlas — the cache "skip"). For a FULL render pass `pagesToDraw[p]=true` for every
+            // resident page. casterScene = the (model,mesh) list to draw. ===
+            auto renderAtlasPartial = [&](const std::vector<std::pair<Mat4, const scene::Mesh*>>& casterScene,
+                                          const std::vector<uint32_t>& indir,
+                                          const std::vector<uint8_t>& pagesToDraw,
+                                          std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+                auto rt = device->CreateRenderTarget(atlasPx, atlasPx);
+                render::RenderGraph graph;
+                render::RgResource rgAtlas = graph.ImportTarget(
+                    "vsmCacheAtlas", render::RgResourceKind::SceneColor, *rt);
+                graph.AddPass("vsmCacheRender", {}, {rgAtlas},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(kAtlasClear);
+                        cmd.BindPipeline(*depthPipeline);
+                        for (int pageId = 0; pageId < nPages; ++pageId) {
+                            uint32_t tile = indir[(size_t)pageId];
+                            if (tile == vsm::kNoTile) continue;
+                            if (!pagesToDraw[(size_t)pageId]) continue;   // cache HIT -> skip this page's draw
+                            int ox, oy; vsm::PhysicalTileOrigin(tile, atlas, ox, oy);
+                            cmd.SetViewport(ox, oy, (uint32_t)atlas.tileSize, (uint32_t)atlas.tileSize);
+                            Mat4 vp = pageViewProj(pageId);
+                            for (const auto& ca : casterScene) {
+                                float pc[32];
+                                for (int k = 0; k < 16; ++k) pc[k] = vp.m[k];
+                                for (int k = 0; k < 16; ++k) pc[16 + k] = ca.first.m[k];
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.BindVertexBuffer(ca.second->vertices());
+                                cmd.BindIndexBuffer(ca.second->indices());
+                                cmd.DrawIndexed(ca.second->indexCount());
+                            }
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->ReadRenderTarget(*rt, outBGRA, outW, outH);
+            };
+
+            // Copy physical-tile `tile`'s pixels from `src` into `dst` (both atlasPx² BGRA). This is the
+            // cache carry-over: a HIT page's tile keeps the previous atlas's (already-correct) bytes.
+            auto copyTile = [&](uint32_t tile, const std::vector<uint8_t>& src, std::vector<uint8_t>& dst) {
+                int ox, oy; vsm::PhysicalTileOrigin(tile, atlas, ox, oy);
+                for (int ty = 0; ty < atlas.tileSize; ++ty) {
+                    size_t row = ((size_t)(oy + ty) * atlasPx + (size_t)ox) * 4;
+                    std::memcpy(&dst[row], &src[row], (size_t)atlas.tileSize * 4);
+                }
+            };
+
+            // === Build the base scene + render Pass 1 (FULL, cache empty -> all resident pages drawn). ===
+            std::vector<std::pair<Mat4, const scene::Mesh*>> baseRender; std::vector<vsm::CasterRef> baseRefs;
+            buildScene(casters, baseRender, baseRefs);
+
+            std::vector<uint8_t> drawAll((size_t)nPages, (uint8_t)1u);   // FULL render: draw every resident page
+            std::vector<uint8_t> atlasA; uint32_t aw = 0, ah = 0;
+            if (!renderAtlasPartial(baseRender, indirection, drawAll, atlasA, aw, ah)) {
+                std::fprintf(stderr, "FATAL: vsm-cache Pass-1 atlas render failed\n"); device->WaitIdle(); return 1;
+            }
+            if (atlasA.size() != (size_t)aw * ah * 4) {
+                std::fprintf(stderr, "FATAL: vsm-cache atlas readback size mismatch\n"); device->WaitIdle(); return 1;
+            }
+
+            // Populate the cache from the base scene's per-page content keys (all miss the first time).
+            vsm::VsmPageCache cache; cache.Resize(nPages);
+            auto baseRefSpan = std::span<const vsm::CasterRef>(baseRefs.data(), baseRefs.size());
+            uint32_t pass1Misses = 0;
+            for (int p = 0; p < nPages; ++p) {
+                if (indirection[(size_t)p] == vsm::kNoTile) continue;   // only resident pages are cached
+                uint64_t k = vsm::PageContentKey(p, cm, baseRefSpan);
+                if (!vsm::PageCacheHit(p, k, cache)) { ++pass1Misses; vsm::PageCacheUpdate(p, k, cache); }
+            }
+            if (pass1Misses != residentPages) {
+                std::fprintf(stderr, "FATAL: vsm-cache Pass-1 missed %u != %u resident pages\n",
+                             pass1Misses, residentPages); device->WaitIdle(); return 1;
+            }
+
+            // === PROOF (1) — the make-or-break: Pass 2, the SAME scene, cached. Every resident page is a
+            // HIT -> 0 page draws; the cached atlas is composited entirely from atlasA's tiles -> it must be
+            // BYTE-IDENTICAL to atlasA (the fresh render). hits == residentPages. ===
+            std::vector<uint8_t> pass2Draw((size_t)nPages, (uint8_t)0u);   // which pages re-render (miss)
+            uint32_t pass2Hits = 0, pass2Miss = 0;
+            for (int p = 0; p < nPages; ++p) {
+                if (indirection[(size_t)p] == vsm::kNoTile) continue;
+                uint64_t k = vsm::PageContentKey(p, cm, baseRefSpan);
+                if (vsm::PageCacheHit(p, k, cache)) { ++pass2Hits; }
+                else { ++pass2Miss; pass2Draw[(size_t)p] = 1u; vsm::PageCacheUpdate(p, k, cache); }
+            }
+            // Composite: render only the misses (none here) into a fresh temp, then carry HIT tiles from atlasA.
+            std::vector<uint8_t> atlasB; uint32_t bw = 0, bh = 0;
+            if (!renderAtlasPartial(baseRender, indirection, pass2Draw, atlasB, bw, bh)) {
+                std::fprintf(stderr, "FATAL: vsm-cache Pass-2 atlas render failed\n"); device->WaitIdle(); return 1;
+            }
+            for (int p = 0; p < nPages; ++p) {
+                uint32_t tile = indirection[(size_t)p];
+                if (tile == vsm::kNoTile) continue;
+                if (!pass2Draw[(size_t)p]) copyTile(tile, atlasA, atlasB);   // HIT -> carry over from atlasA
+            }
+            bool b_eq_a = (atlasB.size() == atlasA.size()) &&
+                          std::memcmp(atlasB.data(), atlasA.data(), atlasA.size()) == 0;
+            if (!b_eq_a || pass2Hits != residentPages || pass2Miss != 0) {
+                std::fprintf(stderr, "FATAL: vsm-cache all-cached != fresh (cache changed pixels — a BUG) "
+                             "[byteIdentical=%d hits=%u/%u misses=%u]\n",
+                             (int)b_eq_a, pass2Hits, residentPages, pass2Miss);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vsm-cache all-cached == fresh: BYTE-IDENTICAL (%u/%u hits)\n",
+                        pass2Hits, residentPages);
+
+            // === PROOF (2) — invalidation: move ONE caster deterministically. Its old+new footprint
+            // overlapping pages get a new key -> they re-render (miss); the rest stay cached. The cached
+            // composite must equal the moved scene rendered FULLY uncached, byte-identical, and the miss
+            // count is the small affected-page set. ===
+            std::vector<Caster> moved = casters;
+            // Move the LAST outer-ring caster a SMALL fixed nudge (+1.0 X) — a real >1mm move that changes
+            // its transform (so the content key of the page(s) its bounds overlap flips) but is small enough
+            // that its ground footprint stays in the SAME marked page, so the resident set + the physical
+            // allocation are UNCHANGED (every tile keeps its index -> all sameTile) and ONLY the few pages
+            // the caster's bounds overlap re-render. This is the "move one caster -> only its page(s)
+            // invalidate, the rest stay cached" property -> a mostly-green viz with a small red cluster.
+            const int movedIdx = (int)casters.size() - 1;
+            moved[movedIdx].x += 1.0f;
+            std::vector<std::pair<Mat4, const scene::Mesh*>> movedRender; std::vector<vsm::CasterRef> movedRefs;
+            buildScene(moved, movedRender, movedRefs);
+
+            // Re-mark/allocate for the moved scene (the resident set + indirection can change too).
+            std::vector<uint32_t> residentM, indirectionM;
+            int allocatedM = markAndAllocate(moved, residentM, indirectionM);
+            uint32_t residentPagesM = 0; for (uint32_t r : residentM) residentPagesM += (r != 0u);
+            if (allocatedM != (int)residentPagesM) {
+                std::fprintf(stderr, "FATAL: vsm-cache moved-scene allocated %d != %u resident\n",
+                             allocatedM, residentPagesM); device->WaitIdle(); return 1;
+            }
+
+            // atlasC_full: the moved scene rendered FULLY uncached (every resident page drawn).
+            std::vector<uint8_t> drawAllM((size_t)nPages, (uint8_t)1u);
+            std::vector<uint8_t> atlasC_full; uint32_t cfw = 0, cfh = 0;
+            if (!renderAtlasPartial(movedRender, indirectionM, drawAllM, atlasC_full, cfw, cfh)) {
+                std::fprintf(stderr, "FATAL: vsm-cache moved-scene full render failed\n"); device->WaitIdle(); return 1;
+            }
+
+            // atlasC (cached): a page is a HIT iff (a) it has a tile in BOTH the base and moved allocation
+            // (same tile index — a resident page whose physical slot is stable) AND (b) its moved-scene
+            // content key matches the cached key. A page that became newly-resident, changed its tile, or
+            // changed its key is a MISS -> re-render. HIT tiles carry from atlasA (cache), MISS tiles render
+            // from the moved scene. This composite must == atlasC_full byte-identical.
+            auto movedRefSpan = std::span<const vsm::CasterRef>(movedRefs.data(), movedRefs.size());
+            std::vector<uint8_t> pass3Draw((size_t)nPages, (uint8_t)0u);
+            std::vector<uint8_t> pass3Hit((size_t)nPages, (uint8_t)0u);
+            uint32_t pass3Hits = 0, pass3Miss = 0;
+            for (int p = 0; p < nPages; ++p) {
+                uint32_t tileM = indirectionM[(size_t)p];
+                if (tileM == vsm::kNoTile) continue;   // not resident in the moved scene -> no tile to fill
+                uint64_t k = vsm::PageContentKey(p, cm, movedRefSpan);
+                bool sameTile = (indirection[(size_t)p] == tileM);   // physical slot unchanged
+                bool hit = sameTile && vsm::PageCacheHit(p, k, cache);
+                if (hit) { ++pass3Hits; pass3Hit[(size_t)p] = 1u; }
+                else { ++pass3Miss; pass3Draw[(size_t)p] = 1u; }
+                vsm::PageCacheUpdate(p, k, cache);   // refresh the cache to the moved-scene key
+            }
+            std::vector<uint8_t> atlasC; uint32_t cw = 0, ch = 0;
+            if (!renderAtlasPartial(movedRender, indirectionM, pass3Draw, atlasC, cw, ch)) {
+                std::fprintf(stderr, "FATAL: vsm-cache Pass-3 cached render failed\n"); device->WaitIdle(); return 1;
+            }
+            for (int p = 0; p < nPages; ++p) {
+                uint32_t tileM = indirectionM[(size_t)p];
+                if (tileM == vsm::kNoTile) continue;
+                if (pass3Hit[(size_t)p]) copyTile(tileM, atlasA, atlasC);   // HIT -> carry the cached tile
+            }
+            bool c_eq_full = (atlasC.size() == atlasC_full.size()) &&
+                             std::memcmp(atlasC.data(), atlasC_full.data(), atlasC_full.size()) == 0;
+            if (!c_eq_full) {
+                std::fprintf(stderr, "FATAL: vsm-cache invalidation: cached != full (cache changed pixels — a BUG) "
+                             "[misses=%u]\n", pass3Miss);
+                device->WaitIdle(); return 1;
+            }
+            // The invalidation must be MEASURABLE + MINIMAL: some pages re-rendered, but not all.
+            if (pass3Miss == 0 || pass3Miss >= residentPagesM) {
+                std::fprintf(stderr, "FATAL: vsm-cache invalidation not minimal (misses=%u, resident=%u)\n",
+                             pass3Miss, residentPagesM);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vsm-cache invalidation: %u pages re-rendered, cached==full BYTE-IDENTICAL\n",
+                        pass3Miss);
+            std::printf("vsm-cache: {residentPages:%u, hits:%u, misses:%u}\n",
+                        residentPagesM, pass3Hits, pass3Miss);
+
+            // === PROOF (3): two-run determinism — repeat the WHOLE cache flow + assert the final cache-state
+            // miss set + the cached atlas are byte-identical. ===
+            {
+                vsm::VsmPageCache cache2; cache2.Resize(nPages);
+                for (int p = 0; p < nPages; ++p) {
+                    if (indirection[(size_t)p] == vsm::kNoTile) continue;
+                    vsm::PageCacheUpdate(p, vsm::PageContentKey(p, cm, baseRefSpan), cache2);
+                }
+                uint32_t miss2 = 0;
+                for (int p = 0; p < nPages; ++p) {
+                    uint32_t tileM = indirectionM[(size_t)p];
+                    if (tileM == vsm::kNoTile) continue;
+                    uint64_t k = vsm::PageContentKey(p, cm, movedRefSpan);
+                    bool sameTile = (indirection[(size_t)p] == tileM);
+                    if (!(sameTile && vsm::PageCacheHit(p, k, cache2))) ++miss2;
+                }
+                std::vector<uint8_t> atlasC2; uint32_t c2w = 0, c2h = 0;
+                if (!renderAtlasPartial(movedRender, indirectionM, pass3Draw, atlasC2, c2w, c2h)) {
+                    std::fprintf(stderr, "FATAL: vsm-cache determinism re-render failed\n"); device->WaitIdle(); return 1;
+                }
+                for (int p = 0; p < nPages; ++p) {
+                    uint32_t tileM = indirectionM[(size_t)p];
+                    if (tileM == vsm::kNoTile) continue;
+                    if (pass3Hit[(size_t)p]) copyTile(tileM, atlasA, atlasC2);
+                }
+                if (miss2 != pass3Miss || atlasC2.size() != atlasC.size() ||
+                    std::memcmp(atlasC2.data(), atlasC.data(), atlasC.size()) != 0) {
+                    std::fprintf(stderr, "FATAL: vsm-cache two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("vsm-cache determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // === Golden: the CACHE-STATUS VIZ. Start from atlasC (the Pass-3 depth), then tint each
+            // resident tile by its cache state — CACHED (hit) = a green tint, RE-RENDERED (miss) = a red
+            // tint — CPU-colored from the integer pass3Hit/pass3Draw state (NO GPU), so it is identical on
+            // both backends by construction. The tint multiplies the underlying depth so the silhouettes
+            // stay visible under the color. ===
+            std::vector<uint8_t> viz = atlasC;
+            auto tintTile = [&](uint32_t tile, float tr, float tg, float tb) {
+                int ox, oy; vsm::PhysicalTileOrigin(tile, atlas, ox, oy);
+                for (int ty = 0; ty < atlas.tileSize; ++ty)
+                    for (int tx = 0; tx < atlas.tileSize; ++tx) {
+                        size_t i = ((size_t)(oy + ty) * atlasPx + (size_t)(ox + tx)) * 4;
+                        // BGRA. Modulate the grayscale depth by the per-channel tint (a colored shade).
+                        viz[i + 0] = (uint8_t)((float)viz[i + 0] * tb + 0.5f);
+                        viz[i + 1] = (uint8_t)((float)viz[i + 1] * tg + 0.5f);
+                        viz[i + 2] = (uint8_t)((float)viz[i + 2] * tr + 0.5f);
+                    }
+            };
+            for (int p = 0; p < nPages; ++p) {
+                uint32_t tileM = indirectionM[(size_t)p];
+                if (tileM == vsm::kNoTile) continue;
+                if (pass3Hit[(size_t)p]) tintTile(tileM, 0.25f, 1.0f, 0.25f);   // CACHED -> green
+                else                     tintTile(tileM, 1.0f, 0.25f, 0.25f);   // RE-RENDERED -> red
+            }
+
+            bool ok = WriteBMP(vsmCacheShotPath, viz, cw, ch);
+            if (ok) std::printf("wrote %s (%ux%u) — VSM cache-status viz (%u resident, %u cached/green, "
+                                "%u re-rendered/red)\n", vsmCacheShotPath, cw, ch, residentPagesM,
+                                pass3Hits, pass3Miss);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vsmCacheShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
