@@ -367,6 +367,15 @@ hf_compile_shaders(
     # additive Format::R32_Uint; existing shaders + goldens untouched.
     "shaders/visbuffer.vert.hlsl:vs"
     "shaders/visbuffer.frag.hlsl:ps"
+    # Virtual-geometry DEFERRED MATERIAL RESOLVE (Slice DX): a FULLSCREEN pass (reuses post.vert) that
+    # texel-fetches the DW R32_Uint vis-buffer (Texture2D<uint>.Load, no sampler), unpacks (clusterID,
+    # triID), looks up the covering triangle via the cluster-meta/index/vertex SSBOs (bound through the
+    # existing BindLightClusters set-3 path), computes a FLAT geometric normal + Lambert shade, and
+    # outputs the lit image — the Nanite decoupled geometry->material resolve. VERBATIM CPU mirror:
+    # render/visresolve.h. NO new RHI (the integer vis-buffer rides BindTexture; the SSBOs ride
+    # BindLightClusters). On Metal the integer texture.read needs MSL 2.2 (the isolated --msl-version
+    # 20200 in metal_headless/CMakeLists.txt, like visbuffer.frag).
+    "shaders/visresolve.frag.hlsl:ps"
     # Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): DT's cluster_cull.comp PLUS CJ's
     # hiz_cull.comp occlusion test. After the frustum test, a frustum-surviving cluster-instance is ALSO
     # tested against a Hi-Z max-depth pyramid (built CPU-side from a depth pre-pass + uploaded; render/hiz.h)

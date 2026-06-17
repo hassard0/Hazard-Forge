@@ -172,6 +172,14 @@ hf_gen_msl(meshlet_viz.frag meshlet_viz.frag.hlsl frag meshlet_viz_fragment)
 # RHI is the additive Format::R32_Uint. Behind --visbuffer only.
 hf_gen_msl(visbuffer_bound.vert visbuffer_bound.vert.hlsl vert visbuffer_vertex)
 hf_gen_msl(visbuffer.frag       visbuffer.frag.hlsl       frag visbuffer_fragment --msl-version 20200)
+# Virtual-geometry DEFERRED MATERIAL RESOLVE (Slice DX): the FULLSCREEN resolve fragment that texel-fetches
+# the DW R32_Uint vis-buffer (Texture2D<uint>.Load -> MSL texture.read), unpacks (clusterID,triID), looks
+# up the covering triangle via the cluster-meta/index/vertex SSBOs (bound through the existing
+# BindLightClusters set-3 path -> Metal fragment buffers 13/14/15), and FLAT-shades it. Like visbuffer.frag,
+# the INTEGER texture.read needs MSL 2.2, so this ONE shader gets the ISOLATED --msl-version 20200 (every
+# other shader's spirv-cross command is left exactly as-is, so all 86 existing goldens are byte-for-byte
+# unchanged). Reuses the post.vert fullscreen triangle (already generated). NO new RHI. Behind --visresolve.
+hf_gen_msl(visresolve.frag      visresolve.frag.hlsl      frag visresolve_fragment --msl-version 20200)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.

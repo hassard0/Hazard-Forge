@@ -563,6 +563,14 @@ hf_add_pure_test(cluster_lod_test)
 # DT/DV contract), and determinism. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(visbuffer_test)
 
+# Virtual-geometry DEFERRED MATERIAL RESOLVE (Slice DX): the CPU mirror of the flat-shade resolve math
+# (render/visresolve.h) the GPU visresolve.frag.hlsl copies verbatim. Pins FlatNormal (unit outward
+# normal + winding sign-flip), LambertShade (face-on, back-facing max(0,ndotl) clamp, ambient),
+# ResolveFlatShade over a known mesh (+ triOffset addressing + translation-invariant normal), ResolvePixel
+# (sentinel + out-of-range clusterID -> sky, valid -> shade), EncodeBGRA8 saturate+round, and determinism.
+# Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(visresolve_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)

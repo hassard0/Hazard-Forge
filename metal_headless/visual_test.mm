@@ -15305,6 +15305,329 @@ static int RunVisBufferShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual-geometry DEFERRED MATERIAL RESOLVE showcase (Slice DX). The TRUE Vulkan pass
+// (--visresolve-shot) renders the DW vis-buffer then a FULLSCREEN deferred-resolve pass texel-fetches it,
+// looks up the covering triangle, and FLAT-shades it. Here Metal renders the IDENTICAL result: the SAME
+// render::vg::CullClusterInstances survivor set is rasterized into the SAME R32_Uint vis-buffer via the
+// per-cluster BOUND path (visbuffer_bound.vert + visbuffer.frag, == --visbuffer), then the SAME
+// visresolve.frag fullscreen pass texel-fetches that integer RT (BindTexture, no sampler — the integer
+// texture.read needs MSL 2.2, the isolated --msl-version 20200) + the cluster-meta/index/vertex SSBOs
+// (BindLightClusters) + the resolve UBO -> the lit image. The flat-shade math is the VERBATIM
+// render/visresolve.h, GPU==CPU bit-exact via the DH FP discipline. PROOFS: (1) ID provenance bit-exact,
+// (2) GPU==CPU resolve-MATH bit-exact (interior pixels), (3) determinism, (4) resolve-vs-forward SMOKE
+// bound. New golden tests/golden/metal/visresolve.png; two runs DIFF 0.0000. NO new RHI.
+static int RunVisResolveShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace fr = render::frustum;
+    namespace vg = render::vg;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- The SAME mesh + DS decomposition + instance grid + narrow camera as --visbuffer (so the same
+    // survivors -> the same vis-buffer the resolve reads). ---
+    scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+    vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+
+    const int kInstances = 4;
+    std::vector<Mat4> instanceModels;
+    {
+        const float spacing = 3.2f;
+        const float half = 0.5f * (float)(kInstances - 1) * spacing;
+        for (int gi = 0; gi < kInstances; ++gi)
+            instanceModels.push_back(Mat4::Translate({(float)gi * spacing - half, 0.0f, -6.0f}));
+    }
+    std::vector<vg::ClusterInstance> clusters = vg::BuildClusterInstances(
+        std::span<const Mat4>(instanceModels.data(), instanceModels.size()), ms);
+    const uint32_t kClusterInstances = (uint32_t)clusters.size();
+
+    runtime::Camera narrowCam;
+    narrowCam.position = {0.0f, 0.0f, 1.5f};
+    narrowCam.yaw = 0.0f; narrowCam.SetPitch(0.0f);
+    narrowCam.fovY = 0.5235988f;
+    narrowCam.aspect = aspect;
+    narrowCam.znear = 0.2f; narrowCam.zfar = 50.0f;
+    Mat4 narrowVP = FlipProjY(narrowCam.Proj()) * narrowCam.View();
+    fr::Frustum narrowFrustum = fr::FromViewProj(narrowVP);
+
+    std::span<const vg::ClusterInstance> clusterSpan(clusters.data(), clusters.size());
+    std::vector<render::mdi::MdiCommand> cpuCmds = vg::CullClusterInstances(clusterSpan, narrowFrustum);
+    const uint32_t cpuSurvivors = vg::SurvivorClusterCount(clusterSpan, narrowFrustum);
+    if (cpuSurvivors != (uint32_t)cpuCmds.size())
+        return fail("visresolve: SurvivorClusterCount != CullClusterInstances size (mirror mismatch)");
+    if (!(cpuSurvivors > 0 && cpuSurvivors < kClusterInstances))
+        return fail("visresolve: narrow frustum did not cull a STRICT subset (camera framing wrong)");
+    const uint32_t drawn = cpuSurvivors;
+
+    const vg::ResolveMaterial mat = vg::DefaultResolveMaterial();
+    const Vec3 sky = vg::ResolveSkyColor();
+
+    // --- Shared vertex + reordered index buffers (the vis raster vtx/idx; the resolve fetches verts too). ---
+    rhi::BufferDesc vbd;
+    vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+    vbd.initialData = geo.verts.data();
+    vbd.usage = rhi::BufferUsage::Vertex;
+    auto vbuf = device->CreateBuffer(vbd);
+    rhi::BufferDesc ibd;
+    ibd.size = ms.indices.size() * sizeof(uint32_t);
+    ibd.initialData = ms.indices.data();
+    ibd.usage = rhi::BufferUsage::Index;
+    auto ibuf = device->CreateBuffer(ibd);
+
+    // --- The visibility raster pipeline (visbuffer_bound.vert + visbuffer.frag -> R32_Uint), == --visbuffer. ---
+    auto vbVs = loadMSL("visbuffer_bound.vert.gen.metal", "visbuffer_vertex");
+    auto vbFs = loadMSL("visbuffer.frag.gen.metal", "visbuffer_fragment");
+    rhi::GraphicsPipelineDesc vbDesc;
+    vbDesc.vertex = vbVs.get(); vbDesc.fragment = vbFs.get();
+    rhi::VertexLayout vizLayout;
+    vizLayout.stride = sizeof(scene::Vertex);
+    vizLayout.attributes = { {0, rhi::Format::RGB32_Float, 0} };
+    vbDesc.vertexLayout = vizLayout;
+    vbDesc.colorFormat = rhi::Format::R32_Uint;
+    vbDesc.depthTest = true; vbDesc.usesFrameUniforms = true;
+    vbDesc.pushConstantSize = sizeof(float) * 16 + sizeof(uint32_t) * 4;
+    auto vbPipeline = device->CreateGraphicsPipeline(vbDesc);
+
+    // --- The DEFERRED RESOLVE pipeline: a FULLSCREEN pass (post.vert) -> visresolve.frag. usesTexture =
+    // the integer vis-buffer at the material slot (BindTexture, texel-fetched); usesLightClusters = the 3
+    // SSBOs (BindLightClusters -> Metal fragment buffers 13/14/15); usesFrameUniforms = the resolve UBO. ---
+    auto fsVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto vrFs = loadMSL("visresolve.frag.gen.metal", "visresolve_fragment");
+    rhi::GraphicsPipelineDesc vrDesc;
+    vrDesc.vertex = fsVs.get(); vrDesc.fragment = vrFs.get();
+    vrDesc.colorFormat = rhi::Format::BGRA8_UNorm;
+    vrDesc.depthTest = false;
+    vrDesc.fullscreen = true;
+    vrDesc.usesFrameUniforms = true;
+    vrDesc.usesTexture = true;
+    vrDesc.usesLightClusters = true;
+    auto vrPipeline = device->CreateGraphicsPipeline(vrDesc);
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = narrowVP.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = narrowCam.position.x; fd.viewPos[1] = narrowCam.position.y;
+        fd.viewPos[2] = narrowCam.position.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        runtime::CameraBasis cb = narrowCam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+    }
+
+    // The Metal vis-buffer background sentinel (0xFF000000; float32-exact, decodes to cid far beyond any
+    // survivor count -> the resolve's `cid >= drawnClusterCount` guard maps it to sky, EXACTLY like the
+    // Vulkan 0xFFFFFFFF). Same value + reasoning as the DW Metal visbuffer showcase.
+    static constexpr uint32_t kMetalVisBgSentinel = 0xFF000000u;
+    static_assert((float)kMetalVisBgSentinel == 4278190080.0f &&
+                  (uint32_t)(double)(float)kMetalVisBgSentinel == kMetalVisBgSentinel,
+                  "Metal vis-bg sentinel must survive float32 -> double -> uint32 exactly");
+    static_assert((kMetalVisBgSentinel >> vg::kTriIdBits) > (1u << 20),
+                  "Metal vis-bg sentinel must decode to a clusterID far beyond any survivor count");
+    const rhi::ClearColor visClear{(float)kMetalVisBgSentinel, 0.0f, 0.0f, 0.0f};
+
+    // --- The per-survivor-draw ClusterMeta SSBO (model 4 columns + triOffset), indexed by clusterID. ---
+    struct ClusterMetaGpu { float modelCol[16]; uint32_t info[4]; };
+    static_assert(sizeof(ClusterMetaGpu) == 80, "ClusterMetaGpu must match visresolve.frag ClusterMeta");
+    std::vector<ClusterMetaGpu> metaIn(drawn);
+    for (uint32_t c = 0; c < drawn; ++c) {
+        const vg::ClusterInstance& ci = clusters[cpuCmds[c].firstInstance];
+        const Mat4& model = instanceModels[ci.instanceIndex];
+        for (int k = 0; k < 16; ++k) metaIn[c].modelCol[k] = model.m[k];
+        metaIn[c].info[0] = ci.triOffset; metaIn[c].info[1] = 0; metaIn[c].info[2] = 0; metaIn[c].info[3] = 0;
+    }
+    rhi::BufferDesc metaDesc;
+    metaDesc.size = std::max<uint64_t>(1u, metaIn.size()) * sizeof(ClusterMetaGpu);
+    metaDesc.initialData = metaIn.empty() ? nullptr : metaIn.data();
+    metaDesc.usage = rhi::BufferUsage::Storage;
+    auto clusterMetaBuffer = device->CreateBuffer(metaDesc);
+
+    rhi::BufferDesc idxSsboDesc;
+    idxSsboDesc.size = ms.indices.size() * sizeof(uint32_t);
+    idxSsboDesc.initialData = ms.indices.data();
+    idxSsboDesc.usage = rhi::BufferUsage::Storage;
+    auto indexSsbo = device->CreateBuffer(idxSsboDesc);
+    rhi::BufferDesc vtxSsboDesc;
+    vtxSsboDesc.size = geo.verts.size() * sizeof(scene::Vertex);
+    vtxSsboDesc.initialData = geo.verts.data();
+    vtxSsboDesc.usage = rhi::BufferUsage::Storage;
+    auto vertexSsbo = device->CreateBuffer(vtxSsboDesc);
+
+    // The resolve UBO (== visresolve.frag ResolveParams layout).
+    struct ResolveUbo {
+        float pad0[16];
+        float lightDir[4];
+        float albedo[4];
+        float sky[4];
+        uint32_t counts[4];
+    };
+    static_assert(sizeof(ResolveUbo) == 128, "ResolveUbo layout");
+    ResolveUbo rubo{};
+    rubo.lightDir[0] = mat.lightDir.x; rubo.lightDir[1] = mat.lightDir.y;
+    rubo.lightDir[2] = mat.lightDir.z; rubo.lightDir[3] = 0.0f;
+    rubo.albedo[0] = mat.albedo.x; rubo.albedo[1] = mat.albedo.y;
+    rubo.albedo[2] = mat.albedo.z; rubo.albedo[3] = mat.ambient;
+    rubo.sky[0] = sky.x; rubo.sky[1] = sky.y; rubo.sky[2] = sky.z; rubo.sky[3] = 1.0f;
+    rubo.counts[0] = drawn;
+
+    // === Render: vis-buffer raster (per-cluster bound) -> deferred resolve, in ONE graph. The graph
+    // transitions the R32_Uint vis RT to ShaderRead between the passes. Returns the resolved BGRA8 image
+    // + the read-back vis-buffer IDs (for the CPU proofs). ===
+    auto renderResolve = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH,
+                             std::vector<uint32_t>& outIds) -> bool {
+        auto visRT = device->CreateRenderTarget(W, H, rhi::Format::R32_Uint);
+        auto resolvedRT = device->CreateRenderTarget(W, H, rhi::Format::BGRA8_UNorm);
+        render::RenderGraph graph;
+        render::RgResource rgVis = graph.ImportTarget(
+            "visBuffer", render::RgResourceKind::SceneColor, *visRT);
+        render::RgResource rgResolved = graph.ImportTarget(
+            "resolved", render::RgResourceKind::SceneColor, *resolvedRT);
+        // Pass A: the visibility raster into the integer RT (per-cluster bound, == --visbuffer).
+        graph.AddPass("visbuffer", {}, {rgVis},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(visClear);
+                cmd.BindPipeline(*vbPipeline);
+                cmd.BindVertexBuffer(*vbuf);
+                cmd.BindIndexBuffer(*ibuf);
+                for (uint32_t i = 0; i < (uint32_t)cpuCmds.size(); ++i) {
+                    const render::mdi::MdiCommand& c = cpuCmds[i];
+                    const vg::ClusterInstance& ci = clusters[c.firstInstance];
+                    const Mat4& model = instanceModels[ci.instanceIndex];
+                    struct { float model[16]; uint32_t clusterID; uint32_t pad[3]; } pc{};
+                    for (int k = 0; k < 16; ++k) pc.model[k] = model.m[k];
+                    pc.clusterID = i;
+                    cmd.PushConstants(&pc, sizeof(pc));
+                    cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+                }
+                cmd.EndRenderPass();
+            });
+        // Pass B: the FULLSCREEN deferred resolve. Reads the vis RT as a sampled uint texture (BindTexture,
+        // texel-fetched) + the 3 SSBOs (BindLightClusters) + the UBO -> the lit image.
+        graph.AddPass("visresolve", {rgVis}, {rgResolved},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&rubo, sizeof(ResolveUbo));
+                cmd.BeginRenderPass(rhi::ClearColor{sky.x, sky.y, sky.z, 1.0f});
+                cmd.BindPipeline(*vrPipeline);
+                cmd.BindTexture(*visRT);
+                cmd.BindLightClusters(*clusterMetaBuffer, *indexSsbo, *vertexSsbo);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        std::vector<uint8_t> rawVis;
+        uint32_t vw2 = 0, vh2 = 0;
+        if (!device->ReadRenderTarget(*visRT, rawVis, vw2, vh2)) return false;
+        if (rawVis.size() != (size_t)vw2 * vh2 * 4) return false;
+        outIds.resize((size_t)vw2 * vh2);
+        std::memcpy(outIds.data(), rawVis.data(), rawVis.size());
+        if (!device->ReadRenderTarget(*resolvedRT, outBGRA, outW, outH)) return false;
+        return true;
+    };
+
+    std::vector<uint8_t> bgra; uint32_t vw = 0, vh = 0; std::vector<uint32_t> ids;
+    if (!renderResolve(bgra, vw, vh, ids)) return fail("visresolve: render/readback failed");
+    if (bgra.size() != (size_t)vw * vh * 4) return fail("visresolve: resolved readback not BGRA8");
+
+    std::span<const Mat4> modelsSpan(instanceModels.data(), instanceModels.size());
+    std::span<const uint32_t> idxSpan(ms.indices.data(), ms.indices.size());
+    std::span<const scene::Vertex> vtxSpan(geo.verts.data(), geo.verts.size());
+    std::span<const render::mdi::MdiCommand> cmdsSpan(cpuCmds.data(), cpuCmds.size());
+
+    uint64_t shadedTexels = 0;
+    for (size_t p = 0; p < ids.size(); ++p) {
+        uint32_t cid, tid; vg::UnpackVisId(ids[p], cid, tid);
+        if (ids[p] != vg::kVisBackground && cid < drawn) ++shadedTexels;
+    }
+
+    // The interior-provenance samples (DW's oracle), reused for proofs 1+2.
+    std::vector<Vec3> instanceCenters(instanceModels.size());
+    for (size_t i = 0; i < instanceModels.size(); ++i)
+        instanceCenters[i] = {instanceModels[i].m[12], instanceModels[i].m[13], instanceModels[i].m[14]};
+    std::vector<float> instanceRadius(instanceModels.size(), 0.0f);
+    for (const vg::ClusterInstance& ci : clusters) {
+        float reach = math::length(ci.worldCenter - instanceCenters[ci.instanceIndex]) + ci.worldRadius;
+        if (reach > instanceRadius[ci.instanceIndex]) instanceRadius[ci.instanceIndex] = reach;
+    }
+    std::vector<vg::InteriorSample> samples = vg::InstanceInteriorSamples(
+        cmdsSpan, clusterSpan, std::span<const Vec3>(instanceCenters.data(), instanceCenters.size()),
+        std::span<const float>(instanceRadius.data(), instanceRadius.size()),
+        narrowCam.position, narrowVP, vw, vh);
+
+    // PROOF (1): ID provenance bit-exact.
+    uint32_t idOk = 0, idTotal = 0;
+    for (const vg::InteriorSample& s : samples) {
+        uint32_t v = ids[(size_t)s.py * vw + s.px];
+        uint32_t cid, tid; vg::UnpackVisId(v, cid, tid);
+        if (v == vg::kVisBackground || cid >= drawn) return fail("visresolve: interior pixel is background");
+        ++idTotal;
+        if (clusters[cpuCmds[cid].firstInstance].instanceIndex == s.expectedInstance) ++idOk;
+        else return fail("visresolve: interior pixel wrong instance provenance");
+    }
+    if (idTotal == 0) return fail("visresolve: no interior sample pixels (proof 1 vacuous)");
+    std::printf("visresolve ID provenance: %u/%u interior pixels EXACT\n", idOk, idTotal);
+
+    // PROOF (2): GPU==CPU resolve-MATH bit-exact at the interior pixels.
+    uint32_t shadeOk = 0, shadeTotal = 0;
+    for (const vg::InteriorSample& s : samples) {
+        uint32_t v = ids[(size_t)s.py * vw + s.px];
+        Vec3 cpuRGB = vg::ResolvePixel(v, drawn, cmdsSpan, clusterSpan, modelsSpan, idxSpan, vtxSpan, mat);
+        uint8_t cpuBGRA[4];
+        vg::EncodeBGRA8(cpuRGB, cpuBGRA);
+        const uint8_t* gpuBGRA = &bgra[((size_t)s.py * vw + s.px) * 4];
+        ++shadeTotal;
+        if (gpuBGRA[0] == cpuBGRA[0] && gpuBGRA[1] == cpuBGRA[1] && gpuBGRA[2] == cpuBGRA[2]) ++shadeOk;
+        else return fail("visresolve: GPU != CPU shade at an interior pixel");
+    }
+    std::printf("visresolve GPU==CPU shade @interior: %u/%u EXACT\n", shadeOk, shadeTotal);
+
+    // PROOF (3): determinism — two resolve runs byte-identical (ids + lit image).
+    std::vector<uint8_t> bgra2; uint32_t vw2 = 0, vh2 = 0; std::vector<uint32_t> ids2;
+    if (!renderResolve(bgra2, vw2, vh2, ids2)) return fail("visresolve: second render failed");
+    if (vw != vw2 || vh != vh2 || bgra.size() != bgra2.size() ||
+        std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0 ||
+        ids.size() != ids2.size() ||
+        std::memcmp(ids.data(), ids2.data(), ids.size() * sizeof(uint32_t)) != 0)
+        return fail("visresolve: two renders differ (nondeterministic)");
+    std::printf("visresolve determinism: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (4): resolve-vs-forward SMOKE bound (NOT byte-exact). The forward reference shades every pixel
+    // from its OWN read-back ID via the CPU ResolvePixel mirror; the GPU resolve must differ by < a small eps.
+    uint32_t maxDiff = 0; uint64_t diffPixels = 0;
+    for (size_t p = 0; p < ids.size(); ++p) {
+        Vec3 cpuRGB = vg::ResolvePixel(ids[p], drawn, cmdsSpan, clusterSpan, modelsSpan, idxSpan, vtxSpan, mat);
+        uint8_t fwd[4]; vg::EncodeBGRA8(cpuRGB, fwd);
+        for (int c = 0; c < 3; ++c) {
+            int d = std::abs((int)bgra[p * 4 + c] - (int)fwd[c]);
+            if (d > 0) { if ((uint32_t)d > maxDiff) maxDiff = (uint32_t)d; ++diffPixels; }
+        }
+    }
+    const uint32_t kSmokeEps = 4;
+    if (maxDiff > kSmokeEps) return fail("visresolve: vs-forward maxDiff > eps (resolve diverged from CPU shade)");
+    std::printf("visresolve vs forward: %u < eps %u (smoke OK; %llu sub-eps channel diffs)\n",
+                maxDiff, kSmokeEps, (unsigned long long)diffPixels);
+
+    std::printf("visresolve: {survivors:%u, shaded:%llu}\n", drawn, (unsigned long long)shadedTexels);
+
+    // --- Image golden: the resolved lit image (the flat-shaded spheres). ---
+    if (!WritePNG(outPath, bgra, vw, vh)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deferred-resolved flat-shaded lit image (%u survivors; Metal "
+                "per-cluster vis raster + the shared visresolve.frag resolve)\n", outPath, vw, vh, drawn);
+    return 0;
+}
+
 // --- Virtual-geometry per-CLUSTER frustum cull showcase (Slice DT: GPU per-cluster cull -> indirect
 // cluster draw). The TRUE pass (a compute shader cluster_cull.comp frustum-culls the (instance x cluster)
 // records + ORDER-compacts the survivors into the MDI command buffer + the compacted per-draw SSBO +
@@ -22457,6 +22780,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--visbuffer") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_visbuffer.png";
             try { return RunVisBufferShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --visresolve <out.png>: render the virtual-geometry DEFERRED MATERIAL RESOLVE showcase (Slice DX).
+        // The TRUE Vulkan pass (--visresolve-shot: render the vis-buffer -> a fullscreen resolve pass
+        // texel-fetches it + flat-shades the covering triangle) is mirrored here on Metal: the SAME survivor
+        // set is rasterized into the SAME R32_Uint vis-buffer (per-cluster bound, == --visbuffer), then the
+        // SAME visresolve.frag fullscreen pass texel-fetches it (BindTexture, no sampler — the integer
+        // texture.read needs MSL 2.2) + the cluster-meta/index/vertex SSBOs (BindLightClusters) -> the lit
+        // image. ID-provenance + GPU==CPU resolve-math bit-exact + determinism + a forward SMOKE bound. New
+        // golden tests/golden/metal/visresolve.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--visresolve") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_visresolve.png";
+            try { return RunVisResolveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --hiz-cull <out.png>: render the Hi-Z OCCLUSION cull showcase (Slice CJ). The TRUE pass (a CPU

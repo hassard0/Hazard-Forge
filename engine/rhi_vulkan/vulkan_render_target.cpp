@@ -80,18 +80,26 @@ VulkanRenderTarget::VulkanRenderTarget(VulkanDevice& device, uint32_t width, uin
     // (set 0) samples depthView() directly via VulkanDevice::SetShadowMap.
     if (depthOnly_) return;
 
-    // Slice DW seam-subtlety guard (additive, defaulted-no-op): an INTEGER color format (R32_Uint
-    // visibility buffer) is never bound + sampled-as-float — DW only ReadRenderTargets it. The
-    // SAMPLED_IMAGE+float-sampler material descriptor below is meaningless (and a potential
-    // validation hazard) for an integer image, so skip the per-RT material set entirely for integer
-    // formats. set_ stays VK_NULL_HANDLE (the dtor guards on it); BindTexture on a vis-buffer RT is
-    // never attempted. NO existing call site uses an integer format, so every existing RT still
-    // allocates + writes its set exactly as before (byte-for-byte unchanged).
+    // Slice DW/DX seam-subtlety (additive): an INTEGER color format (R32_Uint visibility buffer) is
+    // bound as a SAMPLED uint texture and TEXEL-FETCHED (OpImageFetch, no sampler) by the DX deferred
+    // resolve pass — never SAMPLED-as-float. DW gated the per-RT material set OFF entirely (set_ stayed
+    // NULL) because it only ReadRenderTarget'd the integer RT; DX needs to BindTexture(*this) so the
+    // resolve frag can texel-fetch it. The material set's binding 0 is a SEPARATE SAMPLED_IMAGE (NOT a
+    // combined image+sampler) and binding 1 is a SEPARATE SAMPLER, so writing the integer image at
+    // binding 0 alongside the default sampler at binding 1 is VALIDATION-CLEAN: the only hazard DW
+    // avoided is a shader that COMBINES a sampler with an integer image, and the resolve frag does
+    // exactly the opposite (a bare integer texelFetch — the sampler descriptor is never used). We
+    // therefore allocate + populate the set exactly like the float path below (binding 0 = this image,
+    // 1 = default sampler, 3/4 = default normal/sampler), with NO float-only assumptions. Existing
+    // float RTs are byte-for-byte unchanged (integerColor is false for every one of them). VERIFIED
+    // validation-clean under the Khronos layer (the --visresolve-shot gate). NO new RHI symbol.
     const bool integerColor = (colorFormatReq == Format::R32_Uint);
-    if (integerColor) return;
+    (void)integerColor;
 
-    // Descriptor set on the material set layout (set 1) so the post pass can BindTexture(*this).
-    // Same two-write pattern as VulkanTexture: binding 0 sampled image, binding 1 sampler.
+    // Descriptor set on the material set layout (set 1) so the post pass (and the DX resolve) can
+    // BindTexture(*this). Same two-write pattern as VulkanTexture: binding 0 sampled image, binding 1
+    // sampler. For an integer image the sampler at binding 1 is a harmless unused descriptor (the
+    // resolve frag texel-fetches binding 0 only).
     VkDescriptorSetLayout layout = device_.materialSetLayout();
     VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dai.descriptorPool = device_.descriptorPool();
