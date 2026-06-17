@@ -15358,26 +15358,27 @@ static int RunSwRasterShowcase(const char* outPath) {
     return 0;
 }
 
-// --- Nanite SOFTWARE-RASTER GPU showcase (Slice SW2). The GPU COMPUTE software rasterizer: the SAME
-// shaders/swraster.comp (here swraster.comp.gen.metal) — one thread per cluster-triangle — scan-converts
-// a clustered SphereGeometry's triangles into a w*h depth|id visibility-buffer SSBO via InterlockedMin
-// (lowered to MSL atomic_min), running the int64 integer edge math + top-left fill rule + flat min-depth
-// copied VERBATIM from render/swraster.h over the HOST-SNAPPED integer ScreenVerts (the GPU does ZERO FP).
-// ReadBuffer reads the integer vis-buffer; it is PROVEN BIT-IDENTICAL vs the CPU swraster.h::RasterClusters
-// reference (memcmp, full-frame — the make-or-break) — the same GPU==CPU proof the Vulkan --swraster-gpu-shot
-// runs; two dispatches byte-identical (atomic-min commutative); a sub-pixel triangle COVERED; triCount=0 ->
-// all-kSwClear. The image golden is a CPU-coloring of the read-back integer vis-buffer (bg->clear, else
-// hashColor(visId>>kTriIdBits)) -> identical to the Vulkan path BY CONSTRUCTION (same integer SSBO -> same
-// RGB). New golden tests/golden/metal/swraster_gpu.png; two runs DIFF 0.0000. NO new RHI.
+// --- Nanite SOFTWARE-RASTER GPU showcase (Slice SW2). On Metal this renders via the CPU BOUND PATH, NOT
+// a GPU compute dispatch. The GPU compute rasterizer shaders/swraster.comp is VULKAN-SPIR-V-ONLY: its
+// int64 integer edge math (REQUIRED — the snapped-coord products exceed 32 bits, which is what makes the
+// Vulkan GPU==CPU bit-identity hold) is compiled by DXC on the Vulkan path, but glslc (the Metal HLSL->
+// SPIR-V->MSL frontend) cannot parse int64_t in HLSL, so swraster.comp is NOT in the Metal MSL-gen list.
+// This is the SAME established convention as the Metal cluster-cull / hiz showcases (cluster_cull.comp /
+// gpudriven_cull.comp / cluster_hiz_cull.comp are Vulkan-only too): Metal renders the IDENTICAL result via
+// the CPU bound path while the Vulkan side carries the GPU==CPU proof. Here it is especially clean — the
+// CPU bound path IS render/swraster.h::RasterClusters, the EXACT bit-exact reference the Vulkan
+// --swraster-gpu-shot GPU==CPU memcmp already compares against. So this builds the SAME clustered
+// SphereGeometry scene the Vulkan showcase builds (same BuildMeshlets clusters + the SAME appended
+// sub-pixel triangle + the SAME ProjectToScreenVert host snap), runs vg::RasterClusters over it into a
+// SwVisBuffer, and CPU-colors it (bg->clear, else hashColor(visId>>kTriIdBits)) -> the image is
+// BYTE-IDENTICAL to the Vulkan GPU result BY CONSTRUCTION (the Vulkan side proved GPU==CPU bit-identical,
+// and Metal runs that same CPU). Same 512x512 dims + same scene + same coloring as --swraster-gpu-shot, so
+// the baked golden matches the Vulkan capture. Determinism + sub-pixel coverage are re-checked on the CPU
+// path. New golden tests/golden/metal/swraster_gpu.png; two runs DIFF 0.0000. NO GPU compute, NO new RHI.
 static int RunSwRasterGpuShowcase(const char* outPath) {
     using math::Vec3; using math::Mat4;
     namespace vg = render::vg;
     const uint32_t SW = 512, SH = 512;
-    auto device = rhi::mtl::CreateMetalDeviceHeadless(SW, SH);
-    auto loadMSL = [&](const char* file, const char* entry) {
-        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
-        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
-    };
 
     // --- The clustered showcase scene (== the Vulkan --swraster-gpu-shot): a SphereGeometry decomposed
     // into meshlet clusters PLUS one appended SUB-PIXEL triangle (its own cluster). ---
@@ -15439,136 +15440,69 @@ static int RunSwRasterGpuShowcase(const char* outPath) {
         behind[i] = okp ? 0 : 1;
     }
 
-    struct GpuTri { uint32_t i0, i1, i2, visId; };
-    std::vector<GpuTri> gpuTris;
+    // Flatten clusters into the per-triangle list (skipping behind-camera tris, exactly as the Vulkan
+    // showcase + RasterClusters do) only to COUNT the rasterized triangles for the stat line — on Metal
+    // there is no GPU tri SSBO to upload; render/swraster.h::RasterClusters walks the meshlets directly.
+    uint32_t triCount = 0;
     for (uint32_t cl = 0; cl < (uint32_t)meshlets.size(); ++cl) {
         const vg::Meshlet& m = meshlets[cl];
         for (uint32_t t = 0; t < m.triCount; ++t) {
             uint32_t base = 3u * (m.triOffset + t);
             uint32_t i0 = workIndices[base+0], i1 = workIndices[base+1], i2 = workIndices[base+2];
             if (behind[i0] || behind[i1] || behind[i2]) continue;
-            gpuTris.push_back({i0, i1, i2, vg::PackVisId(cl, t)});
+            ++triCount;
         }
     }
-    const uint32_t triCount = (uint32_t)gpuTris.size();
 
-    // CPU reference (the GPU==CPU oracle).
+    auto screenSpan  = std::span<const vg::ScreenVert>(screen.data(), screen.size());
+    auto behindSpan  = std::span<const uint8_t>(behind.data(), behind.size());
+    auto indexSpan   = std::span<const uint32_t>(workIndices.data(), workIndices.size());
+    auto meshletSpan = std::span<const vg::Meshlet>(meshlets.data(), meshlets.size());
+
+    // --- CPU bound path: render/swraster.h::RasterClusters — the EXACT bit-exact reference the Vulkan
+    // --swraster-gpu-shot GPU==CPU memcmp compares against. The Vulkan side proved GPU==CPU BIT-IDENTICAL,
+    // so this vis-buffer is byte-identical to the Vulkan GPU result by construction. ---
     vg::SwVisBuffer cpuVis; cpuVis.Init(SW, SH);
-    vg::RasterClusters(cpuVis,
-        std::span<const vg::ScreenVert>(screen.data(), screen.size()),
-        std::span<const uint8_t>(behind.data(), behind.size()),
-        std::span<const uint32_t>(workIndices.data(), workIndices.size()),
-        std::span<const vg::Meshlet>(meshlets.data(), meshlets.size()));
+    vg::RasterClusters(cpuVis, screenSpan, behindSpan, indexSpan, meshletSpan);
 
-    struct GpuScreenVert { int32_t x; int32_t y; uint32_t z; };
-    static_assert(sizeof(GpuScreenVert) == 12, "std430 ScreenVert {int,int,uint}");
-    std::vector<GpuScreenVert> svUpload(screen.size());
-    for (size_t i = 0; i < screen.size(); ++i)
-        svUpload[i] = {screen[i].x, screen[i].y, screen[i].z};
-    rhi::BufferDesc svDesc;
-    svDesc.size = svUpload.size() * sizeof(GpuScreenVert);
-    svDesc.initialData = svUpload.data();
-    svDesc.usage = rhi::BufferUsage::Storage;
-    auto svBuf = device->CreateBuffer(svDesc);
-
-    rhi::BufferDesc triDesc;
-    triDesc.size = gpuTris.size() * sizeof(GpuTri);
-    triDesc.initialData = gpuTris.data();
-    triDesc.usage = rhi::BufferUsage::Storage;
-    auto triBuf = device->CreateBuffer(triDesc);
-
-    struct GpuSwParams { uint32_t dims[4]; };
-    std::vector<uint32_t> visClear((size_t)SW * SH, vg::kSwClear);
-    auto makeVisBuf = [&]() {
-        rhi::BufferDesc d;
-        d.size = visClear.size() * sizeof(uint32_t);
-        d.initialData = visClear.data();
-        d.usage = rhi::BufferUsage::Storage;
-        return device->CreateBuffer(d);
-    };
-    auto makeParamBuf = [&](uint32_t tc) {
-        GpuSwParams p{}; p.dims[0] = SW; p.dims[1] = SH; p.dims[2] = tc; p.dims[3] = 0;
-        rhi::BufferDesc d; d.size = sizeof(p); d.initialData = &p;
-        d.usage = rhi::BufferUsage::Storage;
-        return device->CreateBuffer(d);
-    };
-
-    auto swCs = loadMSL("swraster.comp.gen.metal", "swraster_main");
-    rhi::ComputePipelineDesc swCd;
-    swCd.compute = swCs.get(); swCd.storageBufferCount = 4; swCd.threadsPerGroupX = 64;
-    auto swCompute = device->CreateComputePipeline(swCd);
-
-    auto rt = device->CreateRenderTarget(SW, SH);
-
-    auto runRaster = [&](uint32_t tc, std::vector<uint32_t>& outVis) {
-        auto visBuf = makeVisBuf();
-        auto paramBuf = makeParamBuf(tc);
-        const uint32_t groups = (tc + 63u) / 64u;
-        render::RenderGraph graph;
-        render::RgResource rgScene = graph.ImportTarget(
-            "sceneColor", render::RgResourceKind::SceneColor, *rt);
-        graph.AddPass("swraster", {}, {rgScene},
-            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
-                cmd.BindComputePipeline(*swCompute);
-                cmd.BindStorageBuffer(*svBuf, 0);
-                cmd.BindStorageBuffer(*triBuf, 1);
-                cmd.BindStorageBuffer(*visBuf, 2);
-                cmd.BindStorageBuffer(*paramBuf, 3);
-                cmd.DispatchCompute(groups);
-                cmd.ComputeToFragmentBarrier();
-                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
-                cmd.EndRenderPass();
-            });
-        graph.Execute(*device);
-        device->WaitIdle();
-        outVis.assign((size_t)SW * SH, 0u);
-        device->ReadBuffer(*visBuf, outVis.data(), outVis.size() * sizeof(uint32_t), 0);
-    };
-
-    std::vector<uint32_t> gpuVis;
-    runRaster(triCount, gpuVis);
     uint64_t covered = 0;
-    for (uint32_t v : gpuVis) if (v != vg::kSwClear) ++covered;
+    for (uint32_t v : cpuVis.packed) if (v != vg::kSwClear) ++covered;
 
-    // PROOF (1) — GPU==CPU BIT-IDENTICAL full-frame (the make-or-break).
-    if (gpuVis.size() != cpuVis.packed.size() ||
-        std::memcmp(gpuVis.data(), cpuVis.packed.data(), cpuVis.packed.size() * sizeof(uint32_t)) != 0)
-        return fail("swraster-gpu: GPU vis-buffer != CPU swraster.h reference (integer edge math diverged)");
-    std::printf("swraster-gpu GPU==CPU: BIT-IDENTICAL (%ux%u, %llu covered)\n",
-                SW, SH, (unsigned long long)covered);
+    // PROOF (1) — determinism: two rasterizations byte-identical (the CPU analog of the Vulkan two-dispatch
+    // proof; the golden round-trip also gates DIFF 0).
+    vg::SwVisBuffer cpuVis2; cpuVis2.Init(SW, SH);
+    vg::RasterClusters(cpuVis2, screenSpan, behindSpan, indexSpan, meshletSpan);
+    if (cpuVis.packed.size() != cpuVis2.packed.size() ||
+        std::memcmp(cpuVis.packed.data(), cpuVis2.packed.data(),
+                    cpuVis.packed.size() * sizeof(uint32_t)) != 0)
+        return fail("swraster-gpu: two rasterizations differ (nondeterministic)");
+    std::printf("swraster-gpu determinism: two raster passes BYTE-IDENTICAL\n");
 
-    // PROOF (2) — determinism: two dispatches byte-identical.
-    std::vector<uint32_t> gpuVis2;
-    runRaster(triCount, gpuVis2);
-    if (gpuVis.size() != gpuVis2.size() ||
-        std::memcmp(gpuVis.data(), gpuVis2.data(), gpuVis.size() * sizeof(uint32_t)) != 0)
-        return fail("swraster-gpu: two dispatches differ (InterlockedMin not order-independent?)");
-    std::printf("swraster-gpu determinism: two dispatches BYTE-IDENTICAL\n");
-
-    // PROOF (3) — sub-pixel coverage.
-    if (gpuVis[(size_t)subPixelPy * SW + subPixelPx] == vg::kSwClear)
+    // PROOF (2) — sub-pixel coverage: the appended < 1px triangle (HW would miss) IS covered by SW raster.
+    if (cpuVis.packed[(size_t)subPixelPy * SW + subPixelPx] == vg::kSwClear)
         return fail("swraster-gpu: sub-pixel triangle pixel NOT covered (HW would miss, SW must catch)");
     std::printf("swraster-gpu sub-pixel: COVERED\n");
 
-    // PROOF (4) — disabled-path no-op: triCount=0 -> gVis all-kSwClear.
+    // PROOF (3) — disabled-path no-op: an empty meshlet list -> the vis-buffer stays all-kSwClear.
     {
-        std::vector<uint32_t> emptyVis;
-        runRaster(0u, emptyVis);
-        if (emptyVis.size() != visClear.size() ||
-            std::memcmp(emptyVis.data(), visClear.data(), visClear.size() * sizeof(uint32_t)) != 0)
-            return fail("swraster-gpu: triCount=0 gVis != cleared upload (dispatch-0 not a no-op)");
+        vg::SwVisBuffer emptyVis; emptyVis.Init(SW, SH);
+        vg::RasterClusters(emptyVis, screenSpan, behindSpan, indexSpan,
+                           std::span<const vg::Meshlet>());
+        for (uint32_t v : emptyVis.packed)
+            if (v != vg::kSwClear)
+                return fail("swraster-gpu: empty meshlet list did not stay all-kSwClear");
     }
-    std::printf("swraster-gpu disabled-path (triCount=0): all-kSwClear\n");
-    std::printf("swraster-gpu: {tris:%u, covered:%llu}\n", triCount, (unsigned long long)covered);
+    std::printf("swraster-gpu disabled-path (no clusters): all-kSwClear\n");
+    std::printf("swraster-gpu: {tris:%u, covered:%llu} (Metal: CPU swraster.h reference path, "
+                "image == Vulkan GPU by construction)\n", triCount, (unsigned long long)covered);
 
-    // Golden: CPU-color the read-back GPU vis-buffer (identical to the Vulkan path by construction).
-    vg::SwVisBuffer gpuVb; gpuVb.Init(SW, SH);
-    gpuVb.packed.assign(gpuVis.begin(), gpuVis.end());
-    std::vector<uint8_t> bgra = vg::ColorSwVisBuffer(gpuVb);
+    // Golden: CPU-color the vis-buffer (bg->clear, else hashColor(visId>>kTriIdBits)) — identical to the
+    // Vulkan --swraster-gpu-shot capture by construction (same integer vis-buffer -> same RGB).
+    std::vector<uint8_t> bgra = vg::ColorSwVisBuffer(cpuVis);
     if (!WritePNG(outPath, bgra, SW, SH)) return fail("PNG write failed");
-    device->WaitIdle();
-    std::printf("OK wrote %s (%ux%u) — CPU-colored GPU software-rasterized vis-buffer (%u tris, %llu covered; "
-                "identical to the Vulkan --swraster-gpu-shot by construction)\n",
+    std::printf("OK wrote %s (%ux%u) — CPU-colored software-rasterized vis-buffer (%u tris, %llu covered; "
+                "Metal CPU swraster.h reference path, identical to the Vulkan --swraster-gpu-shot GPU result "
+                "by construction)\n",
                 outPath, SW, SH, triCount, (unsigned long long)covered);
     return 0;
 }

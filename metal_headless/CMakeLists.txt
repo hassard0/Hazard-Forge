@@ -188,14 +188,16 @@ hf_gen_msl(visresolve.frag      visresolve.frag.hlsl      frag visresolve_fragme
 # / atomics, so NO --msl-version 20200 needed). The resident set is bit-exact GPU==CPU + cross-backend by
 # construction. Behind --vsm-mark only; existing shaders + goldens untouched.
 hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
-# Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer — one
-# thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO via
-# InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied VERBATIM
-# from render/swraster.h over the HOST-SNAPPED integer ScreenVerts (ZERO GPU FP). The commutative atomic-min
-# => the GPU vis-buffer is bit-identical to the CPU swraster.h::RasterClusters reference at EVERY pixel.
-# InterlockedMin on a device uint buffer lowers to MSL atomic_min — plain MSL, NO --msl-version 20200
-# (the int64_t edge math lowers to MSL `long`). Behind --swraster-gpu only; existing goldens untouched.
-hf_gen_msl(swraster.comp         swraster.comp.hlsl         comp swraster_main)
+# Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
+# thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
+# It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/
+# swraster.h, REQUIRED because the snapped-coord products exceed 32 bits) is compiled fine by DXC on the
+# Vulkan path, but glslc (glslang's HLSL frontend used for the Metal HLSL->SPIR-V->MSL chain) cannot parse
+# int64_t in HLSL, so it can't lower this shader. Same Vulkan-only convention as cluster_cull.comp /
+# gpudriven_cull.comp / cluster_hiz_cull.comp (which glslc/spirv-cross likewise can't lower): on Metal the
+# --swraster-gpu showcase renders the IDENTICAL result via the CPU bound path (render/swraster.h::
+# RasterClusters — the SAME bit-exact reference the Vulkan GPU==CPU proof compares against), while the
+# Vulkan side carries the GPU==CPU bit-identity proof. So swraster.comp gets NO hf_gen_msl line.
 # Virtual Shadow Maps Slice 2 (Slice VB): vsm_depth.frag renders each resident PHYSICAL page's casters'
 # depth into its atlas tile. Paired with shadow_csm.vert (the page's light-space ortho VP in the push
 # constant); unlike the depth-only CSM caster it renders into a COLOR atlas (SV_Position.z -> grayscale,
