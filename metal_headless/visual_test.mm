@@ -83,6 +83,7 @@
 #include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/visbuffer.h"       // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/InstanceInteriorSamples)
 #include "render/visresolve.h"      // Slice DX: deferred material resolve CPU mirror (ResolveMaterial/DefaultResolveMaterial/ResolveSkyColor/ResolvePixel/EncodeBGRA8) — shared verbatim with --visresolve-shot (Vulkan)
+#include "render/swraster.h"        // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw/BuildSwRasterScene/ColorSwVisBuffer) — shared verbatim with --swraster-shot (Vulkan)
 #include "render/vsm.h"             // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp + the Vulkan --vsm-mark-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -15307,6 +15308,56 @@ static int RunVisBufferShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Nanite SOFTWARE-RASTER showcase (Slice SW1). PURE CPU on BOTH backends: a deterministic
+// integer/fixed-point software rasterizer (render/swraster.h) scan-converts the SAME fixed cluster
+// triangles (vg::BuildSwRasterScene) into a packed depth|id vis-buffer, front-most-per-pixel via a
+// serial min over a 32-bit depth|id key. The ONE FP step (ProjectToScreenVert) is host-only; coverage
+// is pure integer edge functions + a top-left fill rule. The golden is a CPU-colored vis-buffer
+// (vg::ColorSwVisBuffer: bg->clear, else hashColor(visId>>kTriIdBits)) — BYTE-IDENTICAL to the Vulkan
+// --swraster-shot output BY CONSTRUCTION (same integer bits in -> same RGB out). NO GPU, NO new RHI.
+// New golden tests/golden/metal/swraster.png; two runs DIFF 0.0000.
+static int RunSwRasterShowcase(const char* outPath) {
+    namespace vg = render::vg;
+    const uint32_t SW = 256, SH = 256;
+
+    // The fixed showcase scene (shared VERBATIM with the Vulkan --swraster-shot path).
+    vg::SwRasterScene scene = vg::BuildSwRasterScene(SW, SH);
+    std::vector<vg::ScreenVert> screen; std::vector<uint8_t> behind;
+    vg::ProjectSwRasterScene(scene, screen, behind);
+    auto screenSpan  = std::span<const vg::ScreenVert>(screen.data(), screen.size());
+    auto behindSpan  = std::span<const uint8_t>(behind.data(), behind.size());
+    auto indexSpan   = std::span<const uint32_t>(scene.indices.data(), scene.indices.size());
+    auto meshletSpan = std::span<const vg::Meshlet>(scene.meshlets.data(), scene.meshlets.size());
+
+    vg::SwVisBuffer vb; vb.Init(SW, SH);
+    vg::RasterClusters(vb, screenSpan, behindSpan, indexSpan, meshletSpan);
+
+    uint32_t triCount = 0;
+    for (const vg::Meshlet& m : scene.meshlets) triCount += m.triCount;
+    uint64_t coveredPixels = 0;
+    for (uint32_t v : vb.packed) if (v != vg::kSwClear) ++coveredPixels;
+
+    // Two-run determinism (the same proof the Vulkan path runs; the golden round-trip also gates DIFF 0).
+    vg::SwVisBuffer vb2; vb2.Init(SW, SH);
+    vg::RasterClusters(vb2, screenSpan, behindSpan, indexSpan, meshletSpan);
+    if (std::memcmp(vb.packed.data(), vb2.packed.data(), vb.packed.size() * sizeof(uint32_t)) != 0)
+        return fail("swraster: two rasterizations differ (nondeterministic)");
+
+    // Sub-pixel coverage proof.
+    {
+        uint32_t spIdx = scene.subPixelPy * SW + scene.subPixelPx;
+        if (vb.packed[spIdx] == vg::kSwClear)
+            return fail("swraster: sub-pixel triangle pixel NOT covered (HW would miss, SW must catch)");
+    }
+
+    std::vector<uint8_t> bgra = vg::ColorSwVisBuffer(vb);
+    if (!WritePNG(outPath, bgra, SW, SH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — CPU-colored software-rasterized vis-buffer (%u tris, %llu covered; "
+                "identical to the Vulkan --swraster-shot by construction)\n",
+                outPath, SW, SH, triCount, (unsigned long long)coveredPixels);
+    return 0;
+}
+
 // --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
 // backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
 // shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
@@ -23805,6 +23856,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--visresolve") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_visresolve.png";
             try { return RunVisResolveShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --swraster <out.png>: render the Nanite SOFTWARE-RASTER showcase (Slice SW1). PURE CPU on both
+        // backends — a deterministic integer/fixed-point software rasterizer (render/swraster.h) scan-
+        // converts the SAME fixed cluster triangles into a packed depth|id vis-buffer (front-most-per-pixel
+        // via a serial min), CPU-colored into the golden. BYTE-IDENTICAL to the Vulkan --swraster-shot by
+        // construction (same integer bits in -> same RGB out). New golden tests/golden/metal/swraster.png;
+        // two runs DIFF 0.0000. NO GPU, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--swraster") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_swraster.png";
+            try { return RunSwRasterShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vsm-mark <out.png>: render the Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The

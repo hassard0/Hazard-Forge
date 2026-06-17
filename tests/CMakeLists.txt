@@ -571,6 +571,15 @@ hf_add_pure_test(visbuffer_test)
 # Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(visresolve_test)
 
+# Nanite Software-Raster Slice 1 (Slice SW1): the CPU-reference INTEGER software rasterizer
+# (render/swraster.h) the GPU compute software-rasterizer (SW2) copies verbatim + proves bit-identical.
+# Pins PackSw/UnpackSw round-trip + kSwClear non-collision + nearer-key<farther-key, the TOP-LEFT fill
+# rule (shared edge covered EXACTLY once — watertight), sub-pixel coverage (a sub-pixel triangle covers
+# its straddled pixel), min order-independence (set vs shuffled byte-identical), degenerate zero-area ->
+# no coverage, depth occlusion (nearer visId wins on overlap), empty==cleared, and determinism. Pure
+# C++ (hf_core), ASan-eligible.
+hf_add_pure_test(swraster_test)
+
 # Virtual Shadow Maps Slice 1 (Slice VA): the virtual clipmap PAGE TABLE + PAGE-NEEDED marking math
 # (render/vsm.h) the GPU shaders/vsm_mark.comp.hlsl copies verbatim. Pins PageId/UnpackPageId bijection
 # over [0,pageCount()), SelectClipmapLevel's INTEGER threshold-ladder edges (at-camera->level0, far->top,

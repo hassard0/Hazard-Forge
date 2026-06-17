@@ -264,6 +264,8 @@ int main() {
             bool sawVsmSampleFeature = false;
             // Slice VD: the virtual-shadow-maps-cache capability is advertised in the feature manifest.
             bool sawVsmCacheFeature = false;
+            // Slice SW1: the nanite-software-raster capability is advertised in the feature manifest.
+            bool sawSwRasterFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -335,6 +337,7 @@ int main() {
                     if (AsString(el->value) == "virtual-shadow-maps-render") sawVsmRenderFeature = true;
                     if (AsString(el->value) == "virtual-shadow-maps-sample") sawVsmSampleFeature = true;
                     if (AsString(el->value) == "virtual-shadow-maps-cache") sawVsmCacheFeature = true;
+                    if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -403,6 +406,7 @@ int main() {
             check(sawVsmRenderFeature, "engine.features includes virtual-shadow-maps-render");
             check(sawVsmSampleFeature, "engine.features includes virtual-shadow-maps-sample");
             check(sawVsmCacheFeature, "engine.features includes virtual-shadow-maps-cache");
+            check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -524,6 +528,8 @@ int main() {
         bool sawVisbufferShot = false;
         // Slice DX: the --visresolve-shot showcase flag is listed in the showcase manifest.
         bool sawVisresolveShot = false;
+        // Slice SW1: the --swraster-shot showcase flag is listed in the showcase manifest.
+        bool sawSwRasterShot = false;
         // Slice VA: the --vsm-mark-shot showcase flag is listed in the showcase manifest.
         bool sawVsmMarkShot = false;
         // Slice VB: the --vsm-render-shot showcase flag is listed in the showcase manifest.
@@ -616,6 +622,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--cluster-lod-shot") sawClusterLodShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--visbuffer-shot") sawVisbufferShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--visresolve-shot") sawVisresolveShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--swraster-shot") sawSwRasterShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-mark-shot") sawVsmMarkShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-render-shot") sawVsmRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-sample-shot") sawVsmSampleShot = true;
@@ -687,6 +694,7 @@ int main() {
         check(sawClusterLodShot, "showcases manifest includes --cluster-lod-shot");
         check(sawVisbufferShot, "showcases manifest includes --visbuffer-shot");
         check(sawVisresolveShot, "showcases manifest includes --visresolve-shot");
+        check(sawSwRasterShot, "showcases manifest includes --swraster-shot");
         check(sawVsmMarkShot, "showcases manifest includes --vsm-mark-shot");
         check(sawVsmRenderShot, "showcases manifest includes --vsm-render-shot");
         check(sawVsmSampleShot, "showcases manifest includes --vsm-sample-shot");

@@ -63,6 +63,7 @@
 #include "render/cluster_lod.h"  // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/visbuffer.h"   // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/SurvivorInteriorSamples)
 #include "render/visresolve.h"  // Slice DX: deferred material resolve CPU mirror (ResolveFlatShade/ResolvePixel/EncodeBGRA8)
+#include "render/swraster.h"    // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw) — shared verbatim with --swraster (Metal)
 #include "render/vsm.h"         // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -427,6 +428,7 @@ int main(int argc, char** argv) {
     const char* clusterLodShotPath = nullptr; // --cluster-lod-shot <out.bmp> (Slice DV: discrete cluster-LOD selection by screen-space error)
     const char* visbufferShotPath = nullptr; // --visbuffer-shot <out.bmp> (Slice DW: rasterize (clusterID,triID) into an R32_Uint visibility buffer + bit-exact ID readback)
     const char* visresolveShotPath = nullptr; // --visresolve-shot <out.bmp> (Slice DX: deferred material resolve — texel-fetch the vis-buffer, flat-shade the covering triangle, lit image)
+    const char* swrasterShotPath = nullptr;  // --swraster-shot <out.bmp> (Slice SW1: PURE-CPU integer software rasterizer — scan-convert cluster triangles into a packed depth|id vis-buffer, top-left fill rule, sub-pixel coverage, min-order-independent; CPU-colored golden)
     const char* vsmMarkShotPath = nullptr; // --vsm-mark-shot <out.bmp> (Slice VA: VSM virtual page table + page-needed marking, integer compute, GPU==CPU resident-set bit-exact, clipmap debug-viz)
     const char* vsmRenderShotPath = nullptr; // --vsm-render-shot <out.bmp> (Slice VB: allocate physical atlas tiles to VA's resident pages + render each page's casters' depth into its tile; colorized depth atlas)
     const char* vsmSampleShotPath = nullptr; // --vsm-sample-shot <out.bmp> (Slice VC: lit-pass VSM indirection sample — per receiver pixel level->page->tile->tile-clamped PCF over the depth atlas -> a VSM-shadowed scene; vsmEnabled=0 byte-identical-to-unshadowed no-op)
@@ -1253,6 +1255,20 @@ int main(int argc, char** argv) {
             // pixels) + two-run determinism + a resolve-vs-forward SMOKE bound. NO new RHI (BindTexture
             // for the integer vis-buffer, BindLightClusters for the SSBOs). One BMP -> exit.
             visresolveShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--swraster-shot") == 0 && i + 1 < argc) {
+            // Slice SW1: Nanite Software-Raster Slice 1 — CPU-REFERENCE INTEGER RASTERIZER (BEACHHEAD).
+            // PURE CPU, NO GPU: a deterministic integer/fixed-point software rasterizer scan-converts a
+            // small fixed set of cluster triangles into a packed depth|id visibility buffer (the same
+            // (clusterID<<7|triID) identity as DW's HW vis-buffer), front-most surface per pixel via a
+            // serial min over a 32-bit depth|id key (the CPU mirror of SW2's InterlockedMin). The ONE FP
+            // step (ProjectToScreenVert) is host-only; the coverage is pure integer edge functions with a
+            // TOP-LEFT fill rule (watertight). PROOFS (fail loudly): (1) bit-exact (a hash of packed[]) +
+            // {w,h,coveredPixels,tris}; (2) shuffled-order rasterization BYTE-IDENTICAL (min order-
+            // independence); (3) a sub-pixel triangle COVERED (HW sample-at-center would miss); (4) an
+            // empty tri set == the cleared buffer BYTE-IDENTICAL. The golden is a CPU-colored vis-buffer
+            // (bg->clear, else hashColor(visId>>kTriIdBits)) -> identical both backends by construction.
+            // NO new RHI (a present is declared so the validation layer has a clean frame). One BMP -> exit.
+            swrasterShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--vsm-mark-shot") == 0 && i + 1 < argc) {
             // Slice VA: Virtual Shadow Maps Slice 1 — PAGE TABLE + PAGE-NEEDED MARKING (BEACHHEAD). A fixed
             // directional CLIPMAP (levels=4, vpps=8, pageSize=128, level0WorldExtent=16, fixed cameraPos) +
@@ -12821,6 +12837,118 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — GPU per-cluster-culled %u/%u cluster-instances via "
                                 "compute-cull -> MDI\n", clusterCullShotPath, gw, gh, gpuDrawn, kClusterInstances);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clusterCullShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Nanite SOFTWARE-RASTER (--swraster-shot <out.bmp>, Slice SW1). PURE CPU, NO GPU: a
+        // deterministic integer/fixed-point software rasterizer (render/swraster.h) scan-converts a small
+        // fixed set of cluster triangles into a packed depth|id vis-buffer (the same (clusterID<<7|triID)
+        // identity as DW's HW vis-buffer), front-most-per-pixel via a serial min over a 32-bit depth|id
+        // key (the CPU mirror of SW2's InterlockedMin). The ONE FP step (ProjectToScreenVert) is host-only;
+        // coverage is pure integer edge functions with a top-left fill rule. The golden is a CPU-colored
+        // vis-buffer (bg->clear, else hashColor(visId>>kTriIdBits)) — identical both backends by
+        // construction. PROOFS print + fail loudly. NO new RHI. One BMP -> exit. -------------------------
+        if (swrasterShotPath) {
+            namespace vg = render::vg;
+            const uint32_t SW = 256, SH = 256;
+
+            // The fixed showcase scene (shared VERBATIM with the Metal --swraster path).
+            vg::SwRasterScene scene = vg::BuildSwRasterScene(SW, SH);
+            std::vector<vg::ScreenVert> screen; std::vector<uint8_t> behind;
+            vg::ProjectSwRasterScene(scene, screen, behind);
+            auto screenSpan  = std::span<const vg::ScreenVert>(screen.data(), screen.size());
+            auto behindSpan  = std::span<const uint8_t>(behind.data(), behind.size());
+            auto indexSpan   = std::span<const uint32_t>(scene.indices.data(), scene.indices.size());
+            auto meshletSpan = std::span<const vg::Meshlet>(scene.meshlets.data(), scene.meshlets.size());
+
+            // The reference rasterization.
+            vg::SwVisBuffer vb; vb.Init(SW, SH);
+            vg::RasterClusters(vb, screenSpan, behindSpan, indexSpan, meshletSpan);
+
+            // Triangle + covered-pixel counts + a stable FNV-1a hash of packed[] (the bit-exact print).
+            uint32_t triCount = 0;
+            for (const vg::Meshlet& m : scene.meshlets) triCount += m.triCount;
+            uint64_t coveredPixels = 0;
+            for (uint32_t v : vb.packed) if (v != vg::kSwClear) ++coveredPixels;
+            uint64_t hash = 1469598103934665603ull;  // FNV-1a 64
+            for (uint32_t v : vb.packed) { hash ^= (uint64_t)v; hash *= 1099511628211ull; }
+            std::printf("swraster: {w:%u,h:%u,coveredPixels:%llu,tris:%u} packedHash:%016llx\n",
+                        SW, SH, (unsigned long long)coveredPixels, triCount, (unsigned long long)hash);
+
+            // PROOF (2): min order-independence — the SAME triangles in a SHUFFLED order -> BYTE-IDENTICAL.
+            {
+                struct Tri { uint32_t cluster, triLocal; };
+                std::vector<Tri> work;
+                for (uint32_t cl = 0; cl < scene.meshlets.size(); ++cl)
+                    for (uint32_t t = 0; t < scene.meshlets[cl].triCount; ++t) work.push_back({cl, t});
+                // A fixed-seed deterministic shuffle (no clock/RNG nondeterminism).
+                for (size_t k = work.size(); k > 1; --k) {
+                    size_t j = (size_t)((k * 2654435761u + 1013904223u) % k);  // LCG-ish index
+                    std::swap(work[k - 1], work[j]);
+                }
+                vg::SwVisBuffer shuf; shuf.Init(SW, SH);
+                for (const Tri& tw : work) {
+                    const vg::Meshlet& m = scene.meshlets[tw.cluster];
+                    uint32_t base = 3u * (m.triOffset + tw.triLocal);
+                    uint32_t i0 = scene.indices[base + 0], i1 = scene.indices[base + 1], i2 = scene.indices[base + 2];
+                    if (behind[i0] || behind[i1] || behind[i2]) continue;
+                    vg::RasterTriangle(shuf, screen[i0], screen[i1], screen[i2], vg::PackVisId(tw.cluster, tw.triLocal));
+                }
+                if (std::memcmp(vb.packed.data(), shuf.packed.data(), vb.packed.size() * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: swraster shuffled order != in-order (min not order-independent)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("swraster determinism (shuffled order): BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3): sub-pixel coverage — the tiny triangle's straddled pixel IS covered (HW misses).
+            {
+                uint32_t spIdx = scene.subPixelPy * SW + scene.subPixelPx;
+                if (vb.packed[spIdx] == vg::kSwClear) {
+                    std::fprintf(stderr, "FATAL: swraster sub-pixel triangle pixel (%u,%u) NOT covered\n",
+                                 scene.subPixelPx, scene.subPixelPy);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("swraster sub-pixel triangle: COVERED (HW would miss)\n");
+            }
+
+            // PROOF (4): empty triangle set -> all kSwClear, byte-identical to the cleared init.
+            {
+                vg::SwVisBuffer empty; empty.Init(SW, SH);
+                std::vector<vg::ScreenVert> ns; std::vector<uint8_t> nb; std::vector<uint32_t> ni; std::vector<vg::Meshlet> nm;
+                vg::RasterClusters(empty, ns, nb, ni, nm);
+                vg::SwVisBuffer cleared; cleared.Init(SW, SH);
+                if (std::memcmp(empty.packed.data(), cleared.packed.data(), empty.packed.size() * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: swraster empty tri set != cleared buffer\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("swraster empty == cleared: BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (1) follow-up + depth occlusion smoke: the near cluster (right quad, z=-4) must win
+            // over the far cluster (left quad, z=-6) on their screen-space overlap. Sample a column band
+            // where both project; assert at least one overlap pixel carries the near cluster's id.
+            {
+                bool sawNearOverFar = false;
+                for (uint32_t p = 0; p < vb.packed.size() && !sawNearOverFar; ++p) {
+                    if (vb.packed[p] == vg::kSwClear) continue;
+                    uint32_t d, id; vg::UnpackSw(vb.packed[p], d, id);
+                    uint32_t cluster = id >> vg::kTriIdBits;
+                    if (cluster == 1u || cluster == 2u) sawNearOverFar = true;  // the near quad's clusters
+                }
+                if (!sawNearOverFar) {
+                    std::fprintf(stderr, "FATAL: swraster near cluster never visible (depth occlusion broken)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            // The CPU-colored golden (shared verbatim with the Metal path).
+            std::vector<uint8_t> bgra = vg::ColorSwVisBuffer(vb);
+            bool ok = WriteBMP(swrasterShotPath, bgra, SW, SH);
+            if (ok) std::printf("wrote %s (%ux%u) — CPU-colored software-rasterized vis-buffer (%u tris, %llu covered)\n",
+                                swrasterShotPath, SW, SH, triCount, (unsigned long long)coveredPixels);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", swrasterShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
