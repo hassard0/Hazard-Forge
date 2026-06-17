@@ -254,6 +254,15 @@ hf_gen_msl(cas.frag               cas.frag.hlsl               frag cas_fragment)
 # --contactshadow only; existing lit/gtao/ssao shaders + goldens untouched.
 hf_gen_msl(contact_shadows.frag   contact_shadows.frag.hlsl   frag contact_shadows_fragment)
 hf_gen_msl(lit_contactshadow.frag lit_contactshadow.frag.hlsl frag contactshadow_fragment)
+# DDGI GI Composite — DDGI Slice 5 (Slice DN): a SIBLING of lit.frag adding a single-bounce DDGI
+# indirect-diffuse term (the visible Cornell color bleed). Per pixel it trilinearly blends the 8 nearest
+# probes' 3rd-order real-SH irradiance (NearestProbes + InterpolateSH + SHEvaluate copied VERBATIM from
+# engine/render/probe_gi.h + probe_sh.h, mad for every accumulation) toward the surface normal. The ProbeSH[]
+# rides in a fragment storage buffer (binding 13/space3 -> Metal fragment buffer 13) bound via the existing
+# usesLightClusters/BindLightClusters path. The SAME math compiled here makes the indirect term bit-identical
+# to the Vulkan/CPU mirror; giStrength==0 (or probeCount=0) -> a literal +0.0 -> byte-identical to the no-GI
+# render. Behind --ddgi only; existing lit shaders + goldens untouched.
+hf_gen_msl(lit_ddgi.frag           lit_ddgi.frag.hlsl           frag ddgi_fragment)
 # Froxel Volumetric Fog (Slice CS): a true 3D view-space froxel volume. froxel_inject.comp writes
 # per-froxel (scatter, extinction) from the render/froxel.h height-density + HG phase; froxel_integrate.comp
 # marches each Z column front-to-back via IntegrateStep into (inScatter, transmittance); froxel_apply.frag

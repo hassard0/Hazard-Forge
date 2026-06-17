@@ -306,6 +306,16 @@ hf_add_pure_test(probe_sh_test)
 # Pure C++ (hf_core; reuses render/probe_gi.h + render/probe_sh.h), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(probe_interp_test)
 
+# DDGI GI Composite (Slice DN): the COMPOSITE-specific properties of the single-bounce DDGI indirect-diffuse
+# term the lit_ddgi.frag.hlsl shader adds last — indirect = InterpolateIrradianceSH(wpos,N)*(1-metallic);
+# rgb += indirect*albedo*giStrength. Pins giStrength=0 -> a literal +0.0 (the byte-identical no-op the 77
+# image goldens rest on), the color-bleed DIRECTION (a red-dominant ProbeSH toward a facing normal -> a
+# red-dominant indirect color), the probeCount=0 zero-indirect fallback, the metallic=1 zeroing, and
+# determinism. The same math is mirrored VERBATIM in lit_ddgi.frag.hlsl (mad for every accumulation); the
+# GPU==CPU bit-exact blend lives in --probeinterp-shot + the giStrength=0==no-GI BYTE-IDENTICAL render proof
+# in --ddgi-shot. Pure C++ (hf_core; reuses render/probe_gi.h + render/probe_sh.h), ASan-eligible.
+hf_add_pure_test(ddgi_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,

@@ -236,6 +236,16 @@ hf_compile_shaders(
     # shaders + their goldens untouched.
     "shaders/contact_shadows.frag.hlsl:ps"
     "shaders/lit_contactshadow.frag.hlsl:ps"
+    # DDGI GI Composite — DDGI Slice 5 (Slice DN): a SIBLING of lit.frag that adds a single-bounce DDGI
+    # indirect-diffuse term as the LAST contribution. Per pixel it trilinearly blends the 8 nearest probes'
+    # 3rd-order real-SH irradiance (NearestProbes + InterpolateSH + SHEvaluate copied VERBATIM from
+    # engine/render/probe_gi.h + probe_sh.h, mad for every accumulation) toward the surface normal and adds
+    # indirect*albedo*(1-metallic)*giStrength -> colored Cornell color bleed. The ProbeSH[] rides in a
+    # fragment-stage storage buffer bound via the EXISTING usesLightClusters/BindLightClusters path (binding
+    # 13/space3, single SSBO via dummies) — NO new RHI. giStrength==0 (or probeCount=0) -> the indirect term
+    # is a literal +0.0 -> byte-identical to the no-GI render. Used ONLY by --ddgi-shot; lit.frag + its
+    # goldens are untouched.
+    "shaders/lit_ddgi.frag.hlsl:ps"
     # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
     # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect

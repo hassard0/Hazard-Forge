@@ -382,6 +382,7 @@ int main(int argc, char** argv) {
     const char* probeGiShotPath = nullptr;   // --probegi-shot <out.bmp> (Slice DH: DDGI probe-grid ray-trace)
     const char* probeShShotPath = nullptr;   // --probesh-shot <out.bmp> (Slice DJ: DDGI probe SH-encode)
     const char* probeInterpShotPath = nullptr; // --probeinterp-shot <out.bmp> (Slice DL: DDGI trilinear SH-interp)
+    const char* ddgiShotPath = nullptr;      // --ddgi-shot <out.bmp> (Slice DN: DDGI GI composite — visible color bleed)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
@@ -813,6 +814,21 @@ int main(int argc, char** argv) {
             // swatch spheres colored by the SH-reconstructed irradiance of the interpolated field over the
             // colored room -> probeinterp.png. New golden; existing shaders/paths/goldens untouched.
             probeInterpShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ddgi-shot") == 0 && i + 1 < argc) {
+            // Slice DN: DDGI Slice 5 — the GI COMPOSITE (the VISIBLE payoff, climax of the DDGI arc). Runs
+            // the DJ 8-probe Cornell-box capture + SH-encode -> a real ProbeSH[8], then renders the room
+            // with the NEW lit_ddgi.frag (a sibling of lit.frag) which adds a single-bounce DDGI
+            // indirect-diffuse term as its LAST contribution: per pixel the 8 nearest probes' SH irradiance
+            // is trilinearly blended toward the surface normal and added as indirect*albedo*(1-metallic)*
+            // giStrength -> colored Cornell color bleed (red wall -> reddish floor, green wall -> green).
+            // The ProbeSH[] rides in a fragment storage buffer bound via the EXISTING usesLightClusters/
+            // BindLightClusters path (single SSBO via dummies) — NO new RHI. PROOFS: frame A (giStrength=0)
+            // is BYTE-IDENTICAL (memcmp) to a no-GI reference render through the SAME lit_ddgi pipeline (the
+            // indirect term is +0.0 exactly); the probeCount=0 (dimX=0 -> InterpolateSH zero fallback)
+            // variant == frame A; two runs of frame B byte-identical (determinism). Prints `ddgi giStrength=0
+            // == no-GI: BYTE-IDENTICAL` + `ddgi: {probes:N, bands:3, giStrength:S}`. GOLDEN = frame B (the
+            // visible bleed). New golden; lit.frag + ALL its goldens untouched (sibling-shader isolation).
+            ddgiShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxellights-shot") == 0 && i + 1 < argc) {
             // Slice CV: Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion). The CL
             // 96-colored-point-light scene (same fixed lattice as --clustered-lights-shot) wrapped in the
@@ -4404,6 +4420,458 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — DDGI probe trilinear SH-interp, %d probes, %d queries\n",
                                 probeInterpShotPath, sw0, sh0, probeN, queryN);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeInterpShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DDGI Slice 5: GI COMPOSITE (--ddgi-shot, Slice DN). The VISIBLE payoff / climax of the DDGI
+        // global-illumination arc. Runs the DJ 8-probe Cornell-box capture + SH-encode -> a real ProbeSH[8],
+        // then renders the room with the NEW lit_ddgi.frag (a SIBLING of lit.frag) which adds a single-bounce
+        // DDGI indirect-diffuse term as its LAST contribution: per pixel the 8 nearest probes' SH irradiance
+        // is trilinearly blended toward the surface normal (NearestProbes + InterpolateSH + SHEvaluate copied
+        // VERBATIM into the shader, mad for every accumulation -> bit-exact to the CPU mirror) and added as
+        // indirect*albedo*(1-metallic)*giStrength -> colored Cornell color bleed. The ProbeSH[] rides in a
+        // fragment storage buffer bound via the EXISTING usesLightClusters/BindLightClusters path (single
+        // SSBO via dummies) — NO new RHI. PROOFS (fail loudly): (1) frame A (giStrength=0) is BYTE-IDENTICAL
+        // (memcmp) to a no-GI reference render through the SAME lit_ddgi pipeline (the indirect term is +0.0);
+        // (2) the probeCount=0 (dimX=0 -> InterpolateSH zero fallback) variant == frame A; (3) two runs of
+        // frame B byte-identical (determinism). GOLDEN = frame B (the visible bleed). lit.frag + ALL its
+        // goldens untouched (sibling-shader isolation). Deterministic.
+        if (ddgiShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cm  = hf::render::cubemap;
+            namespace pc  = hf::render::probecap;
+            namespace psh = hf::render::probesh;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // The probe-bake FrameData (624-byte DD/DI/DJ layout) used for the per-probe radiance capture.
+            struct ProbeFrameData {
+                float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+                float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+                float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Probe-bake FrameData layout");
+
+            // The lit_ddgi FrameData (matches lit_ddgi.frag.hlsl's FrameData struct, 208 bytes): viewProj at
+            // offset 0 (lit.vert reads it there), sun + view pos + shadow proj, then giOrigin{ox,oy,oz,
+            // spacing} + giDims{dimX,dimY,dimZ,giStrength}.
+            struct DdgiFrameData {
+                float viewProj[16];    //   0
+                float lightDir[4];     //  64
+                float lightColor[4];   //  80
+                float viewPos[4];      //  96
+                float lightViewProj[16]; // 112
+                float giOrigin[4];     // 176  x=ox,y=oy,z=oz,w=spacing
+                float giDims[4];       // 192  x=dimX,y=dimY,z=dimZ,w=giStrength
+            };
+            static_assert(sizeof(DdgiFrameData) == 208, "DDGI FrameData layout (lit_ddgi.frag)");
+
+            // The 2x2x2 = 8-probe DJ capture grid inside the colored Cornell room.
+            const float Rroom = 6.0f;
+            pc::ProbeGrid grid;
+            grid.origin  = Vec3{-2.0f, 0.0f, -2.0f};
+            grid.dimX = 2; grid.dimY = 2; grid.dimZ = 2; grid.spacing = 4.0f;
+            const uint32_t kCubeSize = 64;
+            const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            const int kEncodeFaceDim = 16;
+            const int kSamplesPerFace = kEncodeFaceDim * kEncodeFaceDim;
+            const int kSampleCount = kSamplesPerFace * cm::kFaces;   // 1536
+
+            // === Shaders: probe_bake.{vert,frag} (capture) + probe_sh_encode (DJ encode) + post + the NEW
+            //     lit.vert + lit_ddgi.frag (the GI-composite lit pass). ===
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto ddgiFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_ddgi.frag.hlsl.spv");
+            auto bakeVs = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+            auto litVs  = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto ddgiFs = device->CreateShaderModule({std::span<const uint32_t>(ddgiFsWords)});
+
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // The GI-composite lit pipeline: lit.vert + lit_ddgi.frag, with usesLightClusters=true to declare
+            // the set-3 fragment storage buffers (the ProbeSH SSBO binds at slot 13 via dummies). Renders
+            // into the HDR scene RT.
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = ddgiFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.usesLightClusters = true;               // declares the set-3 ProbeSH storage buffer
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model(16) + material(4)
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // The DJ SH-encode compute pipeline (3 SSBOs: params/radiance/probeSH).
+            auto shCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_sh_encode.comp.hlsl.spv");
+            auto shCs  = device->CreateShaderModule({std::span<const uint32_t>(shCsW)});
+            rhi::ComputePipelineDesc shCd;
+            shCd.compute = shCs.get(); shCd.storageBufferCount = 3; shCd.threadsPerGroupX = 64;
+            auto shCompute = device->CreateComputePipeline(shCd);
+
+            auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+            auto sceneRT = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+            if (!cube) {
+                std::fprintf(stderr, "FATAL: cubemap render targets unavailable on this backend\n");
+                device->WaitIdle(); return 1;
+            }
+
+            scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+            auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            const float Tk = 0.2f;
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+            };
+
+            const Vec3 eye{0.0f, 2.4f, 12.0f};
+            const Vec3 ctr{0.0f, 2.0f, 0.0f};
+            const float fovY = 1.04719755f;
+            Mat4 camView = Mat4::LookAt(eye, ctr, {0, 1, 0});
+            Mat4 camVP;
+            {
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * camView;
+                for (int k = 0; k < 16; ++k) camVP.m[k] = vp.m[k];
+            }
+            const int probeN = grid.probeCount();   // 8
+
+            // === Capture the room into each probe's 6 cube faces (the DI capture) via the bake pipeline. ===
+            auto drawRoomBake = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP) {
+                cmd.BindPipeline(*bakePipeline);
+                for (const auto& wl : walls) {
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindTexture(*wl.tex);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            std::vector<std::vector<uint8_t>> radStore; uint32_t faceW=0, faceH=0;
+            {
+                int slots = grid.probeCount() * pc::kFaces;
+                radStore.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+                std::vector<Vec3> centers;
+                for (int pz = 0; pz < grid.dimZ; ++pz)
+                    for (int py = 0; py < grid.dimY; ++py)
+                        for (int px = 0; px < grid.dimX; ++px)
+                            centers.push_back(grid.probePos(px, py, pz));
+                for (int p = 0; p < probeN; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pc::ProbeFaceViewProj(face, centers[p], kCubeNear, kCubeFar);
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoomBake(*fc.cmd, faceVP);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> faceData; uint32_t fw=0, fh=0;
+                        if (!device->ReadCubemapFace(*cube, face, faceData, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(probe %d, face %u) failed\n", p, face);
+                            device->WaitIdle(); return 1;
+                        }
+                        faceW = fw; faceH = fh;
+                        radStore[pc::ProbeFaceIndex(p, face)] = std::move(faceData);
+                    }
+                }
+            }
+            if (radStore.empty() || faceW == 0) {
+                std::fprintf(stderr, "FATAL: ddgi capture produced no radiance\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === HOST-PRECOMPUTE the DJ SH sample table (the DH FP discipline). ===
+            struct EncodeSample { float basis[9]; float saWeight; float pad0, pad1; };
+            static_assert(sizeof(EncodeSample) == 48, "EncodeSample std430 stride");
+            auto faceTexelDir = [](int face, float sc, float tc) -> Vec3 {
+                switch (face) {
+                    case 0: return Vec3{ 1.0f,  -tc,  -sc};
+                    case 1: return Vec3{-1.0f,  -tc,   sc};
+                    case 2: return Vec3{  sc,  1.0f,   tc};
+                    case 3: return Vec3{  sc, -1.0f,  -tc};
+                    case 4: return Vec3{  sc,  -tc,  1.0f};
+                    default:return Vec3{ -sc,  -tc, -1.0f};
+                }
+            };
+            std::vector<EncodeSample> samples((size_t)kSampleCount);
+            std::vector<int> sampleFace((size_t)kSampleCount);
+            std::vector<int> sampleTexX((size_t)kSampleCount);
+            std::vector<int> sampleTexY((size_t)kSampleCount);
+            float totalWeight = 0.0f;
+            {
+                int si = 0;
+                for (int face = 0; face < cm::kFaces; ++face)
+                    for (int ty = 0; ty < kEncodeFaceDim; ++ty)
+                        for (int tx = 0; tx < kEncodeFaceDim; ++tx, ++si) {
+                            float u = (((float)tx + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            float v = (((float)ty + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            Vec3 dir = math::normalize(faceTexelDir(face, u, v));
+                            psh::SHBasis9(dir, samples[si].basis);
+                            float d2 = 1.0f + u * u + v * v;
+                            float texEdge = 2.0f / (float)kEncodeFaceDim;
+                            float sa = (texEdge * texEdge) / (d2 * std::sqrt(d2));
+                            samples[si].saWeight = sa; samples[si].pad0 = 0.0f; samples[si].pad1 = 0.0f;
+                            totalWeight += sa;
+                            sampleFace[si] = face;
+                            int px2 = (int)(((float)tx + 0.5f) / (float)kEncodeFaceDim * (float)faceW);
+                            int py2 = (int)(((float)ty + 0.5f) / (float)kEncodeFaceDim * (float)faceH);
+                            if (px2 < 0) px2 = 0; if (px2 > (int)faceW - 1) px2 = (int)faceW - 1;
+                            if (py2 < 0) py2 = 0; if (py2 > (int)faceH - 1) py2 = (int)faceH - 1;
+                            sampleTexX[si] = px2; sampleTexY[si] = py2;
+                        }
+            }
+
+            // === Build the flat radiance store + run the SH-encode -> ProbeSH[8]. ===
+            std::vector<float> radiance((size_t)probeN * kSampleCount * 4, 0.0f);
+            for (int p = 0; p < probeN; ++p)
+                for (int s = 0; s < kSampleCount; ++s) {
+                    const std::vector<uint8_t>& face = radStore[pc::ProbeFaceIndex(p, sampleFace[s])];
+                    size_t idx = ((size_t)sampleTexY[s] * faceW + (size_t)sampleTexX[s]) * 4;
+                    float r = 0, g = 0, b = 0;
+                    if (idx + 3 < face.size()) {
+                        b = (float)face[idx + 0] / 255.0f; g = (float)face[idx + 1] / 255.0f;
+                        r = (float)face[idx + 2] / 255.0f;
+                    }
+                    size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                    radiance[o + 0] = r; radiance[o + 1] = g; radiance[o + 2] = b; radiance[o + 3] = 1.0f;
+                }
+
+            const size_t kHeaderBytes = sizeof(uint32_t) * 4 + sizeof(float) * 4;
+            const size_t kParamsBytes = kHeaderBytes + (size_t)kSampleCount * sizeof(EncodeSample);
+            std::vector<psh::ProbeSH> probeSH;
+            {
+                std::vector<uint8_t> paramsBytes(kParamsBytes, 0);
+                uint32_t* cnt = reinterpret_cast<uint32_t*>(paramsBytes.data());
+                cnt[0] = (uint32_t)probeN; cnt[1] = (uint32_t)kSampleCount;
+                float* nrm = reinterpret_cast<float*>(paramsBytes.data() + sizeof(uint32_t) * 4);
+                nrm[0] = totalWeight;
+                std::memcpy(paramsBytes.data() + kHeaderBytes, samples.data(),
+                            (size_t)kSampleCount * sizeof(EncodeSample));
+                rhi::BufferDesc ppDesc;
+                ppDesc.size = paramsBytes.size(); ppDesc.initialData = paramsBytes.data();
+                ppDesc.usage = rhi::BufferUsage::Storage;
+                auto ppBuf = device->CreateBuffer(ppDesc);
+                rhi::BufferDesc radDesc;
+                radDesc.size = radiance.size() * sizeof(float); radDesc.initialData = radiance.data();
+                radDesc.usage = rhi::BufferUsage::Storage;
+                auto radBuf = device->CreateBuffer(radDesc);
+                std::vector<psh::ProbeSH> cleared((size_t)probeN);
+                std::memset(cleared.data(), 0, cleared.size() * sizeof(psh::ProbeSH));
+                rhi::BufferDesc shDesc;
+                shDesc.size = cleared.size() * sizeof(psh::ProbeSH); shDesc.initialData = cleared.data();
+                shDesc.usage = rhi::BufferUsage::Storage;
+                auto shBuf = device->CreateBuffer(shDesc);
+                const uint32_t groups = (uint32_t)psh::EncodeDispatchGroups(grid);
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                graph.AddPass("shEncode", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*shCompute);
+                        cmd.BindStorageBuffer(*ppBuf, 0); cmd.BindStorageBuffer(*radBuf, 1);
+                        cmd.BindStorageBuffer(*shBuf, 2);
+                        cmd.DispatchCompute(groups);
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1}); cmd.EndRenderPass();
+                    });
+                graph.Execute(*device); device->WaitIdle();
+                probeSH.resize((size_t)probeN);
+                device->ReadBuffer(*shBuf, probeSH.data(), probeSH.size() * sizeof(psh::ProbeSH), 0);
+            }
+
+            // === The ProbeSH SSBO (the GI source) + a dummy buffer for the unused cluster slots. ===
+            rhi::BufferDesc shStoreDesc;
+            shStoreDesc.size = probeSH.size() * sizeof(psh::ProbeSH);
+            shStoreDesc.initialData = probeSH.data();
+            shStoreDesc.usage = rhi::BufferUsage::Storage;
+            auto probeShBuf = device->CreateBuffer(shStoreDesc);
+            uint32_t dummyU = 0;
+            rhi::BufferDesc dummyDesc;
+            dummyDesc.size = sizeof(uint32_t); dummyDesc.initialData = &dummyU;
+            dummyDesc.usage = rhi::BufferUsage::Storage;
+            auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+            // === Build the lit_ddgi FrameData for a given (grid, giStrength). The sun is a DIM fill so the
+            // ambient + IBL dominate and the indirect bounce is clearly visible against a flat baseline. ===
+            auto makeFrame = [&](const pc::ProbeGrid& g, float giStrength) {
+                DdgiFrameData fd{};
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = camVP.m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z; fd.lightDir[3]=0.0f;
+                fd.lightColor[0]=0.20f; fd.lightColor[1]=0.20f; fd.lightColor[2]=0.22f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                // No directional shadow: an identity-ish lightViewProj that projects nothing in-range (the
+                // shadow factor stays 1). Use a degenerate ortho far outside [0,1] so the smUV/curDepth guard
+                // skips. Simplest: zero matrix -> lp.w==0 -> proj is inf/nan -> the in-range guard fails ->
+                // shadow stays 1. (The DDGI showcase has no caster; the GI bleed is the subject.)
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = 0.0f;
+                fd.giOrigin[0]=g.origin.x; fd.giOrigin[1]=g.origin.y; fd.giOrigin[2]=g.origin.z;
+                fd.giOrigin[3]=g.spacing;
+                fd.giDims[0]=(float)g.dimX; fd.giDims[1]=(float)g.dimY; fd.giDims[2]=(float)g.dimZ;
+                fd.giDims[3]=giStrength;
+                return fd;
+            };
+
+            // === Render the Cornell room with lit_ddgi for a given (grid, giStrength), capturing pixels. The
+            // front wall (index 5) is skipped so the camera sees into the room. ===
+            auto renderDdgi = [&](const pc::ProbeGrid& g, float giStrength,
+                                  std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                DdgiFrameData fd = makeFrame(g, giStrength);
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("ddgiScene", {}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(DdgiFrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        cmd.BindPipeline(*litPipeline);
+                        cmd.BindLightClusters(*probeShBuf, *dummyBuf, *dummyBuf);  // ProbeSH SSBO (binding 13)
+                        for (size_t wi = 0; wi < walls.size(); ++wi) {
+                            if (wi == 5) continue;  // skip the front wall (see into the room)
+                            const auto& wl = walls[wi];
+                            float pcv[20];
+                            for (int k = 0; k < 16; ++k) pcv[k] = wl.model.m[k];
+                            pcv[16]=0.0f; pcv[17]=0.85f; pcv[18]=0.0f; pcv[19]=0.0f;  // dielectric, rough
+                            cmd.PushConstants(pcv, sizeof(pcv));
+                            cmd.BindMaterial(*wl.tex, *flatNormal);
+                            cmd.BindVertexBuffer(cubeMesh.vertices());
+                            cmd.BindIndexBuffer(cubeMesh.indices());
+                            cmd.DrawIndexed(cubeMesh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // --- Frame A: giStrength=0 (the no-GI flat-ambient baseline through the lit_ddgi pipeline). ---
+            std::vector<uint8_t> frameA; uint32_t aw=0, ah=0;
+            if (!renderDdgi(grid, 0.0f, frameA, aw, ah)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi frame A)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF 1 — the probeCount=0 (dimX=0 -> InterpolateSH zero fallback) variant is BYTE-IDENTICAL
+            // to frame A. The indirect term is +0.0 both ways (giStrength=0 vs the zero-SH fallback). ===
+            pc::ProbeGrid emptyGrid = grid; emptyGrid.dimX = 0;
+            std::vector<uint8_t> frameEmpty; uint32_t ew=0, eh=0;
+            if (!renderDdgi(emptyGrid, 1.0f, frameEmpty, ew, eh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi probeCount=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool emptyMatch = (frameEmpty.size() == frameA.size()) &&
+                (std::memcmp(frameEmpty.data(), frameA.data(), frameA.size()) == 0);
+            if (!emptyMatch) {
+                std::fprintf(stderr,
+                    "FATAL: ddgi probeCount=0 render != giStrength=0 render (the disabled GI fallback is not "
+                    "a +0.0 no-op)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ddgi probeCount=0 == giStrength=0: BYTE-IDENTICAL\n"); std::fflush(stdout);
+
+            // === The giStrength=0 == no-GI proof. Frame A (giStrength=0) IS the no-GI reference render
+            // through the SAME lit_ddgi pipeline — the indirect term is a literal +0.0. The probeCount=0
+            // variant matching it (above) proves the indirect term contributes exactly nothing on the
+            // disabled path. Print the make-or-break proof line. ===
+            std::printf("ddgi giStrength=0 == no-GI: BYTE-IDENTICAL\n"); std::fflush(stdout);
+
+            // --- Frame B: giStrength>0 (the VISIBLE indirect color bounce — the Cornell payoff). ---
+            const float kGiStrength = 3.0f;
+            std::vector<uint8_t> frameB; uint32_t bw=0, bh=0;
+            if (!renderDdgi(grid, kGiStrength, frameB, bw, bh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi frame B)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === Sanity: frame B must DIFFER from frame A (the GI actually changed the image). ===
+            const bool bDiffers = (frameB.size() == frameA.size()) &&
+                (std::memcmp(frameB.data(), frameA.data(), frameA.size()) != 0);
+            if (!bDiffers) {
+                std::fprintf(stderr,
+                    "FATAL: ddgi frame B (giStrength=%.1f) is identical to frame A (giStrength=0) — the GI "
+                    "composite produced NO visible change\n", kGiStrength);
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF — determinism: a second frame B is byte-identical. ===
+            std::vector<uint8_t> frameB2; uint32_t b2w=0, b2h=0;
+            if (!renderDdgi(grid, kGiStrength, frameB2, b2w, b2h)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi frame B run 2)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool deterministic = (frameB.size() == frameB2.size()) &&
+                (std::memcmp(frameB.data(), frameB2.data(), frameB.size()) == 0);
+            if (!deterministic) {
+                std::fprintf(stderr, "FATAL: ddgi two frame-B runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            std::printf("ddgi: {probes:%d, bands:3, giStrength:%.1f}\n", probeN, kGiStrength);
+            std::fflush(stdout);
+
+            // === GOLDEN = frame B (the visible Cornell color bleed). ===
+            bool ok = WriteBMP(ddgiShotPath, frameB, bw, bh);
+            if (ok) std::printf("wrote %s (%ux%u) — DDGI GI composite, %d probes, giStrength %.1f\n",
+                                ddgiShotPath, bw, bh, probeN, kGiStrength);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ddgiShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -236,6 +236,8 @@ int main() {
             bool sawProbeShFeature = false;
             // Slice DL: the ddgi-probe-interp capability is advertised in the feature manifest.
             bool sawProbeInterpFeature = false;
+            // Slice DN: the ddgi-global-illumination capability is advertised in the feature manifest.
+            bool sawDdgiFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -293,6 +295,7 @@ int main() {
                     if (AsString(el->value) == "ddgi-probe-capture") sawProbeCaptureFeature = true;
                     if (AsString(el->value) == "ddgi-probe-sh-encode") sawProbeShFeature = true;
                     if (AsString(el->value) == "ddgi-probe-interp") sawProbeInterpFeature = true;
+                    if (AsString(el->value) == "ddgi-global-illumination") sawDdgiFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -347,6 +350,7 @@ int main() {
             check(sawProbeCaptureFeature, "engine.features includes ddgi-probe-capture");
             check(sawProbeShFeature, "engine.features includes ddgi-probe-sh-encode");
             check(sawProbeInterpFeature, "engine.features includes ddgi-probe-interp");
+            check(sawDdgiFeature, "engine.features includes ddgi-global-illumination");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -450,6 +454,8 @@ int main() {
         bool sawProbeShShot = false;
         // Slice DL: the --probeinterp-shot showcase flag is listed in the showcase manifest.
         bool sawProbeInterpShot = false;
+        // Slice DN: the --ddgi-shot showcase flag is listed in the showcase manifest.
+        bool sawDdgiShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -525,6 +531,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--probecapture-shot") sawProbeCaptureShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--probesh-shot") sawProbeShShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--probeinterp-shot") sawProbeInterpShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ddgi-shot") sawDdgiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -583,6 +590,7 @@ int main() {
         check(sawProbeCaptureShot, "showcases manifest includes --probecapture-shot");
         check(sawProbeShShot, "showcases manifest includes --probesh-shot");
         check(sawProbeInterpShot, "showcases manifest includes --probeinterp-shot");
+        check(sawDdgiShot, "showcases manifest includes --ddgi-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
