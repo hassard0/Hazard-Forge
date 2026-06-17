@@ -268,6 +268,8 @@ int main() {
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
             bool sawVtAllocFeature = false;
+            // Slice VT3: the runtime-virtual-texturing-pagegen capability is advertised in the manifest.
+            bool sawVtPagegenFeature = false;
             // Slice SW1: the nanite-software-raster capability is advertised in the feature manifest.
             bool sawSwRasterFeature = false;
             // Slice SW2: the nanite-software-raster-gpu capability is advertised in the feature manifest.
@@ -347,6 +349,7 @@ int main() {
                     if (AsString(el->value) == "virtual-shadow-maps-cache") sawVsmCacheFeature = true;
                     if (AsString(el->value) == "runtime-virtual-texturing-feedback") sawVtFeedbackFeature = true;
                     if (AsString(el->value) == "runtime-virtual-texturing-allocate") sawVtAllocFeature = true;
+                    if (AsString(el->value) == "runtime-virtual-texturing-pagegen") sawVtPagegenFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -420,6 +423,7 @@ int main() {
             check(sawVsmCacheFeature, "engine.features includes virtual-shadow-maps-cache");
             check(sawVtFeedbackFeature, "engine.features includes runtime-virtual-texturing-feedback");
             check(sawVtAllocFeature, "engine.features includes runtime-virtual-texturing-allocate");
+            check(sawVtPagegenFeature, "engine.features includes runtime-virtual-texturing-pagegen");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -562,6 +566,8 @@ int main() {
         bool sawVtFeedbackShot = false;
         // Slice VT2: the --vt-alloc-shot showcase flag is listed in the showcase manifest.
         bool sawVtAllocShot = false;
+        // Slice VT3: the --vt-pagegen-shot showcase flag is listed in the showcase manifest.
+        bool sawVtPagegenShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -655,6 +661,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-cache-shot") sawVsmCacheShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vt-feedback-shot") sawVtFeedbackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vt-alloc-shot") sawVtAllocShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--vt-pagegen-shot") sawVtPagegenShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -731,6 +738,7 @@ int main() {
         check(sawVsmCacheShot, "showcases manifest includes --vsm-cache-shot");
         check(sawVtFeedbackShot, "showcases manifest includes --vt-feedback-shot");
         check(sawVtAllocShot, "showcases manifest includes --vt-alloc-shot");
+        check(sawVtPagegenShot, "showcases manifest includes --vt-pagegen-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
