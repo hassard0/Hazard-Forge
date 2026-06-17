@@ -527,6 +527,140 @@ int main() {
               stat.bodies[0].pos.z == sp.z, "StepWorld: static body unchanged (disabled model)");
     }
 
+    // ================= Slice FPX4: FxQuatMul (Hamilton product, int64, identity·q==q) =================
+    {
+        using fpx::FxQuat;
+        const FxQuat identity{0, 0, 0, kOne};
+        // A non-trivial (not yet unit) quaternion to exercise all 16 product terms.
+        const FxQuat q{kOne, kOne / 2, kOne / 4, kOne};
+        // identity * q == q (the multiplicative identity, left).
+        FxQuat li = fpx::FxQuatMul(identity, q);
+        check(li.x == q.x && li.y == q.y && li.z == q.z && li.w == q.w, "FxQuatMul identity*q == q");
+        // q * identity == q (right identity).
+        FxQuat ri = fpx::FxQuatMul(q, identity);
+        check(ri.x == q.x && ri.y == q.y && ri.z == q.z && ri.w == q.w, "FxQuatMul q*identity == q");
+
+        // Known product: i*j == k (pure-imaginary basis quaternions). i={1,0,0,0}, j={0,1,0,0}, k={0,0,1,0}.
+        const FxQuat qi{kOne, 0, 0, 0};
+        const FxQuat qj{0, kOne, 0, 0};
+        const FxQuat qk{0, 0, kOne, 0};
+        FxQuat ij = fpx::FxQuatMul(qi, qj);
+        check(ij.x == qk.x && ij.y == qk.y && ij.z == qk.z && ij.w == qk.w, "FxQuatMul i*j == k");
+        // i*i == -1 (w = -kOne, xyz = 0).
+        FxQuat ii = fpx::FxQuatMul(qi, qi);
+        check(ii.x == 0 && ii.y == 0 && ii.z == 0 && ii.w == -kOne, "FxQuatMul i*i == -1");
+        // j*i == -k (anticommutativity).
+        FxQuat ji = fpx::FxQuatMul(qj, qi);
+        check(ji.x == 0 && ji.y == 0 && ji.z == -kOne && ji.w == 0, "FxQuatMul j*i == -k");
+    }
+
+    // ================= Slice FPX4: FxQuatNormalize (|q|≈kOne; known un-normalized -> normalized) =====
+    {
+        using fpx::FxQuat;
+        // Identity normalizes to identity (already unit).
+        FxQuat n = fpx::FxQuatNormalize(FxQuat{0, 0, 0, kOne});
+        check(n.x == 0 && n.y == 0 && n.z == 0 && n.w == kOne, "FxQuatNormalize identity == identity");
+        // len==0 -> identity fallback.
+        FxQuat z = fpx::FxQuatNormalize(FxQuat{0, 0, 0, 0});
+        check(z.x == 0 && z.y == 0 && z.z == 0 && z.w == kOne, "FxQuatNormalize zero -> identity");
+        // Known un-normalized: {kOne,kOne,kOne,kOne} (|q|=2) -> each component ~kOne/2.
+        FxQuat u = fpx::FxQuatNormalize(FxQuat{kOne, kOne, kOne, kOne});
+        // |q|^2 over the normalized quat ≈ kOne^2 within a small fixed-point tolerance.
+        auto qmag2 = [](const FxQuat& q) -> int64_t {
+            return (int64_t)q.x * q.x + (int64_t)q.y * q.y + (int64_t)q.z * q.z + (int64_t)q.w * q.w;
+        };
+        const int64_t one2 = (int64_t)kOne * (int64_t)kOne;
+        // Components are all equal and ≈ 0.5 (kOne/2 = 32768).
+        check(u.x == u.y && u.y == u.z && u.z == u.w, "FxQuatNormalize {1,1,1,1} symmetric");
+        check(u.x > kOne / 2 - 64 && u.x < kOne / 2 + 64, "FxQuatNormalize {1,1,1,1} comp ~0.5");
+        int64_t d = qmag2(u) - one2;
+        if (d < 0) d = -d;
+        check(d < 2 * (int64_t)kOne, "FxQuatNormalize |q|^2 ~ kOne^2 (within fp tol)");
+    }
+
+    // ================= Slice FPX4: FxRotate (identity->v; 90° about Z -> known vector) =================
+    {
+        using fpx::FxQuat;
+        const fpx::FxVec3 vx{kOne, 0, 0};   // unit +x
+        // Identity rotation leaves v unchanged.
+        fpx::FxVec3 r0 = fpx::FxRotate(FxQuat{0, 0, 0, kOne}, vx);
+        check(r0.x == vx.x && r0.y == vx.y && r0.z == vx.z, "FxRotate identity -> v");
+        // 90° about +Z: q = {0,0,sin45,cos45} = {0,0,~0.7071,~0.7071}. Rotates +x -> +y.
+        // sin/cos 45° in Q16.16: ~46341 (0.70710678 * 65536).
+        const fx s = 46341;  // ~0.7071 in Q16.16
+        FxQuat qz{0, 0, s, s};
+        qz = fpx::FxQuatNormalize(qz);     // ensure unit (it already is ~)
+        fpx::FxVec3 ry = fpx::FxRotate(qz, vx);
+        // Expect ~(0, +1, 0) within a fixed-point tolerance (the integer rotate is not perfect).
+        const fx tol = 512;  // ~0.0078 in Q16.16
+        check(ry.x > -tol && ry.x < tol, "FxRotate 90Z: x ~ 0");
+        check(ry.y > kOne - 2 * tol && ry.y < kOne + 2 * tol, "FxRotate 90Z: y ~ +1");
+        check(ry.z > -tol && ry.z < tol, "FxRotate 90Z: z ~ 0");
+    }
+
+    // ================= Slice FPX4: IntegrateOrientation (angVel=0 unchanged; known spin drift) ========
+    {
+        using fpx::FxQuat;
+        const fx kDt = kOne / 60;
+        // angVel = 0 -> orientation unchanged (modulo the normalize, which is a no-op on a unit quat).
+        fpx::FxBody b0; b0.orient = FxQuat{0, 0, 0, kOne}; b0.angVel = {0, 0, 0};
+        fpx::IntegrateOrientation(b0, kDt);
+        check(b0.orient.x == 0 && b0.orient.y == 0 && b0.orient.z == 0 && b0.orient.w == kOne,
+              "IntegrateOrientation angVel=0 -> unchanged");
+
+        // Known spin about +Z at omega = 1 rad/s for K steps -> the quaternion's Z component grows
+        // (positive rotation), w decreases from kOne, and |q| stays ≈ kOne throughout.
+        fpx::FxBody b1; b1.orient = FxQuat{0, 0, 0, kOne}; b1.angVel = {0, 0, kOne};  // 1 rad/s about Z
+        const int K = 120;
+        int64_t maxDrift = 0;
+        for (int s = 0; s < K; ++s) {
+            fpx::IntegrateOrientation(b1, kDt);
+            int64_t m2 = (int64_t)b1.orient.x * b1.orient.x + (int64_t)b1.orient.y * b1.orient.y +
+                         (int64_t)b1.orient.z * b1.orient.z + (int64_t)b1.orient.w * b1.orient.w;
+            int64_t one2 = (int64_t)kOne * (int64_t)kOne;
+            int64_t d = m2 - one2; if (d < 0) d = -d;
+            if (d > maxDrift) maxDrift = d;
+        }
+        // After K=120 steps of dt=1/60 at 1 rad/s -> total angle ~2.0 rad -> half-angle ~1.0 rad ->
+        // q ≈ {0,0,sin(1)=0.8415, cos(1)=0.5403}. z should be clearly positive + large, w reduced.
+        check(b1.orient.z > kOne / 2, "IntegrateOrientation spin Z: z grew large (positive rotation)");
+        check(b1.orient.w < kOne, "IntegrateOrientation spin Z: w reduced from identity");
+        check(b1.orient.x == 0 && b1.orient.y == 0, "IntegrateOrientation spin Z: x,y stay 0");
+        // |q| drift stays small + bounded (the documented fixed-point tolerance). one2 = kOne^2 ~ 4.29e9.
+        // The tolerance: |q|^2-kOne^2 < kOne^2 / 256 ~ 1.68e7 (≈ |q|-1 < ~0.002).
+        check(maxDrift < ((int64_t)kOne * (int64_t)kOne) / 256,
+              "IntegrateOrientation: |q| drift bounded (fp tol)");
+    }
+
+    // ================= Slice FPX4: IntegrateBodyFull (translation + orient) + determinism =============
+    {
+        using fpx::FxQuat;
+        const fx kDt = kOne / 60;
+        const fpx::FxVec3 grav{0, FromInt(-10), 0};
+        // A dynamic body with gravity + spin: position falls AND orientation integrates.
+        fpx::FxBody b; b.pos = {0, FromInt(5), 0}; b.vel = {0, 0, 0};
+        b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+        b.orient = FxQuat{0, 0, 0, kOne}; b.angVel = {0, kOne, 0};  // spin about +Y
+        fpx::FxBody bcopy = b;
+        const int K = 30;
+        for (int s = 0; s < K; ++s) fpx::IntegrateBodyFull(b, grav, kDt);
+        check(b.pos.y < FromInt(5), "IntegrateBodyFull: dynamic body fell under gravity");
+        check(b.orient.y != 0 || b.orient.w != kOne, "IntegrateBodyFull: orientation integrated");
+
+        // Determinism: a second identical run is byte-identical.
+        for (int s = 0; s < K; ++s) fpx::IntegrateBodyFull(bcopy, grav, kDt);
+        check(std::memcmp(&b, &bcopy, sizeof(fpx::FxBody)) == 0,
+              "IntegrateBodyFull: two runs byte-identical (determinism)");
+
+        // Static body (no dynamic flag) does NOT translate; with angVel=0 it is fully unchanged.
+        fpx::FxBody stat; stat.pos = {FromInt(2), FromInt(3), 0}; stat.flags = 0; stat.invMass = 0;
+        stat.orient = FxQuat{0, 0, 0, kOne}; stat.angVel = {0, 0, 0};
+        fpx::FxBody statInit = stat;
+        for (int s = 0; s < K; ++s) fpx::IntegrateBodyFull(stat, grav, kDt);
+        check(std::memcmp(&stat, &statInit, sizeof(fpx::FxBody)) == 0,
+              "IntegrateBodyFull: static+angVel=0 body unchanged (no-op)");
+    }
+
     if (g_fail == 0) std::printf("fpx_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

@@ -96,6 +96,16 @@ inline fx FxLength(const FxVec3& v) {
     return (fx)FxISqrt(sx + sy + sz);
 }
 
+// ----- Slice FPX4: the Q16.16 quaternion (declared early so FxBody can carry a DEFAULTED orient) -----
+// A fixed-point quaternion (the fixed-point twin of math::Quat). identity = {0,0,0,kOne}. std430-packable
+// as 4 x int32 (x,y,z,w) — the GPU FxQuat mirror. The FPX4 math (FxQuatMul/FxQuatNormalize/FxRotate/
+// IntegrateOrientation/IntegrateBodyFull) lives in the FPX4 section below; only the type + kHalf are
+// declared here so FxBody can DEFAULT an `orient`/`angVel` without changing FPX1-FPX3 behavior.
+inline constexpr fx kHalf = kOne / 2;   // 0.5 in Q16.16 (the 0.5*dq*dt factor of q' = 0.5*ω⊗q)
+struct FxQuat {
+    fx x = 0, y = 0, z = 0, w = kOne;
+};
+
 // ----- The rigid body + world (the fixed-point twin of physics::RigidBody / physics::World) --------
 // flags bit 0 = dynamic (integrated by gravity); invMass==0 / !(flags&1) => static/kinematic (never
 // moves). std430-packable as plain int32s (pos.xyz, vel.xyz, invMass, flags) — the GPU FxBody mirror.
@@ -108,6 +118,12 @@ struct FxBody {
     // so FPX1's bodies/tests/showcase are UNCHANGED in behavior (FPX1's IntegrateStep IGNORES radius — it
     // only reads pos/vel/invMass/flags). The integer AABB BodyAabb(b) = {pos - radius, pos + radius}.
     fx       radius  = 0;    // Q16.16 broadphase half-extent (0 => a point; FPX2's AabbOverlap input)
+    // Slice FPX4 orientation: a Q16.16 quaternion + angular velocity. DEFAULTED (identity orient, zero
+    // angVel) so FPX1-FPX3's IntegrateStep/StepWorld + their GPU packs (FpxBodyGpu etc., which pack ONLY
+    // the FPX1-3 fields above) are byte-identical — FPX1-3 NEVER read these. FPX4's IntegrateBodyFull /
+    // fpx_orient.comp read+write them; the FPX4 GPU pack appends orient.xyzw + angVel.xyz.
+    FxQuat   orient;         // Q16.16 orientation quaternion (default identity {0,0,0,kOne})
+    FxVec3   angVel;         // Q16.16 angular velocity (radians/second, body-axis omega; default 0)
 };
 
 inline constexpr uint32_t kFlagDynamic = 1u;
@@ -367,6 +383,105 @@ inline uint32_t CountResidualOverlaps(const FxWorld& w, std::span<const FxPair> 
         if (pen > 0) ++r;
     }
     return r;
+}
+
+// ===== Slice FPX4 — fixed-point integer QUATERNION ORIENTATION (Phase 11 #4) ========================
+// Add ORIENTATION to the deterministic fixed-point sim: each body carries a Q16.16 quaternion `orient`
+// + an angular velocity `angVel`, integrated per-body from angVel as a fixed-point quaternion,
+// normalized via the integer sqrt (FxISqrt) — so the physics state is full 6-DOF (position +
+// orientation) and STILL bit-identical CPU<->Vulkan<->Metal AND frame-deterministic. ADDITIVE: the
+// orient/angVel fields below are DEFAULTED on FxBody so FPX1-FPX3's IntegrateStep/StepWorld + their GPU
+// packs (which pack ONLY the FPX1-3 fields) are byte-identical, and their goldens are unchanged.
+//
+// THE int64/glslc METAL LESSON (FPX1/FPX3): FxQuatMul's Hamilton products + FxQuatNormalize's FxISqrt
+// use the int64 fxmul/fxdiv. DXC compiles int64 (the Vulkan path); glslc (the Metal HLSL->SPIR-V->MSL
+// frontend) CANNOT parse int64_t in HLSL. So shaders/fpx_orient.comp.hlsl is VULKAN-SPIR-V-ONLY (in the
+// Vulkan compile list, NOT the Metal hf_gen_msl list); the Metal --fpx-orient showcase runs the CPU
+// IntegrateBodyFull over the same bodies -> byte-identical to the Vulkan GPU result by construction (the
+// Vulkan side carries the GPU==CPU bit-identity proof). The math here is copied VERBATIM by
+// fpx_orient.comp so the GPU exercises the EXACT integer ops -> the GPU==CPU memcmp catches divergence.
+// (FxQuat + kHalf are declared near FxBody above so the body can carry a DEFAULTED orient/angVel.)
+
+// FxQuatMul(a, b): the Hamilton product a*b, each term an int64 fxmul (the swraster/mc int64 discipline,
+// no overflow within the documented bound; for unit quaternions every component is in [-kOne,kOne]). The
+// standard quaternion multiplication. The shader copies THIS body VERBATIM.
+inline FxQuat FxQuatMul(const FxQuat& a, const FxQuat& b) {
+    FxQuat r;
+    r.w = fxmul(a.w, b.w) - fxmul(a.x, b.x) - fxmul(a.y, b.y) - fxmul(a.z, b.z);
+    r.x = fxmul(a.w, b.x) + fxmul(a.x, b.w) + fxmul(a.y, b.z) - fxmul(a.z, b.y);
+    r.y = fxmul(a.w, b.y) - fxmul(a.x, b.z) + fxmul(a.y, b.w) + fxmul(a.z, b.x);
+    r.z = fxmul(a.w, b.z) + fxmul(a.x, b.y) - fxmul(a.y, b.x) + fxmul(a.z, b.w);
+    return r;
+}
+
+// FxQuatNormalize(q): the unit quaternion of q in Q16.16 (integer normalize, NO std::sqrt / <cmath>).
+// len = FxISqrt of the int64 Q32.32 sum-of-squares (each q.c*q.c is Q32.32; sqrt(Q32.32)=Q16.16, the
+// FxLength discipline on 4 components). len==0 -> return identity (a deterministic fallback). Otherwise
+// {fxdiv(x,len), fxdiv(y,len), fxdiv(z,len), fxdiv(w,len)}. The fixed-point normalize is NOT perfect:
+// |q| drifts slightly but DETERMINISTICALLY (the |q|≈kOne-within-tol check is the proof). The shader
+// copies THIS body VERBATIM.
+inline FxQuat FxQuatNormalize(const FxQuat& q) {
+    const int64_t sx = (int64_t)q.x * (int64_t)q.x;
+    const int64_t sy = (int64_t)q.y * (int64_t)q.y;
+    const int64_t sz = (int64_t)q.z * (int64_t)q.z;
+    const int64_t sw = (int64_t)q.w * (int64_t)q.w;
+    const fx len = (fx)FxISqrt(sx + sy + sz + sw);
+    if (len == 0) return FxQuat{0, 0, 0, kOne};
+    return FxQuat{fxdiv(q.x, len), fxdiv(q.y, len), fxdiv(q.z, len), fxdiv(q.w, len)};
+}
+
+// FxRotate(q, v): rotate the vector v by the (unit) quaternion q, via the optimized form
+// v' = v + 2*cross(q.xyz, cross(q.xyz, v) + q.w*v) — all fxmul, NO float. For the orientation-gizmo viz
+// (project FxRotate(orient, axis) for the 3 local axes). The shader does NOT need this (host-only viz).
+inline FxVec3 FxRotate(const FxQuat& q, const FxVec3& v) {
+    // u = q.xyz; t = cross(u, v) + q.w*v ; v' = v + 2*cross(u, t).
+    const FxVec3 u{q.x, q.y, q.z};
+    // c1 = cross(u, v).
+    const FxVec3 c1{
+        fxmul(u.y, v.z) - fxmul(u.z, v.y),
+        fxmul(u.z, v.x) - fxmul(u.x, v.z),
+        fxmul(u.x, v.y) - fxmul(u.y, v.x),
+    };
+    // t = c1 + q.w*v.
+    const FxVec3 t{c1.x + fxmul(q.w, v.x), c1.y + fxmul(q.w, v.y), c1.z + fxmul(q.w, v.z)};
+    // c2 = cross(u, t).
+    const FxVec3 c2{
+        fxmul(u.y, t.z) - fxmul(u.z, t.y),
+        fxmul(u.z, t.x) - fxmul(u.x, t.z),
+        fxmul(u.x, t.y) - fxmul(u.y, t.x),
+    };
+    // v' = v + 2*c2.
+    return FxVec3{v.x + 2 * c2.x, v.y + 2 * c2.y, v.z + 2 * c2.z};
+}
+
+// IntegrateOrientation(b, dt): the deterministic quaternion angular integrator. dq = ω⊗q (the pure-
+// quaternion product of ωquat={angVel.xyz,0} with the current orient); orient += 0.5*dq*dt component-
+// wise; then renormalize. Fixed op order, per-body independent. The shader copies THIS body VERBATIM.
+inline void IntegrateOrientation(FxBody& b, fx dt) {
+    const FxQuat omega{b.angVel.x, b.angVel.y, b.angVel.z, 0};
+    const FxQuat dq = FxQuatMul(omega, b.orient);
+    b.orient.x += fxmul(fxmul(dq.x, kHalf), dt);
+    b.orient.y += fxmul(fxmul(dq.y, kHalf), dt);
+    b.orient.z += fxmul(fxmul(dq.z, kHalf), dt);
+    b.orient.w += fxmul(fxmul(dq.w, kHalf), dt);
+    b.orient = FxQuatNormalize(b.orient);
+}
+
+// IntegrateBodyFull(b, gravity, dt) = the FPX1 translational IntegrateStep body (vel += gravity*dt; pos
+// += vel*dt; NO ground clamp here — FPX4's showcase has no ground) + IntegrateOrientation. Only dynamic
+// bodies move (translation gated by kFlagDynamic, matching IntegrateBody); orientation integrates for
+// every body (a static body with angVel=0 is unchanged anyway). FPX1-FPX3 keep calling the original
+// IntegrateStep — UNCHANGED. The shader runs THIS exact per-body body K times.
+inline void IntegrateBodyFull(FxBody& b, const FxVec3& gravity, fx dt) {
+    if (b.flags & kFlagDynamic) {
+        b.vel.x += fxmul(gravity.x, dt);
+        b.vel.y += fxmul(gravity.y, dt);
+        b.vel.z += fxmul(gravity.z, dt);
+        b.pos.x += fxmul(b.vel.x, dt);
+        b.pos.y += fxmul(b.vel.y, dt);
+        b.pos.z += fxmul(b.vel.z, dt);
+    }
+    IntegrateOrientation(b, dt);
 }
 
 }  // namespace fpx
