@@ -590,4 +590,114 @@ inline void MarchCells(const VoxelField& f, int32_t iso,
             }
 }
 
+// ===== MC4: fixed-point INTERPOLATED edge-vertex placement ========================================
+// MC3 placed each emitted vertex at the cell-edge MIDPOINT. MC4 places it at the ACTUAL isosurface
+// crossing along the edge — linear interpolation by the two corner scalar values — so the extracted
+// surface is SMOOTH (watertight-on-the-field) instead of blocky. The interpolation parameter
+//   t = (iso - s0) / (s1 - s0)   in [0,1]
+// is computed in FIXED-POINT INTEGER on a 1/kSub edge lattice (the swraster.h kSub trick) — NO float
+// anywhere on the interpolation path — so the interpolated vertex buffer stays GPU==CPU BIT-EXACT and
+// the golden is cross-backend BIT-IDENTICAL. MC3's EdgeMidpoint/EmitCell/MarchCells are left UNCHANGED
+// (its mc_emit golden is the t=0.5 reference); MC4 adds the sibling EdgeInterp/EmitCellInterp/
+// MarchCellsInterp. The GPU shaders/mc_interp.comp.hlsl copies EdgeInterp's fixed-point t + clamp
+// VERBATIM and memcmp's GPU==CPU.
+
+// The fixed-point edge lattice: a vertex coordinate is stored in 1/kSub grid units, so the edge
+// MIDPOINT is kSub/2, the cube spans [0, (dim-1)*kSub], and t in [0,kSub]. Finer than swraster's
+// kSub=16 (here 256) for a smooth surface. Note MC3's McVertex was HALF-units (Ca+Cb = 2×midpoint);
+// MC4's EdgeInterp uses the SAME McVertex struct but in 1/kSub units (Ca*kSub + (Cb-Ca)*t), a finer
+// independent lattice — the two emitters are siblings, never mixed in one buffer.
+static constexpr int32_t kSub = 256;
+
+// EdgeInterp(cell, edge, field, iso): the INTERPOLATED isosurface crossing on kEdgeCorner[edge]=(a,b).
+// Ca = cell + kCornerOffset[a], Cb = cell + kCornerOffset[b] (the two differ by exactly +1 in ONE axis
+// — MC edges are axis-aligned). s0 = SampleField(Ca), s1 = SampleField(Cb). Compute t in [0,kSub]:
+//   * if s1 == s0 (degenerate, no gradient): t = kSub/2 (the midpoint — matches MC3's choice,
+//     deterministic).
+//   * else: t = ((iso - s0) * kSub) / (s1 - s0), then clamp t to [0,kSub].
+// vertexPos.axis = Ca.axis*kSub + (Cb.axis - Ca.axis)*t per axis (the spanning axis moves by ±t, the
+// other two stay at Ca.axis*kSub). Returns {x,y,z,0} in 1/kSub units.
+//
+// THE CROSS-BACKEND CRUX: the ONE division is INTEGER and TRUNCATES TOWARD ZERO — the DEFAULT for both
+// C++ `/` and HLSL `/` — so it is bit-identical CPU↔GPU↔every vendor. We use int32 for t (NOT int64):
+// the numerator (iso - s0) * kSub fits int32 — for this field |scalar| ~ radius*kFixed + dist*kFixed,
+// and on the showcase field (n=33, r=12, kFixed=256) |scalar| <= ~10200, so |(iso - s0)| <= ~10200 and
+// (iso - s0)*kSub (kSub=256) <= ~2.6e6, far inside int32's 2.1e9 range. Staying int32 AVOIDS the
+// int64/glslc(SPIR-V) issue (no --msl-version 20200, no Vulkan-only/Metal-CPU split). The t clamp
+// guards an out-of-range t from a non-bracketing edge. The GPU mc_interp.comp copies this body VERBATIM.
+inline McVertex EdgeInterp(int cx, int cy, int cz, int edge, const VoxelField& f, int32_t iso) {
+    const int a = kEdgeCorner[edge][0];
+    const int b = kEdgeCorner[edge][1];
+    const int ax = cx + kCornerOffset[a][0], ay = cy + kCornerOffset[a][1], az = cz + kCornerOffset[a][2];
+    const int bx = cx + kCornerOffset[b][0], by = cy + kCornerOffset[b][1], bz = cz + kCornerOffset[b][2];
+    const int32_t s0 = SampleField(f, ax, ay, az);
+    const int32_t s1 = SampleField(f, bx, by, bz);
+
+    int32_t t;
+    if (s1 == s0) {
+        t = kSub / 2;                              // degenerate edge -> the deterministic midpoint
+    } else {
+        t = ((iso - s0) * kSub) / (s1 - s0);       // truncating integer divide (C++/HLSL identical)
+        if (t < 0) t = 0; else if (t > kSub) t = kSub;
+    }
+
+    McVertex v;
+    v.x = ax * kSub + (bx - ax) * t;
+    v.y = ay * kSub + (by - ay) * t;
+    v.z = az * kSub + (bz - az) * t;
+    v.w = 0;
+    return v;
+}
+
+// EmitCellInterp: MC3's EmitCell with EdgeInterp substituted for EdgeMidpoint (same triangle-soup
+// layout, same identity indices, same kTriTable walk, same disjoint [3*triOffset, ..) range -> race-
+// free, NO atomics). The GPU mc_interp.comp copies this walk VERBATIM.
+inline void EmitCellInterp(int cx, int cy, int cz, uint8_t caseIndex, uint32_t triOffset,
+                           const VoxelField& f, int32_t iso,
+                           std::span<McVertex> vertsOut, std::span<uint32_t> idxOut) {
+    const int8_t* row = kTriTable[caseIndex];
+    uint32_t t = 0u;
+    for (int e = 0; e + 2 < 16; e += 3) {
+        if (row[e] < 0) break;   // -1 terminator -> done
+        for (int k = 0; k < 3; ++k) {
+            const int edge = (int)row[e + k];
+            const uint32_t slot = 3u * (triOffset + t) + (uint32_t)k;
+            vertsOut[slot] = EdgeInterp(cx, cy, cz, edge, f, iso);
+            idxOut[slot] = slot;   // identity index (triangle soup)
+        }
+        ++t;
+    }
+}
+
+// MarchCellsInterp: MC3's MarchCells with EdgeInterp emission — classify -> count -> PrefixSumOffsets ->
+// EmitCellInterp per cell. Same triangle count + index layout as MarchCells (the ONLY difference is the
+// vertex POSITIONS — interpolated, not midpoint). The reference the GPU mc_scan+mc_interp memcmp's
+// against; verts.size() == idx.size() == 3*triCount.
+inline void MarchCellsInterp(const VoxelField& f, int32_t iso,
+                             std::vector<McVertex>& verts, std::vector<uint32_t>& idx,
+                             uint32_t& triCount) {
+    const int cxN = f.nx - 1, cyN = f.ny - 1, czN = f.nz - 1;
+    const size_t cellCount = (size_t)f.cellCount();
+
+    std::vector<uint8_t> cases;
+    std::vector<uint32_t> counts;
+    ClassifyCells(f, iso, cases);
+    CountCells(f, iso, counts);
+
+    std::vector<uint32_t> offsets(cellCount, 0u);
+    uint32_t total = 0u;
+    PrefixSumOffsets(std::span<const uint32_t>(counts), std::span<uint32_t>(offsets), total);
+    triCount = total;
+
+    verts.assign((size_t)total * 3u, McVertex{0, 0, 0, 0});
+    idx.assign((size_t)total * 3u, 0u);
+    for (int cz = 0; cz < czN; ++cz)
+        for (int cy = 0; cy < cyN; ++cy)
+            for (int cx = 0; cx < cxN; ++cx) {
+                const int cellId = (cz * cyN + cy) * cxN + cx;
+                EmitCellInterp(cx, cy, cz, cases[(size_t)cellId], offsets[(size_t)cellId],
+                               f, iso, std::span<McVertex>(verts), std::span<uint32_t>(idx));
+            }
+}
+
 }  // namespace hf::render::mc

@@ -259,6 +259,14 @@ hf_gen_msl(mc_count.comp         mc_count.comp.hlsl         comp mc_count_main)
 # cross-backend by construction. Behind --mc-emit only; existing shaders + goldens untouched.
 hf_gen_msl(mc_scan.comp          mc_scan.comp.hlsl          comp mc_scan_main)
 hf_gen_msl(mc_emit.comp          mc_emit.comp.hlsl          comp mc_emit_main)
+# GPU Isosurface Meshing Slice 4 (Slice MC4): mc_interp.comp is mc_emit.comp with EdgeInterp instead of
+# EdgeMidpoint — the per-cell triangle emission with FIXED-POINT INTERPOLATED vertex placement (the vertex
+# sits on the ACTUAL isosurface crossing, t = ((iso-s0)*kSub)/(s1-s0) on the 1/kSub lattice, the SAME
+# truncating integer divide both sides -> bit-exact GPU==CPU + cross-backend). INT32 throughout (numerator
+# fits) -> no int64; plain integer SSBO writes -> the default MSL gen suffices (NO --msl-version 20200, the
+# mc_classify/mc_count/mc_emit lesson). Reuses mc_scan.comp UNCHANGED. Behind --mc-interp only; existing
+# MC1-MC3 shaders + goldens untouched.
+hf_gen_msl(mc_interp.comp        mc_interp.comp.hlsl        comp mc_interp_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

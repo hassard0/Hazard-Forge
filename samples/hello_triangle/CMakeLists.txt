@@ -463,6 +463,13 @@ hf_compile_shaders(
     # existing shaders + goldens untouched.
     "shaders/mc_scan.comp.hlsl:cs"
     "shaders/mc_emit.comp.hlsl:cs"
+    # GPU Isosurface Meshing Slice 4 (Slice MC4): mc_interp.comp is mc_emit.comp with EdgeInterp instead
+    # of EdgeMidpoint — the per-cell triangle emission with FIXED-POINT INTERPOLATED vertex placement (the
+    # vertex sits on the ACTUAL isosurface crossing along the edge, t = ((iso-s0)*kSub)/(s1-s0) on the
+    # 1/kSub lattice, the SAME truncating integer divide both sides -> bit-exact GPU==CPU + cross-backend;
+    # int32 throughout (numerator fits) so NO int64/glslc issue). Reuses mc_scan.comp UNCHANGED. NO new
+    # RHI; existing MC1-MC3 shaders + goldens untouched.
+    "shaders/mc_interp.comp.hlsl:cs"
     # Nanite Software-Raster RESOLVE blit (Slice SW4): swraster_resolve_blit.frag is a FULLSCREEN pass
     # (reuses post.vert) that unpacks the SW2 software rasterizer's packed depth|id visibility-buffer SSBO
     # into the R32_Uint visId render target the EXISTING visresolve.frag deferred resolve consumes, so the

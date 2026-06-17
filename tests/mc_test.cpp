@@ -15,9 +15,12 @@
 // Pure C++ (hf_core), ASan-eligible like the other render-math tests.
 #include "render/mc.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <span>
 #include <vector>
 #include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
@@ -400,6 +403,142 @@ int main() {
         // The disabled (meshEnabled=false) path is modeled as the cleared (empty) buffers: a real field
         // marches to a NON-empty mesh (so the no-op is meaningful).
         check(!verts.empty(), "a real sphere field marches to a NON-empty mesh");
+    }
+
+    // ================= MC4: EdgeInterp fixed-point interpolation ==================================
+    // A tiny field where we can hand-pick the corner scalars on a chosen edge and verify the
+    // fixed-point t + the resulting vertex coord. We build a 2x2x2-corner field (1 cell) and set the
+    // scalars so a given edge brackets iso=0 asymmetrically. Edge 0 = corners (0,1) = (0,0,0)->(1,0,0)
+    // (the +x axis).
+    {
+        // kSub is the locked fixed-point lattice.
+        check(mc::kSub == 256, "MC4 kSub == 256 (the locked fixed-point edge lattice)");
+
+        // Symmetric edge: s0 = -10, s1 = +10, iso = 0 -> t == kSub/2 (the midpoint).
+        {
+            mc::VoxelField f; f.nx = f.ny = f.nz = 2; f.scalar.assign(8, 0);
+            // corner index 0 = (0,0,0), corner 1 = (1,0,0); flat = (z*ny+y)*nx+x.
+            f.scalar[(0 * 2 + 0) * 2 + 0] = -10;  // (0,0,0)
+            f.scalar[(0 * 2 + 0) * 2 + 1] = +10;  // (1,0,0)
+            mc::McVertex v = mc::EdgeInterp(0, 0, 0, /*edge=*/0, f, /*iso=*/0);
+            // The spanning axis (x) moves to Ca.x*kSub + (Cb.x-Ca.x)*t = 0 + 1*128 = kSub/2.
+            check(v.x == mc::kSub / 2, "EdgeInterp symmetric edge -> t==kSub/2 (x == 128)");
+            check(v.y == 0 && v.z == 0, "EdgeInterp symmetric edge -> non-spanning axes at Ca*kSub (0)");
+        }
+
+        // Asymmetric edge: s0 = -1, s1 = +3, iso = 0 -> t = ((0 - (-1))*256)/(3 - (-1)) = 256/4 = 64.
+        {
+            mc::VoxelField f; f.nx = f.ny = f.nz = 2; f.scalar.assign(8, 0);
+            f.scalar[(0 * 2 + 0) * 2 + 0] = -1;   // (0,0,0)
+            f.scalar[(0 * 2 + 0) * 2 + 1] = +3;   // (1,0,0)
+            mc::McVertex v = mc::EdgeInterp(0, 0, 0, 0, f, 0);
+            check(v.x == 64, "EdgeInterp asymmetric edge -> known fixed-point t (x == 64)");
+            check(v.y == 0 && v.z == 0, "EdgeInterp asymmetric edge -> non-spanning axes 0");
+        }
+
+        // Degenerate edge: s0 == s1 -> t == kSub/2 (the midpoint, deterministic).
+        {
+            mc::VoxelField f; f.nx = f.ny = f.nz = 2; f.scalar.assign(8, 0);
+            f.scalar[(0 * 2 + 0) * 2 + 0] = 5;    // (0,0,0)
+            f.scalar[(0 * 2 + 0) * 2 + 1] = 5;    // (1,0,0)
+            mc::McVertex v = mc::EdgeInterp(0, 0, 0, 0, f, 0);
+            check(v.x == mc::kSub / 2, "EdgeInterp degenerate s0==s1 -> midpoint (x == 128)");
+        }
+
+        // Clamp on a non-bracketing edge: s0 = +1, s1 = +5, iso = 0 -> raw t = (-1*256)/4 = -64 -> clamp 0.
+        {
+            mc::VoxelField f; f.nx = f.ny = f.nz = 2; f.scalar.assign(8, 0);
+            f.scalar[(0 * 2 + 0) * 2 + 0] = +1;   // (0,0,0)
+            f.scalar[(0 * 2 + 0) * 2 + 1] = +5;   // (1,0,0)
+            mc::McVertex v = mc::EdgeInterp(0, 0, 0, 0, f, 0);
+            check(v.x == 0, "EdgeInterp non-bracketing edge (t<0) -> clamp to Ca (x == 0)");
+        }
+        // Clamp the other way: s0 = -5, s1 = -1, iso = 0 -> raw t = (5*256)/4 = 320 > kSub -> clamp kSub.
+        {
+            mc::VoxelField f; f.nx = f.ny = f.nz = 2; f.scalar.assign(8, 0);
+            f.scalar[(0 * 2 + 0) * 2 + 0] = -5;   // (0,0,0)
+            f.scalar[(0 * 2 + 0) * 2 + 1] = -1;   // (1,0,0)
+            mc::McVertex v = mc::EdgeInterp(0, 0, 0, 0, f, 0);
+            check(v.x == mc::kSub, "EdgeInterp non-bracketing edge (t>kSub) -> clamp to Cb (x == 256)");
+        }
+    }
+
+    // ================= MC4: MarchCellsInterp over the sphere field ================================
+    {
+        mc::VoxelField f = mc::MakeSphereField(33, 12);
+        std::vector<mc::McVertex> verts; std::vector<uint32_t> idx; uint32_t triCount = 0u;
+        mc::MarchCellsInterp(f, 0, verts, idx, triCount);
+
+        // Same tri count + index layout as MC3 (the ONLY difference is vertex positions).
+        check(triCount == 5240u, "MarchCellsInterp(sphere 33/r12/iso0) triCount == 5240 (matches MC3)");
+        check(verts.size() == 3u * 5240u && idx.size() == 3u * 5240u,
+              "MarchCellsInterp(sphere) verts==idx==3*5240==15720");
+        bool identity = true;
+        for (size_t i = 0; i < idx.size(); ++i) if (idx[i] != (uint32_t)i) identity = false;
+        check(identity, "MarchCellsInterp index buffer is the identity [0,3*triCount)");
+
+        // Every vertex lies ON its edge (each axis in [Ca*kSub, Cb*kSub]) AND on-surface (reconstructed
+        // edge scalar ≈ iso within ±1 fixed-pt). Recover (cell,edge) by walking the same emission order.
+        std::vector<uint8_t> cases; mc::ClassifyCells(f, 0, cases);
+        std::vector<uint32_t> counts; mc::CountCells(f, 0, counts);
+        std::vector<uint32_t> offsets((size_t)f.cellCount(), 0u);
+        uint32_t total = 0u;
+        mc::PrefixSumOffsets(std::span<const uint32_t>(counts), std::span<uint32_t>(offsets), total);
+        const int cxN = f.nx - 1, cyN = f.ny - 1;
+        bool onEdge = true; int maxErr = 0;
+        for (int c = 0; c < f.cellCount(); ++c) {
+            const uint8_t kase = cases[(size_t)c];
+            if (!mc::IsSurfaceCase(kase)) continue;
+            const int cx = c % cxN, cy = (c / cxN) % cyN, cz = c / (cxN * cyN);
+            const uint32_t base = offsets[(size_t)c] * 3u;
+            uint32_t loc = 0u;
+            for (int e = 0; e + 2 < 16; e += 3) {
+                if (mc::kTriTable[kase][e] < 0) break;
+                for (int k = 0; k < 3; ++k) {
+                    const int edge = (int)mc::kTriTable[kase][e + k];
+                    const int a = mc::kEdgeCorner[edge][0], b = mc::kEdgeCorner[edge][1];
+                    const int Ca[3] = {cx + mc::kCornerOffset[a][0], cy + mc::kCornerOffset[a][1], cz + mc::kCornerOffset[a][2]};
+                    const int Cb[3] = {cx + mc::kCornerOffset[b][0], cy + mc::kCornerOffset[b][1], cz + mc::kCornerOffset[b][2]};
+                    const mc::McVertex& v = verts[base + loc];
+                    const int coord[3] = {v.x, v.y, v.z};
+                    int t = mc::kSub / 2;
+                    for (int ax = 0; ax < 3; ++ax) {
+                        const int lo = std::min(Ca[ax], Cb[ax]) * mc::kSub;
+                        const int hi = std::max(Ca[ax], Cb[ax]) * mc::kSub;
+                        if (coord[ax] < lo || coord[ax] > hi) onEdge = false;
+                        if (Cb[ax] != Ca[ax]) t = (coord[ax] - Ca[ax] * mc::kSub) * (Cb[ax] - Ca[ax]);
+                    }
+                    const int32_t s0 = mc::SampleField(f, Ca[0], Ca[1], Ca[2]);
+                    const int32_t s1 = mc::SampleField(f, Cb[0], Cb[1], Cb[2]);
+                    const int32_t recon = s0 + (int32_t)(((int64_t)(s1 - s0) * t) / mc::kSub);
+                    const int err = std::abs(recon - 0);
+                    if (err > maxErr) maxErr = err;
+                    ++loc;
+                }
+            }
+        }
+        check(onEdge, "MarchCellsInterp every vertex axis in [Ca*kSub, Cb*kSub] (on the edge)");
+        check(maxErr <= 1, "MarchCellsInterp on-surface: reconstructed scalar ≈ iso within ±1 fixed-pt");
+
+        // Determinism: a second interp-march is byte-identical.
+        std::vector<mc::McVertex> verts2; std::vector<uint32_t> idx2; uint32_t triCount2 = 0u;
+        mc::MarchCellsInterp(f, 0, verts2, idx2, triCount2);
+        bool same = (triCount == triCount2) && verts.size() == verts2.size() &&
+                    std::memcmp(verts.data(), verts2.data(), verts.size() * sizeof(mc::McVertex)) == 0 &&
+                    std::memcmp(idx.data(), idx2.data(), idx.size() * sizeof(uint32_t)) == 0;
+        check(same, "MarchCellsInterp determinism: two marches BYTE-IDENTICAL (verts + indices)");
+
+        // The interpolated mesh DIFFERS from the midpoint mesh (the quality step is real) but shares the
+        // SAME index buffer + tri count.
+        std::vector<mc::McVertex> mverts; std::vector<uint32_t> midx; uint32_t mtri = 0u;
+        mc::MarchCells(f, 0, mverts, midx, mtri);
+        check(mtri == triCount && midx.size() == idx.size(),
+              "MarchCellsInterp shares MC3's tri count + index layout");
+        bool vertsDiffer = verts.size() == mverts.size() &&
+                           std::memcmp(verts.data(), mverts.data(), verts.size() * sizeof(mc::McVertex)) != 0;
+        check(vertsDiffer, "MarchCellsInterp vertices DIFFER from MC3 midpoint vertices (interp is real)");
+
+        check(!verts.empty(), "a real sphere field interp-marches to a NON-empty mesh");
     }
 
     if (g_fail == 0) std::printf("mc_test: ALL PASS\n");
