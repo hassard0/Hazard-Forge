@@ -387,6 +387,13 @@ hf_compile_shaders(
     # BIT-EXACT to the CPU SH-encode. Pure compute + storage buffers (no new RHI seam). The probeCount=0
     # dispatch-0 leaves the SH SSBO untouched == the cleared upload.
     "shaders/probe_sh_encode.comp.hlsl:cs"
+    # Probe Trilinear SH-Interp — DDGI Slice 4 (Slice DL): one thread per QUERY point trilinearly blends
+    # the 8 surrounding probes' SH at the query's world position into a single ProbeSH. NearestProbes (the
+    # FLOOR-cell 8 corners + polynomial weights) + InterpolateSH (the per-corner fma SH accumulation) are
+    # copied VERBATIM from engine/render/probe_gi.h + probe_sh.h (mad for the per-corner product), so the
+    # GPU blended-SH SSBO is BIT-EXACT to the CPU InterpolateSH reference. Pure compute + storage buffers
+    # (no new RHI seam). The probeCount=0 dispatch-0 leaves the output SSBO untouched == the cleared upload.
+    "shaders/probe_interp.comp.hlsl:cs"
     # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
     # color (flat float4 SSBO), computes the Rec.709 Luminance, maps it to a log2-luminance bin via
     # render/auto_exposure.h::LumToBin, and InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER SSBO

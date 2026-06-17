@@ -165,6 +165,47 @@ inline math::Vec3 SHEvaluate(const ProbeSH& sh, const math::Vec3& dir, bool cosi
     return r;
 }
 
+// --- Trilinear SH interpolation (the DDGI Slice 4 primitive the GI composite samples). -------------
+// InterpolateSH(worldPos, grid, probes, probeCount): trilinearly blend the 8 surrounding probes' SH at
+// `worldPos` into a single ProbeSH. tri = probegi::NearestProbes(worldPos, grid); on the degenerate /
+// disabled path (!tri.valid || probeCount<=0) -> a zeroed ProbeSH (the documented disabled fallback the
+// DL composite reads as "no indirect"). Otherwise, for each of the 9x3 coeffs:
+//   out.coeff[i][c] = Σ_corner std::fma(tri.w[corner], probes[tri.idx[corner]].coeff[i][c], acc)
+// SH projection is LINEAR, so blend-then-evaluate == evaluate-then-blend; we blend the compact SH (27
+// floats) once, not the reconstructed irradiance. The per-corner accumulation uses an explicit std::fma
+// per coeff (the cross-backend bit-exactness key — a plain w*coeff+acc contracts to fma on Metal's
+// fast-math but not on Vulkan/DXC or the CPU; the fma is a SINGLE correctly-rounded op matching the
+// shader's mad). The corner indices are clamped in-range by NearestProbes so `probes[tri.idx[c]]` is
+// always a valid read for probeCount>0. Pure / deterministic.
+inline ProbeSH InterpolateSH(const math::Vec3& worldPos, const probegi::ProbeGrid& grid,
+                             const ProbeSH* probes, int probeCount) {
+    ProbeSH out{};
+    for (int i = 0; i < 9; ++i) { out.coeff[i][0] = 0.0f; out.coeff[i][1] = 0.0f; out.coeff[i][2] = 0.0f; }
+    probegi::ProbeTrilinear tri = probegi::NearestProbes(worldPos, grid);
+    if (!tri.valid || probeCount <= 0 || probes == nullptr) return out;   // zeroed disabled fallback
+    for (int c = 0; c < 8; ++c) {
+        const ProbeSH& src = probes[tri.idx[c]];
+        const float wc = tri.w[c];
+        for (int i = 0; i < 9; ++i) {
+            out.coeff[i][0] = std::fma(wc, src.coeff[i][0], out.coeff[i][0]);
+            out.coeff[i][1] = std::fma(wc, src.coeff[i][1], out.coeff[i][1]);
+            out.coeff[i][2] = std::fma(wc, src.coeff[i][2], out.coeff[i][2]);
+        }
+    }
+    return out;
+}
+
+// InterpolateIrradiance(worldPos, grid, probes, probeCount, normal): the diffuse indirect irradiance a
+// surface with `normal` receives at `worldPos` — SHEvaluate(InterpolateSH(...), normalize(normal)) with
+// the cosine-lobe convolution. On the disabled path InterpolateSH returns a zero SH so this returns
+// {0,0,0} (the DL composite's "no indirect" identity). Pure / deterministic.
+inline math::Vec3 InterpolateIrradiance(const math::Vec3& worldPos, const probegi::ProbeGrid& grid,
+                                        const ProbeSH* probes, int probeCount,
+                                        const math::Vec3& normal) {
+    ProbeSH sh = InterpolateSH(worldPos, grid, probes, probeCount);
+    return SHEvaluate(sh, math::normalize(normal));
+}
+
 // --- The disabled / dispatch-sizing path (one thread per probe). -------------------------------------
 // kEncodeThreads = the compute workgroup size. EncodeDispatchGroups(grid) = the number of kEncodeThreads
 // workgroups to cover probeCount probes, or EXACTLY 0 when probeCount<=0 (dimX/dimY/dimZ == 0 ->

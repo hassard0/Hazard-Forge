@@ -290,6 +290,22 @@ hf_add_pure_test(probe_capture_test)
 # Pure C++ (hf_core; reuses render/probe_gi.h), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(probe_sh_test)
 
+# Slice DL — DDGI Slice 4: Probe-Grid Update / Trilinear SH Interpolation. Pure CPU math for the trilinear
+# probe blend (render/probe_gi.h's NearestProbes + InterpDispatchGroups, render/probe_sh.h's InterpolateSH
+# + InterpolateIrradiance): the FLOOR-cell 8-corner lookup with polynomial trilinear weights (computed
+# with std::fma per corner so the per-corner product is a single correctly-rounded op matching the shader's
+# mad — the cross-backend bit-exactness key) and the fma-blended 27-float SH at a world position. Pins:
+# partition of unity (Σw==1 over interior points, weights in [0,1]), lattice-point identity (at a probe
+# position that corner has weight 1 + InterpolateSH == that probe's SH byte-identical — the round-trip),
+# boundary clamp (far-outside -> in-range indices + frac saturates to a single boundary corner), dim==1
+# axis degeneracy (a 1-thick axis contributes no second corner), the disabled guard (spacing<=0 / dim<=0
+# -> valid=false -> InterpolateSH zero SH + InterpolateIrradiance {0,0,0}; InterpDispatchGroups 0 at any
+# zero dim / probeCount / nQueries), blend linearity (8 identical SH -> that SH; monotone falloff away from
+# a bright probe), and DETERMINISM (bit-identical blend). The same math is mirrored VERBATIM in
+# probe_interp.comp; the GPU==CPU bit-exact blend proof + lattice-point identity live in --probeinterp-shot.
+# Pure C++ (hf_core; reuses render/probe_gi.h + render/probe_sh.h), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(probe_interp_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,

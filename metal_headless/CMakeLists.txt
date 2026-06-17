@@ -280,6 +280,14 @@ hf_gen_msl(probe_raytrace.comp    probe_raytrace.comp.hlsl    comp probe_raytrac
 # GPU per-probe SH SSBO is BIT-EXACT to the CPU SH-encode on BOTH backends. Behind --probesh only;
 # existing shaders + goldens untouched.
 hf_gen_msl(probe_sh_encode.comp   probe_sh_encode.comp.hlsl   comp probe_sh_encode_main)
+# Probe Trilinear SH-Interp — DDGI Slice 4 (Slice DL): one thread per QUERY point finds the FLOOR cell
+# whose 8 corner probes bracket the query world position (NearestProbes) and trilinearly blends those 8
+# probes' 3rd-order real-SH coefficients into a single per-query ProbeSH. NearestProbes (FLOOR-cell 8
+# corners + polynomial weights) + InterpolateSH (the per-corner fma SH accumulation) are copied VERBATIM
+# from engine/render/probe_gi.h + probe_sh.h (mad for the per-corner product, matching std::fma), so the
+# GPU blended-SH SSBO is BIT-EXACT to the CPU InterpolateSH reference on BOTH backends. Behind
+# --probeinterp only; existing shaders + goldens untouched.
+hf_gen_msl(probe_interp.comp      probe_interp.comp.hlsl      comp probe_interp_main)
 # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
 # (flat float4 SSBO), Luminance -> LumToBin -> InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER
 # SSBO (order-independent counts -> deterministic; Metal threadgroup atomic_uint maps from the SPIR-V

@@ -141,6 +141,82 @@ inline int GetProbeGridIndex(const math::Vec3& worldPos, const ProbeGrid& grid) 
     return grid.flatIndex(px, py, pz);
 }
 
+// --- Trilinear cell-corner lookup (the DDGI Slice 4 interpolation primitive). ----------------------
+// ProbeTrilinear: the 8 surrounding probes of a FLOOR cell + their trilinear blend weights. idx[c] is
+// the cx-major flat index of corner c (c in 0..7, with bit0=+x, bit1=+y, bit2=+z relative to the cell's
+// base corner); w[c] is the trilinear weight (the 8 weights sum to 1 on the enabled path). valid==false
+// on the degenerate / disabled path (spacing<=0 or any dim<=0): then idx is all 0 and w[0]==1 (a single
+// harmless corner) so a downstream blend reads probe 0 only — but callers should test `valid` and treat
+// it as the zeroed/identity fallback.
+struct ProbeTrilinear {
+    int   idx[8];   // the 8 cell-corner flat indices (cx-major; corner bit0=+x, bit1=+y, bit2=+z)
+    float w[8];     // the 8 trilinear weights (sum == 1 on the enabled path)
+    bool  valid;    // false on the degenerate/disabled path (idx all 0, w[0]=1)
+};
+
+// NearestProbes(worldPos, grid) -> the 8 trilinear cell corners + weights surrounding `worldPos`. Mirrors
+// GetProbeGridIndex's per-axis projection but uses FLOOR (not round) to find the cell whose 8 corners
+// bracket the position, then the fractional trilinear weights:
+//   * degenerate guard: spacing<=0 || any dim<=0 -> {idx all 0, w[0]=1, valid=false}.
+//   * per axis: g = (v - origin)/spacing; base = floor(g) clamped to [0, dim-2] (so base and base+1 are
+//     BOTH valid probe indices); dim==1 -> base=0 and frac forced 0 on that axis (a 1-thick axis has no
+//     second corner to blend toward); frac = clamp(g - base, 0, 1) (out-of-grid positions saturate to the
+//     boundary cell — frac 0 below the grid, 1 above it -> a clamp to the nearest boundary corner).
+//   * corner c in 0..7: (base+(c&1), base+((c>>1)&1), base+((c>>2)&1)) per axis, each coordinate clamped
+//     to [0, dim-1] (so a dim==1 axis's +offset corner collapses onto the single valid index — its weight
+//     is already 0 there) -> grid.flatIndex; the per-axis weight is
+//     (selected? frac : 1-frac); w[c] = wx*wy*wz computed with std::fma so the per-corner product is a
+//     single correctly-rounded fma matching the shader's mad (the cross-backend bit-exactness key — a
+//     plain wx*wy*wz contracts to fma on Metal's fast-math but not on Vulkan/DXC or the CPU). Pure /
+//     deterministic / no transcendentals (the weights are polynomial: floor + subtract + multiply).
+inline ProbeTrilinear NearestProbes(const math::Vec3& worldPos, const ProbeGrid& grid) {
+    ProbeTrilinear t;
+    if (grid.spacing <= 0.0f || grid.dimX <= 0 || grid.dimY <= 0 || grid.dimZ <= 0) {
+        for (int c = 0; c < 8; ++c) { t.idx[c] = 0; t.w[c] = 0.0f; }
+        t.w[0] = 1.0f;
+        t.valid = false;
+        return t;
+    }
+    // Per-axis FLOOR cell base + fractional position. base in [0, dim-2] so base+1 is in range; a 1-thick
+    // axis (dim==1) collapses to base 0, frac 0 (no second corner).
+    auto axis = [](float v, float o, float sp, int dim, int& base, float& frac) {
+        if (dim <= 1) { base = 0; frac = 0.0f; return; }
+        float g = (v - o) / sp;
+        float fb = std::floor(g);
+        if (fb < 0.0f) fb = 0.0f;
+        if (fb > (float)(dim - 2)) fb = (float)(dim - 2);
+        base = (int)fb;
+        float fr = g - fb;
+        if (fr < 0.0f) fr = 0.0f;
+        if (fr > 1.0f) fr = 1.0f;
+        frac = fr;
+    };
+    int bx, by, bz;
+    float fx, fy, fz;
+    axis(worldPos.x, grid.origin.x, grid.spacing, grid.dimX, bx, fx);
+    axis(worldPos.y, grid.origin.y, grid.spacing, grid.dimY, by, fy);
+    axis(worldPos.z, grid.origin.z, grid.spacing, grid.dimZ, bz, fz);
+    for (int c = 0; c < 8; ++c) {
+        int sx = (c & 1), sy = ((c >> 1) & 1), sz = ((c >> 2) & 1);
+        // A dim==1 axis has frac 0 and no second probe, so its +offset corner must clamp back onto the
+        // single in-range index (base+1 would be out of range). Clamping the coordinate keeps every
+        // corner index valid; the +offset weight is already 0 there (frac==0), so the blend is unchanged.
+        int cx = bx + sx; if (cx > grid.dimX - 1) cx = grid.dimX - 1;
+        int cy = by + sy; if (cy > grid.dimY - 1) cy = grid.dimY - 1;
+        int cz = bz + sz; if (cz > grid.dimZ - 1) cz = grid.dimZ - 1;
+        t.idx[c] = grid.flatIndex(cx, cy, cz);
+        float wx = sx ? fx : (1.0f - fx);
+        float wy = sy ? fy : (1.0f - fy);
+        float wz = sz ? fz : (1.0f - fz);
+        // w = wx*wy*wz as two single-rounded fma-able products: p = wx*wy (a single multiply), then
+        // w = std::fma(p, wz, 0) — a SINGLE correctly-rounded fma, matching the shader's mad(p, wz, 0).
+        float p = wx * wy;
+        t.w[c] = std::fma(p, wz, 0.0f);
+    }
+    t.valid = true;
+    return t;
+}
+
 // --- The per-ray view-space march against the depth field. -----------------------------------------
 // TraceRayToDepth(originWorld, dirWorld, maxDist, steps, thickness, view, tanHalfFovY, aspect, yFlip,
 // sampleDepth, outHit) marches the ray in WORLD space, projecting each marched point to a screen UV +
@@ -209,6 +285,19 @@ inline constexpr int kProbeThreads = 64;
 inline int ProbeDispatchGroups(const ProbeGrid& grid) {
     int n = grid.probeCount();
     return (n <= 0) ? 0 : (n + kProbeThreads - 1) / kProbeThreads;
+}
+
+// --- The trilinear-interp dispatch sizing (one thread per QUERY point). ----------------------------
+// kInterpThreads = the interp compute workgroup size (one thread per query point). InterpDispatchGroups(
+// grid, nQueries) = the number of kInterpThreads workgroups to cover nQueries query points, or EXACTLY 0
+// when nQueries<=0 OR the grid is disabled (probeCount<=0, i.e. dimX/dimY/dimZ == 0). probeCount==0 -> 0
+// groups -> DispatchCompute(0) -> the blended-output SSBO is untouched (== the cleared upload) — the
+// byte-identical probeCount=0 no-op the proof rests on (the ProbeDispatchGroups/EncodeDispatchGroups
+// analog). Pure / deterministic.
+inline constexpr int kInterpThreads = 64;
+inline int InterpDispatchGroups(const ProbeGrid& grid, int nQueries) {
+    if (nQueries <= 0 || grid.probeCount() <= 0) return 0;
+    return (nQueries + kInterpThreads - 1) / kInterpThreads;
 }
 
 }  // namespace hf::render::probegi

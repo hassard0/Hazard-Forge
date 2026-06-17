@@ -367,6 +367,7 @@ int main(int argc, char** argv) {
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* probeGiShotPath = nullptr;   // --probegi-shot <out.bmp> (Slice DH: DDGI probe-grid ray-trace)
     const char* probeShShotPath = nullptr;   // --probesh-shot <out.bmp> (Slice DJ: DDGI probe SH-encode)
+    const char* probeInterpShotPath = nullptr; // --probeinterp-shot <out.bmp> (Slice DL: DDGI trilinear SH-interp)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
@@ -783,6 +784,21 @@ int main(int argc, char** argv) {
             // SH-reconstructed irradiance over the colored room -> probe_sh.png. New golden; existing
             // shaders/paths/goldens untouched.
             probeShShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--probeinterp-shot") == 0 && i + 1 < argc) {
+            // Slice DL: DDGI Slice 4 — Probe-Grid Update / Trilinear SH Interpolation. Runs DJ's 8-probe
+            // Cornell-box capture + SH-encode -> a real ProbeSH[8], then a PURE COMPUTE pass
+            // (probe_interp.comp, one thread per QUERY point; NO new RHI) trilinearly blends the 8
+            // surrounding probes' SH at each of a fixed deterministic set of query points -> a per-query
+            // blended-ProbeSH SSBO. NearestProbes + InterpolateSH are copied VERBATIM into the shader
+            // (mad for the per-corner product), so the blend is bit-exact cross-backend. FOUR PROOFS: (1)
+            // the GPU blended-SH SSBO is BIT-EXACT (memcmp) to a CPU probesh::InterpolateSH over the SAME
+            // uploaded ProbeSH[] + query points; (2) a query exactly at a probe position blends to that
+            // probe's SH byte-identical (the lattice-point round-trip); (3) probeCount=0 (dimX=0) ->
+            // dispatch 0 -> the output SSBO byte-identical to the cleared upload; (4) two GPU runs
+            // byte-identical. Prints `probe-interp: {probes:8, queries:Q}`. GOLDEN = a DENSE grid of
+            // swatch spheres colored by the SH-reconstructed irradiance of the interpolated field over the
+            // colored room -> probeinterp.png. New golden; existing shaders/paths/goldens untouched.
+            probeInterpShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxellights-shot") == 0 && i + 1 < argc) {
             // Slice CV: Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion). The CL
             // 96-colored-point-light scene (same fixed lattice as --clustered-lights-shot) wrapped in the
@@ -3845,6 +3861,535 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — DDGI probe SH-encode, %d probes, %d SH samples/probe\n",
                                 probeShShotPath, sw0, sh0, probeN, kSampleCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeShShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DDGI Slice 4: Probe-Grid Trilinear SH-Interp (--probeinterp-shot, Slice DL). Runs DJ's
+        // 8-probe Cornell-box capture + SH-encode -> a real ProbeSH[8], then a PURE COMPUTE pass
+        // (probe_interp.comp, one thread per QUERY point; NO new RHI) trilinearly blends the 8 surrounding
+        // probes' SH at each of a fixed deterministic set of query points (interior cells + boundary-
+        // exceeding + a position exactly at a probe) -> a per-query blended-ProbeSH SSBO. NearestProbes +
+        // InterpolateSH are copied VERBATIM into the shader (mad for the per-corner product), so the blend
+        // is bit-exact cross-backend. FOUR PROOFS (fail loudly): (1) the GPU blended-SH SSBO is BIT-EXACT
+        // (memcmp) to a CPU probesh::InterpolateSH over the SAME uploaded ProbeSH[] + query points; (2) a
+        // query at probePos blends to that probe's SH byte-identical (the lattice-point round-trip); (3)
+        // probeCount=0 (dimX=0) -> dispatch 0 -> the output SSBO byte-identical to the cleared upload; (4)
+        // two GPU runs byte-identical. GOLDEN = a DENSE grid of swatch spheres colored by the
+        // SH-reconstructed irradiance of the interpolated field -> probeinterp.png. Deterministic.
+        if (probeInterpShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cm  = hf::render::cubemap;
+            namespace pc  = hf::render::probecap;
+            namespace psh = hf::render::probesh;
+            namespace pgi = hf::render::probegi;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            struct ProbeFrameData {
+                float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+                float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+                float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Probe-Interp FrameData layout");
+
+            // The SAME 2x2x2 = 8-probe DJ capture grid inside the colored room.
+            const float Rroom = 6.0f;
+            pc::ProbeGrid grid;
+            grid.origin  = Vec3{-2.0f, 0.0f, -2.0f};
+            grid.dimX = 2; grid.dimY = 2; grid.dimZ = 2; grid.spacing = 4.0f;
+            const uint32_t kCubeSize = 64;
+            const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            const int kEncodeFaceDim = 16;
+            const int kSamplesPerFace = kEncodeFaceDim * kEncodeFaceDim;
+            const int kSampleCount = kSamplesPerFace * cm::kFaces;
+
+            // === Shaders: probe_bake + post + probe_sh_encode (DJ encode) + the new probe_interp. ===
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto bakeVs = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // SH-encode compute (3 SSBOs: params/radiance/probeSH) — the DJ encode.
+            auto shCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_sh_encode.comp.hlsl.spv");
+            auto shCs  = device->CreateShaderModule({std::span<const uint32_t>(shCsW)});
+            rhi::ComputePipelineDesc shCd;
+            shCd.compute = shCs.get(); shCd.storageBufferCount = 3; shCd.threadsPerGroupX = 64;
+            auto shCompute = device->CreateComputePipeline(shCd);
+
+            // The NEW interp compute (3 SSBOs: probeSH(read)/params+queries(read)/outSH(write)).
+            auto ipCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_interp.comp.hlsl.spv");
+            auto ipCs  = device->CreateShaderModule({std::span<const uint32_t>(ipCsW)});
+            rhi::ComputePipelineDesc ipCd;
+            ipCd.compute = ipCs.get(); ipCd.storageBufferCount = 3; ipCd.threadsPerGroupX = 64;
+            auto ipCompute = device->CreateComputePipeline(ipCd);
+
+            auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+            auto sceneRT = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+            if (!cube) {
+                std::fprintf(stderr, "FATAL: cubemap render targets unavailable on this backend\n");
+                device->WaitIdle(); return 1;
+            }
+
+            scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+            scene::Mesh sphere   = scene::Mesh::Sphere(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+            auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+
+            const float Tk = 0.2f;
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+            };
+
+            const Vec3 eye{0.0f, 2.4f, 12.0f};
+            const Vec3 ctr{0.0f, 2.0f, 0.0f};
+            const float fovY = 1.04719755f;
+            Mat4 camVP;
+            {
+                Mat4 view = Mat4::LookAt(eye, ctr, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) camVP.m[k] = vp.m[k];
+            }
+            const int probeN = grid.probeCount();   // 8
+
+            auto drawRoom = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP, bool skipFront) {
+                cmd.BindPipeline(*bakePipeline);
+                for (size_t wi = 0; wi < walls.size(); ++wi) {
+                    if (skipFront && wi == 5) continue;
+                    const auto& wl = walls[wi];
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindTexture(*wl.tex);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            // === Capture the room into each probe's 6 cube faces (the DI capture). ===
+            auto runCapture = [&](const pc::ProbeGrid& g, std::vector<std::vector<uint8_t>>& store,
+                                  uint32_t& faceW, uint32_t& faceH) {
+                int slots = g.probeCount() * pc::kFaces;
+                store.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+                if (pc::CaptureFaceCount(g) == 0) return;
+                int pn = g.probeCount();
+                std::vector<Vec3> centers;
+                for (int pz = 0; pz < g.dimZ; ++pz)
+                    for (int py = 0; py < g.dimY; ++py)
+                        for (int px = 0; px < g.dimX; ++px)
+                            centers.push_back(g.probePos(px, py, pz));
+                for (int p = 0; p < pn; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pc::ProbeFaceViewProj(face, centers[p], kCubeNear, kCubeFar);
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoom(*fc.cmd, faceVP, /*skipFront=*/false);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> faceData; uint32_t fw=0, fh=0;
+                        if (!device->ReadCubemapFace(*cube, face, faceData, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(probe %d, face %u) failed\n", p, face);
+                            device->WaitIdle(); return;
+                        }
+                        faceW = fw; faceH = fh;
+                        store[pc::ProbeFaceIndex(p, face)] = std::move(faceData);
+                    }
+                }
+            };
+
+            std::vector<std::vector<uint8_t>> radStore; uint32_t faceW=0, faceH=0;
+            runCapture(grid, radStore, faceW, faceH);
+            if (radStore.empty() || faceW == 0) {
+                std::fprintf(stderr, "FATAL: probe-interp capture produced no radiance\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === HOST-PRECOMPUTE the SH sample table (the DJ encode table). ===
+            struct EncodeSample { float basis[9]; float saWeight; float pad0, pad1; };
+            static_assert(sizeof(EncodeSample) == 48, "EncodeSample std430 stride");
+            auto faceTexelDir = [](int face, float sc, float tc) -> Vec3 {
+                switch (face) {
+                    case 0: return Vec3{ 1.0f,  -tc,  -sc};
+                    case 1: return Vec3{-1.0f,  -tc,   sc};
+                    case 2: return Vec3{  sc,  1.0f,   tc};
+                    case 3: return Vec3{  sc, -1.0f,  -tc};
+                    case 4: return Vec3{  sc,  -tc,  1.0f};
+                    default:return Vec3{ -sc,  -tc, -1.0f};
+                }
+            };
+            std::vector<EncodeSample> samples((size_t)kSampleCount);
+            std::vector<int> sampleFace((size_t)kSampleCount);
+            std::vector<int> sampleTexX((size_t)kSampleCount);
+            std::vector<int> sampleTexY((size_t)kSampleCount);
+            float totalWeight = 0.0f;
+            {
+                int si = 0;
+                for (int face = 0; face < cm::kFaces; ++face)
+                    for (int ty = 0; ty < kEncodeFaceDim; ++ty)
+                        for (int tx = 0; tx < kEncodeFaceDim; ++tx, ++si) {
+                            float u = (((float)tx + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            float v = (((float)ty + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            Vec3 dir = math::normalize(faceTexelDir(face, u, v));
+                            psh::SHBasis9(dir, samples[si].basis);
+                            float d2 = 1.0f + u * u + v * v;
+                            float texEdge = 2.0f / (float)kEncodeFaceDim;
+                            float sa = (texEdge * texEdge) / (d2 * std::sqrt(d2));
+                            samples[si].saWeight = sa; samples[si].pad0 = 0.0f; samples[si].pad1 = 0.0f;
+                            totalWeight += sa;
+                            sampleFace[si] = face;
+                            int px2 = (int)(((float)tx + 0.5f) / (float)kEncodeFaceDim * (float)faceW);
+                            int py2 = (int)(((float)ty + 0.5f) / (float)kEncodeFaceDim * (float)faceH);
+                            if (px2 < 0) px2 = 0; if (px2 > (int)faceW - 1) px2 = (int)faceW - 1;
+                            if (py2 < 0) py2 = 0; if (py2 > (int)faceH - 1) py2 = (int)faceH - 1;
+                            sampleTexX[si] = px2; sampleTexY[si] = py2;
+                        }
+            }
+
+            // === Build the flat radiance store + run the SH-encode -> ProbeSH[8]. ===
+            std::vector<float> radiance((size_t)probeN * kSampleCount * 4, 0.0f);
+            for (int p = 0; p < probeN; ++p)
+                for (int s = 0; s < kSampleCount; ++s) {
+                    const std::vector<uint8_t>& face = radStore[pc::ProbeFaceIndex(p, sampleFace[s])];
+                    size_t idx = ((size_t)sampleTexY[s] * faceW + (size_t)sampleTexX[s]) * 4;
+                    float r = 0, g = 0, b = 0;
+                    if (idx + 3 < face.size()) {
+                        b = (float)face[idx + 0] / 255.0f; g = (float)face[idx + 1] / 255.0f;
+                        r = (float)face[idx + 2] / 255.0f;
+                    }
+                    size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                    radiance[o + 0] = r; radiance[o + 1] = g; radiance[o + 2] = b; radiance[o + 3] = 1.0f;
+                }
+
+            const size_t kHeaderBytes = sizeof(uint32_t) * 4 + sizeof(float) * 4;
+            const size_t kParamsBytes = kHeaderBytes + (size_t)kSampleCount * sizeof(EncodeSample);
+            std::vector<psh::ProbeSH> probeSH;
+            {
+                std::vector<uint8_t> paramsBytes(kParamsBytes, 0);
+                uint32_t* cnt = reinterpret_cast<uint32_t*>(paramsBytes.data());
+                cnt[0] = (uint32_t)probeN; cnt[1] = (uint32_t)kSampleCount;
+                float* nrm = reinterpret_cast<float*>(paramsBytes.data() + sizeof(uint32_t) * 4);
+                nrm[0] = totalWeight;
+                std::memcpy(paramsBytes.data() + kHeaderBytes, samples.data(),
+                            (size_t)kSampleCount * sizeof(EncodeSample));
+                rhi::BufferDesc ppDesc;
+                ppDesc.size = paramsBytes.size(); ppDesc.initialData = paramsBytes.data();
+                ppDesc.usage = rhi::BufferUsage::Storage;
+                auto ppBuf = device->CreateBuffer(ppDesc);
+                rhi::BufferDesc radDesc;
+                radDesc.size = radiance.size() * sizeof(float); radDesc.initialData = radiance.data();
+                radDesc.usage = rhi::BufferUsage::Storage;
+                auto radBuf = device->CreateBuffer(radDesc);
+                std::vector<psh::ProbeSH> cleared((size_t)probeN);
+                std::memset(cleared.data(), 0, cleared.size() * sizeof(psh::ProbeSH));
+                rhi::BufferDesc shDesc;
+                shDesc.size = cleared.size() * sizeof(psh::ProbeSH); shDesc.initialData = cleared.data();
+                shDesc.usage = rhi::BufferUsage::Storage;
+                auto shBuf = device->CreateBuffer(shDesc);
+                const uint32_t groups = (uint32_t)psh::EncodeDispatchGroups(grid);
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                graph.AddPass("shEncode", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*shCompute);
+                        cmd.BindStorageBuffer(*ppBuf, 0); cmd.BindStorageBuffer(*radBuf, 1);
+                        cmd.BindStorageBuffer(*shBuf, 2);
+                        cmd.DispatchCompute(groups);
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1}); cmd.EndRenderPass();
+                    });
+                graph.Execute(*device); device->WaitIdle();
+                probeSH.resize((size_t)probeN);
+                device->ReadBuffer(*shBuf, probeSH.data(), probeSH.size() * sizeof(psh::ProbeSH), 0);
+            }
+
+            // === Build the deterministic QUERY-POINT set. The interp params buffer mirrors the shader's
+            // InterpParams std430: {dimX,dimY,dimZ,queryCount} + {originX,originY,originZ,spacing} + a
+            // float4-per-query position table. We pick: every probe lattice point (the lattice-point proof),
+            // a regular interior grid spanning the cells, AND boundary-exceeding points (frac saturates).
+            // (HF_MAX_INTERP_QUERIES == 4096 caps the table; we stay well under.) ===
+            struct InterpQuery { float pos[4]; };
+            std::vector<InterpQuery> queries;
+            int latticeQueryIndex = -1;   // a query exactly at probePos(1,1,1) -> its flat index for proof 2
+            const int latticePx = 1, latticePy = 1, latticePz = 1;
+            // (a) the 8 lattice points.
+            for (int pz = 0; pz < grid.dimZ; ++pz)
+                for (int py = 0; py < grid.dimY; ++py)
+                    for (int px = 0; px < grid.dimX; ++px) {
+                        Vec3 pp = grid.probePos(px, py, pz);
+                        if (px == latticePx && py == latticePy && pz == latticePz)
+                            latticeQueryIndex = (int)queries.size();
+                        queries.push_back(InterpQuery{{pp.x, pp.y, pp.z, 1.0f}});
+                    }
+            // (b) a dense interior sweep across the cells (fractional steps).
+            const int kSweep = 6;
+            for (int sz = 0; sz < kSweep; ++sz)
+                for (int sy = 0; sy < kSweep; ++sy)
+                    for (int sx = 0; sx < kSweep; ++sx) {
+                        float fx = (float)sx / (float)(kSweep - 1);
+                        float fy = (float)sy / (float)(kSweep - 1);
+                        float fz = (float)sz / (float)(kSweep - 1);
+                        Vec3 q{grid.origin.x + fx * (grid.dimX - 1) * grid.spacing,
+                               grid.origin.y + fy * (grid.dimY - 1) * grid.spacing,
+                               grid.origin.z + fz * (grid.dimZ - 1) * grid.spacing};
+                        queries.push_back(InterpQuery{{q.x, q.y, q.z, 1.0f}});
+                    }
+            // (c) boundary-exceeding points (frac saturates to a boundary corner).
+            queries.push_back(InterpQuery{{grid.origin.x - 100.0f, grid.origin.y - 100.0f, grid.origin.z - 100.0f, 1.0f}});
+            queries.push_back(InterpQuery{{grid.origin.x + 100.0f, grid.origin.y + 100.0f, grid.origin.z + 100.0f, 1.0f}});
+            const int queryN = (int)queries.size();
+
+            // The interp params buffer (header {dims4 + grid4} + the float4 query table). The shader
+            // declares RWStructuredBuffer<InterpParams> whose element stride is the FULL struct (header +
+            // HF_MAX_INTERP_QUERIES float4), so the buffer MUST be allocated to that full stride (matching
+            // probe_sh_encode's EncodeParams trick) — a smaller buffer is an out-of-bounds structured read.
+            const int kMaxInterpQueries = 4096;   // == the shader's HF_MAX_INTERP_QUERIES
+            if (queryN > kMaxInterpQueries) {
+                std::fprintf(stderr, "FATAL: probe-interp query count %d exceeds cap %d\n",
+                             queryN, kMaxInterpQueries);
+                device->WaitIdle(); return 1;
+            }
+            const size_t kIpHeaderBytes = sizeof(uint32_t) * 4 + sizeof(float) * 4;
+            const size_t kIpParamsBytes = kIpHeaderBytes + (size_t)kMaxInterpQueries * sizeof(float) * 4;
+
+            // Run the interp compute for a grid -> the read-back blended ProbeSH[queryN]. The output is
+            // ALWAYS sized to queryN (so the probeCount=0 run reads back the SAME-size cleared buffer; the
+            // dispatch group count is what differs — 0 when probeCount==0).
+            auto runInterp = [&](const pc::ProbeGrid& g, std::vector<psh::ProbeSH>& outSH) {
+                std::vector<uint8_t> ipBytes(kIpParamsBytes, 0);
+                uint32_t* dims = reinterpret_cast<uint32_t*>(ipBytes.data());
+                dims[0] = (uint32_t)g.dimX; dims[1] = (uint32_t)g.dimY;
+                dims[2] = (uint32_t)g.dimZ; dims[3] = (uint32_t)queryN;
+                float* gp = reinterpret_cast<float*>(ipBytes.data() + sizeof(uint32_t) * 4);
+                gp[0] = g.origin.x; gp[1] = g.origin.y; gp[2] = g.origin.z; gp[3] = g.spacing;
+                std::memcpy(ipBytes.data() + kIpHeaderBytes, queries.data(),
+                            (size_t)queryN * sizeof(float) * 4);
+
+                rhi::BufferDesc shInDesc;
+                shInDesc.size = probeSH.size() * sizeof(psh::ProbeSH); shInDesc.initialData = probeSH.data();
+                shInDesc.usage = rhi::BufferUsage::Storage;
+                auto shInBuf = device->CreateBuffer(shInDesc);
+
+                rhi::BufferDesc ipDesc;
+                ipDesc.size = ipBytes.size(); ipDesc.initialData = ipBytes.data();
+                ipDesc.usage = rhi::BufferUsage::Storage;
+                auto ipBuf = device->CreateBuffer(ipDesc);
+
+                std::vector<psh::ProbeSH> cleared((size_t)queryN);
+                std::memset(cleared.data(), 0, cleared.size() * sizeof(psh::ProbeSH));
+                rhi::BufferDesc outDesc;
+                outDesc.size = cleared.size() * sizeof(psh::ProbeSH); outDesc.initialData = cleared.data();
+                outDesc.usage = rhi::BufferUsage::Storage;
+                auto outBuf = device->CreateBuffer(outDesc);
+
+                const uint32_t groups = (uint32_t)pgi::InterpDispatchGroups(g, queryN);
+
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                graph.AddPass("interp", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*ipCompute);
+                        cmd.BindStorageBuffer(*shInBuf, 0);
+                        cmd.BindStorageBuffer(*ipBuf, 1);
+                        cmd.BindStorageBuffer(*outBuf, 2);
+                        cmd.DispatchCompute(groups);   // groups==0 when probeCount==0 -> outBuf untouched
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1}); cmd.EndRenderPass();
+                    });
+                graph.Execute(*device); device->WaitIdle();
+                outSH.resize((size_t)queryN);
+                device->ReadBuffer(*outBuf, outSH.data(), outSH.size() * sizeof(psh::ProbeSH), 0);
+            };
+
+            // --- GPU run #1. ---
+            std::vector<psh::ProbeSH> gpuBlend;
+            runInterp(grid, gpuBlend);
+
+            // === PROOF 1 — GPU == CPU bit-exact. The CPU reference runs probesh::InterpolateSH over the
+            // SAME uploaded ProbeSH[] + the SAME query points. ===
+            std::vector<psh::ProbeSH> cpuBlend((size_t)queryN);
+            for (int q = 0; q < queryN; ++q) {
+                Vec3 wp{queries[q].pos[0], queries[q].pos[1], queries[q].pos[2]};
+                cpuBlend[q] = psh::InterpolateSH(wp, grid, probeSH.data(), probeN);
+            }
+            const bool bitExact = (gpuBlend.size() == cpuBlend.size()) &&
+                (std::memcmp(gpuBlend.data(), cpuBlend.data(),
+                             cpuBlend.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!bitExact) {
+                std::fprintf(stderr,
+                    "FATAL: probe-interp GPU blend != CPU InterpolateSH reference (the trilinear blend "
+                    "diverged cross-backend — the shader-copied NearestProbes/InterpolateSH mismatch the "
+                    "header; use mad in the per-corner product)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-interp GPU==CPU: BIT-EXACT\n"); std::fflush(stdout);
+
+            // === PROOF 2 — lattice-point identity. A query exactly at probePos(1,1,1) -> the blended SH ==
+            // that probe's SH byte-identical (the round-trip). ===
+            int latticeFlat = grid.flatIndex(latticePx, latticePy, latticePz);
+            bool latticeOk = (latticeQueryIndex >= 0) &&
+                (std::memcmp(&gpuBlend[latticeQueryIndex], &probeSH[latticeFlat],
+                             sizeof(psh::ProbeSH)) == 0);
+            if (!latticeOk) {
+                std::fprintf(stderr,
+                    "FATAL: probe-interp query at a probe position did not blend to that probe's SH "
+                    "byte-identical (the lattice-point round-trip failed)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-interp lattice-point == probe SH: BYTE-IDENTICAL\n"); std::fflush(stdout);
+
+            // === PROOF 3 — probeCount=0 no-op. dimX=0 -> InterpDispatchGroups()==0 -> DispatchCompute(0)
+            // -> the output SSBO is byte-identical to the cleared (zero) upload. ===
+            pc::ProbeGrid emptyGrid = grid; emptyGrid.dimX = 0;
+            std::vector<psh::ProbeSH> emptyBlend;
+            runInterp(emptyGrid, emptyBlend);
+            std::vector<psh::ProbeSH> clearedRef((size_t)queryN);
+            std::memset(clearedRef.data(), 0, clearedRef.size() * sizeof(psh::ProbeSH));
+            const bool noOpClean = (emptyBlend.size() == clearedRef.size()) &&
+                (std::memcmp(emptyBlend.data(), clearedRef.data(),
+                             clearedRef.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!noOpClean) {
+                std::fprintf(stderr,
+                    "FATAL: probe-interp probeCount=0 output SSBO != cleared upload (the dispatch-0 was "
+                    "not a no-op)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-interp probeCount=0: SSBO UNTOUCHED == cleared\n"); std::fflush(stdout);
+
+            // === PROOF 4 — determinism: a second GPU run is byte-identical. ===
+            std::vector<psh::ProbeSH> gpuBlend2;
+            runInterp(grid, gpuBlend2);
+            const bool deterministic = (gpuBlend.size() == gpuBlend2.size()) &&
+                (std::memcmp(gpuBlend.data(), gpuBlend2.data(),
+                             gpuBlend.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!deterministic) {
+                std::fprintf(stderr, "FATAL: probe-interp two GPU runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            std::printf("probe-interp: {probes:%d, queries:%d}\n", probeN, queryN); std::fflush(stdout);
+
+            // === GOLDEN viz: render the colored room (front wall skipped) + a DENSE grid of small swatch
+            // spheres, each colored by the SH-reconstructed irradiance of the trilinearly-INTERPOLATED SH
+            // at the swatch position (probesh::InterpolateSH, CPU — bit-exact to the GPU blend). A SMOOTH
+            // interpolated color field between the 8 probes (vs DJ's 8 discrete swatches). ===
+            // A DENSE 5x3x5 = 75 swatch lattice spanning the room interior (vs DJ's 8 discrete swatches) —
+            // a smooth interpolated color field. Kept under the per-frame descriptor budget (maxSets 128:
+            // 75 swatches + 6 walls = 81 binds, one descriptor set per textured draw).
+            const int kSwatchDim = 5;
+            const int kSwatchY   = 3;
+            const Vec3 kUp = math::normalize(Vec3{0.0f, 1.0f, 0.3f});
+            struct Swatch { Vec3 pos; std::unique_ptr<rhi::ITexture> tex; };
+            std::vector<Swatch> swatches;
+            auto clamp01 = [](float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
+            for (int sz = 0; sz < kSwatchDim; ++sz)
+                for (int sy = 0; sy < kSwatchY; ++sy)
+                    for (int sx = 0; sx < kSwatchDim; ++sx) {
+                        float fx = (float)sx / (float)(kSwatchDim - 1);
+                        float fy = (float)sy / (float)(kSwatchY - 1);
+                        float fz = (float)sz / (float)(kSwatchDim - 1);
+                        Vec3 sp{grid.origin.x + fx * (grid.dimX - 1) * grid.spacing,
+                                grid.origin.y + fy * (grid.dimY - 1) * grid.spacing,
+                                grid.origin.z + fz * (grid.dimZ - 1) * grid.spacing};
+                        psh::ProbeSH blended = psh::InterpolateSH(sp, grid, probeSH.data(), probeN);
+                        Vec3 irr = psh::SHEvaluate(blended, kUp);
+                        swatches.push_back(Swatch{sp,
+                            colorTex(clamp01(irr.x * 1.4f), clamp01(irr.y * 1.4f), clamp01(irr.z * 1.4f))});
+                    }
+
+            std::vector<uint8_t> scenePx; uint32_t sw0=0, sh0=0;
+            {
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("interpScene", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoom(cmd, camVP, /*skipFront=*/true);
+                        cmd.BindPipeline(*bakePipeline);
+                        for (const auto& sw : swatches) {
+                            Mat4 model = Mat4::Translate(sw.pos) * Mat4::Scale({0.22f, 0.22f, 0.22f});
+                            float pcv[32];
+                            for (int k = 0; k < 16; ++k) pcv[k]      = camVP.m[k];
+                            for (int k = 0; k < 16; ++k) pcv[16 + k] = model.m[k];
+                            cmd.PushConstants(pcv, sizeof(pcv));
+                            cmd.BindTexture(*sw.tex);
+                            cmd.BindVertexBuffer(sphere.vertices());
+                            cmd.BindIndexBuffer(sphere.indices());
+                            cmd.DrawIndexed(sphere.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                if (!device->GetCapturedPixels(scenePx, sw0, sh0)) {
+                    std::fprintf(stderr, "FATAL: no captured pixels (probe-interp viz)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            bool ok = WriteBMP(probeInterpShotPath, scenePx, sw0, sh0);
+            if (ok) std::printf("wrote %s (%ux%u) — DDGI probe trilinear SH-interp, %d probes, %d queries\n",
+                                probeInterpShotPath, sw0, sh0, probeN, queryN);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeInterpShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
