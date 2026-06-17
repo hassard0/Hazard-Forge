@@ -450,6 +450,7 @@ int main(int argc, char** argv) {
     const char* mcRenderShotPath = nullptr; // --mc-render-shot <out.bmp> (Slice MC5: GPU Isosurface Meshing RENDER — MarchCellsInterp's bit-exact fixed-point mesh -> BuildRenderMesh (position=vert/kSub + flat per-face normals) -> the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO) -> a lit 3D extracted-sphere render. The MC arc's FIRST FLOAT slice: the golden is the visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof), NOT the integer zero-diff bar. NO new RHI / shader)
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
+    const char* fpxPairsShotPath = nullptr; // --fpx-pairs-shot <out.bmp> (Slice FPX2: Deterministic Fixed-Point Physics integer-AABB BROADPHASE — a clustered 8x8 grid meshed by INT32 count->scan->emit (fpx_pair_count/scan/emit.comp) into the deterministic candidate-pair list, GPU==CPU pair list bit-exact, integer N×N pair-matrix viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1485,6 +1486,21 @@ int main(int argc, char** argv) {
             // hashColor(bodyIndex) dot, with the groundY line drawn -> identical both backends by
             // construction. NO collision response (FPX3+), NO new RHI. One BMP -> exit.
             fpxShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--fpx-pairs-shot") == 0 && i + 1 < argc) {
+            // Slice FPX2: Deterministic Fixed-Point Physics — the integer-AABB BROADPHASE candidate-pair
+            // generator. A deterministic CLUSTERED FxWorld (an 8x8 grid of 64 bodies spaced 1 world unit
+            // with radius 0.6 so each body's AABB overlaps its 4 axis-neighbors but NOT diagonals/far ones
+            // -> a NON-TRIVIAL pair subset) is meshed by three pure-INT32 compute passes (the MC3
+            // count->scan->emit): shaders/fpx_pair_count.comp (one thread per body i: perBodyCount[i]=Σ
+            // AabbOverlap over j>i), (barrier) fpx_pair_scan.comp (single-thread exclusive prefix-sum ->
+            // perBodyOffset), (barrier) fpx_pair_emit.comp (one thread per body i: emit each overlapping
+            // (i,j) into gPairs at its DISJOINT range, NO atomics). BodyAabb + AabbOverlap copied VERBATIM
+            // from engine/sim/fpx.h (INT32: integer add/sub + six compares, NO int64). ReadBuffer reads
+            // gPairs + perBodyCount + perBodyOffset; the CPU fpx.h::BuildPairs over the SAME world must
+            // match BIT-EXACT (memcmp). enabled=false -> zero pairs. The golden is an integer N×N
+            // PAIR-MATRIX viz (pixel (i,j) lit hashColor iff (i,j)/(j,i) is a pair, diagonal a marker)
+            // -> identical both backends by construction. NO collision response (FPX3+), NO new RHI.
+            fpxPairsShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--mc-count-shot") == 0 && i + 1 < argc) {
             // Slice MC2: GPU Isosurface Meshing Slice 2 — per-cell MARCHING-CUBES TRIANGLE COUNT. The
             // SAME MC1 sphere VoxelField (33³ corners -> 32³ cells, radius 12, iso 0) feeds a pure-integer
@@ -14864,6 +14880,321 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fixed-point physics side-view (%d/%d settled)\n",
                                 fpxShotPath, imgW, imgH, settled, kBodyCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Fixed-Point Physics integer-AABB BROADPHASE candidate-pair generator
+        // (--fpx-pairs-shot <out.bmp>, Slice FPX2). A deterministic CLUSTERED FxWorld (an 8x8 grid of 64
+        // bodies spaced 1 world unit with radius 0.6 -> each body's AABB overlaps its 4 axis-neighbors but
+        // NOT diagonals/far ones, a non-trivial pair subset) is meshed by three pure-INT32 compute passes
+        // (the MC3 count->scan->emit on bodies): fpx_pair_count.comp (one thread per body i:
+        // perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) over j>i) -> (compute->compute barrier) ->
+        // fpx_pair_scan.comp (single-thread exclusive prefix-sum -> perBodyOffset) -> (barrier) ->
+        // fpx_pair_emit.comp (one thread per body i emits each overlapping (i,j) into gPairs at its DISJOINT
+        // [offset[i],..) range, NO atomics). BodyAabb + AabbOverlap copied VERBATIM from engine/sim/fpx.h
+        // (INT32: integer add/sub + six compares, NO int64 -> MSL-gens natively on Metal). ReadBuffer reads
+        // gPairs + perBodyCount + perBodyOffset; the CPU fpx.h::BuildPairs over the SAME world must match
+        // BIT-EXACT (memcmp). enabled=false -> zero pairs. The golden is an integer N×N PAIR-MATRIX viz. NO
+        // collision response (FPX3+), NO new RHI. One BMP -> exit.
+        if (fpxPairsShotPath) {
+            using math::Vec3;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic CLUSTERED FxWorld (== the Metal --fpx-pairs config). An 8x8 grid spaced 1
+            // world unit, radius 0.6 -> 2*0.6=1.2 >= 1.0 (axis-neighbors overlap) but < sqrt(2)=1.414
+            // (diagonals do NOT) -> a non-trivial pair subset.
+            const int kGrid = 8;                       // 8x8 grid -> 64 bodies
+            const int kBodyCount = kGrid * kGrid;      // 64
+            const fpx::fx kSpacing = fpx::kOne;        // 1.0 world unit
+            const fpx::fx kRadius = (fpx::fx)(fpx::kOne * 6 / 10);  // 0.6 world units
+
+            fpx::FxWorld world;
+            world.gravity = {0, 0, 0};
+            world.groundY = 0;
+            for (int i = 0; i < kBodyCount; ++i) {
+                fpx::FxBody b;
+                const int gx = i % kGrid;
+                const int gz = i / kGrid;
+                b.pos = {(fpx::fx)(gx * (int)kSpacing), 0, (fpx::fx)(gz * (int)kSpacing)};
+                b.vel = {0, 0, 0};
+                b.invMass = fpx::kOne;
+                b.flags = fpx::kFlagDynamic;
+                b.radius = kRadius;
+                world.bodies.push_back(b);
+            }
+
+            // Host reference: BuildPairs -> the exact pair list + per-body counts + offsets the GPU memcmp's.
+            std::vector<uint32_t> cpuCounts((size_t)kBodyCount, 0u);
+            const uint32_t totalPairs = fpx::CountPairs(world, std::span<uint32_t>(cpuCounts));
+            std::vector<uint32_t> cpuOffset; std::vector<fpx::FxPair> cpuPairs;
+            fpx::BuildPairs(world, cpuOffset, cpuPairs);
+            // Worst-case capacity N*(N-1)/2 (so the disabled run has a fixed-size cleared buffer too).
+            const uint32_t kPairCap = (uint32_t)kBodyCount * ((uint32_t)kBodyCount - 1u) / 2u;
+            const uint32_t kPairAlloc = kPairCap > 0u ? kPairCap : 1u;
+
+            // std430 FpxBody mirror (matches fpx_pair_*.comp FpxBody): 9 x int32 (36 bytes).
+            struct FpxBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+            static_assert(sizeof(FpxBodyGpu) == 36, "FpxBodyGpu std430 layout");
+            std::vector<FpxBodyGpu> bodiesInit((size_t)kBodyCount);
+            for (int i = 0; i < kBodyCount; ++i) {
+                const fpx::FxBody& b = world.bodies[(size_t)i];
+                bodiesInit[(size_t)i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                                   b.invMass, b.flags, b.radius};
+            }
+            rhi::BufferDesc bDesc;
+            bDesc.size = bodiesInit.size() * sizeof(FpxBodyGpu);
+            bDesc.initialData = bodiesInit.data();
+            bDesc.usage = rhi::BufferUsage::Storage;
+            auto bodiesBuf = device->CreateBuffer(bDesc);   // read-only on the GPU (shared across runs)
+
+            // std430 FxPair mirror: 2 x uint32 (8 bytes).
+            struct FxPairGpu { uint32_t i, j; };
+            static_assert(sizeof(FxPairGpu) == 8, "FxPairGpu std430 layout");
+
+            // Fresh-cleared per-run output buffers (so the disabled no-op reads the cleared bytes back).
+            std::vector<uint32_t> countInit((size_t)kBodyCount, 0u);
+            std::vector<uint32_t> offsetInit((size_t)kBodyCount, 0u);
+            std::vector<FxPairGpu> pairsInit((size_t)kPairAlloc, FxPairGpu{0u, 0u});
+            auto makeCountBuf = [&]() {
+                rhi::BufferDesc d; d.size = countInit.size() * sizeof(uint32_t);
+                d.initialData = countInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeOffsetBuf = [&]() {
+                rhi::BufferDesc d; d.size = offsetInit.size() * sizeof(uint32_t);
+                d.initialData = offsetInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makePairsBuf = [&]() {
+                rhi::BufferDesc d; d.size = pairsInit.size() * sizeof(FxPairGpu);
+                d.initialData = pairsInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Count/emit params (fpx_pair_count/emit Params std430): int4 cfg {bodyCount, enabled, _, _}.
+            struct FpxPairParams { int32_t cfg[4]; };
+            static_assert(sizeof(FpxPairParams) == 16, "FpxPairParams std430 layout");
+            auto makeCeParams = [&](int32_t enabled) {
+                FpxPairParams p{}; p.cfg[0] = kBodyCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+                return p;
+            };
+            // Scan params (fpx_pair_scan Params std430): { bodyCount, _, _, _ }.
+            struct FpxScanParams { uint32_t bodyCount, pad0, pad1, pad2; };
+            static_assert(sizeof(FpxScanParams) == 16, "FpxScanParams std430 layout");
+            FpxScanParams scanParams{}; scanParams.bodyCount = (uint32_t)kBodyCount;
+            rhi::BufferDesc spDesc;
+            spDesc.size = sizeof(FpxScanParams); spDesc.initialData = &scanParams;
+            spDesc.usage = rhi::BufferUsage::Storage;
+            auto scanParamsBuf = device->CreateBuffer(spDesc);
+
+            // Pipelines: count (3 SSBO, 64 threads), scan (3 SSBO, 1 thread), emit (4 SSBO, 64 threads).
+            auto countWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_pair_count.comp.hlsl.spv");
+            auto countCs = device->CreateShaderModule({std::span<const uint32_t>(countWords)});
+            rhi::ComputePipelineDesc countCd;
+            countCd.compute = countCs.get(); countCd.storageBufferCount = 3; countCd.threadsPerGroupX = 64;
+            auto countCompute = device->CreateComputePipeline(countCd);
+
+            auto scanWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_pair_scan.comp.hlsl.spv");
+            auto scanCs = device->CreateShaderModule({std::span<const uint32_t>(scanWords)});
+            rhi::ComputePipelineDesc scanCd;
+            scanCd.compute = scanCs.get(); scanCd.storageBufferCount = 3; scanCd.threadsPerGroupX = 1;
+            auto scanCompute = device->CreateComputePipeline(scanCd);
+
+            auto emitWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_pair_emit.comp.hlsl.spv");
+            auto emitCs = device->CreateShaderModule({std::span<const uint32_t>(emitWords)});
+            rhi::ComputePipelineDesc emitCd;
+            emitCd.compute = emitCs.get(); emitCd.storageBufferCount = 4; emitCd.threadsPerGroupX = 64;
+            auto emitCompute = device->CreateComputePipeline(emitCd);
+
+            const uint32_t kGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+            // Run count->scan->emit over fresh count/offset/pairs buffers; read all three back.
+            auto runPairs = [&](int32_t enabled, std::vector<uint32_t>& outCount,
+                                std::vector<uint32_t>& outOffset, std::vector<FxPairGpu>& outPairs) {
+                auto countBuf  = makeCountBuf();
+                auto offsetBuf = makeOffsetBuf();
+                auto pairsBuf  = makePairsBuf();
+                FpxPairParams ce = makeCeParams(enabled);
+                rhi::BufferDesc ceDesc;
+                ceDesc.size = sizeof(FpxPairParams); ceDesc.initialData = &ce;
+                ceDesc.usage = rhi::BufferUsage::Storage;
+                auto ceBuf = device->CreateBuffer(ceDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fpx_pairs", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-body overlap count.
+                        cmd.BindComputePipeline(*countCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*countBuf, 1);
+                        cmd.BindStorageBuffer(*ceBuf, 2);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToComputeBarrier();   // count -> scan (perBodyCount written, read by scan)
+                        // Pass 2: single-thread exclusive prefix-sum -> perBodyOffset.
+                        cmd.BindComputePipeline(*scanCompute);
+                        cmd.BindStorageBuffer(*countBuf, 0);
+                        cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*scanParamsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();   // scan -> emit (perBodyOffset written, read by emit)
+                        // Pass 3: per-body emit into the disjoint range.
+                        cmd.BindComputePipeline(*emitCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*pairsBuf, 2);
+                        cmd.BindStorageBuffer(*ceBuf, 3);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outCount.assign((size_t)kBodyCount, 0u);
+                device->ReadBuffer(*countBuf, outCount.data(), outCount.size() * sizeof(uint32_t), 0);
+                outOffset.assign((size_t)kBodyCount, 0u);
+                device->ReadBuffer(*offsetBuf, outOffset.data(), outOffset.size() * sizeof(uint32_t), 0);
+                outPairs.assign((size_t)kPairAlloc, FxPairGpu{0u, 0u});
+                device->ReadBuffer(*pairsBuf, outPairs.data(), outPairs.size() * sizeof(FxPairGpu), 0);
+            };
+
+            // === GPU pairs (enabled) ===
+            std::vector<uint32_t> gpuCount, gpuOffset; std::vector<FxPairGpu> gpuPairs;
+            runPairs(1, gpuCount, gpuOffset, gpuPairs);
+
+            // PROOF (1) GPU==CPU pair list BIT-EXACT (count + scan + emit, integer memcmp, NO tol).
+            bool countOk = (gpuCount.size() == cpuCounts.size()) &&
+                std::memcmp(gpuCount.data(), cpuCounts.data(), cpuCounts.size() * sizeof(uint32_t)) == 0;
+            bool offsetOk = (gpuOffset.size() == cpuOffset.size()) &&
+                std::memcmp(gpuOffset.data(), cpuOffset.data(), cpuOffset.size() * sizeof(uint32_t)) == 0;
+            bool pairsOk = (totalPairs == (uint32_t)cpuPairs.size()) &&
+                std::memcmp(gpuPairs.data(), cpuPairs.data(), (size_t)totalPairs * sizeof(FxPairGpu)) == 0;
+            if (!countOk || !offsetOk || !pairsOk) {
+                std::fprintf(stderr, "FATAL: fpx-pairs GPU pair list != CPU BuildPairs "
+                             "(count=%d scan=%d emit=%d)\n", (int)countOk, (int)offsetOk, (int)pairsOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-pairs GPU==CPU: %u pairs BIT-EXACT (count+scan+emit)\n", totalPairs);
+
+            // PROOF (2) pair-set correctness: every (i,j) has i<j + AabbOverlap true + grouped-by-i + no
+            // dups + totalPairs == Σ perBodyCount. (Checked on the bit-exact GPU list.)
+            {
+                uint32_t sumCounts = 0; for (uint32_t c : gpuCount) sumCounts += c;
+                bool ok = (sumCounts == totalPairs);
+                uint32_t maxPerBody = 0; for (uint32_t c : gpuCount) if (c > maxPerBody) maxPerBody = c;
+                int64_t prevI = -1, prevJ = -1;
+                for (uint32_t p = 0; p < totalPairs && ok; ++p) {
+                    const uint32_t pi = gpuPairs[p].i, pj = gpuPairs[p].j;
+                    if (pi >= pj) ok = false;                                  // i<j
+                    if (ok && !fpx::AabbOverlap(fpx::BodyAabb(world.bodies[pi]),
+                                                fpx::BodyAabb(world.bodies[pj]))) ok = false;
+                    // grouped-by-i ascending, then j ascending; no dups.
+                    if (ok) {
+                        if ((int64_t)pi < prevI) ok = false;
+                        else if ((int64_t)pi == prevI && (int64_t)pj <= prevJ) ok = false;
+                        prevI = (int64_t)pi; prevJ = (int64_t)pj;
+                    }
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "FATAL: fpx-pairs pair-set invariant violated\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx-pairs: {bodies:%d, pairs:%u, max-pairs/body:%u}\n",
+                            kBodyCount, totalPairs, maxPerBody);
+            }
+
+            // PROOF (3) disabled-path no-op: enabled=false -> count all-zero, gPairs untouched (cleared).
+            {
+                std::vector<uint32_t> dCount, dOffset; std::vector<FxPairGpu> dPairs;
+                runPairs(0, dCount, dOffset, dPairs);
+                bool zero = true;
+                for (uint32_t c : dCount) if (c != 0u) { zero = false; break; }
+                if (zero) for (const auto& p : dPairs) if (p.i != 0u || p.j != 0u) { zero = false; break; }
+                if (!zero) {
+                    std::fprintf(stderr, "FATAL: fpx-pairs disabled path produced pairs\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx-pairs disabled: zero pairs (no-op)\n");
+            }
+
+            // PROOF (4) determinism: two full runs byte-identical.
+            {
+                std::vector<uint32_t> c2, o2; std::vector<FxPairGpu> p2;
+                runPairs(1, c2, o2, p2);
+                if (c2.size() != gpuCount.size() ||
+                    std::memcmp(c2.data(), gpuCount.data(), c2.size() * sizeof(uint32_t)) != 0 ||
+                    std::memcmp(o2.data(), gpuOffset.data(), o2.size() * sizeof(uint32_t)) != 0 ||
+                    std::memcmp(p2.data(), gpuPairs.data(), p2.size() * sizeof(FxPairGpu)) != 0) {
+                    std::fprintf(stderr, "FATAL: fpx-pairs two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx-pairs determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (5) known case: two overlapping bodies -> 1 pair; two apart -> 0 pairs.
+            {
+                fpx::FxWorld two;
+                fpx::FxBody a; a.pos = {0, 0, 0};                 a.radius = kRadius; a.flags = fpx::kFlagDynamic;
+                fpx::FxBody bb; bb.pos = {kSpacing, 0, 0};        bb.radius = kRadius; bb.flags = fpx::kFlagDynamic;
+                two.bodies = {a, bb};
+                std::vector<uint32_t> off2; std::vector<fpx::FxPair> pr2;
+                fpx::BuildPairs(two, off2, pr2);
+                const bool overlap1 = (pr2.size() == 1 && pr2[0].i == 0u && pr2[0].j == 1u);
+                fpx::FxWorld apart;
+                fpx::FxBody c2; c2.pos = {0, 0, 0};                       c2.radius = kRadius;
+                fpx::FxBody d2; d2.pos = {(fpx::fx)(5 * (int)kSpacing), 0, 0}; d2.radius = kRadius;
+                apart.bodies = {c2, d2};
+                std::vector<uint32_t> off3; std::vector<fpx::FxPair> pr3;
+                fpx::BuildPairs(apart, off3, pr3);
+                const bool apart0 = pr3.empty();
+                if (!overlap1 || !apart0) {
+                    std::fprintf(stderr, "FATAL: fpx-pairs known case wrong (overlap=%d apart=%d)\n",
+                                 (int)overlap1, (int)apart0);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx-pairs known: overlap->1 apart->0 OK\n");
+            }
+
+            // --- Golden: an integer N×N PAIR-MATRIX viz. Pixel (i,j) lit hashColor(i*N+j) iff (i,j)/(j,i)
+            // is a candidate pair, the diagonal a marker, else dark. CPU-colored from the read-back integer
+            // pair list -> identical both backends by construction. Scaled to 8px/cell -> 512x512. ---
+            const int kN = kBodyCount;            // 64
+            const int kCell = 8;                  // 8px/cell -> 512x512
+            const uint32_t imgW = (uint32_t)(kN * kCell), imgH = (uint32_t)(kN * kCell);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // adjacency[i*N+j] = 1 iff (i,j) or (j,i) a pair (symmetric).
+            std::vector<uint8_t> adj((size_t)kN * kN, 0u);
+            for (uint32_t p = 0; p < totalPairs; ++p) {
+                const uint32_t pi = gpuPairs[p].i, pj = gpuPairs[p].j;
+                adj[(size_t)pi * kN + pj] = 1u; adj[(size_t)pj * kN + pi] = 1u;
+            }
+            auto fillCell = [&](int row, int col, uint8_t r, uint8_t g2, uint8_t b2) {
+                for (int dy = 0; dy < kCell; ++dy)
+                    for (int dx = 0; dx < kCell; ++dx) {
+                        const int ix = col * kCell + dx, iy = row * kCell + dy;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            for (int i = 0; i < kN; ++i)
+                for (int j = 0; j < kN; ++j) {
+                    if (i == j) { fillCell(i, j, 60, 60, 60); continue; }   // diagonal marker
+                    if (adj[(size_t)i * kN + j]) {
+                        Vec3 col = vg::hashColor((uint32_t)(i * kN + j));
+                        fillCell(i, j, (uint8_t)(col.x * 255.0f + 0.5f),
+                                 (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+                    }
+                }
+            bool ok = WriteBMP(fpxPairsShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — integer broadphase pair-matrix (%u pairs)\n",
+                                fpxPairsShotPath, imgW, imgH, totalPairs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxPairsShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
