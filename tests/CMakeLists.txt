@@ -571,6 +571,14 @@ hf_add_pure_test(visbuffer_test)
 # Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(visresolve_test)
 
+# Virtual Shadow Maps Slice 1 (Slice VA): the virtual clipmap PAGE TABLE + PAGE-NEEDED marking math
+# (render/vsm.h) the GPU shaders/vsm_mark.comp.hlsl copies verbatim. Pins PageId/UnpackPageId bijection
+# over [0,pageCount()), SelectClipmapLevel's INTEGER threshold-ladder edges (at-camera->level0, far->top,
+# the 2^L boundaries — the GPU==CPU DETERMINISM CRUX, no transcendental), MarkPage single-point->expected
+# (level,px,py), MarkResidentPages known set (count+membership, duplicate-safe), markingEnabled-off->empty
+# set, and determinism. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(vsm_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)

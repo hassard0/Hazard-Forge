@@ -180,6 +180,14 @@ hf_gen_msl(visbuffer.frag       visbuffer.frag.hlsl       frag visbuffer_fragmen
 # other shader's spirv-cross command is left exactly as-is, so all 86 existing goldens are byte-for-byte
 # unchanged). Reuses the post.vert fullscreen triangle (already generated). NO new RHI. Behind --visresolve.
 hf_gen_msl(visresolve.frag      visresolve.frag.hlsl      frag visresolve_fragment --msl-version 20200)
+# Virtual Shadow Maps Slice 1 (Slice VA): vsm_mark.comp marks which virtual clipmap PAGES the visible
+# receivers need — one thread per receiver world-sample runs SelectClipmapLevel (the INTEGER threshold-
+# ladder, NO transcendental log2) + MarkPage (subtract/divide/floor) copied VERBATIM from render/vsm.h,
+# writing resident[pageId]=1 (an order-independent integer SET — a plain write, no atomics). A pure
+# integer SSBO compute (like froxel_inject.comp) -> the default MSL gen suffices (no integer texture.read
+# / atomics, so NO --msl-version 20200 needed). The resident set is bit-exact GPU==CPU + cross-backend by
+# construction. Behind --vsm-mark only; existing shaders + goldens untouched.
+hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.

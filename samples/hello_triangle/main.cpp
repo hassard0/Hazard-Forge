@@ -63,6 +63,7 @@
 #include "render/cluster_lod.h"  // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/visbuffer.h"   // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/SurvivorInteriorSamples)
 #include "render/visresolve.h"  // Slice DX: deferred material resolve CPU mirror (ResolveFlatShade/ResolvePixel/EncodeBGRA8)
+#include "render/vsm.h"         // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -426,6 +427,7 @@ int main(int argc, char** argv) {
     const char* clusterLodShotPath = nullptr; // --cluster-lod-shot <out.bmp> (Slice DV: discrete cluster-LOD selection by screen-space error)
     const char* visbufferShotPath = nullptr; // --visbuffer-shot <out.bmp> (Slice DW: rasterize (clusterID,triID) into an R32_Uint visibility buffer + bit-exact ID readback)
     const char* visresolveShotPath = nullptr; // --visresolve-shot <out.bmp> (Slice DX: deferred material resolve — texel-fetch the vis-buffer, flat-shade the covering triangle, lit image)
+    const char* vsmMarkShotPath = nullptr; // --vsm-mark-shot <out.bmp> (Slice VA: VSM virtual page table + page-needed marking, integer compute, GPU==CPU resident-set bit-exact, clipmap debug-viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1248,6 +1250,20 @@ int main(int argc, char** argv) {
             // pixels) + two-run determinism + a resolve-vs-forward SMOKE bound. NO new RHI (BindTexture
             // for the integer vis-buffer, BindLightClusters for the SSBOs). One BMP -> exit.
             visresolveShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vsm-mark-shot") == 0 && i + 1 < argc) {
+            // Slice VA: Virtual Shadow Maps Slice 1 — PAGE TABLE + PAGE-NEEDED MARKING (BEACHHEAD). A fixed
+            // directional CLIPMAP (levels=4, vpps=8, pageSize=128, level0WorldExtent=16, fixed cameraPos) +
+            // a fixed receiver point-set (a ground grid spanning several clipmap levels) feed a pure INTEGER
+            // compute pass (shaders/vsm_mark.comp): one thread per receiver runs SelectClipmapLevel (the
+            // threshold-ladder, NO transcendental) + MarkPage (subtract/divide/floor) -> resident[pageId]=1.
+            // ReadBuffer reads the resident[] set back. PROOFS (fail loudly): (1) GPU==CPU resident set
+            // BIT-EXACT (CPU MarkResidentPages over the SAME receivers -> memcmp==0, integer, NO FP tol),
+            // (2) markingEnabled=false -> empty set (all-zero == cleared), (3) two-run determinism byte-
+            // identical. Golden = a top-down clipmap debug-viz: each resident page hashColor(pageId) over its
+            // concentric clipmap level (level 0 small central, each level 2x larger; resident lit, else dark),
+            // CPU-colored from the read-back integer set -> identical both backends by construction. NO
+            // rendering, NO new RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
+            vsmMarkShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -13230,6 +13246,237 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — CPU-colored visibility buffer (%u survivor clusters)\n",
                                 visbufferShotPath, vw, vh, drawn);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", visbufferShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Virtual Shadow Maps PAGE-NEEDED MARKING (--vsm-mark-shot <out.bmp>, Slice VA). A fixed
+        // directional CLIPMAP + a fixed ground-grid receiver point-set feed a pure INTEGER compute
+        // (shaders/vsm_mark.comp): one thread per receiver runs the threshold-ladder SelectClipmapLevel +
+        // MarkPage (verbatim render/vsm.h) -> resident[pageId]=1. ReadBuffer reads the integer resident
+        // set; the CPU vsm::MarkResidentPages over the SAME receivers must match it BIT-EXACT (memcmp, no
+        // FP tol). markingEnabled=false -> empty set. The golden is a top-down concentric-clipmap debug-
+        // viz, CPU-colored from the read-back set (resident -> hashColor(pageId), else dark) -> identical
+        // both backends by construction. NO rendering, NO new RHI.
+        if (vsmMarkShotPath) {
+            using math::Vec3;
+            namespace vsm = hf::render::vsm;
+            namespace vg  = hf::render::vg;
+            // Fixed clipmap (the spec's showcase config).
+            vsm::VsmClipmap cm;
+            cm.levels = 4; cm.pageSize = 128; cm.virtualPagesPerSide = 8;
+            cm.level0WorldExtent = 16.0f;
+            cm.cameraPos = {0.0f, 0.0f, 0.0f};
+            const int vpps = cm.virtualPagesPerSide;
+            const int nPages = cm.pageCount();
+
+            // Fixed receiver point-set: a ground-plane grid (y=0) spanning several clipmap levels. The
+            // grid reaches +/-120 world units so receivers land in every clipmap level (level 3 covers
+            // +/-64 from center; the corners reach level 3). 81x81 = 6561 deterministic samples.
+            std::vector<math::Vec3> receivers;
+            const int kGridHalf = 40;            // [-40,40] cells
+            const float kGridStep = 3.0f;        // 3 world units/cell -> +/-120 world units
+            for (int gz = -kGridHalf; gz <= kGridHalf; ++gz)
+                for (int gx = -kGridHalf; gx <= kGridHalf; ++gx)
+                    receivers.push_back(math::Vec3{(float)gx * kGridStep, 0.0f, (float)gz * kGridStep});
+            const uint32_t receiverCount = (uint32_t)receivers.size();
+
+            // --- GPU buffers. Receivers as float4 (xyz used) so std430 stride is the natural 16 bytes. ---
+            std::vector<float> recF4((size_t)receiverCount * 4);
+            for (uint32_t r = 0; r < receiverCount; ++r) {
+                recF4[(size_t)r * 4 + 0] = receivers[r].x;
+                recF4[(size_t)r * 4 + 1] = receivers[r].y;
+                recF4[(size_t)r * 4 + 2] = receivers[r].z;
+                recF4[(size_t)r * 4 + 3] = 1.0f;
+            }
+            rhi::BufferDesc recDesc;
+            recDesc.size = recF4.size() * sizeof(float);
+            recDesc.initialData = recF4.data();
+            recDesc.usage = rhi::BufferUsage::Storage;
+            auto recBuf = device->CreateBuffer(recDesc);
+
+            // resident[] integer set (cleared to 0). A fresh zero upload per run (so the disabled-path
+            // proof reads the cleared bytes back).
+            std::vector<uint32_t> residentInit((size_t)nPages, 0u);
+            auto makeResidentBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = residentInit.size() * sizeof(uint32_t);
+                d.initialData = residentInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches vsm_mark.comp Params std430): uint4 dims + float4 level0 + float4 cameraPos +
+            // float4 thresholds[4] (16 floats = kMaxLevels thresholds). The thresholds are the host-
+            // precomputed EXACT float32 bits both CPU + shader compare against (the DETERMINISM CRUX).
+            struct VsmParams {
+                uint32_t dims[4];      // levels, vpps, receiverCount, markingEnabled
+                float    level0[4];    // level0WorldExtent, _, _, _
+                float    cameraPos[4]; // xyz, _
+                float    thresholds[16];
+            };
+            static_assert(sizeof(VsmParams) == 16 + 16 + 16 + 64, "VsmParams std430 layout");
+            auto makeParams = [&](uint32_t markingEnabled) {
+                VsmParams p{};
+                p.dims[0] = (uint32_t)cm.levels; p.dims[1] = (uint32_t)vpps;
+                p.dims[2] = receiverCount;       p.dims[3] = markingEnabled;
+                p.level0[0] = cm.level0WorldExtent;
+                p.cameraPos[0] = cm.cameraPos.x; p.cameraPos[1] = cm.cameraPos.y;
+                p.cameraPos[2] = cm.cameraPos.z;
+                float th[vsm::kMaxLevels];
+                vsm::BuildLevelThresholds(cm, th);
+                for (int L = 0; L < cm.levels; ++L) p.thresholds[L] = th[L];
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (receivers, resident, params); 64 threads/group.
+            auto markCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vsm_mark.comp.hlsl.spv");
+            auto markCs = device->CreateShaderModule({std::span<const uint32_t>(markCsWords)});
+            rhi::ComputePipelineDesc markCdesc;
+            markCdesc.compute = markCs.get();
+            markCdesc.storageBufferCount = 3;
+            markCdesc.pushConstantSize = 0;
+            markCdesc.threadsPerGroupX = 64;
+            auto markCompute = device->CreateComputePipeline(markCdesc);
+
+            const uint32_t kGroups = (receiverCount + 63u) / 64u;
+
+            // Run the marking compute over a fresh resident buffer + a params buffer, read back resident[].
+            auto runMark = [&](uint32_t markingEnabled, std::vector<uint32_t>& outResident) {
+                auto residentBuf = makeResidentBuf();
+                VsmParams params = makeParams(markingEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(VsmParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("vsm_mark", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*markCompute);
+                        cmd.BindStorageBuffer(*recBuf, 0);
+                        cmd.BindStorageBuffer(*residentBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outResident.assign((size_t)nPages, 0u);
+                device->ReadBuffer(*residentBuf, outResident.data(),
+                                   outResident.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU marking (enabled) ===
+            std::vector<uint32_t> gpuResident;
+            runMark(1u, gpuResident);
+
+            // === CPU reference over the SAME receivers ===
+            std::vector<uint32_t> cpuResident((size_t)nPages, 0u);
+            vsm::MarkResidentPages(std::span<const math::Vec3>(receivers.data(), receivers.size()), cm,
+                                   std::span<uint32_t>(cpuResident.data(), cpuResident.size()));
+
+            // PROOF (1) GPU==CPU resident set BIT-EXACT (integer memcmp, NO FP tolerance).
+            if (std::memcmp(gpuResident.data(), cpuResident.data(),
+                            (size_t)nPages * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vsm-mark GPU resident set != CPU MarkResidentPages "
+                             "(a transcendental/FP crept into the level selection?)\n");
+                device->WaitIdle(); return 1;
+            }
+            uint32_t residentPages = 0;
+            for (uint32_t r : gpuResident) residentPages += (r != 0u) ? 1u : 0u;
+            if (residentPages == 0u || residentPages >= (uint32_t)nPages) {
+                std::fprintf(stderr, "FATAL: vsm-mark resident set degenerate (%u of %d pages)\n",
+                             residentPages, nPages);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vsm-mark GPU==CPU resident set: %u pages BIT-EXACT\n", residentPages);
+
+            // PROOF (2) markingEnabled=false -> empty set (all-zero == cleared upload).
+            std::vector<uint32_t> disabledResident;
+            runMark(0u, disabledResident);
+            bool disabledEmpty = true;
+            for (uint32_t r : disabledResident) if (r != 0u) { disabledEmpty = false; break; }
+            if (!disabledEmpty) {
+                std::fprintf(stderr, "FATAL: vsm-mark markingEnabled=false did NOT yield an empty set\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("markingEnabled=false -> empty\n");
+
+            // PROOF (3) two-run determinism byte-identical.
+            std::vector<uint32_t> gpuResident2;
+            runMark(1u, gpuResident2);
+            if (gpuResident.size() != gpuResident2.size() ||
+                std::memcmp(gpuResident.data(), gpuResident2.data(),
+                            gpuResident.size() * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vsm-mark two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vsm-mark determinism: two runs BYTE-IDENTICAL\n");
+
+            // Per-level resident counts (a sanity stat: every level should have some resident pages).
+            std::printf("vsm-mark: {levels:%d, vpps:%d, residentPages:%u}\n", cm.levels, vpps, residentPages);
+
+            // --- Golden: top-down concentric-clipmap debug-viz. The image is a fixed square; each clipmap
+            // level L is drawn as a centered square whose side is the FULL image for the TOP level and
+            // halves for each inner level (level L+1 is 2x the world extent of level L -> level L occupies
+            // half the linear size). Draw OUTER (top) level first, then overlay each inner level centered
+            // on top -> concentric rings (level 0 the small central region, each level 2x larger). Within a
+            // level's square, partition vpps x vpps page cells; color resident -> hashColor(pageId), else a
+            // dark version. CPU-colored from the read-back integer set -> identical both backends. ---
+            const uint32_t imgW = 1024, imgH = 1024;
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            // Background (deep navy).
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+            }
+            // Draw the levels from the TOP (largest) inward so inner levels overlay the center.
+            for (int L = cm.levels - 1; L >= 0; --L) {
+                // Level L's square side in pixels: top level fills the image; each inner level halves.
+                // sideFrac = 2^(L - (levels-1)) -> top level 1.0, level0 = 2^-(levels-1).
+                float sideFrac = std::pow(2.0f, (float)(L - (cm.levels - 1)));
+                int side = (int)(sideFrac * (float)imgW);
+                if (side < vpps) side = vpps;  // ensure at least 1 px/page
+                int x0 = ((int)imgW - side) / 2;
+                int y0 = ((int)imgH - side) / 2;
+                for (int sy = 0; sy < side; ++sy) {
+                    int py = sy * vpps / side;          // page row in [0,vpps)
+                    if (py >= vpps) py = vpps - 1;
+                    int iy = y0 + sy;
+                    if (iy < 0 || iy >= (int)imgH) continue;
+                    for (int sx = 0; sx < side; ++sx) {
+                        int px = sx * vpps / side;       // page col in [0,vpps)
+                        if (px >= vpps) px = vpps - 1;
+                        int ix = x0 + sx;
+                        if (ix < 0 || ix >= (int)imgW) continue;
+                        int pageId = vsm::PageId(L, px, py, cm);
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        // Thin 1px page-grid lines (darken page boundaries) for legibility.
+                        bool gridLine = ((sx * vpps) % side) < (vpps) || ((sy * vpps) % side) < (vpps);
+                        if (gpuResident[(size_t)pageId] != 0u) {
+                            Vec3 col = vg::hashColor((uint32_t)pageId);
+                            float dim = gridLine ? 0.55f : 1.0f;
+                            dst[0] = (uint8_t)(col.z * 255.0f * dim + 0.5f);
+                            dst[1] = (uint8_t)(col.y * 255.0f * dim + 0.5f);
+                            dst[2] = (uint8_t)(col.x * 255.0f * dim + 0.5f);
+                            dst[3] = 255;
+                        } else {
+                            // Non-resident page within a clipmap level: a dark gray (distinct from the
+                            // navy background, so the clipmap ring extent is visible).
+                            uint8_t v = gridLine ? 22 : 34;
+                            dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                        }
+                    }
+                }
+            }
+            bool ok = WriteBMP(vsmMarkShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — top-down VSM clipmap page-marking viz (%u resident pages)\n",
+                                vsmMarkShotPath, imgW, imgH, residentPages);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vsmMarkShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

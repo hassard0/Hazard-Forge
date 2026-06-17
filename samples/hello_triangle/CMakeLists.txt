@@ -376,6 +376,13 @@ hf_compile_shaders(
     # BindLightClusters). On Metal the integer texture.read needs MSL 2.2 (the isolated --msl-version
     # 20200 in metal_headless/CMakeLists.txt, like visbuffer.frag).
     "shaders/visresolve.frag.hlsl:ps"
+    # Virtual Shadow Maps Slice 1 (Slice VA): vsm_mark.comp marks which virtual clipmap PAGES the visible
+    # receivers need — one thread per receiver world-sample, SelectClipmapLevel (the INTEGER threshold-
+    # ladder, NO transcendental log2) + MarkPage (subtract/divide/floor) copied VERBATIM from
+    # render/vsm.h, output resident[pageId]=1 (order-independent integer SET). markingEnabled push flag
+    # false -> writes nothing. Pure compute over an integer SSBO + ReadBuffer (the froxel/cluster surface)
+    # -> bit-exact GPU==CPU resident set, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/vsm_mark.comp.hlsl:cs"
     # Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): DT's cluster_cull.comp PLUS CJ's
     # hiz_cull.comp occlusion test. After the frustum test, a frustum-surviving cluster-instance is ALSO
     # tested against a Hi-Z max-depth pyramid (built CPU-side from a depth pre-pass + uploaded; render/hiz.h)

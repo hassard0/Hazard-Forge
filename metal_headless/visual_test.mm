@@ -83,6 +83,7 @@
 #include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/visbuffer.h"       // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/InstanceInteriorSamples)
 #include "render/visresolve.h"      // Slice DX: deferred material resolve CPU mirror (ResolveMaterial/DefaultResolveMaterial/ResolveSkyColor/ResolvePixel/EncodeBGRA8) — shared verbatim with --visresolve-shot (Vulkan)
+#include "render/vsm.h"             // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp + the Vulkan --vsm-mark-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -15306,6 +15307,197 @@ static int RunVisBufferShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
+// backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
+// shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
+// (the INTEGER threshold-ladder, NO transcendental log2) + MarkPage (subtract/divide/floor) copied
+// VERBATIM from render/vsm.h -> resident[pageId]=1 (an order-independent integer SET). ReadBuffer reads
+// the resident[] set and it is PROVEN BIT-EXACT vs the CPU vsm::MarkResidentPages reference (memcmp, NO
+// FP tolerance) — the same GPU==CPU proof the Vulkan --vsm-mark-shot runs; markingEnabled=false -> empty
+// set; two runs byte-identical. The image golden is a top-down concentric-clipmap debug-viz CPU-colored
+// from the read-back integer set (resident page -> hashColor(pageId) over its clipmap level, else dark) ->
+// identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). New golden
+// tests/golden/metal/vsm_pages.png; two runs DIFF 0.0000. NO rendering, NO new RHI.
+static int RunVsmMarkShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vsm = render::vsm;
+    namespace vg  = render::vg;
+    const uint32_t W = 1024, H = 1024;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // The fixed clipmap (== the Vulkan --vsm-mark-shot config).
+    vsm::VsmClipmap cm;
+    cm.levels = 4; cm.pageSize = 128; cm.virtualPagesPerSide = 8;
+    cm.level0WorldExtent = 16.0f;
+    cm.cameraPos = {0.0f, 0.0f, 0.0f};
+    const int vpps = cm.virtualPagesPerSide;
+    const int nPages = cm.pageCount();
+
+    // The fixed ground-grid receiver point-set (== the Vulkan path).
+    std::vector<Vec3> receivers;
+    const int kGridHalf = 40;
+    const float kGridStep = 3.0f;
+    for (int gz = -kGridHalf; gz <= kGridHalf; ++gz)
+        for (int gx = -kGridHalf; gx <= kGridHalf; ++gx)
+            receivers.push_back(Vec3{(float)gx * kGridStep, 0.0f, (float)gz * kGridStep});
+    const uint32_t receiverCount = (uint32_t)receivers.size();
+
+    std::vector<float> recF4((size_t)receiverCount * 4);
+    for (uint32_t r = 0; r < receiverCount; ++r) {
+        recF4[(size_t)r * 4 + 0] = receivers[r].x;
+        recF4[(size_t)r * 4 + 1] = receivers[r].y;
+        recF4[(size_t)r * 4 + 2] = receivers[r].z;
+        recF4[(size_t)r * 4 + 3] = 1.0f;
+    }
+    rhi::BufferDesc recDesc;
+    recDesc.size = recF4.size() * sizeof(float);
+    recDesc.initialData = recF4.data();
+    recDesc.usage = rhi::BufferUsage::Storage;
+    auto recBuf = device->CreateBuffer(recDesc);
+
+    std::vector<uint32_t> residentInit((size_t)nPages, 0u);
+    auto makeResidentBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = residentInit.size() * sizeof(uint32_t);
+        d.initialData = residentInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct VsmParams {
+        uint32_t dims[4];      // levels, vpps, receiverCount, markingEnabled
+        float    level0[4];
+        float    cameraPos[4];
+        float    thresholds[16];
+    };
+    static_assert(sizeof(VsmParams) == 16 + 16 + 16 + 64, "VsmParams std430 layout");
+    auto makeParams = [&](uint32_t markingEnabled) {
+        VsmParams p{};
+        p.dims[0] = (uint32_t)cm.levels; p.dims[1] = (uint32_t)vpps;
+        p.dims[2] = receiverCount;       p.dims[3] = markingEnabled;
+        p.level0[0] = cm.level0WorldExtent;
+        p.cameraPos[0] = cm.cameraPos.x; p.cameraPos[1] = cm.cameraPos.y; p.cameraPos[2] = cm.cameraPos.z;
+        float th[vsm::kMaxLevels];
+        vsm::BuildLevelThresholds(cm, th);
+        for (int L = 0; L < cm.levels; ++L) p.thresholds[L] = th[L];
+        return p;
+    };
+
+    auto markCs = loadMSL("vsm_mark.comp.gen.metal", "vsm_mark_main");
+    rhi::ComputePipelineDesc markCd;
+    markCd.compute = markCs.get(); markCd.storageBufferCount = 3; markCd.threadsPerGroupX = 64;
+    auto markCompute = device->CreateComputePipeline(markCd);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    const uint32_t kGroups = (receiverCount + 63u) / 64u;
+
+    auto runMark = [&](uint32_t markingEnabled, std::vector<uint32_t>& outResident) {
+        auto residentBuf = makeResidentBuf();
+        VsmParams params = makeParams(markingEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(VsmParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("vsm_mark", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*markCompute);
+                cmd.BindStorageBuffer(*recBuf, 0);
+                cmd.BindStorageBuffer(*residentBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outResident.assign((size_t)nPages, 0u);
+        device->ReadBuffer(*residentBuf, outResident.data(), outResident.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU marking (enabled).
+    std::vector<uint32_t> gpuResident;
+    runMark(1u, gpuResident);
+
+    // CPU reference over the SAME receivers.
+    std::vector<uint32_t> cpuResident((size_t)nPages, 0u);
+    vsm::MarkResidentPages(std::span<const Vec3>(receivers.data(), receivers.size()), cm,
+                           std::span<uint32_t>(cpuResident.data(), cpuResident.size()));
+
+    if (std::memcmp(gpuResident.data(), cpuResident.data(), (size_t)nPages * sizeof(uint32_t)) != 0)
+        return fail("vsm-mark: GPU resident set != CPU MarkResidentPages (transcendental/FP crept in?)");
+    uint32_t residentPages = 0;
+    for (uint32_t r : gpuResident) residentPages += (r != 0u) ? 1u : 0u;
+    if (residentPages == 0u || residentPages >= (uint32_t)nPages)
+        return fail("vsm-mark: resident set degenerate");
+    std::printf("vsm-mark GPU==CPU resident set: %u pages BIT-EXACT\n", residentPages);
+
+    // markingEnabled=false -> empty set.
+    std::vector<uint32_t> disabledResident;
+    runMark(0u, disabledResident);
+    for (uint32_t r : disabledResident) if (r != 0u) return fail("vsm-mark: disabled path not empty");
+    std::printf("markingEnabled=false -> empty\n");
+
+    // two-run determinism.
+    std::vector<uint32_t> gpuResident2;
+    runMark(1u, gpuResident2);
+    if (gpuResident.size() != gpuResident2.size() ||
+        std::memcmp(gpuResident.data(), gpuResident2.data(), gpuResident.size() * sizeof(uint32_t)) != 0)
+        return fail("vsm-mark: two runs differ (nondeterministic)");
+    std::printf("vsm-mark determinism: two runs BYTE-IDENTICAL\n");
+    std::printf("vsm-mark: {levels:%d, vpps:%d, residentPages:%u}\n", cm.levels, vpps, residentPages);
+
+    // --- Golden: top-down concentric-clipmap debug-viz, CPU-colored from the read-back integer set
+    // (IDENTICAL to the Vulkan --vsm-mark-shot by construction). ---
+    const uint32_t imgW = 1024, imgH = 1024;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    for (int L = cm.levels - 1; L >= 0; --L) {
+        float sideFrac = std::pow(2.0f, (float)(L - (cm.levels - 1)));
+        int side = (int)(sideFrac * (float)imgW);
+        if (side < vpps) side = vpps;
+        int x0 = ((int)imgW - side) / 2;
+        int y0 = ((int)imgH - side) / 2;
+        for (int sy = 0; sy < side; ++sy) {
+            int py = sy * vpps / side; if (py >= vpps) py = vpps - 1;
+            int iy = y0 + sy; if (iy < 0 || iy >= (int)imgH) continue;
+            for (int sx = 0; sx < side; ++sx) {
+                int px = sx * vpps / side; if (px >= vpps) px = vpps - 1;
+                int ix = x0 + sx; if (ix < 0 || ix >= (int)imgW) continue;
+                int pageId = vsm::PageId(L, px, py, cm);
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                bool gridLine = ((sx * vpps) % side) < (vpps) || ((sy * vpps) % side) < (vpps);
+                if (gpuResident[(size_t)pageId] != 0u) {
+                    Vec3 col = vg::hashColor((uint32_t)pageId);
+                    float dim = gridLine ? 0.55f : 1.0f;
+                    dst[0] = (uint8_t)(col.z * 255.0f * dim + 0.5f);
+                    dst[1] = (uint8_t)(col.y * 255.0f * dim + 0.5f);
+                    dst[2] = (uint8_t)(col.x * 255.0f * dim + 0.5f);
+                    dst[3] = 255;
+                } else {
+                    uint8_t v = gridLine ? 22 : 34;
+                    dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                }
+            }
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — top-down VSM clipmap page-marking viz (%u resident pages)\n",
+                outPath, imgW, imgH, residentPages);
+    return 0;
+}
+
 // --- Virtual-geometry DEFERRED MATERIAL RESOLVE showcase (Slice DX). The TRUE Vulkan pass
 // (--visresolve-shot) renders the DW vis-buffer then a FULLSCREEN deferred-resolve pass texel-fetches it,
 // looks up the covering triangle, and FLAT-shades it. Here Metal renders the IDENTICAL result: the SAME
@@ -22794,6 +22986,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--visresolve") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_visresolve.png";
             try { return RunVisResolveShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vsm-mark <out.png>: render the Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The
+        // TRUE pass is identical both backends: a fixed directional CLIPMAP + a fixed ground-grid receiver
+        // point-set feed the SAME vsm_mark.comp (one thread per receiver runs the INTEGER threshold-ladder
+        // SelectClipmapLevel + MarkPage, verbatim render/vsm.h) -> resident[pageId]=1. ReadBuffer reads the
+        // integer resident set, PROVEN BIT-EXACT vs the CPU vsm::MarkResidentPages reference (memcmp, no FP
+        // tol — the same GPU==CPU proof the Vulkan --vsm-mark-shot runs); markingEnabled=false -> empty set;
+        // two runs byte-identical. The image golden is a top-down concentric-clipmap debug-viz CPU-colored
+        // from the read-back integer set (resident page -> hashColor(pageId), else dark), identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/vsm_pages.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--vsm-mark") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vsm_pages.png";
+            try { return RunVsmMarkShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --hiz-cull <out.png>: render the Hi-Z OCCLUSION cull showcase (Slice CJ). The TRUE pass (a CPU
