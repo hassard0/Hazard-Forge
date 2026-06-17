@@ -391,6 +391,15 @@ hf_compile_shaders(
     # reference at EVERY pixel, full-frame, on any vendor. RWStructuredBuffer<uint> + InterlockedMin (the
     # existing InterlockedAdd family) + ReadBuffer -> NO new RHI; existing shaders + goldens untouched.
     "shaders/swraster.comp.hlsl:cs"
+    # Nanite Software-Raster RESOLVE blit (Slice SW4): swraster_resolve_blit.frag is a FULLSCREEN pass
+    # (reuses post.vert) that unpacks the SW2 software rasterizer's packed depth|id visibility-buffer SSBO
+    # into the R32_Uint visId render target the EXISTING visresolve.frag deferred resolve consumes, so the
+    # resolve is reused BYTE-FOR-BYTE. Per pixel: idx=y*width+x; out=(packed==0xFFFFFFFF)?0xFFFFFFFF:
+    # (packed&0xFFFF) — strip the HIGH-16 depth, keep the LOW-16 visId=(clusterID<<7)|triID. Plain uint32
+    # (NO int64, NO integer texture.read — it WRITES an integer SV_Target). Reads the SW SSBO via the
+    # BindLightClusters set-3 fragment-storage path (binding 13) + a {width,height} UBO. NO new RHI;
+    # existing shaders + goldens untouched. Behind --swraster-resolve-shot.
+    "shaders/swraster_resolve_blit.frag.hlsl:ps"
     # Virtual Shadow Maps Slice 2 (Slice VB): vsm_depth.frag renders each resident PHYSICAL page's
     # casters' depth into its atlas tile (paired with shadow_csm.vert: the page's light-space ortho VP in
     # the push constant). Unlike the depth-only CSM caster it renders into a COLOR atlas — SV_Position.z ->

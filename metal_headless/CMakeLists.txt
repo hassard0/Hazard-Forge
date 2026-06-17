@@ -198,6 +198,15 @@ hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
 # --swraster-gpu showcase renders the IDENTICAL result via the CPU bound path (render/swraster.h::
 # RasterClusters — the SAME bit-exact reference the Vulkan GPU==CPU proof compares against), while the
 # Vulkan side carries the GPU==CPU bit-identity proof. So swraster.comp gets NO hf_gen_msl line.
+# Nanite Software-Raster RESOLVE blit (Slice SW4): swraster_resolve_blit.frag is a FULLSCREEN pass (reuses
+# post.vert) that unpacks the SW software-rasterizer's packed depth|id vis-buffer SSBO into the R32_Uint
+# visId render target the EXISTING visresolve.frag deferred resolve consumes (out=(packed==0xFFFFFFFF)?
+# 0xFFFFFFFF:(packed&0xFFFF)), so the resolve is reused BYTE-FOR-BYTE. Reads the SW SSBO via the set-3
+# BindLightClusters fragment-storage path (binding 13) + a {width,height} UBO. CRITICAL: this shader is
+# PLAIN MSL — it has NO int64 and NO integer texture.read; it only WRITES an integer SV_Target (which is
+# plain MSL), so it gets NO --msl-version 20200 (unlike visresolve.frag, which keeps its 20200 for the
+# integer texture.read). NO new RHI. Behind --swraster-resolve.
+hf_gen_msl(swraster_resolve_blit.frag swraster_resolve_blit.frag.hlsl frag swraster_resolve_blit_fragment)
 # Virtual Shadow Maps Slice 2 (Slice VB): vsm_depth.frag renders each resident PHYSICAL page's casters'
 # depth into its atlas tile. Paired with shadow_csm.vert (the page's light-space ortho VP in the push
 # constant); unlike the depth-only CSM caster it renders into a COLOR atlas (SV_Position.z -> grayscale,
