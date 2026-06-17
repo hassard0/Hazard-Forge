@@ -371,6 +371,13 @@ hf_compile_shaders(
     "shaders/froxel_inject.comp.hlsl:cs"
     "shaders/froxel_integrate.comp.hlsl:cs"
     "shaders/froxel_apply.frag.hlsl:ps"
+    # Probe-Grid Ray-Trace — DDGI beachhead (Slice DH): one thread per probe traces 16 deterministic
+    # Fibonacci-sphere rays against the scene's view-space depth field (a FLAT float SSBO read back from
+    # the G-buffer, NOT a sampled depth texture) into a flat ProbeRayHit SSBO. FibonacciSphere +
+    # ViewToScreenUV/ReconstructViewPos + TraceRayToDepth are copied VERBATIM from engine/render/probe_gi.h
+    # (+ ssr.h), so the GPU ray-hit SSBO is BIT-EXACT to the CPU reference over the same depth field. Pure
+    # compute + storage buffers (no new RHI seam). The probeCount=0 dispatch-0 leaves the SSBO untouched.
+    "shaders/probe_raytrace.comp.hlsl:cs"
     # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
     # color (flat float4 SSBO), computes the Rec.709 Luminance, maps it to a log2-luminance bin via
     # render/auto_exposure.h::LumToBin, and InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER SSBO

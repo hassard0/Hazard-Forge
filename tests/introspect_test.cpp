@@ -226,6 +226,8 @@ int main() {
             bool sawCloudsFeature = false;
             // Slice CK: the cloud-shadows capability is advertised in the feature manifest.
             bool sawCloudShadowsFeature = false;
+            // Slice DH: the ddgi-probe-raytrace capability is advertised in the feature manifest.
+            bool sawProbeGiFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -279,6 +281,7 @@ int main() {
                     if (AsString(el->value) == "particle-vfx") sawVfxFeature = true;
                     if (AsString(el->value) == "volumetric-clouds") sawCloudsFeature = true;
                     if (AsString(el->value) == "cloud-shadows") sawCloudShadowsFeature = true;
+                    if (AsString(el->value) == "ddgi-probe-raytrace") sawProbeGiFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -329,6 +332,7 @@ int main() {
             check(sawVfxFeature, "engine.features includes particle-vfx");
             check(sawCloudsFeature, "engine.features includes volumetric-clouds");
             check(sawCloudShadowsFeature, "engine.features includes cloud-shadows");
+            check(sawProbeGiFeature, "engine.features includes ddgi-probe-raytrace");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -424,6 +428,8 @@ int main() {
         bool sawPlanarShot = false;
         // Slice CS: the --froxelfog-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelFogShot = false;
+        // Slice DH: the --probegi-shot showcase flag is listed in the showcase manifest.
+        bool sawProbeGiShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -495,6 +501,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--captureprobe-shot") sawCaptureProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--planar-shot") sawPlanarShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxelfog-shot") sawFroxelFogShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--probegi-shot") sawProbeGiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -549,6 +556,7 @@ int main() {
         check(sawCaptureProbeShot, "showcases manifest includes --captureprobe-shot");
         check(sawPlanarShot, "showcases manifest includes --planar-shot");
         check(sawFroxelFogShot, "showcases manifest includes --froxelfog-shot");
+        check(sawProbeGiShot, "showcases manifest includes --probegi-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");

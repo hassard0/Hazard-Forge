@@ -44,6 +44,7 @@
 #include "render/clustered.h"
 #include "render/cluster.h"
 #include "render/froxel.h"
+#include "render/probe_gi.h"
 #include "render/auto_exposure.h"   // Slice CW: histogram eye-adaptation math (pure CPU)
 #include "render/taa.h"
 #include "render/frustum.h"
@@ -362,6 +363,7 @@ int main(int argc, char** argv) {
     const char* colorGradeShotPath = nullptr;// --colorgrade-shot <out.bmp> (Slice DB: analytic color grade)
     const char* casShotPath = nullptr;       // --cas-shot <out.bmp> (Slice DF: contrast-adaptive sharpening)
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
+    const char* probeGiShotPath = nullptr;   // --probegi-shot <out.bmp> (Slice DH: DDGI probe-grid ray-trace)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
@@ -749,6 +751,20 @@ int main(int argc, char** argv) {
             // Prints `froxel-fog: {froxels:DIMX*DIMY*DIMZ, density:D, g:G}`. One BMP -> exit. New golden
             // froxel_fog.png; existing scene/sky/volumetric paths/shaders/goldens are untouched.
             froxelFogShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--probegi-shot") == 0 && i + 1 < argc) {
+            // Slice DH: DDGI Beachhead — Probe-Grid Ray-Trace. A world-space lattice of irradiance
+            // probes; each probe traces 16 deterministic Fibonacci-sphere rays against the scene's
+            // view-space depth field — supplied as a FLAT float SSBO read back from the rendered
+            // G-buffer's .w channel (NOT a sampled depth texture). A PURE COMPUTE pass (probe_raytrace
+            // .comp, no new RHI) writes per-ray (world hit pos, hit dist / kRayMiss) into a flat
+            // ProbeRayHit SSBO. THREE PROOFS: (1) the GPU ray-hit SSBO is BIT-EXACT (memcmp) to a CPU
+            // probegi::TraceRayToDepth reference over the SAME depth field; (2) probeCount=0 (dimX=0) ->
+            // dispatch 0 -> the SSBO is byte-identical to the cleared upload (all kRayMiss); (3) two GPU
+            // runs are byte-identical. Prints `probe-gi: {probes:256, rays:16, hits:H}`. GOLDEN = a thin
+            // debug-viz: the ray-hits rendered as colored points (hit world-pos -> color, misses
+            // skipped) over the lit scene -> probegi.png. One BMP -> exit. New golden; existing
+            // shaders/paths/goldens untouched.
+            probeGiShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxellights-shot") == 0 && i + 1 < argc) {
             // Slice CV: Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion). The CL
             // 96-colored-point-light scene (same fixed lattice as --clustered-lights-shot) wrapped in the
@@ -14291,6 +14307,597 @@ int main(int argc, char** argv) {
                                 froxelFogShotPath, fw, fh, DIMX, DIMY, DIMZ,
                                 (double)kBaseDensity, (double)kG, kNumObjs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", froxelFogShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DDGI Beachhead: Probe-Grid Ray-Trace (--probegi-shot, Slice DH). A world-space lattice of
+        // irradiance PROBES; each probe traces 16 deterministic Fibonacci-sphere rays against the scene's
+        // VIEW-SPACE depth field — supplied as a FLAT float[w*h] SSBO read back from the rendered
+        // G-buffer's .w channel (NOT a sampled depth texture: this mirrors froxel_inject, which never
+        // samples a depth texture in compute). A PURE COMPUTE pass (probe_raytrace.comp, one thread per
+        // probe; NO new RHI) writes per-ray (world hit pos, hit dist / kRayMiss) into a flat ProbeRayHit
+        // SSBO; the host reads it back. THREE PROOFS (fail loudly): (1) the GPU ray-hit SSBO is BIT-EXACT
+        // (memcmp) to a CPU probegi::TraceRayToDepth reference over the SAME depthField (same nearest
+        // index math); (2) probeCount=0 (dimX=0) -> ProbeDispatchGroups()==0 -> DispatchCompute(0) -> the
+        // SSBO is byte-identical to the cleared upload (all kRayMiss); (3) two GPU runs byte-identical.
+        // GOLDEN = a thin debug-viz: the ray-hits rendered as colored POINTS (hit world-pos -> color,
+        // misses skipped) over the lit scene via the existing pointList pipeline flag -> probegi.png.
+        // Deterministic (fixed scene/grid/camera/march, deterministic Fibonacci dirs, no RNG/time).
+        if (probeGiShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace pg = hf::render::probegi;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const float kFovY = 1.04719755f;
+            const float tanHalfFovY = std::tan(0.5f * kFovY);
+            const float kYFlip = -1.0f;   // Vulkan: the projection bakes a Y-flip + post.vert gives V-down
+            // Fixed, deterministic probe-march params.
+            const int   kSteps     = 64;
+            const float kMaxDist   = 14.0f;
+            const float kThickness = 0.35f;
+
+            // === Probe grid (fixed, deterministic): a world-space lattice straddling the scene. ===
+            pg::ProbeGrid grid;
+            grid.origin = Vec3{-3.5f, 0.3f, -3.5f};
+            grid.dimX = 8; grid.dimY = 4; grid.dimZ = 8; grid.spacing = 1.0f;
+            const int kProbes = grid.probeCount();           // 256
+
+            // --- Lit / shadow / sky / gbuffer pipelines (UNCHANGED shaders, same as --froxelfog-shot). ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto gbVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.vert.hlsl.spv");
+            auto gbFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/gbuffer.frag.hlsl.spv");
+            auto gbVs = device->CreateShaderModule({std::span<const uint32_t>(gbVsW)});
+            auto gbFs = device->CreateShaderModule({std::span<const uint32_t>(gbFsW)});
+            rhi::GraphicsPipelineDesc gbStDesc;
+            gbStDesc.vertex = gbVs.get(); gbStDesc.fragment = gbFs.get();
+            gbStDesc.vertexLayout = scene::MeshVertexLayout();
+            gbStDesc.colorFormat = kHdr;
+            gbStDesc.depthTest = true; gbStDesc.usesFrameUniforms = true;
+            gbStDesc.pushConstantSize = sizeof(float) * 32;   // model(16) + view(16)
+            auto gbStaticPipeline = device->CreateGraphicsPipeline(gbStDesc);
+
+            // --- Probe ray-trace COMPUTE pipeline (NEW; 3 storage buffers: rayHits/params/depth). ---
+            auto probeCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_raytrace.comp.hlsl.spv");
+            auto probeCs = device->CreateShaderModule({std::span<const uint32_t>(probeCsW)});
+            rhi::ComputePipelineDesc probeCd;
+            probeCd.compute = probeCs.get();
+            probeCd.storageBufferCount = 3;
+            probeCd.threadsPerGroupX = 64;
+            auto probeCompute = device->CreateComputePipeline(probeCd);
+
+            // --- Debug-viz point pipeline (reuses particle.vert/frag + the pointList flag; NO new RHI) +
+            //     post (UNCHANGED tonemap). The point buffer carries (worldHitPos, colorVec) per hit. ---
+            auto partVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/particle.vert.hlsl.spv");
+            auto partFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/particle.frag.hlsl.spv");
+            auto partVs = device->CreateShaderModule({std::span<const uint32_t>(partVsW)});
+            auto partFs = device->CreateShaderModule({std::span<const uint32_t>(partFsW)});
+            const uint32_t kPointStride = sizeof(float) * 8;   // posLife(4) + velSeed(4) (matches particles)
+            rhi::GraphicsPipelineDesc ptDesc;
+            ptDesc.vertex = partVs.get(); ptDesc.fragment = partFs.get();
+            ptDesc.vertexLayout.stride = kPointStride;
+            ptDesc.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},    // hit world position (posLife.xyz)
+                {1, rhi::Format::RGB32_Float, 16},   // a color-encoding vec (velSeed.xyz)
+            };
+            ptDesc.colorFormat = kHdr;
+            ptDesc.depthTest = false; ptDesc.usesFrameUniforms = true;
+            ptDesc.pointList = true; ptDesc.additiveBlend = true;
+            auto pointPipeline = device->CreateGraphicsPipeline(ptDesc);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postFs  = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFs.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // --- Render targets: lit HDR scene + RGBA16F g-buffer + a viz RT (scene + points). ---
+            auto rt    = device->CreateRenderTarget(w, h, kHdr);
+            auto gbuf  = device->CreateRenderTarget(w, h, kHdr);
+            auto vizRT = device->CreateRenderTarget(w, h, kHdr);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // --- Scene objects (deterministic): a few boxes/spheres so the probe rays catch real geometry. ---
+            struct Obj { Vec3 pos; Vec3 scale; bool cube; };
+            const Obj objs[] = {
+                {{-2.0f, 0.7f,  0.5f}, {0.7f, 0.7f, 0.7f}, true},
+                {{ 1.6f, 0.6f, -1.0f}, {0.6f, 0.6f, 0.6f}, false},
+                {{-0.8f, 0.9f, -2.8f}, {0.9f, 0.9f, 0.9f}, true},
+                {{ 2.2f, 0.7f, -2.2f}, {0.7f, 0.7f, 0.7f}, false},
+                {{ 0.2f, 1.0f, -0.4f}, {0.5f, 0.5f, 0.5f}, true},
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            Mat4 groundModel = Mat4::Scale({20.0f, 1.0f, 20.0f});
+
+            const Vec3 eye{0.0f, 3.2f, 6.0f};
+            const Vec3 center{0.0f, 0.6f, -1.5f};
+            Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 projM = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+            Vec3 sunTravel = math::normalize(Vec3{-0.3f, -0.6f, -0.5f});
+            FrameData fd{};
+            {
+                Mat4 vp = projM * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0]=sunTravel.x; fd.lightDir[1]=sunTravel.y; fd.lightDir[2]=sunTravel.z;
+                fd.lightColor[0]=1.0f; fd.lightColor[1]=0.96f; fd.lightColor[2]=0.85f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                fd.ptCount[0]=0.0f;
+                Vec3 sc{0.0f, 0.5f, -1.5f};
+                Vec3 lightEye = sc - sunTravel * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 44.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = tanHalfFovY;
+                fd.skyParams[1] = aspect;
+            }
+            auto objModel = [&](const Obj& o) {
+                return Mat4::Translate(o.pos) * Mat4::Scale(o.scale);
+            };
+
+            // === Render shadow -> lit scene (HDR) -> G-buffer (view normal + linear depth). ===
+            {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgGbuf = graph.ImportTarget(
+                    "gbuffer", render::RgResourceKind::SceneColor, *gbuf);
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            cmd.PushConstants(m.m, sizeof(float) * 16);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16]=0.0f; pc[17]=0.85f; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            pc[16]=0.0f; pc[17]=0.6f; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("gbuffer", {}, {rgGbuf},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 0});
+                        cmd.BindPipeline(*gbStaticPipeline);
+                        {
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[32];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            for (int k = 0; k < 16; ++k) pc[16 + k] = viewM.m[k];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.Execute(*device);
+                device->WaitIdle();
+            }
+
+            // === Read the G-buffer back and extract the .w (view-linear depth) into a FLAT float field. ===
+            // ReadRenderTarget returns RAW RGBA16F bytes (8 bytes/pixel = 4 IEEE binary16); the .w (alpha)
+            // is the 4th half. The SAME depthField feeds the gDepth SSBO (the GPU march) AND the CPU
+            // reference march -> bit-exact, cross-backend-identical.
+            std::vector<uint8_t> gbBytes;
+            uint32_t gbw = 0, gbh = 0;
+            if (!device->ReadRenderTarget(*gbuf, gbBytes, gbw, gbh)) {
+                std::fprintf(stderr, "FATAL: ReadRenderTarget(gbuffer) failed (probe-gi depth readback)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (gbBytes.size() != (size_t)gbw * gbh * 8) {
+                std::fprintf(stderr, "FATAL: g-buffer readback is not RGBA16F (got %zu bytes for %ux%u)\n",
+                             gbBytes.size(), gbw, gbh);
+                device->WaitIdle(); return 1;
+            }
+            auto halfToFloat = [](uint16_t hbits) -> float {
+                uint32_t sign = (uint32_t)(hbits & 0x8000u) << 16;
+                uint32_t exp  = (hbits >> 10) & 0x1Fu;
+                uint32_t mant = hbits & 0x3FFu;
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) { f = sign; }
+                    else {
+                        exp = 127 - 15 + 1;
+                        while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
+                        mant &= 0x3FFu;
+                        f = sign | (exp << 23) | (mant << 13);
+                    }
+                } else if (exp == 0x1Fu) {
+                    f = sign | 0x7F800000u | (mant << 13);
+                } else {
+                    f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+                }
+                float out; std::memcpy(&out, &f, sizeof(out)); return out;
+            };
+            std::vector<float> depthField((size_t)gbw * gbh);
+            for (size_t px = 0; px < (size_t)gbw * gbh; ++px) {
+                uint16_t aHalf;
+                std::memcpy(&aHalf, gbBytes.data() + px * 8 + 6, sizeof(aHalf));   // .w = 4th half
+                depthField[px] = halfToFloat(aHalf);
+            }
+
+            // === The probe params SSBO (matches probe_raytrace.comp ProbeParams std430). ===
+            struct ProbeParamsCPU {
+                float    originSpacing[4];   // xyz origin, w spacing
+                uint32_t dims[4];            // dimX,dimY,dimZ,probeCount
+                float    camera[4];          // tanHalfFovY, aspect, yFlip, _
+                float    march[4];           // maxDist, steps, thickness, _
+                uint32_t depthDims[4];       // depthW, depthH, _, _
+                float    view[16];           // world->view, column-major
+                float    rayDirs[pg::kRaysPerProbe][4];   // the 16 PRECOMPUTED Fibonacci dirs (xyz; w pad)
+            };
+            static_assert(sizeof(ProbeParamsCPU) == 16 * 5 + 64 + 16 * pg::kRaysPerProbe,
+                          "ProbeParams std430 layout (incl. the 16 precomputed ray dirs)");
+
+            // Precompute the kRaysPerProbe Fibonacci-sphere directions ONCE on the host (the verbatim
+            // probegi::FibonacciSphere). The GPU reads these exact float32 bits + the CPU reference uses
+            // the SAME values -> the per-ray dir is bit-identical (cos/sin/sqrt would diverge if computed
+            // on both sides), so the stored hit position is BIT-EXACT.
+            std::vector<math::Vec3> fibDirs(pg::kRaysPerProbe);
+            for (int r = 0; r < pg::kRaysPerProbe; ++r) fibDirs[r] = pg::FibonacciSphere(r, pg::kRaysPerProbe);
+
+            // The flat ray-hit SSBO (ProbeRayHit[probeCount*16]) cleared to kRayMiss — the cleared upload
+            // is exactly the probeCount=0 no-op reference (a dispatch-0 leaves these bytes untouched).
+            auto makeClearedHits = [&](int probes) {
+                std::vector<pg::ProbeRayHit> v((size_t)probes * pg::kRaysPerProbe);
+                for (auto& hp : v) {
+                    hp.hitPosDist[0] = 0.0f; hp.hitPosDist[1] = 0.0f; hp.hitPosDist[2] = 0.0f;
+                    hp.hitPosDist[3] = pg::kRayMiss;
+                }
+                return v;
+            };
+
+            // Run the probe-raytrace compute for a given grid, returning the read-back ray-hit SSBO. The
+            // ray-hit buffer is freshly cleared to kRayMiss per run (so a 0-dispatch leaves it cleared).
+            // The hits buffer is ALWAYS sized to the ENABLED grid (kProbes*16) so the probeCount=0 no-op
+            // run uploads + reads back the SAME-size cleared buffer (== the cleared reference). The
+            // dispatch group count is what differs (0 when probeCount==0).
+            auto runProbeTrace = [&](const pg::ProbeGrid& g,
+                                     std::vector<pg::ProbeRayHit>& outHits) -> bool {
+                const int probes = g.probeCount();
+                std::vector<pg::ProbeRayHit> cleared = makeClearedHits(kProbes);
+
+                rhi::BufferDesc hitsDesc;
+                hitsDesc.size = cleared.size() * sizeof(pg::ProbeRayHit);
+                hitsDesc.initialData = cleared.data();
+                hitsDesc.usage = rhi::BufferUsage::Storage;
+                auto hitsBuf = device->CreateBuffer(hitsDesc);
+
+                ProbeParamsCPU pp{};
+                pp.originSpacing[0]=g.origin.x; pp.originSpacing[1]=g.origin.y;
+                pp.originSpacing[2]=g.origin.z; pp.originSpacing[3]=g.spacing;
+                pp.dims[0]=(uint32_t)g.dimX; pp.dims[1]=(uint32_t)g.dimY; pp.dims[2]=(uint32_t)g.dimZ;
+                pp.dims[3]=(uint32_t)(probes > 0 ? probes : 0);
+                pp.camera[0]=tanHalfFovY; pp.camera[1]=aspect; pp.camera[2]=kYFlip;
+                pp.march[0]=kMaxDist; pp.march[1]=(float)kSteps; pp.march[2]=kThickness;
+                pp.depthDims[0]=gbw; pp.depthDims[1]=gbh;
+                for (int k = 0; k < 16; ++k) pp.view[k] = viewM.m[k];
+                for (int r = 0; r < pg::kRaysPerProbe; ++r) {
+                    pp.rayDirs[r][0]=fibDirs[r].x; pp.rayDirs[r][1]=fibDirs[r].y;
+                    pp.rayDirs[r][2]=fibDirs[r].z; pp.rayDirs[r][3]=0.0f;
+                }
+                rhi::BufferDesc ppDesc;
+                ppDesc.size = sizeof(ProbeParamsCPU); ppDesc.initialData = &pp;
+                ppDesc.usage = rhi::BufferUsage::Storage;
+                auto ppBuf = device->CreateBuffer(ppDesc);
+
+                rhi::BufferDesc dDesc;
+                dDesc.size = depthField.size() * sizeof(float); dDesc.initialData = depthField.data();
+                dDesc.usage = rhi::BufferUsage::Storage;
+                auto dBuf = device->CreateBuffer(dDesc);
+
+                const uint32_t groups = (uint32_t)pg::ProbeDispatchGroups(g);
+
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                graph.AddPass("probe", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*probeCompute);
+                        cmd.BindStorageBuffer(*hitsBuf, 0);
+                        cmd.BindStorageBuffer(*ppBuf, 1);
+                        cmd.BindStorageBuffer(*dBuf, 2);
+                        cmd.DispatchCompute(groups);   // groups==0 when probeCount==0 -> hitsBuf untouched
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                graph.Execute(*device);
+                device->WaitIdle();
+
+                outHits.resize(cleared.size());
+                device->ReadBuffer(*hitsBuf, outHits.data(),
+                                   outHits.size() * sizeof(pg::ProbeRayHit), 0);
+                return true;
+            };
+
+            // --- GPU run #1 (the enabled grid). ---
+            std::vector<pg::ProbeRayHit> gpuHits;
+            if (!runProbeTrace(grid, gpuHits)) {
+                std::fprintf(stderr, "FATAL: probe-raytrace compute failed\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF 1 — GPU == CPU bit-exact. The CPU reference runs probegi::TraceRayToDepth over the
+            // SAME depthField (same nearest index math the shader uses) for every probe x ray. ===
+            auto cpuSampleDepth = [&](float u, float v) -> float {
+                int ix = (int)(u * (float)gbw);
+                int iy = (int)(v * (float)gbh);
+                if (ix < 0) ix = 0; if (ix > (int)gbw - 1) ix = (int)gbw - 1;
+                if (iy < 0) iy = 0; if (iy > (int)gbh - 1) iy = (int)gbh - 1;
+                return depthField[(size_t)iy * gbw + (size_t)ix];
+            };
+            std::vector<pg::ProbeRayHit> cpuHits((size_t)kProbes * pg::kRaysPerProbe);
+            for (int p = 0; p < kProbes; ++p) {
+                int pz = p / (grid.dimX * grid.dimY);
+                int rem = p % (grid.dimX * grid.dimY);
+                int py = rem / grid.dimX;
+                int pxi = rem % grid.dimX;
+                Vec3 probeWorld = grid.probePos(pxi, py, pz);
+                for (int r = 0; r < pg::kRaysPerProbe; ++r) {
+                    Vec3 dir = fibDirs[r];   // the SAME precomputed dir the GPU read
+                    pg::TraceRayToDepth(probeWorld, dir, kMaxDist, kSteps, kThickness, viewM,
+                                        tanHalfFovY, aspect, kYFlip, cpuSampleDepth,
+                                        cpuHits[(size_t)p * pg::kRaysPerProbe + r]);
+                }
+            }
+            const bool bitExact = (gpuHits.size() == cpuHits.size()) &&
+                (std::memcmp(gpuHits.data(), cpuHits.data(),
+                             cpuHits.size() * sizeof(pg::ProbeRayHit)) == 0);
+            if (!bitExact) {
+                std::fprintf(stderr,
+                    "FATAL: probe-gi GPU ray-hits != CPU TraceRayToDepth reference (a march/projection/"
+                    "indexing mismatch between the shader-copied math and the header)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-gi GPU==CPU ray-hits: BIT-EXACT\n");
+
+            // === PROOF 2 — probeCount=0 no-op. dimX=0 -> ProbeDispatchGroups()==0 -> DispatchCompute(0) ->
+            // the ray-hit SSBO is byte-identical to the cleared upload (all kRayMiss). ===
+            pg::ProbeGrid emptyGrid = grid; emptyGrid.dimX = 0;
+            std::vector<pg::ProbeRayHit> emptyHits;
+            if (!runProbeTrace(emptyGrid, emptyHits)) {
+                std::fprintf(stderr, "FATAL: probe-raytrace compute failed (probeCount=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::vector<pg::ProbeRayHit> clearedRef = makeClearedHits((int)emptyHits.size() / pg::kRaysPerProbe);
+            const bool noOpClean = (emptyHits.size() == clearedRef.size()) &&
+                (std::memcmp(emptyHits.data(), clearedRef.data(),
+                             clearedRef.size() * sizeof(pg::ProbeRayHit)) == 0);
+            if (!noOpClean) {
+                std::fprintf(stderr,
+                    "FATAL: probe-gi probeCount=0 SSBO != cleared upload (the dispatch-0 was not a no-op)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-gi probeCount=0: SSBO UNTOUCHED == cleared\n");
+
+            // === PROOF 3 — determinism: a second GPU run is byte-identical. ===
+            std::vector<pg::ProbeRayHit> gpuHits2;
+            if (!runProbeTrace(grid, gpuHits2)) {
+                std::fprintf(stderr, "FATAL: probe-raytrace compute failed (run 2)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool deterministic = (gpuHits.size() == gpuHits2.size()) &&
+                (std::memcmp(gpuHits.data(), gpuHits2.data(),
+                             gpuHits.size() * sizeof(pg::ProbeRayHit)) == 0);
+            if (!deterministic) {
+                std::fprintf(stderr, "FATAL: probe-gi two GPU runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // Count the hits (w != kRayMiss) — deterministic.
+            int hitCount = 0;
+            for (const auto& hp : gpuHits) if (hp.hitPosDist[3] != pg::kRayMiss) ++hitCount;
+            std::printf("probe-gi: {probes:%d, rays:%d, hits:%d}\n", kProbes, pg::kRaysPerProbe, hitCount);
+
+            // === GOLDEN debug-viz: render the ray-hits as colored POINTS over the lit scene. Each hit's
+            // color is derived from its world position (encoded into the velocity attribute so particle
+            // .vert's speed->palette gives a coherent, spatially varying point cloud); misses are skipped.
+            // Reuses the pointList pipeline flag (no new RHI). ===
+            struct VizPoint { float pos[4]; float vel[4]; };
+            std::vector<VizPoint> points;
+            points.reserve((size_t)hitCount);
+            for (const auto& hp : gpuHits) {
+                if (hp.hitPosDist[3] == pg::kRayMiss) continue;   // misses skipped
+                VizPoint vp{};
+                vp.pos[0]=hp.hitPosDist[0]; vp.pos[1]=hp.hitPosDist[1]; vp.pos[2]=hp.hitPosDist[2];
+                // Encode a color from the hit position: a velocity vector whose magnitude (particle.vert's
+                // speed) varies with the hit's height + lateral position -> a coherent palette over space.
+                float speed = 1.5f + 0.9f * (hp.hitPosDist[1]) + 0.4f * std::fabs(hp.hitPosDist[0]);
+                vp.vel[0]=speed; vp.vel[1]=0.0f; vp.vel[2]=0.0f;
+                points.push_back(vp);
+            }
+            const uint32_t kNumPoints = (uint32_t)points.size();
+            rhi::BufferDesc vbDesc;
+            vbDesc.size = (kNumPoints > 0 ? points.size() : 1) * sizeof(VizPoint);
+            VizPoint zeroPt{};
+            vbDesc.initialData = (kNumPoints > 0 ? (const void*)points.data() : (const void*)&zeroPt);
+            vbDesc.usage = rhi::BufferUsage::Vertex;
+            auto pointBuf = device->CreateBuffer(vbDesc);
+
+            std::vector<uint8_t> vizPx; uint32_t vw=0, vh=0;
+            {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgViz = graph.ImportTarget(
+                    "viz", render::RgResourceKind::SceneColor, *vizRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                // Re-render the lit scene (sky + lit) into the viz RT, then overlay the ray-hit points
+                // (additive, depth-test off) -> the coherent debug-viz, then post (tonemap) -> swapchain.
+                graph.AddPass("viz", {rgShadow}, {rgViz},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16]=0.0f; pc[17]=0.85f; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int oi = 0; oi < kNumObjs; ++oi) {
+                            Mat4 m = objModel(objs[oi]);
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = m.m[k];
+                            pc[16]=0.0f; pc[17]=0.6f; pc[18]=0.0f; pc[19]=0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            const scene::Mesh& msh = objs[oi].cube ? cube : sphere;
+                            cmd.BindVertexBuffer(msh.vertices());
+                            cmd.BindIndexBuffer(msh.indices());
+                            cmd.DrawIndexed(msh.indexCount());
+                        }
+                        if (kNumPoints > 0) {
+                            cmd.BindPipeline(*pointPipeline);
+                            cmd.BindVertexBuffer(*pointBuf);
+                            cmd.Draw(kNumPoints);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgViz}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*vizRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                if (!device->GetCapturedPixels(vizPx, vw, vh)) {
+                    std::fprintf(stderr, "FATAL: no captured pixels (probe-gi debug-viz)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            bool ok = WriteBMP(probeGiShotPath, vizPx, vw, vh);
+            if (ok) std::printf("wrote %s (%ux%u) — probe-gi debug-viz, %d probes, %d rays/probe, "
+                                "%d ray-hit points\n",
+                                probeGiShotPath, vw, vh, kProbes, pg::kRaysPerProbe, (int)kNumPoints);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeGiShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

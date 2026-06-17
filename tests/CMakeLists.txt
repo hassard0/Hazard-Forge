@@ -253,6 +253,20 @@ hf_add_pure_test(reflection_probe_test)
 # froxel_inject/integrate/apply. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(froxel_test)
 
+# Probe-Grid Ray-Trace — DDGI beachhead (Slice DH): the world-space probe lattice + the deterministic
+# Fibonacci-sphere ray set + the nearest-probe lookup + the view-space depth-field march
+# (engine/render/probe_gi.h, header-only) the probe_raytrace.comp shader copies VERBATIM (so the GPU
+# ray-hit SSBO is BIT-EXACT to this CPU reference). Asserts FibonacciSphere (unit-length, deterministic,
+# (0,1)->(0,0,1), even full-sphere distribution: |mean|->0 + z monotone/evenly-spaced ~2/N + no dupes),
+# TraceRayToDepth over a FLAT field (a ray aimed away MISSES -> kRayMiss; a ray at the plane HITS at the
+# analytic depth) and a SYNTHETIC near-occluder (the ray through the occluder column hits the occluder,
+# not the far plane), GetProbeGridIndex (round-trips probePos->flatIndex at every lattice point + clamps
+# far-outside positions to the boundary probe), the DISABLED path (dimX/Y/Z=0 -> probeCount 0 ->
+# ProbeDispatchGroups 0 -> the dispatch-0 no-op), and DETERMINISM (the full per-probe ray set is
+# bit-identical across two runs). Pure C++ (hf_core; reuses render/ssr.h), no RHI/backend symbols,
+# ASan-eligible.
+hf_add_pure_test(probe_gi_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,
