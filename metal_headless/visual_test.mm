@@ -17261,11 +17261,13 @@ static int RunPlanarShowcase(const char* outPath) {
     Mat4 mainVP   = mainProj * mainView;
 
     // The reflected camera + oblique near-clip (render::planar — the SAME math the test pins). The clip
-    // plane points to the viewer side after PlaneToView; NEGATE it so the reflected geometry is KEPT.
+    // plane is expressed in the reflected camera's view space; ObliqueNearClip keeps the half-space the
+    // normal points toward (the reflected geometry). On the Metal projection (Y-flipped clip space) the
+    // kept-side convention is the OPPOSITE of the Vulkan projection, so the clip plane is used as-is here
+    // (the Vulkan path negates it). The oblique clip clips only geometry genuinely behind the mirror.
     Mat4 R = plr::ReflectionMatrix(kPlaneN, kPlaneD);
     Mat4 reflView = mainView * R;
     Vec4 clipPlaneView = plr::PlaneToView(kPlaneN, kPlaneD, reflView);
-    clipPlaneView = Vec4{-clipPlaneView.x, -clipPlaneView.y, -clipPlaneView.z, -clipPlaneView.w};
     Mat4 reflProjOblique = plr::ObliqueNearClip(mainProj, clipPlaneView);
     Mat4 reflVP = reflProjOblique * reflView;
 
@@ -17278,9 +17280,10 @@ static int RunPlanarShowcase(const char* outPath) {
         fd.viewPos[0]=camPos.x; fd.viewPos[1]=camPos.y; fd.viewPos[2]=camPos.z; fd.viewPos[3]=1.0f;
         fd.ptCount[0]=0.0f;
         fd.skyParams[0]=reflectivity;
-        // skyParams.y = reflection-sample V-flip. On Metal the RT texture origin differs from Vulkan, so
-        // the reflection RT is sampled flipped in V to line up with the mirror floor's screen rows.
-        fd.skyParams[1]=1.0f;
+        // skyParams.y = reflection-sample V-flip. The reflection RT and the main pass share the SAME
+        // FlipProjY projection, so the reflected geometry lands at the mirror floor's screen rows with no
+        // flip (matches the Vulkan path).
+        fd.skyParams[1]=0.0f;
         fd.skyParams[2]=1.0f / (float)W;
         fd.skyParams[3]=1.0f / (float)H;
         return fd;
