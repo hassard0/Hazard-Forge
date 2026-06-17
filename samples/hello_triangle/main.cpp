@@ -437,6 +437,7 @@ int main(int argc, char** argv) {
     const char* vsmSampleShotPath = nullptr; // --vsm-sample-shot <out.bmp> (Slice VC: lit-pass VSM indirection sample — per receiver pixel level->page->tile->tile-clamped PCF over the depth atlas -> a VSM-shadowed scene; vsmEnabled=0 byte-identical-to-unshadowed no-op)
     const char* vsmCacheShotPath = nullptr; // --vsm-cache-shot <out.bmp> (Slice VD: per-page CACHING — content-key cache skips re-rendering unchanged physical pages; cached==fresh + cached==full BYTE-IDENTICAL; cache-status viz)
     const char* vtFeedbackShotPath = nullptr; // --vt-feedback-shot <out.bmp> (Slice VT1: runtime virtual texturing page-needed FEEDBACK marking, integer compute, GPU==CPU feedback-set bit-exact, per-mip page-grid debug-viz)
+    const char* vtAllocShotPath = nullptr; // --vt-alloc-shot <out.bmp> (Slice VT2: runtime virtual texturing physical tile-pool allocation + virtual->physical INDIRECTION table, single-thread GPU allocator, GPU==CPU indirection bit-exact, per-mip tile-assignment debug-viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1368,6 +1369,24 @@ int main(int argc, char** argv) {
             // the read-back integer set -> identical both backends by construction. NO rendering, NO new
             // RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
             vtFeedbackShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vt-alloc-shot") == 0 && i + 1 < argc) {
+            // Slice VT2: Runtime Virtual Texturing Slice 2 — PHYSICAL TILE-POOL ALLOCATION + virtual->
+            // physical INDIRECTION table (the 2nd RVT slice, the DIRECT analog of VSM Slice VB's
+            // AllocatePhysicalPages). Reuses VT1's scene (VtTexture 4mip/128/16vpps0 + the SAME 576
+            // requests) to build the resident feedback SET (host vt::MarkFeedbackPages), then dispatches a
+            // SINGLE-THREAD allocator (shaders/vt_alloc.comp, [numthreads(1,1,1)]): one thread walks pageId
+            // 0..pageCount-1 ASCENDING maintaining nextTile -> gIndirection[pageId] = (resident &&
+            // nextTile<cap) ? nextTile++ : 0xFFFFFFFF (kNoTile), over a finite VtTilePool{tilesPerSide=12}
+            // (144 tiles < 212 resident -> overflow exercised). ReadBuffer reads the indirection table.
+            // PROOFS (fail loudly): (1) GPU==CPU indirection BIT-EXACT (CPU AllocatePhysicalTiles ->
+            // memcmp==0, integer, NO FP tol), (2) {resident,capacity,allocated,overflow} with
+            // allocated=min(R,C)/overflow=max(0,R-C) + unique/in-range/ascending-priority tile indices,
+            // (3) allocEnabled=false -> all kNoTile (no-op), (4) two-run determinism byte-identical.
+            // Golden = a per-mip page-grid debug-viz: allocated page -> hashColor(tileIndex), kNoTile-but-
+            // resident (overflow) -> a distinct DIM color, non-resident -> dark; CPU-colored from the
+            // read-back integer indirection -> identical both backends by construction. NO rendering, NO
+            // new RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
+            vtAllocShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -14439,6 +14458,257 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — per-mip VT page-feedback viz (%u resident pages)\n",
                                 vtFeedbackShotPath, imgW, imgH, residentPages);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vtFeedbackShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION + INDIRECTION (--vt-alloc-shot
+        // <out.bmp>, Slice VT2). VT1 produced the resident page SET; VT2 assigns each resident page a
+        // PHYSICAL tile in a finite pool — a deterministic integer virtual->physical INDIRECTION table the
+        // future sampling pass reads (the DIRECT analog of VSM Slice VB). Reuses VT1's scene + the SAME 576
+        // requests -> host vt::MarkFeedbackPages builds the feedback set -> a SINGLE-THREAD GPU allocator
+        // (shaders/vt_alloc.comp, one thread walks pageId 0..pageCount-1 ASCENDING maintaining nextTile)
+        // writes gIndirection[pageId] = (resident && nextTile<cap) ? nextTile++ : 0xFFFFFFFF over a finite
+        // VtTilePool{tilesPerSide=12} (144 tiles < the resident set -> overflow). ReadBuffer reads the
+        // indirection; the CPU vt::AllocatePhysicalTiles over the SAME feedback must match BIT-EXACT
+        // (memcmp, no FP tol). allocEnabled=false -> all kNoTile. The golden is a per-mip page-grid debug-
+        // viz CPU-colored from the read-back integer indirection (allocated -> hashColor(tileIndex),
+        // overflow-resident -> a distinct DIM color, non-resident -> dark) -> identical both backends by
+        // construction. NO rendering, NO new RHI.
+        if (vtAllocShotPath) {
+            using math::Vec3;
+            namespace vt = hf::render::vt;
+            namespace vg = hf::render::vg;
+            // Fixed virtual texture (== the VT1 --vt-feedback-shot config): 340 pages over 4 mips.
+            vt::VtTexture vtx;
+            vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+            const int nPages = vtx.pageCount();
+
+            // The SAME fixed deterministic (UV,mip) sample-request set as VT1 (24x24 = 576 requests).
+            std::vector<vt::SampleRequest> requests;
+            const int kGrid = 24;
+            for (int gy = 0; gy < kGrid; ++gy)
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    float u = (float)gx / (float)kGrid;
+                    float v = (float)gy / (float)kGrid;
+                    int mip = (gx + gy) % vtx.mipLevels;
+                    requests.push_back({u, v, mip});
+                }
+
+            // Build the VT1 feedback set on the HOST (simplest; identical to the GPU vt_feedback set,
+            // proven by VT1). This is the allocator's INPUT — uploaded to the GPU as the gFeedback SSBO.
+            std::vector<uint32_t> feedback((size_t)nPages, 0u);
+            vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                                  std::span<uint32_t>(feedback.data(), feedback.size()));
+            uint32_t residentPages = 0;
+            for (uint32_t f : feedback) residentPages += (f != 0u) ? 1u : 0u;
+
+            // The finite physical tile pool: 12x12 = 144 tiles, deliberately SMALLER than the resident set
+            // so the overflow/kNoTile path is exercised.
+            vt::VtTilePool pool; pool.tilesPerSide = 12;
+            const int tileCapacity = pool.tileCapacity();
+
+            // feedback SSBO (the allocator input — uploaded once, read-only on the GPU).
+            rhi::BufferDesc fbDesc;
+            fbDesc.size = feedback.size() * sizeof(uint32_t);
+            fbDesc.initialData = feedback.data();
+            fbDesc.usage = rhi::BufferUsage::Storage;
+            auto feedbackBuf = device->CreateBuffer(fbDesc);
+
+            // indirection SSBO (cleared to 0xFFFFFFFF == kNoTile so a fresh upload reads kNoTile back even
+            // if the shader wrote nothing — the disabled-path safety + the single-thread allocator output).
+            std::vector<uint32_t> indirInit((size_t)nPages, vt::kNoTileU32);
+            auto makeIndirBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = indirInit.size() * sizeof(uint32_t);
+                d.initialData = indirInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches vt_alloc.comp Params std430): { pageCount, tileCapacity, allocEnabled, _ }.
+            struct VtAllocParams { uint32_t pageCount, tileCapacity, allocEnabled, _pad; };
+            static_assert(sizeof(VtAllocParams) == 16, "VtAllocParams std430 layout");
+            auto makeParams = [&](uint32_t allocEnabled) {
+                VtAllocParams p{};
+                p.pageCount = (uint32_t)nPages;
+                p.tileCapacity = (uint32_t)tileCapacity;
+                p.allocEnabled = allocEnabled;
+                p._pad = 0u;
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (feedback, indirection, params); 1 thread/group.
+            auto acsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vt_alloc.comp.hlsl.spv");
+            auto acs = device->CreateShaderModule({std::span<const uint32_t>(acsWords)});
+            rhi::ComputePipelineDesc acDesc;
+            acDesc.compute = acs.get();
+            acDesc.storageBufferCount = 3;
+            acDesc.pushConstantSize = 0;
+            acDesc.threadsPerGroupX = 1;
+            auto acCompute = device->CreateComputePipeline(acDesc);
+
+            // Run the single-thread allocator over a fresh indirection buffer; read back indirection[].
+            auto runAlloc = [&](uint32_t allocEnabled, std::vector<int32_t>& outIndir) {
+                auto indirBuf = makeIndirBuf();
+                VtAllocParams params = makeParams(allocEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(VtAllocParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("vt_alloc", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*acCompute);
+                        cmd.BindStorageBuffer(*feedbackBuf, 0);
+                        cmd.BindStorageBuffer(*indirBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(1);   // ONE group of ONE thread (the serial scan)
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                std::vector<uint32_t> raw((size_t)nPages, 0u);
+                device->ReadBuffer(*indirBuf, raw.data(), raw.size() * sizeof(uint32_t), 0);
+                // Cast the 0xFFFFFFFF SSBO sentinel to int32 -1 (== vt::kNoTile) on read-back.
+                outIndir.assign((size_t)nPages, vt::kNoTile);
+                for (size_t i = 0; i < raw.size(); ++i) outIndir[i] = (int32_t)raw[i];
+            };
+
+            // === GPU allocation (enabled) ===
+            std::vector<int32_t> gpuIndir;
+            runAlloc(1u, gpuIndir);
+
+            // === CPU reference over the SAME feedback set ===
+            std::vector<int32_t> cpuIndir =
+                vt::AllocatePhysicalTiles(std::span<const uint32_t>(feedback.data(), feedback.size()), pool);
+
+            // PROOF (1) GPU==CPU indirection BIT-EXACT (integer memcmp, NO FP tolerance).
+            if (gpuIndir.size() != cpuIndir.size() ||
+                std::memcmp(gpuIndir.data(), cpuIndir.data(), (size_t)nPages * sizeof(int32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vt-alloc GPU indirection != CPU AllocatePhysicalTiles "
+                             "(the single-thread serial scan diverged?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-alloc GPU==CPU indirection: %d entries BIT-EXACT\n", nPages);
+
+            // PROOF (2) allocation correctness: allocated == min(resident,capacity); unique + in-range +
+            // ascending-priority tile indices.
+            const uint32_t R = residentPages;
+            const uint32_t C = (uint32_t)tileCapacity;
+            const uint32_t expectAlloc = R < C ? R : C;
+            const uint32_t expectOverflow = R > C ? (R - C) : 0u;
+            uint32_t allocated = 0;
+            std::vector<uint8_t> tileSeen((size_t)tileCapacity, 0);
+            bool uniqueInRange = true, ascending = true, overflowKNoTile = true, nonResIsNoTile = true;
+            uint32_t residentSeen = 0; int expectTile = 0;
+            for (int pageId = 0; pageId < nPages; ++pageId) {
+                int32_t t = gpuIndir[(size_t)pageId];
+                if (feedback[(size_t)pageId] != 0u) {
+                    ++residentSeen;
+                    if (residentSeen <= C) { if (t != expectTile) ascending = false; ++expectTile; }
+                    else { if (t != vt::kNoTile) overflowKNoTile = false; }
+                } else {
+                    if (t != vt::kNoTile) nonResIsNoTile = false;
+                }
+                if (t != vt::kNoTile) {
+                    ++allocated;
+                    if (t < 0 || t >= tileCapacity) uniqueInRange = false;
+                    else { if (tileSeen[(size_t)t]) uniqueInRange = false; tileSeen[(size_t)t] = 1; }
+                }
+            }
+            if (allocated != expectAlloc || !uniqueInRange || !ascending || !overflowKNoTile ||
+                !nonResIsNoTile) {
+                std::fprintf(stderr, "FATAL: vt-alloc allocation incorrect (allocated=%u expect=%u "
+                             "unique=%d ascending=%d overflowKNoTile=%d nonResNoTile=%d)\n",
+                             allocated, expectAlloc, (int)uniqueInRange, (int)ascending,
+                             (int)overflowKNoTile, (int)nonResIsNoTile);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-alloc: {resident:%u, capacity:%u, allocated:%u, overflow:%u}\n",
+                        R, C, allocated, expectOverflow);
+
+            // PROOF (3) allocEnabled=false -> all kNoTile (no-op).
+            std::vector<int32_t> disabledIndir;
+            runAlloc(0u, disabledIndir);
+            bool allNoTile = true;
+            for (int32_t t : disabledIndir) if (t != vt::kNoTile) { allNoTile = false; break; }
+            if (!allNoTile) {
+                std::fprintf(stderr, "FATAL: vt-alloc allocEnabled=false did NOT yield all kNoTile\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-alloc disabled: all kNoTile (no-op)\n");
+
+            // PROOF (4) two-run determinism byte-identical.
+            std::vector<int32_t> gpuIndir2;
+            runAlloc(1u, gpuIndir2);
+            if (gpuIndir.size() != gpuIndir2.size() ||
+                std::memcmp(gpuIndir.data(), gpuIndir2.data(),
+                            gpuIndir.size() * sizeof(int32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vt-alloc two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-alloc determinism: two dispatches BYTE-IDENTICAL\n");
+
+            // --- Golden: a per-mip page-grid debug-viz (the VT1 layout). Each page colored by its assigned
+            // physical-tile index: allocated -> hashColor(tileIndex); resident-but-overflow (kNoTile yet
+            // feedback==1) -> a distinct DIM amber; non-resident -> dark. CPU-colored from the read-back
+            // integer indirection -> identical both backends. ---
+            const uint32_t imgW = 1024, imgH = 256;
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+            }
+            const int kGutter = 8;
+            const int kMaxPanel = (int)imgH - 2 * kGutter;
+            int x = kGutter;
+            for (int mip = 0; mip < vtx.mipLevels; ++mip) {
+                const int pps = vtx.pagesPerSide(mip);
+                int side = kMaxPanel * pps / vtx.virtualPagesPerSideMip0;
+                if (side < pps) side = pps;
+                int y0 = ((int)imgH - side) / 2;
+                for (int sy = 0; sy < side; ++sy) {
+                    int py = sy * pps / side; if (py >= pps) py = pps - 1;
+                    int iy = y0 + sy; if (iy < 0 || iy >= (int)imgH) continue;
+                    for (int sx = 0; sx < side; ++sx) {
+                        int px = sx * pps / side; if (px >= pps) px = pps - 1;
+                        int ix = x + sx; if (ix < 0 || ix >= (int)imgW) continue;
+                        int pageId = vt::PageId(mip, px, py, vtx);
+                        int32_t tile = gpuIndir[(size_t)pageId];
+                        bool gridLine = ((sx * pps) % side) < pps || ((sy * pps) % side) < pps;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        if (tile != vt::kNoTile) {
+                            // Allocated -> hashColor(tileIndex).
+                            Vec3 col = vg::hashColor((uint32_t)tile);
+                            float dim = gridLine ? 0.55f : 1.0f;
+                            dst[0] = (uint8_t)(col.z * 255.0f * dim + 0.5f);
+                            dst[1] = (uint8_t)(col.y * 255.0f * dim + 0.5f);
+                            dst[2] = (uint8_t)(col.x * 255.0f * dim + 0.5f);
+                            dst[3] = 255;
+                        } else if (feedback[(size_t)pageId] != 0u) {
+                            // Resident but overflowed past the pool cap -> a distinct DIM amber.
+                            uint8_t d = gridLine ? 60 : 90;
+                            dst[0] = (uint8_t)(d / 3); dst[1] = (uint8_t)(d * 2 / 3); dst[2] = d;
+                            dst[3] = 255;
+                        } else {
+                            // Non-resident -> dark.
+                            uint8_t v = gridLine ? 22 : 34;
+                            dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                        }
+                    }
+                }
+                x += side + kGutter;
+            }
+            bool ok = WriteBMP(vtAllocShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — per-mip VT tile-allocation viz (%u allocated / %u "
+                                "resident, %u overflow)\n",
+                                vtAllocShotPath, imgW, imgH, allocated, R, expectOverflow);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vtAllocShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

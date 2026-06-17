@@ -391,6 +391,15 @@ hf_compile_shaders(
     # nothing. Pure integer compute over an SSBO + ReadBuffer (the vsm_mark/froxel surface) -> bit-exact
     # GPU==CPU feedback set, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/vt_feedback.comp.hlsl:cs"
+    # Runtime Virtual Texturing Slice 2 (Slice VT2): vt_alloc.comp is the SINGLE-THREAD physical tile-pool
+    # allocator — one thread walks pageId 0..pageCount-1 ASCENDING maintaining nextTile, writing
+    # gIndirection[pageId] = (resident && nextTile<cap) ? nextTile++ : 0xFFFFFFFF (kNoTile) — the DIRECT
+    # mirror of render/vt.h::AllocatePhysicalTiles (and the VSM-VB AllocatePhysicalPages allocator). The
+    # serial scan is required because allocation is inherently sequential (nextTile depends on prior
+    # assignments); one thread is correct at this scale. allocEnabled=0 -> all kNoTile (no-op). Pure integer
+    # SSBO compute + ReadBuffer -> the GPU indirection table is bit-exact GPU==CPU, proven memcmp. NO new
+    # RHI; existing shaders + goldens untouched.
+    "shaders/vt_alloc.comp.hlsl:cs"
     # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer —
     # ONE thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO
     # via InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied

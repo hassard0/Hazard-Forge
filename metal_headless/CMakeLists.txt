@@ -197,6 +197,13 @@ hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
 # atomics, so NO --msl-version 20200 needed). The feedback set is bit-exact GPU==CPU + cross-backend by
 # construction. Behind --vt-feedback only; existing shaders + goldens untouched.
 hf_gen_msl(vt_feedback.comp      vt_feedback.comp.hlsl      comp vt_feedback_main)
+# Runtime Virtual Texturing Slice 2 (Slice VT2): vt_alloc.comp is the SINGLE-THREAD physical tile-pool
+# allocator ([numthreads(1,1,1)]) — one thread walks pageId 0..pageCount-1 ASCENDING maintaining nextTile,
+# writing gIndirection[pageId] = (resident && nextTile<cap) ? nextTile++ : 0xFFFFFFFF (kNoTile), the DIRECT
+# mirror of render/vt.h::AllocatePhysicalTiles. Pure integer SSBO compute (no atomics, no integer
+# texture.read) -> the default MSL gen suffices (NO --msl-version 20200). The indirection table is bit-exact
+# GPU==CPU + cross-backend by construction. Behind --vt-alloc only; existing shaders + goldens untouched.
+hf_gen_msl(vt_alloc.comp         vt_alloc.comp.hlsl         comp vt_alloc_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

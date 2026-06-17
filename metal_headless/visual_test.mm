@@ -16008,6 +16008,229 @@ static int RunVtFeedbackShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION + INDIRECTION showcase (Slice VT2). VT1
+// produced the resident page SET; VT2 assigns each resident page a PHYSICAL tile in a finite pool — a
+// deterministic integer virtual->physical INDIRECTION table (the DIRECT analog of VSM Slice VB). Reuses
+// VT1's scene + the SAME 576 requests -> host vt::MarkFeedbackPages builds the feedback set -> the SAME
+// shaders/vt_alloc.comp (here vt_alloc.comp.gen.metal): a SINGLE-THREAD allocator ([numthreads(1,1,1)],
+// one thread walks pageId 0..pageCount-1 ASCENDING maintaining nextTile) writes gIndirection[pageId] =
+// (resident && nextTile<cap) ? nextTile++ : 0xFFFFFFFF over a finite VtTilePool{tilesPerSide=12} (144
+// tiles < the resident set -> overflow). ReadBuffer reads the indirection and it is PROVEN BIT-EXACT vs
+// the CPU vt::AllocatePhysicalTiles reference (memcmp, NO FP tolerance) — the same GPU==CPU proof the
+// Vulkan --vt-alloc-shot runs; allocEnabled=false -> all kNoTile; two runs byte-identical. The image
+// golden is a per-mip page-grid debug-viz CPU-colored from the read-back integer indirection (allocated
+// -> hashColor(tileIndex), overflow-resident -> a distinct DIM amber, non-resident -> dark) -> identical
+// to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). New golden
+// tests/golden/metal/vt_alloc.png; two runs DIFF 0.0000. NO rendering, NO new RHI.
+static int RunVtAllocShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vt = render::vt;
+    namespace vg = render::vg;
+    const uint32_t W = 1024, H = 256;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // The fixed virtual texture (== the Vulkan --vt-alloc-shot config): 340 pages over 4 mips.
+    vt::VtTexture vtx;
+    vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+    const int nPages = vtx.pageCount();
+
+    // The SAME fixed deterministic (UV,mip) sample-request set as VT1 (24x24 = 576 requests).
+    std::vector<vt::SampleRequest> requests;
+    const int kGrid = 24;
+    for (int gy = 0; gy < kGrid; ++gy)
+        for (int gx = 0; gx < kGrid; ++gx) {
+            float u = (float)gx / (float)kGrid;
+            float v = (float)gy / (float)kGrid;
+            int mip = (gx + gy) % vtx.mipLevels;
+            requests.push_back({u, v, mip});
+        }
+
+    // Build the VT1 feedback set on the HOST (the allocator INPUT — uploaded as gFeedback).
+    std::vector<uint32_t> feedback((size_t)nPages, 0u);
+    vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                          std::span<uint32_t>(feedback.data(), feedback.size()));
+    uint32_t residentPages = 0;
+    for (uint32_t f : feedback) residentPages += (f != 0u) ? 1u : 0u;
+
+    // The finite physical tile pool (12x12 = 144 tiles < resident -> overflow exercised).
+    vt::VtTilePool pool; pool.tilesPerSide = 12;
+    const int tileCapacity = pool.tileCapacity();
+
+    rhi::BufferDesc fbDesc;
+    fbDesc.size = feedback.size() * sizeof(uint32_t);
+    fbDesc.initialData = feedback.data();
+    fbDesc.usage = rhi::BufferUsage::Storage;
+    auto feedbackBuf = device->CreateBuffer(fbDesc);
+
+    std::vector<uint32_t> indirInit((size_t)nPages, vt::kNoTileU32);
+    auto makeIndirBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = indirInit.size() * sizeof(uint32_t);
+        d.initialData = indirInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct VtAllocParams { uint32_t pageCount, tileCapacity, allocEnabled, _pad; };
+    static_assert(sizeof(VtAllocParams) == 16, "VtAllocParams std430 layout");
+    auto makeParams = [&](uint32_t allocEnabled) {
+        VtAllocParams p{};
+        p.pageCount = (uint32_t)nPages;
+        p.tileCapacity = (uint32_t)tileCapacity;
+        p.allocEnabled = allocEnabled;
+        p._pad = 0u;
+        return p;
+    };
+
+    auto acs = loadMSL("vt_alloc.comp.gen.metal", "vt_alloc_main");
+    rhi::ComputePipelineDesc acDesc;
+    acDesc.compute = acs.get(); acDesc.storageBufferCount = 3; acDesc.threadsPerGroupX = 1;
+    auto acCompute = device->CreateComputePipeline(acDesc);
+
+    auto rt = device->CreateRenderTarget(W, H);
+
+    auto runAlloc = [&](uint32_t allocEnabled, std::vector<int32_t>& outIndir) {
+        auto indirBuf = makeIndirBuf();
+        VtAllocParams params = makeParams(allocEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(VtAllocParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("vt_alloc", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*acCompute);
+                cmd.BindStorageBuffer(*feedbackBuf, 0);
+                cmd.BindStorageBuffer(*indirBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);   // ONE group of ONE thread (the serial scan)
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        std::vector<uint32_t> raw((size_t)nPages, 0u);
+        device->ReadBuffer(*indirBuf, raw.data(), raw.size() * sizeof(uint32_t), 0);
+        outIndir.assign((size_t)nPages, vt::kNoTile);
+        for (size_t i = 0; i < raw.size(); ++i) outIndir[i] = (int32_t)raw[i];
+    };
+
+    // GPU allocation (enabled).
+    std::vector<int32_t> gpuIndir;
+    runAlloc(1u, gpuIndir);
+
+    // CPU reference over the SAME feedback set.
+    std::vector<int32_t> cpuIndir =
+        vt::AllocatePhysicalTiles(std::span<const uint32_t>(feedback.data(), feedback.size()), pool);
+
+    if (gpuIndir.size() != cpuIndir.size() ||
+        std::memcmp(gpuIndir.data(), cpuIndir.data(), (size_t)nPages * sizeof(int32_t)) != 0)
+        return fail("vt-alloc: GPU indirection != CPU AllocatePhysicalTiles (serial scan diverged?)");
+    std::printf("vt-alloc GPU==CPU indirection: %d entries BIT-EXACT\n", nPages);
+
+    // allocation correctness: allocated == min(resident,capacity); unique + in-range + ascending.
+    const uint32_t R = residentPages;
+    const uint32_t C = (uint32_t)tileCapacity;
+    const uint32_t expectAlloc = R < C ? R : C;
+    const uint32_t expectOverflow = R > C ? (R - C) : 0u;
+    uint32_t allocated = 0;
+    std::vector<uint8_t> tileSeen((size_t)tileCapacity, 0);
+    bool uniqueInRange = true, ascending = true, overflowKNoTile = true, nonResIsNoTile = true;
+    uint32_t residentSeen = 0; int expectTile = 0;
+    for (int pageId = 0; pageId < nPages; ++pageId) {
+        int32_t t = gpuIndir[(size_t)pageId];
+        if (feedback[(size_t)pageId] != 0u) {
+            ++residentSeen;
+            if (residentSeen <= C) { if (t != expectTile) ascending = false; ++expectTile; }
+            else { if (t != vt::kNoTile) overflowKNoTile = false; }
+        } else {
+            if (t != vt::kNoTile) nonResIsNoTile = false;
+        }
+        if (t != vt::kNoTile) {
+            ++allocated;
+            if (t < 0 || t >= tileCapacity) uniqueInRange = false;
+            else { if (tileSeen[(size_t)t]) uniqueInRange = false; tileSeen[(size_t)t] = 1; }
+        }
+    }
+    if (allocated != expectAlloc || !uniqueInRange || !ascending || !overflowKNoTile || !nonResIsNoTile)
+        return fail("vt-alloc: allocation incorrect (allocated/unique/ascending/overflow/non-res)");
+    std::printf("vt-alloc: {resident:%u, capacity:%u, allocated:%u, overflow:%u}\n",
+                R, C, allocated, expectOverflow);
+
+    // allocEnabled=false -> all kNoTile.
+    std::vector<int32_t> disabledIndir;
+    runAlloc(0u, disabledIndir);
+    for (int32_t t : disabledIndir) if (t != vt::kNoTile) return fail("vt-alloc: disabled path not all kNoTile");
+    std::printf("vt-alloc disabled: all kNoTile (no-op)\n");
+
+    // two-run determinism.
+    std::vector<int32_t> gpuIndir2;
+    runAlloc(1u, gpuIndir2);
+    if (gpuIndir.size() != gpuIndir2.size() ||
+        std::memcmp(gpuIndir.data(), gpuIndir2.data(), gpuIndir.size() * sizeof(int32_t)) != 0)
+        return fail("vt-alloc: two dispatches differ (nondeterministic)");
+    std::printf("vt-alloc determinism: two dispatches BYTE-IDENTICAL\n");
+
+    // --- Golden: per-mip page-grid debug-viz, CPU-colored from the read-back integer indirection
+    // (IDENTICAL to the Vulkan --vt-alloc-shot by construction). ---
+    const uint32_t imgW = 1024, imgH = 256;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    const int kGutter = 8;
+    const int kMaxPanel = (int)imgH - 2 * kGutter;
+    int x = kGutter;
+    for (int mip = 0; mip < vtx.mipLevels; ++mip) {
+        const int pps = vtx.pagesPerSide(mip);
+        int side = kMaxPanel * pps / vtx.virtualPagesPerSideMip0;
+        if (side < pps) side = pps;
+        int y0 = ((int)imgH - side) / 2;
+        for (int sy = 0; sy < side; ++sy) {
+            int py = sy * pps / side; if (py >= pps) py = pps - 1;
+            int iy = y0 + sy; if (iy < 0 || iy >= (int)imgH) continue;
+            for (int sx = 0; sx < side; ++sx) {
+                int px = sx * pps / side; if (px >= pps) px = pps - 1;
+                int ix = x + sx; if (ix < 0 || ix >= (int)imgW) continue;
+                int pageId = vt::PageId(mip, px, py, vtx);
+                int32_t tile = gpuIndir[(size_t)pageId];
+                bool gridLine = ((sx * pps) % side) < pps || ((sy * pps) % side) < pps;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                if (tile != vt::kNoTile) {
+                    Vec3 col = vg::hashColor((uint32_t)tile);
+                    float dim = gridLine ? 0.55f : 1.0f;
+                    dst[0] = (uint8_t)(col.z * 255.0f * dim + 0.5f);
+                    dst[1] = (uint8_t)(col.y * 255.0f * dim + 0.5f);
+                    dst[2] = (uint8_t)(col.x * 255.0f * dim + 0.5f);
+                    dst[3] = 255;
+                } else if (feedback[(size_t)pageId] != 0u) {
+                    uint8_t d = gridLine ? 60 : 90;
+                    dst[0] = (uint8_t)(d / 3); dst[1] = (uint8_t)(d * 2 / 3); dst[2] = d;
+                    dst[3] = 255;
+                } else {
+                    uint8_t v = gridLine ? 22 : 34;
+                    dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                }
+            }
+        }
+        x += side + kGutter;
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — per-mip VT tile-allocation viz (%u allocated / %u resident, %u "
+                "overflow)\n",
+                outPath, imgW, imgH, allocated, R, expectOverflow);
+    return 0;
+}
+
 // --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
 // backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
 // shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
@@ -24577,6 +24800,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vt-feedback") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vt_feedback.png";
             try { return RunVtFeedbackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vt-alloc <out.png>: render the Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION +
+        // virtual->physical INDIRECTION showcase (Slice VT2, the 2nd RVT slice). VT1's resident feedback
+        // set -> a SINGLE-THREAD allocator (vt_alloc.comp: one thread walks pageId ascending maintaining
+        // nextTile -> gIndirection[pageId] = (resident && nextTile<cap) ? nextTile++ : 0xFFFFFFFF) over a
+        // finite VtTilePool{12} (144 tiles < resident -> overflow). ReadBuffer reads the integer
+        // indirection, PROVEN BIT-EXACT vs the CPU vt::AllocatePhysicalTiles reference (memcmp, no FP tol —
+        // the same GPU==CPU proof the Vulkan --vt-alloc-shot runs); allocEnabled=false -> all kNoTile; two
+        // runs byte-identical. The image golden is a per-mip page-grid debug-viz CPU-colored from the
+        // read-back indirection (allocated -> hashColor(tileIndex), overflow-resident -> a dim amber,
+        // non-resident -> dark), identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/vt_alloc.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--vt-alloc") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vt_alloc.png";
+            try { return RunVtAllocShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vsm-render <out.png>: render the Virtual Shadow Maps PHYSICAL-PAGE DEPTH showcase (Slice VB).
