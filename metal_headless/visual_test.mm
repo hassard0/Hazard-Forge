@@ -16477,6 +16477,329 @@ static int RunMcEmitShowcase(const char* outPath) {
     return 0;
 }
 
+// --- GPU Isosurface Meshing FIXED-POINT INTERPOLATED vertex placement showcase (Slice MC4, the 4th slice
+// of FLAGSHIP #5 — the QUALITY step that makes the surface smooth). The TRUE passes are identical on both
+// backends: the SAME MC1/MC2/MC3 sphere field (33³ corners -> 32³ cells, radius 12, iso 0) feeds the SAME
+// shaders/mc_scan.comp (mc_scan.comp.gen.metal, REUSED UNCHANGED — the exclusive prefix-sum of the per-cell
+// counts -> each cell's write offset) then (compute->compute barrier) shaders/mc_interp.comp (here
+// mc_interp.comp.gen.metal — mc_emit with EdgeInterp instead of EdgeMidpoint: one thread per cell
+// reclassifies via CaseIndex, reads triOffset=gOffsets[cell], walks gTriTable emitting each triangle's 3
+// INTERPOLATED edge-crossing vertices (EdgeInterp, t=((iso-s0)*kSub)/(s1-s0) on the 1/kSub=256 lattice —
+// the SAME truncating integer divide as render/mc.h, int32 throughout) + the identity index into its
+// disjoint range; meshEnabled=0 -> emit nothing). ReadBuffer reads gVerts + gIdx + gOffsets, PROVEN
+// BIT-EXACT vs the CPU render/mc.h::MarchCellsInterp reference (memcmp) — the same proofs the Vulkan
+// --mc-interp-shot runs. The image golden is the same 2D ORTHOGRAPHIC projection as MC3 over the
+// interpolated (1/kSub) vertices -> a SMOOTHER filled-disk sphere, identical to the Vulkan path BY
+// CONSTRUCTION (PURE INTEGER). New golden tests/golden/metal/mc_interp.png; two runs DIFF 0.0000. NO new RHI.
+static int RunMcInterpShowcase(const char* outPath) {
+    namespace mc = render::mc;
+
+    const int kN = 33;
+    const int kRadius = 12;
+    const int32_t kIso = 0;
+    mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+    const int nx = field.nx, ny = field.ny, nz = field.nz;
+    const int cellCount = field.cellCount();
+
+    std::vector<uint32_t> cpuCounts;
+    mc::CountCells(field, kIso, cpuCounts);
+    const uint32_t totalTris = mc::TotalTriangles(std::span<const uint32_t>(cpuCounts));
+    const uint32_t vertCap = totalTris * 3u;
+
+    const int kImg = 256;
+    const uint32_t imgW = (uint32_t)kImg, imgH = (uint32_t)kImg;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    rhi::BufferDesc fDesc;
+    fDesc.size = field.scalar.size() * sizeof(int32_t);
+    fDesc.initialData = field.scalar.data();
+    fDesc.usage = rhi::BufferUsage::Storage;
+    auto fieldBuf = device->CreateBuffer(fDesc);
+
+    rhi::BufferDesc cDesc;
+    cDesc.size = cpuCounts.size() * sizeof(uint32_t);
+    cDesc.initialData = cpuCounts.data();
+    cDesc.usage = rhi::BufferUsage::Storage;
+    auto countsBuf = device->CreateBuffer(cDesc);
+
+    std::vector<int32_t> triTableFlat((size_t)256 * 16);
+    for (int c = 0; c < 256; ++c)
+        for (int e = 0; e < 16; ++e)
+            triTableFlat[(size_t)c * 16 + e] = (int32_t)mc::kTriTable[c][e];
+    rhi::BufferDesc ttDesc;
+    ttDesc.size = triTableFlat.size() * sizeof(int32_t);
+    ttDesc.initialData = triTableFlat.data();
+    ttDesc.usage = rhi::BufferUsage::Storage;
+    auto triTableBuf = device->CreateBuffer(ttDesc);
+
+    std::vector<int32_t> vertsInit((size_t)vertCap * 4, 0);   // McVertex = int4
+    std::vector<uint32_t> idxInit((size_t)vertCap, 0u);
+    std::vector<uint32_t> offsetsInit((size_t)cellCount, 0u);
+    auto makeVertsBuf = [&]() {
+        rhi::BufferDesc d; d.size = vertsInit.size() * sizeof(int32_t);
+        d.initialData = vertsInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeIdxBuf = [&]() {
+        rhi::BufferDesc d; d.size = idxInit.size() * sizeof(uint32_t);
+        d.initialData = idxInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeOffsetsBuf = [&]() {
+        rhi::BufferDesc d; d.size = offsetsInit.size() * sizeof(uint32_t);
+        d.initialData = offsetsInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct McScanParams { uint32_t cellCount; uint32_t pad0, pad1, pad2; };
+    static_assert(sizeof(McScanParams) == 16, "McScanParams std430 layout");
+    McScanParams scanParams{};
+    scanParams.cellCount = (uint32_t)cellCount;
+    rhi::BufferDesc spDesc;
+    spDesc.size = sizeof(McScanParams); spDesc.initialData = &scanParams;
+    spDesc.usage = rhi::BufferUsage::Storage;
+    auto scanParamsBuf = device->CreateBuffer(spDesc);
+
+    struct McInterpParams { int32_t dims[4]; int32_t cfg[4]; };
+    static_assert(sizeof(McInterpParams) == 32, "McInterpParams std430 layout");
+    auto makeInterpParams = [&](int32_t meshEnabled) {
+        McInterpParams p{};
+        p.dims[0] = nx; p.dims[1] = ny; p.dims[2] = nz; p.dims[3] = kIso;
+        p.cfg[0] = meshEnabled; p.cfg[1] = cellCount; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    auto scanCs = loadMSL("mc_scan.comp.gen.metal", "mc_scan_main");
+    rhi::ComputePipelineDesc scanCd;
+    scanCd.compute = scanCs.get(); scanCd.storageBufferCount = 3; scanCd.threadsPerGroupX = 1;
+    auto scanCompute = device->CreateComputePipeline(scanCd);
+
+    auto interpCs = loadMSL("mc_interp.comp.gen.metal", "mc_interp_main");
+    rhi::ComputePipelineDesc interpCd;
+    interpCd.compute = interpCs.get(); interpCd.storageBufferCount = 6; interpCd.threadsPerGroupX = 64;
+    auto interpCompute = device->CreateComputePipeline(interpCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kEmitGroups = ((uint32_t)cellCount + 63u) / 64u;
+
+    auto runMesh = [&](int32_t meshEnabled,
+                       std::vector<int32_t>& outVerts, std::vector<uint32_t>& outIdx,
+                       std::vector<uint32_t>& outOffsets) {
+        auto vertsBuf   = makeVertsBuf();
+        auto idxBuf     = makeIdxBuf();
+        auto offsetsBuf = makeOffsetsBuf();
+        McInterpParams ep = makeInterpParams(meshEnabled);
+        rhi::BufferDesc epDesc;
+        epDesc.size = sizeof(McInterpParams); epDesc.initialData = &ep;
+        epDesc.usage = rhi::BufferUsage::Storage;
+        auto interpParamsBuf = device->CreateBuffer(epDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("mc_interp", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*scanCompute);
+                cmd.BindStorageBuffer(*countsBuf, 0);
+                cmd.BindStorageBuffer(*offsetsBuf, 1);
+                cmd.BindStorageBuffer(*scanParamsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*interpCompute);
+                cmd.BindStorageBuffer(*fieldBuf, 0);
+                cmd.BindStorageBuffer(*offsetsBuf, 1);
+                cmd.BindStorageBuffer(*triTableBuf, 2);
+                cmd.BindStorageBuffer(*vertsBuf, 3);
+                cmd.BindStorageBuffer(*idxBuf, 4);
+                cmd.BindStorageBuffer(*interpParamsBuf, 5);
+                cmd.DispatchCompute(kEmitGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outVerts.assign((size_t)vertCap * 4, 0);
+        device->ReadBuffer(*vertsBuf, outVerts.data(), outVerts.size() * sizeof(int32_t), 0);
+        outIdx.assign((size_t)vertCap, 0u);
+        device->ReadBuffer(*idxBuf, outIdx.data(), outIdx.size() * sizeof(uint32_t), 0);
+        outOffsets.assign((size_t)cellCount, 0u);
+        device->ReadBuffer(*offsetsBuf, outOffsets.data(), outOffsets.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU mesh (enabled).
+    std::vector<int32_t> gpuVertsRaw; std::vector<uint32_t> gpuIdx; std::vector<uint32_t> gpuOffsets;
+    runMesh(1, gpuVertsRaw, gpuIdx, gpuOffsets);
+
+    // CPU reference over the SAME field (INTERPOLATED).
+    std::vector<mc::McVertex> cpuVerts; std::vector<uint32_t> cpuIdx; uint32_t cpuTriCount = 0u;
+    mc::MarchCellsInterp(field, kIso, cpuVerts, cpuIdx, cpuTriCount);
+
+    const size_t vBytes = (size_t)totalTris * 3u * sizeof(mc::McVertex);
+    const size_t iBytes = (size_t)totalTris * 3u * sizeof(uint32_t);
+    if (cpuTriCount != totalTris ||
+        std::memcmp(gpuVertsRaw.data(), cpuVerts.data(), vBytes) != 0 ||
+        std::memcmp(gpuIdx.data(), cpuIdx.data(), iBytes) != 0)
+        return fail("mc-interp: GPU mesh != CPU MarchCellsInterp");
+    std::printf("mc-interp GPU==CPU mesh: %u verts + %u indices BIT-EXACT\n", vertCap, vertCap);
+
+    {
+        const mc::McVertex* gv = reinterpret_cast<const mc::McVertex*>(gpuVertsRaw.data());
+        std::vector<uint8_t> cases;
+        mc::ClassifyCells(field, kIso, cases);
+        const int cxN = nx - 1, cyN = ny - 1;
+        uint32_t onEdge = 0u;
+        bool boundsOk = true;
+        for (int c = 0; c < cellCount && boundsOk; ++c) {
+            const uint8_t kase = cases[(size_t)c];
+            if (!mc::IsSurfaceCase(kase)) continue;
+            const int cx = c % cxN, cy = (c / cxN) % cyN, cz = c / (cxN * cyN);
+            const uint32_t base = gpuOffsets[(size_t)c] * 3u;
+            uint32_t loc = 0u;
+            for (int e = 0; e + 2 < 16; e += 3) {
+                if (mc::kTriTable[kase][e] < 0) break;
+                for (int k = 0; k < 3; ++k) {
+                    const int edge = (int)mc::kTriTable[kase][e + k];
+                    const int a = mc::kEdgeCorner[edge][0], b = mc::kEdgeCorner[edge][1];
+                    const int Ca[3] = {cx + mc::kCornerOffset[a][0], cy + mc::kCornerOffset[a][1], cz + mc::kCornerOffset[a][2]};
+                    const int Cb[3] = {cx + mc::kCornerOffset[b][0], cy + mc::kCornerOffset[b][1], cz + mc::kCornerOffset[b][2]};
+                    const mc::McVertex& v = gv[base + loc];
+                    const int coord[3] = {v.x, v.y, v.z};
+                    bool vOnEdge = true;
+                    for (int ax = 0; ax < 3; ++ax) {
+                        const int lo = std::min(Ca[ax], Cb[ax]) * mc::kSub;
+                        const int hi = std::max(Ca[ax], Cb[ax]) * mc::kSub;
+                        if (coord[ax] < lo || coord[ax] > hi) { boundsOk = false; vOnEdge = false; }
+                    }
+                    if (vOnEdge) ++onEdge;
+                    ++loc;
+                }
+            }
+        }
+        if (!boundsOk) return fail("mc-interp: vertex off its edge");
+        std::printf("mc-interp: {tris:%u, verts:%u, kSub:%d, on-edge:%u/%u OK}\n",
+                    totalTris, vertCap, (int)mc::kSub, onEdge, vertCap);
+    }
+
+    {
+        const mc::McVertex* gv = reinterpret_cast<const mc::McVertex*>(gpuVertsRaw.data());
+        std::vector<uint8_t> cases;
+        mc::ClassifyCells(field, kIso, cases);
+        const int cxN = nx - 1, cyN = ny - 1;
+        int maxErr = 0;
+        for (int c = 0; c < cellCount; ++c) {
+            const uint8_t kase = cases[(size_t)c];
+            if (!mc::IsSurfaceCase(kase)) continue;
+            const int cx = c % cxN, cy = (c / cxN) % cyN, cz = c / (cxN * cyN);
+            const uint32_t base = gpuOffsets[(size_t)c] * 3u;
+            uint32_t loc = 0u;
+            for (int e = 0; e + 2 < 16; e += 3) {
+                if (mc::kTriTable[kase][e] < 0) break;
+                for (int k = 0; k < 3; ++k) {
+                    const int edge = (int)mc::kTriTable[kase][e + k];
+                    const int a = mc::kEdgeCorner[edge][0], b = mc::kEdgeCorner[edge][1];
+                    const int Ca[3] = {cx + mc::kCornerOffset[a][0], cy + mc::kCornerOffset[a][1], cz + mc::kCornerOffset[a][2]};
+                    const int Cb[3] = {cx + mc::kCornerOffset[b][0], cy + mc::kCornerOffset[b][1], cz + mc::kCornerOffset[b][2]};
+                    const int32_t s0 = mc::SampleField(field, Ca[0], Ca[1], Ca[2]);
+                    const int32_t s1 = mc::SampleField(field, Cb[0], Cb[1], Cb[2]);
+                    const mc::McVertex& v = gv[base + loc];
+                    const int coord[3] = {v.x, v.y, v.z};
+                    int t = mc::kSub / 2;
+                    for (int ax = 0; ax < 3; ++ax)
+                        if (Cb[ax] != Ca[ax]) t = (coord[ax] - Ca[ax] * mc::kSub) * (Cb[ax] - Ca[ax]);
+                    const int32_t recon = s0 + (int32_t)(((int64_t)(s1 - s0) * t) / mc::kSub);
+                    const int err = std::abs(recon - kIso);
+                    if (err > maxErr) maxErr = err;
+                    ++loc;
+                }
+            }
+        }
+        if (maxErr > 1) return fail("mc-interp: on-surface error > 1 fixed-pt unit");
+        std::printf("mc-interp on-surface: max |field-iso| = %d (<=1 fixed-pt) OK\n", maxErr);
+    }
+
+    {
+        std::vector<uint8_t> cases;
+        mc::ClassifyCells(field, kIso, cases);
+        const int cxN = nx - 1, cyN = ny - 1;
+        int knownCell = -1;
+        for (int c = 0; c < cellCount; ++c)
+            if (mc::IsSurfaceCase(cases[(size_t)c])) { knownCell = c; break; }
+        if (knownCell < 0) return fail("mc-interp: no surface cell");
+        const uint8_t kase = cases[(size_t)knownCell];
+        const int cx = knownCell % cxN;
+        const int cy = (knownCell / cxN) % cyN;
+        const int cz = knownCell / (cxN * cyN);
+        const int firstEdge = (int)mc::kTriTable[kase][0];
+        mc::McVertex v0 = mc::EdgeInterp(cx, cy, cz, firstEdge, field, kIso);
+        const uint32_t base = gpuOffsets[(size_t)knownCell] * 3u;
+        const mc::McVertex* gv = reinterpret_cast<const mc::McVertex*>(gpuVertsRaw.data());
+        if (gv[base].x != v0.x || gv[base].y != v0.y || gv[base].z != v0.z)
+            return fail("mc-interp: known-cell v0 mismatch");
+        std::printf("mc-interp known cell: case=0x%02X v0=(%d,%d,%d) OK\n",
+                    (unsigned)kase, v0.x, v0.y, v0.z);
+    }
+
+    {
+        std::vector<int32_t> dVerts; std::vector<uint32_t> dIdx; std::vector<uint32_t> dOffsets;
+        runMesh(0, dVerts, dIdx, dOffsets);
+        bool empty = true;
+        for (int32_t v : dVerts) if (v != 0) { empty = false; break; }
+        if (empty) for (uint32_t k : dIdx) if (k != 0u) { empty = false; break; }
+        if (!empty) return fail("mc-interp: meshEnabled=false did not leave the mesh cleared");
+        std::printf("mc-interp disabled: empty mesh (no-op)\n");
+    }
+
+    {
+        std::vector<int32_t> gVerts2; std::vector<uint32_t> gIdx2; std::vector<uint32_t> gOff2;
+        runMesh(1, gVerts2, gIdx2, gOff2);
+        if (gpuVertsRaw.size() != gVerts2.size() ||
+            std::memcmp(gpuVertsRaw.data(), gVerts2.data(), gpuVertsRaw.size() * sizeof(int32_t)) != 0 ||
+            std::memcmp(gpuIdx.data(), gIdx2.data(), gpuIdx.size() * sizeof(uint32_t)) != 0)
+            return fail("mc-interp: two runs differ (nondeterministic)");
+        std::printf("mc-interp determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Golden: the SAME 2D orthographic projection as MC3, over the INTERPOLATED (1/kSub) vertices
+    // (IDENTICAL to the Vulkan --mc-interp-shot by construction; integer-hashColor by triangle). ---
+    const mc::McVertex* gv = reinterpret_cast<const mc::McVertex*>(gpuVertsRaw.data());
+    const int coordMax = (nx - 1) * (int)mc::kSub;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 6; bgra[p * 4 + 3] = 255;
+    }
+    auto intHashColor = [](uint32_t i, uint8_t& b, uint8_t& g2, uint8_t& r) {
+        uint32_t h = i * 2654435761u + 0x9E3779B9u;
+        h ^= h >> 15; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+        r  = (uint8_t)((h)       & 0xFFu);
+        g2 = (uint8_t)((h >> 8)  & 0xFFu);
+        b  = (uint8_t)((h >> 16) & 0xFFu);
+    };
+    for (uint32_t vtx = 0; vtx < vertCap; ++vtx) {
+        const uint32_t tri = vtx / 3u;
+        int px = (int)(((int64_t)gv[vtx].x * (kImg - 1)) / coordMax);
+        int py = (int)(((int64_t)gv[vtx].y * (kImg - 1)) / coordMax);
+        if (px < 0 || px >= kImg || py < 0 || py >= kImg) continue;
+        uint8_t cb, cg, cr; intHashColor(tri, cb, cg, cr);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                int sx = px + dx, sy = py + dy;
+                if (sx < 0 || sx >= kImg || sy < 0 || sy >= kImg) continue;
+                uint8_t* dst = &bgra[((size_t)sy * imgW + sx) * 4];
+                dst[0] = cb; dst[1] = cg; dst[2] = cr; dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — MC interpolated-mesh 2D-projection point cloud (%u tris, %u verts)\n",
+                outPath, imgW, imgH, totalTris, vertCap);
+    return 0;
+}
+
 // --- Runtime Virtual Texturing PAGE-NEEDED FEEDBACK MARKING showcase (Slice VT1, the BEACHHEAD of
 // FLAGSHIP #4). The TRUE pass is identical on both backends: a fixed virtual texture (a MIP PYRAMID) + a
 // fixed deterministic (UV,mip) sample-request set feed the SAME shaders/vt_feedback.comp (here
@@ -26200,6 +26523,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mc-emit") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mc_emit.png";
             try { return RunMcEmitShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mc-interp <out.png>: render the GPU Isosurface Meshing FIXED-POINT INTERPOLATED vertex
+        // placement showcase (Slice MC4, the 4th slice of FLAGSHIP #5). The SAME MC1/MC2/MC3 sphere field
+        // (33³ corners -> 32³ cells) feeds the SAME mc_scan.comp (UNCHANGED) then (compute->compute
+        // barrier) mc_interp.comp (mc_emit with EdgeInterp: each triangle vertex on the ACTUAL isosurface
+        // crossing, t=((iso-s0)*kSub)/(s1-s0) on the 1/kSub=256 lattice, the SAME truncating integer
+        // divide as render/mc.h) -> ReadBuffer reads gVerts + gIdx + gOffsets, PROVEN BIT-EXACT vs the CPU
+        // render/mc.h::MarchCellsInterp reference (memcmp — the same proofs the Vulkan --mc-interp-shot
+        // runs); meshEnabled=false -> empty mesh; two runs byte-identical. The image golden is a SMOOTHER
+        // 2D orthographic projection of the interpolated mesh, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/mc_interp.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--mc-interp") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mc_interp.png";
+            try { return RunMcInterpShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vt-alloc <out.png>: render the Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION +
