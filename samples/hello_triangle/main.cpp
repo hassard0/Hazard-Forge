@@ -451,6 +451,7 @@ int main(int argc, char** argv) {
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
+    const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxPairsShotPath = nullptr; // --fpx-pairs-shot <out.bmp> (Slice FPX2: Deterministic Fixed-Point Physics integer-AABB BROADPHASE — a clustered 8x8 grid meshed by INT32 count->scan->emit (fpx_pair_count/scan/emit.comp) into the deterministic candidate-pair list, GPU==CPU pair list bit-exact, integer N×N pair-matrix viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
@@ -498,6 +499,17 @@ int main(int argc, char** argv) {
         // STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse limit.
         if (std::strcmp(argv[i], "--fpx-solve-shot") == 0 && i + 1 < argc) {
             fpxSolveShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice FPX4: --fpx-orient-shot <out.bmp> — the Deterministic Fixed-Point Physics integer
+        // QUATERNION ORIENTATION integrator. A 6x6 grid of bodies with distinct deterministic angVel,
+        // identity orient, NO gravity (free spin), stepped K=120 by shaders/fpx_orient.comp (ONE thread
+        // per body runs IntegrateBodyFull). int64 quaternion math -> fpx_orient.comp is Vulkan-only; Metal
+        // --fpx-orient runs the CPU IntegrateBodyFull. NO new RHI. Handled as a STANDALONE branch (not in
+        // the --shot else-if chain) to avoid MSVC's nested-block parse limit (the FPX3 lesson).
+        if (std::strcmp(argv[i], "--fpx-orient-shot") == 0 && i + 1 < argc) {
+            fpxOrientShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15486,6 +15498,286 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fixed-point PBD settled pile (%u contacts, residual %u)\n",
                                 fpxSolveShotPath, imgW, imgH, kPairCount, residual);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxSolveShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator (--fpx-orient-shot
+        // <out.bmp>, Slice FPX4, the 4th slice of FLAGSHIP #6). A deterministic 6x6 grid of bodies, each with
+        // a DISTINCT deterministic initial angVel (varied spin axes/rates derived from the grid index),
+        // identity initial orientation, NO gravity (free spin -> the bodies stay put + just rotate), dt=
+        // kOne/60, is stepped K=120 times by ONE GPU thread PER BODY (shaders/fpx_orient.comp; each step =
+        // IntegrateBodyFull = FPX1 translate + IntegrateOrientation: dq=ω⊗q; orient += 0.5*dq*dt; normalize).
+        // The FxQuatMul/FxQuatNormalize/FxISqrt/fxdiv math is copied VERBATIM from engine/sim/fpx.h. ReadBuffer
+        // reads the integer Q16.16 body array; the CPU fpx.h::IntegrateBodyFull over the SAME bodies must match
+        // it BIT-EXACT (memcmp, NO tol — the GPU==CPU make-or-break). enabled=false -> bodies UNCHANGED. The
+        // golden is a grid of orientation GIZMOS (each body's 3 local axes FxRotate(orient,axis) projected to
+        // 2D, x->red/y->green/z->blue, drawn as short colored segments from the cell center) -> identical both
+        // backends by construction. int64 quaternion math -> fpx_orient.comp is VULKAN-ONLY (Metal --fpx-orient
+        // runs the CPU IntegrateBodyFull). NO new RHI.
+        if (fpxOrientShotPath) {
+            using math::Vec3;
+            namespace fpx = hf::sim::fpx;
+
+            const fpx::fx kDt = fpx::kOne / 60;
+            const int kGrid = 6;
+            const int kBodyCount = kGrid * kGrid;   // 36
+            const int kSteps = 120;
+
+            // Build the deterministic grid: identity orient, NO gravity, a distinct angVel per cell.
+            // The angVel axis cycles through {X, Y, Z, XY, YZ, XZ} by (gx+gz)%6 and the rate scales with
+            // the cell index -> varied spin axes AND rates, fully deterministic, host-snapped Q16.16.
+            auto makeWorld = [&]() {
+                fpx::FxWorld world;
+                world.gravity = {0, 0, 0};          // free spin (orientation viz is pure rotation)
+                world.groundY = (fpx::fx)(-1000 * (int)fpx::kOne);
+                for (int i = 0; i < kBodyCount; ++i) {
+                    fpx::FxBody b;
+                    const int gx = i % kGrid;
+                    const int gz = i / kGrid;
+                    b.pos = {(fpx::fx)(gx * (int)fpx::kOne), 0, (fpx::fx)(gz * (int)fpx::kOne)};
+                    b.vel = {0, 0, 0};
+                    b.invMass = fpx::kOne;
+                    b.flags = fpx::kFlagDynamic;
+                    b.radius = 0;
+                    b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};   // identity
+                    // Distinct deterministic angVel: a rate in [0.5, 1.83] rad/s on a per-cell axis.
+                    const fpx::fx rate = (fpx::fx)(fpx::kOne / 2 + (fpx::kOne * (gx + gz + 1)) / 9);
+                    const fpx::fx r2 = (fpx::fx)(rate * 7 / 10);   // a secondary (mixed-axis) component
+                    switch ((gx + 2 * gz) % 6) {
+                        case 0: b.angVel = {rate, 0, 0}; break;          // about +X
+                        case 1: b.angVel = {0, rate, 0}; break;          // about +Y
+                        case 2: b.angVel = {0, 0, rate}; break;          // about +Z
+                        case 3: b.angVel = {r2, r2, 0}; break;           // about XY
+                        case 4: b.angVel = {0, r2, r2}; break;           // about YZ
+                        default: b.angVel = {r2, 0, r2}; break;          // about XZ
+                    }
+                    world.bodies.push_back(b);
+                }
+                return world;
+            };
+            const fpx::FxWorld world = makeWorld();
+
+            // std430 FxBody mirror (matches shaders/fpx_orient.comp FpxBody, the FPX4 pack): 16 x int32
+            // (64 bytes) — the FPX1-3 fields THEN orient.xyzw + angVel.xyz.
+            struct FpxBodyGpu {
+                int32_t px, py, pz, vx, vy, vz, invMass;
+                uint32_t flags;
+                int32_t radius, ox, oy, oz, ow, ax, ay, az;
+            };
+            static_assert(sizeof(FpxBodyGpu) == 64, "FpxBodyGpu (FPX4 pack) std430 layout");
+            auto packBodies = [&](const fpx::FxWorld& w) {
+                std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+                for (size_t i = 0; i < w.bodies.size(); ++i) {
+                    const fpx::FxBody& b = w.bodies[i];
+                    out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                        b.invMass, b.flags, b.radius,
+                                        b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                                        b.angVel.x, b.angVel.y, b.angVel.z};
+                }
+                return out;
+            };
+            const std::vector<FpxBodyGpu> bodiesInit = packBodies(world);
+
+            auto makeBodiesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = bodiesInit.size() * sizeof(FpxBodyGpu);
+                d.initialData = bodiesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches fpx_orient.comp FpxParams std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {bodyCount, steps, enabled, _}.
+            struct FpxParams { int32_t grav[4]; int32_t cfg[4]; };
+            static_assert(sizeof(FpxParams) == 32, "FpxParams std430 layout");
+            auto makeParams = [&](int32_t enabled) {
+                FpxParams p{};
+                p.grav[0] = 0; p.grav[1] = 0; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kBodyCount; p.cfg[1] = kSteps; p.cfg[2] = enabled; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 2 storage buffers (bodies, params); 64 threads/group.
+            auto fpxCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_orient.comp.hlsl.spv");
+            auto fpxCs = device->CreateShaderModule({std::span<const uint32_t>(fpxCsWords)});
+            rhi::ComputePipelineDesc fpxCdesc;
+            fpxCdesc.compute = fpxCs.get();
+            fpxCdesc.storageBufferCount = 2;
+            fpxCdesc.pushConstantSize = 0;
+            fpxCdesc.threadsPerGroupX = 64;
+            auto fpxCompute = device->CreateComputePipeline(fpxCdesc);
+            const uint32_t kGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+            auto runOrient = [&](int32_t enabled, std::vector<FpxBodyGpu>& outBodies) {
+                auto bodiesBuf = makeBodiesBuf();
+                FpxParams params = makeParams(enabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(FpxParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fpx_orient", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*fpxCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*paramsBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outBodies.assign((size_t)kBodyCount, FpxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FpxBodyGpu), 0);
+            };
+
+            // === GPU orient (enabled, K steps) ===
+            std::vector<FpxBodyGpu> gpuBodies;
+            runOrient(1, gpuBodies);
+
+            // === CPU reference: IntegrateBodyFull K times over the SAME bodies ===
+            fpx::FxWorld cpuWorld = world;
+            for (int s = 0; s < kSteps; ++s)
+                for (auto& b : cpuWorld.bodies)
+                    fpx::IntegrateBodyFull(b, cpuWorld.gravity, kDt);
+            std::vector<FpxBodyGpu> cpuBodies = packBodies(cpuWorld);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT (integer memcmp, NO tol) — the MAKE-OR-BREAK.
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx-orient GPU body array != CPU IntegrateBodyFull "
+                             "(a float/overflow crept into the fixed-point quaternion?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-orient GPU==CPU bodies: %d bodies BIT-EXACT (%d steps)\n",
+                        kBodyCount, kSteps);
+
+            // PROOF (2) quaternions stay normalized: every body's |q|^2 ≈ kOne^2 within a documented
+            // fixed-point tolerance. Report the max |q|-1 drift (in Q16.16 units of |q|).
+            int64_t maxDrift2 = 0;       // max ||q|^2 - kOne^2|
+            const int64_t kOne2 = (int64_t)fpx::kOne * (int64_t)fpx::kOne;
+            for (const auto& gb : gpuBodies) {
+                int64_t m2 = (int64_t)gb.ox * gb.ox + (int64_t)gb.oy * gb.oy +
+                             (int64_t)gb.oz * gb.oz + (int64_t)gb.ow * gb.ow;
+                int64_t d = m2 - kOne2; if (d < 0) d = -d;
+                if (d > maxDrift2) maxDrift2 = d;
+            }
+            // |q| ≈ sqrt(|q|^2); |q|-1 ≈ (|q|^2-1)/2 for |q|≈1. Convert maxDrift2 (Q32.32-ish, == drift in
+            // |q|^2 scaled by kOne^2) to an approximate |q|-1 in Q16.16: driftQ16 ≈ maxDrift2 / (2*kOne).
+            const fpx::fx maxDriftQ16 = (fpx::fx)(maxDrift2 / (2 * (int64_t)fpx::kOne));
+            // Tolerance: |q|-1 < kOne/256 (~0.0039). The fixed-point FxISqrt-floor + truncating fxdiv
+            // normalize keeps |q| very close to 1; this bound is comfortably met.
+            const fpx::fx kDriftTol = fpx::kOne / 256;
+            if (maxDriftQ16 > kDriftTol) {
+                std::fprintf(stderr, "FATAL: fpx-orient quaternion drift %d > tol %d (Q16.16 |q|-1)\n",
+                             maxDriftQ16, kDriftTol);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-orient normalized: max |q|-1 drift %d (<=%d) OK\n", maxDriftQ16, kDriftTol);
+
+            // PROOF (3) hand-check: body0 has angVel about +X (the (gx=0,gz=0) case 0). After K=120 steps of
+            // dt=1/60 the total angle ≈ rate*2.0 rad; assert its quaternion matches the closed-form
+            // {sin(θ/2),0,0,cos(θ/2)} within a fixed-point tolerance (recompute the closed form with a
+            // bounded integer series — here we just assert the structure + that it tracks the CPU value,
+            // which is the bit-exact reference). body0 spins about +X so y==z==0 exactly + x grows + w<kOne.
+            {
+                const FpxBodyGpu& b0 = gpuBodies[0];
+                bool ok0 = (b0.oy == 0 && b0.oz == 0)      // pure +X rotation: y,z stay 0
+                        && (b0.ox > 0)                     // positive rotation -> x grows
+                        && (b0.ow < fpx::kOne)             // w reduced from identity
+                        && (b0.ox == cpuBodies[0].ox && b0.ow == cpuBodies[0].ow);  // == bit-exact CPU ref
+                if (!ok0) {
+                    std::fprintf(stderr, "FATAL: fpx-orient hand-check body0 quat wrong "
+                                 "(x=%d y=%d z=%d w=%d)\n", b0.ox, b0.oy, b0.oz, b0.ow);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fpx-orient hand-check: body0 quat = <%d %d %d %d> OK\n",
+                            b0.ox, b0.oy, b0.oz, b0.ow);
+            }
+
+            // PROOF (4) disabled-path no-op: enabled=false -> bodies UNCHANGED (byte-identical upload).
+            std::vector<FpxBodyGpu> disabledBodies;
+            runOrient(0, disabledBodies);
+            if (disabledBodies.size() != bodiesInit.size() ||
+                std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                            bodiesInit.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx-orient enabled=false changed the bodies\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-orient disabled: bodies UNCHANGED (no-op)\n");
+
+            // PROOF (5) determinism: two full runs byte-identical.
+            std::vector<FpxBodyGpu> gpuBodies2;
+            runOrient(1, gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fpx-orient two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fpx-orient determinism: two runs BYTE-IDENTICAL\n");
+
+            // --- Golden: a grid of orientation GIZMOS. For each body, rotate the 3 local unit axes by its
+            // final orientation (FxRotate), drop Z (orthographic), and draw a short colored segment from the
+            // body's grid-cell center (x->red, y->green, z->blue) via an integer DDA. CPU-rendered from the
+            // read-back integer quaternions -> identical both backends by construction. ---
+            const int kCellPx = 80;       // cell size in pixels
+            const int kMargin = 16;
+            const int kAxisLen = 30;      // gizmo axis length in pixels
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kGrid * kCellPx);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kGrid * kCellPx);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+                if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)y * imgW + x) * 4];
+                dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+            };
+            // Integer DDA line (deterministic, pure integer — no float).
+            auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int steps = adx > ady ? adx : ady;
+                if (steps == 0) { putPx(x0, y0, r, g, b); return; }
+                for (int s = 0; s <= steps; ++s) {
+                    // round((x0*steps + dx*s)/steps) via integer add of steps/2.
+                    int px = x0 + (dx * s + (dx < 0 ? -steps / 2 : steps / 2)) / steps;
+                    int py = y0 + (dy * s + (dy < 0 ? -steps / 2 : steps / 2)) / steps;
+                    putPx(px, py, r, g, b);
+                }
+            };
+            // The 3 local unit axes (Q16.16) and their gizmo colors.
+            const fpx::FxVec3 axes[3] = {{fpx::kOne, 0, 0}, {0, fpx::kOne, 0}, {0, 0, fpx::kOne}};
+            const uint8_t axisCol[3][3] = {{230, 60, 60}, {60, 220, 60}, {80, 110, 240}};  // R,G,B
+            for (int i = 0; i < kBodyCount; ++i) {
+                const int gx = i % kGrid;
+                const int gz = i / kGrid;
+                const int cx = kMargin + gx * kCellPx + kCellPx / 2;
+                const int cy = kMargin + gz * kCellPx + kCellPx / 2;
+                const FpxBodyGpu& gb = gpuBodies[(size_t)i];
+                const fpx::FxQuat q{gb.ox, gb.oy, gb.oz, gb.ow};
+                for (int a = 0; a < 3; ++a) {
+                    const fpx::FxVec3 rv = fpx::FxRotate(q, axes[a]);
+                    // Orthographic (X right, Y up; drop Z). rv components are ~Q16.16 unit -> scale to px.
+                    const int ex = cx + (rv.x * kAxisLen) / (int)fpx::kOne;
+                    const int ey = cy - (rv.y * kAxisLen) / (int)fpx::kOne;   // screen y is down
+                    drawLine(cx, cy, ex, ey, axisCol[a][0], axisCol[a][1], axisCol[a][2]);
+                }
+                // A small white dot at the cell center (the gizmo origin).
+                putPx(cx, cy, 255, 255, 255);
+            }
+            bool ok = WriteBMP(fpxOrientShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fixed-point quaternion orientation gizmos (%d bodies)\n",
+                                fpxOrientShotPath, imgW, imgH, kBodyCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxOrientShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

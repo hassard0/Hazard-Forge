@@ -276,6 +276,17 @@ hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_m
 # fpx::StepWorld (the SAME bit-exact reference the Vulkan GPU==CPU proof compares against) -> the Metal
 # result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the
 # GPU==CPU bit-identity proof. So fpx_solve.comp gets NO hf_gen_msl line.
+# Deterministic Fixed-Point Physics Slice 4 (Slice FPX4): fpx_orient.comp is the integer QUATERNION
+# ORIENTATION integrator — ONE thread PER BODY (per-body INDEPENDENT, 64 threads/group, NO atomics) runs
+# `steps` of IntegrateBodyFull = the FPX1 translational integrate + IntegrateOrientation (dq = ω⊗q;
+# orient += 0.5*dq*dt; orient = FxQuatNormalize), the FxQuatMul/FxQuatNormalize/FxISqrt math copied
+# VERBATIM from engine/sim/fpx.h. Like fpx_solve.comp this is int64 (the quaternion fxmul products +
+# FxQuatNormalize's fxdiv/FxISqrt — GENUINELY required for the Q16.16 quaternion math), compiled fine by
+# DXC on the Vulkan path but glslc CANNOT parse int64_t in HLSL. Same Vulkan-only convention as
+# fpx_solve.comp / fpx_integrate.comp / swraster.comp: on Metal the --fpx-orient showcase runs the CPU
+# fpx::IntegrateBodyFull (the SAME bit-exact reference the Vulkan GPU==CPU proof compares against) -> the
+# Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries
+# the GPU==CPU bit-identity proof. So fpx_orient.comp gets NO hf_gen_msl line.
 # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits —
 # ONE thread per cell runs CaseIndex (VERBATIM render/mc.h), looks up triCount = gTriCount[caseIdx] from
 # the host-uploaded 256-entry count table (built from render/mc.h::kTriTable), writes gCounts[cell] and

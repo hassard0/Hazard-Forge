@@ -485,6 +485,17 @@ hf_compile_shaders(
     # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU
     # body array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/fpx_solve.comp.hlsl:cs"
+    # Deterministic Fixed-Point Physics Slice 4 (Slice FPX4): fpx_orient.comp is the integer QUATERNION
+    # ORIENTATION integrator — ONE thread PER BODY (per-body INDEPENDENT, unlike FPX3's single-thread
+    # serial solver; 64 threads/group, NO atomics) runs `steps` of IntegrateBodyFull = the FPX1
+    # translational integrate + IntegrateOrientation (dq = ω⊗q; orient += 0.5*dq*dt; orient = normalize),
+    # the FxQuatMul/FxQuatNormalize/FxISqrt/fxdiv/fxmul math copied VERBATIM from engine/sim/fpx.h, writing
+    # gBodies[i] back. enabled=0 -> bodies UNCHANGED. Like fpx_solve.comp this is int64 (the quaternion
+    # fxmul products + FxQuatNormalize's fxdiv/FxISqrt), so it is VULKAN-SPIR-V-ONLY (DXC compiles int64;
+    # glslc cannot) and is NOT MSL-gen'd — the Metal --fpx-orient showcase runs the CPU IntegrateBodyFull
+    # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact
+    # GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/fpx_orient.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

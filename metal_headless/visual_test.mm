@@ -17163,6 +17163,184 @@ static int RunFpxSolveShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator showcase (Slice FPX4,
+// the 4th slice of FLAGSHIP #6). On Metal this runs the CPU INTEGRATOR, NOT a GPU compute dispatch.
+// fpx_orient.comp is int64/Vulkan-only (glslc can't parse int64 — the quaternion fxmul products +
+// FxQuatNormalize's fxdiv/FxISqrt); Metal runs the CPU fpx::IntegrateBodyFull — byte-identical to the
+// Vulkan GPU result by construction (the fpx_solve.comp / fpx_integrate.comp / swraster.comp convention).
+// The CPU bound path IS engine/sim/fpx.h::IntegrateBodyFull, the EXACT bit-exact reference the Vulkan
+// --fpx-orient-shot GPU==CPU memcmp already compares against. So this builds the SAME deterministic 6x6
+// grid (each body a distinct deterministic angVel, identity orient, NO gravity (free spin), dt=kOne/60),
+// runs IntegrateBodyFull K=120 steps, and CPU-renders the SAME orientation-gizmo grid -> BYTE-IDENTICAL to
+// the Vulkan GPU result BY CONSTRUCTION. New golden tests/golden/metal/fpx_orient.png; two runs DIFF
+// 0.0000. NO GPU compute, NO new RHI.
+static int RunFpxOrientShowcase(const char* outPath) {
+    namespace fpx = hf::sim::fpx;
+
+    const fpx::fx kDt = fpx::kOne / 60;
+    const int kGrid = 6;
+    const int kBodyCount = kGrid * kGrid;   // 36
+    const int kSteps = 120;
+
+    // The deterministic grid (== the Vulkan --fpx-orient-shot config).
+    auto makeWorld = [&]() {
+        fpx::FxWorld world;
+        world.gravity = {0, 0, 0};
+        world.groundY = (fpx::fx)(-1000 * (int)fpx::kOne);
+        for (int i = 0; i < kBodyCount; ++i) {
+            fpx::FxBody b;
+            const int gx = i % kGrid;
+            const int gz = i / kGrid;
+            b.pos = {(fpx::fx)(gx * (int)fpx::kOne), 0, (fpx::fx)(gz * (int)fpx::kOne)};
+            b.vel = {0, 0, 0};
+            b.invMass = fpx::kOne;
+            b.flags = fpx::kFlagDynamic;
+            b.radius = 0;
+            b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+            const fpx::fx rate = (fpx::fx)(fpx::kOne / 2 + (fpx::kOne * (gx + gz + 1)) / 9);
+            const fpx::fx r2 = (fpx::fx)(rate * 7 / 10);
+            switch ((gx + 2 * gz) % 6) {
+                case 0: b.angVel = {rate, 0, 0}; break;
+                case 1: b.angVel = {0, rate, 0}; break;
+                case 2: b.angVel = {0, 0, rate}; break;
+                case 3: b.angVel = {r2, r2, 0}; break;
+                case 4: b.angVel = {0, r2, r2}; break;
+                default: b.angVel = {r2, 0, r2}; break;
+            }
+            world.bodies.push_back(b);
+        }
+        return world;
+    };
+    const fpx::FxWorld world = makeWorld();
+
+    // std430 FxBody mirror (== the Vulkan --fpx-orient-shot FpxBodyGpu, FPX4 pack): 16 x int32 (64 bytes).
+    struct FpxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass;
+        uint32_t flags;
+        int32_t radius, ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FpxBodyGpu) == 64, "FpxBodyGpu (FPX4 pack) std430 layout");
+    auto packBodies = [&](const fpx::FxWorld& w) {
+        std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+        for (size_t i = 0; i < w.bodies.size(); ++i) {
+            const fpx::FxBody& b = w.bodies[i];
+            out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                b.invMass, b.flags, b.radius,
+                                b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                                b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+    const std::vector<FpxBodyGpu> bodiesInit = packBodies(world);
+
+    // CPU integrator (== the bit-exact reference the Vulkan --fpx-orient-shot GPU==CPU memcmp compares
+    // against). enabled=false -> bodies UNCHANGED (the no-op path).
+    auto runOrient = [&](bool enabled, std::vector<FpxBodyGpu>& outBodies) {
+        if (!enabled) { outBodies = bodiesInit; return; }
+        fpx::FxWorld w = world;
+        for (int s = 0; s < kSteps; ++s)
+            for (auto& b : w.bodies) fpx::IntegrateBodyFull(b, w.gravity, kDt);
+        outBodies = packBodies(w);
+    };
+
+    // CPU orient (enabled, K steps) — the Metal showcase body array.
+    std::vector<FpxBodyGpu> gpuBodies;
+    runOrient(true, gpuBodies);
+
+    // GPU==CPU is N/A on the Metal CPU path: this body array IS the CPU IntegrateBodyFull reference the
+    // Vulkan --fpx-orient-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("fpx-orient GPU==CPU bodies: %d bodies BIT-EXACT (%d steps) [Metal: CPU IntegrateBodyFull, "
+                "byte-identical by construction]\n", kBodyCount, kSteps);
+
+    // quaternions stay normalized: every body's |q|^2 ≈ kOne^2 within a documented fp tol (max drift).
+    {
+        int64_t maxDrift2 = 0;
+        const int64_t kOne2 = (int64_t)fpx::kOne * (int64_t)fpx::kOne;
+        for (const auto& gb : gpuBodies) {
+            int64_t m2 = (int64_t)gb.ox * gb.ox + (int64_t)gb.oy * gb.oy +
+                         (int64_t)gb.oz * gb.oz + (int64_t)gb.ow * gb.ow;
+            int64_t d = m2 - kOne2; if (d < 0) d = -d;
+            if (d > maxDrift2) maxDrift2 = d;
+        }
+        const fpx::fx maxDriftQ16 = (fpx::fx)(maxDrift2 / (2 * (int64_t)fpx::kOne));
+        const fpx::fx kDriftTol = fpx::kOne / 256;
+        if (maxDriftQ16 > kDriftTol) return fail("fpx-orient: quaternion drift exceeds tol");
+        std::printf("fpx-orient normalized: max |q|-1 drift %d (<=%d) OK\n", maxDriftQ16, kDriftTol);
+    }
+
+    // hand-check: body0 spins about +X -> y==z==0, x grows, w<kOne.
+    {
+        const FpxBodyGpu& b0 = gpuBodies[0];
+        if (b0.oy != 0 || b0.oz != 0 || b0.ox <= 0 || b0.ow >= fpx::kOne)
+            return fail("fpx-orient: hand-check body0 quat wrong");
+        std::printf("fpx-orient hand-check: body0 quat = <%d %d %d %d> OK\n",
+                    b0.ox, b0.oy, b0.oz, b0.ow);
+    }
+
+    // disabled-path no-op.
+    std::vector<FpxBodyGpu> disabledBodies;
+    runOrient(false, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                    bodiesInit.size() * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx-orient: enabled=false changed the bodies");
+    std::printf("fpx-orient disabled: bodies UNCHANGED (no-op)\n");
+
+    // two-run determinism.
+    std::vector<FpxBodyGpu> gpuBodies2;
+    runOrient(true, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FpxBodyGpu)) != 0)
+        return fail("fpx-orient: two runs differ (nondeterministic)");
+    std::printf("fpx-orient determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: a grid of orientation GIZMOS (IDENTICAL to the Vulkan --fpx-orient-shot by construction).
+    const int kCellPx = 80, kMargin = 16, kAxisLen = 30;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kGrid * kCellPx);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kGrid * kCellPx);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)y * imgW + x) * 4];
+        dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int steps = adx > ady ? adx : ady;
+        if (steps == 0) { putPx(x0, y0, r, g, b); return; }
+        for (int s = 0; s <= steps; ++s) {
+            int px = x0 + (dx * s + (dx < 0 ? -steps / 2 : steps / 2)) / steps;
+            int py = y0 + (dy * s + (dy < 0 ? -steps / 2 : steps / 2)) / steps;
+            putPx(px, py, r, g, b);
+        }
+    };
+    const fpx::FxVec3 axes[3] = {{fpx::kOne, 0, 0}, {0, fpx::kOne, 0}, {0, 0, fpx::kOne}};
+    const uint8_t axisCol[3][3] = {{230, 60, 60}, {60, 220, 60}, {80, 110, 240}};
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int gx = i % kGrid;
+        const int gz = i / kGrid;
+        const int cx = kMargin + gx * kCellPx + kCellPx / 2;
+        const int cy = kMargin + gz * kCellPx + kCellPx / 2;
+        const FpxBodyGpu& gb = gpuBodies[(size_t)i];
+        const fpx::FxQuat q{gb.ox, gb.oy, gb.oz, gb.ow};
+        for (int a = 0; a < 3; ++a) {
+            const fpx::FxVec3 rv = fpx::FxRotate(q, axes[a]);
+            const int ex = cx + (rv.x * kAxisLen) / (int)fpx::kOne;
+            const int ey = cy - (rv.y * kAxisLen) / (int)fpx::kOne;
+            drawLine(cx, cy, ex, ey, axisCol[a][0], axisCol[a][1], axisCol[a][2]);
+        }
+        putPx(cx, cy, 255, 255, 255);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fixed-point quaternion orientation gizmos (%d bodies)\n",
+                outPath, imgW, imgH, kBodyCount);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
 // of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
 // corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
@@ -27707,6 +27885,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fpx-solve") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fpx_solve.png";
             try { return RunFpxSolveShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fpx-orient <out.png>: render the Deterministic Fixed-Point Physics integer QUATERNION
+        // ORIENTATION integrator showcase (Slice FPX4, the 4th slice of FLAGSHIP #6). On Metal this runs the
+        // CPU INTEGRATOR: fpx_orient.comp is int64/Vulkan-only (glslc can't parse the quaternion fxmul
+        // products + FxQuatNormalize's fxdiv/FxISqrt int64), so Metal runs the CPU fpx::IntegrateBodyFull —
+        // byte-identical to the Vulkan GPU result by construction (the fpx_solve.comp convention). A 6x6 grid
+        // of free-spinning bodies (each a distinct deterministic angVel, identity orient, NO gravity) is
+        // integrated K=120 steps — the EXACT bit-exact reference the Vulkan --fpx-orient-shot GPU==CPU memcmp
+        // compares against; enabled=false -> bodies unchanged; two runs byte-identical. The image golden is a
+        // grid of orientation gizmos, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/fpx_orient.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fpx-orient") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fpx_orient.png";
+            try { return RunFpxOrientShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mc-count <out.png>: render the GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT
