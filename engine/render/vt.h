@@ -288,17 +288,26 @@ struct VtAtlasDims {
 // shows the unused pool as a flat dark field.
 inline constexpr uint32_t kAtlasClear = 0xFF101010u;
 
-// THE deterministic per-texel generator (PURE INTEGER — no float, so bit-identical CPU<->Vulkan<->Metal).
-// Returns an RGBA8-packed uint (0xAABBGGRR, A=0xFF). A per-page BASE color from an FNV/avalanche hash of
-// (pageId, mip) (the hashColor lineage in meshlet.h:79, but returning packed bytes) is MODULATED by an
-// integer pattern over the page-local (lx,ly) in [0,pageSize): a coarse 8×8 CHECKERBOARD toggles
-// brightness and a coarse 4-step GRADIENT across the page tints it, so ADJACENT pages (different base
-// hash) AND ADJACENT mips (mip folded into the hash) AND ADJACENT texels within a page are all visually
-// DISTINCT. Every channel is clamped into [0x40,0xFF] (so no generated texel collides with kAtlasClear's
-// 0x10 channels). Pure shifts/xor/add/mul. COPIED VERBATIM into shaders/vt_pagegen.comp.hlsl.
-inline uint32_t PageTexel(int pageId, int mip, int lx, int ly) {
-    // FNV/avalanche hash of (pageId,mip) -> three well-spread base bytes (the meshlet hashColor mix).
-    uint32_t h = (uint32_t)pageId * 2654435761u + (uint32_t)(mip + 1) * 0x9E3779B9u;
+// THE deterministic per-texel generator, CONTENT-VERSION-AWARE (Slice VT5). PURE INTEGER — no float, so
+// bit-identical CPU<->Vulkan<->Metal. Returns an RGBA8-packed uint (0xAABBGGRR, A=0xFF). A per-page BASE
+// color from an FNV/avalanche hash of (pageId, mip) — with `contentVersion` folded into the hash seed so a
+// bumped version VISIBLY changes the page's color — is MODULATED by an integer pattern over the page-local
+// (lx,ly) in [0,pageSize): a coarse 8×8 CHECKERBOARD toggles brightness and a coarse 4-step GRADIENT
+// across the page tints it, so ADJACENT pages, ADJACENT mips, ADJACENT texels AND DIFFERENT content
+// versions are all visually DISTINCT. Every channel is clamped into [0x40,0xFF] (so no generated texel
+// collides with kAtlasClear's 0x10 channels). Pure shifts/xor/add/mul.
+//
+// VERSION-0 INVARIANCE (the VT3/VT4 golden guard): the version is folded as `contentVersion * <prime>`
+// ADDED into the seed, so at contentVersion==0 it contributes EXACTLY 0 and the seed reproduces the
+// ORIGINAL VT3 FNV mix byte-for-byte. PageTexel(pageId,mip,lx,ly) == PageTexelV(pageId,mip,lx,ly,0u)
+// (unit-tested + guarded by the unchanged VT3 vt_atlas + VT4 vt_sample goldens). COPIED VERBATIM into
+// shaders/vt_cachegen.comp.hlsl (the cache-aware sibling of vt_pagegen.comp).
+inline uint32_t PageTexelV(int pageId, int mip, int lx, int ly, uint32_t contentVersion) {
+    // FNV/avalanche hash of (pageId,mip) + contentVersion. At version 0 the `+ version*prime` term is 0,
+    // so the seed == the original VT3 PageTexel seed exactly. The prime (0x27D4EB2F) is large + odd so a
+    // bumped version well-separates the seed (a visibly different page color).
+    uint32_t h = (uint32_t)pageId * 2654435761u + (uint32_t)(mip + 1) * 0x9E3779B9u
+               + contentVersion * 0x27D4EB2Fu;
     h ^= h >> 15; h *= 0x85EBCA6Bu;
     h ^= h >> 13; h *= 0xC2B2AE35u;
     h ^= h >> 16;
@@ -321,6 +330,14 @@ inline uint32_t PageTexel(int pageId, int mip, int lx, int ly) {
     };
     uint32_t r = chan(br), g = chan(bg), b = chan(bb);
     return 0xFF000000u | (b << 16) | (g << 8) | r;      // 0xAABBGGRR
+}
+
+// THE deterministic per-texel generator (PURE INTEGER — no float, so bit-identical CPU<->Vulkan<->Metal).
+// VT3's generator, now expressed as PageTexelV(...,/*contentVersion=*/0) — BYTE-IDENTICAL to the original
+// VT3 PageTexel (version 0 reproduces the original FNV mix exactly; the VT3 vt_atlas + VT4 vt_sample
+// goldens are unchanged). COPIED VERBATIM into shaders/vt_pagegen.comp.hlsl (which is UNCHANGED).
+inline uint32_t PageTexel(int pageId, int mip, int lx, int ly) {
+    return PageTexelV(pageId, mip, lx, ly, 0u);
 }
 
 // Build the HOST reverse table tilePageId[tileIndex] = pageId (the GPU pagegen input). For each pageId
@@ -433,6 +450,110 @@ inline void ReconstructVirtualImage(int mip, std::span<const int32_t> indirectio
             if (idx < imageOut.size())
                 imageOut[idx] = SampleVirtualTexel(vx, vy, mip, indirection, atlas, vt, pool, atlasDims);
         }
+}
+
+// ============================ Slice VT5 — per-page CONTENT KEY + CACHE (pure CPU) ===============
+// VT3 GENERATES every allocated page's procedural content into its physical tile each frame. But a page's
+// content is FULLY determined by (pageId, mip, contentVersion) — PageTexelV is deterministic — so if those
+// inputs are unchanged across frames, re-generating the tile reproduces byte-identical texels: wasted work.
+// VT5 adds a per-page CONTENT KEY (a deterministic FNV hash of exactly those inputs) + a per-PHYSICAL-TILE
+// CACHE; a tile re-generates iff its content key changed (a cache MISS), a HIT keeps the existing (already-
+// correct) atlas tile untouched. This is UE5's Runtime-VT key performance property (generate/stream a page
+// once, reuse it until its source changes) and the direct analog of VSM Slice VD's PageContentKey/
+// VsmPageCache. It is a PURE optimization — proven SAFE because a hit SKIPS work that would produce
+// identical bytes, so the cached atlas is BYTE-IDENTICAL to the fully-regenerated atlas (the froxel.h
+// "an optimization must be byte-identical to the unoptimized path" SHA-equality discipline). ZERO backend
+// symbols — the cache is pure host logic; "skip a tile" = the GPU vt_cachegen.comp's needsGen==0 early-out
+// over a PERSISTENT (not re-cleared) atlas SSBO.
+
+// FNV-1a 32-bit — the fixed, integer/bit-exact hash the content key is built from (mirrors vsm.h's FNV
+// lineage, in 32-bit to match the uint32 page content keys VT carries). Pure integer mixing -> two
+// identical inputs always hash identically, cross-run + cross-backend.
+inline constexpr uint32_t kVtFnvOffset = 2166136261u;
+inline constexpr uint32_t kVtFnvPrime  = 16777619u;
+inline uint32_t VtFnvMix(uint32_t h, uint32_t v) {
+    // Hash the 4 bytes of v (little-endian) into the FNV accumulator.
+    for (int b = 0; b < 4; ++b) { h ^= (v & 0xFFu); h *= kVtFnvPrime; v >>= 8; }
+    return h;
+}
+
+// THE CONTENT KEY: a deterministic 32-bit hash of EVERYTHING that determines page `pageId`'s generated tile
+// — its pageId, its mip, and its contentVersion (PageTexelV is a pure function of exactly these, so the key
+// captures "has this page's content changed"). An avalanche finalizer spreads the bits. Identical inputs ->
+// identical key; a bumped contentVersion (or a different page/mip) -> a different key. FNV over integer
+// inputs -> bit-exact, transcendental-free, cross-backend.
+inline uint32_t PageContentKey(int pageId, int mip, uint32_t contentVersion) {
+    uint32_t h = kVtFnvOffset;
+    h = VtFnvMix(h, (uint32_t)pageId);
+    h = VtFnvMix(h, (uint32_t)mip);
+    h = VtFnvMix(h, contentVersion);
+    // Avalanche finalizer (the meshlet/PageTexelV mix) so near-identical inputs scatter.
+    h ^= h >> 15; h *= 0x85EBCA6Bu;
+    h ^= h >> 13; h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return h;
+}
+
+// The per-PHYSICAL-TILE cache: the last content key + a valid bit, sized pool.tileCapacity(). A fresh cache
+// is all-invalid (every tile a miss on first sight). Mirrors vsm.h::VsmPageCache (indexed by physical TILE
+// rather than virtual page, since the atlas persistence is per-tile).
+struct VtPageCache {
+    std::vector<uint32_t> key;     // [tileCapacity()] last content key seen for the page resident in each tile
+    std::vector<uint8_t>  valid;   // [tileCapacity()] 1 iff key[tileIndex] holds a populated key
+
+    void Resize(int tileCapacity) {
+        key.assign((size_t)tileCapacity, 0u);
+        valid.assign((size_t)tileCapacity, (uint8_t)0u);
+    }
+};
+
+// A cache HIT for physical tile `tileIndex` at `newKey` == the tile has a valid cached key AND it equals
+// newKey (same content -> skip the re-generation, the existing atlas tile is already correct -> byte-
+// identical). Mirrors vsm.h::PageCacheHit.
+inline bool PageCacheHit(const VtPageCache& cache, int tileIndex, uint32_t newKey) {
+    if (tileIndex < 0 || (size_t)tileIndex >= cache.valid.size()) return false;
+    return cache.valid[(size_t)tileIndex] != 0u && cache.key[(size_t)tileIndex] == newKey;
+}
+
+// Record `newKey` as physical tile `tileIndex`'s current content (called after a (re-)generation populates
+// its atlas region). Mirrors vsm.h::PageCacheUpdate.
+inline void PageCacheUpdate(VtPageCache& cache, int tileIndex, uint32_t newKey) {
+    if (tileIndex < 0 || (size_t)tileIndex >= cache.valid.size()) return;
+    cache.key[(size_t)tileIndex]   = newKey;
+    cache.valid[(size_t)tileIndex] = (uint8_t)1u;
+}
+
+// CPU REFERENCE cached atlas generation (the EXACT atlas the GPU vt_cachegen.comp produces given the host-
+// built needsGen flags + per-tile versions). For each allocated physical tile: if needsGen[tile]==0 the
+// tile's existing atlasInOut texels are LEFT UNTOUCHED (the cache hit / persistence path); else its region
+// is (re-)generated with PageTexelV(pageId,mip,lx,ly,tileVersion[tile]). Unallocated tiles are left
+// untouched too (the caller pre-clears the atlas to kAtlasClear on the very first populate). atlasInOut is
+// sized atlasTexels() and PERSISTS across calls (NOT re-cleared here) — mirroring the GPU SSBO.
+inline void GenerateCachedAtlas(std::span<const uint32_t> tilePageId,
+                                std::span<const uint8_t>  needsGen,
+                                std::span<const uint32_t> tileVersion,
+                                const VtTexture& vt, const VtTilePool& pool, const VtAtlasDims& dims,
+                                std::span<uint32_t> atlasInOut) {
+    const int atlasW  = dims.atlasW();
+    const int pageSize = dims.pageSize;
+    const int cap = pool.tileCapacity();
+    for (int tile = 0; tile < cap; ++tile) {
+        if ((size_t)tile >= tilePageId.size()) break;
+        const uint32_t pageId = tilePageId[(size_t)tile];
+        if (pageId == kNoTileU32) continue;                  // unallocated tile -> untouched
+        if ((size_t)tile >= needsGen.size() || needsGen[(size_t)tile] == 0u) continue;  // cached -> untouched
+        int ox, oy;
+        PhysicalTileOrigin(tile, pool, pageSize, ox, oy);
+        int mip, px, py;
+        UnpackPageId((int)pageId, vt, mip, px, py);
+        const uint32_t ver = ((size_t)tile < tileVersion.size()) ? tileVersion[(size_t)tile] : 0u;
+        for (int ly = 0; ly < pageSize; ++ly)
+            for (int lx = 0; lx < pageSize; ++lx) {
+                const size_t idx = (size_t)(oy + ly) * (size_t)atlasW + (size_t)(ox + lx);
+                if (idx < atlasInOut.size())
+                    atlasInOut[idx] = PageTexelV((int)pageId, mip, lx, ly, ver);
+            }
+    }
 }
 
 }  // namespace hf::render::vt

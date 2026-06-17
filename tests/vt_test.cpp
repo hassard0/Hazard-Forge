@@ -18,6 +18,7 @@
 // Pure C++ (hf_core), ASan-eligible like the other render-math tests.
 #include "render/vt.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -754,6 +755,164 @@ int main() {
               "showcase sample: resident texel == PageTexel + non-resident == kVtMiss (round-trip self-consistent)");
         check(textured == (long)residentPages * 64 * 64,
               "showcase sample: textured texels == residentPages * pageSize²");
+    }
+
+    // ================= Slice VT5 — per-page content key + cache (pure CPU) =================
+    // The CRITICAL guard: PageTexelV(...,/*contentVersion=*/0) == the original VT3 PageTexel byte-identical
+    // (version 0 reproduces the FNV mix exactly), so the VT3 vt_atlas + VT4 vt_sample goldens stay unchanged.
+    {
+        bool v0Match = true;
+        // Cover many pages/mips and a coarse spread of page-local texels (the checker/gradient steps).
+        for (int pageId = 0; pageId < 340 && v0Match; ++pageId)
+            for (int mip = 0; mip < 4 && v0Match; ++mip)
+                for (int ly = 0; ly < 64 && v0Match; ly += 7)
+                    for (int lx = 0; lx < 64; lx += 5) {
+                        if (vt::PageTexelV(pageId, mip, lx, ly, 0u) != vt::PageTexel(pageId, mip, lx, ly)) {
+                            v0Match = false; break;
+                        }
+                    }
+        check(v0Match, "PageTexelV(...,0) == PageTexel(...) byte-identical (the VT3/VT4 golden guard)");
+
+        // A bumped contentVersion visibly changes the page's color (the seed actually shifts).
+        bool versionChanges = false;
+        for (int pageId = 0; pageId < 16 && !versionChanges; ++pageId)
+            if (vt::PageTexelV(pageId, 0, 0, 0, 1u) != vt::PageTexelV(pageId, 0, 0, 0, 0u)) versionChanges = true;
+        check(versionChanges, "PageTexelV bumped contentVersion changes the generated texel");
+
+        // A generated texel (any version) still respects the [0x40,0xFF] channel floor (never collides with
+        // kAtlasClear's 0x10 channels) and stays opaque.
+        bool floored = true;
+        for (uint32_t ver = 0; ver < 4 && floored; ++ver)
+            for (int pageId = 0; pageId < 64 && floored; ++pageId) {
+                uint32_t t = vt::PageTexelV(pageId, pageId % 4, 3, 5, ver);
+                uint32_t r = t & 0xFFu, g = (t >> 8) & 0xFFu, b = (t >> 16) & 0xFFu, a = (t >> 24) & 0xFFu;
+                if (r < 0x40u || g < 0x40u || b < 0x40u || a != 0xFFu) floored = false;
+            }
+        check(floored, "PageTexelV channels stay floored into [0x40,0xFF] + opaque for all versions");
+    }
+
+    // PageContentKey: identity + bumped-version-changes-it + different pages/mips differ.
+    {
+        uint32_t k = vt::PageContentKey(42, 1, 0u);
+        check(vt::PageContentKey(42, 1, 0u) == k, "PageContentKey deterministic (identical inputs -> identical key)");
+        check(vt::PageContentKey(42, 1, 1u) != k, "PageContentKey bumped contentVersion -> different key");
+        check(vt::PageContentKey(43, 1, 0u) != k, "PageContentKey different page -> different key");
+        check(vt::PageContentKey(42, 2, 0u) != k, "PageContentKey different mip -> different key");
+
+        // No spurious collisions over a broad (page,mip,version) sweep (a sanity check on the avalanche).
+        std::vector<uint32_t> keys;
+        for (int pageId = 0; pageId < 64; ++pageId)
+            for (int mip = 0; mip < 4; ++mip)
+                for (uint32_t ver = 0; ver < 3; ++ver)
+                    keys.push_back(vt::PageContentKey(pageId, mip, ver));
+        std::vector<uint32_t> sorted = keys;
+        std::sort(sorted.begin(), sorted.end());
+        bool unique = std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end();
+        check(unique, "PageContentKey: no collisions over a 64×4×3 (page,mip,version) sweep");
+    }
+
+    // VtPageCache lifecycle: miss -> update -> hit -> version-bump -> miss (the vsm.h cache precedent).
+    {
+        vt::VtPageCache cache; cache.Resize(16);
+        check(cache.key.size() == 16 && cache.valid.size() == 16, "VtPageCache.Resize sizes key+valid to tileCapacity");
+        const int tile = 5;
+        uint32_t k0 = vt::PageContentKey(100, 1, 0u);
+        check(!vt::PageCacheHit(cache, tile, k0), "fresh cache: tile is a MISS (invalid)");
+        vt::PageCacheUpdate(cache, tile, k0);
+        check(vt::PageCacheHit(cache, tile, k0), "after update: tile is a HIT for the same key");
+        uint32_t k1 = vt::PageContentKey(100, 1, 1u);  // bumped version
+        check(!vt::PageCacheHit(cache, tile, k1), "bumped version: tile is a MISS (key changed)");
+        vt::PageCacheUpdate(cache, tile, k1);
+        check(vt::PageCacheHit(cache, tile, k1), "after re-update: tile is a HIT for the new key");
+        check(!vt::PageCacheHit(cache, 6, k0), "a different (untouched) tile stays a MISS");
+        // Out-of-range tile index is a safe MISS / no-op (no OOB).
+        check(!vt::PageCacheHit(cache, 999, k0), "out-of-range tile index -> MISS (bounds-safe)");
+        vt::PageCacheUpdate(cache, -1, k0);  // no-op, must not crash
+    }
+
+    // Cache transparency (CPU): a cached (partial) generation produces the SAME atlas as a full regen. Over
+    // the REAL showcase config, populate all tiles, then "re-run" with only one tile invalidated (its version
+    // bumped) — the cached atlas (persist the rest, regen the one) must equal a full regen of that version-state.
+    {
+        vt::VtTexture vf; vf.mipLevels = 4; vf.pageSize = 128; vf.virtualPagesPerSideMip0 = 16;
+        std::vector<vt::SampleRequest> requests;
+        const int kg = 24;
+        for (int gy = 0; gy < kg; ++gy) for (int gx = 0; gx < kg; ++gx)
+            requests.push_back({(float)gx / (float)kg, (float)gy / (float)kg, (gx + gy) % vf.mipLevels});
+        std::vector<uint32_t> fb((size_t)vf.pageCount(), 0u);
+        vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vf,
+                              std::span<uint32_t>(fb.data(), fb.size()));
+        vt::VtTilePool pool; pool.tilesPerSide = 16;
+        vt::VtAtlasDims dims; dims.tilesPerSide = 16; dims.pageSize = 64;
+        const int tileCap = pool.tileCapacity();
+        std::vector<int32_t> indir =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        std::vector<uint32_t> tilePageId = vt::BuildTilePageId(
+            std::span<const int32_t>(indir.data(), indir.size()), pool);
+
+        std::vector<int> allocTiles;
+        for (int t = 0; t < tileCap; ++t) if (tilePageId[(size_t)t] != vt::kNoTileU32) allocTiles.push_back(t);
+        check(!allocTiles.empty(), "cache-transparency: some tiles allocated");
+
+        std::vector<uint32_t> versions((size_t)tileCap, 0u);
+
+        // Persistent cached atlas: Pass1 populate all (needsGen=1 for allocated).
+        std::vector<uint32_t> cachedAtlas((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        std::vector<uint8_t> needsAll((size_t)tileCap, 0u);
+        for (int t : allocTiles) needsAll[(size_t)t] = 1u;
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(needsAll.data(), needsAll.size()),
+                                std::span<const uint32_t>(versions.data(), versions.size()),
+                                vf, pool, dims, std::span<uint32_t>(cachedAtlas.data(), cachedAtlas.size()));
+
+        // Bump ONE allocated tile's version; cache-aware regen (only that tile needsGen=1, rest persist).
+        const int bumpTile = allocTiles.front();
+        versions[(size_t)bumpTile] = 1u;
+        std::vector<uint8_t> needsOne((size_t)tileCap, 0u);
+        needsOne[(size_t)bumpTile] = 1u;
+        int needsOneBits = 0; for (uint8_t n : needsOne) needsOneBits += (n ? 1 : 0);
+        check(needsOneBits == 1, "one-page bump -> exactly one needsGen bit among allocated tiles");
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(needsOne.data(), needsOne.size()),
+                                std::span<const uint32_t>(versions.data(), versions.size()),
+                                vf, pool, dims, std::span<uint32_t>(cachedAtlas.data(), cachedAtlas.size()));
+
+        // Full regen of the SAME version-state (all needsGen=1, fresh atlas).
+        std::vector<uint32_t> fullAtlas((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(needsAll.data(), needsAll.size()),
+                                std::span<const uint32_t>(versions.data(), versions.size()),
+                                vf, pool, dims, std::span<uint32_t>(fullAtlas.data(), fullAtlas.size()));
+
+        check(cachedAtlas.size() == fullAtlas.size() &&
+              std::memcmp(cachedAtlas.data(), fullAtlas.data(), cachedAtlas.size() * sizeof(uint32_t)) == 0,
+              "cache transparency: cached partial-regen atlas == full-regen atlas (BYTE-IDENTICAL)");
+
+        // Determinism: re-running the whole cached sequence yields the identical atlas.
+        std::vector<uint32_t> cached2((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        std::vector<uint32_t> vers2((size_t)tileCap, 0u);
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(needsAll.data(), needsAll.size()),
+                                std::span<const uint32_t>(vers2.data(), vers2.size()),
+                                vf, pool, dims, std::span<uint32_t>(cached2.data(), cached2.size()));
+        vers2[(size_t)bumpTile] = 1u;
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(needsOne.data(), needsOne.size()),
+                                std::span<const uint32_t>(vers2.data(), vers2.size()),
+                                vf, pool, dims, std::span<uint32_t>(cached2.data(), cached2.size()));
+        check(std::memcmp(cachedAtlas.data(), cached2.data(), cachedAtlas.size() * sizeof(uint32_t)) == 0,
+              "cache determinism: two cached-sequence runs BYTE-IDENTICAL");
+
+        // GenerateCachedAtlas with needsGen all-0 over a fresh atlas leaves it all kAtlasClear (no writes).
+        std::vector<uint32_t> noneAtlas((size_t)dims.atlasTexels(), vt::kAtlasClear);
+        std::vector<uint8_t> needsNone((size_t)tileCap, 0u);
+        vt::GenerateCachedAtlas(std::span<const uint32_t>(tilePageId.data(), tilePageId.size()),
+                                std::span<const uint8_t>(needsNone.data(), needsNone.size()),
+                                std::span<const uint32_t>(versions.data(), versions.size()),
+                                vf, pool, dims, std::span<uint32_t>(noneAtlas.data(), noneAtlas.size()));
+        bool allClear = true;
+        for (uint32_t t : noneAtlas) if (t != vt::kAtlasClear) { allClear = false; break; }
+        check(allClear, "GenerateCachedAtlas all-cached over a fresh atlas writes nothing (stays kAtlasClear)");
     }
 
     if (g_fail == 0) std::printf("vt_test: ALL PASS\n");
