@@ -19,6 +19,7 @@
 // "GPU" here are doc-only. INTEGER on every path (no float) so the case-index golden is cross-backend
 // bit-identical (the strict zero-differing-pixel bar, like VT1 / swraster / VSM).
 
+#include <cmath>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -698,6 +699,93 @@ inline void MarchCellsInterp(const VoxelField& f, int32_t iso,
                 EmitCellInterp(cx, cy, cz, cases[(size_t)cellId], offsets[(size_t)cellId],
                                f, iso, std::span<McVertex>(verts), std::span<uint32_t>(idx));
             }
+}
+
+// ===== MC5: host RENDER-mesh build (fixed-point MC mesh -> float lit-render vertices) =============
+// MC4's MarchCellsInterp produces a fixed-point (1/kSub) triangle SOUP (verts + identity indices). MC5
+// converts that PROVEN geometry into the float vertex format the engine's existing lit mesh pipeline
+// consumes, then a showcase renders it lit. This is the MC arc's FIRST FLOAT step: the conversion does
+// the ONE documented host float divide (position = vert/kSub) + a flat per-face normal. It does NOT
+// touch MC1-MC4's integer mesh (the render consumes it verbatim -> provenance is exact) and adds NO
+// backend / RHI symbol (pure CPU, header-only) — the showcase copies RenderVertex into scene::Vertex.
+//
+// FLAT per-face normals: the mesh is a triangle SOUP (no shared-vertex averaging), so every triangle's
+// 3 vertices get the SAME face normal normalize(cross(p1-p0, p2-p0)) — a faceted look that reads the
+// extracted geometry clearly. std::fma is used in the normal/centering math so a CPU shade mirror (the
+// interior GPU==CPU proof) can reproduce the exact host floats (the visresolve FP discipline).
+
+// A render-ready vertex: world position + flat face normal. POD float6 (no padding holes), trivially
+// copied into scene::Vertex (pos/color/uv/normal/tangent) by the showcase.
+struct RenderVertex {
+    float px, py, pz;   // world position = (fixed-point vert / kSub), centered + scaled into frame
+    float nx, ny, nz;   // flat per-face normal (unit length), shared by the triangle's 3 verts
+};
+
+// BuildRenderMesh: convert MarchCellsInterp's fixed-point (1/kSub) triangle-soup verts + indices into
+// RenderVertex world positions + flat per-face normals, centered on the origin and scaled so the mesh's
+// largest extent spans `targetExtent` world units (frames the mesh for a fixed camera). Pure +
+// deterministic: same fixed-point mesh -> same floats every run. The index buffer is COPYable verbatim
+// (identity soup) — the render reuses MarchCellsInterp's idx unchanged; only positions/normals are
+// produced here. outVerts.size() == verts.size(); a NON-multiple-of-3 vert count (malformed soup) is
+// tolerated by leaving the trailing <3 verts with a zero normal (never happens for a real MC mesh).
+inline void BuildRenderMesh(std::span<const McVertex> verts, float targetExtent,
+                            std::vector<RenderVertex>& outVerts) {
+    const size_t n = verts.size();
+    outVerts.assign(n, RenderVertex{0, 0, 0, 0, 0, 0});
+    if (n == 0) return;
+
+    // 1) fixed-point -> float world units (the ONE documented host float divide) + the mesh's AABB.
+    const float inv = 1.0f / (float)kSub;
+    float minx = 1e30f, miny = 1e30f, minz = 1e30f;
+    float maxx = -1e30f, maxy = -1e30f, maxz = -1e30f;
+    for (size_t i = 0; i < n; ++i) {
+        const float x = (float)verts[i].x * inv;
+        const float y = (float)verts[i].y * inv;
+        const float z = (float)verts[i].z * inv;
+        outVerts[i].px = x; outVerts[i].py = y; outVerts[i].pz = z;
+        if (x < minx) minx = x; if (x > maxx) maxx = x;
+        if (y < miny) miny = y; if (y > maxy) maxy = y;
+        if (z < minz) minz = z; if (z > maxz) maxz = z;
+    }
+
+    // 2) center on the AABB midpoint + scale the largest extent to targetExtent (frame the mesh).
+    const float cx = 0.5f * (minx + maxx);
+    const float cy = 0.5f * (miny + maxy);
+    const float cz = 0.5f * (minz + maxz);
+    const float ex = maxx - minx, ey = maxy - miny, ez = maxz - minz;
+    float ext = ex; if (ey > ext) ext = ey; if (ez > ext) ext = ez;
+    const float scale = (ext > 0.0f) ? (targetExtent / ext) : 1.0f;
+    for (size_t i = 0; i < n; ++i) {
+        outVerts[i].px = std::fma(outVerts[i].px - cx, scale, 0.0f);
+        outVerts[i].py = std::fma(outVerts[i].py - cy, scale, 0.0f);
+        outVerts[i].pz = std::fma(outVerts[i].pz - cz, scale, 0.0f);
+    }
+
+    // 3) flat per-face normal: each triangle (3 consecutive soup verts) gets the flat face normal on
+    //    all 3 of its verts. std::fma in the cross/length so a CPU shade mirror reproduces it. The
+    //    canonical MC (Bourke / Lorensen-Cline) triangle winding emits cross(p1-p0, p2-p0) pointing
+    //    INTO the surface (toward the dense/inside corners), so we NEGATE it to get the geometric
+    //    OUTWARD normal of the extracted shell — the surface the camera sees from outside is correctly
+    //    lit (outward N·L). Positions/indices are untouched: only the shading normal is produced here.
+    const size_t triEnd = (n / 3) * 3;
+    for (size_t t = 0; t < triEnd; t += 3) {
+        const RenderVertex& a = outVerts[t + 0];
+        const RenderVertex& b = outVerts[t + 1];
+        const RenderVertex& c = outVerts[t + 2];
+        const float e1x = b.px - a.px, e1y = b.py - a.py, e1z = b.pz - a.pz;
+        const float e2x = c.px - a.px, e2y = c.py - a.py, e2z = c.pz - a.pz;
+        float nx = -std::fma(e1y, e2z, -e1z * e2y);
+        float ny = -std::fma(e1z, e2x, -e1x * e2z);
+        float nz = -std::fma(e1x, e2y, -e1y * e2x);
+        float len2 = std::fma(nx, nx, std::fma(ny, ny, nz * nz));
+        float invLen = (len2 > 0.0f) ? (1.0f / std::sqrt(len2)) : 0.0f;
+        nx *= invLen; ny *= invLen; nz *= invLen;
+        for (int k = 0; k < 3; ++k) {
+            outVerts[t + (size_t)k].nx = nx;
+            outVerts[t + (size_t)k].ny = ny;
+            outVerts[t + (size_t)k].nz = nz;
+        }
+    }
 }
 
 }  // namespace hf::render::mc

@@ -16,6 +16,7 @@
 #include "render/mc.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -539,6 +540,93 @@ int main() {
         check(vertsDiffer, "MarchCellsInterp vertices DIFFER from MC3 midpoint vertices (interp is real)");
 
         check(!verts.empty(), "a real sphere field interp-marches to a NON-empty mesh");
+    }
+
+    // ================= MC5: BuildRenderMesh (host render-mesh build for the lit render) =================
+    // The capstone's host build: MarchCellsInterp's fixed-point mesh -> RenderVertex (world float
+    // positions + flat per-face normals), centered + scaled into the camera frame. Pure CPU; the render
+    // itself is golden-verified, not unit-tested.
+    {
+        mc::VoxelField f = mc::MakeSphereField(33, 12);
+        std::vector<mc::McVertex> verts; std::vector<uint32_t> idx; uint32_t triCount = 0u;
+        mc::MarchCellsInterp(f, 0, verts, idx, triCount);
+
+        const float kExtent = 6.0f;
+        std::vector<mc::RenderVertex> rv;
+        mc::BuildRenderMesh(std::span<const mc::McVertex>(verts), kExtent, rv);
+
+        // (a) the render mesh has EXACTLY one render-vertex per MC4 soup vertex (== 3*triCount), and the
+        // index buffer (MarchCellsInterp's verbatim identity soup) is consumed unchanged.
+        check(rv.size() == verts.size(), "BuildRenderMesh: one RenderVertex per MC4 vertex");
+        check(rv.size() == (size_t)triCount * 3u, "BuildRenderMesh: vert count == 3*tris == MC4");
+        check(idx.size() == rv.size(), "BuildRenderMesh: index count == vert count (identity soup)");
+
+        // (b) position = the fixed-point vert / kSub, centered + uniformly scaled. Recompute the same
+        // center + scale from the AABB and verify a few verts match within float epsilon.
+        {
+            const float inv = 1.0f / (float)mc::kSub;
+            float minx=1e30f,miny=1e30f,minz=1e30f,maxx=-1e30f,maxy=-1e30f,maxz=-1e30f;
+            for (const auto& v : verts) {
+                float x=(float)v.x*inv, y=(float)v.y*inv, z=(float)v.z*inv;
+                if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y;
+                if(z<minz)minz=z; if(z>maxz)maxz=z;
+            }
+            float cx=0.5f*(minx+maxx), cy=0.5f*(miny+maxy), cz=0.5f*(minz+maxz);
+            float ext=maxx-minx; if(maxy-miny>ext)ext=maxy-miny; if(maxz-minz>ext)ext=maxz-minz;
+            float scale=(ext>0)?(kExtent/ext):1.0f;
+            bool posOk = true;
+            for (size_t i = 0; i < verts.size(); i += 257) {  // sample sparsely
+                float ex=((float)verts[i].x*inv - cx)*scale;
+                float ey=((float)verts[i].y*inv - cy)*scale;
+                float ez=((float)verts[i].z*inv - cz)*scale;
+                if (std::abs(ex-rv[i].px)>1e-4f || std::abs(ey-rv[i].py)>1e-4f || std::abs(ez-rv[i].pz)>1e-4f)
+                    posOk = false;
+            }
+            check(posOk, "BuildRenderMesh: position == (vert/kSub) centered + scaled into frame");
+        }
+
+        // (c) flat per-face normals: a NON-degenerate face (the MC mesh has a handful of zero-area
+        // triangles where two interpolated edge vertices coincide -> a legitimately zero normal) is unit
+        // length, SHARED by the triangle's 3 verts, and OUTWARD-oriented for the sphere (the face normal
+        // points AWAY from the mesh center, which is the origin after centering -> N·centroid > 0; the
+        // build NEGATES the inward MC winding cross so the extracted shell's outward face is lit).
+        {
+            bool unit = true, shared = true;
+            int outwardN = 0, nonDegen = 0, zeroN = 0;
+            for (size_t t = 0; t + 2 < rv.size(); t += 3) {
+                const auto& a = rv[t+0]; const auto& b = rv[t+1]; const auto& c = rv[t+2];
+                float len = std::sqrt(a.nx*a.nx + a.ny*a.ny + a.nz*a.nz);
+                // a triangle's 3 verts ALWAYS share one flat face normal (degenerate -> all zero).
+                if (a.nx!=b.nx||a.ny!=b.ny||a.nz!=b.nz||a.nx!=c.nx||a.ny!=c.ny||a.nz!=c.nz) shared = false;
+                if (len < 1e-6f) { ++zeroN; continue; }  // degenerate zero-area face: legit zero normal
+                ++nonDegen;
+                if (std::abs(len - 1.0f) > 1e-3f) unit = false;
+                float gx=(a.px+b.px+c.px)/3.0f, gy=(a.py+b.py+c.py)/3.0f, gz=(a.pz+b.pz+c.pz)/3.0f;
+                if (gx*a.nx + gy*a.ny + gz*a.nz > 0.0f) ++outwardN;
+            }
+            check(unit, "BuildRenderMesh: every NON-degenerate face normal is unit length");
+            check(shared, "BuildRenderMesh: a triangle's 3 verts share one flat face normal");
+            check(zeroN < (int)(rv.size() / 3) / 4, "BuildRenderMesh: degenerate faces are a small minority");
+            // The vast majority of non-degenerate faces must be outward (a few grazing faces may flip).
+            check(outwardN * 10 >= nonDegen * 9,
+                  "BuildRenderMesh: face normals outward-oriented for the sphere (>90% of non-degenerate)");
+        }
+
+        // (d) determinism: a second build is byte-identical (pure function of the fixed-point mesh).
+        {
+            std::vector<mc::RenderVertex> rv2;
+            mc::BuildRenderMesh(std::span<const mc::McVertex>(verts), kExtent, rv2);
+            bool same = rv.size() == rv2.size() &&
+                        std::memcmp(rv.data(), rv2.data(), rv.size() * sizeof(mc::RenderVertex)) == 0;
+            check(same, "BuildRenderMesh determinism: two builds BYTE-IDENTICAL");
+        }
+
+        // (e) empty mesh -> empty render mesh (the no-op the showcase's empty-field proof renders).
+        {
+            std::vector<mc::RenderVertex> rvEmpty;
+            mc::BuildRenderMesh(std::span<const mc::McVertex>(), kExtent, rvEmpty);
+            check(rvEmpty.empty(), "BuildRenderMesh: empty mesh -> empty render mesh (no-op)");
+        }
     }
 
     if (g_fail == 0) std::printf("mc_test: ALL PASS\n");
