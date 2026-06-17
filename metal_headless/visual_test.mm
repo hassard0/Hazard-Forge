@@ -15137,17 +15137,38 @@ static int RunVisBufferShowcase(const char* outPath) {
         fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
     }
 
-    // The vis-buffer background clear (kVisBackground = 0xFFFFFFFF). The Vulkan path writes the exact
-    // sentinel via the VkClearColorValue union (uint32[0] aliases float32[0]). On Metal MTLClearColor is
-    // DOUBLE-based and an R32Uint target converts it implementation-definedly — so the Metal background
-    // texels may NOT equal 0xFFFFFFFF exactly. CONTROLLER NOTE: when baking on the real Mac, verify the
-    // R32Uint clear lands on a value distinct from every valid packed survivor ID (clusterID<<7|tri); if it
-    // clears to 0 (== PackVisId(cluster0,tri0)), set the clear via MTLClearColorMake'ing the channels so
-    // the integer clear is 0xFFFFFFFF (or the largest representable), so background stays unambiguous. The
-    // CPU coloring + proofs below additionally treat `clusterID >= survivorCount` as background (defensive),
-    // which covers any clamped/large sentinel; only an exact clear-to-0 would need the above adjustment.
-    float bgClearFloat; std::memcpy(&bgClearFloat, &vg::kVisBackground, sizeof(float));
-    const rhi::ClearColor visClear{bgClearFloat, 0.0f, 0.0f, 0.0f};
+    // --- The vis-buffer background clear, Metal edition. ---
+    // Vulkan clears the R32_Uint RT to the TRUE sentinel kVisBackground = 0xFFFFFFFF via the
+    // VkClearColorValue union (uint32[0] aliases the bits exactly). Metal can't reach that value: the only
+    // clear path is MTLClearColorMake(double r,g,b,a) on the color-attachment descriptor, and for an
+    // INTEGER (R32Uint) target Metal CASTS the double components to uint32 (not normalized). So the engine's
+    // float ClearColor.r -> double -> (uint32) is the pipeline a Metal vis-buffer clear travels through.
+    //
+    // Two values do NOT survive that pipeline, and both land on the WRONG background:
+    //   * The old code reinterpret-cast 0xFFFFFFFF's BITS to a float -> that bit pattern is a NaN; double(NaN)
+    //     cast to uint32 is implementation-defined and on this Mac lands on 0 == PackVisId(cluster0,tri0) ==
+    //     a VALID cluster, so the whole background rendered as cluster-0's hashColor (orange) and `written`
+    //     was 921600 (every texel). THE BUG.
+    //   * The numeric value 4294967295.0 (0xFFFFFFFF) is NOT representable in float32: it rounds UP to 2^32,
+    //     and (uint32)4294967296.0 wraps to 0 — same orange-background failure.
+    //
+    // The fix: clear to a DIFFERENT uint sentinel that (a) is EXACTLY representable in float32 so it survives
+    // float -> double -> uint32 with no rounding, and (b) decodes to clusterID >= survivorCount so the CPU
+    // coloring + coverage proofs below (which already treat `cid >= drawn` as background, lines further down)
+    // map it to the dark background EXACTLY like Vulkan's 0xFFFFFFFF. 0xFF000000 (= 4278190080) has only its
+    // top 8 bits set, so it fits float32's 24-bit mantissa losslessly: float32(0xFF000000) == 4278190080.0,
+    // and (uint32)(double)that == 0xFF000000 bit-for-bit (verified). It unpacks to clusterID = 0xFF000000>>7
+    // = 33,423,360 — astronomically beyond any feasible on-screen survivor count, so it is unambiguously
+    // background and never collides with a valid packed survivor ID. This is Metal-LOCAL: it sets only THIS
+    // R32_Uint vis-buffer's clear; every existing BGRA8/RGBA16F float target keeps its normalized float
+    // ClearColor unchanged (no existing golden moves). Vulkan keeps clearing to 0xFFFFFFFF untouched.
+    static constexpr uint32_t kMetalVisBgSentinel = 0xFF000000u;  // float32-exact; cid = 33,423,360 >> 7
+    static_assert((float)kMetalVisBgSentinel == 4278190080.0f &&
+                  (uint32_t)(double)(float)kMetalVisBgSentinel == kMetalVisBgSentinel,
+                  "Metal vis-bg sentinel must survive float32 -> double -> uint32 exactly");
+    static_assert((kMetalVisBgSentinel >> vg::kTriIdBits) > (1u << 20),
+                  "Metal vis-bg sentinel must decode to a clusterID far beyond any survivor count");
+    const rhi::ClearColor visClear{(float)kMetalVisBgSentinel, 0.0f, 0.0f, 0.0f};
 
     // Render the visibility buffer into a FRESH R32_Uint RT (a fresh RT per render so the readback's
     // layout transition never collides — same reasoning as the Vulkan showcase). Returns the read-back IDs.
