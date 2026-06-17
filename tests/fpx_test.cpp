@@ -372,6 +372,161 @@ int main() {
               "broadphase determinism: two BuildPairs BYTE-IDENTICAL");
     }
 
+    // ================= Slice FPX3: fxdiv known quotients (incl negatives + the int64 shift) =============
+    {
+        // 6.0 / 3.0 == 2.0.
+        check(fpx::fxdiv(FromInt(6), FromInt(3)) == FromInt(2), "fxdiv 6/3 == 2");
+        // 1.0 / 2.0 == 0.5.
+        check(fpx::fxdiv(kOne, FromInt(2)) == kOne / 2, "fxdiv 1/2 == 0.5");
+        // x / 1 == x (identity).
+        check(fpx::fxdiv(FromInt(7), kOne) == FromInt(7), "fxdiv x/1 == x");
+        // Negatives: (-6)/3 == -2 ; 6/(-3) == -2 (truncate toward zero, identical sign of result).
+        check(fpx::fxdiv(FromInt(-6), FromInt(3)) == FromInt(-2), "fxdiv (-6)/3 == -2");
+        check(fpx::fxdiv(FromInt(6), FromInt(-3)) == FromInt(-2), "fxdiv 6/(-3) == -2");
+        // The int64 shift is REQUIRED: 1000.0 / 0.5 == 2000.0 ((1000<<16)<<16 overflows int32).
+        check(fpx::fxdiv(FromInt(1000), kOne / 2) == FromInt(2000),
+              "fxdiv 1000/0.5 == 2000 (int64 shift)");
+        // Truncation toward zero: 1.0 / 3.0 == floor((1<<32)/(3<<16)) -> the exact truncated Q16.16.
+        check(fpx::fxdiv(kOne, FromInt(3)) == (fx)(((int64_t)kOne << kFrac) / (int64_t)FromInt(3)),
+              "fxdiv 1/3 == truncated Q16.16");
+        // Guard: divide by zero -> 0.
+        check(fpx::fxdiv(FromInt(5), 0) == 0, "fxdiv x/0 == 0 (guard)");
+        // fxdiv is the inverse of fxmul at unit scale: fxmul(fxdiv(a,b), b) ~= a (exact when divisible).
+        check(fpx::fxmul(fpx::fxdiv(FromInt(8), FromInt(4)), FromInt(4)) == FromInt(8),
+              "fxmul(fxdiv(8,4),4) == 8");
+    }
+
+    // ================= FxNormalize: unit-length (fp tol) + known direction =================
+    {
+        // A pure +x vector normalizes to (kOne, 0, 0) exactly.
+        fpx::FxVec3 nx = fpx::FxNormalize(fpx::FxVec3{FromInt(5), 0, 0});
+        check(nx.x == kOne && nx.y == 0 && nx.z == 0, "FxNormalize(+x) == (1,0,0)");
+        // A pure -y vector normalizes to (0, -kOne, 0).
+        fpx::FxVec3 ny = fpx::FxNormalize(fpx::FxVec3{0, FromInt(-3), 0});
+        check(ny.x == 0 && ny.y == -kOne && ny.z == 0, "FxNormalize(-y) == (0,-1,0)");
+        // Zero vector -> the fixed fallback (0, kOne, 0).
+        fpx::FxVec3 nz = fpx::FxNormalize(fpx::FxVec3{0, 0, 0});
+        check(nz.x == 0 && nz.y == kOne && nz.z == 0, "FxNormalize(0) == (0,1,0) fallback");
+        // A (3,4,0) vector -> length 5 -> unit (0.6, 0.8, 0). Within a small Q16.16 tolerance (the
+        // integer divide truncates), the magnitude is ~kOne.
+        fpx::FxVec3 d = fpx::FxNormalize(fpx::FxVec3{FromInt(3), FromInt(4), 0});
+        const fx len = fpx::FxLength(d);
+        const fx tol = kOne / 1000;  // ~0.001 tolerance
+        check(len <= kOne + tol && len >= kOne - tol, "FxNormalize(3,4,0) unit length (tol)");
+        // Direction: x-share < y-share (0.6 < 0.8), both positive.
+        check(d.x > 0 && d.y > 0 && d.x < d.y, "FxNormalize(3,4,0) direction 0.6<0.8");
+    }
+
+    // ================= ground resolution: penetrating -> pos.y = groundY + radius =================
+    {
+        const fx r = (fx)(fpx::kOne / 2);   // radius 0.5
+        const fx groundY = 0;
+        // A body whose bottom (pos.y - r) is below groundY -> pushed so pos.y == groundY + r.
+        fpx::FxBody b; b.pos = {0, FromInt(-2), 0}; b.radius = r; b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+        fpx::ResolveGround(b, groundY);
+        check(b.pos.y == groundY + r, "ResolveGround: penetrating -> pos.y = groundY + radius");
+        // A body already above the ground is unmoved.
+        fpx::FxBody hi; hi.pos = {0, FromInt(5), 0}; hi.radius = r; hi.invMass = kOne;
+        fpx::ResolveGround(hi, groundY);
+        check(hi.pos.y == FromInt(5), "ResolveGround: above-ground unmoved");
+        // A static body (invMass==0) takes no correction.
+        fpx::FxBody st; st.pos = {0, FromInt(-2), 0}; st.radius = r; st.invMass = 0;
+        fpx::ResolveGround(st, groundY);
+        check(st.pos.y == FromInt(-2), "ResolveGround: static (invMass=0) unmoved");
+    }
+
+    // ================= sphere-sphere resolution: pushed apart by inverse-mass shares =================
+    {
+        const fx r = (fx)(fpx::kOne * 6 / 10);   // 0.6
+        // Equal masses: a at x=0, b at x=1.0, both r=0.6 -> pen = 1.2 - 1.0 = 0.2 -> each moves 0.1.
+        const fx D = kOne;
+        fpx::FxBody a; a.pos = {0, 0, 0};  a.radius = r; a.invMass = kOne; a.flags = fpx::kFlagDynamic;
+        fpx::FxBody b; b.pos = {D, 0, 0};  b.radius = r; b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+        const fx pen = (r + r) - fpx::FxLength(fpx::FxVec3{D, 0, 0});
+        const fx half = fpx::fxmul(pen, fpx::fxdiv(kOne, kOne + kOne));  // pen * 0.5
+        fpx::ResolvePair(a, b);
+        check(a.pos.x == -half, "ResolvePair equal-mass: a moved -pen/2");
+        check(b.pos.x == D + half, "ResolvePair equal-mass: b moved +pen/2");
+        // Static b (invMass==0): a takes the FULL correction (wi = invMassA/(invMassA+0) = 1), b unmoved.
+        fpx::FxBody a2; a2.pos = {0, 0, 0}; a2.radius = r; a2.invMass = kOne; a2.flags = fpx::kFlagDynamic;
+        fpx::FxBody s2; s2.pos = {D, 0, 0}; s2.radius = r; s2.invMass = 0;    a2.flags = fpx::kFlagDynamic;
+        const fx wi = fpx::fxdiv(kOne, kOne + 0);                    // == kOne
+        const fx full = fpx::fxmul(pen, wi);
+        fpx::ResolvePair(a2, s2);
+        check(s2.pos.x == D, "ResolvePair: static b unmoved");
+        check(a2.pos.x == -full, "ResolvePair: dynamic a takes full correction");
+        // Both static -> no move.
+        fpx::FxBody x1; x1.pos = {0, 0, 0}; x1.radius = r; x1.invMass = 0;
+        fpx::FxBody x2; x2.pos = {D, 0, 0}; x2.radius = r; x2.invMass = 0;
+        fpx::ResolvePair(x1, x2);
+        check(x1.pos.x == 0 && x2.pos.x == D, "ResolvePair: both static unmoved");
+        // Non-overlapping (far apart) -> no move.
+        fpx::FxBody f1; f1.pos = {0, 0, 0};         f1.radius = r; f1.invMass = kOne;
+        fpx::FxBody f2; f2.pos = {FromInt(5), 0, 0}; f2.radius = r; f2.invMass = kOne;
+        fpx::ResolvePair(f1, f2);
+        check(f1.pos.x == 0 && f2.pos.x == FromInt(5), "ResolvePair: non-overlapping unmoved");
+    }
+
+    // ================= SolveContacts: K-iter determinism + a known small scene =================
+    {
+        const fx r = (fx)(fpx::kOne * 6 / 10);
+        auto makeScene = [&]() {
+            fpx::FxWorld w; w.groundY = 0;
+            // Three bodies in a row overlapping their neighbors, resting on the ground.
+            for (int i = 0; i < 3; ++i) {
+                fpx::FxBody b; b.pos = {FromInt(i), 0, 0}; b.radius = r; b.invMass = kOne;
+                b.flags = fpx::kFlagDynamic; w.bodies.push_back(b);
+            }
+            return w;
+        };
+        std::vector<fpx::FxPair> pr = {fpx::FxPair{0u, 1u}, fpx::FxPair{1u, 2u}};
+        // K-iteration determinism: same scene solved twice -> byte-identical bodies.
+        fpx::FxWorld s1 = makeScene(), s2 = makeScene();
+        fpx::SolveContacts(s1, std::span<const fpx::FxPair>(pr), 8);
+        fpx::SolveContacts(s2, std::span<const fpx::FxPair>(pr), 8);
+        check(s1.bodies.size() == s2.bodies.size() &&
+              std::memcmp(s1.bodies.data(), s2.bodies.data(),
+                          s1.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "SolveContacts: two runs BYTE-IDENTICAL");
+        // Known result: bodies are pushed apart (their gaps grow) and all sit at/above the ground.
+        for (const auto& b : s1.bodies)
+            check(b.pos.y - b.radius >= s1.groundY, "SolveContacts: above ground");
+        check(s1.bodies[1].pos.x - s1.bodies[0].pos.x > FromInt(1) ||
+              s1.bodies[2].pos.x - s1.bodies[1].pos.x > FromInt(1),
+              "SolveContacts: overlapping bodies pushed apart");
+        // residual-overlap count is deterministic (same on both runs).
+        check(fpx::CountResidualOverlaps(s1, std::span<const fpx::FxPair>(pr)) ==
+              fpx::CountResidualOverlaps(s2, std::span<const fpx::FxPair>(pr)),
+              "CountResidualOverlaps: deterministic");
+    }
+
+    // ================= StepWorld (integrate + solve) + enabled-off model unchanged =================
+    {
+        const fx r = (fx)(fpx::kOne * 6 / 10);
+        const fx kDt = kOne / 60;
+        fpx::FxWorld w; w.groundY = 0; w.gravity = {0, FromInt(-10), 0};
+        fpx::FxBody a; a.pos = {0, FromInt(3), 0};        a.radius = r; a.invMass = kOne; a.flags = fpx::kFlagDynamic;
+        fpx::FxBody b; b.pos = {kOne / 2, FromInt(3), 0}; b.radius = r; b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+        w.bodies = {a, b};
+        std::vector<fpx::FxPair> pr = {fpx::FxPair{0u, 1u}};
+        // Capture initial, step once -> bodies move (gravity integrated + overlap resolved).
+        const fpx::FxVec3 a0 = w.bodies[0].pos;
+        fpx::StepWorld(w, std::span<const fpx::FxPair>(pr), kDt, 8);
+        check(w.bodies[0].pos.y != a0.y || w.bodies[0].pos.x != a0.x, "StepWorld: body moved");
+        for (const auto& bb : w.bodies)
+            check(bb.pos.y - bb.radius >= w.groundY, "StepWorld: stays above ground");
+
+        // enabled-off model: SolveContacts with 0 iterations + IntegrateStep with no dynamic flag is a
+        // no-op. Concretely model "disabled" as a world of STATIC bodies stepped -> unchanged.
+        fpx::FxWorld stat; stat.groundY = 0; stat.gravity = {0, FromInt(-10), 0};
+        fpx::FxBody sa; sa.pos = {0, FromInt(3), 0}; sa.radius = r; sa.invMass = 0; sa.flags = 0;
+        stat.bodies = {sa};
+        const fpx::FxVec3 sp = stat.bodies[0].pos;
+        fpx::StepWorld(stat, std::span<const fpx::FxPair>(), kDt, 8);
+        check(stat.bodies[0].pos.x == sp.x && stat.bodies[0].pos.y == sp.y &&
+              stat.bodies[0].pos.z == sp.z, "StepWorld: static body unchanged (disabled model)");
+    }
+
     if (g_fail == 0) std::printf("fpx_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

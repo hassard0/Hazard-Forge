@@ -269,5 +269,105 @@ inline void BuildPairs(const FxWorld& world, std::vector<uint32_t>& perBodyOffse
     }
 }
 
+// ===== Slice FPX3 — fixed-point PBD POSITIONAL collision response (the MAKE-OR-BREAK of FLAGSHIP #6) ===
+// A POSITION-BASED-DYNAMICS positional solver: resolve each CONTACT (a body-vs-ground or a penetrating
+// sphere-sphere pair from FPX2's BuildPairs) by moving the two bodies apart along the contact normal by
+// their inverse-mass-weighted share of the penetration depth — purely POSITIONAL (NO velocity impulses,
+// NO restitution; FPX4+). Over the FPX2 candidate pairs + the ground, iterate K times in a FIXED order
+// (Gauss-Seidel: each contact reads the LATEST positions) -> inherently sequential -> the GPU mirror is
+// SINGLE-THREAD ([numthreads(1,1,1)], the mc_scan/vt_alloc pattern) -> bit-exact GPU==CPU + cross-backend.
+//
+// THE int64/glslc METAL LESSON (FPX1): fxdiv + FxISqrt use int64 -> DXC compiles (Vulkan), glslc (the
+// Metal HLSL->SPIR-V->MSL frontend) CANNOT parse int64 in HLSL. So shaders/fpx_solve.comp.hlsl is
+// VULKAN-SPIR-V-ONLY (in the Vulkan compile list, NOT in the Metal hf_gen_msl list); the Metal --fpx-solve
+// showcase runs the CPU StepWorld over the same world -> byte-identical to the Vulkan GPU result by
+// construction (the Vulkan side carries the GPU==CPU proof). The math here is copied VERBATIM by
+// fpx_solve.comp so the GPU exercises the EXACT integer ops -> the GPU==CPU memcmp catches any divergence.
+
+// fxdiv(a,b) = (a << kFrac) / b in Q16.16 — an int64 SHIFT then a TRUNCATING integer divide (truncation
+// TOWARD ZERO, identical C++/HLSL/MSL). The most overflow-sensitive op: a is shifted up by 16 bits into an
+// int64 (|a|<2^31 -> |a<<16|<2^47, well inside int64) then divided by the non-zero denominator b (a mass
+// sum or a distance). Guard b==0 -> return 0 (a contact with a zero denominator is degenerate -> no move).
+inline fx fxdiv(fx a, fx b) {
+    if (b == 0) return 0;
+    return (fx)(((int64_t)a << kFrac) / (int64_t)b);
+}
+
+// FxNormalize(v): the unit vector of v in Q16.16 (integer normalize, NO std::sqrt / <cmath>). len =
+// FxLength(v) (the FxISqrt of the int64 sum-of-squares); if len==0 return a fixed fallback (0,kOne,0) so a
+// coincident pair has a deterministic normal; else { fxdiv(v.x,len), fxdiv(v.y,len), fxdiv(v.z,len) }.
+inline FxVec3 FxNormalize(const FxVec3& v) {
+    const fx len = FxLength(v);
+    if (len == 0) return FxVec3{0, kOne, 0};
+    return FxVec3{fxdiv(v.x, len), fxdiv(v.y, len), fxdiv(v.z, len)};
+}
+
+// ResolveGround(b, groundY): the ground contact (NO normalize — axis-aligned). A body with
+// pos.y - radius < groundY penetrates by pen = groundY + radius - pos.y; resolve pos.y += pen (the ground
+// is static/infinite mass -> the body takes the full correction). Static bodies (invMass==0) take nothing.
+// Pure integer, no divide, no sqrt — the safe core. The shader copies THIS body VERBATIM.
+inline void ResolveGround(FxBody& b, fx groundY) {
+    if (b.invMass == 0) return;
+    const fx pen = groundY + b.radius - b.pos.y;
+    if (pen > 0) b.pos.y += pen;
+}
+
+// ResolvePair(a, b): the sphere-sphere contact. d = b.pos - a.pos; dist = FxLength(d); pen =
+// (a.radius + b.radius) - dist; if pen > 0: n = FxNormalize(d); the inverse-mass shares
+// wi = fxdiv(a.invMass, a.invMass + b.invMass), wj = kOne - wi; a.pos -= n * fxmul(pen, wi);
+// b.pos += n * fxmul(pen, wj). Static bodies (invMass==0) take no correction; if BOTH static, skip.
+// int64 in dist (FxISqrt) / fxdiv / fxmul. The shader copies THIS body VERBATIM.
+inline void ResolvePair(FxBody& a, FxBody& b) {
+    const fx invSum = a.invMass + b.invMass;
+    if (invSum == 0) return;                          // both static -> skip
+    const FxVec3 d = FxSub(b.pos, a.pos);
+    const fx dist = FxLength(d);
+    const fx pen = (a.radius + b.radius) - dist;
+    if (pen <= 0) return;
+    const FxVec3 n = FxNormalize(d);
+    const fx wi = fxdiv(a.invMass, invSum);
+    const fx wj = kOne - wi;
+    const FxVec3 ci = FxScale(n, fxmul(pen, wi));     // a moves -ci
+    const FxVec3 cj = FxScale(n, fxmul(pen, wj));     // b moves +cj
+    a.pos = FxSub(a.pos, ci);
+    b.pos = FxAdd(b.pos, cj);
+}
+
+// SolveContacts(w, pairs, iterations): the CPU reference. K iterations; each iteration resolves ALL ground
+// contacts (in body order) THEN ALL pair contacts in the FIXED FPX2 pair order (ascending) — a
+// deterministic Gauss-Seidel sweep. Sequential (each contact reads the latest positions) -> order-dependent
+// -> the GPU mirror MUST be single-thread. The shader runs THIS exact double loop.
+inline void SolveContacts(FxWorld& w, std::span<const FxPair> pairs, int iterations) {
+    const size_t n = w.bodies.size();
+    for (int it = 0; it < iterations; ++it) {
+        for (size_t i = 0; i < n; ++i) ResolveGround(w.bodies[i], w.groundY);
+        for (const FxPair& p : pairs) {
+            if (p.i < n && p.j < n) ResolvePair(w.bodies[p.i], w.bodies[p.j]);
+        }
+    }
+}
+
+// StepWorld(w, pairs, dt, solveIters) = IntegrateStep(dt) + SolveContacts(pairs, solveIters). The full
+// deterministic fixed-point physics step. The showcase runs `steps` of THIS over a fixed pair list.
+inline void StepWorld(FxWorld& w, std::span<const FxPair> pairs, fx dt, int solveIters) {
+    IntegrateStep(w, dt);
+    SolveContacts(w, pairs, solveIters);
+}
+
+// CountResidualOverlaps(w, pairs): the deterministic count of pairs still penetrating after the solve (a
+// reporting/diagnostic helper — NOT necessarily 0; bit-exact CPU<->GPU because it is pure integer compares
+// over FxLength). Pen > 0 means the spheres still overlap.
+inline uint32_t CountResidualOverlaps(const FxWorld& w, std::span<const FxPair> pairs) {
+    const size_t n = w.bodies.size();
+    uint32_t r = 0;
+    for (const FxPair& p : pairs) {
+        if (p.i >= n || p.j >= n) continue;
+        const FxVec3 d = FxSub(w.bodies[p.j].pos, w.bodies[p.i].pos);
+        const fx pen = (w.bodies[p.i].radius + w.bodies[p.j].radius) - FxLength(d);
+        if (pen > 0) ++r;
+    }
+    return r;
+}
+
 }  // namespace fpx
 }  // namespace hf::sim
