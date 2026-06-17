@@ -341,6 +341,14 @@ foreach (`$shot in `$vkShots) {
 if (`$vkErrors -ne 0) { Write-Host ('Vulkan validation gate FAILED (' + `$vkErrors + ' error line(s))'); exit 18 }
 Write-Host 'Vulkan validation gate: CLEAN (zero VUID / SYNC-HAZARD / UNASSIGNED across showcases)'
 
+# Clear the validation-layer env the gate above set: the checks that follow (mt-determinism byte-compare,
+# runtime material authoring, etc.) are NOT validation checks and must run on a CLEAN runtime. The
+# sync-validation layer STACK-OVERFLOWS (0xC00000FD) on the --mt-shot multithreaded-recording path on this
+# box, so leaving it active makes the layer (not the engine) crash and the determinism check false-fail.
+`$env:VK_INSTANCE_LAYERS = ''
+`$env:VK_LAYER_PATH = ''
+`$env:VK_VALIDATION_FEATURE_ENABLE = ''
+
 # --- Multithreaded-recording determinism oracle (Slice AU): the SAME draw-heavy scene recorded with
 # 1 worker vs N workers must be BYTE-IDENTICAL. Partition + in-order secondary execution guarantee
 # the draw order is independent of worker count; this asserts it on the LIVE Vulkan render. Render
