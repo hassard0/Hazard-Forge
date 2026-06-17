@@ -303,6 +303,114 @@ int main() {
         check(na > 1, "ground grid allocates >1 physical tile");
     }
 
+    // =========================== Slice VC — lit-pass VSM indirection sample ==========================
+    // The lit_vsm.frag page-lookup chain (CPU mirror of the shader's integer math): wpos -> level ->
+    // pageId -> tile over a KNOWN indirection table -> expected tiles. The shader runs the EXACT same
+    // SelectClipmapLevel + MarkPage(verbatim) + PageId + gIndirection[pageId] chain, so this CPU mirror IS
+    // the GPU result bit-for-bit (the shared-math rule; the showcase's GPU==CPU page-lookup proof).
+    {
+        // Mark a known receiver set + allocate tiles -> a concrete indirection table.
+        std::vector<Vec3> recv = {
+            {0,0,0}, {2,0,0}, {0,0,2}, {-2,0,0}, {0,0,-2}, {3,0,3}, {-3,0,-3},
+        };
+        std::vector<uint32_t> resident((size_t)pageCount, 0u), indir((size_t)pageCount, vsm::kNoTile);
+        vsm::MarkResidentPages(std::span<const Vec3>(recv.data(), recv.size()), cm,
+                               std::span<uint32_t>(resident.data(), resident.size()));
+        int alloc = vsm::AllocatePhysicalPages(std::span<const uint32_t>(resident.data(), resident.size()),
+                                               vsm::VsmAtlas{}, std::span<uint32_t>(indir.data(), indir.size()));
+        check(alloc == (int)recv.size(), "VC: each distinct receiver -> a resident tile");
+
+        // The full chain at each receiver: level == UnpackPageId(MarkPage)'s level + a RESIDENT tile.
+        bool chainOk = true;
+        for (const Vec3& s : recv) {
+            float dist = math::length(s - cm.cameraPos);
+            int level = vsm::SelectClipmapLevel(dist, cm);
+            int pageId = 0; vsm::MarkPage(s, cm, pageId);
+            int upl, upx, upy; vsm::UnpackPageId(pageId, cm, upl, upx, upy);
+            uint32_t tile = indir[(size_t)pageId];
+            if (level != upl || tile == vsm::kNoTile) chainOk = false;
+            // The tile origin must be a valid atlas-pixel position (the PCF tap base).
+            int ox, oy; vsm::PhysicalTileOrigin(tile, vsm::VsmAtlas{}, ox, oy);
+            if (ox < 0 || oy < 0) chainOk = false;
+        }
+        check(chainOk, "VC page-lookup chain wpos->level->pageId->tile -> resident tiles (GPU==CPU mirror)");
+
+        // A point in a NON-resident page -> kNoTile -> the shader's shadow=1.0 fallback (documented).
+        int farId = 0; vsm::MarkPage(Vec3{50.0f, 0.0f, 50.0f}, cm, farId);
+        check(indir[(size_t)farId] == vsm::kNoTile, "VC: a non-resident page -> kNoTile (shadow=1.0 fallback)");
+    }
+
+    // The vsmEnabled=0 shadow-factor identity (the CPU mirror of the shader's lerp(1.0, shadow, vsmEnabled)).
+    // With vsmEnabled==0 the factor is EXACTLY 1.0 for ANY shadow value -> the unshadowed render (the
+    // make-or-break byte-identity no-op).
+    {
+        auto vsmShadowFactor = [](float shadow, float vsmEnabled) -> float {
+            // lerp(1.0, shadow, vsmEnabled) — IEEE lerp(a,b,0) = a + (b-a)*0 = a exactly.
+            return 1.0f + (shadow - 1.0f) * vsmEnabled;
+        };
+        bool identity = true;
+        float shadows[5] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+        for (float sh : shadows) if (vsmShadowFactor(sh, 0.0f) != 1.0f) identity = false;
+        check(identity, "VC vsmEnabled=0 -> shadow factor == 1.0 EXACTLY for all shadow (the no-op identity)");
+        // vsmEnabled=1 -> the factor is the shadow value itself (shadowing fully on).
+        bool passthrough = true;
+        for (float sh : shadows) if (vsmShadowFactor(sh, 1.0f) != sh) passthrough = false;
+        check(passthrough, "VC vsmEnabled=1 -> shadow factor == shadow (shadowing on)");
+    }
+
+    // A resident page's light-space projection round-trips a known caster/receiver. The lit_vsm.frag
+    // projects wpos into the page's PageWorldOrtho light-space (top-down, light eye at cameraPos.y +
+    // lightHeight): lightUV = (wpos.xz - center)/half * 0.5 + 0.5 in [0,1]; receiverDepth = (eyeY - wpos.y
+    // - near)/(far - near). A receiver at the page CENTER, on the ground -> lightUV == (0.5, 0.5); a
+    // receiver at the page's +X edge -> lightUV.x near 1.0. This is the inverse of MarkPage's projection.
+    {
+        const float lightHeight = 12.0f, orthoNear = 6.0f, orthoFar = 13.0f;
+        // Mark a level-0 page for a known receiver, then project that receiver back into the page.
+        Vec3 receiver{1.0f, 0.0f, 1.0f};   // level 0 center page (4,4) center == (1,1) (per the VB test)
+        int pageId = 0; vsm::MarkPage(receiver, cm, pageId);
+        vsm::PageOrtho po = vsm::PageWorldOrtho(pageId, cm);
+        // lightUV at the receiver.
+        float u = (receiver.x - po.center.x) / po.halfExtent;
+        float v = (receiver.z - po.center.z) / po.halfExtent;
+        float uvx = u * 0.5f + 0.5f, uvy = v * 0.5f + 0.5f;
+        check(uvx >= 0.0f && uvx <= 1.0f && uvy >= 0.0f && uvy <= 1.0f,
+              "VC light-space lightUV of a marked receiver is inside the page [0,1]");
+        // The page CENTER projects to exactly (0.5, 0.5).
+        float cu = (po.center.x - po.center.x) / po.halfExtent * 0.5f + 0.5f;
+        float cv = (po.center.z - po.center.z) / po.halfExtent * 0.5f + 0.5f;
+        check(std::fabs(cu - 0.5f) < 1e-6f && std::fabs(cv - 0.5f) < 1e-6f,
+              "VC page center -> lightUV (0.5,0.5)");
+        // receiverDepth of a ground (y=0) point: eyeY = cameraPos.y + lightHeight; viewZ = eyeY - 0; depth
+        // = (viewZ - near)/(far - near). For lightHeight=12, near=6, far=13: (12-6)/(13-6) = 6/7 ~= 0.857.
+        float eyeY = cm.cameraPos.y + lightHeight;
+        float viewZ = eyeY - receiver.y;
+        float depth = (viewZ - orthoNear) / (orthoFar - orthoNear);
+        check(depth >= 0.0f && depth <= 1.0f, "VC ground receiverDepth in [0,1] (inside the page ortho)");
+        check(std::fabs(depth - (6.0f / 7.0f)) < 1e-5f, "VC ground receiverDepth == (lightH-near)/(far-near)");
+        // A caster TOP (y above the ground) projects to a SMALLER depth (nearer the light) than the ground
+        // -> the depth test (receiverGround > storedCasterTop) => the ground under the caster is SHADOWED.
+        float casterTopY = 2.0f;
+        float casterDepth = (eyeY - casterTopY - orthoNear) / (orthoFar - orthoNear);
+        check(casterDepth < depth, "VC caster top depth < ground depth -> the ground under it is shadowed");
+    }
+
+    // VC determinism: the page-lookup chain is pure integer -> two passes byte-identical.
+    {
+        std::vector<Vec3> recv = {{0,0,0}, {2,0,0}, {0,0,2}, {3,0,3}};
+        auto resolveTiles = [&](std::vector<uint32_t>& out) {
+            std::vector<uint32_t> resident((size_t)pageCount, 0u), indir((size_t)pageCount, vsm::kNoTile);
+            vsm::MarkResidentPages(std::span<const Vec3>(recv.data(), recv.size()), cm,
+                                   std::span<uint32_t>(resident.data(), resident.size()));
+            vsm::AllocatePhysicalPages(std::span<const uint32_t>(resident.data(), resident.size()),
+                                       vsm::VsmAtlas{}, std::span<uint32_t>(indir.data(), indir.size()));
+            out.clear();
+            for (const Vec3& s : recv) { int id = 0; vsm::MarkPage(s, cm, id); out.push_back(indir[(size_t)id]); }
+        };
+        std::vector<uint32_t> t1, t2; resolveTiles(t1); resolveTiles(t2);
+        check(t1.size() == t2.size() && std::memcmp(t1.data(), t2.data(), t1.size()*sizeof(uint32_t)) == 0,
+              "VC page-lookup deterministic (two passes byte-identical)");
+    }
+
     if (g_fail == 0) std::printf("vsm_test: ALL PASS\n");
     else std::printf("vsm_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

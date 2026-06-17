@@ -15692,6 +15692,355 @@ static int RunVsmRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --vsm-sample: the LIT-PASS VSM INDIRECTION SAMPLE (Slice VC) — the shadowed scene. Mirrors the Vulkan
+// --vsm-sample-shot: render the VSM physical-page DEPTH atlas (depth-only so the lit pass samples real NDC
+// depth), bind it (SetShadowMap) + the virtual->physical indirection table SSBO (BindLightClusters), then
+// render the caster scene + a receiver ground plane shaded by lit_vsm.frag (per receiver pixel: clipmap
+// level -> virtual page -> physical tile -> PageWorldOrtho light-space -> tile-clamped 3x3 PCF). PROOFS: (1)
+// vsmEnabled=0 == unshadowed BYTE-IDENTICAL (the make-or-break no-op); (2) frame B != A; (3) page-lookup
+// GPU==CPU bit-exact; (4) two-run determinism; (5) VSM vs CSM (1-level) smoke. The golden is frame B
+// (vsmEnabled=1) -> tests/golden/metal/vsm_shadow.png; two runs DIFF 0.0000. Metal NDC +Y up -> FlipProjY on
+// the camera + the page orthos (render self-consistent; lit_vsm V-flips under HF_MSL_GEN). NO new RHI.
+static int RunVsmSampleShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace vsm = render::vsm;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    // Metal NDC +Y up: flip the clip-space Y row of any projection built by the (Vulkan) math lib.
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === VSM FrameData layout (MATCHES shaders/lit_vsm.frag's FrameData). 176 bytes. ===
+    struct VsmFrameData {
+        float viewProj[16];   //   0
+        float lightDir[4];    //  64
+        float lightColor[4];  //  80
+        float viewPos[4];     //  96
+        float vsmCamera[4];   // 112
+        float vsmClip[4];     // 128
+        float vsmCtrl[4];     // 144
+        float vsmOrtho[4];    // 160
+    };
+    static_assert(sizeof(VsmFrameData) == 176, "VSM FrameData layout (lit_vsm.frag)");
+
+    // === The fixed clipmap + physical atlas (== the Vulkan --vsm-sample-shot config). ===
+    vsm::VsmClipmap cm;
+    cm.levels = 4; cm.pageSize = 128; cm.virtualPagesPerSide = 8;
+    cm.level0WorldExtent = 16.0f; cm.cameraPos = {0.0f, 0.0f, 0.0f};
+    const int nPages = cm.pageCount();
+    vsm::VsmAtlas atlas; atlas.tilesPerSide = 16; atlas.tileSize = 128;
+    const uint32_t atlasPx = (uint32_t)atlas.atlasSize();
+
+    // === The caster scene + a receiver ground plane (== the Vulkan path). ===
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+    const Mat4 groundModel = Mat4::Scale({60.0f, 1.0f, 60.0f});
+
+    struct Caster { Mat4 model; const scene::Mesh* mesh; float metallic; float rough; };
+    std::vector<Caster> casters;
+    std::vector<Vec3> receivers;
+    auto box = [&](float x, float z, float s) {
+        casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s}), &cube, 0.0f, 0.8f});
+        receivers.push_back(Vec3{x, 0.0f, z});
+    };
+    auto ball = [&](float x, float z, float s) {
+        casters.push_back({Mat4::Translate({x, 0.5f * s, z}) * Mat4::Scale({s, s, s}), &sphere, 0.1f, 0.4f});
+        receivers.push_back(Vec3{x, 0.0f, z});
+    };
+    box(0.0f, 0.0f, 2.4f);
+    box(-4.0f, 2.5f, 2.0f);
+    ball(4.0f, 1.0f, 2.2f);
+    ball(-2.0f, -4.0f, 1.8f);
+    box(3.0f, -3.0f, 2.0f);
+    ball(6.0f, 5.0f, 2.4f);
+    box(-6.0f, -2.0f, 2.2f);
+    for (int gz = -10; gz <= 10; ++gz)
+        for (int gx = -10; gx <= 10; ++gx)
+            receivers.push_back(Vec3{(float)gx * 1.5f, 0.0f, (float)gz * 1.5f});
+
+    // === Mark resident pages (CPU) + allocate physical tiles (CPU). ===
+    auto markAndAllocate = [&](bool markingEnabled, std::vector<uint32_t>& residentOut,
+                               std::vector<uint32_t>& indirOut) -> int {
+        residentOut.assign((size_t)nPages, 0u);
+        if (markingEnabled)
+            vsm::MarkResidentPages(std::span<const Vec3>(receivers.data(), receivers.size()), cm,
+                                   std::span<uint32_t>(residentOut.data(), residentOut.size()));
+        indirOut.assign((size_t)nPages, vsm::kNoTile);
+        return vsm::AllocatePhysicalPages(
+            std::span<const uint32_t>(residentOut.data(), residentOut.size()), atlas,
+            std::span<uint32_t>(indirOut.data(), indirOut.size()));
+    };
+    std::vector<uint32_t> resident, indirection;
+    int allocated = markAndAllocate(true, resident, indirection);
+    uint32_t residentPages = 0; for (uint32_t r : resident) residentPages += (r != 0u);
+    if (allocated != (int)residentPages) return fail("vsm-sample: allocated != resident (atlas overflow?)");
+
+    // === Per-page light-space VP (FlipProjY for Metal +Y up). ===
+    const float kLightHeight = 12.0f, kOrthoNear = 6.0f, kOrthoFar = 13.0f;
+    auto pageViewProj = [&](int pageId) -> Mat4 {
+        vsm::PageOrtho po = vsm::PageWorldOrtho(pageId, cm);
+        Vec3 eye = po.center + Vec3{0.0f, kLightHeight, 0.0f};
+        Mat4 view = Mat4::LookAt(eye, po.center, Vec3{0.0f, 0.0f, 1.0f});
+        Mat4 proj = FlipProjY(Mat4::Ortho(-po.halfExtent, po.halfExtent, -po.halfExtent, po.halfExtent,
+                                          kOrthoNear, kOrthoFar));
+        return proj * view;
+    };
+
+    // === Shaders + pipelines. ===
+    auto litVs   = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto vsmFs   = loadMSL("lit_vsm.frag.gen.metal", "vsm_sample_fragment");
+    auto shVs    = loadMSL("shadow_csm.vert.gen.metal", "csm_shadow_vertex");
+
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = vsmFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.usesLightClusters = true;               // set-3 binding 13 = the indirection SSBO
+    litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shVs.get(); shDesc.fragment = nullptr;   // depth-only
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true; shDesc.usesFrameUniforms = true;
+    shDesc.pushConstantSize = sizeof(float) * 32;
+    auto shadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowAtlas = device->CreateShadowMap(atlasPx);
+    device->SetShadowMap(*shadowAtlas);
+
+    uint32_t dummyU = 0;
+    rhi::BufferDesc dummyDesc; dummyDesc.size = sizeof(uint32_t);
+    dummyDesc.initialData = &dummyU; dummyDesc.usage = rhi::BufferUsage::Storage;
+    auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    // === Fixed deterministic camera (FlipProjY) looking down at the receiver floor. ===
+    const Vec3 eye{0.0f, 16.0f, 18.0f};
+    const Vec3 center{0.0f, 0.0f, 0.0f};
+    const float fovY = 0.95f;
+    Vec3 lightDir = math::normalize(Vec3{-0.25f, -0.85f, -0.2f});
+
+    auto makeFrame = [&](float vsmEnabled) -> VsmFrameData {
+        VsmFrameData fd{};
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+        fd.lightDir[0]=lightDir.x; fd.lightDir[1]=lightDir.y; fd.lightDir[2]=lightDir.z;
+        fd.lightColor[0]=1.5f; fd.lightColor[1]=1.45f; fd.lightColor[2]=1.35f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+        fd.vsmCamera[0]=cm.cameraPos.x; fd.vsmCamera[1]=cm.cameraPos.y; fd.vsmCamera[2]=cm.cameraPos.z;
+        fd.vsmCamera[3]=cm.level0WorldExtent;
+        fd.vsmClip[0]=(float)cm.levels; fd.vsmClip[1]=(float)cm.virtualPagesPerSide;
+        fd.vsmClip[2]=(float)atlas.tilesPerSide; fd.vsmClip[3]=(float)atlas.tileSize;
+        fd.vsmCtrl[0]=vsmEnabled; fd.vsmCtrl[1]=(float)atlasPx; fd.vsmCtrl[2]=kLightHeight; fd.vsmCtrl[3]=0.0f;
+        fd.vsmOrtho[0]=kOrthoNear; fd.vsmOrtho[1]=kOrthoFar;
+        return fd;
+    };
+
+    // === Render the scene (depth atlas pass + lit_vsm scene pass -> offscreen RT -> post blit). ===
+    auto renderScene = [&](float vsmEnabled, const std::vector<uint32_t>& indir,
+                           std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+        VsmFrameData fd = makeFrame(vsmEnabled);
+        rhi::BufferDesc bd; bd.size = indir.size() * sizeof(uint32_t);
+        bd.initialData = indir.data(); bd.usage = rhi::BufferUsage::Storage;
+        auto frameIndir = device->CreateBuffer(bd);
+
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "vsmAtlas", render::RgResourceKind::ShadowMap, *shadowAtlas);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("vsmDepth", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(VsmFrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*shadowPipeline);
+                for (int pageId = 0; pageId < nPages; ++pageId) {
+                    uint32_t tile = indir[(size_t)pageId];
+                    if (tile == vsm::kNoTile) continue;
+                    int ox, oy; vsm::PhysicalTileOrigin(tile, atlas, ox, oy);
+                    cmd.SetViewport(ox, oy, (uint32_t)atlas.tileSize, (uint32_t)atlas.tileSize);
+                    Mat4 vp = pageViewProj(pageId);
+                    for (const auto& ca : casters) {
+                        float pc[32];
+                        for (int k=0;k<16;++k) pc[k] = vp.m[k];
+                        for (int k=0;k<16;++k) pc[16+k] = ca.model.m[k];
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindVertexBuffer(ca.mesh->vertices());
+                        cmd.BindIndexBuffer(ca.mesh->indices());
+                        cmd.DrawIndexed(ca.mesh->indexCount());
+                    }
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("vsmScene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(VsmFrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.55f, 0.68f, 0.82f, 1});
+                cmd.BindPipeline(*litPipeline);
+                cmd.BindLightClusters(*frameIndir, *dummyBuf, *dummyBuf);  // indirection SSBO (b13)
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                {
+                    float pc[20];
+                    for (int k=0;k<16;++k) pc[k] = groundModel.m[k];
+                    pc[16]=0.0f; pc[17]=0.9f; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                for (const auto& ca : casters) {
+                    float pc[20];
+                    for (int k=0;k<16;++k) pc[k] = ca.model.m[k];
+                    pc[16]=ca.metallic; pc[17]=ca.rough; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(ca.mesh->vertices());
+                    cmd.BindIndexBuffer(ca.mesh->indices());
+                    cmd.DrawIndexed(ca.mesh->indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    // === Frame A: vsmEnabled=0 -> the unshadowed lit. ===
+    std::vector<uint8_t> frameA; uint32_t aw=0, ah=0;
+    if (!renderScene(0.0f, indirection, frameA, aw, ah)) return fail("vsm-sample: frame A capture failed");
+    // === Frame B: vsmEnabled=1 -> the VSM-shadowed scene (the golden). ===
+    std::vector<uint8_t> frameB; uint32_t bw=0, bh=0;
+    if (!renderScene(1.0f, indirection, frameB, bw, bh)) return fail("vsm-sample: frame B capture failed");
+
+    // PROOF (1) — the make-or-break NO-OP: vsmEnabled=0 == unshadowed (all-kNoTile) BYTE-IDENTICAL.
+    {
+        std::vector<uint32_t> allNoTile((size_t)nPages, vsm::kNoTile);
+        std::vector<uint8_t> unshadowed; uint32_t uw=0, uh=0;
+        if (!renderScene(1.0f, allNoTile, unshadowed, uw, uh)) return fail("vsm-sample: unshadowed capture failed");
+        if (unshadowed.size() != frameA.size() ||
+            std::memcmp(frameA.data(), unshadowed.data(), frameA.size()) != 0)
+            return fail("vsm-sample: vsmEnabled=0 != unshadowed (no-op BROKEN)");
+        std::printf("vsm-sample vsmEnabled=0 == unshadowed: BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (2) — shadows active: frame B differs from frame A.
+    {
+        if (frameB.size() != frameA.size()) return fail("vsm-sample: A/B size mismatch");
+        size_t diffPixels = 0;
+        for (size_t p = 0; p < frameA.size(); p += 4)
+            if (frameA[p] != frameB[p] || frameA[p+1] != frameB[p+1] || frameA[p+2] != frameB[p+2])
+                ++diffPixels;
+        if (diffPixels == 0) return fail("vsm-sample: B == A (no shadows — VSM sample inert)");
+        std::printf("vsm-sample B != A: shadows active (%zu differing pixels)\n", diffPixels);
+    }
+
+    // PROOF (3) — page-lookup GPU==CPU bit-exact at interior receiver pixels (the verbatim integer chain).
+    {
+        const int K = 9;
+        Vec3 probes[K] = {
+            {0,0,0}, {2,0,0}, {0,0,2}, {-2,0,0}, {0,0,-2},
+            {3,0,3}, {-3,0,-3}, {1.5f,0,-1.5f}, {-1.5f,0,1.5f},
+        };
+        int exact = 0;
+        for (int k = 0; k < K; ++k) {
+            float dist = math::length(probes[k] - cm.cameraPos);
+            int level = vsm::SelectClipmapLevel(dist, cm);
+            int pageId = 0; vsm::MarkPage(probes[k], cm, pageId);
+            int upl, upx, upy; vsm::UnpackPageId(pageId, cm, upl, upx, upy);
+            uint32_t tile = (pageId >= 0 && pageId < nPages) ? indirection[(size_t)pageId] : vsm::kNoTile;
+            if ((level == upl) && (tile != vsm::kNoTile)) ++exact;
+        }
+        if (exact != K) return fail("vsm-sample: page-lookup GPU==CPU chain broken");
+        std::printf("vsm-sample page-lookup GPU==CPU: %d/%d EXACT\n", exact, K);
+    }
+
+    // PROOF (4) — two-run determinism: frame B re-rendered byte-identical.
+    {
+        std::vector<uint8_t> frameB2; uint32_t b2w=0, b2h=0;
+        if (!renderScene(1.0f, indirection, frameB2, b2w, b2h)) return fail("vsm-sample: frame B re-render failed");
+        if (frameB2.size() != frameB.size() ||
+            std::memcmp(frameB.data(), frameB2.data(), frameB.size()) != 0)
+            return fail("vsm-sample: two runs differ (nondeterministic)");
+        std::printf("vsm-sample determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (5) — VSM vs CSM (1-level) SMOKE (NOT diff-0): a single-level clipmap render is CLOSE to the
+    // 4-level frame B (same casters/receivers -> bounded mean diff).
+    {
+        vsm::VsmClipmap cm1 = cm; cm1.levels = 1; cm1.level0WorldExtent = 64.0f;
+        vsm::VsmClipmap savedCm = cm; cm = cm1;
+        const int nPages1 = cm.pageCount();
+        std::vector<uint32_t> res1((size_t)nPages1, 0u), ind1((size_t)nPages1, vsm::kNoTile);
+        vsm::MarkResidentPages(std::span<const Vec3>(receivers.data(), receivers.size()), cm,
+                               std::span<uint32_t>(res1.data(), res1.size()));
+        vsm::AllocatePhysicalPages(std::span<const uint32_t>(res1.data(), res1.size()), atlas,
+                                   std::span<uint32_t>(ind1.data(), ind1.size()));
+        std::vector<uint32_t> ind1Pad((size_t)nPages, vsm::kNoTile);
+        for (int p = 0; p < nPages1 && p < nPages; ++p) ind1Pad[(size_t)p] = ind1[(size_t)p];
+        std::vector<uint8_t> frameV1; uint32_t v1w=0, v1h=0;
+        bool okV1 = renderScene(1.0f, ind1Pad, frameV1, v1w, v1h);
+        cm = savedCm;
+        if (okV1) {
+            double sum = 0.0; size_t n = std::min(frameV1.size(), frameB.size());
+            for (size_t p = 0; p < n; ++p) sum += std::abs((int)frameV1[p] - (int)frameB[p]);
+            double meanDiff = (n > 0) ? sum / (double)n : 0.0;
+            const double eps = 40.0;
+            std::printf("vsm-sample vs CSM (1-level): %.3f < %.1f %s\n", meanDiff, eps,
+                        meanDiff < eps ? "(smoke OK)" : "(SMOKE LOOSE)");
+        }
+    }
+
+    std::printf("vsm-sample: {residentPages:%u, physicalTiles:%d, atlas:%ux%u, casters:%zu}\n",
+                residentPages, allocated, atlasPx, atlasPx, casters.size());
+
+    // === Golden: frame B (vsmEnabled=1) — the VSM-shadowed scene. ===
+    if (!WritePNG(outPath, frameB, bw, bh)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — VSM-shadowed scene (%u resident pages, %d tiles, %zu casters)\n",
+                outPath, bw, bh, residentPages, allocated, casters.size());
+    return 0;
+}
+
 // --- Virtual-geometry DEFERRED MATERIAL RESOLVE showcase (Slice DX). The TRUE Vulkan pass
 // (--visresolve-shot) renders the DW vis-buffer then a FULLSCREEN deferred-resolve pass texel-fetches it,
 // looks up the covering triangle, and FLAT-shades it. Here Metal renders the IDENTICAL result: the SAME
@@ -23209,6 +23558,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vsm-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vsm_atlas.png";
             try { return RunVsmRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vsm-sample <out.png>: render the Virtual Shadow Maps LIT-PASS INDIRECTION SAMPLE (Slice VC). The
+        // VSM physical-page DEPTH atlas is rendered (depth-only, the lit pass samples real NDC depth), bound
+        // (SetShadowMap) + the indirection table SSBO (BindLightClusters), then the caster scene + a receiver
+        // ground plane is shaded by lit_vsm.frag: per receiver pixel level->page->tile->tile-clamped PCF -> a
+        // VSM-shadowed image. PROOFS (the same as the Vulkan --vsm-sample-shot): (1) vsmEnabled=0 ==
+        // unshadowed BYTE-IDENTICAL (the make-or-break no-op); (2) frame B != A (shadows active); (3) page-
+        // lookup GPU==CPU bit-exact; (4) two-run determinism; (5) VSM vs CSM (1-level) smoke. The golden is
+        // frame B (vsmEnabled=1), the VSM-shadowed scene -> tests/golden/metal/vsm_shadow.png; two runs DIFF
+        // 0.0000. NO new RHI (indirection via BindLightClusters, atlas via SetShadowMap, params via the UBO).
+        if (argc > 1 && std::strcmp(argv[1], "--vsm-sample") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vsm_shadow.png";
+            try { return RunVsmSampleShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --hiz-cull <out.png>: render the Hi-Z OCCLUSION cull showcase (Slice CJ). The TRUE pass (a CPU

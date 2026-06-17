@@ -193,6 +193,12 @@ hf_gen_msl(vsm_mark.comp         vsm_mark.comp.hlsl         comp vsm_mark_main)
 # constant); unlike the depth-only CSM caster it renders into a COLOR atlas (SV_Position.z -> grayscale,
 # near=bright) so the per-tile depth is ReadRenderTarget'd back as the golden. Default MSL gen suffices.
 hf_gen_msl(vsm_depth.frag         vsm_depth.frag.hlsl         frag vsm_depth_fragment)
+# Virtual Shadow Maps Slice 3 (Slice VC): lit_vsm.frag — the LIT-PASS VSM indirection sample (the shadowed
+# scene), a SIBLING of lit_csm.frag. Per receiver pixel: VA-threshold-ladder clipmap level -> virtual page
+# -> physical tile via the indirection SSBO (binding 13, BindLightClusters) -> PageWorldOrtho light-space ->
+# tile-clamped 3x3 PCF over the DEPTH atlas (SetShadowMap). vsmEnabled=0 -> unshadowed byte-identical. The
+# SAME HLSL->SPIR-V->MSL chain; lit_csm.frag + its goldens untouched (sibling isolation). NO new RHI.
+hf_gen_msl(lit_vsm.frag           lit_vsm.frag.hlsl           frag vsm_sample_fragment)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.

@@ -389,6 +389,14 @@ hf_compile_shaders(
     # grayscale (near=bright) — so the per-tile depth is ReadRenderTarget'd back as the golden. NO new RHI
     # (reuses CreateShadowMap-sized CreateRenderTarget + SetViewport + the integer AllocatePhysicalPages).
     "shaders/vsm_depth.frag.hlsl:ps"
+    # Virtual Shadow Maps Slice 3 (Slice VC): lit_vsm.frag is the LIT-PASS VSM indirection sample (the
+    # shadowed scene) — a SIBLING of lit_csm.frag. Per receiver pixel it picks the clipmap level (the VA
+    # threshold-ladder, verbatim), projects to the virtual page, looks up the physical tile in the
+    # indirection SSBO ([[vk::binding(13,3)]], bound via usesLightClusters/BindLightClusters), projects into
+    # that page's PageWorldOrtho light-space, and tile-clamped 3x3-PCF-samples the DEPTH atlas (gShadow via
+    # SetShadowMap) -> a VSM-shadowed scene. vsmEnabled=0 -> lerp(1,x,0)==1 -> unshadowed BYTE-IDENTICAL.
+    # NO new RHI. lit.frag/lit_csm.frag + their goldens untouched (sibling isolation).
+    "shaders/lit_vsm.frag.hlsl:ps"
     # Virtual-geometry per-CLUSTER Hi-Z OCCLUSION cull (Slice DU): DT's cluster_cull.comp PLUS CJ's
     # hiz_cull.comp occlusion test. After the frustum test, a frustum-surviving cluster-instance is ALSO
     # tested against a Hi-Z max-depth pyramid (built CPU-side from a depth pre-pass + uploaded; render/hiz.h)
