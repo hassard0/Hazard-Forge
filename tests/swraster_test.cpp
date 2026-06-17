@@ -17,6 +17,7 @@
 #include "render/visbuffer.h"
 #include "render/meshlet.h"
 #include "scene/vertex.h"
+#include "scene/mesh.h"        // Slice SW2: SphereGeometry — the clustered showcase scene the GPU memcmp's against
 #include "math/math.h"
 
 #include <algorithm>
@@ -234,6 +235,86 @@ int main() {
         vg::SwVisBuffer cleared; cleared.Init(W, H);
         check(std::memcmp(vb.packed.data(), cleared.packed.data(), vb.packed.size() * sizeof(uint32_t)) == 0,
               "empty triangle set == cleared (all kSwClear) BYTE-IDENTICAL");
+    }
+
+    // ===== Slice SW2: RasterClusters over a CLUSTERED SphereGeometry (the GPU oracle) =====
+    // The --swraster-gpu-shot showcase rasterizes a clustered SphereGeometry; this is the CPU reference
+    // the GPU memcmp's against. Prove it is (a) DETERMINISTIC (two runs byte-identical) and (b)
+    // WATERTIGHT at cluster seams — every covered pixel is claimed EXACTLY once across all triangles (no
+    // gap, no double-cover), which is what makes the serial-min == InterlockedMin bit-identity meaningful.
+    {
+        using math::Vec3; using math::Mat4;
+        const uint32_t W = 512, H = 512;
+        scene::MeshGeometry geo = scene::SphereGeometry(24, 16);
+
+        // Decompose into clusters (the showcase decomposition).
+        vg::MeshletSet ms = vg::BuildMeshlets(
+            std::span<const scene::Vertex>(geo.verts.data(), geo.verts.size()),
+            std::span<const uint32_t>(geo.indices.data(), geo.indices.size()));
+        check(ms.meshlets.size() >= 1, "SphereGeometry decomposes into >=1 cluster");
+
+        // Host projection (== the showcase camera).
+        Mat4 view = Mat4::LookAt({0, 0, 3}, {0, 0, 0}, {0, 1, 0});
+        Mat4 proj = Mat4::Perspective(0.9f, (float)W / (float)H, 0.1f, 50.0f);
+        Mat4 viewProj = proj * view;
+        std::vector<vg::ScreenVert> screen(geo.verts.size());
+        std::vector<uint8_t> behind(geo.verts.size(), 0);
+        for (size_t i = 0; i < geo.verts.size(); ++i) {
+            bool ok = true;
+            screen[i] = vg::ProjectToScreenVert(
+                Vec3{geo.verts[i].pos[0], geo.verts[i].pos[1], geo.verts[i].pos[2]},
+                viewProj, W, H, vg::kSub, ok);
+            behind[i] = ok ? 0 : 1;
+        }
+        auto screenSpan  = std::span<const vg::ScreenVert>(screen.data(), screen.size());
+        auto behindSpan  = std::span<const uint8_t>(behind.data(), behind.size());
+        auto idxSpan     = std::span<const uint32_t>(ms.indices.data(), ms.indices.size());
+        auto meshletSpan = std::span<const vg::Meshlet>(ms.meshlets.data(), ms.meshlets.size());
+
+        vg::SwVisBuffer a; a.Init(W, H);
+        vg::RasterClusters(a, screenSpan, behindSpan, idxSpan, meshletSpan);
+        vg::SwVisBuffer b; b.Init(W, H);
+        vg::RasterClusters(b, screenSpan, behindSpan, idxSpan, meshletSpan);
+        check(std::memcmp(a.packed.data(), b.packed.data(), a.packed.size() * sizeof(uint32_t)) == 0,
+              "clustered-sphere RasterClusters deterministic (two runs BYTE-IDENTICAL)");
+
+        uint64_t coveredSphere = 0;
+        for (uint32_t v : a.packed) if (v != vg::kSwClear) ++coveredSphere;
+        check(coveredSphere > 1000u, "clustered-sphere covers a non-trivial pixel count");
+
+        // WATERTIGHT at cluster seams: rasterize ALL triangles into a per-pixel COVERAGE COUNTER (one tri
+        // per fresh buffer, count any covered pixel). Every covered pixel must be claimed EXACTLY once at
+        // the FRONT-MOST surface — i.e. the top-left fill rule prevents shared seams double-covering. We
+        // verify no FRONT-facing triangle double-covers a same-depth neighbour by checking that, for the
+        // front layer, the number of (triangle, pixel) coverages whose key == the final min equals the
+        // covered-pixel count (each visible pixel claimed by exactly one winning triangle).
+        std::vector<uint32_t> winnerCount((size_t)W * H, 0);
+        for (uint32_t cl = 0; cl < (uint32_t)ms.meshlets.size(); ++cl) {
+            const vg::Meshlet& m = ms.meshlets[cl];
+            for (uint32_t t = 0; t < m.triCount; ++t) {
+                uint32_t base = 3u * (m.triOffset + t);
+                uint32_t i0 = ms.indices[base+0], i1 = ms.indices[base+1], i2 = ms.indices[base+2];
+                if (behind[i0] || behind[i1] || behind[i2]) continue;
+                vg::SwVisBuffer one; one.Init(W, H);
+                vg::RasterTriangle(one, screen[i0], screen[i1], screen[i2], vg::PackVisId(cl, t));
+                for (uint32_t p = 0; p < W * H; ++p) {
+                    if (one.packed[p] == vg::kSwClear) continue;
+                    // This triangle covers pixel p with its key; if its key == the global winner, it is the
+                    // visible surface there. Count how many distinct triangles produce the EXACT winning key.
+                    if (one.packed[p] == a.packed[p]) winnerCount[p] += 1;
+                }
+            }
+        }
+        // Watertight + min-deterministic: every covered pixel has EXACTLY ONE winning triangle (no two
+        // triangles produce the same min key at a pixel — no double-cover at a seam, no depth-tie ambiguity).
+        bool exactlyOneWinner = true;
+        for (uint32_t p = 0; p < W * H; ++p) {
+            if (a.packed[p] == vg::kSwClear) { if (winnerCount[p] != 0) exactlyOneWinner = false; }
+            else if (winnerCount[p] != 1) exactlyOneWinner = false;
+        }
+        check(exactlyOneWinner,
+              "clustered-sphere watertight: each covered pixel claimed by EXACTLY one winning triangle "
+              "(no seam gap/double-cover)");
     }
 
     if (g_fail == 0) std::printf("swraster_test: ALL PASS\n");

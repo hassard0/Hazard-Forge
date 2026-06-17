@@ -95,6 +95,13 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     // pipelines don't use it, so every existing RT / golden is byte-for-byte unchanged. geometryShader is
     // a core VkPhysicalDeviceFeatures capability available on the engine's VK 1.3 target GPUs.
     f10.geometryShader = VK_TRUE;
+    // Slice SW2 (GPU software rasterizer): swraster.comp's integer edge function uses int64_t to match the
+    // CPU swraster.h::SwEdge bit-exactly (the snapped-coord products exceed 32 bits). DXC lowers int64_t to
+    // SPIR-V OpCapability Int64, so the device must advertise the shaderInt64 feature or the validation layer
+    // flags VUID-VkShaderModuleCreateInfo-pCode-08740 at module creation. Like geometryShader above this is a
+    // device-capability advertisement ONLY (every existing pipeline is int32; no existing RT/golden changes);
+    // shaderInt64 is a core VkPhysicalDeviceFeatures capability available on the engine's VK 1.3 target GPUs.
+    f10.shaderInt64 = VK_TRUE;
 
     // Slice BZ (bindless textures): the bindless fragment samples one large runtime sampled-image array
     // by a per-draw index — gTextures[NonUniformResourceIndex(texIndex)]. That needs the

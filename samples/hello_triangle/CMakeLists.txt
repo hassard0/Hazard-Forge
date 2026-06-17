@@ -383,6 +383,14 @@ hf_compile_shaders(
     # false -> writes nothing. Pure compute over an integer SSBO + ReadBuffer (the froxel/cluster surface)
     # -> bit-exact GPU==CPU resident set, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/vsm_mark.comp.hlsl:cs"
+    # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer —
+    # ONE thread per cluster-triangle scan-converts the triangle into a w*h depth|id visibility-buffer SSBO
+    # via InterlockedMin, running the int64 integer edge math + top-left fill rule + flat min-depth copied
+    # VERBATIM from render/swraster.h over the HOST-SNAPPED integer ScreenVerts (ZERO GPU FP). The
+    # commutative atomic-min => the GPU vis-buffer is bit-identical to the CPU swraster.h::RasterClusters
+    # reference at EVERY pixel, full-frame, on any vendor. RWStructuredBuffer<uint> + InterlockedMin (the
+    # existing InterlockedAdd family) + ReadBuffer -> NO new RHI; existing shaders + goldens untouched.
+    "shaders/swraster.comp.hlsl:cs"
     # Virtual Shadow Maps Slice 2 (Slice VB): vsm_depth.frag renders each resident PHYSICAL page's
     # casters' depth into its atlas tile (paired with shadow_csm.vert: the page's light-space ortho VP in
     # the push constant). Unlike the depth-only CSM caster it renders into a COLOR atlas — SV_Position.z ->

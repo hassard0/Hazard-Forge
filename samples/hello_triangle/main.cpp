@@ -429,6 +429,7 @@ int main(int argc, char** argv) {
     const char* visbufferShotPath = nullptr; // --visbuffer-shot <out.bmp> (Slice DW: rasterize (clusterID,triID) into an R32_Uint visibility buffer + bit-exact ID readback)
     const char* visresolveShotPath = nullptr; // --visresolve-shot <out.bmp> (Slice DX: deferred material resolve — texel-fetch the vis-buffer, flat-shade the covering triangle, lit image)
     const char* swrasterShotPath = nullptr;  // --swraster-shot <out.bmp> (Slice SW1: PURE-CPU integer software rasterizer — scan-convert cluster triangles into a packed depth|id vis-buffer, top-left fill rule, sub-pixel coverage, min-order-independent; CPU-colored golden)
+    const char* swrasterGpuShotPath = nullptr; // --swraster-gpu-shot <out.bmp> (Slice SW2: GPU COMPUTE software rasterizer — swraster.comp scan-converts cluster triangles into a w*h depth|id vis-buffer SSBO via InterlockedMin; proven bit-identical to the CPU swraster.h reference; CPU-colored golden)
     const char* vsmMarkShotPath = nullptr; // --vsm-mark-shot <out.bmp> (Slice VA: VSM virtual page table + page-needed marking, integer compute, GPU==CPU resident-set bit-exact, clipmap debug-viz)
     const char* vsmRenderShotPath = nullptr; // --vsm-render-shot <out.bmp> (Slice VB: allocate physical atlas tiles to VA's resident pages + render each page's casters' depth into its tile; colorized depth atlas)
     const char* vsmSampleShotPath = nullptr; // --vsm-sample-shot <out.bmp> (Slice VC: lit-pass VSM indirection sample — per receiver pixel level->page->tile->tile-clamped PCF over the depth atlas -> a VSM-shadowed scene; vsmEnabled=0 byte-identical-to-unshadowed no-op)
@@ -1269,6 +1270,20 @@ int main(int argc, char** argv) {
             // (bg->clear, else hashColor(visId>>kTriIdBits)) -> identical both backends by construction.
             // NO new RHI (a present is declared so the validation layer has a clean frame). One BMP -> exit.
             swrasterShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--swraster-gpu-shot") == 0 && i + 1 < argc) {
+            // Slice SW2: Nanite Software-Raster Slice 2 — the GPU COMPUTE software rasterizer. shaders/
+            // swraster.comp scan-converts a clustered mesh's triangles (SphereGeometry -> BuildMeshlets,
+            // several hundred tris) into a w*h depth|id visibility-buffer SSBO via InterlockedMin, running
+            // the int64 integer edge math + top-left fill rule + flat min-depth copied VERBATIM from
+            // render/swraster.h over the HOST-SNAPPED integer ScreenVerts (the GPU does ZERO FP). The
+            // commutative atomic-min => the GPU vis-buffer is provably == the CPU swraster.h::RasterClusters
+            // reference at EVERY pixel. PROOFS (fail loudly): (1) GPU==CPU BIT-IDENTICAL full-frame
+            // (memcmp(gpuVis, cpuVis.packed)==0 — the make-or-break); (2) two dispatches BYTE-IDENTICAL
+            // (atomic-min order-independence); (3) a sub-pixel triangle COVERED (HW would miss); (4)
+            // triCount=0 -> gVis all-kSwClear (disabled-path no-op). The golden is a CPU-coloring of the
+            // read-back integer vis-buffer (bg->clear, else hashColor(visId>>kTriIdBits)) -> identical both
+            // backends by construction. NO new RHI (RWStructuredBuffer<uint> + InterlockedMin + ReadBuffer).
+            swrasterGpuShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--vsm-mark-shot") == 0 && i + 1 < argc) {
             // Slice VA: Virtual Shadow Maps Slice 1 — PAGE TABLE + PAGE-NEEDED MARKING (BEACHHEAD). A fixed
             // directional CLIPMAP (levels=4, vpps=8, pageSize=128, level0WorldExtent=16, fixed cameraPos) +
@@ -12949,6 +12964,271 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — CPU-colored software-rasterized vis-buffer (%u tris, %llu covered)\n",
                                 swrasterShotPath, SW, SH, triCount, (unsigned long long)coveredPixels);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", swrasterShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Nanite SOFTWARE-RASTER GPU (--swraster-gpu-shot <out.bmp>, Slice SW2). The GPU COMPUTE
+        // software rasterizer: shaders/swraster.comp scan-converts a clustered mesh's triangles
+        // (SphereGeometry -> BuildMeshlets) into a w*h depth|id visibility-buffer SSBO via InterlockedMin,
+        // running the int64 integer edge math + top-left fill rule + flat min-depth copied VERBATIM from
+        // render/swraster.h over the HOST-SNAPPED integer ScreenVerts (the GPU does ZERO FP). The
+        // commutative atomic-min => the GPU vis-buffer is provably == the CPU swraster.h::RasterClusters
+        // reference at EVERY pixel. PROOFS (fail loudly): (1) GPU==CPU BIT-IDENTICAL full-frame; (2) two
+        // dispatches BYTE-IDENTICAL; (3) a sub-pixel triangle COVERED; (4) triCount=0 -> all-kSwClear.
+        // NO new RHI (RWStructuredBuffer<uint> + InterlockedMin + ReadBuffer). One BMP -> exit. ----------
+        if (swrasterGpuShotPath) {
+            namespace vg = render::vg;
+            const uint32_t SW = 512, SH = 512;
+
+            // --- The clustered showcase scene: a SphereGeometry decomposed into meshlet clusters (several
+            // hundred triangles) PLUS one appended SUB-PIXEL triangle (its own cluster) the HW raster would
+            // miss but the SW raster covers. Everything downstream of the host projection is integer. ---
+            scene::MeshGeometry geo = scene::SphereGeometry(24, 16);
+            std::vector<scene::Vertex> verts = geo.verts;
+            std::vector<uint32_t>      indices = geo.indices;
+
+            // Camera/projection (the ONE FP context). The sphere is unit-radius at the origin; place the
+            // camera back along +Z looking at it so it fills most of the frame.
+            using math::Vec3; using math::Mat4;
+            Mat4 view = Mat4::LookAt({0.0f, 0.0f, 3.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+            float aspect = (SH > 0) ? (float)SW / (float)SH : 1.0f;
+            Mat4 proj = Mat4::Perspective(0.9f, aspect, 0.1f, 50.0f);
+            Mat4 viewProj = proj * view;
+
+            // Decompose the SPHERE-only indices into clusters first (so the sub-pixel triangle is a clean
+            // extra cluster appended after, not folded into a sphere cluster).
+            vg::MeshletSet ms = vg::BuildMeshlets(
+                std::span<const scene::Vertex>(verts.data(), verts.size()),
+                std::span<const uint32_t>(indices.data(), indices.size()));
+            // The decomposition reorders indices into ms.indices; adopt that as the working index buffer.
+            std::vector<uint32_t> workIndices = ms.indices;
+            std::vector<vg::Meshlet> meshlets = ms.meshlets;
+
+            // Append a SUB-PIXEL triangle as its own cluster. Target a deterministic empty-ish pixel near a
+            // corner (away from the sphere's center disc). Build a tiny world triangle straddling that
+            // pixel's center via the same unproject construction BuildSwRasterScene uses.
+            const uint32_t subPixelPx = SW / 6;   // ~85
+            const uint32_t subPixelPy = SH / 6;   // ~85
+            {
+                float ndcX = ((float)subPixelPx + 0.5f) / (float)SW * 2.0f - 1.0f;
+                float ndcY = ((float)subPixelPy + 0.5f) / (float)SH * 2.0f - 1.0f;
+                float zw = 1.0f;  // a near depth in front of the sphere (sphere spans z in [-1,1] at origin)
+                Mat4 invVP = viewProj.Inverse();
+                float wDummy = 0.0f;
+                Vec3 onAxis = math::MulPointDivide(viewProj, Vec3{0.0f, 0.0f, zw}, wDummy);
+                float ndcZ = onAxis.z;
+                auto unproj = [&](float nx, float ny, float nz) -> Vec3 {
+                    const float* m = invVP.m;
+                    float x = m[0]*nx + m[4]*ny + m[8]*nz + m[12];
+                    float y = m[1]*nx + m[5]*ny + m[9]*nz + m[13];
+                    float z = m[2]*nx + m[6]*ny + m[10]*nz + m[14];
+                    float wq = m[3]*nx + m[7]*ny + m[11]*nz + m[15];
+                    float inv = (wq != 0.0f) ? 1.0f / wq : 1.0f;
+                    return Vec3{x*inv, y*inv, z*inv};
+                };
+                Vec3 centerW = unproj(ndcX, ndcY, ndcZ);
+                float worldPerPixel = (2.0f * std::tan(0.45f) * 3.0f) / (float)SH;  // ~one pixel in world
+                float r = worldPerPixel * 0.30f;  // < 1px so it straddles the center but HW would miss
+                auto addV = [&](float x, float y, float z) -> uint32_t {
+                    scene::Vertex v{}; v.pos[0]=x; v.pos[1]=y; v.pos[2]=z;
+                    v.normal[2]=1.0f; verts.push_back(v); return (uint32_t)(verts.size()-1);
+                };
+                uint32_t triStart = (uint32_t)(workIndices.size() / 3);
+                uint32_t a = addV(centerW.x - r, centerW.y - r, zw);
+                uint32_t b = addV(centerW.x + r, centerW.y - r, zw);
+                uint32_t c = addV(centerW.x,     centerW.y + r, zw);
+                workIndices.push_back(a); workIndices.push_back(b); workIndices.push_back(c);
+                vg::Meshlet sm; sm.triOffset = triStart; sm.triCount = 1; meshlets.push_back(sm);
+            }
+
+            // --- HOST projection -> integer ScreenVerts (the ONE FP step; the GPU gets these integers). ---
+            std::vector<vg::ScreenVert> screen(verts.size());
+            std::vector<uint8_t> behind(verts.size(), 0);
+            for (size_t i = 0; i < verts.size(); ++i) {
+                bool okp = true;
+                screen[i] = vg::ProjectToScreenVert(
+                    Vec3{verts[i].pos[0], verts[i].pos[1], verts[i].pos[2]}, viewProj, SW, SH, vg::kSub, okp);
+                behind[i] = okp ? 0 : 1;
+            }
+
+            // --- Flatten clusters into a per-triangle record list (the gTriangles SSBO): 3 vert indices +
+            // visId = PackVisId(clusterId, triLocal). Behind-camera triangles are SKIPPED here (matching
+            // RasterClusters), so the GPU never sees them — the CPU reference skips them too. ---
+            struct GpuTri { uint32_t i0, i1, i2, visId; };
+            std::vector<GpuTri> gpuTris;
+            for (uint32_t cl = 0; cl < (uint32_t)meshlets.size(); ++cl) {
+                const vg::Meshlet& m = meshlets[cl];
+                for (uint32_t t = 0; t < m.triCount; ++t) {
+                    uint32_t base = 3u * (m.triOffset + t);
+                    uint32_t i0 = workIndices[base+0], i1 = workIndices[base+1], i2 = workIndices[base+2];
+                    if (behind[i0] || behind[i1] || behind[i2]) continue;
+                    gpuTris.push_back({i0, i1, i2, vg::PackVisId(cl, t)});
+                }
+            }
+            const uint32_t triCount = (uint32_t)gpuTris.size();
+
+            // --- The CPU REFERENCE (the GPU==CPU oracle): swraster.h::RasterClusters over the SAME screen
+            // verts + clusters -> a CPU SwVisBuffer. ---
+            vg::SwVisBuffer cpuVis; cpuVis.Init(SW, SH);
+            vg::RasterClusters(cpuVis,
+                std::span<const vg::ScreenVert>(screen.data(), screen.size()),
+                std::span<const uint8_t>(behind.data(), behind.size()),
+                std::span<const uint32_t>(workIndices.data(), workIndices.size()),
+                std::span<const vg::Meshlet>(meshlets.data(), meshlets.size()));
+
+            // --- GPU buffers. gScreenVerts (std430 int x,int y,uint z), gTriangles, gVis (w*h uint), and
+            // a tiny params SSBO {w,h,triCount,_}. The gVis upload is a kSwClear-filled host buffer (the
+            // clear), so the dispatch only does InterlockedMin into it. ---
+            struct GpuScreenVert { int32_t x; int32_t y; uint32_t z; };
+            static_assert(sizeof(GpuScreenVert) == 12, "std430 ScreenVert {int,int,uint}");
+            std::vector<GpuScreenVert> svUpload(screen.size());
+            for (size_t i = 0; i < screen.size(); ++i)
+                svUpload[i] = {screen[i].x, screen[i].y, screen[i].z};
+
+            rhi::BufferDesc svDesc;
+            svDesc.size = svUpload.size() * sizeof(GpuScreenVert);
+            svDesc.initialData = svUpload.data();
+            svDesc.usage = rhi::BufferUsage::Storage;
+            auto svBuf = device->CreateBuffer(svDesc);
+
+            rhi::BufferDesc triDesc;
+            triDesc.size = gpuTris.size() * sizeof(GpuTri);
+            triDesc.initialData = gpuTris.data();
+            triDesc.usage = rhi::BufferUsage::Storage;
+            auto triBuf = device->CreateBuffer(triDesc);
+
+            struct GpuSwParams { uint32_t dims[4]; };
+            std::vector<uint32_t> visClear((size_t)SW * SH, vg::kSwClear);
+
+            auto makeVisBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = visClear.size() * sizeof(uint32_t);
+                d.initialData = visClear.data();        // host-uploaded kSwClear clear
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeParamBuf = [&](uint32_t tc) {
+                GpuSwParams p{}; p.dims[0] = SW; p.dims[1] = SH; p.dims[2] = tc; p.dims[3] = 0;
+                rhi::BufferDesc d; d.size = sizeof(p); d.initialData = &p;
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            auto swCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/swraster.comp.hlsl.spv");
+            auto swCs = device->CreateShaderModule({std::span<const uint32_t>(swCsWords)});
+            rhi::ComputePipelineDesc swCdesc;
+            swCdesc.compute = swCs.get();
+            swCdesc.storageBufferCount = 4;     // gScreenVerts, gTriangles, gVis, gParams
+            swCdesc.pushConstantSize = 0;
+            swCdesc.threadsPerGroupX = 64;
+            auto swCompute = device->CreateComputePipeline(swCdesc);
+
+            auto rt = device->CreateRenderTarget(SW, SH);
+
+            // Run the rasterizer for a given triangle count -> read-back gVis. tc==0 dispatches 0 groups
+            // (the disabled-path no-op) so gVis stays the cleared upload.
+            auto runRaster = [&](uint32_t tc, std::vector<uint32_t>& outVis) {
+                auto visBuf = makeVisBuf();
+                auto paramBuf = makeParamBuf(tc);
+                const uint32_t groups = (tc + 63u) / 64u;   // 0 when tc==0
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                graph.AddPass("swraster", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*swCompute);
+                        cmd.BindStorageBuffer(*svBuf, 0);
+                        cmd.BindStorageBuffer(*triBuf, 1);
+                        cmd.BindStorageBuffer(*visBuf, 2);
+                        cmd.BindStorageBuffer(*paramBuf, 3);
+                        cmd.DispatchCompute(groups);   // 0 -> no-op (gVis stays cleared)
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                graph.Execute(*device);
+                device->WaitIdle();
+                outVis.assign((size_t)SW * SH, 0u);
+                device->ReadBuffer(*visBuf, outVis.data(), outVis.size() * sizeof(uint32_t), 0);
+            };
+
+            // --- GPU dispatch #1 (the full triangle set). ---
+            std::vector<uint32_t> gpuVis;
+            runRaster(triCount, gpuVis);
+
+            uint64_t covered = 0;
+            for (uint32_t v : gpuVis) if (v != vg::kSwClear) ++covered;
+
+            // === PROOF (1) — GPU==CPU BIT-IDENTICAL full-frame (the make-or-break). ===
+            if (gpuVis.size() != cpuVis.packed.size() ||
+                std::memcmp(gpuVis.data(), cpuVis.packed.data(),
+                            cpuVis.packed.size() * sizeof(uint32_t)) != 0) {
+                // Diagnose: count + locate the first divergent pixel.
+                uint64_t mismatches = 0; size_t firstX = 0, firstY = 0; bool found = false;
+                for (size_t p = 0; p < gpuVis.size(); ++p) {
+                    if (gpuVis[p] != cpuVis.packed[p]) {
+                        ++mismatches;
+                        if (!found) { firstX = p % SW; firstY = p / SW; found = true; }
+                    }
+                }
+                std::fprintf(stderr,
+                    "FATAL: swraster-gpu GPU vis-buffer != CPU swraster.h reference (the GPU integer edge "
+                    "math diverged — int-width or fill-rule mismatch). %llu mismatched pixels, first at "
+                    "(%zu,%zu)\n", (unsigned long long)mismatches, firstX, firstY);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("swraster-gpu GPU==CPU: BIT-IDENTICAL (%ux%u, %llu covered)\n",
+                        SW, SH, (unsigned long long)covered);
+
+            // === PROOF (2) — determinism: a second dispatch is byte-identical (atomic-min commutative). ===
+            std::vector<uint32_t> gpuVis2;
+            runRaster(triCount, gpuVis2);
+            if (gpuVis.size() != gpuVis2.size() ||
+                std::memcmp(gpuVis.data(), gpuVis2.data(), gpuVis.size() * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr,
+                    "FATAL: swraster-gpu two dispatches differ (InterlockedMin not order-independent?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("swraster-gpu determinism: two dispatches BYTE-IDENTICAL\n");
+
+            // === PROOF (3) — sub-pixel coverage: the tiny triangle's straddled pixel IS covered. ===
+            {
+                uint32_t spIdx = subPixelPy * SW + subPixelPx;
+                if (gpuVis[spIdx] == vg::kSwClear) {
+                    std::fprintf(stderr,
+                        "FATAL: swraster-gpu sub-pixel triangle pixel (%u,%u) NOT covered (HW would miss, "
+                        "SW must catch)\n", subPixelPx, subPixelPy);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("swraster-gpu sub-pixel: COVERED\n");
+            }
+
+            // === PROOF (4) — disabled-path no-op: triCount=0 -> gVis byte-identical to the cleared buffer. ===
+            {
+                std::vector<uint32_t> emptyVis;
+                runRaster(0u, emptyVis);
+                if (emptyVis.size() != visClear.size() ||
+                    std::memcmp(emptyVis.data(), visClear.data(), visClear.size() * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr,
+                        "FATAL: swraster-gpu triCount=0 gVis != cleared upload (dispatch-0 not a no-op)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("swraster-gpu disabled-path (triCount=0): all-kSwClear\n");
+            }
+
+            std::printf("swraster-gpu: {tris:%u, covered:%llu}\n", triCount, (unsigned long long)covered);
+
+            // --- Golden: CPU-color the read-back GPU vis-buffer (bg->clear, else hashColor(visId>>kTriIdBits)).
+            // Identical both backends by construction (same integer SSBO -> same RGB). ---
+            vg::SwVisBuffer gpuVb; gpuVb.Init(SW, SH);
+            gpuVb.packed.assign(gpuVis.begin(), gpuVis.end());
+            std::vector<uint8_t> bgra = vg::ColorSwVisBuffer(gpuVb);
+            bool ok = WriteBMP(swrasterGpuShotPath, bgra, SW, SH);
+            if (ok) std::printf("wrote %s (%ux%u) — CPU-colored GPU software-rasterized vis-buffer "
+                                "(%u tris, %llu covered)\n",
+                                swrasterGpuShotPath, SW, SH, triCount, (unsigned long long)covered);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", swrasterGpuShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
