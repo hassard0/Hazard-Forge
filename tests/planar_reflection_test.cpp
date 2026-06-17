@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace pl = hf::render::planar;
 using hf::math::Mat4;
@@ -46,6 +47,7 @@ static Vec4 mul(const Mat4& m, const Vec4& v) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- ReflectionMatrix: reflect a point across the y==0 plane (N=(0,1,0), d=0). ----------------
     {
         const Vec3 N{0, 1, 0};

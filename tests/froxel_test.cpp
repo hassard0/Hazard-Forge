@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace froxel = hf::render::froxel;
 using hf::math::Vec3;
@@ -30,6 +31,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     froxel::FroxelGrid g;            // 16x9x64 over [0.5, 80] (the showcase grid)
     g.dimX = 16; g.dimY = 9; g.dimZ = 64; g.zNear = 0.5f; g.zFar = 80.0f;
 

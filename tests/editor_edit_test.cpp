@@ -33,6 +33,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -97,6 +98,7 @@ static std::vector<ecs::Entity> BuildScene(ecs::Registry& reg, scene::Mesh* mesh
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     auto* meshCube   = reinterpret_cast<scene::Mesh*>(0x1000);
     auto* meshSphere = reinterpret_cast<scene::Mesh*>(0x2000);
     auto* meshDuck   = reinterpret_cast<scene::Mesh*>(0x3000);

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace ae = hf::render::autoexp;
 using hf::math::Vec3;
@@ -30,6 +31,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float tol) { return std::fabs(a - b) <= tol; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // Fixed histogram params (the showcase/shader family): a log2-luminance range over [2^-8, 2^4] ==
     // [~0.0039, 16] across 256 bins. The exact range is documented in auto_exposure.h; the test relies
     // on the relations + the analytic average.

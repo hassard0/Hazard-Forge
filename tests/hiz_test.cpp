@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace hz = hf::render::hiz;
@@ -32,6 +33,7 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // =====================================================================================
     // 1) Hi-Z BUILD: a known 4x4 depth buffer -> the expected 4x4/2x2/1x1 pyramid, each coarse texel
     //    the MAX of its 2x2 children, dims halving to the 1x1 top.

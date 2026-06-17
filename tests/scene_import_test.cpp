@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using namespace hf::math;
@@ -32,6 +33,7 @@ static void xformPoint(const Mat4& w, float x, float y, float z, float out[3]) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- ComposeWorld == parent * local --------------------------------------------------------
     {
         Mat4 parent = Mat4::Translate({10.0f, 0.0f, 0.0f});

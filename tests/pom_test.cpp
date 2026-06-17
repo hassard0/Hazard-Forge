@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace pom = hf::render::pom;
 using hf::math::Vec2;
@@ -57,6 +58,7 @@ static float StepHeight(Vec2 uv) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const int kSteps = 32;
 
     // ---- ZERO HEIGHT = IDENTITY (the core equivalence proof). ----

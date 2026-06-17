@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace gd = hf::render::gpudriven;
@@ -86,6 +87,7 @@ static std::vector<gd::GpuDrivenObject> BuildScene(uint32_t cubeIndexCount, uint
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const uint32_t kCubeIdx = 36, kCubeVtx = 24, kSphereIdx = 2880;
     std::vector<rhi::ITexture*> palette;
     for (size_t i = 0; i < kPaletteSize; ++i) palette.push_back(FakeTex(i));

@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -53,6 +54,7 @@ static double AsNumber(const json_value_s* v, double fallback = 0.0) {
 static bool approx(double a, double b) { return std::fabs(a - b) < 1e-4; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- Build a known scene ---------------------------------------------------------------------
     auto* meshCube   = reinterpret_cast<scene::Mesh*>(0x1000);
     auto* meshSphere = reinterpret_cast<scene::Mesh*>(0x2000);

@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace fr = hf::render::frustum;
@@ -44,6 +45,7 @@ static bool RefPointInside(const Mat4& m, const Vec3& p) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // A known view-proj: camera at +Z=5 looking at origin (down -Z), 90deg vertical FOV, square
     // aspect, near 1, far 11. Symmetric, so the side planes are tilted at 45deg.
     const float fovY = 1.57079633f;  // 90 degrees

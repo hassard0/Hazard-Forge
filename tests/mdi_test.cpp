@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace mdi = hf::render::mdi;
@@ -67,6 +68,7 @@ static std::vector<mdi::DrawObject> BuildScene(uint32_t cubeIndexCount, uint32_t
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const uint32_t kCubeIdx = 36, kSphereIdx = 2880;  // representative, non-equal counts
     std::vector<mdi::DrawObject> objs = BuildScene(kCubeIdx, kSphereIdx);
     const uint32_t N = (uint32_t)objs.size();

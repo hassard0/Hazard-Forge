@@ -22,6 +22,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace froxel = hf::render::froxel;
 namespace csm = hf::render::csm;
@@ -34,6 +35,7 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // A fixed directional sun shadow projection: ortho fit around the origin, looking along the sun's
     // travel direction (the SAME Ortho*LookAt the --volshadows-shot / lit pass builds). Vulkan clip:
     // depth [0,1], Y-flip baked.

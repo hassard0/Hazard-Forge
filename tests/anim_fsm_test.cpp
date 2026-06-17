@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using namespace hf::anim;
@@ -67,6 +68,7 @@ static bool PalettesEqual(const std::vector<math::Mat4>& a, const std::vector<ma
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     Skeleton skel = MakeSkeleton();
     // idle: child stays near 0; walk: rotates to +0.6; run: rotates to +1.2 (radians). Distinct poses.
     std::vector<Animation> anims = {

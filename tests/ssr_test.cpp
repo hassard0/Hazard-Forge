@@ -5,6 +5,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace ssr = hf::render::ssr;
@@ -16,6 +17,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const float fovY = 1.04719755f;          // 60 deg, matches the showcase
     const float tanHalf = std::tan(0.5f * fovY);
     const float aspect = 1280.0f / 720.0f;

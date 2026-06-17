@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace grade = hf::render::grade;
 using hf::math::Vec3;
@@ -36,6 +37,7 @@ static bool approx3(const Vec3& a, const Vec3& b, float eps = 1e-5f) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const grade::GradeParams kId = grade::GradeParams::Identity();
 
     // A representative set of LDR colors (post-tonemap, nominally [0,1]).

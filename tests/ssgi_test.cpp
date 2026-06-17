@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace ssgi = hf::render::ssgi;
@@ -20,6 +21,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const int K = 16;
 
     // ---- Hemisphere kernel: all K dirs unit length + in the hemisphere of the normal. ----

@@ -5,6 +5,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace ps = hf::render::point_shadow;
@@ -20,6 +21,7 @@ static Vec3 project(const Mat4& m, const Vec3& p, float& outW) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const Vec3  P{0.0f, 0.0f, 0.0f};   // point light at origin
     const float nearZ = 0.1f;
     const float range = 30.0f;

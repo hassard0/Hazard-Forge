@@ -17,6 +17,7 @@
 #include "render/reflection_probe.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace rp = hf::render::reflprobe;
 using hf::math::Vec3;
@@ -44,6 +45,7 @@ static float angleBetween(const Vec3& a, const Vec3& b) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // A unit box centered at the origin: [-1,1]^3.
     const Vec3 bmin{-1.0f, -1.0f, -1.0f};
     const Vec3 bmax{ 1.0f,  1.0f,  1.0f};

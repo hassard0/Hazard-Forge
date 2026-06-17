@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace probegi = hf::render::probegi;
 using hf::math::Mat4;
@@ -34,6 +35,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ====================================================================================
     // FibonacciSphere
     // ====================================================================================

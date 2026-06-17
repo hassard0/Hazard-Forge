@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace cm = hf::render::cubemap;
 using hf::math::Vec2;
@@ -40,6 +41,7 @@ static Vec3 mulDir(const Mat4& m, const Vec3& d) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const Vec3 center{2.0f, -1.0f, 3.0f};   // an off-origin probe center
     const float kNear = 0.05f, kFar = 60.0f;
 

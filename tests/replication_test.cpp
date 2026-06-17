@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -39,6 +40,7 @@ static net::Snapshot MakeSample() {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- 1. Snapshot round-trip -------------------------------------------------------------------
     {
         net::Snapshot s = MakeSample();

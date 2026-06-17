@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using hf::scene::CellState;
@@ -32,6 +33,7 @@ static StreamConfig UnthrottledConfig(float loadR, float unloadR) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     using math::Vec3;
 
     // A fixed 8x8 grid centered on the origin, cells spaced 4 units apart, on the y=0 plane. This is

@@ -9,6 +9,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using runtime::Key;
@@ -23,6 +24,7 @@ static bool approxV(const math::Vec3& a, const math::Vec3& b, float eps = 1e-4f)
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ============================================================ Camera basis from yaw/pitch.
     {
         runtime::Camera cam;

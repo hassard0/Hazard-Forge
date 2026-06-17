@@ -22,6 +22,7 @@
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
+#include "platform/crash_dialogs.h"     // hf::platform::DisableCrashDialogs() -- no-op on Apple/clang
 #include "rhi/rhi.h"
 #include "rhi_metal/metal_offscreen.h"   // CreateMetalDeviceHeadless (Metal-free)
 #include "rhi_metal/metal_shader_load.h" // MakeShaderModuleFromMSL (Metal-free)
@@ -19345,6 +19346,8 @@ static int RunPlanarShowcase(const char* outPath) {
 }
 
 int main(int argc, char** argv) {
+    // Headless operability (no-op on Apple/clang; present for call-site uniformity across exes).
+    hf::platform::DisableCrashDialogs();
     @autoreleasepool {
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
         if (argc > 1 && std::strcmp(argv[1], "--clustered") == 0) {

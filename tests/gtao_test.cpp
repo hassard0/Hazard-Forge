@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace gtao = hf::render::gtao;
 using hf::math::Vec3;
@@ -30,6 +31,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const float kHalfPi = gtao::kHalfPi;
 
     // ---- IntegrateArc: the full unoccluded hemisphere integrates to 1 (the identity the proof rests

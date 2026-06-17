@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <span>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace cl = hf::render::cluster;
@@ -25,6 +26,7 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ===================== SphereAABBIntersect: inside / touching / outside =====================
     {
         Vec3 mn{-1, -1, -1}, mx{1, 1, 1};

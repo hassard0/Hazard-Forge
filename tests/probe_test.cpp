@@ -6,6 +6,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace pr = hf::render::probe;
@@ -17,6 +18,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 2e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- A direction straight along +X maps to the +X face, at the face CENTER (uv ~ 0.5,0.5). ----
     {
         int face = -1;

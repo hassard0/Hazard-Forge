@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -67,6 +68,7 @@ struct Authority {
 };
 
 int main() {
+    HF_TEST_MAIN_INIT();
     std::vector<game::GameInput> track = game::ScriptedTrack();
     const int N = (int)track.size();
 

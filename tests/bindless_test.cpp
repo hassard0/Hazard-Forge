@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace bl = hf::render::bindless;
 namespace rhi = hf::rhi;
@@ -38,6 +39,7 @@ static rhi::ITexture* FakeTex(size_t i) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     rhi::ITexture* tA = FakeTex(0);
     rhi::ITexture* tB = FakeTex(1);
     rhi::ITexture* tC = FakeTex(2);

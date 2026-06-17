@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace probegi = hf::render::probegi;
 namespace probesh = hf::render::probesh;
@@ -49,6 +50,7 @@ static std::vector<probesh::ProbeSH> MakeProbes(const probegi::ProbeGrid& grid) 
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     probegi::ProbeGrid grid;
     grid.origin = Vec3{-2.0f, 0.0f, -2.0f};
     grid.dimX = 4; grid.dimY = 3; grid.dimZ = 4; grid.spacing = 2.0f;

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using hf::runtime::DrawRange;
 using hf::runtime::PartitionDraws;
@@ -190,6 +191,7 @@ void TestRecordParallelSingleThread() {
 }  // namespace
 
 int main() {
+    HF_TEST_MAIN_INIT();
     TestEvenSplit();
     TestUnevenSplit();
     TestDegenerate();

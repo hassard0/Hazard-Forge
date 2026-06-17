@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <functional>
 #include <string>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -71,6 +72,7 @@ static material::Graph MakeShowcaseGraph() {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     using namespace material;
 
     // ============================ 1. VALIDATION ===============================================

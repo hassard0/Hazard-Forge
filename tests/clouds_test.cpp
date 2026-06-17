@@ -8,6 +8,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace clouds = hf::render::clouds;
@@ -19,6 +20,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- Noise3: deterministic + range [0,1]. ----
     {
         // Same point -> bit-identical (no RNG, pure hash).

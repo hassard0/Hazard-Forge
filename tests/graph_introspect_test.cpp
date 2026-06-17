@@ -21,6 +21,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using namespace hf::material;
@@ -103,6 +104,7 @@ static Graph BuildSmall() {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // =============================================================================================
     // STRUCTURE + DEFAULTS
     // =============================================================================================

@@ -18,6 +18,7 @@
 #include "scene/components.h"
 #include "scene/mesh.h"
 #include "scene/scene_io.h"
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using hf::math::Mat4;
@@ -30,6 +31,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- Mat4::Inverse: M * M.Inverse() == I. -------------------------------------------------
     {
         Mat4 id = Mat4::Identity();

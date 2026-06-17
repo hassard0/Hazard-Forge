@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace probecap = hf::render::probecap;
 namespace cubemap  = hf::render::cubemap;
@@ -35,6 +36,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-5f) { return std::fabs(a - b) <= eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ====================================================================================
     // CaptureFaceCount == probeCount*6; 0 at dimX/dimY/dimZ == 0
     // ====================================================================================

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace probesh = hf::render::probesh;
 using hf::math::Vec3;
@@ -47,6 +48,7 @@ static std::vector<Sample> MakeSamples(int n) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ====================================================================================
     // ProbeSH layout + SHBasis9 axis values + Y00 const + no NaN
     // ====================================================================================

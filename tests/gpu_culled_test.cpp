@@ -31,6 +31,7 @@
 #include <cstring>
 #include <random>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace fr  = hf::render::frustum;
@@ -91,6 +92,7 @@ static std::vector<gcd::CulledObject> BuildScene(uint32_t cubeIdx, uint32_t cube
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const uint32_t kCubeIdx = 36, kCubeVtx = 24, kSphIdx = 2880;
     std::vector<rhi::ITexture*> palette;
     for (size_t i = 0; i < kPalette; ++i) palette.push_back(FakeTex(i));

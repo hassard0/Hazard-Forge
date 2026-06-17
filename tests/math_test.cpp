@@ -1,6 +1,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 
@@ -11,6 +12,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // Identity * Identity == Identity
     Mat4 i = Mat4::Identity();
     Mat4 ii = i * i;

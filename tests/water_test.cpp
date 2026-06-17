@@ -6,6 +6,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace water = hf::render::water;
@@ -17,6 +18,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- Single-wave Gerstner displacement at t=0: known closed form. ----
     {
         // A +X-traveling wave at the origin (x=z=0, t=0): theta = 0 -> cos=1, sin=0.

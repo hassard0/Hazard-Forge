@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace csm = hf::render::csm;
@@ -16,6 +17,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- Split scheme: N increasing splits within (near, far], last == far. ----
     {
         const float nearZ = 0.5f, farZ = 60.0f;

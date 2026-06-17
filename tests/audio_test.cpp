@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -48,6 +49,7 @@ static audio::Voice ConstSquare(int16_t gainQ15, int16_t panQ15, int totalSample
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const int kSR = 44100;
     const int16_t kFull = 32767;     // Q15 1.0 (as close as int16 gets)
     const int16_t kCenter = 0;       // pan center

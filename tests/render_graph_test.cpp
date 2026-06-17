@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -78,6 +79,7 @@ public:
 }  // namespace
 
 int main() {
+    HF_TEST_MAIN_INIT();
     StubTarget shadowTgt, sceneTgt;
     StubDevice device;
 

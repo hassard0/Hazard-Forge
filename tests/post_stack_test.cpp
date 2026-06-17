@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace post = hf::render::post;
@@ -25,6 +26,7 @@ static bool approx3(const Vec3& a, const Vec3& b, float eps = 1e-4f) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ================= Config: LoadPostStack ==================================================
     {
         // Ordered effect list with params, order preserved.

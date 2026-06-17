@@ -16,6 +16,7 @@
 #include "render/sss.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace sss = hf::render::sss;
 using hf::math::Vec2;
@@ -33,6 +34,7 @@ static bool exactEq(const Vec3& a, const Vec3& b) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- DiffusionWeight: peaks at 0, positive, strictly decreasing, wider width spreads weight. ----
     {
         const float width = 8.0f;

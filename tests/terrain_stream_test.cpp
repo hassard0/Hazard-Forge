@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using hf::terrain::LodBands;
@@ -31,6 +32,7 @@ static void check(bool cond, const char* what) {
 static bool feq(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     using math::Vec3;
 
     // The fixed grid all tests share: 6x6 = 36 square tiles, each 16x16, centered on the origin.

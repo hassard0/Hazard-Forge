@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using hf::math::Vec3;
@@ -59,6 +60,7 @@ static vfx::EmitterConfig BareConfig() {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- Spawn rate -----------------------------------------------------------------------------
     {
         vfx::EmitterConfig c = BareConfig();

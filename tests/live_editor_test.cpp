@@ -18,6 +18,7 @@
 #include "runtime/camera.h"
 #include "runtime/hot_reload.h"
 #include "scene/transform.h"
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using hf::math::Vec3;
@@ -29,6 +30,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- (a) cursor PIXEL -> NDC -> ray hits a known world point. -----------------------------
     // Round-trips the px<->NDC mapping the live loop uses: project a world point to NDC, convert that
     // NDC to a PIXEL (inverse of PixelToNdc), feed the pixel back through PixelToNdc + the ray cast,

@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -53,6 +54,7 @@ static game::GameState RunFullTrack(physics::World& world) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const float dt = 1.0f / 120.0f;
 
     // --- 1. Determinism: two identical playthroughs are bit-identical at the end. ----------------

@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace cas = hf::render::cas;
 using hf::math::Vec3;
@@ -34,6 +35,7 @@ static bool exactEq(const Vec3& a, const Vec3& b) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- sharpness=0 IDENTITY (the byte-identical no-op proof's core). --------------------------
     {
         // A spread of neighborhoods: flat, a bright center, a dark center, a colored edge, extremes.

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using render::RgResourceState;
@@ -47,6 +48,7 @@ std::string Fmt(const render::RgBarrier& b, const render::RenderGraph& g) {
 }  // namespace
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- Canonical shadow -> scene -> post frame -------------------------------------------------
     // shadow writes shadowMap (DepthWrite); scene reads shadowMap (must be ShaderRead) + writes
     // sceneColor (ColorTarget); post reads sceneColor (must be ShaderRead) + writes swapchain

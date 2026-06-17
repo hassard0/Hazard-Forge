@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace contact = hf::render::contact;
 using hf::math::Vec3;
@@ -28,6 +29,7 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // Shared projection params (a typical 60-deg-fovY 16:9 view; Vulkan yFlip = -1).
     const float kTanHalfFovY = std::tan(0.5f * 1.04719755f);
     const float kAspect = 1280.0f / 720.0f;

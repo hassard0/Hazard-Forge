@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -91,6 +92,7 @@ static void WriteFile(const std::string& path, const char* contents) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     using namespace material;
 
     const std::string matPath = TempPath("a.mat.json");

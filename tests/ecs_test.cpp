@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <set>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::ecs;
 
@@ -17,6 +18,7 @@ struct Velocity { float dx, dy, dz; };
 struct Tag { int id; };
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- Entity create / valid / destroy ------------------------------------
     {
         Registry r;

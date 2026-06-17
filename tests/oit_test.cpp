@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace oit = hf::render::oit;
 using hf::math::Vec3;
@@ -56,6 +57,7 @@ static Vec3 AccumulateAndResolve(const std::vector<Frag>& frags, const std::vect
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- Weight: positive + finite for all inputs. ----
     {
         const float depths[] = {-5.0f, 0.0f, 0.001f, 1.0f, 10.0f, 90.0f, 500.0f, 5000.0f};

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -34,6 +35,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-5f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- Build a known scene: cube #0, sphere #1, duck #2 (view order = creation order). ----------
     auto* meshCube   = reinterpret_cast<scene::Mesh*>(0x1000);
     auto* meshSphere = reinterpret_cast<scene::Mesh*>(0x2000);

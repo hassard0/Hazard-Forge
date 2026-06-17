@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace cl = hf::render::clustered;
@@ -17,6 +18,7 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // A standard perspective camera: 60deg fovY, 16:9, znear 0.1, zfar 80.
     const float fovY = 1.0471975512f;  // 60 deg
     const float W = 1280.0f, H = 720.0f;

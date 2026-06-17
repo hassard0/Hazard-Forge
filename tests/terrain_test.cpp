@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -58,6 +59,7 @@ float Height(float x, float z) {
 }  // namespace ref
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- 1. Height determinism: same input -> same output, every call. ---------------------------
     {
         float a = terrain::Height(3.1f, -2.4f);

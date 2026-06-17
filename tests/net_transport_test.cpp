@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -51,6 +52,7 @@ static float PosError(const net::Snapshot& a, const net::Snapshot& truth) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     using net::ChannelConfig;
     using net::SimChannel;
     using net::ClientView;

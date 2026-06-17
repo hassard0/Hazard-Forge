@@ -3,8 +3,10 @@
 #include "rhi/rhi_factory.h"
 #include <cstdint>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 int main() {
+    HF_TEST_MAIN_INIT();
     using namespace hf;
     try {
         hal::Window window({"hf-smoke", 64, 64});

@@ -6,6 +6,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace decal = hf::render::decal;
@@ -17,6 +18,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-3f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- BuildDecalTransform + WorldToDecalLocal round-trip (axis-aligned box). ----
     {
         Vec3 center{2.0f, 0.0f, -1.5f};

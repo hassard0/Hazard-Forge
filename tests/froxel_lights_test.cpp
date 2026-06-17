@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <span>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace froxel = hf::render::froxel;
 namespace cluster = hf::render::cluster;
@@ -37,6 +38,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) <= eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const float kG = 0.76f;            // the showcase HG anisotropy
     const Mat4 view = Mat4::Identity();  // identity view -> world == view space, so the math is clear
 

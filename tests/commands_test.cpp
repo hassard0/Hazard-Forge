@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -41,6 +42,7 @@ static int Count(ecs::Registry& reg) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     auto* meshCube   = reinterpret_cast<scene::Mesh*>(0x1000);
     auto* meshSphere = reinterpret_cast<scene::Mesh*>(0x2000);
     auto* texChecker = reinterpret_cast<rhi::ITexture*>(0x3000);

@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <random>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace fr = hf::render::frustum;
@@ -44,6 +45,7 @@ static std::vector<float> FlattenGrid(const std::vector<hf::scene::InstanceData>
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- A unit-cube local bound (matches the showcase grid of unit cubes). The unit cube spans
     // [-0.5,0.5]^3, so localCenter = origin and localRadius = |(0.5,0.5,0.5)| = sqrt(0.75). ----
     const Vec3 localCenter{0.0f, 0.0f, 0.0f};

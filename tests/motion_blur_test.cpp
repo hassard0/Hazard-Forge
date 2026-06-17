@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace mb = hf::render::motionblur;
 using hf::math::Mat4;
@@ -31,6 +32,7 @@ static bool finite2(const Vec2& v) { return std::isfinite(v.x) && std::isfinite(
 static float len2(const Vec2& v) { return std::sqrt(v.x * v.x + v.y * v.y); }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const int W = 1280, H = 720;
     const float aspect = (float)W / (float)H;
     const float fovY = 1.04719755f;  // 60 deg

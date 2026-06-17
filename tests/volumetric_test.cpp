@@ -6,6 +6,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace vol = hf::render::volumetric;
@@ -17,6 +18,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // ---- HG: at g=0 the phase is isotropic = 1/(4*pi) for every angle. ----
     {
         const float iso = 1.0f / (4.0f * vol::kPi);

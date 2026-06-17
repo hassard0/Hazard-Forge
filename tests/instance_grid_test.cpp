@@ -6,6 +6,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -16,6 +17,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b, float eps = 1e-4f) { return std::fabs(a - b) < eps; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- Instance transform layout: mat4 as 4x RGBA32_Float at locations 7-10, stride 64. ---
     rhi::VertexLayout il = scene::InstanceTransformLayout();
     check(il.stride == 64, "instance stride == 64");

@@ -19,6 +19,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 
+#include "platform/crash_dialogs.h"     // hf::platform::DisableCrashDialogs() -- no-op on Apple/clang
 #include "rhi/rhi.h"
 #include "rhi_metal/metal_windowed.h"   // CreateMetalDeviceWindowedLayer (Metal-free)
 #include "rhi_metal/metal_shader_load.h" // MakeShaderModuleFromMSL (Metal-free)
@@ -488,6 +489,8 @@ static runtime::Key MapKeyCode(unsigned short kc) {
 @end
 
 int main(int /*argc*/, const char** /*argv*/) {
+    // Headless operability (no-op on Apple/clang; present for call-site uniformity across exes).
+    hf::platform::DisableCrashDialogs();
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];

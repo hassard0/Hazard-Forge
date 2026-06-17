@@ -5,6 +5,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace spot = hf::render::spot;
@@ -21,6 +22,7 @@ static Vec3 project(const Mat4& m, const Vec3& p, float& outW) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // Spot mounted at (0,10,0) aiming straight down -Y, 20deg outer half-angle.
     const Vec3  pos{0.0f, 10.0f, 0.0f};
     const Vec3  dir{0.0f, -1.0f, 0.0f};

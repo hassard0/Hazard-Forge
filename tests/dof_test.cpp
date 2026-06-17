@@ -14,6 +14,7 @@
 #include "render/dof.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 namespace dof = hf::render::dof;
 
@@ -24,6 +25,7 @@ static void check(bool cond, const char* what) {
 static bool finite(float x) { return std::isfinite(x); }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // Fixed lens params (matching the showcase family): focal distance 6 view-units, an f-stop-ish
     // aperture, a 50mm-ish focal length expressed in the same view units the CoC formula uses, and a
     // max CoC of 16 px. The exact units are documented in dof.h; the test only relies on the relations.

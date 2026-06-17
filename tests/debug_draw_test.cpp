@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 using debug::DebugDraw;
@@ -22,6 +23,7 @@ static void check(bool cond, const char* what) {
 static bool feq(float a, float b) { return std::fabs(a - b) < 1e-5f; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- 1. A single Line = 1 segment = 2 vertices; endpoints match the inputs, color carried. ---
     {
         DebugDraw dd;

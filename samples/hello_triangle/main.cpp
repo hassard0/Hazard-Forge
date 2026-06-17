@@ -1,4 +1,5 @@
 #include "hal/window.h"
+#include "platform/crash_dialogs.h"  // hf::platform::DisableCrashDialogs() -- headless dialog suppression
 #include "rhi/rhi.h"
 #include "rhi/rhi_factory.h"
 #include "math/math.h"
@@ -87,6 +88,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -300,6 +302,18 @@ struct HudOverlay {
 
 int main(int argc, char** argv) {
     using namespace hf;
+
+    // Headless operability: route a tripped assert/abort/fault to stderr + non-zero exit instead of a
+    // MODAL Windows dialog that would block a background agent. No-op on success and off Windows/MSVC.
+    hf::platform::DisableCrashDialogs();
+
+    // --selftest-assert: throwaway proof that DisableCrashDialogs() routes a tripped CRT assert to
+    // stderr + a non-zero exit with NO modal dialog (the process returns immediately, doesn't block).
+    // Guarded so it is never a permanent failing test; not part of any golden/showcase/ctest path.
+    if (argc > 1 && std::strcmp(argv[1], "--selftest-assert") == 0) {
+        assert(false && "hf selftest: deliberate assert after DisableCrashDialogs()");
+        return 0;  // unreached when NDEBUG is off; present so the build is warning-clean either way.
+    }
 
     // --shot <path>: render one frame headless, write a BMP, and exit (no present loop).
     // --dump-scene: load the scene from data, print DumpScene(...) JSON to stdout, exit 0 (headless,

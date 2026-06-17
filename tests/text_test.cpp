@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -25,6 +26,7 @@ static void check(bool cond, const char* what) {
 static bool approx(float a, float b) { return std::fabs(a - b) < 1e-4f; }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // --- Atlas determinism + shape --------------------------------------------------------------
     std::vector<uint8_t> a(static_cast<size_t>(ui::kAtlasW) * ui::kAtlasH * 4, 0xAB);
     std::vector<uint8_t> b(static_cast<size_t>(ui::kAtlasW) * ui::kAtlasH * 4, 0xCD);

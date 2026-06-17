@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf::math;
 namespace ssgi = hf::render::ssgi;
@@ -31,6 +32,7 @@ static float Variance(const std::vector<float>& v) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const float spatialSigma = 2.0f;
     const float depthSigma   = 0.5f;
     const float normalPower  = 16.0f;

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <fstream>
 #include <string>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -24,6 +25,7 @@ static bool approx3(const math::Vec3& a, const math::Vec3& b) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     // Dummy resources: distinct non-null pointers used purely as identities. scene_io never
     // dereferences these — it maps pointer <-> name. We register a few named meshes/textures.
     auto* meshCube   = reinterpret_cast<scene::Mesh*>(0x1000);

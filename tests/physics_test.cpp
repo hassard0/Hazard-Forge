@@ -5,6 +5,7 @@
 #include "math/math.h"
 #include <cmath>
 #include <cstdio>
+#include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
 using namespace hf;
 
@@ -14,6 +15,7 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    HF_TEST_MAIN_INIT();
     const float dt = 1.0f / 120.0f;
 
     // --- 1. A sphere dropped from height falls under gravity, rests at y ~= radius, and STAYS. ---
