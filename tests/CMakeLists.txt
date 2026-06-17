@@ -588,6 +588,15 @@ hf_add_pure_test(swraster_test)
 # set, and determinism. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(vsm_test)
 
+# Runtime Virtual Texturing Slice 1 (Slice VT1): the VT mip page-table + page-needed FEEDBACK/MARKING
+# math (render/vt.h) the GPU shaders/vt_feedback.comp.hlsl copies verbatim. Pins pagesPerSide/
+# mipPageOffset (the PREFIX-SUM, NOT mip*vpps² — the VT-vs-VSM crux), PageId/UnpackPageId bijection over
+# [0,pageCount()), SelectMipLevel's INTEGER threshold-ladder edges (the 2^m boundaries — the GPU==CPU
+# DETERMINISM CRUX, no transcendental), VtPageId corners (0/just<1/mid/clamp), MarkFeedbackPages known
+# set (count+membership, duplicate-safe), feedbackEnabled-off->empty set, and determinism. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(vt_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)
