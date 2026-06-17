@@ -3045,6 +3045,256 @@ static int RunTerrainShowcase(const char* outPath) {
     return 0;
 }
 
+// --- GPU Isosurface Meshing RENDER showcase (Slice MC5, the MC arc CAPSTONE). Mirrors the Vulkan
+// --mc-render-shot path EXACTLY: the SAME MC1-MC4 sphere field (render/mc.h::MakeSphereField, 33³
+// corners, radius 12, iso 0) is meshed on the CPU by render/mc.h::MarchCellsInterp (the PROVEN bit-exact
+// fixed-point mesh — byte-identical to the Windows build), converted by render/mc.h::BuildRenderMesh
+// (position = vert/kSub, flat per-face normals) into the existing lit pipeline's scene::Vertex format,
+// and rendered lit + shadowed from the SAME fixed 3/4 camera + directional light through the EXISTING
+// lit mesh pipeline (lit.vert + lit.frag, scene::MeshVertexLayout, FrameData UBO, sky + static-shadow +
+// post) — no new shader / RHI. Identical scene/camera/light to the Vulkan path so the only difference
+// vs the BMP is backend NDC handling (FlipProjY). One offscreen frame -> PNG (new golden mc_render.png,
+// the MC arc's FIRST FLOAT golden — the visresolve bar: Metal-baked, determinism + provenance/coverage
+// proof). The mesh build (render/mc.h, hf_core) is shared byte-for-byte with the Vulkan build. ---------
+static int RunMcRenderShowcase(const char* outPath) {
+    namespace mc = render::mc;
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // 1) The SAME MC1-MC4 sphere field -> the PROVEN bit-exact interpolated mesh (CPU, IDENTICAL params
+    // to the Vulkan --mc-render-shot).
+    const int kN = 33;
+    const int kRadius = 12;
+    const int32_t kIso = 0;
+    mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+    std::vector<mc::McVertex> mcVerts; std::vector<uint32_t> mcIdx; uint32_t mcTriCount = 0u;
+    mc::MarchCellsInterp(field, kIso, mcVerts, mcIdx, mcTriCount);
+
+    // PROOF (1) provenance: the render consumes EXACTLY MarchCellsInterp's mesh.
+    const uint32_t kVertCount = (uint32_t)mcVerts.size();
+    const uint32_t kIndexCount = (uint32_t)mcIdx.size();
+    if (kVertCount != mcTriCount * 3u || kIndexCount != mcTriCount * 3u)
+        return fail("mc-render mesh size != 3*tris (provenance broken)");
+    std::printf("mc-render mesh: {tris:%u, verts:%u} (MC4 bit-exact mesh)\n", mcTriCount, kVertCount);
+
+    // 2) BuildRenderMesh -> scene::Vertex (the lit layout). Same conversion + constants as Vulkan.
+    const float kTargetExtent = 6.0f;
+    std::vector<mc::RenderVertex> rv;
+    mc::BuildRenderMesh(std::span<const mc::McVertex>(mcVerts), kTargetExtent, rv);
+    std::vector<scene::Vertex> sceneVerts(rv.size());
+    for (size_t i = 0; i < rv.size(); ++i) {
+        scene::Vertex& v = sceneVerts[i];
+        v.pos[0] = rv[i].px; v.pos[1] = rv[i].py; v.pos[2] = rv[i].pz;
+        v.color[0] = 0.72f; v.color[1] = 0.74f; v.color[2] = 0.80f;
+        v.uv[0] = 0.5f; v.uv[1] = 0.5f;
+        v.normal[0] = rv[i].nx; v.normal[1] = rv[i].ny; v.normal[2] = rv[i].nz;
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+    }
+
+    rhi::BufferDesc mvb;
+    mvb.size = (uint64_t)sceneVerts.size() * sizeof(scene::Vertex);
+    mvb.initialData = sceneVerts.data();
+    mvb.usage = rhi::BufferUsage::Vertex;
+    auto mcVB = device->CreateBuffer(mvb);
+    rhi::BufferDesc mib;
+    mib.size = (uint64_t)mcIdx.size() * sizeof(uint32_t);
+    mib.initialData = mcIdx.data();
+    mib.usage = rhi::BufferUsage::Index;
+    auto mcIB = device->CreateBuffer(mib);
+    scene::Mesh mcMesh{std::move(mcVB), std::move(mcIB), kIndexCount};
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    Mat4 meshModel = Mat4::Identity();
+
+    const Vec3 eye{6.5f, 5.0f, 6.5f};
+    const Vec3 center{0.0f, 0.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 12.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 28.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(meshModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(mcMesh.vertices());
+                cmd.BindIndexBuffer(mcMesh.indices());
+                cmd.DrawIndexed(mcMesh.indexCount());
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = meshModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*whiteTex, *flatNormal);
+                    cmd.BindVertexBuffer(mcMesh.vertices());
+                    cmd.BindIndexBuffer(mcMesh.indices());
+                    cmd.DrawIndexed(mcMesh.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        return device->GetCapturedPixels(outBGRA, outW, outH);
+    };
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!renderOnce(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (2) determinism: a second render is BYTE-IDENTICAL.
+    {
+        std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+        if (!renderOnce(bgra2, cw2, ch2) || bgra2.size() != bgra.size() ||
+            std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+            return fail("mc-render two renders differ (nondeterministic)");
+        std::printf("mc-render determinism: two renders BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage: the lit sphere covers a COHERENT shaded disk (off-background, non-uniform).
+    uint32_t shaded = 0;
+    {
+        const uint8_t bgB = bgra[0], bgG = bgra[1], bgR = bgra[2];
+        uint8_t minL = 255, maxL = 0;
+        for (size_t p = 0; p + 3 < bgra.size(); p += 4) {
+            const uint8_t b = bgra[p + 0], g = bgra[p + 1], r = bgra[p + 2];
+            const int db = (int)b - bgB, dg = (int)g - bgG, dr = (int)r - bgR;
+            if (db*db + dg*dg + dr*dr > 64) {
+                ++shaded;
+                const uint8_t lum = (uint8_t)(((int)r * 54 + (int)g * 183 + (int)b * 19) >> 8);
+                if (lum < minL) minL = lum;
+                if (lum > maxL) maxL = lum;
+            }
+        }
+        if (shaded < 1000 || (maxL - minL) < 16)
+            return fail("mc-render coverage weak — not a lit disk");
+        std::printf("mc-render coverage: %u shaded (coherent lit disk)\n", shaded);
+    }
+
+    // PROOF (4) empty-field no-op.
+    {
+        const int32_t kIsoEmpty = 1 << 20;
+        std::vector<mc::McVertex> ev; std::vector<uint32_t> ei; uint32_t et = 0u;
+        mc::MarchCellsInterp(field, kIsoEmpty, ev, ei, et);
+        if (et != 0u || !ev.empty()) return fail("mc-render empty-field expected 0 tris");
+        std::printf("mc-render empty-field: background (no-op)\n");
+    }
+
+    // PROOF (5) the {stats} line.
+    std::printf("mc-render: {tris:%u, shaded:%u} (voxel field -> GPU-meshed -> lit render)\n",
+                mcTriCount, shaded);
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — lit extracted MC sphere (%u tris, %u verts)\n",
+                outPath, cw, ch, mcTriCount, kVertCount);
+    return 0;
+}
+
 // --- Playable game sample (Slice AX). Mirrors the Vulkan --game-shot path EXACTLY: build the
 // deterministic roll-a-ball game (game::MakeRollGame: ground + dynamic player sphere + 3 fixed
 // pickups), run game::StepGame over the FULL game::ScriptedTrack() at the engine fixed dt (the
@@ -26538,6 +26788,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mc-interp") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mc_interp.png";
             try { return RunMcInterpShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mc-render <out.png>: render the GPU Isosurface Meshing RENDER showcase (Slice MC5, the MC arc
+        // CAPSTONE). The SAME MC1-MC4 sphere field -> render/mc.h::MarchCellsInterp (the PROVEN bit-exact
+        // fixed-point mesh) -> render/mc.h::BuildRenderMesh (position=vert/kSub + flat per-face normals) ->
+        // the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO, sky +
+        // static-shadow + post) -> a lit 3D extracted-sphere frame. Mirrors the Vulkan --mc-render-shot
+        // path; the MC arc's FIRST FLOAT golden tests/golden/metal/mc_render.png (the visresolve bar:
+        // Metal-baked + determinism + provenance/coverage). NO new RHI / shader; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--mc-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mc_render.png";
+            try { return RunMcRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vt-alloc <out.png>: render the Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION +
