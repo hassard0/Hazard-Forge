@@ -447,6 +447,7 @@ int main(int argc, char** argv) {
     const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
     const char* mcInterpShotPath = nullptr; // --mc-interp-shot <out.bmp> (Slice MC4: GPU Isosurface Meshing FIXED-POINT INTERPOLATED vertex placement — mc_emit with EdgeInterp instead of EdgeMidpoint (the vertex on the ACTUAL isosurface crossing, t=((iso-s0)*kSub)/(s1-s0) on the 1/kSub=256 lattice, the same truncating integer divide both sides -> bit-exact GPU==CPU + cross-backend), reuses mc_scan UNCHANGED, GPU==CPU mesh bit-exact, a SMOOTHER 2D mesh-projection debug-viz than mc-emit)
     const char* mcRenderShotPath = nullptr; // --mc-render-shot <out.bmp> (Slice MC5: GPU Isosurface Meshing RENDER — MarchCellsInterp's bit-exact fixed-point mesh -> BuildRenderMesh (position=vert/kSub + flat per-face normals) -> the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO) -> a lit 3D extracted-sphere render. The MC arc's FIRST FLOAT slice: the golden is the visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof), NOT the integer zero-diff bar. NO new RHI / shader)
+    const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1518,6 +1519,16 @@ int main(int argc, char** argv) {
             // visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof),
             // NOT MC1-MC4's integer zero-diff. NO new RHI / shader. One BMP -> exit.
             mcRenderShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--mc-normals-shot") == 0 && i + 1 < argc) {
+            // Slice MC6 (the 6th and FINAL MC slice): GPU Isosurface Meshing SMOOTH FIELD-GRADIENT
+            // NORMALS. IDENTICAL to MC5's --mc-render-shot (the SAME MC1-MC4 sphere field, the same
+            // MarchCellsInterp bit-exact mesh, the same fixed camera + light + lit pipeline), EXCEPT the
+            // per-vertex normal is BuildSmoothRenderMesh's OUTWARD field-gradient normal (-∇f via central
+            // differences) instead of MC5's flat per-face normal -> the sphere shades SMOOTH (Gouraud),
+            // no facets. Positions + indices are byte-identical to MC5 (the MC4 bit-exact mesh —
+            // provenance unchanged). The FLOAT visresolve bar (Metal-baked golden + determinism +
+            // provenance). NO new RHI / shader. One BMP -> exit.
+            mcNormalsShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -15416,6 +15427,315 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — lit extracted MC sphere (%u tris, %u verts)\n",
                                 mcRenderShotPath, cw, ch2, mcTriCount, kVertCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS (--mc-normals-shot <out.bmp>, Slice MC6,
+        // the 6th and FINAL MC slice). IDENTICAL to MC5's --mc-render-shot (the SAME MC1-MC4 sphere field,
+        // the same MarchCellsInterp bit-exact mesh, the same fixed 3/4 camera + directional light + lit
+        // pipeline + sky/static-shadow/post), EXCEPT the per-vertex normal comes from BuildSmoothRenderMesh
+        // (the OUTWARD field-gradient normal -∇f at each vertex's grid position, via central differences)
+        // instead of MC5's flat per-face normal -> the extracted sphere shades SMOOTH (Gouraud), no facets.
+        // Positions + indices are byte-identical to MC5 (the MC4 bit-exact mesh — provenance unchanged); the
+        // golden is the FLOAT visresolve bar (Metal-baked, determinism + provenance). NO new shader / RHI.
+        // One frame -> BMP -> exit. ----------------------------------------------------------------------
+        if (mcNormalsShotPath) {
+            namespace mc = hf::render::mc;
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // 1) The SAME MC1-MC4 sphere field -> the PROVEN bit-exact interpolated mesh (CPU). IDENTICAL
+            // params to --mc-render-shot.
+            const int kN = 33;
+            const int kRadius = 12;
+            const int32_t kIso = 0;
+            mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+            std::vector<mc::McVertex> mcVerts; std::vector<uint32_t> mcIdx; uint32_t mcTriCount = 0u;
+            mc::MarchCellsInterp(field, kIso, mcVerts, mcIdx, mcTriCount);
+
+            // PROOF (1) provenance: the render consumes EXACTLY MarchCellsInterp's mesh (verts == 3*tris);
+            // positions + indices are the MC4 bit-exact mesh — only the gradient normals are new.
+            const uint32_t kVertCount = (uint32_t)mcVerts.size();
+            const uint32_t kIndexCount = (uint32_t)mcIdx.size();
+            if (kVertCount != mcTriCount * 3u || kIndexCount != mcTriCount * 3u) {
+                std::fprintf(stderr, "FATAL: mc-normals mesh size != 3*tris (provenance broken)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mc-normals mesh: {tris:%u, verts:%u} (MC4 bit-exact mesh, gradient normals)\n",
+                        mcTriCount, kVertCount);
+
+            // 2) BuildSmoothRenderMesh: fixed-point mesh -> world float positions (IDENTICAL to MC5) +
+            // per-vertex OUTWARD field-gradient normals (the smooth refinement). Also build the MC5 FLAT
+            // normals for the smoother-than-flat proof. Copy the smooth verts into scene::Vertex.
+            const float kTargetExtent = 6.0f;
+            std::vector<mc::RenderVertex> rv;
+            mc::BuildSmoothRenderMesh(std::span<const mc::McVertex>(mcVerts), field, kTargetExtent, rv);
+            std::vector<mc::RenderVertex> flatRv;
+            mc::BuildRenderMesh(std::span<const mc::McVertex>(mcVerts), kTargetExtent, flatRv);
+
+            // PROOF (3a) gradient-normal correctness + smoother-than-flat: count unit-length + outward
+            // (dot(N, vertexPos) > 0 after centering) normals, and confirm the smooth normal SET DIFFERS
+            // from the flat one (the refinement took effect). Computed on the host floats fed to the GPU.
+            uint32_t unitN = 0, outwardN = 0;
+            bool smootherThanFlat = false;
+            {
+                for (size_t i = 0; i < rv.size(); ++i) {
+                    const auto& v = rv[i];
+                    const float len = std::sqrt(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
+                    if (std::abs(len - 1.0f) <= 1e-3f) ++unitN;
+                    if (len > 1e-6f && (v.px*v.nx + v.py*v.ny + v.pz*v.nz) > 0.0f) ++outwardN;
+                    if (!smootherThanFlat && i < flatRv.size() &&
+                        std::memcmp(&v.nx, &flatRv[i].nx, sizeof(float) * 3) != 0)
+                        smootherThanFlat = true;
+                }
+                // The vast majority of verts must be unit-length + outward, and the smooth set must differ
+                // from the flat set (else the gradient normals are not actually applied).
+                if (unitN * 10 < (uint32_t)rv.size() * 9 || outwardN * 10 < (uint32_t)rv.size() * 9 ||
+                    !smootherThanFlat) {
+                    std::fprintf(stderr,
+                        "FATAL: mc-normals gradient-normal correctness failed (unit:%u/%zu outward:%u/%zu "
+                        "smoother:%d)\n", unitN, rv.size(), outwardN, rv.size(), (int)smootherThanFlat);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-normals: {unit:%u/%zu, outward:%u/%zu, smoother-than-flat: yes}\n",
+                            unitN, rv.size(), outwardN, rv.size());
+            }
+
+            std::vector<scene::Vertex> sceneVerts(rv.size());
+            for (size_t i = 0; i < rv.size(); ++i) {
+                scene::Vertex& v = sceneVerts[i];
+                v.pos[0] = rv[i].px; v.pos[1] = rv[i].py; v.pos[2] = rv[i].pz;
+                v.color[0] = 0.72f; v.color[1] = 0.74f; v.color[2] = 0.80f;
+                v.uv[0] = 0.5f; v.uv[1] = 0.5f;
+                v.normal[0] = rv[i].nx; v.normal[1] = rv[i].ny; v.normal[2] = rv[i].nz;
+                v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+            }
+
+            // Upload the MC mesh vertex/index buffers + wrap in a scene::Mesh (the SAME vertex layout as
+            // the static lit pipeline — no new RHI). idx is MarchCellsInterp's verbatim identity soup.
+            rhi::BufferDesc mvb;
+            mvb.size = (uint64_t)sceneVerts.size() * sizeof(scene::Vertex);
+            mvb.initialData = sceneVerts.data();
+            mvb.usage = rhi::BufferUsage::Vertex;
+            auto mcVB = device->CreateBuffer(mvb);
+            rhi::BufferDesc mib;
+            mib.size = (uint64_t)mcIdx.size() * sizeof(uint32_t);
+            mib.initialData = mcIdx.data();
+            mib.usage = rhi::BufferUsage::Index;
+            auto mcIB = device->CreateBuffer(mib);
+            scene::Mesh mcMesh{std::move(mcVB), std::move(mcIB), kIndexCount};
+
+            // Static lit pipeline (lit.vert + shared lit.frag) — REUSED VERBATIM from --mc-render-shot.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Static depth-only shadow pipeline (the MC sphere caster).
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // Sky + post (REUSED — the deterministic background + tonemap).
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            Mat4 meshModel = Mat4::Identity();  // BuildSmoothRenderMesh already centered the sphere.
+
+            // Fixed 3/4 camera framing the ~6-unit sphere centered at the origin — IDENTICAL to MC5.
+            const Vec3 eye{6.5f, 5.0f, 6.5f};
+            const Vec3 center{0.0f, 0.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-5.0f, 5.0f, -5.0f, 5.0f, 1.0f, 28.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(meshModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(mcMesh.vertices());
+                        cmd.BindIndexBuffer(mcMesh.indices());
+                        cmd.DrawIndexed(mcMesh.indexCount());
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = meshModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;  // dielectric, rough
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*whiteTex, *flatNormal);
+                            cmd.BindVertexBuffer(mcMesh.vertices());
+                            cmd.BindIndexBuffer(mcMesh.indices());
+                            cmd.DrawIndexed(mcMesh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                return device->GetCapturedPixels(outBGRA, outW, outH);
+            };
+
+            // === Render #1 (the golden frame) ===
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!renderOnce(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: mc-normals no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF (2) determinism: a second render is BYTE-IDENTICAL.
+            {
+                std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+                if (!renderOnce(px2, cw2, ch3) || px2.size() != px.size() ||
+                    std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                    std::fprintf(stderr, "FATAL: mc-normals two renders differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-normals determinism: two renders BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (5 prep) coverage / shaded-pixel count (the lit smooth sphere): pixels off the cleared
+            // sky background (top-left corner is pure background), with a real lit luminance gradient.
+            uint32_t shaded = 0;
+            {
+                const uint8_t bgB = px[0], bgG = px[1], bgR = px[2];  // top-left = sky background
+                uint8_t minL = 255, maxL = 0;
+                for (size_t p = 0; p + 3 < px.size(); p += 4) {
+                    const uint8_t b = px[p + 0], g = px[p + 1], r = px[p + 2];
+                    const int db = (int)b - bgB, dg = (int)g - bgG, dr = (int)r - bgR;
+                    if (db*db + dg*dg + dr*dr > 64) {  // clearly off the background
+                        ++shaded;
+                        const uint8_t lum = (uint8_t)(((int)r * 54 + (int)g * 183 + (int)b * 19) >> 8);
+                        if (lum < minL) minL = lum;
+                        if (lum > maxL) maxL = lum;
+                    }
+                }
+                if (shaded < 1000 || (maxL - minL) < 16) {
+                    std::fprintf(stderr,
+                        "FATAL: mc-normals coverage weak (shaded=%u, lumRange=%d) — not a lit disk\n",
+                        shaded, (int)maxL - (int)minL);
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            // PROOF (4) empty-field no-op: an iso ABOVE the field max -> 0 triangles -> nothing meshed ->
+            // the cleared background.
+            {
+                const int32_t kIsoEmpty = 1 << 20;  // far above any sphere scalar -> all-out, 0 tris
+                std::vector<mc::McVertex> ev; std::vector<uint32_t> ei; uint32_t et = 0u;
+                mc::MarchCellsInterp(field, kIsoEmpty, ev, ei, et);
+                if (et != 0u || !ev.empty()) {
+                    std::fprintf(stderr, "FATAL: mc-normals empty-field expected 0 tris, got %u\n", et);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-normals empty-field: background (no-op)\n");
+            }
+
+            // PROOF (5) the {stats} line.
+            std::printf("mc-normals: {tris:%u, shaded:%u} (smooth field-gradient normals)\n",
+                        mcTriCount, shaded);
+
+            bool ok = WriteBMP(mcNormalsShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — smooth-shaded MC sphere (%u tris, %u verts)\n",
+                                mcNormalsShotPath, cw, ch2, mcTriCount, kVertCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcNormalsShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
