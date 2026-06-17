@@ -82,6 +82,7 @@
 #include "render/cluster_cull.h"    // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/cluster_lod.h"     // Slice DV: discrete cluster-LOD selection CPU mirror (BuildLodMeshes/SelectLod, squared form)
 #include "render/visbuffer.h"       // Slice DW: visibility-buffer ID packing + CPU coverage reference (PackVisId/UnpackVisId/InstanceInteriorSamples)
+#include "render/visresolve.h"      // Slice DX: deferred material resolve CPU mirror (ResolveMaterial/DefaultResolveMaterial/ResolveSkyColor/ResolvePixel/EncodeBGRA8) — shared verbatim with --visresolve-shot (Vulkan)
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
