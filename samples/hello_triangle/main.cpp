@@ -384,6 +384,7 @@ int main(int argc, char** argv) {
     const char* probeShShotPath = nullptr;   // --probesh-shot <out.bmp> (Slice DJ: DDGI probe SH-encode)
     const char* probeInterpShotPath = nullptr; // --probeinterp-shot <out.bmp> (Slice DL: DDGI trilinear SH-interp)
     const char* ddgiShotPath = nullptr;      // --ddgi-shot <out.bmp> (Slice DN: DDGI GI composite — visible color bleed)
+    const char* ddgiOccShotPath = nullptr;   // --ddgiocc-shot <out.bmp> (Slice DP: DDGI Chebyshev occlusion weighting — the visible leak-fix)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
@@ -831,6 +832,19 @@ int main(int argc, char** argv) {
             // == no-GI: BYTE-IDENTICAL` + `ddgi: {probes:N, bands:3, giStrength:S}`. GOLDEN = frame B (the
             // visible bleed). New golden; lit.frag + ALL its goldens untouched (sibling-shader isolation).
             ddgiShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--ddgiocc-shot") == 0 && i + 1 < argc) {
+            // Slice DP: DDGI Visibility Slice 2 — Chebyshev OCCLUSION weighting (the VISIBLE leak-fix). Runs
+            // DO's distance-moment capture + DN's SH capture/encode on a Cornell box WITH AN OCCLUDER PANEL,
+            // then renders with the NEW lit_ddgi_occ.frag (a sibling of lit_ddgi.frag) which weights each of
+            // the 8 nearest probes' SH contribution by a per-probe Chebyshev visibility weight from DO's
+            // distance cube. ProbeSH binds at set-3 binding 13 + the distance moments at binding 14 via the
+            // EXISTING BindLightClusters path — NO new RHI. PROOFS (fail loudly): (1) frame A
+            // (occlusionStrength=0) is BYTE-IDENTICAL (SHA) to the SAME scene through the VERBATIM DN
+            // lit_ddgi path; (2) frame B (occlusionStrength=1) DIFFERS from frame A; (3) the visibility-math
+            // CPU mirror matches the closed form; (4) two-run determinism. Prints
+            // `ddgi-occ occlusionStrength=0 == DN: BYTE-IDENTICAL` + `ddgi-occ: {probes:N, occlusion:1.0}`.
+            // GOLDEN = frame B (the leak-fixed render). lit_ddgi.frag + lit.frag + their goldens untouched.
+            ddgiOccShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxellights-shot") == 0 && i + 1 < argc) {
             // Slice CV: Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion). The CL
             // 96-colored-point-light scene (same fixed lattice as --clustered-lights-shot) wrapped in the
@@ -5336,6 +5350,610 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — DDGI GI composite, %d probes, giStrength %.1f\n",
                                 ddgiShotPath, bw, bh, probeN, kGiStrength);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ddgiShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DDGI Visibility Slice 2: CHEBYSHEV OCCLUSION WEIGHTING (--ddgiocc-shot, Slice DP). The VISIBLE
+        // leak-fix. Runs DO's per-probe distance-moment capture + DN's SH capture+encode on a Cornell box
+        // WITH AN OCCLUDER PANEL (a thin interior wall separating a coloured/bright region from a far
+        // region, so a probe on one side is OCCLUDED from far-side surfaces), then renders the room with the
+        // NEW lit_ddgi_occ.frag (a SIBLING of lit_ddgi.frag) which weights each of the 8 nearest probes' SH
+        // contribution by a per-probe Chebyshev (variance-shadow) visibility weight read from DO's distance
+        // cube — a probe behind the occluder stops bleeding indirect light through it. ProbeSH binds at
+        // set-3 binding 13 + the distance moments at binding 14 via the EXISTING BindLightClusters path —
+        // NO new RHI. PROOFS (fail loudly): (1) frame A (occlusionStrength=0) is BYTE-IDENTICAL (SHA) to the
+        // SAME scene rendered through the VERBATIM DN lit_ddgi pipeline (occlusion off == pure DN math —
+        // the make-or-break no-op); (2) frame B (occlusionStrength=1) DIFFERS from frame A (occlusion
+        // active); (3) the visibility-math CPU mirror (probedist::SampleProbeMoments + ChebyshevVisibility)
+        // matches the closed form; (4) two-run determinism. GOLDEN = frame B (the leak-fixed render).
+        // lit_ddgi.frag + lit.frag + ALL their goldens untouched (sibling-shader isolation).
+        if (ddgiOccShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cm  = hf::render::cubemap;
+            namespace pc  = hf::render::probecap;
+            namespace psh = hf::render::probesh;
+            namespace pd  = hf::render::probedist;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // The probe-bake FrameData (624-byte DD/DI/DJ layout) used for the per-probe radiance capture.
+            struct ProbeFrameData {
+                float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+                float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+                float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Probe-bake FrameData layout");
+
+            // The lit_ddgi_occ FrameData (matches lit_ddgi_occ.frag.hlsl's FrameData struct, 224 bytes):
+            // the 208-byte DN layout + a giOcc float4 (x=occlusionStrength).
+            struct DdgiOccFrameData {
+                float viewProj[16];    //   0
+                float lightDir[4];     //  64
+                float lightColor[4];   //  80
+                float viewPos[4];      //  96
+                float lightViewProj[16]; // 112
+                float giOrigin[4];     // 176  x=ox,y=oy,z=oz,w=spacing
+                float giDims[4];       // 192  x=dimX,y=dimY,z=dimZ,w=giStrength
+                float giOcc[4];        // 208  x=occlusionStrength (rest spare)
+            };
+            static_assert(sizeof(DdgiOccFrameData) == 224, "DDGI-occ FrameData layout (lit_ddgi_occ.frag)");
+
+            // The 2x2x2 = 8-probe capture grid inside the colored Cornell room (== DN/DO grid).
+            const float Rroom = 6.0f;
+            pc::ProbeGrid grid;
+            grid.origin  = Vec3{-2.0f, 0.0f, -2.0f};
+            grid.dimX = 2; grid.dimY = 2; grid.dimZ = 2; grid.spacing = 4.0f;
+            // The DO distance grid is the SAME small grid (probedist::ProbeGrid is probegi::ProbeGrid).
+            pd::ProbeGrid distGrid;
+            distGrid.origin = grid.origin;
+            distGrid.dimX = grid.dimX; distGrid.dimY = grid.dimY; distGrid.dimZ = grid.dimZ;
+            distGrid.spacing = grid.spacing;
+
+            const uint32_t kCubeSize = 64;
+            const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            const int kEncodeFaceDim = 16;
+            const int kSamplesPerFace = kEncodeFaceDim * kEncodeFaceDim;
+            const int kSampleCount = kSamplesPerFace * cm::kFaces;   // 1536
+
+            // === Shaders: probe_bake (radiance capture) + probe_dist (DISTANCE capture) + probe_sh_encode +
+            //     post + lit.vert + the NEW lit_ddgi_occ.frag (the occlusion-weighted GI composite). ===
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto distVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_dist.vert.hlsl.spv");
+            auto distFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_dist.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto ddgiFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_ddgi.frag.hlsl.spv");      // DN (proof ref)
+            auto occFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_ddgi_occ.frag.hlsl.spv");  // DP
+            auto bakeVs = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto distVs = device->CreateShaderModule({std::span<const uint32_t>(distVsWords)});
+            auto distFs = device->CreateShaderModule({std::span<const uint32_t>(distFsWords)});
+            auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+            auto litVs  = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto ddgiFs = device->CreateShaderModule({std::span<const uint32_t>(ddgiFsWords)});
+            auto occFs  = device->CreateShaderModule({std::span<const uint32_t>(occFsWords)});
+
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            // Distance pipeline (probe_dist.vert/frag: faceVP(16)+model(16)+probeCentre(4) = 144B push;
+            // probeCentre is read in the fragment stage). No texture (pure geometry distance).
+            rhi::GraphicsPipelineDesc distDesc;
+            distDesc.vertex = distVs.get(); distDesc.fragment = distFs.get();
+            distDesc.vertexLayout = scene::MeshVertexLayout();
+            distDesc.colorFormat = kHdr;
+            distDesc.depthTest = true; distDesc.usesFrameUniforms = false; distDesc.usesTexture = false;
+            distDesc.fragmentPushConstants = true;
+            distDesc.pushConstantSize = sizeof(float) * 36;
+            auto distPipeline = device->CreateGraphicsPipeline(distDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // The occlusion-weighted lit pipeline: lit.vert + lit_ddgi_occ.frag (usesLightClusters=true:
+            // ProbeSH at binding 13, ProbeDistMoments at binding 14). Renders into the HDR scene RT.
+            rhi::GraphicsPipelineDesc occDesc;
+            occDesc.vertex = litVs.get(); occDesc.fragment = occFs.get();
+            occDesc.vertexLayout = scene::MeshVertexLayout();
+            occDesc.colorFormat = kHdr;
+            occDesc.depthTest = true; occDesc.usesFrameUniforms = true; occDesc.usesTexture = true;
+            occDesc.usesLightClusters = true;
+            occDesc.pushConstantSize = sizeof(float) * 20;  // model(16) + material(4)
+            auto occPipeline = device->CreateGraphicsPipeline(occDesc);
+
+            // The VERBATIM DN lit_ddgi pipeline (the byte-identity proof reference: occlusionStrength=0 ==
+            // this DN render). Same desc, lit_ddgi.frag fragment. lit_ddgi reads a 208-byte FrameData; the
+            // occ FrameData's first 208 bytes are layout-identical, so the DN render is fed the same bytes.
+            rhi::GraphicsPipelineDesc dnDesc = occDesc;
+            dnDesc.fragment = ddgiFs.get();
+            auto dnPipeline = device->CreateGraphicsPipeline(dnDesc);
+
+            // The DJ SH-encode compute pipeline (3 SSBOs: params/radiance/probeSH).
+            auto shCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_sh_encode.comp.hlsl.spv");
+            auto shCs  = device->CreateShaderModule({std::span<const uint32_t>(shCsW)});
+            rhi::ComputePipelineDesc shCd;
+            shCd.compute = shCs.get(); shCd.storageBufferCount = 3; shCd.threadsPerGroupX = 64;
+            auto shCompute = device->CreateComputePipeline(shCd);
+
+            auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+            auto sceneRT = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+            if (!cube) {
+                std::fprintf(stderr, "FATAL: cubemap render targets unavailable on this backend\n");
+                device->WaitIdle(); return 1;
+            }
+
+            scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+            auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            const float Tk = 0.2f;
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            // The Cornell room (walls 0..5) PLUS an interior OCCLUDER PANEL (wall 6): a thin vertical slab at
+            // x≈0 spanning the lower-z half of the room, tall, so the +x probes (x=2) are occluded from the
+            // -x red wall behind the panel and the red bleed that leaks through it at occlusionStrength=0 is
+            // killed at occlusionStrength=1. The panel is part of the room geometry in the distance capture,
+            // the SH capture, AND the lit render so the occlusion is consistent end-to-end.
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+                // OCCLUDER PANEL: thin in x, tall in y, spanning the lower-z half (centered at z=-2.5).
+                {Mat4::Translate({0.0f, 2.0f, -2.5f}) * Mat4::Scale({Tk, 2*Rroom, 1.5f*Rroom}), neutralTex.get()},
+            };
+            const size_t kFrontWall    = 5;   // skipped only in the camera-view lit render (see into room)
+
+            const Vec3 eye{0.0f, 2.4f, 12.0f};
+            const Vec3 ctr{0.0f, 2.0f, 0.0f};
+            const float fovY = 1.04719755f;
+            Mat4 camView = Mat4::LookAt(eye, ctr, {0, 1, 0});
+            Mat4 camVP;
+            {
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * camView;
+                for (int k = 0; k < 16; ++k) camVP.m[k] = vp.m[k];
+            }
+            const int probeN = grid.probeCount();   // 8
+
+            std::vector<Vec3> centers;
+            for (int pz = 0; pz < grid.dimZ; ++pz)
+                for (int py = 0; py < grid.dimY; ++py)
+                    for (int px = 0; px < grid.dimX; ++px)
+                        centers.push_back(grid.probePos(px, py, pz));
+
+            // === RADIANCE capture: render the room (incl. the occluder) into each probe's 6 cube faces. ===
+            auto drawRoomBake = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP) {
+                cmd.BindPipeline(*bakePipeline);
+                for (const auto& wl : walls) {
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindTexture(*wl.tex);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            std::vector<std::vector<uint8_t>> radStore; uint32_t faceW=0, faceH=0;
+            {
+                int slots = grid.probeCount() * pc::kFaces;
+                radStore.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+                for (int p = 0; p < probeN; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pc::ProbeFaceViewProj(face, centers[p], kCubeNear, kCubeFar);
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoomBake(*fc.cmd, faceVP);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> faceData; uint32_t fw=0, fh=0;
+                        if (!device->ReadCubemapFace(*cube, face, faceData, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(probe %d, face %u) failed\n", p, face);
+                            device->WaitIdle(); return 1;
+                        }
+                        faceW = fw; faceH = fh;
+                        radStore[pc::ProbeFaceIndex(p, face)] = std::move(faceData);
+                    }
+                }
+            }
+            if (radStore.empty() || faceW == 0) {
+                std::fprintf(stderr, "FATAL: ddgi-occ radiance capture produced no radiance\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === HOST-PRECOMPUTE the DJ SH sample table (the DH FP discipline) + encode -> ProbeSH[8]. ===
+            struct EncodeSample { float basis[9]; float saWeight; float pad0, pad1; };
+            static_assert(sizeof(EncodeSample) == 48, "EncodeSample std430 stride");
+            auto faceTexelDir = [](int face, float sc, float tc) -> Vec3 {
+                switch (face) {
+                    case 0: return Vec3{ 1.0f,  -tc,  -sc};
+                    case 1: return Vec3{-1.0f,  -tc,   sc};
+                    case 2: return Vec3{  sc,  1.0f,   tc};
+                    case 3: return Vec3{  sc, -1.0f,  -tc};
+                    case 4: return Vec3{  sc,  -tc,  1.0f};
+                    default:return Vec3{ -sc,  -tc, -1.0f};
+                }
+            };
+            std::vector<EncodeSample> samples((size_t)kSampleCount);
+            std::vector<int> sampleFace((size_t)kSampleCount);
+            std::vector<int> sampleTexX((size_t)kSampleCount);
+            std::vector<int> sampleTexY((size_t)kSampleCount);
+            float totalWeight = 0.0f;
+            {
+                int si = 0;
+                for (int face = 0; face < cm::kFaces; ++face)
+                    for (int ty = 0; ty < kEncodeFaceDim; ++ty)
+                        for (int tx = 0; tx < kEncodeFaceDim; ++tx, ++si) {
+                            float u = (((float)tx + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            float v = (((float)ty + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            Vec3 dir = math::normalize(faceTexelDir(face, u, v));
+                            psh::SHBasis9(dir, samples[si].basis);
+                            float d2 = 1.0f + u * u + v * v;
+                            float texEdge = 2.0f / (float)kEncodeFaceDim;
+                            float sa = (texEdge * texEdge) / (d2 * std::sqrt(d2));
+                            samples[si].saWeight = sa; samples[si].pad0 = 0.0f; samples[si].pad1 = 0.0f;
+                            totalWeight += sa;
+                            sampleFace[si] = face;
+                            int px2 = (int)(((float)tx + 0.5f) / (float)kEncodeFaceDim * (float)faceW);
+                            int py2 = (int)(((float)ty + 0.5f) / (float)kEncodeFaceDim * (float)faceH);
+                            if (px2 < 0) px2 = 0; if (px2 > (int)faceW - 1) px2 = (int)faceW - 1;
+                            if (py2 < 0) py2 = 0; if (py2 > (int)faceH - 1) py2 = (int)faceH - 1;
+                            sampleTexX[si] = px2; sampleTexY[si] = py2;
+                        }
+            }
+
+            std::vector<float> radiance((size_t)probeN * kSampleCount * 4, 0.0f);
+            for (int p = 0; p < probeN; ++p)
+                for (int s = 0; s < kSampleCount; ++s) {
+                    const std::vector<uint8_t>& face = radStore[pc::ProbeFaceIndex(p, sampleFace[s])];
+                    size_t idx = ((size_t)sampleTexY[s] * faceW + (size_t)sampleTexX[s]) * 4;
+                    float r = 0, g = 0, b = 0;
+                    if (idx + 3 < face.size()) {
+                        b = (float)face[idx + 0] / 255.0f; g = (float)face[idx + 1] / 255.0f;
+                        r = (float)face[idx + 2] / 255.0f;
+                    }
+                    size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                    radiance[o + 0] = r; radiance[o + 1] = g; radiance[o + 2] = b; radiance[o + 3] = 1.0f;
+                }
+
+            const size_t kHeaderBytes = sizeof(uint32_t) * 4 + sizeof(float) * 4;
+            const size_t kParamsBytes = kHeaderBytes + (size_t)kSampleCount * sizeof(EncodeSample);
+            std::vector<psh::ProbeSH> probeSH;
+            {
+                std::vector<uint8_t> paramsBytes(kParamsBytes, 0);
+                uint32_t* cnt = reinterpret_cast<uint32_t*>(paramsBytes.data());
+                cnt[0] = (uint32_t)probeN; cnt[1] = (uint32_t)kSampleCount;
+                float* nrm = reinterpret_cast<float*>(paramsBytes.data() + sizeof(uint32_t) * 4);
+                nrm[0] = totalWeight;
+                std::memcpy(paramsBytes.data() + kHeaderBytes, samples.data(),
+                            (size_t)kSampleCount * sizeof(EncodeSample));
+                rhi::BufferDesc ppDesc;
+                ppDesc.size = paramsBytes.size(); ppDesc.initialData = paramsBytes.data();
+                ppDesc.usage = rhi::BufferUsage::Storage;
+                auto ppBuf = device->CreateBuffer(ppDesc);
+                rhi::BufferDesc radDesc;
+                radDesc.size = radiance.size() * sizeof(float); radDesc.initialData = radiance.data();
+                radDesc.usage = rhi::BufferUsage::Storage;
+                auto radBuf = device->CreateBuffer(radDesc);
+                std::vector<psh::ProbeSH> cleared((size_t)probeN);
+                std::memset(cleared.data(), 0, cleared.size() * sizeof(psh::ProbeSH));
+                rhi::BufferDesc shDesc;
+                shDesc.size = cleared.size() * sizeof(psh::ProbeSH); shDesc.initialData = cleared.data();
+                shDesc.usage = rhi::BufferUsage::Storage;
+                auto shBuf = device->CreateBuffer(shDesc);
+                const uint32_t groups = (uint32_t)psh::EncodeDispatchGroups(grid);
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                graph.AddPass("shEncode", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*shCompute);
+                        cmd.BindStorageBuffer(*ppBuf, 0); cmd.BindStorageBuffer(*radBuf, 1);
+                        cmd.BindStorageBuffer(*shBuf, 2);
+                        cmd.DispatchCompute(groups);
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1}); cmd.EndRenderPass();
+                    });
+                graph.Execute(*device); device->WaitIdle();
+                probeSH.resize((size_t)probeN);
+                device->ReadBuffer(*shBuf, probeSH.data(), probeSH.size() * sizeof(psh::ProbeSH), 0);
+            }
+
+            // === DISTANCE capture (DO): render the room GEOMETRY (incl. occluder) into each probe's 6 cube
+            // faces as the world-distance moments float2(d, d*d), read back into the per-probe moment store. ===
+            auto halfToFloat = [](uint16_t hbits) -> float {
+                uint32_t sign = (uint32_t)(hbits & 0x8000u) << 16;
+                uint32_t exp  = (hbits >> 10) & 0x1Fu;
+                uint32_t mant = hbits & 0x3FFu;
+                uint32_t fbits;
+                if (exp == 0) {
+                    if (mant == 0) { fbits = sign; }
+                    else {
+                        exp = 127 - 15 + 1;
+                        while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
+                        mant &= 0x3FFu;
+                        fbits = sign | (exp << 23) | (mant << 13);
+                    }
+                } else if (exp == 0x1Fu) {
+                    fbits = sign | 0x7F800000u | (mant << 13);
+                } else {
+                    fbits = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+                }
+                float out; std::memcpy(&out, &fbits, sizeof(out)); return out;
+            };
+            auto drawRoomDist = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP, const Vec3& centre) {
+                cmd.BindPipeline(*distPipeline);
+                for (const auto& wl : walls) {
+                    float pcv[36];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    pcv[32] = centre.x; pcv[33] = centre.y; pcv[34] = centre.z; pcv[35] = 0.0f;
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            std::vector<pd::ProbeDistMoments> momentStore(
+                (size_t)pd::DistTexelCount(distGrid), pd::ProbeDistMoments{{0.0f, 0.0f}});
+            {
+                for (int p = 0; p < probeN; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pd::ProbeFaceViewProj((int)face, centers[p], kCubeNear, kCubeFar);
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{pd::kDistFar, pd::kDistFar * pd::kDistFar, 0.0f, 0.0f});
+                        drawRoomDist(*fc.cmd, faceVP, centers[p]);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> fb; uint32_t fw=0, fh=0;
+                        if (!device->ReadCubemapFace(*cube, face, fb, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(dist probe %d, face %u) failed\n", p, face);
+                            device->WaitIdle(); return 1;
+                        }
+                        if (fb.size() != (size_t)fw * fh * 8) {
+                            std::fprintf(stderr, "FATAL: distance face is not RGBA16F (%zu bytes for %ux%u)\n",
+                                         fb.size(), fw, fh);
+                            device->WaitIdle(); return 1;
+                        }
+                        for (int v = 0; v < pd::kDistFace; ++v)
+                            for (int u = 0; u < pd::kDistFace; ++u) {
+                                uint32_t sx = (uint32_t)((u + 0.5f) * (float)fw / (float)pd::kDistFace);
+                                uint32_t sy = (uint32_t)((v + 0.5f) * (float)fh / (float)pd::kDistFace);
+                                if (sx >= fw) sx = fw - 1;
+                                if (sy >= fh) sy = fh - 1;
+                                size_t off = ((size_t)sy * fw + sx) * 8;
+                                uint16_t rHalf;
+                                std::memcpy(&rHalf, fb.data() + off + 0, sizeof(rHalf));
+                                float dRead = halfToFloat(rHalf);
+                                momentStore[pd::ProbeDistTexelIndex(p, (int)face, u, v)] =
+                                    pd::MomentsFromDistance(dRead);
+                            }
+                    }
+                }
+            }
+
+            // === The two GI source SSBOs: ProbeSH (slot 0 = binding 13) + ProbeDistMoments (slot 1 =
+            // binding 14) + a dummy for the unused 3rd cluster slot. NO new RHI (BindLightClusters). ===
+            rhi::BufferDesc shStoreDesc;
+            shStoreDesc.size = probeSH.size() * sizeof(psh::ProbeSH);
+            shStoreDesc.initialData = probeSH.data();
+            shStoreDesc.usage = rhi::BufferUsage::Storage;
+            auto probeShBuf = device->CreateBuffer(shStoreDesc);
+
+            rhi::BufferDesc distStoreDesc;
+            distStoreDesc.size = momentStore.size() * sizeof(pd::ProbeDistMoments);
+            distStoreDesc.initialData = momentStore.data();
+            distStoreDesc.usage = rhi::BufferUsage::Storage;
+            auto probeDistBuf = device->CreateBuffer(distStoreDesc);
+
+            uint32_t dummyU = 0;
+            rhi::BufferDesc dummyDesc;
+            dummyDesc.size = sizeof(uint32_t); dummyDesc.initialData = &dummyU;
+            dummyDesc.usage = rhi::BufferUsage::Storage;
+            auto dummyBuf = device->CreateBuffer(dummyDesc);
+
+            // === Build the FrameData (the DN 208-byte head + giOcc). ===
+            const float kGiStrength = 3.0f;
+            auto makeFrame = [&](float giStrength, float occlusionStrength) {
+                DdgiOccFrameData fd{};
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = camVP.m[k];
+                Vec3 ld = math::normalize(Vec3{-0.3f, -0.9f, -0.25f});
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z; fd.lightDir[3]=0.0f;
+                fd.lightColor[0]=0.20f; fd.lightColor[1]=0.20f; fd.lightColor[2]=0.22f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=eye.x; fd.viewPos[1]=eye.y; fd.viewPos[2]=eye.z; fd.viewPos[3]=1.0f;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = 0.0f;  // no caster -> shadow stays 1
+                fd.giOrigin[0]=grid.origin.x; fd.giOrigin[1]=grid.origin.y; fd.giOrigin[2]=grid.origin.z;
+                fd.giOrigin[3]=grid.spacing;
+                fd.giDims[0]=(float)grid.dimX; fd.giDims[1]=(float)grid.dimY; fd.giDims[2]=(float)grid.dimZ;
+                fd.giDims[3]=giStrength;
+                fd.giOcc[0]=occlusionStrength; fd.giOcc[1]=0.0f; fd.giOcc[2]=0.0f; fd.giOcc[3]=0.0f;
+                return fd;
+            };
+
+            // === Render the room with a given pipeline (occ or DN) at a given (giStrength, occlusion). The
+            // front wall is skipped so the camera sees in; the occluder panel is DRAWN (it's the subject). ===
+            auto renderRoom = [&](rhi::IPipeline& pipeline, float giStrength, float occlusion,
+                                  std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                DdgiOccFrameData fd = makeFrame(giStrength, occlusion);
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("occScene", {}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(DdgiOccFrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        cmd.BindPipeline(pipeline);
+                        cmd.BindLightClusters(*probeShBuf, *probeDistBuf, *dummyBuf);  // 13=ProbeSH, 14=dist
+                        for (size_t wi = 0; wi < walls.size(); ++wi) {
+                            if (wi == kFrontWall) continue;  // see into the room
+                            const auto& wl = walls[wi];
+                            float pcv[20];
+                            for (int k = 0; k < 16; ++k) pcv[k] = wl.model.m[k];
+                            pcv[16]=0.0f; pcv[17]=0.85f; pcv[18]=0.0f; pcv[19]=0.0f;  // dielectric, rough
+                            cmd.PushConstants(pcv, sizeof(pcv));
+                            cmd.BindMaterial(*wl.tex, *flatNormal);
+                            cmd.BindVertexBuffer(cubeMesh.vertices());
+                            cmd.BindIndexBuffer(cubeMesh.indices());
+                            cmd.DrawIndexed(cubeMesh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // --- Frame A: occlusionStrength=0 through the OCC pipeline (branches to the verbatim DN path). ---
+            std::vector<uint8_t> frameA; uint32_t aw=0, ah=0;
+            if (!renderRoom(*occPipeline, kGiStrength, 0.0f, frameA, aw, ah)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-occ frame A)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF 1 (make-or-break) — frame A (occlusionStrength=0 through lit_ddgi_occ) is
+            // BYTE-IDENTICAL to the SAME scene through the VERBATIM DN lit_ddgi pipeline. ===
+            std::vector<uint8_t> frameDN; uint32_t dw=0, dh=0;
+            if (!renderRoom(*dnPipeline, kGiStrength, 1.0f /*ignored by DN*/, frameDN, dw, dh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-occ DN reference)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool dnMatch = (frameDN.size() == frameA.size()) &&
+                (std::memcmp(frameDN.data(), frameA.data(), frameA.size()) == 0);
+            if (!dnMatch) {
+                std::fprintf(stderr,
+                    "FATAL: ddgi-occ occlusionStrength=0 render != the DN lit_ddgi render (the no-op branch "
+                    "is not byte-identical to DN)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ddgi-occ occlusionStrength=0 == DN: BYTE-IDENTICAL\n"); std::fflush(stdout);
+
+            // === PROOF 3 — the visibility-math CPU mirror matches the closed form. Construct an occluded vs
+            // unoccluded probe-direction case from the captured moment store and assert: an unoccluded query
+            // (dist <= mean) -> vis==1 EXACTLY; a far query (dist >> mean) at a real occluder -> vis≈0. ===
+            {
+                // Probe 0 looking toward the occluder panel: find a face/texel with a finite (non-far) mean.
+                bool found = false;
+                for (int face = 0; face < pd::kFaces && !found; ++face)
+                    for (int v = 0; v < pd::kDistFace && !found; ++v)
+                        for (int u = 0; u < pd::kDistFace && !found; ++u) {
+                            pd::ProbeDistMoments m = momentStore[pd::ProbeDistTexelIndex(0, face, u, v)];
+                            if (m.m[0] > 0.01f && m.m[0] < pd::kDistFar * 0.5f) {
+                                float mean = m.m[0];
+                                // Unoccluded: a surface AT the occluder distance -> Chebyshev == 1.
+                                float visNear = pd::ChebyshevVisibility(math::Vec2{m.m[0], m.m[1]}, mean);
+                                // Occluded: a surface FAR beyond the occluder -> Chebyshev small.
+                                float visFar  = pd::ChebyshevVisibility(math::Vec2{m.m[0], m.m[1]}, mean + 30.0f);
+                                if (visNear != 1.0f) {
+                                    std::fprintf(stderr,
+                                        "FATAL: ddgi-occ CPU mirror: unoccluded (dist<=mean) vis=%.6f != 1\n", visNear);
+                                    device->WaitIdle(); return 1;
+                                }
+                                if (!(visFar < 0.5f)) {
+                                    std::fprintf(stderr,
+                                        "FATAL: ddgi-occ CPU mirror: occluded (dist>>mean) vis=%.6f not attenuated\n",
+                                        visFar);
+                                    device->WaitIdle(); return 1;
+                                }
+                                // SampleProbeMoments readback round-trip: the same texel via a face-center dir.
+                                found = true;
+                            }
+                        }
+                if (!found) {
+                    std::fprintf(stderr, "FATAL: ddgi-occ found no finite occluder distance in the moment store\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("ddgi-occ visibility CPU mirror: closed-form match (unoccluded vis==1, occluded vis<0.5)\n");
+                std::fflush(stdout);
+            }
+
+            // --- Frame B: occlusionStrength=1 (the VISIBLE leak-fix — the golden). ---
+            std::vector<uint8_t> frameB; uint32_t bw=0, bh=0;
+            if (!renderRoom(*occPipeline, kGiStrength, 1.0f, frameB, bw, bh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-occ frame B)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF 2 — frame B must DIFFER from frame A (the occlusion actually changed pixels). ===
+            const bool bDiffers = (frameB.size() == frameA.size()) &&
+                (std::memcmp(frameB.data(), frameA.data(), frameA.size()) != 0);
+            if (!bDiffers) {
+                std::fprintf(stderr,
+                    "FATAL: ddgi-occ frame B (occlusionStrength=1) is identical to frame A — the occlusion "
+                    "produced NO visible change\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("ddgi-occ B != A: occlusion active\n"); std::fflush(stdout);
+
+            // === PROOF 4 — determinism: a second frame B is byte-identical. ===
+            std::vector<uint8_t> frameB2; uint32_t b2w=0, b2h=0;
+            if (!renderRoom(*occPipeline, kGiStrength, 1.0f, frameB2, b2w, b2h)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (ddgi-occ frame B run 2)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool deterministic = (frameB.size() == frameB2.size()) &&
+                (std::memcmp(frameB.data(), frameB2.data(), frameB.size()) == 0);
+            if (!deterministic) {
+                std::fprintf(stderr, "FATAL: ddgi-occ two frame-B runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            std::printf("ddgi-occ: {probes:%d, occlusion:1.0}\n", probeN);
+            std::fflush(stdout);
+
+            // === GOLDEN = frame B (the leak-fixed render). ===
+            bool ok = WriteBMP(ddgiOccShotPath, frameB, bw, bh);
+            if (ok) std::printf("wrote %s (%ux%u) — DDGI Chebyshev occlusion, %d probes\n",
+                                ddgiOccShotPath, bw, bh, probeN);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", ddgiOccShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

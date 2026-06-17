@@ -246,6 +246,16 @@ hf_compile_shaders(
     # is a literal +0.0 -> byte-identical to the no-GI render. Used ONLY by --ddgi-shot; lit.frag + its
     # goldens are untouched.
     "shaders/lit_ddgi.frag.hlsl:ps"
+    # DDGI Visibility Slice 2 — Chebyshev occlusion-weighted GI composite (Slice DP): a SIBLING of
+    # lit_ddgi.frag that weights each of the 8 nearest probes' SH contribution by a per-probe Chebyshev
+    # (variance-shadow) visibility weight read from DO's per-probe distance-moment cube (DistDirToFaceUV +
+    # SampleProbeMoments copied VERBATIM from engine/render/probe_dist.h), so a probe geometrically occluded
+    # from a surface stops bleeding indirect light through the occluder (the DDGI light-leak fix). ProbeSH
+    # binds at set-3 binding 13 (slot 0, as DN) + the distance moments at the next free slot binding 14 via
+    # the EXISTING BindLightClusters path — NO new RHI. occlusionStrength==0 branches to the VERBATIM DN path
+    # -> frame A byte-identical to the DN lit_ddgi render. Used ONLY by --ddgiocc-shot; lit_ddgi.frag +
+    # lit.frag + their goldens untouched.
+    "shaders/lit_ddgi_occ.frag.hlsl:ps"
     # Screen-space global illumination (Slice BP): reuses the SSAO/SSR g-buffer (view normal + linear
     # depth) + the lit HDR scene. ssgi.frag traces K cosine-hemisphere rays per pixel and marches them
     # (the SAME view-space march + binary-search as ssr.frag), sampling the lit scene as indirect

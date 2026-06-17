@@ -171,6 +171,61 @@ inline ProbeDistMoments MomentsFromDistance(float d) {
     return r;
 }
 
+// --- Direction -> (face, u, v) into the distance-moment cube (the DP Chebyshev query). --------------
+// DistDirToFaceUV(dir, face, u, v) maps a world-space sample direction to the (face, texel u, texel v)
+// of the kDistFace×kDistFace×6 distance cube, matching DO's CAPTURE orientation EXACTLY. DO captured each
+// face with cubemap::FaceView/FaceProj and stored texel (u,v) by sub-sampling the captured face at
+// s=(u+0.5)/kDistFace, t=(v+0.5)/kDistFace (row-major, v outer / u inner). The hardware cube lookup that
+// matches that FaceView/FaceProj convention is cubemap::DirToFaceUV (the SAME header the capture uses):
+// it returns the selected face + the [0,1] face S/T. We then quantise s,t to the NEAREST texel:
+// u = clamp(floor(s*kDistFace), 0, kDistFace-1), v likewise. NEAREST-texel (deterministic, bit-exact, no
+// filter ambiguity — bilinear is a documented future refinement). `dir` need not be unit. This is the
+// SAME math the DP shader copies VERBATIM. Pure / deterministic.
+inline void DistDirToFaceUV(const math::Vec3& dir, int& outFace, int& outU, int& outV) {
+    math::Vec2 uv;
+    cubemap::DirToFaceUV(dir, outFace, uv);     // face + [0,1] S/T in DO's FaceView convention
+    int u = (int)std::floor(uv.x * (float)kDistFace);
+    int v = (int)std::floor(uv.y * (float)kDistFace);
+    if (u < 0) u = 0; if (u > kDistFace - 1) u = kDistFace - 1;
+    if (v < 0) v = 0; if (v > kDistFace - 1) v = kDistFace - 1;
+    outU = u; outV = v;
+}
+
+// --- Sample the distance moments of a probe in a direction (the DP Chebyshev source). ---------------
+// SampleProbeMoments(store, probeIdx, dir) reads the {meanDist, meanDist²} moments of probe `probeIdx`
+// along `dir`: DistDirToFaceUV(dir) -> (face,u,v), then store[ProbeDistTexelIndex(probeIdx,face,u,v)].m.
+// NEAREST-texel (no filtering). `store` is the flat ProbeDistMoments[probeCount*384] DO produced; returns
+// {meanDist, meanDist²} as a Vec2 (x=m[0], y=m[1]). store==null -> {0,0} (a degenerate / no-data probe ->
+// the DP Chebyshev test then sees var=0,mean=0 -> the dist<=mean early-out gives vis=1 only at dist 0, so
+// a missing store yields no spurious occlusion at distance — documented). This is the SAME readback the DP
+// shader copies VERBATIM (gProbeDist[ProbeDistTexelIndex(...)]). Pure / deterministic.
+inline math::Vec2 SampleProbeMoments(const ProbeDistMoments* store, int probeIdx, const math::Vec3& dir) {
+    if (store == nullptr) return math::Vec2{0.0f, 0.0f};
+    int face, u, v;
+    DistDirToFaceUV(dir, face, u, v);
+    const ProbeDistMoments& m = store[ProbeDistTexelIndex(probeIdx, face, u, v)];
+    return math::Vec2{m.m[0], m.m[1]};
+}
+
+// --- The Chebyshev (variance-shadow) visibility weight (the DP leak-fix, CPU mirror). ----------------
+// ChebyshevVisibility(mom, dist) = the variance-shadow upper bound that probe `mom` (its {meanDist,
+// meanDist²} along the probe->point direction) is VISIBLE from a surface at linear distance `dist`:
+//   mean = mom.x;  var = max(0, mom.y - mean*mean);
+//   dist <= mean              -> 1 (the surface is at/closer than the mean occluder -> fully visible)
+//   else                      -> var / (var + (dist-mean)²)   (Chebyshev's inequality, in [0,1])
+// var==0 (a perfectly certain occluder) collapses to a HARD step at dist==mean (1 for dist<=mean, 0 past
+// it). This is the SAME closed form the DP shader runs (mad where multiply-adds occur). Pure /
+// deterministic; no NaN (the dist<=mean branch guards var+dd²==0 only when var==0 AND dist==mean -> the
+// branch returns 1 first). The full per-probe weight in the shader is lerp(1, cheb, occlusionStrength).
+inline float ChebyshevVisibility(const math::Vec2& mom, float dist) {
+    float mean = mom.x;
+    float var  = mom.y - mean * mean;
+    if (var < 0.0f) var = 0.0f;
+    if (dist <= mean) return 1.0f;
+    float dd = dist - mean;                 // > 0 here
+    return var / (var + dd * dd);
+}
+
 // --- The per-probe MEAN captured distance (the swatch-viz value, deterministic). --------------------
 // ProbeMeanDistance(moments, texelCount) folds `texelCount` per-texel moments' FIRST moment (m[0] = d)
 // into a single mean distance (the per-probe debug-viz value: a colored swatch sphere at the probe — near

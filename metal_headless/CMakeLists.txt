@@ -263,6 +263,14 @@ hf_gen_msl(lit_contactshadow.frag lit_contactshadow.frag.hlsl frag contactshadow
 # to the Vulkan/CPU mirror; giStrength==0 (or probeCount=0) -> a literal +0.0 -> byte-identical to the no-GI
 # render. Behind --ddgi only; existing lit shaders + goldens untouched.
 hf_gen_msl(lit_ddgi.frag           lit_ddgi.frag.hlsl           frag ddgi_fragment)
+# DDGI Visibility Slice 2 — Chebyshev occlusion-weighted GI composite (Slice DP): a SIBLING of lit_ddgi.frag
+# that weights each of the 8 nearest probes' SH contribution by a per-probe Chebyshev (variance-shadow)
+# visibility weight read from DO's per-probe distance-moment cube, killing DDGI light-leak through occluders.
+# ProbeSH at set-3 binding 13 (Metal fragment buffer 13) + the distance moments at binding 14 (buffer 14),
+# both via the existing usesLightClusters/BindLightClusters path. The SAME math compiled here makes the
+# occlusion weight bit-identical to the Vulkan/CPU mirror; occlusionStrength==0 -> the VERBATIM DN path ->
+# byte-identical to the DN render. Behind --ddgiocc only; existing lit/ddgi shaders + goldens untouched.
+hf_gen_msl(lit_ddgi_occ.frag       lit_ddgi_occ.frag.hlsl       frag ddgi_occ_fragment)
 # Froxel Volumetric Fog (Slice CS): a true 3D view-space froxel volume. froxel_inject.comp writes
 # per-froxel (scatter, extinction) from the render/froxel.h height-density + HG phase; froxel_integrate.comp
 # marches each Z column front-to-back via IntegrateStep into (inScatter, transmittance); froxel_apply.frag

@@ -328,6 +328,18 @@ hf_add_pure_test(probe_dist_test)
 # in --ddgi-shot. Pure C++ (hf_core; reuses render/probe_gi.h + render/probe_sh.h), ASan-eligible.
 hf_add_pure_test(ddgi_test)
 
+# Slice DP — DDGI Visibility Slice 2: Chebyshev Occlusion Weighting. Pure CPU math for the visibility
+# leak-fix (render/probe_dist.h's DistDirToFaceUV / SampleProbeMoments / ChebyshevVisibility, mirrored
+# VERBATIM in lit_ddgi_occ.frag.hlsl): the dir->(face,u,v) cube query matches DO's FaceView capture
+# convention (the 6 axis dirs -> the 6 face centres; consistent with cubemap::DirToFaceUV), SampleProbeMoments
+# reads back a planted texel, the Chebyshev variance-shadow closed form (dist<=mean -> 1, dist>>mean small
+# var -> ≈0, var==0 -> a hard step with no 0/0 NaN), the occlusionStrength=0 identity (the all-vis==1
+# renormalised weighted blend == probesh::InterpolateSH BYTE-IDENTICAL — the CPU mirror of the shader's
+# occlusionStrength==0 -> VERBATIM-DN-path no-op, exact because Σ trilinear weights == 1.0 and /1.0 is exact),
+# and the all-occluded -> zero-indirect fallback (no /wsum NaN). Pure C++ (hf_core; reuses render/probe_dist.h
+# + render/probe_gi.h + render/probe_sh.h + render/cubemap.h), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(probe_occlusion_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,

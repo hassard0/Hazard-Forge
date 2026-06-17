@@ -240,6 +240,8 @@ int main() {
             bool sawProbeDistFeature = false;
             // Slice DN: the ddgi-global-illumination capability is advertised in the feature manifest.
             bool sawDdgiFeature = false;
+            // Slice DP: the ddgi-probe-occlusion capability is advertised in the feature manifest.
+            bool sawProbeOcclusionFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -299,6 +301,7 @@ int main() {
                     if (AsString(el->value) == "ddgi-probe-interp") sawProbeInterpFeature = true;
                     if (AsString(el->value) == "ddgi-probe-distance") sawProbeDistFeature = true;
                     if (AsString(el->value) == "ddgi-global-illumination") sawDdgiFeature = true;
+                    if (AsString(el->value) == "ddgi-probe-occlusion") sawProbeOcclusionFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -355,6 +358,7 @@ int main() {
             check(sawProbeInterpFeature, "engine.features includes ddgi-probe-interp");
             check(sawProbeDistFeature, "engine.features includes ddgi-probe-distance");
             check(sawDdgiFeature, "engine.features includes ddgi-global-illumination");
+            check(sawProbeOcclusionFeature, "engine.features includes ddgi-probe-occlusion");
         }
 
         // commands manifest includes set_transform + introspect.
