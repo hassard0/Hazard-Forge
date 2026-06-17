@@ -268,6 +268,140 @@ int main() {
         check(totalFromCases == total, "Σ CountTriangles(case) == TotalTriangles(counts) (sphere field)");
     }
 
+    // ================= MC3: EdgeMidpoint for known edges (the two corner coords SUMMED) ===========
+    {
+        // For the cell at the ORIGIN (0,0,0): edge e connects kEdgeCorner[e]=(a,b); the midpoint in
+        // half-units = kCornerOffset[a] + kCornerOffset[b].
+        // edge 0: corners (0,1) = (0,0,0)+(1,0,0) -> (1,0,0).
+        mc::McVertex v0 = mc::EdgeMidpoint(0, 0, 0, 0);
+        check(v0.x == 1 && v0.y == 0 && v0.z == 0 && v0.w == 0,
+              "EdgeMidpoint cell(0,0,0) edge0 (corners 0-1) -> (1,0,0) half-units");
+        // edge 10: corners (2,6) = (1,1,0)+(1,1,1) -> (2,2,1).
+        mc::McVertex v10 = mc::EdgeMidpoint(0, 0, 0, 10);
+        check(v10.x == 2 && v10.y == 2 && v10.z == 1 && v10.w == 0,
+              "EdgeMidpoint cell(0,0,0) edge10 (corners 2-6) -> (2,2,1) half-units");
+        // edge 8 (vertical 0-4): (0,0,0)+(0,0,1) -> (0,0,1).
+        mc::McVertex v8 = mc::EdgeMidpoint(0, 0, 0, 8);
+        check(v8.x == 0 && v8.y == 0 && v8.z == 1, "EdgeMidpoint edge8 (corners 0-4) -> (0,0,1)");
+        // A SHIFTED cell (1,2,3): the same edge 0 is offset by 2*cell (both summed corners include cell).
+        mc::McVertex vs = mc::EdgeMidpoint(1, 2, 3, 0);
+        check(vs.x == (1 + 2) && vs.y == (2 + 2) && vs.z == (3 + 3),
+              "EdgeMidpoint cell(1,2,3) edge0 = (cx+cx+1, cy+cy, cz+cz) -> (3,4,6)");
+    }
+
+    // ================= MC3: PrefixSumOffsets known counts -> known offsets + total ================
+    {
+        const uint32_t counts[5] = {3, 0, 2, 5, 1};
+        uint32_t offsets[5] = {99, 99, 99, 99, 99};
+        uint32_t total = 999u;
+        mc::PrefixSumOffsets(std::span<const uint32_t>(counts, 5),
+                             std::span<uint32_t>(offsets, 5), total);
+        check(offsets[0] == 0 && offsets[1] == 3 && offsets[2] == 3 &&
+              offsets[3] == 5 && offsets[4] == 10,
+              "PrefixSumOffsets {3,0,2,5,1} -> exclusive {0,3,3,5,10}");
+        check(total == 11u, "PrefixSumOffsets total == Σ counts == 11");
+        // Empty input -> total 0.
+        uint32_t emptyTotal = 7u;
+        mc::PrefixSumOffsets(std::span<const uint32_t>(),
+                             std::span<uint32_t>(), emptyTotal);
+        check(emptyTotal == 0u, "PrefixSumOffsets of empty -> total 0");
+    }
+
+    // ================= MC3: EmitCell for a known case (tri count, midpoint verts, identity idx) ====
+    {
+        // Case 0x01 (only corner 0 above) emits 1 triangle, kTriTable[0x01] = {0,8,3,...}. At the origin
+        // cell with triOffset=0, slots 0..2 are edges 0,8,3 -> midpoints, indices the identity {0,1,2}.
+        const uint8_t kase = 0x01;
+        const int n = mc::CountTriangles(kase);
+        check(n == 1, "case 0x01 emits 1 triangle");
+        std::vector<mc::McVertex> verts((size_t)n * 3, mc::McVertex{-9, -9, -9, -9});
+        std::vector<uint32_t> idx((size_t)n * 3, 0xDEADu);
+        mc::EmitCell(0, 0, 0, kase, 0u, std::span<mc::McVertex>(verts), std::span<uint32_t>(idx));
+        // Edges for 0x01 are 0,8,3.
+        mc::McVertex e0 = mc::EdgeMidpoint(0, 0, 0, 0);
+        mc::McVertex e8 = mc::EdgeMidpoint(0, 0, 0, 8);
+        mc::McVertex e3 = mc::EdgeMidpoint(0, 0, 0, 3);
+        check(verts[0].x == e0.x && verts[0].y == e0.y && verts[0].z == e0.z,
+              "EmitCell case 0x01 v0 == EdgeMidpoint(edge0)");
+        check(verts[1].x == e8.x && verts[1].y == e8.y && verts[1].z == e8.z,
+              "EmitCell case 0x01 v1 == EdgeMidpoint(edge8)");
+        check(verts[2].x == e3.x && verts[2].y == e3.y && verts[2].z == e3.z,
+              "EmitCell case 0x01 v2 == EdgeMidpoint(edge3)");
+        check(idx[0] == 0 && idx[1] == 1 && idx[2] == 2, "EmitCell case 0x01 indices are identity {0,1,2}");
+
+        // A non-zero triOffset writes into the offset slots (the disjoint-range contract).
+        std::vector<mc::McVertex> verts2((size_t)6, mc::McVertex{0, 0, 0, 0});
+        std::vector<uint32_t> idx2((size_t)6, 0u);
+        mc::EmitCell(0, 0, 0, kase, 1u, std::span<mc::McVertex>(verts2), std::span<uint32_t>(idx2));
+        check(idx2[3] == 3 && idx2[4] == 4 && idx2[5] == 5,
+              "EmitCell triOffset=1 writes identity indices {3,4,5} into slots 3..5");
+        bool slot0Untouched = (verts2[0].x == 0 && idx2[0] == 0);
+        check(slot0Untouched, "EmitCell triOffset=1 leaves the prior cell's range untouched");
+
+        // Empty case 0x00 emits nothing.
+        std::vector<mc::McVertex> verts3;
+        std::vector<uint32_t> idx3;
+        mc::EmitCell(0, 0, 0, 0x00, 0u, std::span<mc::McVertex>(verts3), std::span<uint32_t>(idx3));
+        check(verts3.empty() && idx3.empty(), "EmitCell case 0x00 emits nothing (empty soup)");
+    }
+
+    // ================= MC3: MarchCells over a tiny field -> known counts + sizing =================
+    {
+        // The planar-boundary 3x2x2 field: cell0 case 0x66 (some tris), cell1 0xFF (0 tris).
+        mc::VoxelField f; f.nx = 3; f.ny = 2; f.nz = 2;
+        f.scalar.assign((size_t)3*2*2, 0);
+        for (int z = 0; z < 2; ++z)
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 3; ++x)
+                    f.scalar[(size_t)(z*2 + y)*3 + x] = (x == 0) ? -1 : +1;
+        std::vector<uint32_t> counts;
+        mc::CountCells(f, 0, counts);
+        uint32_t expectTotal = mc::TotalTriangles(std::span<const uint32_t>(counts));
+
+        std::vector<mc::McVertex> verts;
+        std::vector<uint32_t> idx;
+        uint32_t triCount = 999u;
+        mc::MarchCells(f, 0, verts, idx, triCount);
+        check(triCount == expectTotal, "MarchCells triCount == TotalTriangles(counts)");
+        check(verts.size() == (size_t)triCount * 3 && idx.size() == (size_t)triCount * 3,
+              "MarchCells verts.size()==idx.size()==3*triCount");
+        // The index buffer is the IDENTITY [0,3T).
+        bool identity = true;
+        for (size_t i = 0; i < idx.size(); ++i) if (idx[i] != (uint32_t)i) identity = false;
+        check(identity, "MarchCells index buffer is the identity [0,3*triCount)");
+    }
+
+    // ================= MC3: MarchCells over the sphere field -> consistency + determinism =========
+    {
+        mc::VoxelField f = mc::MakeSphereField(33, 12);
+        std::vector<mc::McVertex> verts; std::vector<uint32_t> idx; uint32_t triCount = 0u;
+        mc::MarchCells(f, 0, verts, idx, triCount);
+        // Total must equal the MC2 total over the SAME field.
+        std::vector<uint32_t> counts;
+        mc::CountCells(f, 0, counts);
+        uint32_t mc2total = mc::TotalTriangles(std::span<const uint32_t>(counts));
+        check(triCount == mc2total, "MarchCells(sphere) triCount == MC2 TotalTriangles");
+        check(triCount == 5240u, "MarchCells(sphere 33/r12/iso0) triCount == 5240 (the locked count)");
+        check(verts.size() == 3u * 5240u && idx.size() == 3u * 5240u,
+              "MarchCells(sphere) verts==idx==3*5240==15720");
+        // Every index in range [0, 3*triCount).
+        bool inRange = true;
+        for (uint32_t v : idx) if (v >= 3u * triCount) inRange = false;
+        check(inRange, "MarchCells(sphere) every index in [0,3*triCount)");
+
+        // Determinism: a second march is byte-identical (verts + indices).
+        std::vector<mc::McVertex> verts2; std::vector<uint32_t> idx2; uint32_t triCount2 = 0u;
+        mc::MarchCells(f, 0, verts2, idx2, triCount2);
+        bool same = (triCount == triCount2) && verts.size() == verts2.size() && idx.size() == idx2.size() &&
+                    std::memcmp(verts.data(), verts2.data(), verts.size() * sizeof(mc::McVertex)) == 0 &&
+                    std::memcmp(idx.data(), idx2.data(), idx.size() * sizeof(uint32_t)) == 0;
+        check(same, "MarchCells determinism: two marches BYTE-IDENTICAL (verts + indices)");
+
+        // The disabled (meshEnabled=false) path is modeled as the cleared (empty) buffers: a real field
+        // marches to a NON-empty mesh (so the no-op is meaningful).
+        check(!verts.empty(), "a real sphere field marches to a NON-empty mesh");
+    }
+
     if (g_fail == 0) std::printf("mc_test: ALL PASS\n");
     else std::printf("mc_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;

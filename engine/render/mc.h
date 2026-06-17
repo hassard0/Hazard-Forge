@@ -491,4 +491,103 @@ inline VoxelField MakeSphereField(int n, int radiusCells) {
     return f;
 }
 
+// ===== MC3: prefix-sum compaction + triangle EMISSION (midpoint vertices) ==========================
+// Turn the per-cell triangle COUNTS (MC2) into an actual MESH: an exclusive prefix-sum of the counts
+// gives each cell its write OFFSET into the output buffers, then each cell EMITS its triangles as
+// cell-edge MIDPOINT vertices + an index buffer. Kept PURE INTEGER (a midpoint = the SUM of the two
+// integer corner coords in HALF-grid units = 2×the actual midpoint — no division, no float), so the
+// vertex+index buffers are GPU==CPU BIT-EXACT and the golden is cross-backend BIT-IDENTICAL. The GPU
+// shaders (shaders/mc_scan.comp.hlsl single-thread exclusive scan + shaders/mc_emit.comp.hlsl one
+// thread per cell) copy EdgeMidpoint + the kTriTable walk VERBATIM and memcmp GPU==CPU.
+
+// ----- The emitted vertex: an edge-MIDPOINT in HALF-grid units -----------------------------------
+// (x,y,z) = Ca + Cb (each axis), the SUM of the two cube-corner grid coords the edge connects, which
+// equals 2×the actual midpoint — kept as an INTEGER on the half-unit lattice so there is no division /
+// float (the swraster.h fixed-point-lattice discipline). w=0 padding (future use). Trivially memcmp-able
+// (POD, no padding holes — 4×int32).
+struct McVertex {
+    int32_t x, y, z, w;
+};
+
+// EdgeMidpoint(cell, edge): kEdgeCorner[edge] = (a,b) are the two corner indices the edge connects;
+// Ca = cell + kCornerOffset[a], Cb = cell + kCornerOffset[b]; the midpoint (half-units) = Ca + Cb. Pure
+// integer. The GPU mc_emit.comp copies this body VERBATIM.
+inline McVertex EdgeMidpoint(int cx, int cy, int cz, int edge) {
+    const int a = kEdgeCorner[edge][0];
+    const int b = kEdgeCorner[edge][1];
+    const int ax = cx + kCornerOffset[a][0], ay = cy + kCornerOffset[a][1], az = cz + kCornerOffset[a][2];
+    const int bx = cx + kCornerOffset[b][0], by = cy + kCornerOffset[b][1], bz = cz + kCornerOffset[b][2];
+    return McVertex{ax + bx, ay + by, az + bz, 0};
+}
+
+// PrefixSumOffsets: the CPU reference EXCLUSIVE prefix-sum of the per-cell counts. offsetsOut[i] =
+// Σ_{j<i} counts[j] (so offsetsOut[0]==0), totalOut = Σ counts (== MC2's TotalTriangles). This is the
+// serial scan the GPU mc_scan.comp (single thread) mirrors BIT-EXACT — an inherently sequential running
+// sum (the VT2 single-thread-allocator pattern). offsetsOut sized counts.size().
+inline void PrefixSumOffsets(std::span<const uint32_t> counts,
+                             std::span<uint32_t> offsetsOut, uint32_t& totalOut) {
+    uint32_t running = 0u;
+    const size_t n = counts.size();
+    for (size_t i = 0; i < n; ++i) {
+        offsetsOut[i] = running;   // exclusive: the offset is the sum of all PRIOR counts
+        running += counts[i];
+    }
+    totalOut = running;
+}
+
+// EmitCell: walk kTriTable[caseIndex] in groups of 3 (until -1); for triangle t (its GLOBAL index is
+// triOffset+t), for each of its 3 edges k write vertsOut[3*(triOffset+t)+k] = EdgeMidpoint(cell, edge_k)
+// and idxOut[3*(triOffset+t)+k] = 3*(triOffset+t)+k (a triangle SOUP — no cross-cell vertex dedup; the
+// index buffer is the identity, deferred to MC: indexed sharing). Winding per the canonical table. The
+// per-cell writes land in the cell's DISJOINT [3*triOffset, 3*(triOffset+triCount)) range, so the GPU
+// emit is race-free with NO atomics. The GPU mc_emit.comp copies this walk VERBATIM.
+inline void EmitCell(int cx, int cy, int cz, uint8_t caseIndex, uint32_t triOffset,
+                     std::span<McVertex> vertsOut, std::span<uint32_t> idxOut) {
+    const int8_t* row = kTriTable[caseIndex];
+    uint32_t t = 0u;
+    for (int e = 0; e + 2 < 16; e += 3) {
+        if (row[e] < 0) break;   // -1 terminator -> done
+        for (int k = 0; k < 3; ++k) {
+            const int edge = (int)row[e + k];
+            const uint32_t slot = 3u * (triOffset + t) + (uint32_t)k;
+            vertsOut[slot] = EdgeMidpoint(cx, cy, cz, edge);
+            idxOut[slot] = slot;   // identity index (triangle soup)
+        }
+        ++t;
+    }
+}
+
+// MarchCells: the full CPU reference mesher — classify → count → PrefixSumOffsets → EmitCell per cell.
+// verts + idx are sized to exactly 3*triCount and filled in cell order (the deterministic source-order
+// the GPU's per-cell disjoint-range writes reproduce). The reference the GPU mc_scan+mc_emit memcmp's
+// against; verts.size() == idx.size() == 3*triCount.
+inline void MarchCells(const VoxelField& f, int32_t iso,
+                       std::vector<McVertex>& verts, std::vector<uint32_t>& idx, uint32_t& triCount) {
+    const int cxN = f.nx - 1, cyN = f.ny - 1, czN = f.nz - 1;
+    const size_t cellCount = (size_t)f.cellCount();
+
+    // 1) classify + count per cell (cellId = (cz*cyN+cy)*cxN+cx).
+    std::vector<uint8_t> cases;
+    std::vector<uint32_t> counts;
+    ClassifyCells(f, iso, cases);
+    CountCells(f, iso, counts);
+
+    // 2) exclusive prefix-sum of the counts -> per-cell triangle offset + grand total.
+    std::vector<uint32_t> offsets(cellCount, 0u);
+    uint32_t total = 0u;
+    PrefixSumOffsets(std::span<const uint32_t>(counts), std::span<uint32_t>(offsets), total);
+    triCount = total;
+
+    // 3) preallocate the output buffers to exactly 3*total, emit each cell at its offset.
+    verts.assign((size_t)total * 3u, McVertex{0, 0, 0, 0});
+    idx.assign((size_t)total * 3u, 0u);
+    for (int cz = 0; cz < czN; ++cz)
+        for (int cy = 0; cy < cyN; ++cy)
+            for (int cx = 0; cx < cxN; ++cx) {
+                const int cellId = (cz * cyN + cy) * cxN + cx;
+                EmitCell(cx, cy, cz, cases[(size_t)cellId], offsets[(size_t)cellId],
+                         std::span<McVertex>(verts), std::span<uint32_t>(idx));
+            }
+}
+
 }  // namespace hf::render::mc
