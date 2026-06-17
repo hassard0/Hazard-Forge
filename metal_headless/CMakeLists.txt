@@ -247,6 +247,18 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # --msl-version 20200 needed, the mc_classify lesson). Counts + total bit-exact GPU==CPU + cross-backend
 # by construction. Behind --mc-count only; existing shaders + goldens untouched.
 hf_gen_msl(mc_count.comp         mc_count.comp.hlsl         comp mc_count_main)
+# GPU Isosurface Meshing Slice 3 (Slice MC3): the prefix-sum compaction + triangle EMISSION. mc_scan.comp
+# is a SINGLE-THREAD ([numthreads(1,1,1)]) exclusive prefix-sum of the MC2 per-cell counts -> each cell's
+# write offset (the VT2 vt_alloc single-thread-allocator pattern; serial dependency -> one thread ->
+# GPU==CPU bit-exact). mc_emit.comp is ONE thread per cell: reclassify via CaseIndex (VERBATIM
+# render/mc.h), read triOffset=gOffsets[cell], walk gTriTable emitting each triangle's 3 edge-MIDPOINT
+# vertices (EdgeMidpoint = the integer SUM of two corner coords in half-units, NO float) + the identity
+# index into its DISJOINT [3*triOffset,..) range (race-free, NO atomics). meshEnabled=0 -> emit nothing.
+# Plain integer SSBO writes (no atomics, no integer texture.read) -> the default MSL gen suffices (NO
+# --msl-version 20200 needed, the mc_classify/mc_count lesson). Vertex+index buffers bit-exact GPU==CPU +
+# cross-backend by construction. Behind --mc-emit only; existing shaders + goldens untouched.
+hf_gen_msl(mc_scan.comp          mc_scan.comp.hlsl          comp mc_scan_main)
+hf_gen_msl(mc_emit.comp          mc_emit.comp.hlsl          comp mc_emit_main)
 # Nanite Software-Raster Slice 2 (Slice SW2): swraster.comp is the GPU COMPUTE software rasterizer (one
 # thread per cluster-triangle scan-converts into a w*h depth|id visibility-buffer SSBO via InterlockedMin).
 # It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 integer edge math (int64_t in render/

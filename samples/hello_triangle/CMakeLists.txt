@@ -451,6 +451,18 @@ hf_compile_shaders(
     # Pure integer compute over Storage SSBOs + ReadBuffer -> bit-exact GPU==CPU counts + total +
     # cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/mc_count.comp.hlsl:cs"
+    # GPU Isosurface Meshing Slice 3 (Slice MC3): the prefix-sum compaction + triangle EMISSION — the
+    # geometry-generating heart of Marching Cubes. mc_scan.comp is a SINGLE-THREAD ([numthreads(1,1,1)])
+    # exclusive prefix-sum of the MC2 per-cell counts -> each cell's write offset (the VT2 vt_alloc
+    # single-thread-allocator pattern, GPU==CPU bit-exact). mc_emit.comp is ONE thread per cell: it
+    # reclassifies via CaseIndex (VERBATIM render/mc.h), reads triOffset=gOffsets[cell], and walks
+    # gTriTable emitting each triangle's 3 edge-MIDPOINT vertices (EdgeMidpoint = the integer SUM of two
+    # corner coords in half-units, NO float) + the identity index at its DISJOINT range (race-free, NO
+    # atomics). meshEnabled=0 -> emit nothing. Pure integer SSBO compute + compute->compute barrier +
+    # ReadBuffer -> bit-exact GPU==CPU vertex+index buffers + cross-backend, proven memcmp. NO new RHI;
+    # existing shaders + goldens untouched.
+    "shaders/mc_scan.comp.hlsl:cs"
+    "shaders/mc_emit.comp.hlsl:cs"
     # Nanite Software-Raster RESOLVE blit (Slice SW4): swraster_resolve_blit.frag is a FULLSCREEN pass
     # (reuses post.vert) that unpacks the SW2 software rasterizer's packed depth|id visibility-buffer SSBO
     # into the R32_Uint visId render target the EXISTING visresolve.frag deferred resolve consumes, so the
