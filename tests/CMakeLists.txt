@@ -221,6 +221,18 @@ hf_add_pure_test(sss_test)
 # same color_grade.h math is mirrored VERBATIM in color_grade.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(color_grade_test)
 
+# Contrast-Adaptive Sharpening (Slice DF; AMD FidelityFX CAS): the adaptive negative-lobe weight
+# CasWeight (amp = sqrt(clamp(min(minL,1-maxL)/max(maxL,eps),0,1)); w = amp*lerp(-1/8,-1/5,sharpness),
+# forced to EXACTLY 0 at sharpness 0) and the normalized cross sharpen CasSharpen (out = (center +
+# w*(up+down+left+right))/(1+4w), clamped per-channel to the neighborhood [min,max] — the no-ringing
+# clamp) (render/cas.h, header-only). The CORE proof: CasSharpen(c, ..., sharpness=0) == center EXACTLY
+# for ANY neighborhood and CasWeight(...,0) == 0 — the CPU half of the byte-identical sharpness=0 ==
+# unsharpened render proof. Also pins the sharpening behavior (a bright/contrasty center gains contrast,
+# a flat neighborhood is unchanged), the no-overshoot clamp on a hard edge, the adaptive weight (|w|
+# larger in low-contrast than at a hard edge; monotone in sharpness), and determinism. The same cas.h
+# math is mirrored VERBATIM in cas.frag.hlsl. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(cas_test)
+
 # Box-Projected Cubemap Reflections (Slice DA): the slab-method ray-box EXIT t (RayBoxExitT: analytic
 # exit for axis-aligned + diagonal rays, always positive) and the box-projected reflection direction
 # (BoxProject, render/reflection_probe.h, header-only). The CORE proof: BoxProject(parallaxStrength=0)

@@ -17,7 +17,7 @@
            scp it to the Mac, extract, configure+build the metal_headless target ONCE, then for
            EACH committed Metal golden run visual_test with its showcase flag and compare
            the output to the matching golden with threshold 0.0 (every pair must be DIFF 0.0000).
-           A per-golden table is printed; the Mac portion passes only if ALL 42 diff 0.0000.
+           A per-golden table is printed; the Mac portion passes only if ALL 43 diff 0.0000.
 
     Idempotent and re-runnable: build dirs are reused; the Mac staging dir is recreated each run.
 
@@ -95,6 +95,7 @@ $Goldens = @(
     @{ Name = 'gtao';          Flag = '--gtao' }                 # Slice CR (ground-truth ambient occlusion: horizon-search cosine-weighted visibility integral; radius=0 byte-identical to the no-AO scene)
     @{ Name = 'sss';           Flag = '--sss' }                  # Slice CZ (subsurface scattering: screen-space separable depth-aware diffusion; sssStrength=0 byte-identical to the non-SSS lit render)
     @{ Name = 'color_grade';   Flag = '--colorgrade' }           # Slice DB (analytic color grading: lift/gamma/gain + ASC-CDL slope/offset/power + luma-preserving saturation applied post-tonemap; the identity grade is byte-identical to the ungraded tonemap render)
+    @{ Name = 'cas';           Flag = '--cas' }                  # Slice DF (contrast-adaptive sharpening / AMD FidelityFX CAS: an adaptive 3x3-cross edge sharpen on the tonemapped SDR result, clamped to the neighborhood min/max so it never rings; the sharpness=0 render is byte-identical to the unsharpened tonemap render)
     @{ Name = 'refl_probe';    Flag = '--reflprobe' }            # Slice DA (box-projected cubemap reflections: the specular reflection direction parallax-corrected to a local probe box so reflected walls line up with the room geometry; parallaxStrength=0 byte-identical to the standard infinite-cubemap reflection)
     @{ Name = 'capture_probe'; Flag = '--captureprobe' }         # Slice DD (runtime cubemap-capture reflection probe: the scene is rendered into 6 cube faces from the probe center, then a reflective sphere/floor samples the captured cube box-projected; a captured cube face is byte-identical to the scene rendered directly with that face's view/proj)
     @{ Name = 'planar_reflection'; Flag = '--planar' }           # Slice DE (planar reflections: the scene is rendered a second time through the camera reflected across the mirror plane — householder reflection + Lengyel oblique near-clip + flipped winding — into a 2D RT, then the mirror floor samples it at its own screen UV; reflectivity=0 byte-identical to the matte non-reflective render)

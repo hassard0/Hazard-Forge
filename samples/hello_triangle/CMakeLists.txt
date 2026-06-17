@@ -215,6 +215,16 @@ hf_compile_shaders(
     # saturation 1) the grade is a pure pass-through -> byte-identical to the ungraded tonemap render.
     # Existing post/ssr/ssgi/dof/gtao/sss shaders + goldens untouched.
     "shaders/color_grade.frag.hlsl:ps"
+    # Contrast-Adaptive Sharpening (Slice DF; AMD FidelityFX CAS): cas.frag is a NEW fullscreen pass
+    # (reuses post.vert) that reads the resolved TONEMAPPED SDR scene color (the engine's post.frag LDR
+    # result rendered into an intermediate RT), gathers the cross neighborhood (center + up/down/left/
+    # right via the texel size from GetDimensions), and applies render/cas.h's CasSharpen (CasWeight +
+    # CasSharpen mirrored in-shader: out = (center + w*(up+down+left+right))/(1+4w) clamped to the
+    # neighborhood [min,max], the no-ringing clamp) from a small `sharpness` push constant — an adaptive
+    # edge sharpen. Behind --cas-shot ONLY; at sharpness 0 CasWeight==0 -> a pure pass-through ->
+    # byte-identical to the unsharpened tonemap render. Existing post/ssr/ssgi/dof/gtao/sss/colorgrade
+    # shaders + goldens untouched.
+    "shaders/cas.frag.hlsl:ps"
     # Screen-Space Contact Shadows (Slice CT): reuses the SSAO/SSR/GTAO g-buffer (view normal + linear
     # depth). contact_shadows.frag reconstructs the view position (like gtao.frag), marches a SHORT ray
     # TOWARD the sun through the depth field (render/contact_shadows.h RayMarchShadow mirrored in-shader)

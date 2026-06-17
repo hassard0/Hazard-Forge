@@ -235,6 +235,15 @@ hf_gen_msl(sss_blur.frag          sss_blur.frag.hlsl          frag sss_blur_frag
 # Vulkan/CPU path; at the IDENTITY params the grade is a pure pass-through -> byte-identical to the
 # ungraded tonemap render. Behind --colorgrade only; existing shaders + goldens untouched.
 hf_gen_msl(color_grade.frag       color_grade.frag.hlsl       frag color_grade_fragment)
+# Contrast-Adaptive Sharpening (Slice DF; AMD FidelityFX CAS): cas.frag is a NEW fullscreen pass (reuses
+# post.vert) that reads the resolved TONEMAPPED SDR scene color, gathers the cross neighborhood (center +
+# up/down/left/right via the texel size from GetDimensions), and applies render/cas.h's CasSharpen
+# (CasWeight + CasSharpen mirrored in-shader; out = (center + w*(up+down+left+right))/(1+4w) clamped to
+# the neighborhood [min,max]) from a small `sharpness` push constant. The SAME render/cas.h math compiled
+# here makes the sharpen bit-identical to the Vulkan/CPU path; at sharpness 0 CasWeight==0 -> a pure
+# pass-through -> byte-identical to the unsharpened tonemap render. Behind --cas only; existing shaders +
+# goldens untouched.
+hf_gen_msl(cas.frag               cas.frag.hlsl               frag cas_fragment)
 # Screen-Space Contact Shadows (Slice CT): contact_shadows.frag reconstructs the view position from the
 # SSAO/GTAO g-buffer and marches a SHORT ray TOWARD the sun through the depth field (render/
 # contact_shadows.h RayMarchShadow mirrored in-shader) with a baked per-pixel dither, outputting the

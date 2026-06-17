@@ -192,6 +192,8 @@ int main() {
             bool sawSssFeature = false;
             // Slice DB: the color-grading capability is advertised in the feature manifest.
             bool sawColorGradeFeature = false;
+            // Slice DF: the contrast-adaptive-sharpening capability is advertised in the feature manifest.
+            bool sawCasFeature = false;
             // Slice DA: the reflection-probe (box-projected reflections) capability is advertised.
             bool sawReflProbeFeature = false;
             // Slice DD: the capture-reflection-probe (runtime cubemap-capture) capability is advertised.
@@ -259,6 +261,7 @@ int main() {
                     if (AsString(el->value) == "ground-truth-ambient-occlusion") sawGtaoFeature = true;
                     if (AsString(el->value) == "subsurface-scattering") sawSssFeature = true;
                     if (AsString(el->value) == "color-grading") sawColorGradeFeature = true;
+                    if (AsString(el->value) == "contrast-adaptive-sharpening") sawCasFeature = true;
                     if (AsString(el->value) == "reflection-probe") sawReflProbeFeature = true;
                     if (AsString(el->value) == "capture-reflection-probe") sawCaptureProbeFeature = true;
                     if (AsString(el->value) == "planar-reflections") sawPlanarFeature = true;
@@ -308,6 +311,7 @@ int main() {
             check(sawGtaoFeature, "engine.features includes ground-truth-ambient-occlusion");
             check(sawSssFeature, "engine.features includes subsurface-scattering");
             check(sawColorGradeFeature, "engine.features includes color-grading");
+            check(sawCasFeature, "engine.features includes contrast-adaptive-sharpening");
         check(sawReflProbeFeature, "engine.features includes reflection-probe");
             check(sawCaptureProbeFeature, "engine.features includes capture-reflection-probe");
             check(sawPlanarFeature, "engine.features includes planar-reflections");
@@ -410,6 +414,8 @@ int main() {
         bool sawSssShot = false;
         // Slice DB: the --colorgrade-shot showcase flag is listed in the showcase manifest.
         bool sawColorGradeShot = false;
+        // Slice DF: the --cas-shot showcase flag is listed in the showcase manifest.
+        bool sawCasShot = false;
         // Slice DA: the --reflprobe-shot showcase flag is listed in the showcase manifest.
         bool sawReflProbeShot = false;
         // Slice DD: the --captureprobe-shot showcase flag is listed in the showcase manifest.
@@ -484,6 +490,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--gtao-shot") sawGtaoShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--sss-shot") sawSssShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--colorgrade-shot") sawColorGradeShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--cas-shot") sawCasShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--reflprobe-shot") sawReflProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--captureprobe-shot") sawCaptureProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--planar-shot") sawPlanarShot = true;
@@ -537,6 +544,7 @@ int main() {
         check(sawGtaoShot, "showcases manifest includes --gtao-shot");
         check(sawSssShot, "showcases manifest includes --sss-shot");
         check(sawColorGradeShot, "showcases manifest includes --colorgrade-shot");
+        check(sawCasShot, "showcases manifest includes --cas-shot");
         check(sawReflProbeShot, "showcases manifest includes --reflprobe-shot");
         check(sawCaptureProbeShot, "showcases manifest includes --captureprobe-shot");
         check(sawPlanarShot, "showcases manifest includes --planar-shot");

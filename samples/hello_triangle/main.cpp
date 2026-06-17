@@ -39,6 +39,7 @@
 #include "render/planar_reflection.h"
 #include "render/decal.h"
 #include "render/color_grade.h"
+#include "render/cas.h"
 #include "render/post_stack.h"
 #include "render/clustered.h"
 #include "render/cluster.h"
@@ -359,6 +360,7 @@ int main(int argc, char** argv) {
     const char* gtaoShotPath = nullptr;      // --gtao-shot <out.bmp> (Slice CR: ground-truth ambient occlusion)
     const char* sssShotPath = nullptr;       // --sss-shot <out.bmp> (Slice CZ: subsurface scattering)
     const char* colorGradeShotPath = nullptr;// --colorgrade-shot <out.bmp> (Slice DB: analytic color grade)
+    const char* casShotPath = nullptr;       // --cas-shot <out.bmp> (Slice DF: contrast-adaptive sharpening)
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
@@ -720,6 +722,19 @@ int main(int argc, char** argv) {
             // identity). Prints `color-grade: {sat:S, gamma:G}`. One BMP -> exit. New golden; existing
             // post/lit/ssao/ssr/dof/gtao/sss paths/shaders/goldens untouched.
             colorGradeShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--cas-shot") == 0 && i + 1 < argc) {
+            // Slice DF: Contrast-Adaptive Sharpening (AMD FidelityFX CAS). The standard lit+shadowed
+            // scene renders into an HDR RT, the engine's post.frag tonemaps it into an intermediate LDR RT
+            // (swapchain format), then a fullscreen cas.frag pass (reusing post.vert) reads that
+            // tonemapped color, gathers the cross neighborhood, and applies render/cas.h's CasSharpen
+            // (mirrored in-shader) from a small `sharpness` push constant -> swapchain: an adaptive edge
+            // sharpen that crisps detail without ringing (the no-ringing neighborhood clamp). CRITICAL:
+            // the SAME chain is ALSO rendered at sharpness 0 (cas.frag's pure pass-through) and asserted
+            // BYTE-IDENTICAL (SHA) to the unsharpened render (post.frag directly to the swapchain) -- the
+            // sharpness=0 no-op proof (the sharpen has no bias/clamp drift at zero). Prints `cas: {S}`.
+            // One BMP -> exit. New golden; existing post/lit/ssao/ssr/dof/gtao/sss/colorgrade
+            // paths/shaders/goldens untouched.
+            casShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxelfog-shot") == 0 && i + 1 < argc) {
             // Slice CS: Froxel Volumetric Fog (sun single-scattering). A lit+shadowed scene (ground +
             // objects) wrapped in a TRUE 3D view-space FROXEL volume: a compute pass (froxel_inject)
@@ -16896,6 +16911,355 @@ int main(int argc, char** argv) {
                                 colorGradeShotPath, gw, gh, (double)gp.saturation,
                                 (double)gp.gamma.x, kNumObjs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", colorGradeShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Contrast-Adaptive Sharpening showcase (--cas-shot, Slice DF; AMD FidelityFX CAS): an
+        // adaptive 3x3-cross edge sharpen, applied POST-tonemap. The standard lit+shadowed scene renders
+        // into an HDR RT; the EXISTING post.frag tonemaps it into an intermediate LDR RT (swapchain
+        // format); then a fullscreen cas.frag pass (reusing post.vert) reads that tonemapped color,
+        // gathers the cross neighborhood, and applies render/cas.h's CasSharpen (mirrored in-shader) from
+        // a small `sharpness` push constant -> swapchain. A fixed sharpness gives a visibly crisper image
+        // (sharper edges/detail) with no ringing halos (the no-ringing neighborhood clamp). THE
+        // sharpness=0 NO-OP PROOF: the SAME chain at sharpness 0 (cas.frag's pure pass-through -> the
+        // sharpened LDR equals the tonemapped LDR) and the UNSHARPENED render (post.frag DIRECTLY to the
+        // swapchain) are asserted BYTE-IDENTICAL (SHA) -- both quantize the SAME post.frag float to the
+        // SAME 8-bit swapchain format and the sharpness-0 sharpen is an exact pass-through, so it holds on
+        // every backend. Deterministic (fixed camera/lights/sharpness, no RNG); two runs byte-identical.
+        // SEPARATE cas pipeline + the REUSED lit/shadow/sky/post pipelines; existing post/lit/ssao/ssr/
+        // dof/gtao/sss/colorgrade paths/shaders/goldens untouched.
+        if (casShotPath) {
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+            const float kFovY = 1.04719755f;
+
+            // FIXED, deterministic CAS sharpness (the showcase look; strong enough to be visibly crisper).
+            const float kSharpness = 0.8f;
+
+            struct Obj { Vec3 pos; float scale; bool cube; float col[3]; };
+            const Obj objs[] = {
+                {{-2.2f, 0.7f, -0.5f}, 0.7f, true,  {0.90f, 0.20f, 0.20f}},  // red cube
+                {{ 0.0f, 0.9f, -1.2f}, 0.9f, false, {0.20f, 0.85f, 0.30f}},  // green sphere
+                {{ 2.3f, 0.6f,  0.2f}, 0.6f, true,  {0.25f, 0.45f, 0.95f}},  // blue cube
+                {{-0.9f, 0.5f,  1.4f}, 0.5f, false, {0.95f, 0.80f, 0.20f}},  // yellow sphere
+                {{ 1.4f, 0.75f, 1.6f}, 0.75f,true,  {0.85f, 0.35f, 0.90f}},  // magenta cube
+            };
+            const int kNumObjs = (int)(sizeof(objs) / sizeof(objs[0]));
+
+            // --- Lit / shadow / sky pipelines (UNCHANGED shaders). ---
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = kHdr;
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            // --- post (tonemap) + cas fullscreen pipelines (reuse post.vert). ---
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto loadFs = [&](const char* name) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name + ".spv");
+                return device->CreateShaderModule({std::span<const uint32_t>(words)});
+            };
+            // Push-constant layout — MUST match CasParams in shaders/cas.frag.hlsl (sharpness in .x,
+            // padded to a float4). 16 bytes.
+            struct CasPC { float sharpness[4]; };
+            static_assert(sizeof(CasPC) <= 128, "CasPC must fit the 128B push-constant budget");
+            auto casFs  = loadFs("cas.frag.hlsl");
+            auto postFs = loadFs("post.frag.hlsl");
+
+            rhi::GraphicsPipelineDesc casD;
+            casD.vertex = postVsM.get(); casD.fragment = casFs.get();
+            casD.colorFormat = kSwap;
+            casD.depthTest = false; casD.usesTexture = true; casD.fullscreen = true;
+            casD.fragmentPushConstants = true; casD.pushConstantSize = sizeof(CasPC);
+            auto casPipe = device->CreateGraphicsPipeline(casD);
+
+            // post.frag -> the intermediate LDR (swapchain-format) RT for the CAS chain.
+            rhi::GraphicsPipelineDesc postLdrD;
+            postLdrD.vertex = postVsM.get(); postLdrD.fragment = postFs.get();
+            postLdrD.colorFormat = kSwap;
+            postLdrD.depthTest = false; postLdrD.usesTexture = true; postLdrD.fullscreen = true;
+            auto postLdrPipe = device->CreateGraphicsPipeline(postLdrD);
+
+            // post.frag -> the swapchain directly (the UNSHARPENED reference path).
+            rhi::GraphicsPipelineDesc postSwapD;
+            postSwapD.vertex = postVsM.get(); postSwapD.fragment = postFs.get();
+            postSwapD.colorFormat = kSwap;
+            postSwapD.depthTest = false; postSwapD.usesTexture = true; postSwapD.fullscreen = true;
+            auto postSwapPipe = device->CreateGraphicsPipeline(postSwapD);
+
+            auto rt    = device->CreateRenderTarget(w, h, kHdr);   // lit HDR scene
+            auto ldrRT = device->CreateRenderTarget(w, h, kSwap);  // tonemapped LDR (swapchain format)
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> floorPx(256 * 256 * 4);
+            for (uint32_t y = 0; y < 256; ++y)
+                for (uint32_t x = 0; x < 256; ++x) {
+                    bool dark = (((x / 32) + (y / 32)) & 1) != 0;
+                    uint8_t v = dark ? 70 : 110;
+                    size_t idx = (static_cast<size_t>(y) * 256 + x) * 4;
+                    floorPx[idx + 0] = v; floorPx[idx + 1] = v;
+                    floorPx[idx + 2] = (uint8_t)(v + 8); floorPx[idx + 3] = 255;
+                }
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, floorPx.data(), floorPx.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            std::vector<std::unique_ptr<rhi::ITexture>> objTex;
+            for (int o = 0; o < kNumObjs; ++o) {
+                uint8_t px[4] = {(uint8_t)std::lround(objs[o].col[0] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[1] * 255.0f),
+                                 (uint8_t)std::lround(objs[o].col[2] * 255.0f), 255};
+                objTex.push_back(device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)}));
+            }
+
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+            std::vector<Mat4> objModel(kNumObjs);
+            for (int o = 0; o < kNumObjs; ++o)
+                objModel[o] = Mat4::Translate(objs[o].pos) * Mat4::Scale(
+                    {objs[o].scale, objs[o].scale, objs[o].scale});
+
+            const Vec3 eye{0.0f, 1.9f, 5.2f};
+            const Vec3 center{0.0f, 0.7f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 viewM = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * viewM;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.6f; fd.lightDir[1] = -0.75f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.5f; fd.lightColor[1] = 1.42f; fd.lightColor[2] = 1.3f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.6f, -0.75f, -0.3f});
+                Vec3 sc{0.0f, 0.6f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-8.0f, 8.0f, -8.0f, 8.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * kFovY);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto drawObj = [&](rhi::ICommandBuffer& cmd, int o) {
+                const scene::Mesh& m = objs[o].cube ? cube : sphere;
+                cmd.BindVertexBuffer(m.vertices());
+                cmd.BindIndexBuffer(m.indices());
+                cmd.DrawIndexed(m.indexCount());
+            };
+
+            // Record the lit scene (shadow + scene) into the HDR rt.
+            auto recordScene = [&](render::RenderGraph& graph, render::RgResource rgShadow,
+                                   render::RgResource rgScene) {
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            cmd.PushConstants(objModel[o].m, sizeof(float) * 16);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        for (int o = 0; o < kNumObjs; ++o) {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = objModel[o].m[k];
+                            pc[16] = 0.0f; pc[17] = 0.6f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*objTex[o], *flatNormal);
+                            drawObj(cmd, o);
+                        }
+                        cmd.EndRenderPass();
+                    });
+            };
+
+            // Pack the CasParams push constant (sharpness in .x).
+            auto packCas = [](float sharpness) {
+                CasPC pc{};
+                pc.sharpness[0] = sharpness;
+                return pc;
+            };
+
+            // SHARPENED chain: scene -> post.frag tonemap -> ldrRT -> cas.frag(sharpness) -> swapchain.
+            auto renderSharpened = [&](float sharpness,
+                                       std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgLdr = graph.ImportTarget(
+                    "tonemapLdr", render::RgResourceKind::SceneColor, *ldrRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                recordScene(graph, rgShadow, rgScene);
+                graph.AddPass("tonemap", {rgScene}, {rgLdr},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postLdrPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                CasPC cpc = packCas(sharpness);
+                graph.AddPass("cas", {rgLdr}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*casPipe);
+                        cmd.BindTexture(*ldrRT);
+                        cmd.PushConstants(&cpc, sizeof(cpc));
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // UNSHARPENED reference: scene -> post.frag tonemap -> swapchain directly (no CAS pass).
+            auto renderUnsharpened = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                recordScene(graph, rgShadow, rgScene);
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postSwapPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // THE sharpness=0 NO-OP PROOF.
+            //   sharpPx  — the REAL sharpened render (sharpness > 0): the golden.
+            //   zeroPx   — the sharpness=0 render (cas.frag's pure pass-through of the tonemapped LDR).
+            //   unshPx   — the UNSHARPENED render (post.frag DIRECTLY to the swapchain).
+            // zeroPx and unshPx both display the SAME tonemapped LDR (the sharpness-0 sharpen adds
+            // nothing), so they MUST be BYTE-IDENTICAL — proving the CAS pass is a pure pass-through at
+            // zero (no bias/division/clamp drift).
+            std::vector<uint8_t> sharpPx, zeroPx, unshPx;
+            uint32_t sw = 0, sh = 0, zw = 0, zh = 0, uw = 0, uh = 0;
+            if (!renderSharpened(kSharpness, sharpPx, sw, sh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (CAS sharpen)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderSharpened(0.0f, zeroPx, zw, zh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (sharpness=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderUnsharpened(unshPx, uw, uh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (unsharpened reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t zeroHash = fnv(zeroPx), unshHash = fnv(unshPx), sharpHash = fnv(sharpPx);
+            std::printf("cas sharpness=0 hash: %016llx  unsharpened hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)unshHash);
+            const bool zeroEquivalent = (zw == uw) && (zh == uh) && (zeroPx.size() == unshPx.size()) &&
+                                        (std::memcmp(zeroPx.data(), unshPx.data(), unshPx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: sharpness=0 render != unsharpened render — CAS is NOT a pure pass-through at "
+                    "sharpness 0 (bias/division/clamp drift). sharpness0 %016llx vs unsharpened %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)unshHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cas sharpness=0 == unsharpened scene: BYTE-IDENTICAL (sharpness=0 no-op proof)\n");
+            std::printf("cas: {%.4g}\n", (double)kSharpness);
+            // Sanity: the real sharpen must DIFFER from the unsharpened render (the sharpen is visible).
+            if (sharpHash == unshHash)
+                std::fprintf(stderr, "WARNING: sharpened render is identical to the unsharpened render "
+                                     "(no visible sharpen) — check the sharpness\n");
+
+            bool ok = WriteBMP(casShotPath, sharpPx, sw, sh);
+            if (ok) std::printf("wrote %s (%ux%u) — contrast-adaptive sharpening, sharpness %.4g, %d objects\n",
+                                casShotPath, sw, sh, (double)kSharpness, kNumObjs);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", casShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
