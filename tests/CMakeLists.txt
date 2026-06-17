@@ -590,6 +590,17 @@ hf_add_pure_test(swraster_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(mc_test)
 
+# Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
+# fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
+# shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products
+# incl negatives + the int64 intermediate (no overflow within the +-32768 bound) + arithmetic-shift
+# floor semantics, FxISqrt floor(sqrt) on known squares + FxLength 3-4-5, IntegrateBody/IntegrateStep
+# one-step + K-step semi-implicit-Euler closed form (exact Q16.16 fall) + the ground floor clamp
+# (pos.y==groundY, vel.y zeroed on contact) + static bodies never move + the disabled no-op model,
+# determinism (two runs byte-identical), and BroadphaseCell/CellId/FloorDiv incl NEGATIVE coords
+# (correct floor, not truncate-toward-zero). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(fpx_test)
+
 # Virtual Shadow Maps Slice 1 (Slice VA): the virtual clipmap PAGE TABLE + PAGE-NEEDED marking math
 # (render/vsm.h) the GPU shaders/vsm_mark.comp.hlsl copies verbatim. Pins PageId/UnpackPageId bijection
 # over [0,pageCount()), SelectClipmapLevel's INTEGER threshold-ladder edges (at-camera->level0, far->top,
