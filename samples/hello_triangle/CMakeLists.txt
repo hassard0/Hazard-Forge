@@ -284,6 +284,13 @@ hf_compile_shaders(
     # to DA's static env reflection. Reuses probe_bake.{vert,frag} for the capture + post.vert.
     # Existing shaders + goldens untouched.
     "shaders/captureprobe.frag.hlsl:ps"
+    # Planar reflections (Slice DE): the MIRROR-SURFACE fragment. Shades the flat reflective floor with
+    # lit.frag's matte Cook-Torrance result, then blends lerp(matte, reflectionSample, reflectivity) —
+    # the reflection RT being the scene rendered through the camera reflected across the mirror plane
+    # (render::planar's ReflectionMatrix + oblique near-clip + winding flip), sampled at the pixel's own
+    # screen UV. reflectivity=0 -> byte-identical to the matte render (the reflection RT is never read).
+    # Reuses lit.vert (unchanged). Existing shaders + goldens untouched.
+    "shaders/planar.frag.hlsl:ps"
     # Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
     # current jittered HDR scene. Reuses post.vert (fullscreen triangle) + the existing RT/RGBA16F path;
     # the only new shader for the slice. Existing post/bloom/ssao/ssr shaders + goldens untouched.

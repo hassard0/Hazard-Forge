@@ -36,6 +36,7 @@
 #include "render/probe.h"
 #include "render/reflection_probe.h"
 #include "render/cubemap.h"
+#include "render/planar_reflection.h"
 #include "render/decal.h"
 #include "render/color_grade.h"
 #include "render/post_stack.h"
@@ -373,6 +374,7 @@ int main(int argc, char** argv) {
     const char* probeShotPath = nullptr;     // --probe-shot <out.bmp> (Slice AK: reflection/irradiance probes)
     const char* reflProbeShotPath = nullptr; // --reflprobe-shot <out.bmp> (Slice DA: box-projected cubemap reflections)
     const char* captureProbeShotPath = nullptr; // --captureprobe-shot <out.bmp> (Slice DD: runtime cubemap-capture reflection probe)
+    const char* planarShotPath = nullptr;       // --planar-shot <out.bmp> (Slice DE: planar reflections — flat mirror-plane scene reflection)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
     const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
     const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
@@ -908,6 +910,16 @@ int main(int argc, char** argv) {
             // captured cube's face 0 (the capture-correctness proof). One BMP -> exit. New golden;
             // existing paths/shaders/goldens untouched.
             captureProbeShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--planar-shot") == 0 && i + 1 < argc) {
+            // Slice DE: planar reflections showcase (a flat MIRROR floor reflecting the objects standing
+            // on it). The scene is RENDERED a second time through the camera REFLECTED across the mirror
+            // plane (render::planar::ReflectionMatrix * mainView + the Lengyel oblique near-clip at the
+            // mirror plane + FRONT-FACE winding flipped via the existing cullNone knob) into a 2D
+            // reflection RT; then the mirror floor (planar.frag) samples that RT at its own screen UV and
+            // blends lerp(matte, reflection, reflectivity). INTERNALLY renders with reflectivity=0 and
+            // asserts it is BYTE-IDENTICAL (SHA) to the matte-floor render (the no-op proof). One BMP ->
+            // exit. New golden; existing paths/shaders/goldens untouched.
+            planarShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--taa-shot") == 0 && i + 1 < argc) {
             // Slice AP: temporal anti-aliasing showcase. Renders a FIXED N=8 accumulation frames over
             // a static lit + shadowed scene, advancing only the deterministic Halton(2,3) sub-pixel
@@ -2938,6 +2950,308 @@ int main(int argc, char** argv) {
                                 "probe (%.1f,%.1f,%.1f)\n", captureProbeShotPath, sw0, sh0, kCubeSize,
                                 kProbePos.x, kProbePos.y, kProbePos.z);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", captureProbeShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Planar Reflections showcase (--planar-shot, Slice DE). A flat MIRROR FLOOR reflecting the
+        // distinct colored objects standing on it. Distinct from SSR (screen-space) + the cubemap probes
+        // (DA/DD): the scene is RENDERED A SECOND TIME through the camera REFLECTED across the mirror
+        // plane into a 2D reflection RT, then the mirror floor samples that RT at its own screen UV.
+        //
+        // THE PIPELINE (render::planar): reflectedVP = mainProj * ReflectionMatrix(floor) * mainView,
+        // with the Lengyel oblique near-clip set to the mirror plane (geometry behind the mirror clipped)
+        // and FRONT-FACE WINDING FLIPPED (a reflection mirrors handedness so CCW->CW) via the existing
+        // cullNone knob (NO new RHI seam). The reflected scene EXCLUDES the mirror floor itself (no
+        // recursion). The reflection RT is written, the render graph emits the write->sample barrier
+        // (ShaderRead), then the main pass draws the objects (lit) + the floor (planar.frag sampling the
+        // reflection RT) and tonemaps.
+        //
+        // THE reflectivity=0 NO-OP PROOF (backend-portable): the floor is shaded by planar.frag, which
+        // blends lerp(matte, reflectionSample, reflectivity). The showcase renders the scene THREE ways:
+        //   * reflPx  — the REAL reflectivity>0 render (the golden): the floor mirrors the objects.
+        //   * zeroPx  — planar.frag at reflectivity=0 WITH the reflection RT rendered (real reflection).
+        //   * mattePx — planar.frag at reflectivity=0 WITHOUT the reflection RT (it holds a flat clear).
+        // zeroPx and mattePx MUST be BYTE-IDENTICAL — proving that at reflectivity=0 the reflection RT is
+        // never read (no blend bias, no projection drift): the planar render is a pure pass-through to the
+        // matte render. Asserted internally, fail loudly. Deterministic (fixed scene/plane/camera); two
+        // runs byte-identical. Existing lit/floor path + goldens UNTOUCHED (planar is behind this flag).
+        if (planarShotPath) {
+            using math::Mat4; using math::Vec3; using math::Vec4;
+            namespace plr = hf::render::planar;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+            const rhi::Format kHdr  = rhi::Format::RGBA16_Float;
+
+            // === Shaders. lit.vert (scene) + lit.frag (the objects + the reflection-pass geometry) +
+            //     planar.frag (the mirror floor) + post.{vert,frag} (tonemap). ===
+            auto litVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto planFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/planar.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto litVs  = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            auto planFs = device->CreateShaderModule({std::span<const uint32_t>(planFsWords)});
+            auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+            // The objects' lit pipeline (back-face culled, standard winding) — used for the MAIN scene.
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = kHdr;
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;  // model mat4 + material
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // The REFLECTION-pass pipeline: identical to lit but with cullNone=true — a reflection mirrors
+            // handedness (CCW->CW), so back-face culling would wrongly cull the reflected geometry. The
+            // existing cullNone knob is the winding/cull toggle (NO new RHI seam). This is the ONLY
+            // difference from litPipeline.
+            rhi::GraphicsPipelineDesc reflDesc = litDesc;
+            reflDesc.cullNone = true;
+            auto reflPipeline = device->CreateGraphicsPipeline(reflDesc);
+
+            // The mirror-floor pipeline (planar.frag): samples the reflection RT at the environment slot.
+            rhi::GraphicsPipelineDesc floorDesc;
+            floorDesc.vertex = litVs.get(); floorDesc.fragment = planFs.get();
+            floorDesc.vertexLayout = scene::MeshVertexLayout();
+            floorDesc.colorFormat = kHdr;
+            floorDesc.depthTest = true; floorDesc.usesFrameUniforms = true; floorDesc.usesTexture = true;
+            floorDesc.usesEnvironment = true;               // reserve set 3 (the reflection RT)
+            floorDesc.pushConstantSize = sizeof(float) * 20;
+            auto floorPipeline = device->CreateGraphicsPipeline(floorDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            auto reflRT  = device->CreateRenderTarget(w, h, kHdr);  // the 2D planar reflection target
+            auto sceneRT = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex    = colorTex(0.85f, 0.10f, 0.10f);
+            auto greenTex  = colorTex(0.12f, 0.78f, 0.16f);
+            auto blueTex   = colorTex(0.15f, 0.28f, 0.90f);
+            auto floorTex  = colorTex(0.55f, 0.55f, 0.60f);
+
+            // The mirror plane: the floor at world y == 0, facing UP. dot(N,p)+planeD = p.y.
+            const Vec3 kPlaneN{0.0f, 1.0f, 0.0f};
+            const float kPlaneD = 0.0f;
+            const float kReflectivity = 0.75f;   // the golden's mirror strength
+
+            // Distinct colored objects STANDING ON the floor (all above y=0), at distinct xz so the
+            // upside-down reflection is recognizable. The mirror floor itself is a thin wide slab AT y=0.
+            struct Obj { Mat4 model; const scene::Mesh* mesh; rhi::ITexture* tex; float metallic; float rough; };
+            std::vector<Obj> objects = {
+                {Mat4::Translate({-2.2f, 1.0f, -0.5f}) * Mat4::Scale({1.0f, 1.0f, 1.0f}), &cube,   redTex.get(),   0.0f, 0.55f},
+                {Mat4::Translate({ 0.0f, 1.1f,  0.6f}) * Mat4::Scale({1.1f, 1.1f, 1.1f}), &sphere, greenTex.get(), 0.0f, 0.45f},
+                {Mat4::Translate({ 2.3f, 0.8f, -0.3f}) * Mat4::Scale({0.8f, 0.8f, 0.8f}), &cube,   blueTex.get(),  0.0f, 0.6f},
+            };
+            // The mirror floor: a wide thin slab whose TOP face is the mirror plane (y == 0).
+            Mat4 floorModel = Mat4::Translate({0.0f, -0.05f, 0.0f}) * Mat4::Scale({7.0f, 0.05f, 7.0f});
+
+            // Fixed camera: a 3/4 view looking down at the floor so the reflection is clearly visible.
+            const Vec3 eye{0.0f, 2.6f, 7.0f};
+            const Vec3 center{0.0f, 0.6f, 0.0f};
+            const float fovY = 1.04719755f;  // 60deg
+            Mat4 mainView = Mat4::LookAt(eye, center, {0, 1, 0});
+            Mat4 mainProj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+            Mat4 mainVP   = mainProj * mainView;
+
+            // --- The reflected camera + oblique near-clip (render::planar — the SAME math the test pins). ---
+            Mat4 R = plr::ReflectionMatrix(kPlaneN, kPlaneD);
+            Mat4 reflView = mainView * R;                            // main camera viewing the reflected world
+            // The mirror plane in the reflected camera's view space. ObliqueNearClip keeps the half-space
+            // the clip-plane normal points toward; we want to keep the REFLECTED geometry (which lands on
+            // the far side of the mirror in reflView), so the clip plane must point toward it. The world
+            // normal N points to the viewer side; after PlaneToView it points toward the camera side, so
+            // we NEGATE it to keep the reflected scene (and clip only what is genuinely behind the mirror).
+            Vec4 clipPlaneView = plr::PlaneToView(kPlaneN, kPlaneD, reflView);
+            clipPlaneView = Vec4{-clipPlaneView.x, -clipPlaneView.y, -clipPlaneView.z, -clipPlaneView.w};
+            Mat4 reflProjOblique = plr::ObliqueNearClip(mainProj, clipPlaneView);
+            Mat4 reflVP = reflProjOblique * reflView;
+
+            // Common lighting for the FrameData (lit.frag/planar.frag share the layout). skyParams.x =
+            // reflectivity (read by planar.frag; lit.frag ignores skyParams).
+            Vec3 ld = math::normalize(Vec3{-0.35f, -0.85f, -0.35f});
+            auto fillFrame = [&](const Mat4& vp, const Vec3& camPos, float reflectivity) {
+                FrameData fd{};
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z; fd.lightDir[3]=0.0f;
+                fd.lightColor[0]=0.95f; fd.lightColor[1]=0.93f; fd.lightColor[2]=0.88f; fd.lightColor[3]=1.0f;
+                fd.viewPos[0]=camPos.x; fd.viewPos[1]=camPos.y; fd.viewPos[2]=camPos.z; fd.viewPos[3]=1.0f;
+                fd.ptCount[0]=0.0f;
+                // No shadow contribution (dummy 64px shadow map, lightViewProj identity-ish -> out of range).
+                fd.skyParams[0]=reflectivity;
+                // skyParams.y = the planar.frag reflection-sample V-flip toggle (0 on Vulkan — the
+                // reflected-camera render already matches the main pass framebuffer orientation, so the
+                // mirror samples the reflection RT at its own screen UV with no flip).
+                fd.skyParams[1]=0.0f;
+                // skyParams.zw = 1/width, 1/height (the reflection RT screen-UV scale for planar.frag).
+                fd.skyParams[2] = (w > 0) ? 1.0f / (float)w : 0.0f;
+                fd.skyParams[3] = (h > 0) ? 1.0f / (float)h : 0.0f;
+                return fd;
+            };
+
+            auto drawObjects = [&](rhi::ICommandBuffer& cmd, rhi::IPipeline& pipe) {
+                cmd.BindPipeline(pipe);
+                for (const auto& o : objects) {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = o.model.m[k];
+                    pc[16]=o.metallic; pc[17]=o.rough; pc[18]=0.0f; pc[19]=0.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*o.tex, *flatNormal);
+                    cmd.BindVertexBuffer(o.mesh->vertices());
+                    cmd.BindIndexBuffer(o.mesh->indices());
+                    cmd.DrawIndexed(o.mesh->indexCount());
+                }
+            };
+
+            // Render the whole scene. `reflectivity` drives the floor blend; `renderReflection` controls
+            // whether the reflection RT is actually filled with the reflected scene (false -> it holds a
+            // flat clear color, used by the matte reference to prove reflectivity=0 ignores the RT).
+            auto renderScene = [&](float reflectivity, bool renderReflection,
+                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+                FrameData fdMain = fillFrame(mainVP, eye, reflectivity);
+                FrameData fdRefl = fillFrame(reflVP, eye, 0.0f);  // reflection pass: objects only, no floor
+
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget("shadow", render::RgResourceKind::ShadowMap, *dummyShadow);
+                render::RgResource rgRefl  = graph.ImportTarget("reflRT", render::RgResourceKind::SceneColor, *reflRT);
+                render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+                // PASS 0: an EMPTY shadow pass over the dummy shadow map. lit.frag/planar.frag sample
+                // gShadow (the per-frame shadow binding), so the dummy depth image must be transitioned
+                // to SHADER_READ_ONLY before the lit/floor draws sample it (this scene has no shadow
+                // casters — the directional shadow contributes nothing, the dummy is just a valid bind).
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.EndRenderPass();
+                    });
+
+                // PASS 1: render the scene through the REFLECTED camera (objects only — the mirror floor
+                // is EXCLUDED to avoid recursion) into the reflection RT. cullNone flips the winding.
+                // When renderReflection is false the pass clears to a flat color and draws NOTHING, so the
+                // reflection RT holds a constant the matte reference can use to prove reflectivity=0
+                // ignores the RT.
+                graph.AddPass("reflPass", {rgShadow}, {rgRefl},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fdRefl, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.05f, 0.06f, 0.09f, 1});
+                        if (renderReflection) drawObjects(cmd, *reflPipeline);
+                        cmd.EndRenderPass();
+                    });
+
+                // PASS 2: the MAIN scene render. The graph inserts the reflRT write->ShaderRead barrier
+                // before this pass (rgRefl is a read). Draw the objects (lit, back-face culled) + the
+                // mirror floor (planar.frag) sampling the reflection RT.
+                graph.AddPass("mainPass", {rgRefl, rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fdMain, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.05f, 0.06f, 0.09f, 1});
+                        drawObjects(cmd, *litPipeline);
+                        // The mirror floor.
+                        cmd.BindPipeline(*floorPipeline);
+                        cmd.BindReflectionProbe(*reflRT);
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = floorModel.m[k];
+                        pc[16]=0.0f; pc[17]=0.35f; pc[18]=0.0f; pc[19]=0.0f;  // metallic, roughness
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*floorTex, *flatNormal);
+                        cmd.BindReflectionProbe(*reflRT);
+                        cmd.BindVertexBuffer(cube.vertices());
+                        cmd.BindIndexBuffer(cube.indices());
+                        cmd.DrawIndexed(cube.indexCount());
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // reflPx  = the real reflective golden; zeroPx = reflectivity=0 WITH the reflection rendered;
+            // mattePx = reflectivity=0 WITHOUT the reflection (a flat reflRT). zeroPx == mattePx proves
+            // reflectivity=0 never reads the reflection RT (the no-op proof).
+            std::vector<uint8_t> reflPx, zeroPx, mattePx;
+            uint32_t rw0=0, rh0=0, zw0=0, zh0=0, mw0=0, mh0=0;
+            if (!renderScene(kReflectivity, true, reflPx, rw0, rh0)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (planar reflective render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(0.0f, true, zeroPx, zw0, zh0)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (planar reflectivity=0)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!renderScene(0.0f, false, mattePx, mw0, mh0)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (planar matte reference)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            uint64_t reflHash = fnv(reflPx), zeroHash = fnv(zeroPx), matteHash = fnv(mattePx);
+            std::printf("planar reflectivity=0 hash: %016llx  matte-floor hash: %016llx\n",
+                        (unsigned long long)zeroHash, (unsigned long long)matteHash);
+            const bool zeroEquivalent = (zw0 == mw0) && (zh0 == mh0) && (zeroPx.size() == mattePx.size()) &&
+                                        (std::memcmp(zeroPx.data(), mattePx.data(), mattePx.size()) == 0);
+            if (!zeroEquivalent) {
+                std::fprintf(stderr,
+                    "FATAL: planar reflectivity=0 render != matte-floor render — the reflection blend is "
+                    "NOT a pure pass-through at reflectivity=0 (blend bias / the reflection RT is read when "
+                    "it shouldn't be). reflectivity=0 %016llx vs matte %016llx\n",
+                    (unsigned long long)zeroHash, (unsigned long long)matteHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("planar reflectivity=0 == matte-floor render: BYTE-IDENTICAL "
+                        "(reflectivity=0 no-op proof)\n");
+            std::printf("planar: {reflectivity:%.4g}\n", (double)kReflectivity);
+            // Sanity: the reflective render must DIFFER from the matte render (the reflection is visible).
+            if (reflHash == matteHash)
+                std::fprintf(stderr, "WARNING: the reflective render is identical to the matte render "
+                                     "(no visible reflection) — check the mirror plane / scene\n");
+
+            bool ok = WriteBMP(planarShotPath, reflPx, rw0, rh0);
+            if (ok) std::printf("wrote %s (%ux%u) — planar reflection, reflectivity %.4g\n",
+                                planarShotPath, rw0, rh0, (double)kReflectivity);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", planarShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

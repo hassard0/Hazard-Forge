@@ -366,6 +366,15 @@ hf_add_pure_test(probe_test)
 # capture path + the reflection shader. Pure C++ (render/cubemap.h, header-only), ASan-eligible.
 hf_add_pure_test(cubemap_test)
 
+# Planar Reflections (Slice DE): the householder ReflectionMatrix (reflect a point across the mirror
+# plane: +h above y=0 -> -h, a point ON the plane unchanged, the normal flips; INVOLUTORY R*R == I for
+# several planes) + the Lengyel ObliqueNearClip (near plane == mirror plane: a point in front of the
+# mirror kept (depth in [0,1]), a point behind clipped (depth<0); degenerate clip plane -> proj
+# unchanged) + PlaneToView (world plane -> reflected view space, axis-aligned hand-check) + determinism.
+# The same reflection math is mirrored in the reflected-camera render path + the planar.frag mirror
+# shader. Pure C++ (render/planar_reflection.h, header-only), ASan-eligible.
+hf_add_pure_test(planar_reflection_test)
+
 # Machine-readable engine-state introspection (Slice AL): DescribeEngine builds a deterministic JSON
 # document (engine/features/showcases/commands + scene entities + camera/lights + stats). Asserts the
 # JSON parses, the entity/transform/camera/light values are present, backends == ["vulkan","metal"],

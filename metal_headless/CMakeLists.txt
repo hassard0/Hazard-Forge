@@ -319,6 +319,13 @@ hf_gen_msl(reflprobe.frag        reflprobe.frag.hlsl        frag reflprobe_fragm
 # + probe_bake.{vert,frag} (the per-face capture) + post.vert. Same HLSL->SPIR-V->MSL toolchain ->
 # bit-identical to the Vulkan path; new golden capture_probe.png.
 hf_gen_msl(captureprobe.frag     captureprobe.frag.hlsl     frag captureprobe_fragment)
+# Planar reflections (Slice DE): the MIRROR-SURFACE fragment — shades the flat reflective floor with
+# lit.frag's matte Cook-Torrance result, then blends lerp(matte, reflectionSample, reflectivity), the
+# reflection RT being the scene rendered through the camera reflected across the mirror plane
+# (render::planar) sampled at the pixel's own screen UV. reflectivity=0 -> byte-identical to the matte
+# render. Reuses lit.vert + post.{vert,frag}. Same HLSL->SPIR-V->MSL toolchain -> bit-identical to the
+# Vulkan path; new golden planar_reflection.png.
+hf_gen_msl(planar.frag           planar.frag.hlsl           frag planar_fragment)
 # Temporal anti-aliasing (Slice AP): the resolve pass — neighborhood-clamped history blend over the
 # current jittered HDR scene. Reuses post.vert (fullscreen triangle). Same HLSL->SPIR-V->MSL toolchain;
 # existing shaders + goldens untouched.

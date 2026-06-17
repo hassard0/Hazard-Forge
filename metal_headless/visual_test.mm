@@ -57,6 +57,7 @@
 #include "render/probe.h"        // Slice AK: reflection + irradiance probe atlas math (pure math)
 #include "render/reflection_probe.h" // Slice DA: box-projected cubemap reflection math (pure math)
 #include "render/cubemap.h"       // Slice DD: runtime cubemap-capture reflection probe math (pure math)
+#include "render/planar_reflection.h" // Slice DE: planar-reflection math (pure math)
 #include "render/color_grade.h"      // Slice DB: analytic color-grade math (lift/gamma/gain + ASC-CDL + saturation)
 #include "render/clustered.h"     // Slice AG: clustered / Forward+ light culling (pure math)
 #include "render/cluster.h"       // Slice CL: clustered light culling (cluster-grid assignment math)
@@ -17160,6 +17161,232 @@ static int RunCaptureProbeShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Planar Reflections showcase (Slice DE). Mirrors the Vulkan --planar-shot path EXACTLY: a flat
+// MIRROR FLOOR reflecting distinct colored objects standing on it. The scene is RENDERED a second time
+// through the camera REFLECTED across the mirror plane (render::planar::ReflectionMatrix * mainView +
+// the Lengyel oblique near-clip at the mirror plane + flipped front-face winding via the existing
+// cullNone knob) into a 2D reflection RT, then the mirror floor (planar.frag) samples that RT at its
+// own screen UV and blends lerp(matte, reflection, reflectivity). The SAME planar.frag compiled here
+// (HLSL->SPIR-V->MSL) makes the result bit-identical to the Vulkan path. THE reflectivity=0 NO-OP PROOF
+// (backend-portable): reflectivity=0 WITH the reflection rendered == reflectivity=0 WITHOUT it (flat
+// reflRT) — proving the reflection RT is never read at reflectivity=0. New golden planar_reflection.png.
+static int RunPlanarShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3; using math::Vec4;
+    namespace plr = hf::render::planar;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+    const float aspect = (float)W / (float)H;
+
+    auto litVs  = loadMSL("lit.vert.gen.metal",   "vertex_main");
+    auto litFs  = loadMSL("lit.frag.gen.metal",   "fragment_main");
+    auto planFs = loadMSL("planar.frag.gen.metal", "planar_fragment");
+    auto postVs = loadMSL("post.vert.gen.metal",  "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal",  "post_fragment");
+
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = kHdr;
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+    litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    // Reflection pass: cullNone flips the winding (a reflection mirrors handedness). The ONLY difference.
+    rhi::GraphicsPipelineDesc reflDesc = litDesc;
+    reflDesc.cullNone = true;
+    auto reflPipeline = device->CreateGraphicsPipeline(reflDesc);
+
+    rhi::GraphicsPipelineDesc floorDesc;
+    floorDesc.vertex = litVs.get(); floorDesc.fragment = planFs.get();
+    floorDesc.vertexLayout = scene::MeshVertexLayout();
+    floorDesc.colorFormat = kHdr;
+    floorDesc.depthTest = true; floorDesc.usesFrameUniforms = true; floorDesc.usesTexture = true;
+    floorDesc.usesEnvironment = true;
+    floorDesc.pushConstantSize = sizeof(float) * 20;
+    auto floorPipeline = device->CreateGraphicsPipeline(floorDesc);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto reflRT  = device->CreateRenderTarget(W, H, kHdr);
+    auto sceneRT = device->CreateRenderTarget(W, H, kHdr);
+    auto dummyShadow = device->CreateShadowMap(64);
+    device->SetShadowMap(*dummyShadow);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    auto whiteTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    auto colorTex = [&](float r, float g, float b) {
+        uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+        return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+    };
+    auto redTex   = colorTex(0.85f, 0.10f, 0.10f);
+    auto greenTex = colorTex(0.12f, 0.78f, 0.16f);
+    auto blueTex  = colorTex(0.15f, 0.28f, 0.90f);
+    auto floorTex = colorTex(0.55f, 0.55f, 0.60f);
+
+    const Vec3 kPlaneN{0.0f, 1.0f, 0.0f};
+    const float kPlaneD = 0.0f;
+    const float kReflectivity = 0.75f;
+
+    struct Obj { Mat4 model; const scene::Mesh* mesh; rhi::ITexture* tex; float metallic; float rough; };
+    std::vector<Obj> objects = {
+        {Mat4::Translate({-2.2f, 1.0f, -0.5f}) * Mat4::Scale({1.0f, 1.0f, 1.0f}), &cube,   redTex.get(),   0.0f, 0.55f},
+        {Mat4::Translate({ 0.0f, 1.1f,  0.6f}) * Mat4::Scale({1.1f, 1.1f, 1.1f}), &sphere, greenTex.get(), 0.0f, 0.45f},
+        {Mat4::Translate({ 2.3f, 0.8f, -0.3f}) * Mat4::Scale({0.8f, 0.8f, 0.8f}), &cube,   blueTex.get(),  0.0f, 0.6f},
+    };
+    Mat4 floorModel = Mat4::Translate({0.0f, -0.05f, 0.0f}) * Mat4::Scale({7.0f, 0.05f, 7.0f});
+
+    const Vec3 eye{0.0f, 2.6f, 7.0f};
+    const Vec3 center{0.0f, 0.6f, 0.0f};
+    const float fovY = 1.04719755f;
+    Mat4 mainView = Mat4::LookAt(eye, center, {0, 1, 0});
+    Mat4 mainProj = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f));
+    Mat4 mainVP   = mainProj * mainView;
+
+    // The reflected camera + oblique near-clip (render::planar — the SAME math the test pins). The clip
+    // plane points to the viewer side after PlaneToView; NEGATE it so the reflected geometry is KEPT.
+    Mat4 R = plr::ReflectionMatrix(kPlaneN, kPlaneD);
+    Mat4 reflView = mainView * R;
+    Vec4 clipPlaneView = plr::PlaneToView(kPlaneN, kPlaneD, reflView);
+    clipPlaneView = Vec4{-clipPlaneView.x, -clipPlaneView.y, -clipPlaneView.z, -clipPlaneView.w};
+    Mat4 reflProjOblique = plr::ObliqueNearClip(mainProj, clipPlaneView);
+    Mat4 reflVP = reflProjOblique * reflView;
+
+    Vec3 ld = math::normalize(Vec3{-0.35f, -0.85f, -0.35f});
+    auto fillFrame = [&](const Mat4& vp, const Vec3& camPos, float reflectivity) {
+        FrameData fd{};
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0]=ld.x; fd.lightDir[1]=ld.y; fd.lightDir[2]=ld.z; fd.lightDir[3]=0.0f;
+        fd.lightColor[0]=0.95f; fd.lightColor[1]=0.93f; fd.lightColor[2]=0.88f; fd.lightColor[3]=1.0f;
+        fd.viewPos[0]=camPos.x; fd.viewPos[1]=camPos.y; fd.viewPos[2]=camPos.z; fd.viewPos[3]=1.0f;
+        fd.ptCount[0]=0.0f;
+        fd.skyParams[0]=reflectivity;
+        // skyParams.y = reflection-sample V-flip. On Metal the RT texture origin differs from Vulkan, so
+        // the reflection RT is sampled flipped in V to line up with the mirror floor's screen rows.
+        fd.skyParams[1]=1.0f;
+        fd.skyParams[2]=1.0f / (float)W;
+        fd.skyParams[3]=1.0f / (float)H;
+        return fd;
+    };
+
+    auto drawObjects = [&](rhi::ICommandBuffer& cmd, rhi::IPipeline& pipe) {
+        cmd.BindPipeline(pipe);
+        for (const auto& o : objects) {
+            float pc[20];
+            for (int k = 0; k < 16; ++k) pc[k] = o.model.m[k];
+            pc[16]=o.metallic; pc[17]=o.rough; pc[18]=0.0f; pc[19]=0.0f;
+            cmd.PushConstants(pc, sizeof(pc));
+            cmd.BindMaterial(*o.tex, *flatNormal);
+            cmd.BindVertexBuffer(o.mesh->vertices());
+            cmd.BindIndexBuffer(o.mesh->indices());
+            cmd.DrawIndexed(o.mesh->indexCount());
+        }
+    };
+
+    auto renderScene = [&](float reflectivity, bool renderReflection,
+                           std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+        FrameData fdMain = fillFrame(mainVP, eye, reflectivity);
+        FrameData fdRefl = fillFrame(reflVP, eye, 0.0f);
+
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget("shadow", render::RgResourceKind::ShadowMap, *dummyShadow);
+        render::RgResource rgRefl  = graph.ImportTarget("reflRT", render::RgResourceKind::SceneColor, *reflRT);
+        render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+        render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("reflPass", {rgShadow}, {rgRefl},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fdRefl, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.05f, 0.06f, 0.09f, 1});
+                if (renderReflection) drawObjects(cmd, *reflPipeline);
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("mainPass", {rgRefl, rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fdMain, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.05f, 0.06f, 0.09f, 1});
+                drawObjects(cmd, *litPipeline);
+                cmd.BindPipeline(*floorPipeline);
+                cmd.BindReflectionProbe(*reflRT);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = floorModel.m[k];
+                pc[16]=0.0f; pc[17]=0.35f; pc[18]=0.0f; pc[19]=0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*floorTex, *flatNormal);
+                cmd.BindReflectionProbe(*reflRT);
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexed(cube.indexCount());
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneRT);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    auto fnv = [](const std::vector<uint8_t>& px) {
+        uint64_t hsh = 1469598103934665603ull;
+        for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+        return hsh;
+    };
+
+    std::vector<uint8_t> reflPx, zeroPx, mattePx;
+    uint32_t rw0=0, rh0=0, zw0=0, zh0=0, mw0=0, mh0=0;
+    if (!renderScene(kReflectivity, true, reflPx, rw0, rh0)) return fail("no captured pixels (planar reflective)");
+    if (!renderScene(0.0f, true, zeroPx, zw0, zh0)) return fail("no captured pixels (planar reflectivity=0)");
+    if (!renderScene(0.0f, false, mattePx, mw0, mh0)) return fail("no captured pixels (planar matte)");
+
+    const bool zeroEquivalent = (zw0 == mw0) && (zh0 == mh0) && (zeroPx.size() == mattePx.size()) &&
+                                (std::memcmp(zeroPx.data(), mattePx.data(), mattePx.size()) == 0);
+    if (!zeroEquivalent)
+        return fail("planar reflectivity=0 render != matte-floor render — the reflection blend is NOT a pure pass-through at reflectivity=0");
+    std::printf("planar reflectivity=0 == matte-floor render: BYTE-IDENTICAL (reflectivity=0 no-op proof) "
+                "[zero %016llx matte %016llx]\n",
+                (unsigned long long)fnv(zeroPx), (unsigned long long)fnv(mattePx));
+    std::printf("planar: {reflectivity:%.4g}\n", (double)kReflectivity);
+
+    if (!WritePNG(outPath, reflPx, rw0, rh0)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — planar reflection, reflectivity %.4g\n",
+                outPath, rw0, rh0, (double)kReflectivity);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     @autoreleasepool {
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
@@ -17783,6 +18010,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--captureprobe") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_capture_probe.png";
             try { return RunCaptureProbeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --planar <out.png>: planar reflections showcase (Slice DE). A flat mirror floor reflecting the
+        // colored objects standing on it: the scene is rendered through the camera reflected across the
+        // mirror plane into a 2D RT, then the mirror floor samples it. INTERNALLY asserts reflectivity=0
+        // == the matte render (BYTE-IDENTICAL). Mirrors the Vulkan --planar-shot; new golden
+        // planar_reflection.png.
+        if (argc > 1 && std::strcmp(argv[1], "--planar") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_planar.png";
+            try { return RunPlanarShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --taa <out.png>: temporal anti-aliasing showcase (Slice AP). The settled sphere-pyramid scene

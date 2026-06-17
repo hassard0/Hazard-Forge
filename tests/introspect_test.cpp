@@ -196,6 +196,8 @@ int main() {
             bool sawReflProbeFeature = false;
             // Slice DD: the capture-reflection-probe (runtime cubemap-capture) capability is advertised.
             bool sawCaptureProbeFeature = false;
+            // Slice DE: the planar-reflections capability is advertised in the feature manifest.
+            bool sawPlanarFeature = false;
             // Slice CS: the froxel-volumetric-fog capability is advertised in the feature manifest.
             bool sawFroxelFogFeature = false;
             // Slice CV: the froxel-light-injection capability is advertised in the feature manifest.
@@ -259,6 +261,7 @@ int main() {
                     if (AsString(el->value) == "color-grading") sawColorGradeFeature = true;
                     if (AsString(el->value) == "reflection-probe") sawReflProbeFeature = true;
                     if (AsString(el->value) == "capture-reflection-probe") sawCaptureProbeFeature = true;
+                    if (AsString(el->value) == "planar-reflections") sawPlanarFeature = true;
                     if (AsString(el->value) == "froxel-volumetric-fog") sawFroxelFogFeature = true;
                     if (AsString(el->value) == "froxel-light-injection") sawFroxelLightsFeature = true;
                     if (AsString(el->value) == "volumetric-shadows") sawVolShadowsFeature = true;
@@ -307,6 +310,7 @@ int main() {
             check(sawColorGradeFeature, "engine.features includes color-grading");
         check(sawReflProbeFeature, "engine.features includes reflection-probe");
             check(sawCaptureProbeFeature, "engine.features includes capture-reflection-probe");
+            check(sawPlanarFeature, "engine.features includes planar-reflections");
             check(sawFroxelFogFeature, "engine.features includes froxel-volumetric-fog");
             check(sawFroxelLightsFeature, "engine.features includes froxel-light-injection");
             check(sawVolShadowsFeature, "engine.features includes volumetric-shadows");
@@ -410,6 +414,8 @@ int main() {
         bool sawReflProbeShot = false;
         // Slice DD: the --captureprobe-shot showcase flag is listed in the showcase manifest.
         bool sawCaptureProbeShot = false;
+        // Slice DE: the --planar-shot showcase flag is listed in the showcase manifest.
+        bool sawPlanarShot = false;
         // Slice CS: the --froxelfog-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelFogShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
@@ -480,6 +486,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--colorgrade-shot") sawColorGradeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--reflprobe-shot") sawReflProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--captureprobe-shot") sawCaptureProbeShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--planar-shot") sawPlanarShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxelfog-shot") sawFroxelFogShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
@@ -532,6 +539,7 @@ int main() {
         check(sawColorGradeShot, "showcases manifest includes --colorgrade-shot");
         check(sawReflProbeShot, "showcases manifest includes --reflprobe-shot");
         check(sawCaptureProbeShot, "showcases manifest includes --captureprobe-shot");
+        check(sawPlanarShot, "showcases manifest includes --planar-shot");
         check(sawFroxelFogShot, "showcases manifest includes --froxelfog-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
