@@ -85,6 +85,7 @@
 #include "render/visresolve.h"      // Slice DX: deferred material resolve CPU mirror (ResolveMaterial/DefaultResolveMaterial/ResolveSkyColor/ResolvePixel/EncodeBGRA8) — shared verbatim with --visresolve-shot (Vulkan)
 #include "render/swraster.h"        // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw/BuildSwRasterScene/ColorSwVisBuffer) — shared verbatim with --swraster-shot (Vulkan)
 #include "render/vsm.h"             // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp + the Vulkan --vsm-mark-shot
+#include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -15811,6 +15812,202 @@ static int RunSwRasterResolveShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Runtime Virtual Texturing PAGE-NEEDED FEEDBACK MARKING showcase (Slice VT1, the BEACHHEAD of
+// FLAGSHIP #4). The TRUE pass is identical on both backends: a fixed virtual texture (a MIP PYRAMID) + a
+// fixed deterministic (UV,mip) sample-request set feed the SAME shaders/vt_feedback.comp (here
+// vt_feedback.comp.gen.metal). The host HOST-SNAPS each request to integer (mip,px,py) page coords
+// (vt.h::SnapRequest — the UV->page quantization done CPU-side so the GPU does ZERO float), one thread
+// per request computes pageId via PageId (copied VERBATIM from render/vt.h) -> feedback[pageId]=1 (an
+// order-independent integer SET). ReadBuffer reads the feedback[] set and it is PROVEN BIT-EXACT vs the
+// CPU vt::MarkFeedbackPages reference (memcmp, NO FP tolerance) — the same GPU==CPU proof the Vulkan
+// --vt-feedback-shot runs; feedbackEnabled=false -> empty set; two runs byte-identical. The image golden
+// is a per-mip page-grid debug-viz CPU-colored from the read-back integer set (resident page ->
+// hashColor(pageId), else dark) -> identical to the Vulkan path BY CONSTRUCTION (same integer bits ->
+// same RGB). New golden tests/golden/metal/vt_feedback.png; two runs DIFF 0.0000. NO rendering, NO new RHI.
+static int RunVtFeedbackShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vt = render::vt;
+    namespace vg = render::vg;
+    const uint32_t W = 1024, H = 256;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // The fixed virtual texture (== the Vulkan --vt-feedback-shot config).
+    vt::VtTexture vtx;
+    vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+    const int nPages = vtx.pageCount();
+
+    // The fixed deterministic (UV, mip) sample-request set (== the Vulkan path).
+    std::vector<vt::SampleRequest> requests;
+    const int kGrid = 24;
+    for (int gy = 0; gy < kGrid; ++gy)
+        for (int gx = 0; gx < kGrid; ++gx) {
+            float u = (float)gx / (float)kGrid;
+            float v = (float)gy / (float)kGrid;
+            int mip = (gx + gy) % vtx.mipLevels;
+            requests.push_back({u, v, mip});
+        }
+    const uint32_t requestCount = (uint32_t)requests.size();
+
+    // HOST-SNAP each request to integer (mip,px,py) page coords (the GPU does ZERO float).
+    std::vector<int32_t> reqI4((size_t)requestCount * 4);
+    for (uint32_t r = 0; r < requestCount; ++r) {
+        vt::SnappedRequest sn = vt::SnapRequest(requests[r], vtx);
+        reqI4[(size_t)r * 4 + 0] = sn.mip;
+        reqI4[(size_t)r * 4 + 1] = sn.px;
+        reqI4[(size_t)r * 4 + 2] = sn.py;
+        reqI4[(size_t)r * 4 + 3] = 0;
+    }
+    rhi::BufferDesc reqDesc;
+    reqDesc.size = reqI4.size() * sizeof(int32_t);
+    reqDesc.initialData = reqI4.data();
+    reqDesc.usage = rhi::BufferUsage::Storage;
+    auto reqBuf = device->CreateBuffer(reqDesc);
+
+    std::vector<uint32_t> feedbackInit((size_t)nPages, 0u);
+    auto makeFeedbackBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = feedbackInit.size() * sizeof(uint32_t);
+        d.initialData = feedbackInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct VtParams {
+        uint32_t dims[4];
+        uint32_t pagesPerSide[16];
+        uint32_t mipOffset[16];
+    };
+    static_assert(sizeof(VtParams) == 16 + 64 + 64, "VtParams std430 layout");
+    auto makeParams = [&](uint32_t feedbackEnabled) {
+        VtParams p{};
+        p.dims[0] = (uint32_t)vtx.mipLevels; p.dims[1] = requestCount;
+        p.dims[2] = feedbackEnabled;         p.dims[3] = 0u;
+        for (int m = 0; m < vtx.mipLevels; ++m) {
+            p.pagesPerSide[m] = (uint32_t)vtx.pagesPerSide(m);
+            p.mipOffset[m]    = (uint32_t)vtx.mipPageOffset(m);
+        }
+        return p;
+    };
+
+    auto fbCs = loadMSL("vt_feedback.comp.gen.metal", "vt_feedback_main");
+    rhi::ComputePipelineDesc fbCd;
+    fbCd.compute = fbCs.get(); fbCd.storageBufferCount = 3; fbCd.threadsPerGroupX = 64;
+    auto fbCompute = device->CreateComputePipeline(fbCd);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    const uint32_t kGroups = (requestCount + 63u) / 64u;
+
+    auto runFeedback = [&](uint32_t feedbackEnabled, std::vector<uint32_t>& outFeedback) {
+        auto feedbackBuf = makeFeedbackBuf();
+        VtParams params = makeParams(feedbackEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(VtParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("vt_feedback", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*fbCompute);
+                cmd.BindStorageBuffer(*reqBuf, 0);
+                cmd.BindStorageBuffer(*feedbackBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outFeedback.assign((size_t)nPages, 0u);
+        device->ReadBuffer(*feedbackBuf, outFeedback.data(), outFeedback.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU feedback (enabled).
+    std::vector<uint32_t> gpuFeedback;
+    runFeedback(1u, gpuFeedback);
+
+    // CPU reference over the SAME requests.
+    std::vector<uint32_t> cpuFeedback((size_t)nPages, 0u);
+    vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                          std::span<uint32_t>(cpuFeedback.data(), cpuFeedback.size()));
+
+    if (std::memcmp(gpuFeedback.data(), cpuFeedback.data(), (size_t)nPages * sizeof(uint32_t)) != 0)
+        return fail("vt-feedback: GPU feedback set != CPU MarkFeedbackPages (transcendental/FP crept in?)");
+    uint32_t residentPages = 0;
+    for (uint32_t f : gpuFeedback) residentPages += (f != 0u) ? 1u : 0u;
+    if (residentPages == 0u || residentPages >= (uint32_t)nPages)
+        return fail("vt-feedback: feedback set degenerate");
+    std::printf("vt-feedback GPU==CPU page set: %u pages BIT-EXACT\n", residentPages);
+
+    // feedbackEnabled=false -> empty set.
+    std::vector<uint32_t> disabledFeedback;
+    runFeedback(0u, disabledFeedback);
+    for (uint32_t f : disabledFeedback) if (f != 0u) return fail("vt-feedback: disabled path not empty");
+    std::printf("vt-feedback disabled: empty set (no-op)\n");
+
+    // two-run determinism.
+    std::vector<uint32_t> gpuFeedback2;
+    runFeedback(1u, gpuFeedback2);
+    if (gpuFeedback.size() != gpuFeedback2.size() ||
+        std::memcmp(gpuFeedback.data(), gpuFeedback2.data(), gpuFeedback.size() * sizeof(uint32_t)) != 0)
+        return fail("vt-feedback: two dispatches differ (nondeterministic)");
+    std::printf("vt-feedback determinism: two dispatches BYTE-IDENTICAL\n");
+    std::printf("vt-feedback: {vt:%dmip/%dvpps0, requests:%u, resident:%u/%d}\n",
+                vtx.mipLevels, vtx.virtualPagesPerSideMip0, requestCount, residentPages, nPages);
+
+    // --- Golden: per-mip page-grid debug-viz, CPU-colored from the read-back integer set (IDENTICAL to
+    // the Vulkan --vt-feedback-shot by construction). ---
+    const uint32_t imgW = 1024, imgH = 256;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    const int kGutter = 8;
+    const int kMaxPanel = (int)imgH - 2 * kGutter;
+    int x = kGutter;
+    for (int mip = 0; mip < vtx.mipLevels; ++mip) {
+        const int pps = vtx.pagesPerSide(mip);
+        int side = kMaxPanel * pps / vtx.virtualPagesPerSideMip0;
+        if (side < pps) side = pps;
+        int y0 = ((int)imgH - side) / 2;
+        for (int sy = 0; sy < side; ++sy) {
+            int py = sy * pps / side; if (py >= pps) py = pps - 1;
+            int iy = y0 + sy; if (iy < 0 || iy >= (int)imgH) continue;
+            for (int sx = 0; sx < side; ++sx) {
+                int px = sx * pps / side; if (px >= pps) px = pps - 1;
+                int ix = x + sx; if (ix < 0 || ix >= (int)imgW) continue;
+                int pageId = vt::PageId(mip, px, py, vtx);
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                bool gridLine = ((sx * pps) % side) < pps || ((sy * pps) % side) < pps;
+                if (gpuFeedback[(size_t)pageId] != 0u) {
+                    Vec3 col = vg::hashColor((uint32_t)pageId);
+                    float dim = gridLine ? 0.55f : 1.0f;
+                    dst[0] = (uint8_t)(col.z * 255.0f * dim + 0.5f);
+                    dst[1] = (uint8_t)(col.y * 255.0f * dim + 0.5f);
+                    dst[2] = (uint8_t)(col.x * 255.0f * dim + 0.5f);
+                    dst[3] = 255;
+                } else {
+                    uint8_t v = gridLine ? 22 : 34;
+                    dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                }
+            }
+        }
+        x += side + kGutter;
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — per-mip VT page-feedback viz (%u resident pages)\n",
+                outPath, imgW, imgH, residentPages);
+    return 0;
+}
+
 // --- Virtual Shadow Maps PAGE-NEEDED MARKING showcase (Slice VA). The TRUE pass is identical on both
 // backends: a fixed directional CLIPMAP + a fixed ground-grid receiver point-set feed the SAME
 // shaders/vsm_mark.comp (here vsm_mark.comp.gen.metal) — one thread per receiver runs SelectClipmapLevel
@@ -24365,6 +24562,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vsm-mark") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vsm_pages.png";
             try { return RunVsmMarkShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vt-feedback <out.png>: render the Runtime Virtual Texturing PAGE-NEEDED FEEDBACK MARKING
+        // showcase (Slice VT1, the beachhead of FLAGSHIP #4). A fixed virtual texture (a MIP PYRAMID) + a
+        // fixed deterministic (UV,mip) sample-request set feed the SAME vt_feedback.comp (one thread per
+        // request consumes its host-snapped integer (mip,px,py) page coords + computes pageId via PageId,
+        // verbatim render/vt.h) -> feedback[pageId]=1. ReadBuffer reads the integer feedback set, PROVEN
+        // BIT-EXACT vs the CPU vt::MarkFeedbackPages reference (memcmp, no FP tol — the same GPU==CPU proof
+        // the Vulkan --vt-feedback-shot runs); feedbackEnabled=false -> empty set; two runs byte-identical.
+        // The image golden is a per-mip page-grid debug-viz CPU-colored from the read-back integer set
+        // (resident page -> hashColor(pageId), else dark), identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/vt_feedback.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--vt-feedback") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vt_feedback.png";
+            try { return RunVtFeedbackShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vsm-render <out.png>: render the Virtual Shadow Maps PHYSICAL-PAGE DEPTH showcase (Slice VB).

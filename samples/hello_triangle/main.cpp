@@ -65,6 +65,7 @@
 #include "render/visresolve.h"  // Slice DX: deferred material resolve CPU mirror (ResolveFlatShade/ResolvePixel/EncodeBGRA8)
 #include "render/swraster.h"    // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw) — shared verbatim with --swraster (Metal)
 #include "render/vsm.h"         // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp
+#include "render/vt.h"          // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -435,6 +436,7 @@ int main(int argc, char** argv) {
     const char* vsmRenderShotPath = nullptr; // --vsm-render-shot <out.bmp> (Slice VB: allocate physical atlas tiles to VA's resident pages + render each page's casters' depth into its tile; colorized depth atlas)
     const char* vsmSampleShotPath = nullptr; // --vsm-sample-shot <out.bmp> (Slice VC: lit-pass VSM indirection sample — per receiver pixel level->page->tile->tile-clamped PCF over the depth atlas -> a VSM-shadowed scene; vsmEnabled=0 byte-identical-to-unshadowed no-op)
     const char* vsmCacheShotPath = nullptr; // --vsm-cache-shot <out.bmp> (Slice VD: per-page CACHING — content-key cache skips re-rendering unchanged physical pages; cached==fresh + cached==full BYTE-IDENTICAL; cache-status viz)
+    const char* vtFeedbackShotPath = nullptr; // --vt-feedback-shot <out.bmp> (Slice VT1: runtime virtual texturing page-needed FEEDBACK marking, integer compute, GPU==CPU feedback-set bit-exact, per-mip page-grid debug-viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1349,6 +1351,23 @@ int main(int argc, char** argv) {
             // new RHI (the cache is pure host logic; "skip a page render" = not issuing its SetViewport+
             // draw). One BMP -> exit.
             vsmCacheShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--vt-feedback-shot") == 0 && i + 1 < argc) {
+            // Slice VT1: Runtime Virtual Texturing Slice 1 — VT PAGE TABLE + PAGE-NEEDED FEEDBACK MARKING
+            // (BEACHHEAD of FLAGSHIP #4, UE5's literal RVT). A fixed virtual texture (mipLevels=4,
+            // pageSize=128, virtualPagesPerSideMip0=16 -> a 2048²-mip0 mip pyramid, 340 pages) + a fixed
+            // deterministic set of (UV,mip) sample-requests feed a pure INTEGER compute pass
+            // (shaders/vt_feedback.comp): one thread per request consumes its HOST-SNAPPED integer
+            // (mip,px,py) page coords (the host ran the UV->page quantization vt.h::SnapRequest, GPU does
+            // ZERO float) + computes pageId via PageId (copied VERBATIM from render/vt.h) -> feedback[
+            // pageId]=1 (an order-independent integer SET). ReadBuffer reads the feedback[] set back.
+            // PROOFS (fail loudly): (1) GPU==CPU feedback set BIT-EXACT (CPU MarkFeedbackPages over the
+            // SAME requests -> memcmp==0, integer, NO FP tol), (2) feedbackEnabled=false -> empty set
+            // (all-zero == cleared), (3) two-run determinism byte-identical, (4) {vt,requests,resident}.
+            // Golden = a per-mip page-grid debug-viz: each resident page hashColor(pageId), non-resident
+            // dark; the mips laid out in a row (mip 0 widest, each coarser mip narrower), CPU-colored from
+            // the read-back integer set -> identical both backends by construction. NO rendering, NO new
+            // RHI (BufferUsage::Storage + DispatchCompute + ReadBuffer). One BMP -> exit.
+            vtFeedbackShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -14192,6 +14211,234 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — CPU-colored visibility buffer (%u survivor clusters)\n",
                                 visbufferShotPath, vw, vh, drawn);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", visbufferShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Runtime Virtual Texturing PAGE-NEEDED FEEDBACK MARKING (--vt-feedback-shot <out.bmp>,
+        // Slice VT1, the BEACHHEAD of FLAGSHIP #4). A fixed virtual texture (a MIP PYRAMID) + a fixed
+        // deterministic (UV,mip) sample-request set feed a pure INTEGER compute (shaders/vt_feedback.comp):
+        // the host HOST-SNAPS each request to integer (mip,px,py) page coords (vt.h::SnapRequest, the
+        // UV->page quantization done CPU-side so the GPU does ZERO float), one thread per request computes
+        // pageId via PageId (verbatim render/vt.h) -> feedback[pageId]=1. ReadBuffer reads the integer
+        // feedback set; the CPU vt::MarkFeedbackPages over the SAME requests must match it BIT-EXACT
+        // (memcmp, no FP tol). feedbackEnabled=false -> empty set. The golden is a per-mip page-grid
+        // debug-viz, CPU-colored from the read-back set (resident -> hashColor(pageId), else dark) ->
+        // identical both backends by construction. NO rendering, NO new RHI.
+        if (vtFeedbackShotPath) {
+            using math::Vec3;
+            namespace vt = hf::render::vt;
+            namespace vg = hf::render::vg;
+            // Fixed virtual texture (the spec's showcase config): 2048²-mip0 mip pyramid, 340 pages.
+            vt::VtTexture vtx;
+            vtx.mipLevels = 4; vtx.pageSize = 128; vtx.virtualPagesPerSideMip0 = 16;
+            const int nPages = vtx.pageCount();
+
+            // Fixed deterministic (UV, mip) sample-request set: a UV grid sampled at a couple of mips so a
+            // known NON-trivial subset of pages is marked. Mip chosen by (gx+gy)%mipLevels so all 4 mips
+            // are exercised; 24x24 = 576 deterministic requests.
+            std::vector<vt::SampleRequest> requests;
+            const int kGrid = 24;
+            for (int gy = 0; gy < kGrid; ++gy)
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    float u = (float)gx / (float)kGrid;   // [0,1)
+                    float v = (float)gy / (float)kGrid;
+                    int mip = (gx + gy) % vtx.mipLevels;
+                    requests.push_back({u, v, mip});
+                }
+            const uint32_t requestCount = (uint32_t)requests.size();
+
+            // HOST-SNAP each request to integer (mip,px,py) page coords (the GPU consumes these as int4 so
+            // it does ZERO float — the swraster.h host-snap discipline). x=mip, y=px, z=py, w=0.
+            std::vector<int32_t> reqI4((size_t)requestCount * 4);
+            for (uint32_t r = 0; r < requestCount; ++r) {
+                vt::SnappedRequest sn = vt::SnapRequest(requests[r], vtx);
+                reqI4[(size_t)r * 4 + 0] = sn.mip;
+                reqI4[(size_t)r * 4 + 1] = sn.px;
+                reqI4[(size_t)r * 4 + 2] = sn.py;
+                reqI4[(size_t)r * 4 + 3] = 0;
+            }
+            rhi::BufferDesc reqDesc;
+            reqDesc.size = reqI4.size() * sizeof(int32_t);
+            reqDesc.initialData = reqI4.data();
+            reqDesc.usage = rhi::BufferUsage::Storage;
+            auto reqBuf = device->CreateBuffer(reqDesc);
+
+            // feedback[] integer set (cleared to 0). A fresh zero upload per run (so the disabled-path
+            // proof reads the cleared bytes back).
+            std::vector<uint32_t> feedbackInit((size_t)nPages, 0u);
+            auto makeFeedbackBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = feedbackInit.size() * sizeof(uint32_t);
+                d.initialData = feedbackInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches vt_feedback.comp Params std430): uint4 dims + uint4 pagesPerSide[4] + uint4
+            // mipOffset[4] (16 uints each = kMaxMips entries). The per-mip tables are host-precomputed
+            // integers both CPU + shader read the SAME of (the page math is pure integer).
+            struct VtParams {
+                uint32_t dims[4];          // mipLevels, requestCount, feedbackEnabled, _
+                uint32_t pagesPerSide[16]; // pagesPerSide[m]
+                uint32_t mipOffset[16];    // mipPageOffset(m)
+            };
+            static_assert(sizeof(VtParams) == 16 + 64 + 64, "VtParams std430 layout");
+            auto makeParams = [&](uint32_t feedbackEnabled) {
+                VtParams p{};
+                p.dims[0] = (uint32_t)vtx.mipLevels; p.dims[1] = requestCount;
+                p.dims[2] = feedbackEnabled;         p.dims[3] = 0u;
+                for (int m = 0; m < vtx.mipLevels; ++m) {
+                    p.pagesPerSide[m] = (uint32_t)vtx.pagesPerSide(m);
+                    p.mipOffset[m]    = (uint32_t)vtx.mipPageOffset(m);
+                }
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (requests, feedback, params); 64 threads/group.
+            auto fbCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vt_feedback.comp.hlsl.spv");
+            auto fbCs = device->CreateShaderModule({std::span<const uint32_t>(fbCsWords)});
+            rhi::ComputePipelineDesc fbCdesc;
+            fbCdesc.compute = fbCs.get();
+            fbCdesc.storageBufferCount = 3;
+            fbCdesc.pushConstantSize = 0;
+            fbCdesc.threadsPerGroupX = 64;
+            auto fbCompute = device->CreateComputePipeline(fbCdesc);
+
+            const uint32_t kGroups = (requestCount + 63u) / 64u;
+
+            // Run the feedback compute over a fresh feedback buffer + a params buffer, read back feedback[].
+            auto runFeedback = [&](uint32_t feedbackEnabled, std::vector<uint32_t>& outFeedback) {
+                auto feedbackBuf = makeFeedbackBuf();
+                VtParams params = makeParams(feedbackEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(VtParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("vt_feedback", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*fbCompute);
+                        cmd.BindStorageBuffer(*reqBuf, 0);
+                        cmd.BindStorageBuffer(*feedbackBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outFeedback.assign((size_t)nPages, 0u);
+                device->ReadBuffer(*feedbackBuf, outFeedback.data(),
+                                   outFeedback.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU feedback (enabled) ===
+            std::vector<uint32_t> gpuFeedback;
+            runFeedback(1u, gpuFeedback);
+
+            // === CPU reference over the SAME requests ===
+            std::vector<uint32_t> cpuFeedback((size_t)nPages, 0u);
+            vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vtx,
+                                  std::span<uint32_t>(cpuFeedback.data(), cpuFeedback.size()));
+
+            // PROOF (1) GPU==CPU feedback set BIT-EXACT (integer memcmp, NO FP tolerance).
+            if (std::memcmp(gpuFeedback.data(), cpuFeedback.data(),
+                            (size_t)nPages * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vt-feedback GPU feedback set != CPU MarkFeedbackPages "
+                             "(a transcendental/FP crept into the page quantization?)\n");
+                device->WaitIdle(); return 1;
+            }
+            uint32_t residentPages = 0;
+            for (uint32_t f : gpuFeedback) residentPages += (f != 0u) ? 1u : 0u;
+            if (residentPages == 0u || residentPages >= (uint32_t)nPages) {
+                std::fprintf(stderr, "FATAL: vt-feedback feedback set degenerate (%u of %d pages)\n",
+                             residentPages, nPages);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-feedback GPU==CPU page set: %u pages BIT-EXACT\n", residentPages);
+
+            // PROOF (2) feedbackEnabled=false -> empty set (all-zero == cleared upload).
+            std::vector<uint32_t> disabledFeedback;
+            runFeedback(0u, disabledFeedback);
+            bool disabledEmpty = true;
+            for (uint32_t f : disabledFeedback) if (f != 0u) { disabledEmpty = false; break; }
+            if (!disabledEmpty) {
+                std::fprintf(stderr, "FATAL: vt-feedback feedbackEnabled=false did NOT yield an empty set\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-feedback disabled: empty set (no-op)\n");
+
+            // PROOF (3) two-run determinism byte-identical.
+            std::vector<uint32_t> gpuFeedback2;
+            runFeedback(1u, gpuFeedback2);
+            if (gpuFeedback.size() != gpuFeedback2.size() ||
+                std::memcmp(gpuFeedback.data(), gpuFeedback2.data(),
+                            gpuFeedback.size() * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: vt-feedback two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vt-feedback determinism: two dispatches BYTE-IDENTICAL\n");
+
+            // PROOF (4) the {...} stat line.
+            std::printf("vt-feedback: {vt:%dmip/%dvpps0, requests:%u, resident:%u/%d}\n",
+                        vtx.mipLevels, vtx.virtualPagesPerSideMip0, requestCount, residentPages, nPages);
+
+            // --- Golden: a per-mip page-grid debug-viz. Lay the mips out in a ROW (mip 0 widest, each
+            // coarser mip narrower, proportional to its pages-per-side), each mip's vpps x vpps page cells
+            // hashColor(pageId) if resident, else dark. CPU-colored from the read-back integer set ->
+            // identical both backends. ---
+            const uint32_t imgW = 1024, imgH = 256;
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            // Background (deep navy).
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+            }
+            // Each mip gets a square panel; panels are laid out left-to-right with a small gutter. The
+            // panel side is proportional to pagesPerSide(mip) so mip 0 is the largest (the finest grid).
+            const int kGutter = 8;
+            const int kMaxPanel = (int)imgH - 2 * kGutter;   // mip-0 panel side (the tallest)
+            int x = kGutter;
+            for (int mip = 0; mip < vtx.mipLevels; ++mip) {
+                const int pps = vtx.pagesPerSide(mip);
+                // Panel side scaled by pps/pps0 -> mip 0 fills kMaxPanel, coarser mips proportionally
+                // smaller (but at least vpps px so every page is >= 1 px).
+                int side = kMaxPanel * pps / vtx.virtualPagesPerSideMip0;
+                if (side < pps) side = pps;
+                int y0 = ((int)imgH - side) / 2;
+                for (int sy = 0; sy < side; ++sy) {
+                    int py = sy * pps / side; if (py >= pps) py = pps - 1;
+                    int iy = y0 + sy; if (iy < 0 || iy >= (int)imgH) continue;
+                    for (int sx = 0; sx < side; ++sx) {
+                        int px = sx * pps / side; if (px >= pps) px = pps - 1;
+                        int ix = x + sx; if (ix < 0 || ix >= (int)imgW) continue;
+                        int pageId = vt::PageId(mip, px, py, vtx);
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        // Thin 1px page-grid lines for legibility.
+                        bool gridLine = ((sx * pps) % side) < pps || ((sy * pps) % side) < pps;
+                        if (gpuFeedback[(size_t)pageId] != 0u) {
+                            Vec3 col = vg::hashColor((uint32_t)pageId);
+                            float dim = gridLine ? 0.55f : 1.0f;
+                            dst[0] = (uint8_t)(col.z * 255.0f * dim + 0.5f);
+                            dst[1] = (uint8_t)(col.y * 255.0f * dim + 0.5f);
+                            dst[2] = (uint8_t)(col.x * 255.0f * dim + 0.5f);
+                            dst[3] = 255;
+                        } else {
+                            uint8_t v = gridLine ? 22 : 34;
+                            dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                        }
+                    }
+                }
+                x += side + kGutter;
+            }
+            bool ok = WriteBMP(vtFeedbackShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — per-mip VT page-feedback viz (%u resident pages)\n",
+                                vtFeedbackShotPath, imgW, imgH, residentPages);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vtFeedbackShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
