@@ -272,6 +272,14 @@ hf_gen_msl(froxel_apply.frag      froxel_apply.frag.hlsl      frag froxel_apply_
 # the marched position `precise`, so the GPU ray-hit SSBO is BIT-EXACT to the CPU reference on BOTH
 # backends. Behind --probegi only; existing shaders + goldens untouched.
 hf_gen_msl(probe_raytrace.comp    probe_raytrace.comp.hlsl    comp probe_raytrace_main)
+# Probe SH-Encode — DDGI Slice 3 (Slice DJ): one thread per probe loops the FIXED host-precomputed sample
+# set (per cube-texel: the 9 SHBasis9 weights + the solid-angle weight) and accumulates the captured
+# radiance (read from a flat radiance SSBO) into 3rd-order real-SH coefficients, writing the per-probe
+# ProbeSH SSBO. SHEncodeAccumulate/SHNormalize are copied VERBATIM from engine/render/probe_sh.h; the
+# host precomputes the sample basis weights + solid-angle weights + uploads them as exact bits, so the
+# GPU per-probe SH SSBO is BIT-EXACT to the CPU SH-encode on BOTH backends. Behind --probesh only;
+# existing shaders + goldens untouched.
+hf_gen_msl(probe_sh_encode.comp   probe_sh_encode.comp.hlsl   comp probe_sh_encode_main)
 # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
 # (flat float4 SSBO), Luminance -> LumToBin -> InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER
 # SSBO (order-independent counts -> deterministic; Metal threadgroup atomic_uint maps from the SPIR-V

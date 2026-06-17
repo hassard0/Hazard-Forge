@@ -275,6 +275,21 @@ hf_add_pure_test(probe_gi_test)
 # and the deterministic debug-viz FaceAverage. No RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(probe_capture_test)
 
+# Slice DJ — DDGI Slice 3: Probe SH-Encode. Pure CPU math for the per-probe 3rd-order real spherical-
+# harmonic encode (render/probe_sh.h, reusing render/probe_gi.h's grid + Fibonacci sample set): SHBasis9
+# (the 9 real-SH basis functions, polynomial in the unit direction — Y00 == 0.282095 const + the +X/+Y/+Z
+# axis values hand-checked vs the documented constants, no NaN), SHEncodeAccumulate (the per-sample fma
+# accumulation), SHNormalize (the solid-angle normalization + the totalWeight<=0 degenerate guard), and
+# SHEvaluate (cosine-lobe irradiance reconstruction). Pins the classic SH sanity checks: a uniform
+# radiance over the sphere projects to band-0 only (coeff[0] == uniform*Y00, coeff[1..8] ~= 0) + an
+# isotropic reconstruction, a directional lobe reconstructs larger toward its peak than away
+# (SHEvaluate(d) > SHEvaluate(-d)), zero radiance -> an EXACTLY all-zero ProbeSH (the zero-radiance ==
+# zero-SH proof's CPU half), EncodeDispatchGroups (ceil(n/64); 0 at any zero dim -> the probeCount=0
+# dispatch-0 no-op), and DETERMINISM (two encodes -> bit-identical SH). The same probe_sh.h math is
+# mirrored VERBATIM in probe_sh_encode.comp; the GPU==CPU bit-exact SH proof lives in --probesh-shot.
+# Pure C++ (hf_core; reuses render/probe_gi.h), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(probe_sh_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,

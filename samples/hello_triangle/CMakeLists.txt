@@ -378,6 +378,15 @@ hf_compile_shaders(
     # (+ ssr.h), so the GPU ray-hit SSBO is BIT-EXACT to the CPU reference over the same depth field. Pure
     # compute + storage buffers (no new RHI seam). The probeCount=0 dispatch-0 leaves the SSBO untouched.
     "shaders/probe_raytrace.comp.hlsl:cs"
+    # Probe SH-Encode — DDGI Slice 3 (Slice DJ): one thread per probe loops the FIXED host-precomputed
+    # sample set (per cube-texel: the 9 SHBasis9 weights + the solid-angle weight, computed once on the
+    # host), reads the captured radiance at each sample from the flat radiance store, and accumulates it
+    # into 3rd-order real-SH coefficients (SHEncodeAccumulate/SHNormalize copied VERBATIM from
+    # engine/render/probe_sh.h), writing the per-probe ProbeSH SSBO. Because the sample basis weights +
+    # solid-angle weights are uploaded as exact bits the GPU + CPU read identically, the GPU SH SSBO is
+    # BIT-EXACT to the CPU SH-encode. Pure compute + storage buffers (no new RHI seam). The probeCount=0
+    # dispatch-0 leaves the SH SSBO untouched == the cleared upload.
+    "shaders/probe_sh_encode.comp.hlsl:cs"
     # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
     # color (flat float4 SSBO), computes the Rec.709 Luminance, maps it to a log2-luminance bin via
     # render/auto_exposure.h::LumToBin, and InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER SSBO

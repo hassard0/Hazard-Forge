@@ -46,6 +46,7 @@
 #include "render/froxel.h"
 #include "render/probe_gi.h"
 #include "render/probe_capture.h"   // Slice DI: DDGI probe radiance capture math (pure CPU)
+#include "render/probe_sh.h"        // Slice DJ: DDGI probe SH-encode math (pure CPU)
 #include "render/auto_exposure.h"   // Slice CW: histogram eye-adaptation math (pure CPU)
 #include "render/taa.h"
 #include "render/frustum.h"
@@ -365,6 +366,7 @@ int main(int argc, char** argv) {
     const char* casShotPath = nullptr;       // --cas-shot <out.bmp> (Slice DF: contrast-adaptive sharpening)
     const char* froxelFogShotPath = nullptr; // --froxelfog-shot <out.bmp> (Slice CS: froxel volumetric fog)
     const char* probeGiShotPath = nullptr;   // --probegi-shot <out.bmp> (Slice DH: DDGI probe-grid ray-trace)
+    const char* probeShShotPath = nullptr;   // --probesh-shot <out.bmp> (Slice DJ: DDGI probe SH-encode)
     const char* froxelLightsShotPath = nullptr; // --froxellights-shot <out.bmp> (Slice CV: per-froxel clustered-light injection)
     const char* volShadowsShotPath = nullptr; // --volshadows-shot <out.bmp> (Slice CX: volumetric shadows / sun light shafts)
     const char* contactShadowShotPath = nullptr; // --contactshadow-shot <out.bmp> (Slice CT: contact shadows)
@@ -767,6 +769,20 @@ int main(int argc, char** argv) {
             // skipped) over the lit scene -> probegi.png. One BMP -> exit. New golden; existing
             // shaders/paths/goldens untouched.
             probeGiShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--probesh-shot") == 0 && i + 1 < argc) {
+            // Slice DJ: DDGI Slice 3 — Probe SH-Encode. Runs DI's 8-probe Cornell-box radiance capture,
+            // then a PURE COMPUTE pass (probe_sh_encode.comp, one thread per probe; NO new RHI) encodes
+            // each probe's captured cubemap into 3rd-order real spherical harmonics (9 coeffs per RGB
+            // channel) -> a per-probe ProbeSH SSBO. The sample directions + their SHBasis9 weights +
+            // solid-angle weights are HOST-PRECOMPUTED + uploaded as exact bits the GPU + CPU read, so
+            // the encode is bit-exact cross-backend. FOUR PROOFS: (1) the GPU ProbeSH SSBO is BIT-EXACT
+            // (memcmp) to a CPU probesh::SHEncode over the SAME read-back radiance; (2) a zero-radiance
+            // probe -> its ProbeSH is all-zero; (3) probeCount=0 (dimX=0) -> dispatch 0 -> the SH SSBO is
+            // byte-identical to the cleared upload; (4) two GPU runs byte-identical. Prints `probe-sh:
+            // {probes:8, bands:3, coeffs:9}`. GOLDEN = per-probe swatch spheres colored by the
+            // SH-reconstructed irradiance over the colored room -> probe_sh.png. New golden; existing
+            // shaders/paths/goldens untouched.
+            probeShShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--froxellights-shot") == 0 && i + 1 < argc) {
             // Slice CV: Per-Froxel Clustered-Light Injection (the marquee CS+CL fusion). The CL
             // 96-colored-point-light scene (same fixed lattice as --clustered-lights-shot) wrapped in the
@@ -3341,6 +3357,494 @@ int main(int argc, char** argv) {
                                 "cubeSize %u\n", probeCaptureShotPath, sw0, sh0, probeN,
                                 pc::CaptureFaceCount(grid), kCubeSize);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeCaptureShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- DDGI Slice 3: Probe SH-Encode (--probesh-shot, Slice DJ). Runs DI's 8-probe Cornell-box
+        // radiance capture, then a PURE COMPUTE pass (probe_sh_encode.comp, one thread per probe; NO new
+        // RHI) encodes each probe's captured cubemap into 3rd-order real spherical harmonics (9 coeffs
+        // per RGB channel) -> a per-probe ProbeSH SSBO. The CROSS-BACKEND FP DISCIPLINE (DH): the sample
+        // directions (cube-texel dirs, which need normalize=sqrt) + their SHBasis9 weights + solid-angle
+        // weights are HOST-PRECOMPUTED ONCE + uploaded as exact float32 bits the GPU encode shader AND
+        // the CPU reference read, and the captured radiance is host-sampled into a FLAT float radiance
+        // SSBO both sides read identically -> the encode is a pure (radiance * stored-weight) fma/mad
+        // accumulation, BIT-EXACT cross-backend. FOUR PROOFS (fail loudly): (1) the GPU ProbeSH SSBO is
+        // BIT-EXACT (memcmp) to a CPU probesh::SHEncode over the SAME read-back radiance; (2) a
+        // zero-radiance probe -> its ProbeSH is all-zero; (3) probeCount=0 (dimX=0) -> dispatch 0 -> the
+        // SH SSBO byte-identical to the cleared upload; (4) two GPU runs byte-identical. GOLDEN = per-
+        // probe swatch spheres colored by the SH-reconstructed irradiance over the colored room ->
+        // probe_sh.png. Deterministic (fixed scene/grid/camera/sample-set, no RNG/time).
+        if (probeShShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cm  = hf::render::cubemap;
+            namespace pc  = hf::render::probecap;
+            namespace psh = hf::render::probesh;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // Same 624-byte FrameData layout as DD/DI (reused so the SAME probe_bake/post shaders bind).
+            struct ProbeFrameData {
+                float viewProj[16]; float lightDir[4]; float lightColor[4]; float viewPos[4];
+                float faceVP[6][16]; float probePos[4]; float atlasParams[4]; float atlasParams2[4];
+                float camFwd[4]; float camRight[4]; float camUp[4]; float skyParams[4]; float pad0[4];
+            };
+            static_assert(sizeof(ProbeFrameData) == 624, "Probe-SH FrameData layout");
+
+            // The SMALL DI capture grid: 2x2x2 = 8 probes inside the colored room (IDENTICAL to DI).
+            const float Rroom = 6.0f;
+            pc::ProbeGrid grid;
+            grid.origin  = Vec3{-2.0f, 0.0f, -2.0f};
+            grid.dimX = 2; grid.dimY = 2; grid.dimZ = 2; grid.spacing = 4.0f;
+            const uint32_t kCubeSize = 64;
+            const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+            const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+            const rhi::Format kSwap = device->Swapchain().ColorFormat();
+
+            // The fixed SH sample resolution: kEncodeFaceDim^2 samples per cube face, 6 faces. Keep it
+            // small + fixed so the host sample table fits the shader's HF_MAX_SH_SAMPLES cap (1536).
+            const int kEncodeFaceDim = 16;                       // 16x16 per face
+            const int kSamplesPerFace = kEncodeFaceDim * kEncodeFaceDim;   // 256
+            const int kSampleCount = kSamplesPerFace * cm::kFaces;         // 1536
+
+            // === Shaders: probe_bake.{vert,frag} (per-face capture + room/swatch) + post + the new
+            //     probe_sh_encode compute. ===
+            auto bakeVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.vert.hlsl.spv");
+            auto bakeFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_bake.frag.hlsl.spv");
+            auto postVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto bakeVs = device->CreateShaderModule({std::span<const uint32_t>(bakeVsWords)});
+            auto bakeFs = device->CreateShaderModule({std::span<const uint32_t>(bakeFsWords)});
+            auto postVs = device->CreateShaderModule({std::span<const uint32_t>(postVsWords)});
+            auto postFs = device->CreateShaderModule({std::span<const uint32_t>(postFsWords)});
+
+            rhi::GraphicsPipelineDesc bakeDesc;
+            bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+            bakeDesc.vertexLayout = scene::MeshVertexLayout();
+            bakeDesc.colorFormat = kHdr;
+            bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+            bakeDesc.pushConstantSize = sizeof(float) * 32;   // viewProj(16) + model(16)
+            auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+            rhi::GraphicsPipelineDesc postDesc;
+            postDesc.vertex = postVs.get(); postDesc.fragment = postFs.get();
+            postDesc.colorFormat = kSwap;
+            postDesc.depthTest = false; postDesc.usesTexture = true; postDesc.fullscreen = true;
+            auto postPipeline = device->CreateGraphicsPipeline(postDesc);
+
+            // --- Probe SH-encode COMPUTE pipeline (NEW; 3 storage buffers: params/radiance/probeSH). ---
+            auto shCsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/probe_sh_encode.comp.hlsl.spv");
+            auto shCs  = device->CreateShaderModule({std::span<const uint32_t>(shCsW)});
+            rhi::ComputePipelineDesc shCd;
+            shCd.compute = shCs.get();
+            shCd.storageBufferCount = 3;
+            shCd.threadsPerGroupX = 64;
+            auto shCompute = device->CreateComputePipeline(shCd);
+
+            auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+            auto sceneRT = device->CreateRenderTarget(w, h, kHdr);
+            auto dummyShadow = device->CreateShadowMap(64);
+            device->SetShadowMap(*dummyShadow);
+            if (!cube) {
+                std::fprintf(stderr, "FATAL: cubemap render targets unavailable on this backend\n");
+                device->WaitIdle(); return 1;
+            }
+
+            scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+            scene::Mesh sphere   = scene::Mesh::Sphere(*device);
+
+            auto colorTex = [&](float r, float g, float b) {
+                uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+                return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+            };
+            auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+            auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+            auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+            auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+            auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+
+            const float Tk = 0.2f;
+            struct Wall { Mat4 model; rhi::ITexture* tex; };
+            std::vector<Wall> walls = {
+                {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+                {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+                {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+                {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+                {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+            };
+
+            const Vec3 eye{0.0f, 2.4f, 12.0f};
+            const Vec3 ctr{0.0f, 2.0f, 0.0f};
+            const float fovY = 1.04719755f;
+            ProbeFrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, ctr, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(fovY, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.viewProj[k] = vp.m[k];
+            }
+            Mat4 camVP;
+            for (int k = 0; k < 16; ++k) camVP.m[k] = fd.viewProj[k];
+
+            std::vector<Vec3> probeCenters;
+            for (int pz = 0; pz < grid.dimZ; ++pz)
+                for (int py = 0; py < grid.dimY; ++py)
+                    for (int px = 0; px < grid.dimX; ++px)
+                        probeCenters.push_back(grid.probePos(px, py, pz));
+            const int probeN = grid.probeCount();   // 8
+
+            auto drawRoom = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP, bool skipFront) {
+                cmd.BindPipeline(*bakePipeline);
+                for (size_t wi = 0; wi < walls.size(); ++wi) {
+                    if (skipFront && wi == 5) continue;
+                    const auto& wl = walls[wi];
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindTexture(*wl.tex);
+                    cmd.BindVertexBuffer(cubeMesh.vertices());
+                    cmd.BindIndexBuffer(cubeMesh.indices());
+                    cmd.DrawIndexed(cubeMesh.indexCount());
+                }
+            };
+
+            // === Capture the room into each probe's 6 cube faces; read each face back (BGRA8). The
+            // radiance store is a per-probe×face flat block of BGRA8 bytes (the DI radStore). ===
+            auto runCapture = [&](const pc::ProbeGrid& g, std::vector<std::vector<uint8_t>>& store,
+                                  uint32_t& faceW, uint32_t& faceH) {
+                int slots = g.probeCount() * pc::kFaces;
+                store.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+                if (pc::CaptureFaceCount(g) == 0) return;
+                int pn = g.probeCount();
+                std::vector<Vec3> centers;
+                for (int pz = 0; pz < g.dimZ; ++pz)
+                    for (int py = 0; py < g.dimY; ++py)
+                        for (int px = 0; px < g.dimX; ++px)
+                            centers.push_back(g.probePos(px, py, pz));
+                for (int p = 0; p < pn; ++p) {
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        Mat4 faceVP = pc::ProbeFaceViewProj(face, centers[p], kCubeNear, kCubeFar);
+                        auto fc = device->BeginCubemapFace(*cube, face);
+                        fc.cmd->BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoom(*fc.cmd, faceVP, /*skipFront=*/false);
+                        fc.cmd->EndRenderPass();
+                        device->EndCubemapFace(fc);
+                    }
+                    for (uint32_t face = 0; face < 6; ++face) {
+                        std::vector<uint8_t> faceData; uint32_t fw=0, fh=0;
+                        if (!device->ReadCubemapFace(*cube, face, faceData, fw, fh)) {
+                            std::fprintf(stderr, "FATAL: ReadCubemapFace(probe %d, face %u) failed\n", p, face);
+                            device->WaitIdle(); return;
+                        }
+                        faceW = fw; faceH = fh;
+                        store[pc::ProbeFaceIndex(p, face)] = std::move(faceData);
+                    }
+                }
+            };
+
+            std::vector<std::vector<uint8_t>> radStore; uint32_t faceW=0, faceH=0;
+            runCapture(grid, radStore, faceW, faceH);
+            if (radStore.empty() || faceW == 0) {
+                std::fprintf(stderr, "FATAL: probe-sh capture produced no radiance\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === HOST-PRECOMPUTE the fixed SH sample table (the DH FP discipline). For each cube face +
+            // texel of a kEncodeFaceDim grid, reconstruct the WORLD direction (the inverse of the
+            // cubemap S/T parameterization), normalize it (sqrt, done ONCE on the host), evaluate
+            // SHBasis9, and the differential cube->sphere solid-angle weight. The GPU + CPU read these
+            // EXACT bits -> the encode never recomputes normalize/SHBasis9 on the device. ===
+            // EncodeSample mirrors the shader's struct: 9 basis + saWeight + 2 pad = 12 floats.
+            struct EncodeSample { float basis[9]; float saWeight; float pad0, pad1; };
+            static_assert(sizeof(EncodeSample) == 48, "EncodeSample std430 stride (12 floats)");
+
+            // Reconstruct the world direction for (face, s, t) where s,t in [-1,1] are the face S/T. This
+            // is the exact inverse of cubemap.h's DirToFaceUV table (face order +X,-X,+Y,-Y,+Z,-Z):
+            //   +X: x=+1, z=-sc, y=-tc | -X: x=-1, z=+sc, y=-tc
+            //   +Y: y=+1, x=+sc, z=+tc | -Y: y=-1, x=+sc, z=-tc
+            //   +Z: z=+1, x=+sc, y=-tc | -Z: z=-1, x=-sc, y=-tc
+            auto faceTexelDir = [](int face, float sc, float tc) -> Vec3 {
+                switch (face) {
+                    case 0: return Vec3{ 1.0f,  -tc,  -sc};
+                    case 1: return Vec3{-1.0f,  -tc,   sc};
+                    case 2: return Vec3{  sc,  1.0f,   tc};
+                    case 3: return Vec3{  sc, -1.0f,  -tc};
+                    case 4: return Vec3{  sc,  -tc,  1.0f};
+                    default:return Vec3{ -sc,  -tc, -1.0f};
+                }
+            };
+
+            std::vector<EncodeSample> samples((size_t)kSampleCount);
+            std::vector<Vec3>         sampleDirs((size_t)kSampleCount);   // (kept for the radiance sampling)
+            std::vector<int>          sampleFace((size_t)kSampleCount);
+            std::vector<int>          sampleTexX((size_t)kSampleCount);
+            std::vector<int>          sampleTexY((size_t)kSampleCount);
+            float totalWeight = 0.0f;
+            {
+                int si = 0;
+                for (int face = 0; face < cm::kFaces; ++face) {
+                    for (int ty = 0; ty < kEncodeFaceDim; ++ty) {
+                        for (int tx = 0; tx < kEncodeFaceDim; ++tx, ++si) {
+                            // Texel-center face coords in [-1,1].
+                            float u = (((float)tx + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            float v = (((float)ty + 0.5f) / (float)kEncodeFaceDim) * 2.0f - 1.0f;
+                            Vec3 dir = math::normalize(faceTexelDir(face, u, v));   // ONE host normalize
+                            psh::SHBasis9(dir, samples[si].basis);
+                            // Differential cube->sphere solid angle for this texel: dA on the cube face
+                            // is (2/dim)^2; the projected solid angle is dA * cosθ^3-ish == the standard
+                            // 4 / ((1+u^2+v^2)^1.5) * (du/2)*(dv/2) form (du=dv=2/dim).
+                            float d2 = 1.0f + u * u + v * v;
+                            float texEdge = 2.0f / (float)kEncodeFaceDim;
+                            float sa = (texEdge * texEdge) / (d2 * std::sqrt(d2));
+                            samples[si].saWeight = sa;
+                            samples[si].pad0 = 0.0f; samples[si].pad1 = 0.0f;
+                            totalWeight += sa;
+                            sampleDirs[si] = dir;
+                            sampleFace[si] = face;
+                            // Nearest texel in the captured face (faceW x faceH) for this sample center.
+                            int px2 = (int)(((float)tx + 0.5f) / (float)kEncodeFaceDim * (float)faceW);
+                            int py2 = (int)(((float)ty + 0.5f) / (float)kEncodeFaceDim * (float)faceH);
+                            if (px2 < 0) px2 = 0; if (px2 > (int)faceW - 1) px2 = (int)faceW - 1;
+                            if (py2 < 0) py2 = 0; if (py2 > (int)faceH - 1) py2 = (int)faceH - 1;
+                            sampleTexX[si] = px2; sampleTexY[si] = py2;
+                        }
+                    }
+                }
+            }
+
+            // === Build the FLAT radiance store float4[probeCount*sampleCount] from the captured BGRA8
+            // faces (the SAME float32 bits the GPU + CPU read). radiance[probe*N + s] = the captured
+            // radiance at probe `probe`'s sample-`s` face/texel (BGRA8 -> RGB float /255). ===
+            auto buildRadiance = [&](const std::vector<std::vector<uint8_t>>& store) {
+                std::vector<float> rad((size_t)probeN * kSampleCount * 4, 0.0f);
+                for (int p = 0; p < probeN; ++p) {
+                    for (int s = 0; s < kSampleCount; ++s) {
+                        const std::vector<uint8_t>& face = store[pc::ProbeFaceIndex(p, sampleFace[s])];
+                        size_t idx = ((size_t)sampleTexY[s] * faceW + (size_t)sampleTexX[s]) * 4;
+                        float r = 0, g = 0, b = 0;
+                        if (idx + 3 < face.size()) {
+                            b = (float)face[idx + 0] / 255.0f;   // BGRA8
+                            g = (float)face[idx + 1] / 255.0f;
+                            r = (float)face[idx + 2] / 255.0f;
+                        }
+                        size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                        rad[o + 0] = r; rad[o + 1] = g; rad[o + 2] = b; rad[o + 3] = 1.0f;
+                    }
+                }
+                return rad;
+            };
+            std::vector<float> radiance = buildRadiance(radStore);
+
+            // === The encode params SSBO (matches probe_sh_encode.comp EncodeParams std430). ===
+            struct EncodeParamsCPU {
+                uint32_t counts[4];      // x=probeCount, y=sampleCount, zw unused
+                float    norm[4];        // x=totalWeight, yzw unused
+                EncodeSample samples[1]; // flexible tail; allocated to kSampleCount below
+            };
+            // Allocate the params buffer as a raw byte blob (counts+norm header + kSampleCount samples).
+            const size_t kHeaderBytes = sizeof(uint32_t) * 4 + sizeof(float) * 4;
+            const size_t kParamsBytes = kHeaderBytes + (size_t)kSampleCount * sizeof(EncodeSample);
+
+            // Run the SH-encode compute for a grid, returning the read-back ProbeSH SSBO. The SH buffer
+            // is freshly cleared to zero per run (so a 0-dispatch leaves it zero). The SH buffer is
+            // ALWAYS sized to the ENABLED grid (probeN) so the probeCount=0 run reads back the SAME-size
+            // cleared buffer; the dispatch group count is what differs (0 when probeCount==0).
+            auto runEncode = [&](const pc::ProbeGrid& g, const std::vector<float>& radData,
+                                 std::vector<psh::ProbeSH>& outSH) {
+                const int probes = g.probeCount();
+
+                // Params buffer.
+                std::vector<uint8_t> paramsBytes(kParamsBytes, 0);
+                uint32_t* cnt = reinterpret_cast<uint32_t*>(paramsBytes.data());
+                cnt[0] = (uint32_t)(probes > 0 ? probes : 0);
+                cnt[1] = (uint32_t)kSampleCount;
+                float* nrm = reinterpret_cast<float*>(paramsBytes.data() + sizeof(uint32_t) * 4);
+                nrm[0] = totalWeight;
+                std::memcpy(paramsBytes.data() + kHeaderBytes, samples.data(),
+                            (size_t)kSampleCount * sizeof(EncodeSample));
+                rhi::BufferDesc ppDesc;
+                ppDesc.size = paramsBytes.size(); ppDesc.initialData = paramsBytes.data();
+                ppDesc.usage = rhi::BufferUsage::Storage;
+                auto ppBuf = device->CreateBuffer(ppDesc);
+
+                // Radiance buffer (always the ENABLED-grid size so the readback is stable; the disabled
+                // run still uploads it but never reads it — dispatch 0).
+                rhi::BufferDesc radDesc;
+                radDesc.size = radData.size() * sizeof(float); radDesc.initialData = radData.data();
+                radDesc.usage = rhi::BufferUsage::Storage;
+                auto radBuf = device->CreateBuffer(radDesc);
+
+                // ProbeSH output, cleared to zero (== the probeCount=0 no-op reference).
+                std::vector<psh::ProbeSH> cleared((size_t)probeN);
+                std::memset(cleared.data(), 0, cleared.size() * sizeof(psh::ProbeSH));
+                rhi::BufferDesc shDesc;
+                shDesc.size = cleared.size() * sizeof(psh::ProbeSH); shDesc.initialData = cleared.data();
+                shDesc.usage = rhi::BufferUsage::Storage;
+                auto shBuf = device->CreateBuffer(shDesc);
+
+                const uint32_t groups = (uint32_t)psh::EncodeDispatchGroups(g);
+
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                graph.AddPass("shEncode", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*shCompute);
+                        cmd.BindStorageBuffer(*ppBuf, 0);
+                        cmd.BindStorageBuffer(*radBuf, 1);
+                        cmd.BindStorageBuffer(*shBuf, 2);
+                        cmd.DispatchCompute(groups);   // groups==0 when probeCount==0 -> shBuf untouched
+                        cmd.ComputeToFragmentBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                graph.Execute(*device);
+                device->WaitIdle();
+
+                outSH.resize((size_t)probeN);
+                device->ReadBuffer(*shBuf, outSH.data(), outSH.size() * sizeof(psh::ProbeSH), 0);
+            };
+
+            // --- GPU run #1 (the enabled grid). ---
+            std::vector<psh::ProbeSH> gpuSH;
+            runEncode(grid, radiance, gpuSH);
+
+            // === PROOF 1 — GPU == CPU bit-exact. The CPU reference runs probesh::SHEncodeAccumulate /
+            // SHNormalize over the SAME flat radiance store with the SAME uploaded basis weights +
+            // solid-angle weights. ===
+            std::vector<psh::ProbeSH> cpuSH((size_t)probeN);
+            for (int p = 0; p < probeN; ++p) {
+                psh::ProbeSH sh{};
+                std::memset(&sh, 0, sizeof(sh));
+                for (int s = 0; s < kSampleCount; ++s) {
+                    size_t o = ((size_t)p * kSampleCount + (size_t)s) * 4;
+                    Vec3 rad{radiance[o + 0], radiance[o + 1], radiance[o + 2]};
+                    psh::SHEncodeAccumulate(sh, rad, samples[s].basis, samples[s].saWeight);
+                }
+                psh::SHNormalize(sh, totalWeight);
+                cpuSH[p] = sh;
+            }
+            const bool bitExact = (gpuSH.size() == cpuSH.size()) &&
+                (std::memcmp(gpuSH.data(), cpuSH.data(),
+                             cpuSH.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!bitExact) {
+                std::fprintf(stderr,
+                    "FATAL: probe-sh GPU ProbeSH != CPU SHEncode reference (the SH accumulation diverged "
+                    "cross-backend — the shader-copied SHEncodeAccumulate/SHNormalize mismatch the header)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-sh GPU==CPU: BIT-EXACT\n");
+
+            // === PROOF 2 — zero-radiance -> zero-SH. Encode a probe whose radiance is all zero (a
+            // zeroed radiance store) -> its ProbeSH must be all zero (byte-identical to a cleared
+            // record). ===
+            std::vector<float> zeroRad((size_t)probeN * kSampleCount * 4, 0.0f);
+            std::vector<psh::ProbeSH> zeroSH;
+            runEncode(grid, zeroRad, zeroSH);
+            psh::ProbeSH zeroRef{}; std::memset(&zeroRef, 0, sizeof(zeroRef));
+            bool zeroClean = (zeroSH.size() == (size_t)probeN);
+            for (const auto& sh : zeroSH)
+                if (std::memcmp(&sh, &zeroRef, sizeof(psh::ProbeSH)) != 0) zeroClean = false;
+            if (!zeroClean) {
+                std::fprintf(stderr,
+                    "FATAL: probe-sh zero-radiance encode produced a non-zero ProbeSH\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-sh zero-radiance == zero-SH: BYTE-IDENTICAL\n");
+
+            // === PROOF 3 — probeCount=0 no-op. dimX=0 -> EncodeDispatchGroups()==0 -> DispatchCompute(0)
+            // -> the SH SSBO is byte-identical to the cleared (zero) upload. ===
+            pc::ProbeGrid emptyGrid = grid; emptyGrid.dimX = 0;
+            std::vector<psh::ProbeSH> emptySH;
+            runEncode(emptyGrid, radiance, emptySH);
+            std::vector<psh::ProbeSH> clearedRef((size_t)probeN);
+            std::memset(clearedRef.data(), 0, clearedRef.size() * sizeof(psh::ProbeSH));
+            const bool noOpClean = (emptySH.size() == clearedRef.size()) &&
+                (std::memcmp(emptySH.data(), clearedRef.data(),
+                             clearedRef.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!noOpClean) {
+                std::fprintf(stderr,
+                    "FATAL: probe-sh probeCount=0 SH SSBO != cleared upload (the dispatch-0 was not a no-op)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("probe-sh probeCount=0: SSBO UNTOUCHED == cleared\n");
+
+            // === PROOF 4 — determinism: a second GPU run is byte-identical. ===
+            std::vector<psh::ProbeSH> gpuSH2;
+            runEncode(grid, radiance, gpuSH2);
+            const bool deterministic = (gpuSH.size() == gpuSH2.size()) &&
+                (std::memcmp(gpuSH.data(), gpuSH2.data(),
+                             gpuSH.size() * sizeof(psh::ProbeSH)) == 0);
+            if (!deterministic) {
+                std::fprintf(stderr, "FATAL: probe-sh two GPU runs differ (non-deterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            std::printf("probe-sh: {probes:%d, bands:3, coeffs:9}\n", probeN);
+
+            // === GOLDEN viz: render the colored room (front wall skipped) + a swatch sphere at each
+            // probe colored by the SH-reconstructed IRRADIANCE in a fixed direction (probe-up). The
+            // swatch reads the GI the SH encodes -> a coherent per-probe colored cloud. ===
+            std::vector<std::unique_ptr<rhi::ITexture>> swatchTex((size_t)probeN);
+            const Vec3 kViewDir = math::normalize(Vec3{0.0f, 1.0f, 0.3f});   // probe-up-ish reconstruction dir
+            for (int p = 0; p < probeN; ++p) {
+                Vec3 irr = psh::SHEvaluate(gpuSH[p], kViewDir);   // cosine-lobe irradiance
+                auto clamp01 = [](float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
+                swatchTex[p] = colorTex(clamp01(irr.x * 1.4f), clamp01(irr.y * 1.4f), clamp01(irr.z * 1.4f));
+            }
+
+            std::vector<uint8_t> scenePx; uint32_t sw0=0, sh0=0;
+            {
+                render::RenderGraph graph;
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shScene", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                        drawRoom(cmd, camVP, /*skipFront=*/true);
+                        cmd.BindPipeline(*bakePipeline);
+                        for (int p = 0; p < probeN; ++p) {
+                            Mat4 model = Mat4::Translate(probeCenters[p]) * Mat4::Scale({0.45f, 0.45f, 0.45f});
+                            float pcv[32];
+                            for (int k = 0; k < 16; ++k) pcv[k]      = camVP.m[k];
+                            for (int k = 0; k < 16; ++k) pcv[16 + k] = model.m[k];
+                            cmd.PushConstants(pcv, sizeof(pcv));
+                            cmd.BindTexture(*swatchTex[p]);
+                            cmd.BindVertexBuffer(sphere.vertices());
+                            cmd.BindIndexBuffer(sphere.indices());
+                            cmd.DrawIndexed(sphere.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipeline);
+                        cmd.BindTexture(*sceneRT);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                if (!device->GetCapturedPixels(scenePx, sw0, sh0)) {
+                    std::fprintf(stderr, "FATAL: no captured pixels (probe-sh viz)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            bool ok = WriteBMP(probeShShotPath, scenePx, sw0, sh0);
+            if (ok) std::printf("wrote %s (%ux%u) — DDGI probe SH-encode, %d probes, %d SH samples/probe\n",
+                                probeShShotPath, sw0, sh0, probeN, kSampleCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", probeShShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
