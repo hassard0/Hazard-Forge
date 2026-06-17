@@ -120,6 +120,7 @@ $Goldens = @(
     @{ Name = 'probe';         Flag = '--probe' }                # Slice AK (reflection + irradiance probes)
     @{ Name = 'taa';           Flag = '--taa' }                  # Slice AP (temporal anti-aliasing)
     @{ Name = 'cull';          Flag = '--cull' }                 # Slice AQ (frustum-culling visualization)
+    @{ Name = 'meshlet_viz';   Flag = '--meshlet-viz' }          # Slice DS (virtual-geometry meshlet/cluster decomposition: SphereGeometry(48,32) partitioned by a pure-CPU integer-deterministic Morton sort into <=128-tri clusters, each drawn as an index sub-range with its deterministic per-cluster hash color -> coherent flat-colored spatial cluster patches; cross-backend-identical by construction — same verts, same projection, color = pure integer hash; the BEACHHEAD of the Nanite-style virtual-geometry arc)
     @{ Name = 'gpu_cull';      Flag = '--gpu-cull' }             # Slice AR (GPU-driven culling + indirect draw)
     @{ Name = 'mdi';           Flag = '--mdi' }                  # Slice BM (GPU multi-draw-indirect; Metal renders the identical scene per-object)
     @{ Name = 'bindless';      Flag = '--bindless' }            # Slice BZ (bindless textures; Metal renders the identical multi-texture scene per-material bound)
@@ -300,7 +301,7 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 # lit_ddgi pass which binds the per-frame dummy shadow map, and were never validation-gated before —
 # they emitted 8x VUID-vkCmdDraw-None-09600 (sampled-image layout) until DQ added the missing
 # SHADER_READ_ONLY transition. Gating them here keeps the GI path validation-clean permanently.
-`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--hiz-cull-shot'), @('--ddgi-shot'), @('--ddgimb-shot'), @('--ddgiocc-shot'), @('--probedist-shot'), @('--probegi-shot'), @('--probecapture-shot'), @('--probesh-shot'), @('--probeinterp-shot'))
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--hiz-cull-shot'), @('--ddgi-shot'), @('--ddgimb-shot'), @('--ddgiocc-shot'), @('--probedist-shot'), @('--probegi-shot'), @('--probecapture-shot'), @('--probesh-shot'), @('--probeinterp-shot'), @('--meshlet-viz'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))

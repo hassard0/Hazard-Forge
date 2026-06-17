@@ -129,6 +129,12 @@ hf_compile_shaders(
     # FrameData.viewProj, flat per-vertex color. LINE_LIST topology.
     "shaders/debug_line.vert.hlsl:vs"
     "shaders/debug_line.frag.hlsl:ps"
+    # Virtual-geometry meshlet viz (Slice DS): per-cluster flat-color pass. The vertex shader applies
+    # the per-draw model matrix + a fixed-direction Lambert and forwards the pushed hashColor(cluster)
+    # color; the fragment outputs it. Behind --meshlet-viz ONLY; reuses the existing draw + push-
+    # constant surface (no new RHI), no existing shader/pipeline/golden touched.
+    "shaders/meshlet_viz.vert.hlsl:vs"
+    "shaders/meshlet_viz.frag.hlsl:ps"
     # SSAO chain (Slice Y): view-space normal+linear-depth g-buffer prepass (static + instanced
     # vertex variants + shared fragment), hemisphere-kernel AO pass, box blur, and composite/apply.
     "shaders/gbuffer.vert.hlsl:vs"

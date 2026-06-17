@@ -53,6 +53,7 @@
 #include "render/auto_exposure.h"   // Slice CW: histogram eye-adaptation math (pure CPU)
 #include "render/taa.h"
 #include "render/frustum.h"
+#include "render/meshlet.h"    // Slice DS: virtual-geometry meshlet/cluster decomposition (pure CPU; shared with --meshlet-viz)
 #include "render/gpu_cull.h"
 #include "render/mdi.h"   // Slice BM: GPU multi-draw-indirect batch builder (pure CPU)
 #include "render/bindless.h"  // Slice BZ: bindless texture-index table (pure CPU)
@@ -407,6 +408,7 @@ int main(int argc, char** argv) {
     const char* planarShotPath = nullptr;       // --planar-shot <out.bmp> (Slice DE: planar reflections — flat mirror-plane scene reflection)
     const char* taaShotPath = nullptr;       // --taa-shot <out.bmp> (Slice AP: temporal anti-aliasing)
     const char* cullShotPath = nullptr;      // --cull-shot <out.bmp> (Slice AQ: frustum-culling viz)
+    const char* meshletVizPath = nullptr;    // --meshlet-viz <out.bmp> (Slice DS: meshlet/cluster decomposition viz)
     const char* gpuCullShotPath = nullptr;   // --gpu-cull-shot <out.bmp> (Slice AR: GPU cull + indirect)
     const char* mtShotPath = nullptr;        // --mt-shot <out.bmp> (Slice AU: multithreaded recording)
     int mtWorkers = 4;                       // --mt-shot ... --workers N (default 4)
@@ -1093,6 +1095,15 @@ int main(int argc, char** argv) {
             // partition is the conservative bounding-sphere test (engine/render/frustum.h) the render
             // submission path uses — render-invariant. One BMP -> exit. New golden (cull.png).
             cullShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--meshlet-viz") == 0 && i + 1 < argc) {
+            // Slice DS (Nanite-style virtual-geometry beachhead): decompose SphereGeometry(48,32) into
+            // ~128-triangle clusters (engine/render/meshlet.h, pure-CPU integer-deterministic Morton
+            // sort), upload the REORDERED index buffer, and draw each cluster as an index sub-range with
+            // its deterministic per-cluster hashColor pushed as a flat color — the sphere segmented into
+            // coherent flat-colored spatial cluster patches. Prints the {tris,clusters,maxTris} line +
+            // the partition-completeness + determinism proof lines. One BMP -> exit. New golden
+            // (meshlet_viz.png); existing goldens untouched.
+            meshletVizPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--gpu-cull-shot") == 0 && i + 1 < argc) {
             // Slice AR: GPU-driven culling + indirect draw. A compute shader frustum-culls a
             // 1024-instance cube grid, ORDER-compacts the survivors into a second instance buffer, and
@@ -9023,6 +9034,208 @@ int main(int argc, char** argv) {
         // the test the render submission path uses — so this is the render-invariant proof made
         // visible. A {drawn, culled, total} stat line is printed. One BMP -> exit. New golden cull.png;
         // existing image goldens untouched (culling removes nothing on-screen in the normal scenes). --
+        // --- Virtual-geometry meshlet/cluster decomposition viz (--meshlet-viz, Slice DS: the Nanite-
+        // style arc BEACHHEAD). SphereGeometry(48,32) is decomposed by engine/render/meshlet.h's pure-
+        // CPU, integer-deterministic Morton-sort BuildMeshlets into ~128-triangle clusters; the
+        // REORDERED index buffer is uploaded once and each cluster is drawn as an index sub-range
+        // (firstIndex=3*triOffset, indexCount=3*triCount) with its deterministic hashColor(i) pushed as
+        // a flat per-cluster color. The result is the sphere segmented into coherent flat-colored
+        // SPATIAL cluster patches (the Morton coherence made visible — the visible cluster structure the
+        // whole DT/DU/DV arc builds on). NO new RHI (existing draw + push-constant surface), NO GPU
+        // math (the color is a pure CPU integer hash). Prints the {tris,clusters,maxTris} stat + the
+        // partition-completeness + determinism proof lines. One BMP -> exit. New golden meshlet_viz.png;
+        // existing goldens untouched. ----
+        if (meshletVizPath) {
+            using math::Mat4; using math::Vec3;
+            namespace vg = render::vg;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- The input mesh + its CPU decomposition. ---
+            scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+            vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+            const uint32_t triCountTotal = (uint32_t)(geo.indices.size() / 3);
+            const uint32_t clusterCount  = (uint32_t)ms.meshlets.size();
+
+            // --- PROOF 1: partition completeness — Sum(triCount) == T and every triangle appears once
+            // (the reordered index multiset == the original). ---
+            uint32_t sumTri = 0;
+            for (const auto& m : ms.meshlets) sumTri += m.triCount;
+            bool everyTriOnce = (ms.indices.size() == (size_t)triCountTotal * 3);
+            {
+                auto sortedTris = [](const std::vector<uint32_t>& idx) {
+                    std::vector<std::array<uint32_t, 3>> tris;
+                    tris.reserve(idx.size() / 3);
+                    for (size_t t = 0; t + 3 <= idx.size(); t += 3)
+                        tris.push_back({idx[t], idx[t + 1], idx[t + 2]});
+                    std::sort(tris.begin(), tris.end());
+                    return tris;
+                };
+                everyTriOnce = everyTriOnce && (sortedTris(geo.indices) == sortedTris(ms.indices));
+            }
+            // --- PROOF 2: determinism — a second build is byte-identical. ---
+            vg::MeshletSet ms2 = vg::BuildMeshlets(geo.verts, geo.indices);
+            bool deterministic =
+                ms.meshlets.size() == ms2.meshlets.size() && ms.indices.size() == ms2.indices.size() &&
+                (ms.meshlets.empty() || std::memcmp(ms.meshlets.data(), ms2.meshlets.data(),
+                                          ms.meshlets.size() * sizeof(vg::Meshlet)) == 0) &&
+                (ms.indices.empty() || std::memcmp(ms.indices.data(), ms2.indices.data(),
+                                          ms.indices.size() * sizeof(uint32_t)) == 0);
+
+            // --- Upload the shared vertex buffer + the REORDERED index buffer. ---
+            rhi::BufferDesc vbd;
+            vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+            vbd.initialData = geo.verts.data();
+            vbd.usage = rhi::BufferUsage::Vertex;
+            auto vbuf = device->CreateBuffer(vbd);
+            rhi::BufferDesc ibd;
+            ibd.size = ms.indices.size() * sizeof(uint32_t);
+            ibd.initialData = ms.indices.data();
+            ibd.usage = rhi::BufferUsage::Index;
+            auto ibuf = device->CreateBuffer(ibd);
+
+            // --- Pipelines: the per-cluster flat-color meshlet viz + sky + post. NO shadow map / lit
+            // pass (the viz fragment reads no textures + no shadow map), so there is no empty-shadow-
+            // pass to declare — the only passes that record draws are sky, meshlet, and post, all
+            // validation-clean. ---
+            auto mvVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/meshlet_viz.vert.hlsl.spv");
+            auto mvFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/meshlet_viz.frag.hlsl.spv");
+            auto mvVs = device->CreateShaderModule({std::span<const uint32_t>(mvVsW)});
+            auto mvFs = device->CreateShaderModule({std::span<const uint32_t>(mvFsW)});
+            rhi::GraphicsPipelineDesc mvDesc;
+            mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+            // The viz vertex shader consumes only pos(0) + normal(3), so we feed a 2-attribute layout
+            // over the same stride-56 scene::Vertex buffer (pos @0, normal @32) — every declared
+            // attribute is consumed, so there are NO "attribute not consumed" validation warnings.
+            rhi::VertexLayout mvLayout;
+            mvLayout.stride = sizeof(scene::Vertex);  // 56
+            mvLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {3, rhi::Format::RGB32_Float, 32},
+            };
+            mvDesc.vertexLayout = mvLayout;
+            mvDesc.colorFormat = device->Swapchain().ColorFormat();
+            mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+            mvDesc.pushConstantSize = sizeof(float) * 20;   // float4x4 model + float4 color
+            auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+
+            // --- Fixed camera framing the unit sphere (deterministic, no clock/RNG). ---
+            runtime::Camera cam;
+            cam.position = {0.0f, 0.0f, 3.0f};
+            cam.yaw = 0.0f; cam.SetPitch(0.0f);
+            cam.fovY = 0.8726646f;  // 50 degrees
+            cam.aspect = aspect;
+            cam.znear = 0.1f; cam.zfar = 50.0f;
+
+            scene::Transform sphereXform;  // identity (unit sphere at origin)
+            Mat4 sphereModel = sphereXform.Matrix();
+
+            FrameData fd{};
+            {
+                Mat4 vp = cam.ViewProj();
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = cam.position.x; fd.viewPos[1] = cam.position.y;
+                fd.viewPos[2] = cam.position.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("scene", {}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*mvPipeline);
+                    cmd.BindVertexBuffer(*vbuf);
+                    cmd.BindIndexBuffer(*ibuf);
+                    // Per-cluster: push { model, hashColor(i) } and draw that cluster's index sub-range.
+                    for (uint32_t ci = 0; ci < clusterCount; ++ci) {
+                        const vg::Meshlet& m = ms.meshlets[ci];
+                        Vec3 col = vg::hashColor(ci);
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = sphereModel.m[k];
+                        pc[16] = col.x; pc[17] = col.y; pc[18] = col.z; pc[19] = 1.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.DrawIndexed(m.triCount * 3, m.triOffset * 3, 0);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::printf("meshlet: {tris:%u, clusters:%u, maxTris:%u}\n",
+                        triCountTotal, clusterCount, vg::kMaxTrisPerCluster);
+            if (sumTri == triCountTotal && everyTriOnce)
+                std::printf("meshlet partition: COMPLETE (\xCE\xA3triCount==T, every tri once)\n");
+            else
+                std::printf("meshlet partition: BROKEN (sumTri=%u T=%u everyTriOnce=%d)\n",
+                            sumTri, triCountTotal, (int)everyTriOnce);
+            if (deterministic)
+                std::printf("meshlet determinism: two builds BYTE-IDENTICAL\n");
+            else
+                std::printf("meshlet determinism: FAILED (two builds differ)\n");
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            bool ok = false;
+            if (device->GetCapturedPixels(px, cw, ch2)) {
+                ok = WriteBMP(meshletVizPath, px, cw, ch2);
+                if (ok) std::printf("wrote %s (%ux%u) — %u tris in %u clusters\n",
+                                    meshletVizPath, cw, ch2, triCountTotal, clusterCount);
+                else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", meshletVizPath);
+            } else {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+            }
+            device->WaitIdle();
+            return (ok && sumTri == triCountTotal && everyTriOnce && deterministic) ? 0 : 1;
+        }
+
         if (cullShotPath) {
             using math::Mat4; using math::Vec3;
             namespace fr = render::frustum;

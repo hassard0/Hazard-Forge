@@ -149,6 +149,11 @@ hf_gen_msl(particle.frag   particle.frag.hlsl  frag particle_fragment)
 # FrameData.viewProj, flat per-vertex color. LINE_LIST topology. Same HLSL->SPIR-V->MSL toolchain.
 hf_gen_msl(debug_line.vert debug_line.vert.hlsl vert debug_line_vertex)
 hf_gen_msl(debug_line.frag debug_line.frag.hlsl frag debug_line_fragment)
+# Virtual-geometry meshlet viz (Slice DS): per-cluster flat-color pass (model matrix + fixed-direction
+# Lambert in the vertex, pushed hashColor(cluster) forwarded to the fragment). Reuses the existing draw
+# + push-constant surface (no new RHI). Same HLSL->SPIR-V->MSL toolchain; behind --meshlet-viz ONLY.
+hf_gen_msl(meshlet_viz.vert meshlet_viz.vert.hlsl vert meshlet_viz_vertex)
+hf_gen_msl(meshlet_viz.frag meshlet_viz.frag.hlsl frag meshlet_viz_fragment)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.

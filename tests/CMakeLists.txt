@@ -512,6 +512,14 @@ hf_add_pure_test(taa_test)
 # (render/frustum.h, header-only), ASan-eligible.
 hf_add_pure_test(frustum_test)
 
+# Virtual-geometry meshlet decomposition (Slice DS, Nanite-style arc beachhead): the SAME
+# render/meshlet.h BuildMeshlets the --meshlet-viz showcase uses. Pins partition completeness (the
+# reordered triangle multiset == the original, Sum(triCount)==T, <=128/cluster, only-last-partial),
+# determinism (two builds byte-identical), the CONSERVATIVE per-cluster bounds contract (every vert in
+# the AABB + radius — the contract DT/DU rely on), the degenerate/empty no-ops + non-mult-of-3 trailing-
+# ignore, MortonCode10 round-trip, and hashColor determinism/spread. Pure C++ (header-only), ASan-eligible.
+hf_add_pure_test(meshlet_test)
+
 # GPU-driven culling (Slice AR): the CPU MIRROR of shaders/cull.comp.hlsl's ordered single-workgroup
 # prefix-sum compaction + frustum-sphere test (render/gpu_cull.h). Asserts the compacted survivor
 # stream + count match an independent brute-force reference IN SOURCE-INDEX ORDER over a 1024-instance

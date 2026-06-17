@@ -142,6 +142,7 @@ const Showcase kShowcases[] = {
     {"--planar-shot",       "Planar reflections (flat mirror-plane scene reflection: the scene is RENDERED a second time through the camera REFLECTED across the mirror plane — householder reflection + Lengyel oblique near-clip at the mirror plane + flipped front-face winding — into a 2D reflection target, then the mirror floor samples that target at its own screen-space position and blends lerp(matte, reflection, reflectivity); the reflectivity=0 render is BYTE-IDENTICAL to the matte non-reflective render, proving the reflection blend is a pure pass-through when off)."},
     {"--taa-shot",          "Temporal anti-aliasing (jittered accumulation)."},
     {"--cull-shot",         "Frustum culling visualization (overview camera + kept/culled bounds)."},
+    {"--meshlet-viz",       "Virtual-geometry meshlet/cluster decomposition (the BEACHHEAD of the Nanite-style virtual-geometry arc: a sphere's index buffer is partitioned by a pure-CPU integer-deterministic Morton-sort into clusters of up to 128 triangles, each with a conservative per-cluster AABB + bounding sphere; the reordered index buffer is uploaded once and each cluster drawn as an index sub-range with its deterministic per-cluster hash color, so the sphere shows as coherent flat-colored SPATIAL cluster patches — the cluster data structure the whole DT/DU/DV arc builds on; the partition is COMPLETE (Sum(triCount)==T, every triangle covered exactly once) and two builds are BYTE-IDENTICAL; no new RHI (existing draw + push-constant surface), no GPU math (the color is a pure CPU integer hash))."},
     {"--gpu-cull-shot",     "GPU-driven culling + indirect draw (compute compaction, GPU draw count)."},
     {"--mdi-shot",          "GPU multi-draw-indirect batching (144 objects in 1 draw; MDI==per-draw byte-identical)."},
     {"--bindless-shot",     "Bindless textures (multi-texture scene via 1 descriptor array; bindless==bound byte-identical)."},
@@ -237,6 +238,7 @@ const char* kFeatures[] = {
     "state-replication",
     "network-transport-sim",
     "client-prediction",
+    "virtual-geometry-meshlets",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

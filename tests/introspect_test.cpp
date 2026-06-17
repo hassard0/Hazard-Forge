@@ -244,6 +244,8 @@ int main() {
             bool sawProbeOcclusionFeature = false;
             // Slice DR: the ddgi-multi-bounce capability is advertised in the feature manifest.
             bool sawMultiBounceFeature = false;
+            // Slice DS: the virtual-geometry-meshlets capability is advertised in the feature manifest.
+            bool sawMeshletFeature = false;
             // Slice BX: the editor-live-edit capability is advertised in the feature manifest.
             bool sawEditorLiveEditFeature = false;
             if (features)
@@ -305,6 +307,7 @@ int main() {
                     if (AsString(el->value) == "ddgi-global-illumination") sawDdgiFeature = true;
                     if (AsString(el->value) == "ddgi-probe-occlusion") sawProbeOcclusionFeature = true;
                     if (AsString(el->value) == "ddgi-multi-bounce") sawMultiBounceFeature = true;
+                    if (AsString(el->value) == "virtual-geometry-meshlets") sawMeshletFeature = true;
                 }
             check(sawTaaFeature, "engine.features includes temporal-anti-aliasing");
             check(sawCullFeature, "engine.features includes frustum-culling");
@@ -363,6 +366,7 @@ int main() {
             check(sawDdgiFeature, "engine.features includes ddgi-global-illumination");
             check(sawProbeOcclusionFeature, "engine.features includes ddgi-probe-occlusion");
             check(sawMultiBounceFeature, "engine.features includes ddgi-multi-bounce");
+            check(sawMeshletFeature, "engine.features includes virtual-geometry-meshlets");
         }
 
         // commands manifest includes set_transform + introspect.
@@ -472,6 +476,8 @@ int main() {
         bool sawDdgiShot = false;
         // Slice DR: the --ddgimb-shot showcase flag is listed in the showcase manifest.
         bool sawDdgiMbShot = false;
+        // Slice DS: the --meshlet-viz showcase flag is listed in the showcase manifest.
+        bool sawMeshletVizShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -550,6 +556,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--probedist-shot") sawProbeDistShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ddgi-shot") sawDdgiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ddgimb-shot") sawDdgiMbShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--meshlet-viz") sawMeshletVizShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -611,6 +618,7 @@ int main() {
         check(sawProbeDistShot, "showcases manifest includes --probedist-shot");
         check(sawDdgiShot, "showcases manifest includes --ddgi-shot");
         check(sawDdgiMbShot, "showcases manifest includes --ddgimb-shot");
+        check(sawMeshletVizShot, "showcases manifest includes --meshlet-viz");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
