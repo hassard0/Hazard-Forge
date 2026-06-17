@@ -9,7 +9,7 @@
 #   * windows-vulkan : conan install (cppstd=17 + Ninja; also pulls the Khronos validation layer)
 #                      -> cmake configure (runs the material_codegen build-time tool that bakes the
 #                      *.mat.json material graphs into the committed generated HLSL) -> build ->
-#                      ctest (73 tests). This is the same pipeline scripts/verify.ps1 runs locally
+#                      ctest (76 tests). This is the same pipeline scripts/verify.ps1 runs locally
 #                      for Windows, plus the Slice-AL introspection JSON golden (an exact byte match
 #                      of the live --introspect output vs tests/golden/introspect/default_scene.json),
 #                      the Slice-BI material-graph introspection JSON golden (an exact byte match of a
@@ -20,18 +20,19 @@
 #                      synchronization validation, every showcase VUID/SYNC-HAZARD/[ERROR]-free) runs
 #                      locally via scripts/verify.ps1.
 #   * windows-asan   : the AddressSanitizer build (HF_SANITIZE=address) of the pure-C++ core + tests,
-#                      then ctest under ASan (same 73 tests, the pure ones instrumented; rhi_smoke
+#                      then ctest under ASan (same 76 tests, the pure ones instrumented; rhi_smoke
 #                      drives the live Vulkan device and is intentionally not sanitized).
 #   * macos-metal    : documented below. Builds metal_headless ONCE, then renders + golden-compares
-#                      ALL 73 committed Metal goldens (each visual_test showcase flag) at threshold
+#                      ALL 76 committed Metal goldens (each visual_test showcase flag) at threshold
 #                      0.0 (every diff must be 0.0000), now including gtao/froxel_fog/contact_shadows/
 #                      froxel_lights/auto_exposure/vol_shadows/sss/refl_probe/color_grade/
-#                      capture_probe/planar_reflection/cas.
+#                      capture_probe/planar_reflection/cas and the DDGI GI-arc goldens
+#                      probegi/probe_capture/probe_sh.
 #                      GitHub-hosted macOS runners are x86_64/ARM
 #                      cloud VMs that CANNOT reach the LAN bench Mac, and they have no Metal GPU for
 #                      an offscreen golden compare that matches the bench. Run it on a SELF-HOSTED
 #                      runner on the bench Mac, or manually via scripts/verify.ps1 (which drives the
-#                      bench Mac over SSH and runs the same 73-golden loop). The job below is gated to
+#                      bench Mac over SSH and runs the same 76-golden loop). The job below is gated to
 #                      self-hosted and is a no-op otherwise.
 
 name: ci
@@ -79,7 +80,7 @@ jobs:
       - name: Build
         run: cmake --build --preset windows-msvc-debug
 
-      - name: Test (ctest, 73 tests)
+      - name: Test (ctest, 76 tests)
         run: ctest --preset windows-msvc-debug --output-on-failure
 
       # Slice-AL introspection JSON golden: an EXACT byte match of the live --introspect output for
@@ -186,7 +187,7 @@ jobs:
       - name: Build (ASan)
         run: cmake --build --preset windows-msvc-asan
 
-      - name: Test under ASan (ctest, 73 tests)
+      - name: Test under ASan (ctest, 76 tests)
         run: ctest --preset windows-msvc-asan --output-on-failure
 
   # ---------------------------------------------------------------------------------------------------
@@ -194,11 +195,11 @@ jobs:
   # Metal GPU, so this job ONLY runs on a self-hosted runner labelled 'metal' (set one up on the
   # bench Mac). On hosted infra the job is skipped. For day-to-day verification, run the Metal half
   # via scripts/verify.ps1 from the Windows dev box (it SSHes into the bench Mac and runs the SAME
-  # 73-golden loop below). This builds metal_headless once then renders + compares every committed
+  # 76-golden loop below). This builds metal_headless once then renders + compares every committed
   # golden at threshold 0.0; the job fails if ANY golden diffs != 0.0000.
   # ---------------------------------------------------------------------------------------------------
   macos-metal:
-    name: Mac / Metal (73 goldens, DIFF 0.0) [self-hosted only]
+    name: Mac / Metal (76 goldens, DIFF 0.0) [self-hosted only]
     runs-on: [self-hosted, macos, metal]
     if: ${{ contains(github.event.repository.topics, 'enable-self-hosted-metal') || github.event_name == 'workflow_dispatch' }}
     steps:
@@ -210,11 +211,11 @@ jobs:
           cmake -S metal_headless -B build-metal -G Ninja
           cmake --build build-metal
 
-      # Render + golden-compare all 73 showcases. Each entry is "<golden-basename>|<visual_test flag>"
+      # Render + golden-compare all 76 showcases. Each entry is "<golden-basename>|<visual_test flag>"
       # (empty flag = the default Slice-F scene). Flags are the real ones parsed in
       # metal_headless/visual_test.mm. The loop does not abort on a single failure so the full table
       # prints; a trailing check fails the job if any golden drifted.
-      - name: Render + compare all 73 goldens (each must be DIFF 0.0000)
+      - name: Render + compare all 76 goldens (each must be DIFF 0.0000)
         run: |
           source ~/mac-remote-rig/env.sh
           fail=0
@@ -290,7 +291,10 @@ jobs:
           color_grade|--colorgrade
           capture_probe|--captureprobe
           planar_reflection|--planar
-          cas|--cas'
+          cas|--cas
+          probegi|--probegi
+          probe_capture|--probecapture
+          probe_sh|--probesh'
           while IFS='|' read -r name flag; do
             [ -z "$name" ] && continue
             out="/tmp/hf_${name}.png"
@@ -311,4 +315,4 @@ jobs:
             echo "::error::one or more Metal goldens drifted (DIFF != 0.0000)"
             exit 1
           fi
-          echo "All 73 Metal goldens at DIFF 0.0000"
+          echo "All 76 Metal goldens at DIFF 0.0000"

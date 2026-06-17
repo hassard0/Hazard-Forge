@@ -36,9 +36,9 @@ scoped token is available.
 
 | Job              | Runner                       | What it does                                                              |
 | ---------------- | ---------------------------- | ------------------------------------------------------------------------- |
-| `windows-vulkan` | `windows-2022` (hosted)      | conan install (cppstd=17 + Ninja; pulls the Khronos validation layer) -> configure (runs the `material_codegen` build-time tool) -> build -> ctest (73 tests) + the introspection JSON-golden byte match + the material-graph introspection JSON-golden byte match + the audio WAV-golden byte match |
-| `windows-asan`   | `windows-2022` (hosted)      | `HF_SANITIZE=address` build of the pure-C++ core + tests -> ctest under ASan (73 tests; the pure ones instrumented, `rhi_smoke` not) |
-| `macos-metal`    | `[self-hosted, macos, metal]`| headless Metal build -> render + golden-compare **all 73 goldens** (DIFF 0.0) |
+| `windows-vulkan` | `windows-2022` (hosted)      | conan install (cppstd=17 + Ninja; pulls the Khronos validation layer) -> configure (runs the `material_codegen` build-time tool) -> build -> ctest (76 tests) + the introspection JSON-golden byte match + the material-graph introspection JSON-golden byte match + the audio WAV-golden byte match |
+| `windows-asan`   | `windows-2022` (hosted)      | `HF_SANITIZE=address` build of the pure-C++ core + tests -> ctest under ASan (76 tests; the pure ones instrumented, `rhi_smoke` not) |
+| `macos-metal`    | `[self-hosted, macos, metal]`| headless Metal build -> render + golden-compare **all 76 goldens** (DIFF 0.0) |
 
 The Windows build runs the **`material_codegen`** build-time tool (it bakes the showcase `*.mat.json`
 material graphs into the committed generated HLSL the offline shader pipeline compiles) and links
@@ -61,10 +61,10 @@ offscreen output matches the baked goldens, so `macos-metal` is gated to a **sel
 labelled `metal` (set one up on the bench Mac and register it with the labels `self-hosted, macos,
 metal`). On hosted infrastructure the job is skipped.
 
-The job builds `metal_headless` **once**, then for each of the **73** committed goldens runs
+The job builds `metal_headless` **once**, then for each of the **76** committed goldens runs
 `visual_test <flag> /tmp/hf_<name>.png` and compares it to `tests/golden/metal/<name>.png` at
 threshold `0.0`. Every pair must report `DIFF 0.0000`; the job fails if any golden drifts. The
-73 (golden -> flag) pairs are:
+76 (golden -> flag) pairs are:
 
 | golden              | flag                          | golden              | flag                  |
 | ------------------- | ----------------------------- | ------------------- | --------------------- |
@@ -104,7 +104,8 @@ threshold `0.0`. Every pair must report `DIFF 0.0000`; the job fails if any gold
 | `vol_shadows`       | `--volshadows`                | `sss`               | `--sss`               |
 | `refl_probe`        | `--reflprobe`                 | `color_grade`       | `--colorgrade`        |
 | `capture_probe`     | `--captureprobe`              | `planar_reflection` | `--planar`            |
-| `cas`               | `--cas`                       |                     |                       |
+| `cas`               | `--cas`                       | `probegi`           | `--probegi`           |
+| `probe_capture`     | `--probecapture`              | `probe_sh`          | `--probesh`           |
 
 For routine local verification of **both** platforms in one command, use:
 
@@ -114,7 +115,7 @@ scripts\verify.ps1
 
 That script runs the Windows/Vulkan ctest locally (plus the introspection JSON-golden and audio
 WAV-golden byte matches) and drives the bench Mac over SSH to build the headless Metal target once
-and run the **same 73-golden loop**, each compared at threshold `0.0` (every one must report
+and run the **same 76-golden loop**, each compared at threshold `0.0` (every one must report
 `DIFF 0.0000`). It prints a per-golden table and an overall `VERIFY: PASS/FAIL`.
 
 ## Local equivalents
