@@ -38,8 +38,15 @@ set(HF_GEN_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen_shaders")
 file(MAKE_DIRECTORY "${HF_GEN_SHADER_DIR}")
 
 set(HF_GENERATED_MSL "")
-# hf_gen_msl(<basename> <hlsl-file> <vert|frag> <new-entry-point>)
+# hf_gen_msl(<basename> <hlsl-file> <vert|frag> <new-entry-point> [extra spirv-cross args...])
+#
+# Any trailing args (ARGN, after the 4 required ones) are appended VERBATIM to the spirv-cross
+# invocation for THIS shader only. Used to opt a single shader into a higher --msl-version (e.g.
+# visbuffer.frag needs --msl-version 20200 for SV_PrimitiveID -> [[primitive_id]]) WITHOUT touching
+# any other shader's command — every other call omits the extra args, so its spirv-cross command line
+# (and thus its generated MSL) is byte-for-byte unchanged and its golden is unaffected.
 function(hf_gen_msl base src stage entry)
+  set(extra_sc_args ${ARGN})  # optional per-shader extra spirv-cross args (empty for all but visbuffer.frag)
   set(spv "${HF_GEN_SHADER_DIR}/${base}.spv")
   set(msl "${HF_GEN_SHADER_DIR}/${base}.gen.metal")
   if(stage STREQUAL "vert")
@@ -57,7 +64,7 @@ function(hf_gen_msl base src stage entry)
     COMMAND "${GLSLC_EXECUTABLE}" -DHF_MSL_GEN -fshader-stage=${glslc_stage}
             -x hlsl -fentry-point=main "${HF_SHADER_SRC}/${src}" -o "${spv}"
     COMMAND "${SPIRV_CROSS_EXECUTABLE}" --msl --msl-decoration-binding
-            --rename-entry-point main ${entry} ${sc_stage}
+            --rename-entry-point main ${entry} ${sc_stage} ${extra_sc_args}
             "${spv}" --output "${msl}"
     DEPENDS "${HF_SHADER_SRC}/${src}"
     COMMENT "Gen MSL ${src} -> ${base}.gen.metal"
@@ -157,11 +164,14 @@ hf_gen_msl(meshlet_viz.frag meshlet_viz.frag.hlsl frag meshlet_viz_fragment)
 # Virtual-geometry VISIBILITY BUFFER (Slice DW): the BOUND visbuffer vertex (clusterID pushed per
 # survivor, since glslc/spirv-cross can't lower the Vulkan MDI DrawIndex builtin — same as cluster_viz)
 # + the shared visbuffer fragment (out single uint = (clusterID<<7)|(SV_PrimitiveID&0x7F) into the
-# R32_Uint visibility buffer). spirv-cross lowers SV_PrimitiveID to [[primitive_id]] in the MSL fragment;
-# the controller verifies it on the real Mac (else the fragment packs clusterID-only). Same
-# HLSL->SPIR-V->MSL toolchain; the only new RHI is the additive Format::R32_Uint. Behind --visbuffer only.
+# R32_Uint visibility buffer). spirv-cross lowers SV_PrimitiveID to [[primitive_id]] in the MSL fragment,
+# but ONLY when targeting MSL 2.2+ (else it throws "PrimitiveId on macOS requires MSL 2.2"). So this ONE
+# shader gets an extra --msl-version 20200 (passed as the optional trailing hf_gen_msl arg); EVERY other
+# shader's spirv-cross command is left exactly as-is (no version flag), so all other generated MSL — and
+# thus all existing goldens — are byte-for-byte unchanged. Same HLSL->SPIR-V->MSL toolchain; the only new
+# RHI is the additive Format::R32_Uint. Behind --visbuffer only.
 hf_gen_msl(visbuffer_bound.vert visbuffer_bound.vert.hlsl vert visbuffer_vertex)
-hf_gen_msl(visbuffer.frag       visbuffer.frag.hlsl       frag visbuffer_fragment)
+hf_gen_msl(visbuffer.frag       visbuffer.frag.hlsl       frag visbuffer_fragment --msl-version 20200)
 # Text / HUD renderer (Slice BA): NDC pass-through vertex + atlas-coverage fragment (configurable
 # text color in a FRAGMENT push constant -> the HF_MSL_GEN cbuffer at the flat fragment push-const
 # slot, like the bloom passes). Alpha-blended screen-space overlay drawn over the scene after post.
