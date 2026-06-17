@@ -5242,10 +5242,21 @@ int main(int argc, char** argv) {
                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
                 DdgiFrameData fd = makeFrame(g, giStrength);
                 render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadow", render::RgResourceKind::ShadowMap, *dummyShadow);
                 render::RgResource rgScene = graph.ImportTarget(
                     "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
                 render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
-                graph.AddPass("ddgiScene", {}, {rgScene},
+                // EMPTY shadow pass: litPipeline (lit_ddgi.frag) binds gShadow, so the dummy depth
+                // image must be transitioned to SHADER_READ_ONLY before the lit draw. This scene has
+                // no caster (lightViewProj is zero -> the shadow guard skips, gShadow is never
+                // sampled), so this is a pure layout no-op: the lit result is byte-identical.
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("ddgiScene", {rgShadow}, {rgScene},
                     [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                         dev.SetFrameUniforms(&fd, sizeof(DdgiFrameData));
                         cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
@@ -5814,10 +5825,21 @@ int main(int argc, char** argv) {
                                   std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
                 DdgiOccFrameData fd = makeFrame(giStrength, occlusion);
                 render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadow", render::RgResourceKind::ShadowMap, *dummyShadow);
                 render::RgResource rgScene = graph.ImportTarget(
                     "sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
                 render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
-                graph.AddPass("occScene", {}, {rgScene},
+                // EMPTY shadow pass: the lit pipeline (lit_ddgi.frag) binds gShadow, so the dummy
+                // depth image must be transitioned to SHADER_READ_ONLY before the lit draw. This scene
+                // has no caster (lightViewProj is zero -> the shadow guard skips, gShadow is never
+                // sampled), so this is a pure layout no-op: the lit result is byte-identical.
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{1, 1, 1, 1});
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("occScene", {rgShadow}, {rgScene},
                     [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
                         dev.SetFrameUniforms(&fd, sizeof(DdgiOccFrameData));
                         cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});

@@ -295,7 +295,11 @@ Write-Host ('validation layer dir: ' + `$layerDir)
 `$env:VK_VALIDATION_FEATURE_ENABLE = 'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION'
 # Representative showcases: --shot (GPU particles + shared-base/varied-normal materials, where the
 # UPDATE_AFTER_BIND bug lived) and --csm-shot (cascaded shadow atlas, a heavy multi-pass graph path).
-`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--hiz-cull-shot'))
+# The GI/DDGI showcases (--ddgi-shot ... --probeinterp-shot) were ADDED in slice DQ: they run the
+# lit_ddgi pass which binds the per-frame dummy shadow map, and were never validation-gated before —
+# they emitted 8x VUID-vkCmdDraw-None-09600 (sampled-image layout) until DQ added the missing
+# SHADER_READ_ONLY transition. Gating them here keeps the GI path validation-clean permanently.
+`$vkShots = @(@('--shot'), @('--csm-shot'), @('--mt-shot'), @('--mdi-shot'), @('--bindless-shot'), @('--gpudriven-shot'), @('--gpucull-draw-shot'), @('--hiz-cull-shot'), @('--ddgi-shot'), @('--ddgiocc-shot'), @('--probedist-shot'), @('--probegi-shot'), @('--probecapture-shot'), @('--probesh-shot'), @('--probeinterp-shot'))
 `$vkErrors = 0
 foreach (`$shot in `$vkShots) {
     `$shotArgs = `$shot + @((Join-Path `$env:TEMP ('hf_validate_' + (`$shot[0] -replace '-','') + '.png')))
