@@ -405,6 +405,185 @@ int main() {
               "AllocatePhysicalTiles deterministic (two passes byte-identical)");
     }
 
+    // ================= Slice VT3: PageTexel + GeneratePhysicalAtlas + BuildTilePageId ===============
+    // PageTexel determinism + adjacent-page/adjacent-mip DIFFERENT base colors + pattern correct at known
+    // (lx,ly). These pin the EXACT integer math shaders/vt_pagegen.comp copies VERBATIM.
+    {
+        // Determinism: same inputs -> same texel (twice).
+        check(vt::PageTexel(42, 1, 7, 13) == vt::PageTexel(42, 1, 7, 13),
+              "PageTexel deterministic (same inputs -> same texel)");
+
+        // Alpha is always opaque 0xFF; channels always in [0x40,0xFF] (distinct from kAtlasClear's 0x10).
+        bool alphaOpaque = true, chanInRange = true;
+        for (int s = 0; s < 64; ++s) {
+            uint32_t t = vt::PageTexel(s * 3, s % 4, (s * 7) & 63, (s * 5) & 63);
+            if ((t >> 24) != 0xFFu) alphaOpaque = false;
+            uint32_t r = t & 0xFFu, g = (t >> 8) & 0xFFu, b = (t >> 16) & 0xFFu;
+            if (r < 0x40u || g < 0x40u || b < 0x40u) chanInRange = false;
+            if (t == vt::kAtlasClear) chanInRange = false;  // never collide with the clear sentinel
+        }
+        check(alphaOpaque, "PageTexel alpha always opaque (0xFF)");
+        check(chanInRange, "PageTexel channels in [0x40,0xFF] (never collides with kAtlasClear)");
+
+        // Adjacent PAGES (different pageId) -> different base color (the same texel position differs).
+        check(vt::PageTexel(10, 0, 0, 0) != vt::PageTexel(11, 0, 0, 0),
+              "adjacent pages (10 vs 11) -> DIFFERENT texel at (0,0)");
+        check(vt::PageTexel(100, 0, 32, 32) != vt::PageTexel(101, 0, 32, 32),
+              "adjacent pages (100 vs 101) -> DIFFERENT texel at (32,32)");
+
+        // Adjacent MIPS (same pageId, different mip) -> different base color.
+        check(vt::PageTexel(7, 0, 0, 0) != vt::PageTexel(7, 1, 0, 0),
+              "adjacent mips (0 vs 1) -> DIFFERENT texel at (0,0)");
+        check(vt::PageTexel(7, 1, 16, 16) != vt::PageTexel(7, 2, 16, 16),
+              "adjacent mips (1 vs 2) -> DIFFERENT texel at (16,16)");
+
+        // The checkerboard pattern: toggling lx across an 8-block boundary flips the dark/light cell, so a
+        // texel in a light cell (check==1) is brighter (or equal) than the same base in a dark cell. Pick a
+        // page whose base channels are large enough that 5/8 scaling is a strict decrease (>= 8 so floor !=
+        // base). The 8×8 checker: (lx>>3)^(ly>>3). At (0,0) check=0^0=0 (dark); at (8,0) check=1^0=1 (light).
+        {
+            uint32_t darkCell  = vt::PageTexel(3, 0, 0, 0);    // (0>>3)^(0>>3) = 0 -> dark (5/8)
+            uint32_t lightCell = vt::PageTexel(3, 0, 8, 0);    // (8>>3)^(0>>3) = 1 -> light (full); same grad step 0
+            // grad = (lx>>4)+(ly>>4): at lx=0 -> 0; at lx=8 -> 0 (8>>4==0). So ONLY the checker differs.
+            uint32_t dr = darkCell & 0xFFu, lr = lightCell & 0xFFu;
+            check(lr >= dr, "checkerboard: light cell channel >= dark cell channel (same gradient step)");
+            check(darkCell != lightCell || dr == 0x40u,
+                  "checkerboard: adjacent 8-blocks differ (unless both clamp to the floor)");
+        }
+    }
+
+    // BuildTilePageId is a correct INVERSE of the indirection over the allocated set.
+    {
+        // indirection: page 0 -> tile 2, page 3 -> tile 0, page 5 -> tile 1; the rest kNoTile.
+        std::vector<int32_t> indir(8, vt::kNoTile);
+        indir[0] = 2; indir[3] = 0; indir[5] = 1;
+        vt::VtTilePool pool; pool.tilesPerSide = 2;   // cap = 4
+        std::vector<uint32_t> tpi =
+            vt::BuildTilePageId(std::span<const int32_t>(indir.data(), indir.size()), pool);
+        check(tpi.size() == 4u, "tilePageId sized tileCapacity (4)");
+        check(tpi[2] == 0u, "tile 2 -> page 0 (inverse)");
+        check(tpi[0] == 3u, "tile 0 -> page 3 (inverse)");
+        check(tpi[1] == 5u, "tile 1 -> page 5 (inverse)");
+        check(tpi[3] == vt::kNoTileU32, "unallocated tile 3 -> kNoTileU32");
+        // Round-trip: for every allocated page, tpi[indir[page]] == page.
+        bool inverseOk = true;
+        for (size_t p = 0; p < indir.size(); ++p)
+            if (indir[p] != vt::kNoTile && tpi[(size_t)indir[p]] != (uint32_t)p) inverseOk = false;
+        check(inverseOk, "BuildTilePageId is the exact inverse of the indirection over the allocated set");
+    }
+
+    // GeneratePhysicalAtlas: known indirection -> known atlas (allocated tiles filled with the right page's
+    // pattern, unallocated kAtlasClear). Use a tiny atlas: tilesPerSide=2, pageSize=4 -> 8×8 atlas.
+    {
+        vt::VtTexture small; small.mipLevels = 2; small.pageSize = 4; small.virtualPagesPerSideMip0 = 2;
+        // pages: mip0 = 2×2 = 4 pages (0..3), mip1 = 1×1 = 1 page (4). pageCount = 5.
+        check(small.pageCount() == 5, "small VT pageCount == 5");
+        vt::VtTilePool pool; pool.tilesPerSide = 2;       // cap = 4
+        vt::VtAtlasDims dims; dims.tilesPerSide = 2; dims.pageSize = 4;
+        check(dims.atlasW() == 8 && dims.atlasH() == 8 && dims.atlasTexels() == 64,
+              "small atlas 8×8 = 64 texels");
+
+        // indirection: page 0 -> tile 0, page 1 -> tile 1, page 4 (mip1) -> tile 2; pages 2,3 kNoTile.
+        std::vector<int32_t> indir(5, vt::kNoTile);
+        indir[0] = 0; indir[1] = 1; indir[4] = 2;
+
+        std::vector<uint32_t> atlas((size_t)dims.atlasTexels(), 0u);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), small, pool, dims,
+                                  std::span<uint32_t>(atlas.data(), atlas.size()), true);
+
+        // Tile 0 origin (0,0): every texel == PageTexel(page 0, mip 0, lx, ly).
+        bool tile0Ok = true, tile1Ok = true, tile2Ok = true;
+        int mip, px, py;
+        vt::UnpackPageId(0, small, mip, px, py);
+        for (int ly = 0; ly < 4; ++ly) for (int lx = 0; lx < 4; ++lx)
+            if (atlas[(size_t)ly * 8 + lx] != vt::PageTexel(0, mip, lx, ly)) tile0Ok = false;
+        check(tile0Ok, "atlas tile 0 == PageTexel(page 0, ...) over its 4×4 region");
+
+        // Tile 1 origin (4,0): page 1, mip 0.
+        vt::UnpackPageId(1, small, mip, px, py);
+        for (int ly = 0; ly < 4; ++ly) for (int lx = 0; lx < 4; ++lx)
+            if (atlas[(size_t)ly * 8 + (4 + lx)] != vt::PageTexel(1, mip, lx, ly)) tile1Ok = false;
+        check(tile1Ok, "atlas tile 1 == PageTexel(page 1, ...) over its region");
+
+        // Tile 2 origin (0,4): page 4 (mip 1).
+        vt::UnpackPageId(4, small, mip, px, py);
+        check(mip == 1, "page 4 unpacks to mip 1");
+        for (int ly = 0; ly < 4; ++ly) for (int lx = 0; lx < 4; ++lx)
+            if (atlas[(size_t)(4 + ly) * 8 + lx] != vt::PageTexel(4, mip, lx, ly)) tile2Ok = false;
+        check(tile2Ok, "atlas tile 2 == PageTexel(page 4 / mip 1, ...) over its region");
+
+        // Tile 3 origin (4,4) is unallocated -> all kAtlasClear.
+        bool tile3Clear = true;
+        for (int ly = 0; ly < 4; ++ly) for (int lx = 0; lx < 4; ++lx)
+            if (atlas[(size_t)(4 + ly) * 8 + (4 + lx)] != vt::kAtlasClear) tile3Clear = false;
+        check(tile3Clear, "unallocated tile 3 -> all kAtlasClear");
+
+        // No allocated tile contains a kAtlasClear hole; exactly 3 tiles (48 texels) generated.
+        uint32_t generated = 0, cleared = 0;
+        for (uint32_t t : atlas) { if (t == vt::kAtlasClear) ++cleared; else ++generated; }
+        check(generated == 48u && cleared == 16u,
+              "3 allocated tiles -> 48 generated texels, 16 kAtlasClear (1 free tile)");
+    }
+
+    // genEnabled=false -> all kAtlasClear (the disabled-path no-op).
+    {
+        vt::VtTexture small; small.mipLevels = 2; small.pageSize = 4; small.virtualPagesPerSideMip0 = 2;
+        vt::VtTilePool pool; pool.tilesPerSide = 2;
+        vt::VtAtlasDims dims; dims.tilesPerSide = 2; dims.pageSize = 4;
+        std::vector<int32_t> indir(5, vt::kNoTile);
+        indir[0] = 0; indir[1] = 1;   // some allocated, but disabled -> ignored
+        std::vector<uint32_t> atlas((size_t)dims.atlasTexels(), 0u);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), small, pool, dims,
+                                  std::span<uint32_t>(atlas.data(), atlas.size()), false);
+        bool allClear = true; for (uint32_t t : atlas) if (t != vt::kAtlasClear) allClear = false;
+        check(allClear, "GeneratePhysicalAtlas genEnabled=false -> all kAtlasClear (no-op)");
+    }
+
+    // GeneratePhysicalAtlas determinism: two passes byte-identical (over the real showcase config).
+    {
+        vt::VtTexture vfull; vfull.mipLevels = 4; vfull.pageSize = 128; vfull.virtualPagesPerSideMip0 = 16;
+        std::vector<vt::SampleRequest> requests;
+        const int kg = 24;
+        for (int gy = 0; gy < kg; ++gy) for (int gx = 0; gx < kg; ++gx)
+            requests.push_back({(float)gx / (float)kg, (float)gy / (float)kg, (gx + gy) % vfull.mipLevels});
+        std::vector<uint32_t> fb((size_t)vfull.pageCount(), 0u);
+        vt::MarkFeedbackPages(std::span<const vt::SampleRequest>(requests.data(), requests.size()), vfull,
+                              std::span<uint32_t>(fb.data(), fb.size()));
+        vt::VtTilePool pool; pool.tilesPerSide = 16;   // 256 tiles > resident(212) -> some tiles stay free
+        vt::VtAtlasDims dims; dims.tilesPerSide = 16; dims.pageSize = 64;
+        int resident = 0; for (uint32_t f : fb) resident += (f != 0u);
+        std::vector<int32_t> indir =
+            vt::AllocatePhysicalTiles(std::span<const uint32_t>(fb.data(), fb.size()), pool);
+        int allocated = 0; for (int32_t t : indir) if (t != vt::kNoTile) ++allocated;
+        check(resident == 212, "showcase pagegen config: resident == 212");
+        check(allocated == resident && allocated < pool.tileCapacity(),
+              "showcase pagegen config: all 212 resident allocated, free tiles remain (clear regions shown)");
+
+        std::vector<uint32_t> a((size_t)dims.atlasTexels(), 0u), b((size_t)dims.atlasTexels(), 0u);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), vfull, pool, dims,
+                                  std::span<uint32_t>(a.data(), a.size()), true);
+        vt::GeneratePhysicalAtlas(std::span<const int32_t>(indir.data(), indir.size()), vfull, pool, dims,
+                                  std::span<uint32_t>(b.data(), b.size()), true);
+        check(std::memcmp(a.data(), b.data(), a.size() * sizeof(uint32_t)) == 0,
+              "GeneratePhysicalAtlas deterministic (two passes byte-identical)");
+
+        // Every allocated tile fully written (no kAtlasClear hole); the rest kAtlasClear.
+        std::vector<uint32_t> tpi = vt::BuildTilePageId(
+            std::span<const int32_t>(indir.data(), indir.size()), pool);
+        bool coverageOk = true;
+        for (int ty = 0; ty < pool.tilesPerSide && coverageOk; ++ty)
+            for (int tx = 0; tx < pool.tilesPerSide && coverageOk; ++tx) {
+                bool alloc = (tpi[(size_t)(ty * pool.tilesPerSide + tx)] != vt::kNoTileU32);
+                for (int ly = 0; ly < dims.pageSize && coverageOk; ++ly)
+                    for (int lx = 0; lx < dims.pageSize; ++lx) {
+                        bool clear = a[(size_t)(ty * dims.pageSize + ly) * dims.atlasW()
+                                       + (tx * dims.pageSize + lx)] == vt::kAtlasClear;
+                        if (alloc == clear) { coverageOk = false; break; }  // alloc must be non-clear, free must be clear
+                    }
+            }
+        check(coverageOk, "every allocated tile fully written, every free tile all kAtlasClear");
+    }
+
     if (g_fail == 0) std::printf("vt_test: ALL PASS\n");
     else std::printf("vt_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
