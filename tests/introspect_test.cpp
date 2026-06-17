@@ -264,6 +264,8 @@ int main() {
             bool sawVsmSampleFeature = false;
             // Slice VD: the virtual-shadow-maps-cache capability is advertised in the feature manifest.
             bool sawVsmCacheFeature = false;
+            // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
+            bool sawVtFeedbackFeature = false;
             // Slice SW1: the nanite-software-raster capability is advertised in the feature manifest.
             bool sawSwRasterFeature = false;
             // Slice SW2: the nanite-software-raster-gpu capability is advertised in the feature manifest.
@@ -341,6 +343,7 @@ int main() {
                     if (AsString(el->value) == "virtual-shadow-maps-render") sawVsmRenderFeature = true;
                     if (AsString(el->value) == "virtual-shadow-maps-sample") sawVsmSampleFeature = true;
                     if (AsString(el->value) == "virtual-shadow-maps-cache") sawVsmCacheFeature = true;
+                    if (AsString(el->value) == "runtime-virtual-texturing-feedback") sawVtFeedbackFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -412,6 +415,7 @@ int main() {
             check(sawVsmRenderFeature, "engine.features includes virtual-shadow-maps-render");
             check(sawVsmSampleFeature, "engine.features includes virtual-shadow-maps-sample");
             check(sawVsmCacheFeature, "engine.features includes virtual-shadow-maps-cache");
+            check(sawVtFeedbackFeature, "engine.features includes runtime-virtual-texturing-feedback");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -550,6 +554,8 @@ int main() {
         bool sawVsmSampleShot = false;
         // Slice VD: the --vsm-cache-shot showcase flag is listed in the showcase manifest.
         bool sawVsmCacheShot = false;
+        // Slice VT1: the --vt-feedback-shot showcase flag is listed in the showcase manifest.
+        bool sawVtFeedbackShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -641,6 +647,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-render-shot") sawVsmRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-sample-shot") sawVsmSampleShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--vsm-cache-shot") sawVsmCacheShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--vt-feedback-shot") sawVtFeedbackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -715,6 +722,7 @@ int main() {
         check(sawVsmRenderShot, "showcases manifest includes --vsm-render-shot");
         check(sawVsmSampleShot, "showcases manifest includes --vsm-sample-shot");
         check(sawVsmCacheShot, "showcases manifest includes --vsm-cache-shot");
+        check(sawVtFeedbackShot, "showcases manifest includes --vt-feedback-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
