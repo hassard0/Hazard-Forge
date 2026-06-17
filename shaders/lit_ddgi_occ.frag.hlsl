@@ -238,11 +238,15 @@ float3 InterpolateIrradianceSH(float3 worldPos, float3 N) {
 }
 
 // ===================================================================================================
-// THE DP CHEBYSHEV-OCCLUSION DISTANCE QUERY (VERBATIM probedist::DistDirToFaceUV + SampleProbeMoments).
+// THE DP CHEBYSHEV-OCCLUSION DISTANCE QUERY (VERBATIM probedist::DistDirToFaceUVf + SampleProbeMoments).
+// BILINEAR moment sampling (was NEAREST): nearest quantized the per-pixel probe→point direction to one of
+// the 8×8 texels per face, so the visibility weight jumped at every texel boundary — visible as
+// concentric-ring / moiré patterns on every surface of the baked frame. Bilinear makes the moments (and
+// the Chebyshev weight) a SMOOTH function of direction -> the rings become a smooth occlusion gradient.
 // ===================================================================================================
-// Direction -> (face, u, v) into the distance cube, matching DO's cubemap::DirToFaceUV / FaceView
-// convention EXACTLY (copied verbatim from cubemap::DirToFaceUV + probedist::DistDirToFaceUV).
-void DistDirToFaceUV(float3 dir, out int outFace, out int outU, out int outV) {
+// Direction -> (face, CONTINUOUS face s/t) into the distance cube, matching DO's cubemap::DirToFaceUV /
+// FaceView convention EXACTLY (copied verbatim from cubemap::DirToFaceUV + probedist::DistDirToFaceUVf).
+void DistDirToFaceUVf(float3 dir, out int outFace, out float outS, out float outT) {
     float ax = abs(dir.x), ay = abs(dir.y), az = abs(dir.z);
     float ma, sc, tc;
     if (ax >= ay && ax >= az) {
@@ -259,21 +263,48 @@ void DistDirToFaceUV(float3 dir, out int outFace, out int outU, out int outV) {
         ma = az;
     }
     float inv = (ma > 1e-20) ? 0.5 / ma : 0.0;
-    float s = sc * inv + 0.5;   // [0,1] face S
-    float t = tc * inv + 0.5;   // [0,1] face T
-    int u = (int)floor(s * (float)kDistFace);
-    int v = (int)floor(t * (float)kDistFace);
-    if (u < 0) u = 0; if (u > kDistFace - 1) u = kDistFace - 1;
-    if (v < 0) v = 0; if (v > kDistFace - 1) v = kDistFace - 1;
-    outU = u; outV = v;
+    outS = sc * inv + 0.5;   // [0,1] face S (CONTINUOUS — not quantized)
+    outT = tc * inv + 0.5;   // [0,1] face T
 }
-// Read {meanDist, meanDist²} for probe `probeIdx` along `dir` (NEAREST-texel; verbatim
-// probedist::SampleProbeMoments / ProbeDistTexelIndex p*384+f*64+v*8+u).
+// Read {meanDist, meanDist²} for probe `probeIdx` along `dir` — BILINEAR across the 4 surrounding texels,
+// edge-clamped (verbatim probedist::SampleProbeMoments; ProbeDistTexelIndex slot = p*384+f*64+v*8+u). The
+// fma-lerp form lerp(a,b,w)=mad(w, b-a, a) keeps the blend GPU==CPU bit-exact (the DH cross-backend rule).
 float2 SampleProbeMoments(int probeIdx, float3 dir) {
-    int face, u, v;
-    DistDirToFaceUV(dir, face, u, v);
-    int slot = probeIdx * kProbeTexels + face * kFaceTexels + v * kDistFace + u;
-    return float2(gProbeDist[slot].m[0], gProbeDist[slot].m[1]);
+    int face; float s, t;
+    DistDirToFaceUVf(dir, face, s, t);
+
+    // Fractional texel coords (texel-centered): fu = s*kDistFace - 0.5.
+    float fu = mad(s, (float)kDistFace, -0.5);
+    float fv = mad(t, (float)kDistFace, -0.5);
+    float bu = floor(fu);
+    float bv = floor(fv);
+    float fracU = fu - bu;
+    float fracV = fv - bv;
+
+    int u0 = (int)bu;
+    int v0 = (int)bv;
+    int u1 = u0 + 1;
+    int v1 = v0 + 1;
+    // Edge-clamp the 4 taps to [0, kDistFace-1] (face border; no cross-face for this first cut).
+    if (u0 < 0) u0 = 0; if (u0 > kDistFace - 1) u0 = kDistFace - 1;
+    if (u1 < 0) u1 = 0; if (u1 > kDistFace - 1) u1 = kDistFace - 1;
+    if (v0 < 0) v0 = 0; if (v0 > kDistFace - 1) v0 = kDistFace - 1;
+    if (v1 < 0) v1 = 0; if (v1 > kDistFace - 1) v1 = kDistFace - 1;
+
+    int base = probeIdx * kProbeTexels + face * kFaceTexels;
+    float2 m00 = float2(gProbeDist[base + v0 * kDistFace + u0].m[0], gProbeDist[base + v0 * kDistFace + u0].m[1]);
+    float2 m10 = float2(gProbeDist[base + v0 * kDistFace + u1].m[0], gProbeDist[base + v0 * kDistFace + u1].m[1]);
+    float2 m01 = float2(gProbeDist[base + v1 * kDistFace + u0].m[0], gProbeDist[base + v1 * kDistFace + u0].m[1]);
+    float2 m11 = float2(gProbeDist[base + v1 * kDistFace + u1].m[0], gProbeDist[base + v1 * kDistFace + u1].m[1]);
+
+    // Separable bilinear via fma-lerp: lerp(a,b,w) = mad(w, b-a, a). Blend in u, then v. Per-moment.
+    float r0x = mad(fracU, m10.x - m00.x, m00.x);
+    float r1x = mad(fracU, m11.x - m01.x, m01.x);
+    float ox  = mad(fracV, r1x - r0x, r0x);
+    float r0y = mad(fracU, m10.y - m00.y, m00.y);
+    float r1y = mad(fracU, m11.y - m01.y, m01.y);
+    float oy  = mad(fracV, r1y - r0y, r0y);
+    return float2(ox, oy);
 }
 
 // ===================================================================================================
@@ -350,6 +381,10 @@ float3 InterpolateIrradianceSHOcc(float3 worldPos, float3 N) {
             float2 mom = SampleProbeMoments(cflat[c], dir);
             float mean = mom.x;
             float var  = max(0.0, mad(-mean, mean, mom.y));   // m[1] - mean*mean
+            // Variance floor (band-softener, std DDGI practice; verbatim probedist::kVarFloorRel/Abs):
+            // clamp var UP to 2e-4*mean² + 1e-5 so the visibility transition is SOFT (no residual banding).
+            float floorV = mad(2.0e-4, mean * mean, 1.0e-5);
+            var = max(var, floorV);
             float dd   = max(0.0, dist - mean);
             float cheb = (dist <= mean) ? 1.0 : (var / (var + dd * dd));
             float vis  = lerp(1.0, cheb, occ);                // occlusionStrength=0 path is branched above

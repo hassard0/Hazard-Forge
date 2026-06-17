@@ -171,7 +171,7 @@ inline ProbeDistMoments MomentsFromDistance(float d) {
     return r;
 }
 
-// --- Direction -> (face, u, v) into the distance-moment cube (the DP Chebyshev query). --------------
+// --- Direction -> (face, u, v) into the distance-moment cube (the DP Chebyshev query, NEAREST). ------
 // DistDirToFaceUV(dir, face, u, v) maps a world-space sample direction to the (face, texel u, texel v)
 // of the kDistFace×kDistFace×6 distance cube, matching DO's CAPTURE orientation EXACTLY. DO captured each
 // face with cubemap::FaceView/FaceProj and stored texel (u,v) by sub-sampling the captured face at
@@ -179,8 +179,9 @@ inline ProbeDistMoments MomentsFromDistance(float d) {
 // matches that FaceView/FaceProj convention is cubemap::DirToFaceUV (the SAME header the capture uses):
 // it returns the selected face + the [0,1] face S/T. We then quantise s,t to the NEAREST texel:
 // u = clamp(floor(s*kDistFace), 0, kDistFace-1), v likewise. NEAREST-texel (deterministic, bit-exact, no
-// filter ambiguity — bilinear is a documented future refinement). `dir` need not be unit. This is the
-// SAME math the DP shader copies VERBATIM. Pure / deterministic.
+// filter ambiguity). RETAINED for the unit tests / the face-selection round-trip; the SHADING path now
+// uses the BILINEAR sampler below (DistDirToFaceUVf + SampleProbeMoments) to KILL the per-texel
+// quantization rings on the baked frame. `dir` need not be unit. Pure / deterministic.
 inline void DistDirToFaceUV(const math::Vec3& dir, int& outFace, int& outU, int& outV) {
     math::Vec2 uv;
     cubemap::DirToFaceUV(dir, outFace, uv);     // face + [0,1] S/T in DO's FaceView convention
@@ -191,36 +192,111 @@ inline void DistDirToFaceUV(const math::Vec3& dir, int& outFace, int& outU, int&
     outU = u; outV = v;
 }
 
-// --- Sample the distance moments of a probe in a direction (the DP Chebyshev source). ---------------
+// --- Direction -> (face, CONTINUOUS face s/t) into the distance cube (the BILINEAR Chebyshev query). -
+// DistDirToFaceUVf(dir, face, s, t) is the BILINEAR analog of DistDirToFaceUV: it returns the selected
+// face (same dominant-axis face selection as the nearest path / cubemap::DirToFaceUV) and the CONTINUOUS
+// [0,1] face S/T (NOT quantized to a texel). The bilinear SampleProbeMoments below turns (s,t) into the 4
+// surrounding texel taps + bilinear weights. `dir` need not be unit. Pure / deterministic.
+inline void DistDirToFaceUVf(const math::Vec3& dir, int& outFace, float& outS, float& outT) {
+    math::Vec2 uv;
+    cubemap::DirToFaceUV(dir, outFace, uv);     // face + [0,1] S/T in DO's FaceView convention
+    outS = uv.x;
+    outT = uv.y;
+}
+
+// --- Sample the distance moments of a probe in a direction — BILINEAR (the DP Chebyshev source). -----
 // SampleProbeMoments(store, probeIdx, dir) reads the {meanDist, meanDist²} moments of probe `probeIdx`
-// along `dir`: DistDirToFaceUV(dir) -> (face,u,v), then store[ProbeDistTexelIndex(probeIdx,face,u,v)].m.
-// NEAREST-texel (no filtering). `store` is the flat ProbeDistMoments[probeCount*384] DO produced; returns
-// {meanDist, meanDist²} as a Vec2 (x=m[0], y=m[1]). store==null -> {0,0} (a degenerate / no-data probe ->
-// the DP Chebyshev test then sees var=0,mean=0 -> the dist<=mean early-out gives vis=1 only at dist 0, so
-// a missing store yields no spurious occlusion at distance — documented). This is the SAME readback the DP
-// shader copies VERBATIM (gProbeDist[ProbeDistTexelIndex(...)]). Pure / deterministic.
+// along `dir` with BILINEAR FILTERING across the 4 surrounding texels of the selected face. This replaces
+// the old NEAREST-texel read: nearest quantized the per-pixel probe→point direction to one of the 8×8
+// texels per face, so the visibility weight jumped discretely at every texel boundary — visible as
+// high-contrast CONCENTRIC-RING / moiré patterns on every wall/floor/ceiling of the baked frame. Bilinear
+// makes the moments (and therefore the Chebyshev visibility weight) a SMOOTH function of direction, so the
+// rings become a smooth occlusion gradient.
+//
+// THE FILTER (texel-centered, edge-clamped):
+//   The face stores texel (u,v) sampled at s=(u+0.5)/kDistFace. So the continuous s in [0,1] maps to a
+//   FRACTIONAL texel coord fu = s*kDistFace - 0.5; bu = floor(fu); fracU = fu - bu; taps are bu and bu+1,
+//   each CLAMPED to [0, kDistFace-1] (EDGE-CLAMP at the face border — this first cut does NOT cross to an
+//   adjacent cube face; edge-clamp is deterministic and exact). Same for v. The 4 bilinear weights are
+//   (1-fracU)(1-fracV), fracU(1-fracV), (1-fracU)fracV, fracU fracV; each moment (m[0]=mean, m[1]=mean²)
+//   is the bilinear blend of its 4 taps.
+//
+// THE CROSS-BACKEND FP DISCIPLINE: every weight product uses std::fma (the DH GPU==CPU bit-exact rule —
+// Metal contracts a*b+c to one fma, others don't; forcing fma here keeps the bilinear blend bit-identical
+// across backends). We blend with the 1-D separable form mad'd in s then in t:
+//   r0 = lerp_fma(t00, t10, fracU);  r1 = lerp_fma(t01, t11, fracU);  out = lerp_fma(r0, r1, fracV)
+// where lerp_fma(a,b,w) = fma(w, b-a, a) — one subtract + one fma, matching the shader's mad form exactly.
+// `store` is the flat ProbeDistMoments[probeCount*384] DO produced; returns {meanDist, meanDist²} as a
+// Vec2. store==null -> {0,0} (the documented no-data fallback: var=0,mean=0 -> vis=1 only at dist 0, no
+// spurious occlusion at distance). A moment field CONSTANT over a face -> bilinear returns that constant
+// EXACTLY (the 4 equal taps blend to the same value for any frac). This is the SAME math the DP shader
+// copies VERBATIM. Pure / deterministic.
 inline math::Vec2 SampleProbeMoments(const ProbeDistMoments* store, int probeIdx, const math::Vec3& dir) {
     if (store == nullptr) return math::Vec2{0.0f, 0.0f};
-    int face, u, v;
-    DistDirToFaceUV(dir, face, u, v);
-    const ProbeDistMoments& m = store[ProbeDistTexelIndex(probeIdx, face, u, v)];
-    return math::Vec2{m.m[0], m.m[1]};
+    int face;
+    float s, t;
+    DistDirToFaceUVf(dir, face, s, t);
+
+    // Fractional texel coords (texel-centered): fu = s*kDistFace - 0.5.
+    float fu = std::fma(s, (float)kDistFace, -0.5f);
+    float fv = std::fma(t, (float)kDistFace, -0.5f);
+    float bu = std::floor(fu);
+    float bv = std::floor(fv);
+    float fracU = fu - bu;
+    float fracV = fv - bv;
+
+    int u0 = (int)bu;
+    int v0 = (int)bv;
+    int u1 = u0 + 1;
+    int v1 = v0 + 1;
+    // Edge-clamp the 4 taps to [0, kDistFace-1] (face border; no cross-face for this first cut).
+    if (u0 < 0) u0 = 0; if (u0 > kDistFace - 1) u0 = kDistFace - 1;
+    if (u1 < 0) u1 = 0; if (u1 > kDistFace - 1) u1 = kDistFace - 1;
+    if (v0 < 0) v0 = 0; if (v0 > kDistFace - 1) v0 = kDistFace - 1;
+    if (v1 < 0) v1 = 0; if (v1 > kDistFace - 1) v1 = kDistFace - 1;
+
+    const ProbeDistMoments& m00 = store[ProbeDistTexelIndex(probeIdx, face, u0, v0)];
+    const ProbeDistMoments& m10 = store[ProbeDistTexelIndex(probeIdx, face, u1, v0)];
+    const ProbeDistMoments& m01 = store[ProbeDistTexelIndex(probeIdx, face, u0, v1)];
+    const ProbeDistMoments& m11 = store[ProbeDistTexelIndex(probeIdx, face, u1, v1)];
+
+    // Separable bilinear via fma-lerp: lerp(a,b,w) = fma(w, b-a, a). Blend in u, then in v. Per-moment.
+    float r0x = std::fma(fracU, m10.m[0] - m00.m[0], m00.m[0]);
+    float r1x = std::fma(fracU, m11.m[0] - m01.m[0], m01.m[0]);
+    float ox  = std::fma(fracV, r1x - r0x, r0x);
+
+    float r0y = std::fma(fracU, m10.m[1] - m00.m[1], m00.m[1]);
+    float r1y = std::fma(fracU, m11.m[1] - m01.m[1], m01.m[1]);
+    float oy  = std::fma(fracV, r1y - r0y, r0y);
+
+    return math::Vec2{ox, oy};
 }
 
 // --- The Chebyshev (variance-shadow) visibility weight (the DP leak-fix, CPU mirror). ----------------
 // ChebyshevVisibility(mom, dist) = the variance-shadow upper bound that probe `mom` (its {meanDist,
 // meanDist²} along the probe->point direction) is VISIBLE from a surface at linear distance `dist`:
-//   mean = mom.x;  var = max(0, mom.y - mean*mean);
+//   mean = mom.x;  var = max(varFloor, mom.y - mean*mean);
 //   dist <= mean              -> 1 (the surface is at/closer than the mean occluder -> fully visible)
 //   else                      -> var / (var + (dist-mean)²)   (Chebyshev's inequality, in [0,1])
-// var==0 (a perfectly certain occluder) collapses to a HARD step at dist==mean (1 for dist<=mean, 0 past
-// it). This is the SAME closed form the DP shader runs (mad where multiply-adds occur). Pure /
-// deterministic; no NaN (the dist<=mean branch guards var+dd²==0 only when var==0 AND dist==mean -> the
-// branch returns 1 first). The full per-probe weight in the shader is lerp(1, cheb, occlusionStrength).
+//
+// THE VARIANCE FLOOR (the band-softener, standard DDGI practice — Majercik et al. 2019 §"chebyshev"):
+// after the bilinear moment filter a face that is locally near-flat still has a TINY variance, so the
+// transition var/(var+dd²) can collapse to a near-hard step and read as a faint band. We clamp the
+// variance UP to a small relative floor varFloor = kVarFloorRel * mean*mean (a fixed fraction of the
+// squared mean distance, so the softening scales with the probe→occluder distance and is unit-consistent),
+// plus a tiny absolute floor kVarFloorAbs so mean==0 still has a defined (soft) transition. This makes the
+// visibility transition SOFT rather than a hard step -> no residual banding -> a clean leak-fixed frame.
+// kVarFloorRel=2e-4, kVarFloorAbs=1e-5 (documented; deterministic). This is the SAME closed form +
+// floor the DP shader runs (mad where multiply-adds occur). Pure / deterministic; no NaN (var>=kVarFloorAbs
+// >0 always now, so var+dd² > 0 strictly; the dist<=mean branch still returns 1 first at the boundary).
+inline constexpr float kVarFloorRel = 2.0e-4f;   // relative variance floor (fraction of mean²)
+inline constexpr float kVarFloorAbs = 1.0e-5f;   // absolute variance floor (so mean==0 stays soft)
 inline float ChebyshevVisibility(const math::Vec2& mom, float dist) {
     float mean = mom.x;
     float var  = mom.y - mean * mean;
     if (var < 0.0f) var = 0.0f;
+    float floorV = kVarFloorRel * (mean * mean) + kVarFloorAbs;   // soften: small minimum variance
+    if (var < floorV) var = floorV;
     if (dist <= mean) return 1.0f;
     float dd = dist - mean;                 // > 0 here
     return var / (var + dd * dd);

@@ -85,27 +85,31 @@ int main() {
     }
 
     // ====================================================================================
-    // SampleProbeMoments — a store with a known moment at a texel reads back via the matching dir.
+    // SampleProbeMoments (BILINEAR) — a distinct CONSTANT moment per face reads back via the axis dir.
+    // (Bilinear: the axis dir lands at face-center s=t=0.5, which straddles 4 texels; with a per-FACE
+    // constant fill all 4 taps are equal so the bilinear blend returns that face's value EXACTLY.)
     // ====================================================================================
     {
         const int kProbes = 8;
         std::vector<probedist::ProbeDistMoments> store(
             (size_t)kProbes * probedist::kProbeTexels, probedist::ProbeDistMoments{{0.0f, 0.0f}});
-        // Plant a distinct moment at probe 3, the face-centre texel (4,4) of each face. Sampling the axis
-        // dir of that face reads it back.
+        // Fill probe 3, each face, with a distinct CONSTANT moment over the whole face. The axis dir of
+        // that face reads it back exactly (bilinear of 4 equal taps == the constant).
         const Vec3 axes[6] = {
             {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}};
-        bool readback = true;
         for (int f = 0; f < 6; ++f) {
             float d = 2.0f + (float)f;   // distinct per face
-            store[probedist::ProbeDistTexelIndex(3, f, 4, 4)] = probedist::MomentsFromDistance(d);
+            for (int v = 0; v < probedist::kDistFace; ++v)
+                for (int u = 0; u < probedist::kDistFace; ++u)
+                    store[probedist::ProbeDistTexelIndex(3, f, u, v)] = probedist::MomentsFromDistance(d);
         }
+        bool readback = true;
         for (int f = 0; f < 6; ++f) {
             float d = 2.0f + (float)f;
             Vec2 mom = probedist::SampleProbeMoments(store.data(), 3, axes[f]);
-            if (mom.x != d || mom.y != d * d) readback = false;
+            if (mom.x != d || mom.y != d * d) readback = false;   // EXACT (constant face)
         }
-        check(readback, "SampleProbeMoments: an axis dir reads back the moment planted at that face centre");
+        check(readback, "SampleProbeMoments: an axis dir reads back the per-face constant moment EXACTLY");
 
         // null store -> {0,0} (no UB, the documented no-data fallback).
         Vec2 z = probedist::SampleProbeMoments(nullptr, 0, Vec3{1, 0, 0});
@@ -118,10 +122,12 @@ int main() {
     }
 
     // ====================================================================================
-    // Chebyshev closed form — dist<=mean -> 1; dist>>mean small var -> ≈0; var==0 -> hard step.
+    // Chebyshev closed form (with the variance FLOOR) — dist<=mean -> 1; dist>>mean small var -> ≈0;
+    // var==0 -> SOFT step (the floor replaces the old hard step — standard DDGI band-softening).
     // ====================================================================================
     {
-        // A moderately-certain occluder at mean=5, with some variance.
+        // A moderately-certain occluder at mean=5, with variance WELL ABOVE the relative floor
+        // (varFloor = 2e-4*25 + 1e-5 ≈ 5.01e-3, so var=0.25 is untouched -> the closed form is exact here).
         float mean = 5.0f, var = 0.25f;
         Vec2 mom{mean, mean * mean + var};   // m[1] = mean^2 + var
 
@@ -130,29 +136,96 @@ int main() {
         check(probedist::ChebyshevVisibility(mom, mean) == 1.0f, "Chebyshev: dist==mean -> vis==1 (boundary)");
         check(probedist::ChebyshevVisibility(mom, mean - 1.0f) == 1.0f, "Chebyshev: dist<mean -> vis==1");
 
-        // dist >> mean with small var -> ≈0 (strongly attenuated, occluded).
+        // dist >> mean with this var -> ≈0 (strongly attenuated, occluded). The floor (≈5e-3) is far below
+        // var=0.25 so it does not lift this.
         float visFar = probedist::ChebyshevVisibility(mom, mean + 20.0f);
-        check(visFar > 0.0f && visFar < 0.01f, "Chebyshev: dist>>mean (small var) -> vis≈0 (occluded)");
+        check(visFar > 0.0f && visFar < 0.01f, "Chebyshev: dist>>mean (var>>floor) -> vis≈0 (occluded)");
 
-        // The closed form at a known point: dist = mean + dd -> var/(var+dd^2).
+        // The closed form at a known point: dist = mean + dd -> var/(var+dd^2) (var>>floor -> floor inert).
         float dd = 2.0f;
         float expect = var / (var + dd * dd);
         float got = probedist::ChebyshevVisibility(mom, mean + dd);
         check(std::fabs(got - expect) <= 1e-6f, "Chebyshev: dist=mean+dd -> var/(var+dd^2) (closed form)");
 
-        // var==0 -> a HARD step: 1 at dist<=mean, 0 strictly past it (no NaN from 0/0 — the dist<=mean
-        // branch returns 1 first; past mean it is 0/(0+dd^2)==0).
-        Vec2 hard{mean, mean * mean};   // var == 0 exactly
-        check(probedist::ChebyshevVisibility(hard, mean) == 1.0f, "Chebyshev: var==0, dist==mean -> 1 (no NaN)");
-        check(probedist::ChebyshevVisibility(hard, mean + 0.001f) == 0.0f,
-              "Chebyshev: var==0, dist>mean -> 0 (hard step, no 0/0 NaN)");
-        float hv = probedist::ChebyshevVisibility(hard, mean + 5.0f);
-        check(hv == 0.0f && !std::isnan(hv), "Chebyshev: var==0 far -> 0, finite (no NaN)");
+        // THE VARIANCE FLOOR: var==0 no longer collapses to a HARD step — the floor makes the transition
+        // SOFT. At dist==mean it is still EXACTLY 1 (the dist<=mean early-out, before any var use, no NaN).
+        Vec2 hard{mean, mean * mean};   // raw var == 0; the floor lifts it to varFloor
+        float floorV = probedist::kVarFloorRel * (mean * mean) + probedist::kVarFloorAbs;
+        check(probedist::ChebyshevVisibility(hard, mean) == 1.0f, "Chebyshev: var==0, dist==mean -> 1 (early-out)");
+        // Just past mean the floor gives a SOFT, near-1 visibility (not the old hard 0): var/(var+dd²) with
+        // var=floorV and dd=0.001 -> floorV/(floorV + 1e-6), which is close to 1 (the softening payoff).
+        {
+            float dd2 = 0.001f;
+            float expectSoft = floorV / (floorV + dd2 * dd2);
+            float gotSoft = probedist::ChebyshevVisibility(hard, mean + dd2);
+            check(std::fabs(gotSoft - expectSoft) <= 1e-6f,
+                  "Chebyshev: var==0, just past mean -> SOFT (var floored, no hard step)");
+            check(gotSoft > 0.5f, "Chebyshev: var floor softens the near-mean transition (vis>0.5, was 0)");
+        }
+        // Far past mean with the floor: var/(var+dd²) -> small but FINITE, no NaN.
+        float hv = probedist::ChebyshevVisibility(hard, mean + 50.0f);
+        check(hv > 0.0f && hv < 0.01f && !std::isnan(hv),
+              "Chebyshev: var-floored far -> small, positive, finite (no NaN)");
 
         // Determinism.
         float x = probedist::ChebyshevVisibility(mom, mean + dd);
         float y = probedist::ChebyshevVisibility(mom, mean + dd);
         check(std::memcmp(&x, &y, sizeof(float)) == 0, "Chebyshev: deterministic (byte-identical)");
+    }
+
+    // ====================================================================================
+    // BILINEAR SampleProbeMoments — a moment field CONSTANT over a face returns that constant EXACTLY;
+    // a continuous direction sweep produces a SMOOTH (monotone-between-taps) readback (no quantization
+    // jumps); the face-center axis dir still reads the planted center value.
+    // ====================================================================================
+    {
+        const int kProbes = 8;
+        std::vector<probedist::ProbeDistMoments> store(
+            (size_t)kProbes * probedist::kProbeTexels, probedist::ProbeDistMoments{{0.0f, 0.0f}});
+
+        // (1) CONSTANT over a face -> bilinear returns the constant EXACTLY for ANY direction into that face.
+        // Fill probe 2, face +X (face 0), every texel with the SAME moment.
+        const float kc = 7.5f;
+        for (int v = 0; v < probedist::kDistFace; ++v)
+            for (int u = 0; u < probedist::kDistFace; ++u)
+                store[probedist::ProbeDistTexelIndex(2, 0, u, v)] = probedist::MomentsFromDistance(kc);
+        bool constExact = true;
+        const Vec3 intoPlusX[] = {
+            {1.0f, 0.0f, 0.0f}, {1.0f, 0.2f, -0.1f}, {1.0f, -0.3f, 0.25f}, {1.0f, 0.31f, 0.31f}};
+        for (const Vec3& d : intoPlusX) {
+            Vec2 mom = probedist::SampleProbeMoments(store.data(), 2, d);
+            if (mom.x != kc || mom.y != kc * kc) constExact = false;   // EXACT (==), not approx
+        }
+        check(constExact, "bilinear: a moment field constant over a face -> bilinear returns it EXACTLY");
+
+        // (2) A LINEAR ramp across the face -> bilinear reads the interpolated value, and a small angular
+        // step yields a SMALL readback change (smoothness, no per-texel jump). Fill probe 4 face +X with a
+        // ramp in u: moment mean = (float)u.
+        for (int v = 0; v < probedist::kDistFace; ++v)
+            for (int u = 0; u < probedist::kDistFace; ++u)
+                store[probedist::ProbeDistTexelIndex(4, 0, u, v)] = probedist::MomentsFromDistance((float)u);
+        // Sweep s across the face by varying dir.z (sc = -z for +X), keep into +X. Confirm readback is
+        // monotone non-decreasing and changes are bounded (no >1 jump between fine steps).
+        float prev = -1.0e9f;
+        bool monotone = true, smooth = true;
+        for (int k = 0; k <= 64; ++k) {
+            float frac = (float)k / 64.0f;             // 0..1 across the face
+            float z = (0.5f - frac);                   // sc=-z spans [-0.5,0.5] -> s spans [0,1]
+            Vec3 d{1.0f, 0.0f, z};
+            Vec2 mom = probedist::SampleProbeMoments(store.data(), 4, d);
+            if (mom.x < prev - 1e-5f) monotone = false;
+            if (k > 0 && std::fabs(mom.x - prev) > 0.5f) smooth = false;   // per-fine-step jump bounded
+            prev = mom.x;
+        }
+        check(monotone, "bilinear: a face-ramp reads back monotone across a continuous direction sweep");
+        check(smooth, "bilinear: fine direction steps yield bounded readback changes (no per-texel jump)");
+
+        // (3) null store -> {0,0}; determinism (byte-identical across calls).
+        Vec2 zr = probedist::SampleProbeMoments(nullptr, 0, Vec3{1, 0, 0});
+        check(zr.x == 0.0f && zr.y == 0.0f, "bilinear: null store -> {0,0}");
+        Vec2 a = probedist::SampleProbeMoments(store.data(), 4, Vec3{1.0f, 0.1f, 0.2f});
+        Vec2 b = probedist::SampleProbeMoments(store.data(), 4, Vec3{1.0f, 0.1f, 0.2f});
+        check(std::memcmp(&a, &b, sizeof(Vec2)) == 0, "bilinear: deterministic (byte-identical)");
     }
 
     // ====================================================================================
