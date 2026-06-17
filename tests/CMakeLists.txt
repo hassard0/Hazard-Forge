@@ -267,6 +267,14 @@ hf_add_pure_test(froxel_test)
 # ASan-eligible.
 hf_add_pure_test(probe_gi_test)
 
+# Slice DI — DDGI Slice 2: Probe Radiance Capture. Pure CPU math for the per-probe cubemap-capture data
+# layer (render/probe_capture.h, reusing render/probe_gi.h's grid + render/cubemap.h's 6-face projection):
+# CaptureFaceCount (probeCount*6; 0 at dimX/Y/Z=0 -> the capture-loop skip no-op), ProbeFaceIndex (the
+# probe×face flat-slot round-trip + full coverage without overlap), the FaceView/FaceProj reuse from the
+# probe center (the 6 axes + the +Y/-Y up convention), the ProbeRadiance RGBA16F/6-face layout descriptor,
+# and the deterministic debug-viz FaceAverage. No RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(probe_capture_test)
+
 # Auto-Exposure (Slice CW): the histogram eye-adaptation math (render/auto_exposure.h, header-only) the
 # autoexposure_histogram/reduce compute shaders mirror VERBATIM. Asserts Luminance (Rec.709: white->1,
 # black->0 exactly, green->0.7152, linear), the log2-luminance LumToBin (lum<=0/below-floor -> bin 0,
