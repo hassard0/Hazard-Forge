@@ -297,6 +297,16 @@ hf_gen_msl(probe_sh_encode.comp   probe_sh_encode.comp.hlsl   comp probe_sh_enco
 # GPU blended-SH SSBO is BIT-EXACT to the CPU InterpolateSH reference on BOTH backends. Behind
 # --probeinterp only; existing shaders + goldens untouched.
 hf_gen_msl(probe_interp.comp      probe_interp.comp.hlsl      comp probe_interp_main)
+# Per-Probe Distance-Moment Capture — DDGI Visibility Slice 1 (Slice DO): the VISIBILITY data layer.
+# probe_dist.vert clones probe_bake.vert (passes the world position + carries probeCentre in the push
+# constant); probe_dist.frag outputs the linear world-distance d = length(worldPos - probeCentre) packed
+# as the two moments float2(d, d*d) (d*d a BARE multiply, bit-identical to the CPU reference
+# probedist::MomentsFromDistance). Pure geometry (no lighting), captured into the DD cube RT + read back
+# into a per-probe distance-moment store (the data the next slice DP, Chebyshev occlusion, consumes to
+# kill DDGI leak). Same HLSL->SPIR-V->MSL toolchain -> bit-identical to the Vulkan path; new golden
+# probe_dist.png. Behind --probedist only; existing shaders + goldens untouched. NO new RHI.
+hf_gen_msl(probe_dist.vert        probe_dist.vert.hlsl        vert probe_dist_vertex)
+hf_gen_msl(probe_dist.frag        probe_dist.frag.hlsl        frag probe_dist_fragment)
 # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
 # (flat float4 SSBO), Luminance -> LumToBin -> InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER
 # SSBO (order-independent counts -> deterministic; Metal threadgroup atomic_uint maps from the SPIR-V

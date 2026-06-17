@@ -404,6 +404,16 @@ hf_compile_shaders(
     # GPU blended-SH SSBO is BIT-EXACT to the CPU InterpolateSH reference. Pure compute + storage buffers
     # (no new RHI seam). The probeCount=0 dispatch-0 leaves the output SSBO untouched == the cleared upload.
     "shaders/probe_interp.comp.hlsl:cs"
+    # Per-Probe Distance-Moment Capture — DDGI Visibility Slice 1 (Slice DO): the VISIBILITY data layer.
+    # probe_dist.vert is a probe_bake.vert clone that passes the world position + carries probeCentre in the
+    # push constant; probe_dist.frag outputs the linear world-distance d = length(worldPos - probeCentre)
+    # packed as the two moments float2(d, d*d) (d*d a BARE multiply so it is bit-identical to the CPU
+    # reference probedist::MomentsFromDistance). Pure geometry (no lighting), captured into the DD cube RT +
+    # read back into a per-probe distance-moment store (the data the next slice DP, Chebyshev occlusion,
+    # consumes to kill DDGI leak). Behind --probedist-shot ONLY; lit.frag + every existing pipeline + golden
+    # stay byte-identical. NO new RHI (reuses DD's ICubemapTarget / Begin-EndCubemapFace / ReadCubemapFace).
+    "shaders/probe_dist.vert.hlsl:vs"
+    "shaders/probe_dist.frag.hlsl:ps"
     # Auto-Exposure (Slice CW): histogram eye adaptation. autoexposure_histogram.comp reads the HDR scene
     # color (flat float4 SSBO), computes the Rec.709 Luminance, maps it to a log2-luminance bin via
     # render/auto_exposure.h::LumToBin, and InterlockedAdd(histogram[bin],1) into a bins-entry INTEGER SSBO

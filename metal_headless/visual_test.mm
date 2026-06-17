@@ -67,6 +67,7 @@
 #include "render/probe_gi.h"        // Slice DH: DDGI probe-grid ray-trace (grid + Fibonacci + TraceRayToDepth)
 #include "render/probe_capture.h"   // Slice DI: DDGI probe radiance capture (CaptureFaceCount/ProbeFaceIndex/FaceAverage)
 #include "render/probe_sh.h"        // Slice DJ: DDGI probe SH-encode (SHBasis9/SHEncodeAccumulate/SHNormalize/SHEvaluate)
+#include "render/probe_dist.h"      // Slice DO: DDGI per-probe distance-moment capture (DistTexelCount/ProbeDist*/MomentsFromDistance)
 #include "render/cubemap.h"         // Slice DJ: cube-face count (kFaces) for the SH sample table
 #include "render/auto_exposure.h"  // Slice CW: auto-exposure histogram eye-adaptation math (luminance/bins/exposure)
 #include "render/ssgi.h"          // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -18253,6 +18254,372 @@ static int RunProbeCaptureShowcase(const char* outPath) {
     return 0;
 }
 
+// --- DDGI Per-Probe Distance-Moment Capture showcase (Slice DO). Mirrors the Vulkan --probedist-shot path
+// EXACTLY: for the SAME small 2x2x2 = 8-probe Cornell box, each probe renders the scene GEOMETRY into the 6
+// cube faces from its centre — looping the SINGLE cube RT one probe at a time — writing the linear world-
+// distance d = length(worldPos - probeCentre) packed as the two moments float2(d, d*d) (probe_dist.frag)
+// into the RGBA16F cube, read back into a per-probe distance-moment store. The mean captured distance is
+// visualized as per-probe swatch spheres (near warm / far cool). The SAME probe_dist.{vert,frag} compiled
+// here (HLSL->SPIR-V->MSL) makes the capture bit-identical to the Vulkan path. THE PROOFS also run on Metal:
+// (1) CAPTURE-CORRECTNESS — probe-0's captured distance face 0 rendered DIRECTLY (FlipProjY'd) is
+// BYTE-IDENTICAL to ReadCubemapFace(probe-0, 0); (2) MOMENT GPU==CPU BIT-EXACT — the moment store == the CPU
+// MomentsFromDistance over the read-back distance bytes (the moment-from-distance step; the sqrt distance
+// itself is render-equivalence per backend); (3) probeCount=0 (dimX=0) -> the loop is skipped -> the store
+// is cleared; (4) two captures byte-identical. New golden probe_dist.png; existing goldens untouched.
+static int RunProbeDistShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace cm = hf::render::cubemap;
+    namespace pd = hf::render::probedist;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    const float Rroom = 6.0f;
+    pd::ProbeGrid grid;
+    grid.origin  = Vec3{-2.0f, 0.0f, -2.0f};
+    grid.dimX = 2; grid.dimY = 2; grid.dimZ = 2; grid.spacing = 4.0f;
+    const uint32_t kCubeSize = 64;
+    const float kCubeNear = 0.05f, kCubeFar = 60.0f;
+    const rhi::Format kHdr = rhi::Format::RGBA16_Float;
+    const float aspect = (float)W / (float)H;
+
+    auto distVs = loadMSL("probe_dist.vert.gen.metal", "probe_dist_vertex");
+    auto distFs = loadMSL("probe_dist.frag.gen.metal", "probe_dist_fragment");
+    auto bakeVs = loadMSL("probe_bake.vert.gen.metal", "probe_bake_vertex");
+    auto bakeFs = loadMSL("probe_bake.frag.gen.metal", "probe_bake_fragment");
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+
+    // Distance pipeline (probe_dist.vert/frag: faceViewProj(16) + model(16) + probeCentre(4) = 144B push).
+    rhi::GraphicsPipelineDesc distDesc;
+    distDesc.vertex = distVs.get(); distDesc.fragment = distFs.get();
+    distDesc.vertexLayout = scene::MeshVertexLayout();
+    distDesc.colorFormat = kHdr;
+    distDesc.depthTest = true; distDesc.usesFrameUniforms = false; distDesc.usesTexture = false;
+    distDesc.fragmentPushConstants = true;   // probeCentre is read in the FRAGMENT stage
+    distDesc.pushConstantSize = sizeof(float) * 36;
+    auto distPipeline = device->CreateGraphicsPipeline(distDesc);
+
+    // Bake pipeline (the swatch-room/sphere viz: viewProj(16) + model(16) push).
+    rhi::GraphicsPipelineDesc bakeDesc;
+    bakeDesc.vertex = bakeVs.get(); bakeDesc.fragment = bakeFs.get();
+    bakeDesc.vertexLayout = scene::MeshVertexLayout();
+    bakeDesc.colorFormat = kHdr;
+    bakeDesc.depthTest = true; bakeDesc.usesFrameUniforms = false; bakeDesc.usesTexture = true;
+    bakeDesc.pushConstantSize = sizeof(float) * 32;
+    auto bakePipeline = device->CreateGraphicsPipeline(bakeDesc);
+
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto cube    = device->CreateCubemapTarget(kCubeSize, kHdr);
+    auto faceRT  = device->CreateRenderTarget(kCubeSize, kCubeSize, kHdr);
+    auto sceneRT = device->CreateRenderTarget(W, H, kHdr);
+    auto dummyShadow = device->CreateShadowMap(64);
+    device->SetShadowMap(*dummyShadow);
+    if (!cube) return fail("cubemap render targets unavailable");
+
+    scene::Mesh cubeMesh = scene::Mesh::Cube(*device);
+    scene::Mesh sphere   = scene::Mesh::Sphere(*device);
+
+    auto colorTex = [&](float r, float g, float b) {
+        uint8_t px[4] = {(uint8_t)(r * 255), (uint8_t)(g * 255), (uint8_t)(b * 255), 255};
+        return device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, px, sizeof(px)});
+    };
+    auto redTex     = colorTex(0.85f, 0.07f, 0.07f);
+    auto greenTex   = colorTex(0.10f, 0.75f, 0.12f);
+    auto blueTex    = colorTex(0.10f, 0.20f, 0.85f);
+    auto yellowTex  = colorTex(0.85f, 0.80f, 0.10f);
+    auto neutralTex = colorTex(0.78f, 0.78f, 0.78f);
+
+    const float Tk = 0.2f;
+    struct Wall { Mat4 model; rhi::ITexture* tex; };
+    std::vector<Wall> walls = {
+        {Mat4::Translate({-Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), redTex.get()},
+        {Mat4::Translate({ Rroom, 2.0f, 0.0f}) * Mat4::Scale({Tk, 2*Rroom, 2*Rroom}), greenTex.get()},
+        {Mat4::Translate({0.0f, 2.0f - Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+        {Mat4::Translate({0.0f, 2.0f + Rroom, 0.0f}) * Mat4::Scale({2*Rroom, Tk, 2*Rroom}), neutralTex.get()},
+        {Mat4::Translate({0.0f, 2.0f, -Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), blueTex.get()},
+        {Mat4::Translate({0.0f, 2.0f,  Rroom}) * Mat4::Scale({2*Rroom, 2*Rroom, Tk}), yellowTex.get()},
+    };
+
+    const Vec3 eye{0.0f, 2.4f, 12.0f};
+    const Vec3 ctr{0.0f, 2.0f, 0.0f};
+    const float fovY = 1.04719755f;
+    Mat4 camVP = FlipProjY(Mat4::Perspective(fovY, aspect, 0.1f, 100.0f)) * Mat4::LookAt(eye, ctr, {0, 1, 0});
+
+    std::vector<Vec3> probeCenters;
+    for (int pz = 0; pz < grid.dimZ; ++pz)
+        for (int py = 0; py < grid.dimY; ++py)
+            for (int px = 0; px < grid.dimX; ++px)
+                probeCenters.push_back(grid.probePos(px, py, pz));
+    const int probeN = grid.probeCount();
+
+    // The room draw stream through the DISTANCE pipeline, carrying the probe centre in the push constant.
+    auto drawRoomDist = [&](rhi::ICommandBuffer& cmd, const Mat4& faceVP, const Vec3& centre) {
+        cmd.BindPipeline(*distPipeline);
+        for (size_t wi = 0; wi < walls.size(); ++wi) {
+            const auto& wl = walls[wi];
+            float pcv[36];
+            for (int k = 0; k < 16; ++k) pcv[k]      = faceVP.m[k];
+            for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+            pcv[32] = centre.x; pcv[33] = centre.y; pcv[34] = centre.z; pcv[35] = 0.0f;
+            cmd.PushConstants(pcv, sizeof(pcv));
+            cmd.BindVertexBuffer(cubeMesh.vertices());
+            cmd.BindIndexBuffer(cubeMesh.indices());
+            cmd.DrawIndexed(cubeMesh.indexCount());
+        }
+    };
+
+    // fp16 -> fp32 (the RGBA16F readback is raw half-floats: R=d, G=d*d, B=A=0). Matches the Vulkan path.
+    auto halfToFloat = [](uint16_t hbits) -> float {
+        uint32_t sign = (uint32_t)(hbits & 0x8000u) << 16;
+        uint32_t exp  = (hbits >> 10) & 0x1Fu;
+        uint32_t mant = hbits & 0x3FFu;
+        uint32_t f;
+        if (exp == 0) {
+            if (mant == 0) { f = sign; }
+            else {
+                exp = 127 - 15 + 1;
+                while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
+                mant &= 0x3FFu;
+                f = sign | (exp << 23) | (mant << 13);
+            }
+        } else if (exp == 0x1Fu) {
+            f = sign | 0x7F800000u | (mant << 13);
+        } else {
+            f = sign | ((exp - 15 + 127) << 23) | (mant << 13);
+        }
+        float out; std::memcpy(&out, &f, sizeof(out)); return out;
+    };
+
+    // The capture loop: for each probe, capture the room DISTANCE into the 6 cube faces (FlipProjY'd per-
+    // face view/proj for Metal clip space) + read them back; the moment store is built by the CPU
+    // MomentsFromDistance over the read-back R (distance) channel. probeCount==0 -> DistTexelCount==0 -> the
+    // loop body never runs -> `store` keeps its cleared value. Raw face bytes are returned for proof 1.
+    auto runCapture = [&](const pd::ProbeGrid& g,
+                          std::vector<pd::ProbeDistMoments>& store,
+                          std::vector<std::vector<uint8_t>>& faceBytes,
+                          uint32_t& faceW, uint32_t& faceH) {
+        int texels = pd::DistTexelCount(g);
+        store.assign(texels > 0 ? texels : 0, pd::ProbeDistMoments{{0.0f, 0.0f}});
+        int slots = g.probeCount() * pd::kFaces;
+        faceBytes.assign(slots > 0 ? slots : 0, std::vector<uint8_t>());
+        if (pd::DistTexelCount(g) == 0) return;
+        int pn = g.probeCount();
+        std::vector<Vec3> centers;
+        for (int pz = 0; pz < g.dimZ; ++pz)
+            for (int py = 0; py < g.dimY; ++py)
+                for (int px = 0; px < g.dimX; ++px)
+                    centers.push_back(g.probePos(px, py, pz));
+        for (int p = 0; p < pn; ++p) {
+            Mat4 faceVPs[6];
+            for (int fi = 0; fi < 6; ++fi)
+                faceVPs[fi] = FlipProjY(pd::ProbeFaceViewProj(fi, centers[p], kCubeNear, kCubeFar));
+            for (uint32_t face = 0; face < 6; ++face) {
+                auto fc = device->BeginCubemapFace(*cube, face);
+                fc.cmd->BeginRenderPass(rhi::ClearColor{pd::kDistFar, pd::kDistFar * pd::kDistFar, 0.0f, 0.0f});
+                drawRoomDist(*fc.cmd, faceVPs[face], centers[p]);
+                fc.cmd->EndRenderPass();
+                device->EndCubemapFace(fc);
+            }
+            for (uint32_t face = 0; face < 6; ++face) {
+                std::vector<uint8_t> fb; uint32_t fw=0, fh=0;
+                if (!device->ReadCubemapFace(*cube, face, fb, fw, fh)) {
+                    std::fprintf(stderr, "FATAL: ReadCubemapFace(probe %d, face %u) failed\n", p, face);
+                    std::exit(1);
+                }
+                if (fb.size() != (size_t)fw * fh * 8) {
+                    std::fprintf(stderr, "FATAL: distance face is not RGBA16F (got %zu bytes for %ux%u)\n",
+                                 fb.size(), fw, fh);
+                    std::exit(1);
+                }
+                faceW = fw; faceH = fh;
+                faceBytes[pd::ProbeFaceIndexRaw(p, face)] = fb;
+                for (int v = 0; v < pd::kDistFace; ++v)
+                    for (int u = 0; u < pd::kDistFace; ++u) {
+                        uint32_t sx = (uint32_t)((u + 0.5f) * (float)fw / (float)pd::kDistFace);
+                        uint32_t sy = (uint32_t)((v + 0.5f) * (float)fh / (float)pd::kDistFace);
+                        if (sx >= fw) sx = fw - 1;
+                        if (sy >= fh) sy = fh - 1;
+                        size_t off = ((size_t)sy * fw + sx) * 8;
+                        uint16_t rHalf;
+                        std::memcpy(&rHalf, fb.data() + off + 0, sizeof(rHalf));   // R = d (fp16)
+                        store[pd::ProbeDistTexelIndex(p, (int)face, u, v)] =
+                            pd::MomentsFromDistance(halfToFloat(rHalf));
+                    }
+            }
+        }
+    };
+
+    std::vector<pd::ProbeDistMoments> momentStore;
+    std::vector<std::vector<uint8_t>> faceBytes; uint32_t faceW=0, faceH=0;
+    runCapture(grid, momentStore, faceBytes, faceW, faceH);
+
+    auto probeMeanDist = [&](int p) -> float {
+        return pd::ProbeMeanDistance(momentStore.data() + (size_t)p * pd::kProbeTexels, pd::kProbeTexels);
+    };
+    float dMin = 1e9f, dMax = -1e9f;
+    for (int p = 0; p < probeN; ++p) {
+        float md = probeMeanDist(p);
+        if (md < dMin) dMin = md;
+        if (md > dMax) dMax = md;
+    }
+    float dRange = (dMax > dMin) ? (dMax - dMin) : 1.0f;
+    std::vector<std::unique_ptr<rhi::ITexture>> swatchTex(probeN);
+    for (int p = 0; p < probeN; ++p) {
+        float t = (probeMeanDist(p) - dMin) / dRange;
+        float r = (1.0f - t) * 0.95f + t * 0.10f;
+        float g = (1.0f - t) * 0.55f + t * 0.35f;
+        float b = (1.0f - t) * 0.10f + t * 0.95f;
+        swatchTex[p] = colorTex(r, g, b);
+    }
+
+    auto drawRoomViz = [&](rhi::ICommandBuffer& cmd, const Mat4& vp, bool skipFront) {
+        cmd.BindPipeline(*bakePipeline);
+        for (size_t wi = 0; wi < walls.size(); ++wi) {
+            if (skipFront && wi == 5) continue;
+            const auto& wl = walls[wi];
+            float pcv[32];
+            for (int k = 0; k < 16; ++k) pcv[k]      = vp.m[k];
+            for (int k = 0; k < 16; ++k) pcv[16 + k] = wl.model.m[k];
+            cmd.PushConstants(pcv, sizeof(pcv));
+            cmd.BindTexture(*wl.tex);
+            cmd.BindVertexBuffer(cubeMesh.vertices());
+            cmd.BindIndexBuffer(cubeMesh.indices());
+            cmd.DrawIndexed(cubeMesh.indexCount());
+        }
+    };
+    auto renderScene = [&](std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) {
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget("sceneColor", render::RgResourceKind::SceneColor, *sceneRT);
+        render::RgResource rgSwap  = graph.ImportSwapchain("swapchain");
+        graph.AddPass("capScene", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.03f, 1});
+                drawRoomViz(cmd, camVP, /*skipFront=*/true);
+                cmd.BindPipeline(*bakePipeline);
+                for (int p = 0; p < probeN; ++p) {
+                    Mat4 model = Mat4::Translate(probeCenters[p]) * Mat4::Scale({0.45f, 0.45f, 0.45f});
+                    float pcv[32];
+                    for (int k = 0; k < 16; ++k) pcv[k]      = camVP.m[k];
+                    for (int k = 0; k < 16; ++k) pcv[16 + k] = model.m[k];
+                    cmd.PushConstants(pcv, sizeof(pcv));
+                    cmd.BindTexture(*swatchTex[p]);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.DrawIndexed(sphere.indexCount());
+                }
+                cmd.EndRenderPass();
+            });
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*sceneRT);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        device->WaitIdle();
+        return device->GetCapturedPixels(outPx, outW, outH);
+    };
+
+    auto sha = [](const std::vector<uint8_t>& px) {
+        uint64_t hsh = 1469598103934665603ull;
+        for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+        return hsh;
+    };
+
+    std::vector<uint8_t> scenePx; uint32_t sw0=0, sh0=0;
+    if (!renderScene(scenePx, sw0, sh0)) return fail("no captured pixels (probe-dist scene)");
+
+    // PROOF 1: probe-0's captured distance face 0 == a direct distance render with face-0's view/proj.
+    const std::vector<uint8_t>& probe0Face0 = faceBytes[pd::ProbeFaceIndexRaw(0, 0)];
+    Mat4 probe0Face0VP = FlipProjY(pd::ProbeFaceViewProj(0, probeCenters[0], kCubeNear, kCubeFar));
+    {
+        auto fc = device->BeginRenderTargetFrame(*faceRT);
+        fc.cmd->BeginRenderPass(rhi::ClearColor{pd::kDistFar, pd::kDistFar * pd::kDistFar, 0.0f, 0.0f});
+        drawRoomDist(*fc.cmd, probe0Face0VP, probeCenters[0]);
+        fc.cmd->EndRenderPass();
+        device->EndRenderTargetFrame(fc);
+    }
+    std::vector<uint8_t> directFace0; uint32_t dfw=0, dfh=0;
+    if (!device->ReadRenderTarget(*faceRT, directFace0, dfw, dfh)) return fail("ReadRenderTarget failed");
+    const bool faceIdentical = (faceW == dfw) && (faceH == dfh) &&
+                               (probe0Face0.size() == directFace0.size()) &&
+                               (std::memcmp(probe0Face0.data(), directFace0.data(), directFace0.size()) == 0);
+    if (!faceIdentical)
+        return fail("probe-0 captured distance face 0 != scene rendered directly with face-0 view/proj");
+    std::printf("probe-dist face-0 == direct distance render: BYTE-IDENTICAL [cap %016llx direct %016llx]\n",
+                (unsigned long long)sha(probe0Face0), (unsigned long long)sha(directFace0));
+
+    // PROOF 2: moment GPU==CPU bit-exact (the moment-from-distance step). Re-derive the moments independently
+    // from the read-back R (distance) channel and memcmp against the moment store — bit-for-bit.
+    std::vector<pd::ProbeDistMoments> cpuMoments(momentStore.size(), pd::ProbeDistMoments{{0.0f, 0.0f}});
+    for (int p = 0; p < probeN; ++p)
+        for (int face = 0; face < pd::kFaces; ++face) {
+            const std::vector<uint8_t>& fb = faceBytes[pd::ProbeFaceIndexRaw(p, face)];
+            for (int v = 0; v < pd::kDistFace; ++v)
+                for (int u = 0; u < pd::kDistFace; ++u) {
+                    uint32_t sx = (uint32_t)((u + 0.5f) * (float)faceW / (float)pd::kDistFace);
+                    uint32_t sy = (uint32_t)((v + 0.5f) * (float)faceH / (float)pd::kDistFace);
+                    if (sx >= faceW) sx = faceW - 1;
+                    if (sy >= faceH) sy = faceH - 1;
+                    size_t off = ((size_t)sy * faceW + sx) * 8;
+                    uint16_t rHalf;
+                    std::memcpy(&rHalf, fb.data() + off + 0, sizeof(rHalf));
+                    cpuMoments[pd::ProbeDistTexelIndex(p, face, u, v)] =
+                        pd::MomentsFromDistance(halfToFloat(rHalf));
+                }
+        }
+    bool momentsBitExact = (cpuMoments.size() == momentStore.size()) &&
+                           (std::memcmp(cpuMoments.data(), momentStore.data(),
+                                        momentStore.size() * sizeof(pd::ProbeDistMoments)) == 0);
+    if (!momentsBitExact)
+        return fail("moment store != CPU MomentsFromDistance over the read-back distance bytes — NOT bit-exact");
+    std::printf("probe-dist moments GPU==CPU: BIT-EXACT (moment-from-distance over %zu texels)\n",
+                momentStore.size());
+
+    // PROOF 3: probeCount=0 (dimX=0) -> the capture loop is skipped -> the moment store == its cleared value.
+    pd::ProbeGrid zeroGrid = grid; zeroGrid.dimX = 0;
+    std::vector<pd::ProbeDistMoments> zeroStore;
+    std::vector<std::vector<uint8_t>> zeroFaces; uint32_t zfw=0, zfh=0;
+    runCapture(zeroGrid, zeroStore, zeroFaces, zfw, zfh);
+    if (!(zeroStore.empty() && pd::DistTexelCount(zeroGrid) == 0))
+        return fail("probeCount=0 capture is NOT a no-op — the moment store was touched");
+    std::printf("probe-dist probeCount=0: store UNTOUCHED == cleared\n");
+
+    // PROOF 4: determinism — a second capture is byte-identical to the first.
+    std::vector<pd::ProbeDistMoments> momentStore2;
+    std::vector<std::vector<uint8_t>> faceBytes2; uint32_t fw2=0, fh2=0;
+    runCapture(grid, momentStore2, faceBytes2, fw2, fh2);
+    bool deterministic = (momentStore.size() == momentStore2.size()) &&
+                         (std::memcmp(momentStore.data(), momentStore2.data(),
+                                      momentStore.size() * sizeof(pd::ProbeDistMoments)) == 0);
+    if (!deterministic) return fail("two distance captures differ — NOT deterministic");
+    std::printf("probe-dist determinism: two runs BYTE-IDENTICAL\n");
+
+    std::printf("probe-dist: {probes:%d, faces:%d, distFace:%d}\n",
+                probeN, probeN * pd::kFaces, pd::kDistFace);
+
+    if (!WritePNG(outPath, scenePx, sw0, sh0)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — DDGI per-probe distance-moment capture, %d probes, %d faces, "
+                "distFace %d\n", outPath, sw0, sh0, probeN, probeN * pd::kFaces, pd::kDistFace);
+    return 0;
+}
+
 // --- DDGI Probe SH-Encode showcase (Slice DJ). Mirrors the Vulkan --probesh-shot path EXACTLY: runs
 // DI's 8-probe Cornell-box capture, then a pure compute pass (probe_sh_encode.comp) encodes each probe's
 // captured cubemap into 3rd-order real spherical harmonics (9 coeffs/RGB channel) -> a per-probe ProbeSH
@@ -20389,6 +20756,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--probecapture") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_probe_capture.png";
             try { return RunProbeCaptureShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --probedist <out.png>: DDGI per-probe DISTANCE-moment capture showcase (Slice DO). For the same
+        // 8-probe grid, each probe renders the scene GEOMETRY into its cubemap writing the linear world-
+        // distance d = length(worldPos - probeCentre) as the two moments float2(d, d*d) (probe_dist.frag)
+        // + reads it back into a per-probe distance-moment store; per-probe swatch spheres are colored by
+        // the mean captured distance (near warm / far cool). INTERNALLY asserts probe-0's captured distance
+        // face 0 == a direct distance render with face-0's view/proj (BYTE-IDENTICAL) + the moment store ==
+        // the CPU MomentsFromDistance over the read-back distance bytes (BIT-EXACT) + probeCount=0 (dimX=0)
+        // leaves the store cleared + two runs byte-identical. Mirrors the Vulkan --probedist-shot; new
+        // golden probe_dist.png.
+        if (argc > 1 && std::strcmp(argv[1], "--probedist") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_probe_dist.png";
+            try { return RunProbeDistShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --probesh <out.png>: DDGI probe SH-encode showcase (Slice DJ). Runs DI's 8-probe capture, then a

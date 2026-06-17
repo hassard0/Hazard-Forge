@@ -306,6 +306,18 @@ hf_add_pure_test(probe_sh_test)
 # Pure C++ (hf_core; reuses render/probe_gi.h + render/probe_sh.h), no RHI/backend symbols, ASan-eligible.
 hf_add_pure_test(probe_interp_test)
 
+# Slice DO — DDGI Visibility Slice 1: Per-Probe Distance-Moment Capture. Pure CPU math for the visibility
+# data layer (render/probe_dist.h): the moment-from-distance reference MomentsFromDistance(d) == {d, d*d}
+# (a single BARE multiply for the second moment so it is bit-identical to the shader's bare d*d — the
+# GPU==CPU bit-exact step, given the same distance bytes; the sqrt-derived distance itself is NOT claimed
+# bit-exact cross-backend), DistTexelCount == probeCount*384 (0 at any zero dim — the probeCount=0 capture-
+# loop no-op), and the per-probe×face×texel flat layout p*384+f*64+v*8+u as a BIJECTION over
+# [0, probeCount*384) (ProbeDistFaceIndex block start + ProbeDistTexelIndex round-trip + full coverage, no
+# overlap). The same math is mirrored in probe_dist.frag (the moment output) + consumed by --probedist-shot
+# (the GPU==CPU bit-exact moment proof + capture==direct render proof). Pure C++ (hf_core; reuses
+# render/probe_gi.h + render/cubemap.h), no RHI/backend symbols, ASan-eligible.
+hf_add_pure_test(probe_dist_test)
+
 # DDGI GI Composite (Slice DN): the COMPOSITE-specific properties of the single-bounce DDGI indirect-diffuse
 # term the lit_ddgi.frag.hlsl shader adds last — indirect = InterpolateIrradianceSH(wpos,N)*(1-metallic);
 # rgb += indirect*albedo*giStrength. Pins giStrength=0 -> a literal +0.0 (the byte-identical no-op the 77
