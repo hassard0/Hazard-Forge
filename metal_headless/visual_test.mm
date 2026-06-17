@@ -86,6 +86,7 @@
 #include "render/swraster.h"        // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw/BuildSwRasterScene/ColorSwVisBuffer) — shared verbatim with --swraster-shot (Vulkan)
 #include "render/vsm.h"             // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp + the Vulkan --vsm-mark-shot
 #include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
+#include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -15812,6 +15813,187 @@ static int RunSwRasterResolveShowcase(const char* outPath) {
     return 0;
 }
 
+// --- GPU Isosurface Meshing per-cell MARCHING-CUBES CASE CLASSIFICATION showcase (Slice MC1, the
+// BEACHHEAD of FLAGSHIP #5). The TRUE pass is identical on both backends: a fixed VoxelField (33³
+// corners -> 32³ cells) filled host-side with a deterministic INTEGER sphere SDF
+// (render/mc.h::MakeSphereField, radius 12 cells, int32 fixed-point, isovalue 0) feeds the SAME
+// shaders/mc_classify.comp (here mc_classify.comp.gen.metal). One thread per cell gathers its 8 cube-
+// CORNER scalars from gField at the canonical kCornerOffset + writes gCases[cell] = CaseIndex(corners,
+// isovalue) (copied VERBATIM from render/mc.h; an order-independent per-cell integer write). ReadBuffer
+// reads the case-index field and it is PROVEN BIT-EXACT vs the CPU render/mc.h::ClassifyCells reference
+// (memcmp, NO tolerance) — the same GPU==CPU proof the Vulkan --mc-classify-shot runs;
+// classifyEnabled=false -> all-zero; two runs byte-identical. The image golden is the case-index field
+// CPU-colored as a grid of Z-slices (hashColor(caseIndex) per cell, empty/full dark; 32 slices tiled
+// 8x4) -> identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). New golden
+// tests/golden/metal/mc_classify.png; two runs DIFF 0.0000. NO rendering, NO triangle emission, NO new RHI.
+static int RunMcClassifyShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace mc = render::mc;
+    namespace vg = render::vg;
+
+    // The fixed VoxelField (== the Vulkan --mc-classify-shot config).
+    const int kN = 33;
+    const int kRadius = 12;
+    const int32_t kIso = 0;
+    mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+    const int nx = field.nx, ny = field.ny, nz = field.nz;
+    const int cellCount = field.cellCount();
+
+    const int cxN = nx - 1, cyN = ny - 1, czN = nz - 1;   // 32 x 32 x 32 cells
+    const int kTilesX = 8, kTilesY = 4, kPad = 2;
+    const uint32_t imgW = (uint32_t)(kTilesX * cxN + (kTilesX + 1) * kPad);
+    const uint32_t imgH = (uint32_t)(kTilesY * cyN + (kTilesY + 1) * kPad);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // gField SSBO (the int32 scalar field — uploaded once, read-only on the GPU).
+    rhi::BufferDesc fDesc;
+    fDesc.size = field.scalar.size() * sizeof(int32_t);
+    fDesc.initialData = field.scalar.data();
+    fDesc.usage = rhi::BufferUsage::Storage;
+    auto fieldBuf = device->CreateBuffer(fDesc);
+
+    std::vector<uint32_t> casesInit((size_t)cellCount, 0u);
+    auto makeCasesBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = casesInit.size() * sizeof(uint32_t);
+        d.initialData = casesInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct McParams { int32_t dims[4]; int32_t cfg[4]; };
+    static_assert(sizeof(McParams) == 32, "McParams std430 layout");
+    auto makeParams = [&](int32_t classifyEnabled) {
+        McParams p{};
+        p.dims[0] = nx; p.dims[1] = ny; p.dims[2] = nz; p.dims[3] = 0;
+        p.cfg[0] = kIso; p.cfg[1] = classifyEnabled; p.cfg[2] = cellCount; p.cfg[3] = 0;
+        return p;
+    };
+
+    auto mcCs = loadMSL("mc_classify.comp.gen.metal", "mc_classify_main");
+    rhi::ComputePipelineDesc mcCd;
+    mcCd.compute = mcCs.get(); mcCd.storageBufferCount = 3; mcCd.threadsPerGroupX = 64;
+    auto mcCompute = device->CreateComputePipeline(mcCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)cellCount + 63u) / 64u;
+
+    auto runClassify = [&](int32_t classifyEnabled, std::vector<uint32_t>& outCases) {
+        auto casesBuf = makeCasesBuf();
+        McParams params = makeParams(classifyEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(McParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("mc_classify", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*mcCompute);
+                cmd.BindStorageBuffer(*fieldBuf, 0);
+                cmd.BindStorageBuffer(*casesBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCases.assign((size_t)cellCount, 0u);
+        device->ReadBuffer(*casesBuf, outCases.data(), outCases.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU classify (enabled).
+    std::vector<uint32_t> gpuCases;
+    runClassify(1, gpuCases);
+
+    // CPU reference over the SAME field.
+    std::vector<uint8_t> cpuCases8;
+    mc::ClassifyCells(field, kIso, cpuCases8);
+    std::vector<uint32_t> cpuCases((size_t)cellCount, 0u);
+    for (int c = 0; c < cellCount; ++c) cpuCases[(size_t)c] = (uint32_t)cpuCases8[(size_t)c];
+
+    if (gpuCases.size() != cpuCases.size() ||
+        std::memcmp(gpuCases.data(), cpuCases.data(), (size_t)cellCount * sizeof(uint32_t)) != 0)
+        return fail("mc-classify: GPU case set != CPU ClassifyCells (float/transcendental crept in?)");
+    std::printf("mc-classify GPU==CPU case set: %d cells BIT-EXACT\n", cellCount);
+
+    // classifyEnabled=false -> all-zero.
+    std::vector<uint32_t> disabledCases;
+    runClassify(0, disabledCases);
+    for (uint32_t c : disabledCases) if (c != 0u) return fail("mc-classify: disabled path not zero");
+    std::printf("mc-classify disabled: zero cases (no-op)\n");
+
+    // two-run determinism.
+    std::vector<uint32_t> gpuCases2;
+    runClassify(1, gpuCases2);
+    if (gpuCases.size() != gpuCases2.size() ||
+        std::memcmp(gpuCases.data(), gpuCases2.data(), gpuCases.size() * sizeof(uint32_t)) != 0)
+        return fail("mc-classify: two dispatches differ (nondeterministic)");
+    std::printf("mc-classify determinism: two dispatches BYTE-IDENTICAL\n");
+
+    // hand-checked known cells.
+    {
+        int32_t below[8]; for (int i = 0; i < 8; ++i) below[i] = -1;
+        int32_t above[8]; for (int i = 0; i < 8; ++i) above[i] = +1;
+        int32_t c0[8];    for (int i = 0; i < 8; ++i) c0[i] = -1; c0[0] = +1;
+        if (mc::CaseIndex(below, kIso) != 0x00 || mc::CaseIndex(above, kIso) != 0xFF ||
+            mc::CaseIndex(c0, kIso) != 0x01)
+            return fail("mc-classify: known-cell configs wrong (empty/full/corner0)");
+        std::printf("mc-classify known cells: empty=0x00 full=0xFF corner0=0x01 OK\n");
+    }
+
+    int surfaceCells = 0;
+    for (uint32_t c : gpuCases) if (mc::IsSurfaceCase((uint8_t)c)) ++surfaceCells;
+    std::printf("mc-classify: {field:%dx%dx%d, iso:%d, cells:%d, surface-cells:%d/%d}\n",
+                nx, ny, nz, kIso, cellCount, surfaceCells, cellCount);
+
+    // --- Golden: the case-index field CPU-colored as a grid of Z-slices (IDENTICAL to the Vulkan
+    // --mc-classify-shot by construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    for (int cz = 0; cz < czN; ++cz) {
+        const int tileX = cz % kTilesX;
+        const int tileY = cz / kTilesX;
+        const int ox = kPad + tileX * (cxN + kPad);
+        const int oy = kPad + tileY * (cyN + kPad);
+        for (int cy = 0; cy < cyN; ++cy)
+            for (int cx = 0; cx < cxN; ++cx) {
+                const int cellId = (cz * cyN + cy) * cxN + cx;
+                const uint8_t caseIdx = (uint8_t)gpuCases[(size_t)cellId];
+                const int ix = ox + cx;
+                const int iy = oy + cy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                if (mc::IsSurfaceCase(caseIdx)) {
+                    Vec3 col = vg::hashColor((uint32_t)caseIdx);
+                    dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                    dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                    dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                    dst[3] = 255;
+                } else {
+                    uint8_t v = (caseIdx == 0xFF) ? 40 : 18;
+                    dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                }
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — MC case-index Z-slice viz (%d surface cells)\n",
+                outPath, imgW, imgH, surfaceCells);
+    return 0;
+}
+
 // --- Runtime Virtual Texturing PAGE-NEEDED FEEDBACK MARKING showcase (Slice VT1, the BEACHHEAD of
 // FLAGSHIP #4). The TRUE pass is identical on both backends: a fixed virtual texture (a MIP PYRAMID) + a
 // fixed deterministic (UV,mip) sample-request set feed the SAME shaders/vt_feedback.comp (here
@@ -25487,6 +25669,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vt-feedback") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vt_feedback.png";
             try { return RunVtFeedbackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mc-classify <out.png>: render the GPU Isosurface Meshing per-cell MARCHING-CUBES CASE
+        // CLASSIFICATION showcase (Slice MC1, the beachhead of FLAGSHIP #5). A fixed VoxelField (33³
+        // corners -> 32³ cells) filled with a deterministic INTEGER sphere SDF feeds the SAME
+        // mc_classify.comp (one thread per cell gathers its 8 cube-CORNER scalars at the canonical
+        // kCornerOffset + writes gCases[cell]=CaseIndex(corners,isovalue), verbatim render/mc.h) ->
+        // ReadBuffer reads the case-index field, PROVEN BIT-EXACT vs the CPU render/mc.h::ClassifyCells
+        // reference (memcmp, no tol — the same GPU==CPU proof the Vulkan --mc-classify-shot runs);
+        // classifyEnabled=false -> all-zero; two runs byte-identical. The image golden is the case-index
+        // field CPU-colored as a grid of Z-slices (hashColor(caseIndex), empty/full dark; 32 tiled 8x4),
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/mc_classify.png;
+        // two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--mc-classify") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mc_classify.png";
+            try { return RunMcClassifyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vt-alloc <out.png>: render the Runtime Virtual Texturing PHYSICAL TILE-POOL ALLOCATION +

@@ -66,6 +66,7 @@
 #include "render/swraster.h"    // Slice SW1: CPU-reference integer software rasterizer (SwVisBuffer/RasterClusters/PackSw) — shared verbatim with --swraster (Metal)
 #include "render/vsm.h"         // Slice VA: virtual shadow map clipmap page table + page-needed marking (VsmClipmap/PageId/SelectClipmapLevel/MarkResidentPages) — shared verbatim with vsm_mark.comp
 #include "render/vt.h"          // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp
+#include "render/mc.h"          // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -441,6 +442,7 @@ int main(int argc, char** argv) {
     const char* vtPagegenShotPath = nullptr; // --vt-pagegen-shot <out.bmp> (Slice VT3: runtime virtual texturing procedural PAGE GENERATION into the physical atlas, one-thread-per-texel GPU pass, GPU==CPU atlas bit-exact, the decoded RGBA8 atlas as the golden)
     const char* vtSampleShotPath = nullptr; // --vt-sample-shot <out.bmp> (Slice VT4: runtime virtual texturing material-pass SAMPLE through the indirection, one-thread-per-virtual-texel GPU pass reconstructs the mip-0 virtual image NEAREST through the indirection, GPU==CPU image bit-exact, the decoded RGBA8 virtual image as the golden)
     const char* vtCacheShotPath = nullptr; // --vt-cache-shot <out.bmp> (Slice VT5: runtime virtual texturing per-page CACHING across frames — a per-page content key + per-tile cache skips regenerating unchanged pages over a PERSISTENT atlas SSBO; cached==fresh + cached==full BYTE-IDENTICAL, GPU==CPU bit-exact; cache-status viz golden)
+    const char* mcClassifyShotPath = nullptr; // --mc-classify-shot <out.bmp> (Slice MC1: GPU Isosurface Meshing per-cell MARCHING-CUBES CASE CLASSIFICATION, integer compute over an SDF VoxelField, GPU==CPU case-set bit-exact, case-index Z-slice debug-viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -1447,6 +1449,20 @@ int main(int argc, char** argv) {
             // / RED the 1 regenerated, dark unallocated). NO rendering, NO new RHI (Storage SSBO + DispatchCompute
             // + ReadBuffer). One BMP -> exit.
             vtCacheShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--mc-classify-shot") == 0 && i + 1 < argc) {
+            // Slice MC1: GPU Isosurface Meshing Slice 1 — per-cell MARCHING-CUBES CASE CLASSIFICATION
+            // (BEACHHEAD of FLAGSHIP #5). A fixed VoxelField (33³ corners -> 32³ cells) is filled host-
+            // side with a deterministic INTEGER sphere SDF (render/mc.h::MakeSphereField, radius ~12
+            // cells, int32 fixed-point, isovalue 0) feeding a pure-integer compute pass
+            // (shaders/mc_classify.comp): one thread per cell gathers its 8 cube-CORNER scalars at the
+            // canonical kCornerOffset + writes gCases[cell] = CaseIndex(corners, isovalue) (the corner-
+            // sign classifier copied VERBATIM from render/mc.h; an order-independent per-cell integer
+            // write). ReadBuffer reads the case-index field; the CPU render/mc.h::ClassifyCells over the
+            // SAME field must match it BIT-EXACT (memcmp, no tol). classifyEnabled=false -> all-zero. The
+            // golden is the case-index field CPU-colored as a grid of Z-slices (hashColor(caseIndex) per
+            // cell, empty/full dark; 32 slices tiled 8x4) -> identical both backends by construction.
+            // NO rendering, NO triangle emission, NO new RHI. One BMP -> exit.
+            mcClassifyShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--clustered-lights-shot") == 0 && i + 1 < argc) {
             // Slice CL: Clustered Light Culling (Forward+). A scene (ground + objects) lit by 96
             // deterministically-placed colored point lights + the sun. A compute pass (cluster_assign)
@@ -14290,6 +14306,214 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — CPU-colored visibility buffer (%u survivor clusters)\n",
                                 visbufferShotPath, vw, vh, drawn);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", visbufferShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU Isosurface Meshing per-cell MARCHING-CUBES CASE CLASSIFICATION (--mc-classify-shot
+        // <out.bmp>, Slice MC1, the BEACHHEAD of FLAGSHIP #5). A fixed VoxelField (33³ corners -> 32³
+        // cells) is filled host-side with a deterministic INTEGER sphere SDF (render/mc.h::MakeSphereField,
+        // radius 12 cells, int32 fixed-point, isovalue 0) feeding a pure-integer compute
+        // (shaders/mc_classify.comp): one thread per cell gathers its 8 cube-CORNER scalars at the
+        // canonical kCornerOffset + writes gCases[cell] = CaseIndex(corners, isovalue) (the classifier
+        // copied VERBATIM from render/mc.h; an order-independent per-cell integer write, NO atomics).
+        // ReadBuffer reads the integer case-index field; the CPU render/mc.h::ClassifyCells over the SAME
+        // field must match it BIT-EXACT (memcmp, NO tol). classifyEnabled=false -> all-zero. The golden is
+        // the case-index field CPU-colored as a grid of Z-slices (hashColor(caseIndex) per cell, empty/full
+        // dark; 32 slices tiled 8x4) -> identical both backends by construction. NO rendering, NO triangle
+        // emission, NO new RHI.
+        if (mcClassifyShotPath) {
+            using math::Vec3;
+            namespace mc = hf::render::mc;
+            namespace vg = hf::render::vg;
+
+            // The fixed VoxelField: 33³ corners -> 32³ cells, a centered sphere SDF (radius 12 cells).
+            const int kN = 33;          // CORNER count per axis
+            const int kRadius = 12;     // sphere radius in cells
+            const int32_t kIso = 0;     // surface at the zero level set
+            mc::VoxelField field = mc::MakeSphereField(kN, kRadius);
+            const int nx = field.nx, ny = field.ny, nz = field.nz;
+            const int cellCount = field.cellCount();
+
+            // gField SSBO (the int32 scalar field — uploaded once, read-only on the GPU).
+            rhi::BufferDesc fDesc;
+            fDesc.size = field.scalar.size() * sizeof(int32_t);
+            fDesc.initialData = field.scalar.data();
+            fDesc.usage = rhi::BufferUsage::Storage;
+            auto fieldBuf = device->CreateBuffer(fDesc);
+
+            // gCases SSBO (one uint per cell, cleared to 0 — a fresh zero upload per run so the disabled
+            // path reads the cleared bytes back).
+            std::vector<uint32_t> casesInit((size_t)cellCount, 0u);
+            auto makeCasesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = casesInit.size() * sizeof(uint32_t);
+                d.initialData = casesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches mc_classify.comp Params std430): int4 dims {nx,ny,nz,_} + int4 cfg
+            // {isovalue, classifyEnabled, cellCount, _}.
+            struct McParams { int32_t dims[4]; int32_t cfg[4]; };
+            static_assert(sizeof(McParams) == 32, "McParams std430 layout");
+            auto makeParams = [&](int32_t classifyEnabled) {
+                McParams p{};
+                p.dims[0] = nx; p.dims[1] = ny; p.dims[2] = nz; p.dims[3] = 0;
+                p.cfg[0] = kIso; p.cfg[1] = classifyEnabled; p.cfg[2] = cellCount; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (field, cases, params); 64 threads/group.
+            auto mcCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/mc_classify.comp.hlsl.spv");
+            auto mcCs = device->CreateShaderModule({std::span<const uint32_t>(mcCsWords)});
+            rhi::ComputePipelineDesc mcCdesc;
+            mcCdesc.compute = mcCs.get();
+            mcCdesc.storageBufferCount = 3;
+            mcCdesc.pushConstantSize = 0;
+            mcCdesc.threadsPerGroupX = 64;
+            auto mcCompute = device->CreateComputePipeline(mcCdesc);
+
+            const uint32_t kGroups = ((uint32_t)cellCount + 63u) / 64u;
+
+            // Run the classify compute over a fresh cases buffer + a params buffer, read back gCases.
+            auto runClassify = [&](int32_t classifyEnabled, std::vector<uint32_t>& outCases) {
+                auto casesBuf = makeCasesBuf();
+                McParams params = makeParams(classifyEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(McParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("mc_classify", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*mcCompute);
+                        cmd.BindStorageBuffer(*fieldBuf, 0);
+                        cmd.BindStorageBuffer(*casesBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outCases.assign((size_t)cellCount, 0u);
+                device->ReadBuffer(*casesBuf, outCases.data(), outCases.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU classify (enabled) ===
+            std::vector<uint32_t> gpuCases;
+            runClassify(1, gpuCases);
+
+            // === CPU reference over the SAME field ===
+            std::vector<uint8_t> cpuCases8;
+            mc::ClassifyCells(field, kIso, cpuCases8);
+            // Widen the CPU uint8 cases to uint32 for the memcmp against the GPU's uint-per-cell buffer.
+            std::vector<uint32_t> cpuCases((size_t)cellCount, 0u);
+            for (int c = 0; c < cellCount; ++c) cpuCases[(size_t)c] = (uint32_t)cpuCases8[(size_t)c];
+
+            // PROOF (1) GPU==CPU case set BIT-EXACT (integer memcmp, NO tolerance).
+            if (gpuCases.size() != cpuCases.size() ||
+                std::memcmp(gpuCases.data(), cpuCases.data(),
+                            (size_t)cellCount * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: mc-classify GPU case set != CPU ClassifyCells "
+                             "(a float/transcendental crept into the corner-sign compare?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mc-classify GPU==CPU case set: %d cells BIT-EXACT\n", cellCount);
+
+            // PROOF (2) classifyEnabled=false -> all-zero (byte-identical to the cleared upload).
+            std::vector<uint32_t> disabledCases;
+            runClassify(0, disabledCases);
+            bool disabledZero = true;
+            for (uint32_t c : disabledCases) if (c != 0u) { disabledZero = false; break; }
+            if (!disabledZero) {
+                std::fprintf(stderr, "FATAL: mc-classify classifyEnabled=false did NOT yield zero cases\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mc-classify disabled: zero cases (no-op)\n");
+
+            // PROOF (3) two-run determinism byte-identical.
+            std::vector<uint32_t> gpuCases2;
+            runClassify(1, gpuCases2);
+            if (gpuCases.size() != gpuCases2.size() ||
+                std::memcmp(gpuCases.data(), gpuCases2.data(),
+                            gpuCases.size() * sizeof(uint32_t)) != 0) {
+                std::fprintf(stderr, "FATAL: mc-classify two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("mc-classify determinism: two dispatches BYTE-IDENTICAL\n");
+
+            // PROOF (4) hand-checked known cells: empty (all corners below iso) -> 0x00; full (all above)
+            // -> 0xFF; only corner 0 above -> 0x01 (per the locked convention). Checked against CaseIndex
+            // directly so the proof is the classifier the GPU ran, not the showcase field.
+            {
+                int32_t below[8]; for (int i = 0; i < 8; ++i) below[i] = -1;
+                int32_t above[8]; for (int i = 0; i < 8; ++i) above[i] = +1;
+                int32_t c0[8];    for (int i = 0; i < 8; ++i) c0[i] = -1; c0[0] = +1;
+                if (mc::CaseIndex(below, kIso) != 0x00 || mc::CaseIndex(above, kIso) != 0xFF ||
+                    mc::CaseIndex(c0, kIso) != 0x01) {
+                    std::fprintf(stderr, "FATAL: mc-classify known-cell configs wrong "
+                                 "(empty/full/corner0 mismatch the locked convention)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("mc-classify known cells: empty=0x00 full=0xFF corner0=0x01 OK\n");
+            }
+
+            // PROOF (5) the {...} stat line: surface-cells = cells whose case is neither 0x00 nor 0xFF.
+            int surfaceCells = 0;
+            for (uint32_t c : gpuCases)
+                if (mc::IsSurfaceCase((uint8_t)c)) ++surfaceCells;
+            std::printf("mc-classify: {field:%dx%dx%d, iso:%d, cells:%d, surface-cells:%d/%d}\n",
+                        nx, ny, nz, kIso, cellCount, surfaceCells, cellCount);
+
+            // --- Golden: the case-index field CPU-colored as a grid of Z-slices. Each slice is an
+            // (nx-1)x(ny-1) image (hashColor(caseIndex) per surface cell, empty 0x00 / full 0xFF dark);
+            // the (nz-1)=32 slices are tiled in an 8x4 grid. CPU-colored from the read-back integer field
+            // -> identical both backends by construction. ---
+            const int cxN = nx - 1, cyN = ny - 1, czN = nz - 1;   // 32 x 32 x 32 cells
+            const int kTilesX = 8, kTilesY = 4;                    // 8*4 = 32 slices
+            const int kPad = 2;                                    // gutter between slice tiles
+            const uint32_t imgW = (uint32_t)(kTilesX * cxN + (kTilesX + 1) * kPad);
+            const uint32_t imgH = (uint32_t)(kTilesY * cyN + (kTilesY + 1) * kPad);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+            }
+            for (int cz = 0; cz < czN; ++cz) {
+                const int tileX = cz % kTilesX;
+                const int tileY = cz / kTilesX;
+                const int ox = kPad + tileX * (cxN + kPad);
+                const int oy = kPad + tileY * (cyN + kPad);
+                for (int cy = 0; cy < cyN; ++cy)
+                    for (int cx = 0; cx < cxN; ++cx) {
+                        const int cellId = (cz * cyN + cy) * cxN + cx;
+                        const uint8_t caseIdx = (uint8_t)gpuCases[(size_t)cellId];
+                        const int ix = ox + cx;
+                        const int iy = oy + cy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        if (mc::IsSurfaceCase(caseIdx)) {
+                            Vec3 col = vg::hashColor((uint32_t)caseIdx);
+                            dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                            dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                            dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                            dst[3] = 255;
+                        } else {
+                            // empty (0x00) -> very dark; full (0xFF) -> a dim slate so interior reads.
+                            uint8_t v = (caseIdx == 0xFF) ? 40 : 18;
+                            dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = 255;
+                        }
+                    }
+            }
+            bool ok = WriteBMP(mcClassifyShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — MC case-index Z-slice viz (%d surface cells)\n",
+                                mcClassifyShotPath, imgW, imgH, surfaceCells);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcClassifyShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
