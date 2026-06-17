@@ -79,6 +79,7 @@
 #include "render/frustum.h"        // Slice AQ: Gribb-Hartmann frustum extraction + sphere cull (pure math)
 #include "render/gpu_cull.h"        // Slice AR: GPU-cull CPU mirror (ordered compaction + sphere test)
 #include "render/gpu_culled.h"      // Slice CD: compute cull+compact CPU mirror (model+material+texIndex)
+#include "render/cluster_cull.h"    // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
 #include "render/post_stack.h"       // Slice BN: data-driven post-process stack config + per-effect math
@@ -15029,6 +15030,201 @@ static int RunGpuCullDrawShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Virtual-geometry per-CLUSTER frustum cull showcase (Slice DT: GPU per-cluster cull -> indirect
+// cluster draw). The TRUE pass (a compute shader cluster_cull.comp frustum-culls the (instance x cluster)
+// records + ORDER-compacts the survivors into the MDI command buffer + the compacted per-draw SSBO +
+// writes the survivor count, then ONE DrawIndexedMultiIndirect over cluster_viz.vert + meshlet_viz.frag)
+// is the VULKAN demonstration (--cluster-cull-shot). Here Metal renders the IDENTICAL scene — a WIDE row
+// of DS-clustered spheres viewed by a NARROW camera so a CLEAR subset of cluster-instances falls off-
+// frustum — via the CPU per-cluster BOUND path: the SAME render::vg::CullClusterInstances (the exact
+// mirror of the GPU compute) decides the survivors, and only those cluster-instances are drawn (per-
+// cluster, in source order) via the meshlet_viz push-constant path. The image is backend-identical to the
+// Vulkan GPU-culled image. The cull frustum is built from the SAME FlipProjY-composed view-proj the
+// renderer uses (Metal clip), so the survivor SET matches Vulkan geometrically. Passes: sky + cluster +
+// post (no shadow/lit). Prints the SAME stat line as Vulkan. New golden tests/golden/metal/cluster_cull.png;
+// two runs DIFF 0.0000.
+static int RunClusterCullShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace fr = render::frustum;
+    namespace vg = render::vg;
+    const uint32_t W = 1280, H = 720;
+    const float aspect = (float)W / (float)H;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // --- The shared mesh + its DS decomposition (the SAME SphereGeometry(48,32) -> 24 clusters as Vulkan).
+    scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+    vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+    const uint32_t clustersPerMesh = (uint32_t)ms.meshlets.size();
+
+    // --- The instance grid: a WIDE row of spheres (IDENTICAL builder to the Vulkan --cluster-cull-shot). ---
+    const int kInstances = 4;
+    std::vector<Mat4> instanceModels;
+    {
+        const float spacing = 3.2f;
+        const float half = 0.5f * (float)(kInstances - 1) * spacing;
+        for (int gi = 0; gi < kInstances; ++gi) {
+            float x = (float)gi * spacing - half;
+            instanceModels.push_back(Mat4::Translate({x, 0.0f, -6.0f}));
+        }
+    }
+
+    std::vector<vg::ClusterInstance> clusters = vg::BuildClusterInstances(
+        std::span<const Mat4>(instanceModels.data(), instanceModels.size()), ms);
+    const uint32_t kClusterInstances = (uint32_t)clusters.size();
+
+    // --- The narrow render/cull camera (SAME pose/FOV/clips as the Vulkan path). The cull frustum is
+    // extracted from the FlipProjY-composed view-proj (Metal clip), so the survivor set matches Vulkan. ---
+    runtime::Camera narrowCam;
+    narrowCam.position = {0.0f, 0.0f, 1.5f};
+    narrowCam.yaw = 0.0f; narrowCam.SetPitch(0.0f);
+    narrowCam.fovY = 0.5235988f;  // 30 degrees
+    narrowCam.aspect = aspect;
+    narrowCam.znear = 0.2f; narrowCam.zfar = 50.0f;
+    Mat4 narrowVP = FlipProjY(narrowCam.Proj()) * narrowCam.View();
+    fr::Frustum narrowFrustum = fr::FromViewProj(narrowVP);
+
+    // --- CPU cull+compact (the exact mirror of the GPU compute): the survivor MdiCommands in source order.
+    std::span<const vg::ClusterInstance> clusterSpan(clusters.data(), clusters.size());
+    std::vector<render::mdi::MdiCommand> cpuCmds = vg::CullClusterInstances(clusterSpan, narrowFrustum);
+    const uint32_t cpuSurvivors = vg::SurvivorClusterCount(clusterSpan, narrowFrustum);
+    if (cpuSurvivors != (uint32_t)cpuCmds.size())
+        return fail("cluster-cull: SurvivorClusterCount != CullClusterInstances size (mirror mismatch)");
+
+    // --- Upload the shared vertex + reordered index buffers. ---
+    rhi::BufferDesc vbd;
+    vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+    vbd.initialData = geo.verts.data();
+    vbd.usage = rhi::BufferUsage::Vertex;
+    auto vbuf = device->CreateBuffer(vbd);
+    rhi::BufferDesc ibd;
+    ibd.size = ms.indices.size() * sizeof(uint32_t);
+    ibd.initialData = ms.indices.data();
+    ibd.usage = rhi::BufferUsage::Index;
+    auto ibuf = device->CreateBuffer(ibd);
+
+    // --- Meshlet viz pipeline (the per-cluster bound path; consumes pos(0)+normal(3); push = model+color),
+    // the SAME shaders the Vulkan CPU reference uses. NO texture/shadow. ---
+    auto mvVs = loadMSL("meshlet_viz.vert.gen.metal", "meshlet_viz_vertex");
+    auto mvFs = loadMSL("meshlet_viz.frag.gen.metal", "meshlet_viz_fragment");
+    rhi::GraphicsPipelineDesc mvDesc;
+    mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+    rhi::VertexLayout vizLayout;
+    vizLayout.stride = sizeof(scene::Vertex);  // 56
+    vizLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {3, rhi::Format::RGB32_Float, 32},
+    };
+    mvDesc.vertexLayout = vizLayout;
+    mvDesc.colorFormat = device->Swapchain().ColorFormat();
+    mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+    mvDesc.pushConstantSize = sizeof(float) * 20;   // float4x4 model + float4 color
+    auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false; postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+
+    FrameData fd{};
+    {
+        for (int k = 0; k < 16; ++k) fd.vp[k] = narrowVP.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = narrowCam.position.x; fd.viewPos[1] = narrowCam.position.y;
+        fd.viewPos[2] = narrowCam.position.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        runtime::CameraBasis cb = narrowCam.Basis();
+        fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+        fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+        fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+        fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+    }
+
+    // Per-cluster-instance hash color (keyed off the cluster index within its mesh, cluster-minor order),
+    // matching the Vulkan upload + the --meshlet-viz palette.
+    auto colorOf = [&](uint32_t clusterInstanceIdx) {
+        return vg::hashColor(clusterInstanceIdx % clustersPerMesh);
+    };
+
+    render::RenderGraph graph;
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("scene", {}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*mvPipeline);
+            cmd.BindVertexBuffer(*vbuf);
+            cmd.BindIndexBuffer(*ibuf);
+            // The CPU-frustum-culled SURVIVING cluster-instances, per-cluster bound, in source order (the
+            // Metal equivalent of the Vulkan one-MDI-call over the compacted survivor buffer). Off-frustum
+            // cluster-instances are absent — exactly what the GPU compute cull would render.
+            for (const render::mdi::MdiCommand& c : cpuCmds) {
+                const vg::ClusterInstance& ci = clusters[c.firstInstance];
+                const Mat4& model = instanceModels[ci.instanceIndex];
+                Vec3 col = colorOf(c.firstInstance);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = model.m[k];
+                pc[16] = col.x; pc[17] = col.y; pc[18] = col.z; pc[19] = 1.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    // The same stat line as the Vulkan path. On Metal the cull is the CPU mirror (survivors == cpuSurvivors
+    // by construction); the Vulkan path does the compute-cull -> MDI render the image is identical to.
+    if (!(cpuSurvivors > 0 && cpuSurvivors < kClusterInstances))
+        return fail("cluster-cull: narrow frustum did not cull a STRICT subset (camera framing wrong)");
+    std::printf("cluster-cull: {instances:%u, clustersPerMesh:%u, clusterInstances:%u, survivors:%u} "
+                "(Metal: CPU-frustum-culled per-cluster bound path, image backend-identical)\n",
+                (uint32_t)kInstances, clustersPerMesh, kClusterInstances, cpuSurvivors);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — per-cluster-culled %u/%u cluster-instances (Metal per-cluster bound; "
+                "Vulkan does compute-cull -> MDI)\n", outPath, cw, ch, cpuSurvivors, kClusterInstances);
+    return 0;
+}
+
 // --- Hi-Z OCCLUSION culling showcase (Slice CJ). The TRUE pass (a CPU depth pre-pass -> Hi-Z max-depth
 // pyramid -> a compute shader frustum+occlusion-culls + compacts the survivors) is the VULKAN
 // demonstration (--hiz-cull-shot). Here Metal renders the IDENTICAL scene — a BIG occluder WALL near
@@ -21487,6 +21683,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gpucull-draw") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gpucull_draw.png";
             try { return RunGpuCullDrawShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cluster-cull <out.png>: render the virtual-geometry per-CLUSTER frustum cull showcase (Slice DT:
+        // GPU per-cluster cull -> indirect cluster draw). The TRUE pass (a compute shader cluster_cull.comp
+        // frustum-culls the (instance x cluster) records + ORDER-compacts the survivors into the MDI command
+        // buffer + the compacted per-draw SSBO + writes the survivor count, then ONE DrawIndexedMultiIndirect
+        // over cluster_viz.vert + meshlet_viz.frag renders exactly the surviving cluster-instances) is the
+        // VULKAN demonstration (--cluster-cull-shot); here Metal renders the IDENTICAL instance grid of
+        // DS-clustered spheres via the CPU per-cluster BOUND path (the SAME render::vg::CullClusterInstances
+        // decides the survivors, drawn per-cluster via the meshlet_viz push-constant path in source order),
+        // so cluster_cull.png is backend-identical to the Vulkan GPU-culled image. The cull frustum is built
+        // from the SAME FlipProjY-composed view-proj the renderer uses (Metal clip). New golden
+        // tests/golden/metal/cluster_cull.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--cluster-cull") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cluster_cull.png";
+            try { return RunClusterCullShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --hiz-cull <out.png>: render the Hi-Z OCCLUSION cull showcase (Slice CJ). The TRUE pass (a CPU

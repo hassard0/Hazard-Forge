@@ -528,6 +528,16 @@ hf_add_pure_test(meshlet_test)
 # ASan-eligible.
 hf_add_pure_test(gpu_cull_test)
 
+# Virtual-geometry per-CLUSTER frustum cull (Slice DT): the CPU MIRROR of shaders/cluster_cull.comp.hlsl's
+# ordered single-workgroup prefix-sum compaction + frustum-sphere test (render/cluster_cull.h) at the
+# (instance x cluster) granularity (a DS cluster is just an object with a per-cluster bounding sphere).
+# Pins BuildClusterInstances order (instance-major/cluster-minor) + conservative world radius
+# (InstanceWorldSphere, never under-bounds), CullClusterInstances all-survive/none/half-cut == the
+# independent frustum.h::SphereOutside subset IN SOURCE ORDER, the MdiCommand fields (indexCount==triCount*3,
+# firstIndex==triOffset*3, firstInstance==source index), determinism (two builds + culls byte-identical),
+# and the conservative-keep contract (a straddling sphere is KEPT). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(cluster_cull_test)
+
 # GPU multi-draw-indirect batching (Slice BM): the pure-CPU BUILDER (render/mdi.h) that lays out, for
 # a scene of N distinct objects, the N-command indirect-args buffer (5x u32 == VkDrawIndexedIndirectCommand,
 # instanceCount=1/firstInstance=0) + the parallel per-draw storage buffer (mat4 model + float4 material)

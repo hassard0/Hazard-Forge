@@ -59,6 +59,7 @@
 #include "render/bindless.h"  // Slice BZ: bindless texture-index table (pure CPU)
 #include "render/gpu_driven.h"  // Slice CB: combined MDI+bindless GPU-driven batch builder (pure CPU)
 #include "render/gpu_culled.h"  // Slice CD: compute cull+compact CPU mirror (ordered, model+material+texIndex)
+#include "render/cluster_cull.h"  // Slice DT: per-cluster frustum cull CPU mirror (BuildClusterInstances/CullClusterInstances)
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -416,6 +417,7 @@ int main(int argc, char** argv) {
     const char* bindlessShotPath = nullptr;  // --bindless-shot <out.bmp> (Slice BZ: bindless textures)
     const char* gpuDrivenShotPath = nullptr; // --gpudriven-shot <out.bmp> (Slice CB: MDI + bindless capstone)
     const char* gpuCullDrawShotPath = nullptr; // --gpucull-draw-shot <out.bmp> (Slice CD: compute-cull -> MDI + bindless)
+    const char* clusterCullShotPath = nullptr; // --cluster-cull-shot <out.bmp> (Slice DT: GPU per-cluster frustum cull -> indirect cluster draw)
     const char* hizCullShotPath = nullptr;   // --hiz-cull-shot <out.bmp> (Slice CJ: Hi-Z occlusion cull)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
@@ -1161,6 +1163,19 @@ int main(int argc, char** argv) {
             // Prints `gpucull-draw: {total:N, drawn:K, cpuRef:K, drawCalls:1, textureBinds:1}`. One BMP ->
             // exit. New golden gpucull_draw.png; existing goldens untouched.
             gpuCullDrawShotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--cluster-cull-shot") == 0 && i + 1 < argc) {
+            // Slice DT: GPU per-CLUSTER frustum cull -> indirect cluster draw (the per-cluster analogue of
+            // the per-OBJECT --gpucull-draw-shot). An instance grid of DS-clustered spheres ->
+            // BuildClusterInstances (instance x cluster, each with a per-cluster world bounding sphere) ->
+            // shaders/cluster_cull.comp.hlsl frustum-culls + ORDER-compacts the survivors into the MDI
+            // command buffer + the compacted (model+color) per-draw SSBO + writes the survivor count; the
+            // host reads it back and issues ONE DrawIndexedMultiIndirect(count) over cluster_viz.vert +
+            // meshlet_viz.frag -> renders exactly the in-frustum cluster-instances. ASSERTS GPU count == CPU
+            // SurvivorClusterCount (frustum.h), GPU-culled image == CPU-CullClusterInstances image BYTE-
+            // IDENTICAL, all-in-frustum == full unculled draw byte-identical, two-run determinism. Prints
+            // `cluster-cull: {instances:M, clustersPerMesh:24, clusterInstances:M*24, survivors:N}`. One BMP
+            // -> exit. New golden cluster_cull.png; existing goldens untouched.
+            clusterCullShotPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--hiz-cull-shot") == 0 && i + 1 < argc) {
             // Slice CJ: Hi-Z OCCLUSION cull. A scene with a BIG OCCLUDER (a large wall near the camera)
             // hiding many objects BEHIND it + objects beside/in-front (visible). A CPU depth pre-pass
@@ -11476,6 +11491,601 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — GPU-culled %u/%u objects via compute-cull -> MDI + bindless\n",
                                 gpuCullDrawShotPath, gw, gh, gpuDrawn, kObjects);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", gpuCullDrawShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Virtual-geometry per-CLUSTER frustum cull -> indirect cluster draw (--cluster-cull-shot
+        // <out.bmp>, Slice DT). The per-CLUSTER analogue of the per-OBJECT --gpucull-draw-shot: an instance
+        // grid of DS-clustered spheres is decomposed into (instance x cluster) records, each with its
+        // per-cluster WORLD bounding sphere (InstanceWorldSphere of the DS local cluster sphere). A compute
+        // shader (shaders/cluster_cull.comp.hlsl) frustum-culls the FULL cluster-instance list, ORDER-
+        // compacts the survivors into the MDI command buffer + the compacted (model+color) per-draw SSBO,
+        // and writes the survivor count; the host reads it back and issues ONE DrawIndexedMultiIndirect over
+        // cluster_viz.vert (reads PerDraw[gl_DrawID] model+color) + meshlet_viz.frag (the flat-color pass).
+        // The run ALSO renders the IDENTICAL survivors via the CPU CullClusterInstances reference (the per-
+        // cluster meshlet_viz push-constant path, in source order) and ASSERTS:
+        //   (1) GPU draw-count == CPU SurvivorClusterCount (frustum.h) EXACT,
+        //   (2) GPU-culled image == CPU-culled image BYTE-IDENTICAL (same shader),
+        //   (3) all-in-frustum (a camera containing ALL) -> count == total AND == the full unculled draw
+        //       byte-identical,
+        //   (4) two GPU-culled runs byte-identical (ordered prefix sum -> source order).
+        // Prints `cluster-cull: {instances:M, clustersPerMesh:24, clusterInstances:M*24, survivors:N}`. The
+        // empty shadow pass is declared (the DQ lesson) -> validation-clean. One BMP -> exit. New golden
+        // cluster_cull.png; existing goldens untouched. ----
+        if (clusterCullShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace fr = render::frustum;
+            namespace vg = render::vg;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- The shared mesh + its DS decomposition (the SAME SphereGeometry(48,32) -> 24 clusters as
+            // --meshlet-viz). The reordered index buffer is uploaded once; each cluster is an index slice. -
+            scene::MeshGeometry geo = scene::SphereGeometry(48, 32);
+            vg::MeshletSet ms = vg::BuildMeshlets(geo.verts, geo.indices);
+            const uint32_t clustersPerMesh = (uint32_t)ms.meshlets.size();
+
+            // --- The instance grid: a WIDE row of spheres so a CLEAR subset falls outside the narrow render
+            // frustum (a REAL per-cluster cull). 4 instances across X at z=-6, spaced wide. ---
+            const int kInstances = 4;
+            std::vector<Mat4> instanceModels;
+            {
+                const float spacing = 3.2f;
+                const float half = 0.5f * (float)(kInstances - 1) * spacing;
+                for (int gi = 0; gi < kInstances; ++gi) {
+                    float x = (float)gi * spacing - half;
+                    instanceModels.push_back(Mat4::Translate({x, 0.0f, -6.0f}));
+                }
+            }
+
+            // --- Build the (instance x cluster) records (instance-major, cluster-minor). ---
+            std::vector<vg::ClusterInstance> clusters = vg::BuildClusterInstances(
+                std::span<const Mat4>(instanceModels.data(), instanceModels.size()), ms);
+            const uint32_t kClusterInstances = (uint32_t)clusters.size();
+
+            // --- Two cameras: NARROW (the actual cull/render frustum, a clear subset off-screen) and WIDE
+            // (contains ALL cluster-instances, for the all-in-frustum == full-draw proof). Both look down -Z
+            // at the grid centre (the Vulkan-clip view-proj feeds the GPU cull's six planes + the CPU ref). -
+            runtime::Camera narrowCam;
+            narrowCam.position = {0.0f, 0.0f, 1.5f};
+            narrowCam.yaw = 0.0f; narrowCam.SetPitch(0.0f);
+            narrowCam.fovY = 0.5235988f;  // 30 degrees — narrow, the wings fall outside
+            narrowCam.aspect = aspect;
+            narrowCam.znear = 0.2f; narrowCam.zfar = 50.0f;
+            Mat4 narrowVP = narrowCam.ViewProj();
+            fr::Frustum narrowFrustum = fr::FromViewProj(narrowVP);
+
+            runtime::Camera wideCam;
+            wideCam.position = {0.0f, 0.0f, 4.0f};
+            wideCam.yaw = 0.0f; wideCam.SetPitch(0.0f);
+            wideCam.fovY = 1.7453293f;  // 100 degrees — contains the whole grid
+            wideCam.aspect = aspect;
+            wideCam.znear = 0.1f; wideCam.zfar = 100.0f;
+            Mat4 wideVP = wideCam.ViewProj();
+            fr::Frustum wideFrustum = fr::FromViewProj(wideVP);
+
+            // --- CPU references (the proof RHS): the survivor count + the compacted MdiCommand list, in
+            // source order. The narrow camera is the showcase camera; the wide one is the no-op proof. ---
+            std::span<const vg::ClusterInstance> clusterSpan(clusters.data(), clusters.size());
+            const uint32_t cpuSurvivors = vg::SurvivorClusterCount(clusterSpan, narrowFrustum);
+            std::vector<render::mdi::MdiCommand> cpuCmds = vg::CullClusterInstances(clusterSpan, narrowFrustum);
+            const uint32_t cpuWideSurvivors = vg::SurvivorClusterCount(clusterSpan, wideFrustum);
+
+            // --- Upload the shared vertex + reordered index buffers. ---
+            rhi::BufferDesc vbd;
+            vbd.size = geo.verts.size() * sizeof(scene::Vertex);
+            vbd.initialData = geo.verts.data();
+            vbd.usage = rhi::BufferUsage::Vertex;
+            auto vbuf = device->CreateBuffer(vbd);
+            rhi::BufferDesc ibd;
+            ibd.size = ms.indices.size() * sizeof(uint32_t);
+            ibd.initialData = ms.indices.data();
+            ibd.usage = rhi::BufferUsage::Index;
+            auto ibuf = device->CreateBuffer(ibd);
+
+            // --- The GPU ClusterIn upload struct must match shaders/cluster_cull.comp.hlsl's std430 layout:
+            // mat4 (4 float4) + color (float4) + worldSphere (float4) + slice (uint4) = 112 bytes. The world
+            // sphere is precomputed (the SAME InstanceWorldSphere the CPU mirror tests). The per-cluster hash
+            // color is keyed off the cluster index within its mesh (so the spatial cluster patches match the
+            // --meshlet-viz palette). ---
+            struct ClusterIn {
+                float    model[16];
+                float    color[4];
+                float    worldSphere[4];   // xyz center, w radius
+                uint32_t slice[4];         // firstIndex (triOffset*3), indexCount (triCount*3), pad, pad
+            };
+            static_assert(sizeof(ClusterIn) == 112, "ClusterIn must match the compute std430 layout (112 bytes)");
+            std::vector<ClusterIn> clustersIn(kClusterInstances);
+            for (uint32_t i = 0; i < kClusterInstances; ++i) {
+                const vg::ClusterInstance& ci = clusters[i];
+                const Mat4& model = instanceModels[ci.instanceIndex];
+                uint32_t clusterInMesh = i % clustersPerMesh;   // cluster-minor order
+                Vec3 col = vg::hashColor(clusterInMesh);
+                for (int k = 0; k < 16; ++k) clustersIn[i].model[k] = model.m[k];
+                clustersIn[i].color[0] = col.x; clustersIn[i].color[1] = col.y;
+                clustersIn[i].color[2] = col.z; clustersIn[i].color[3] = 1.0f;
+                clustersIn[i].worldSphere[0] = ci.worldCenter.x; clustersIn[i].worldSphere[1] = ci.worldCenter.y;
+                clustersIn[i].worldSphere[2] = ci.worldCenter.z; clustersIn[i].worldSphere[3] = ci.worldRadius;
+                clustersIn[i].slice[0] = ci.triOffset * 3u; clustersIn[i].slice[1] = ci.triCount * 3u;
+                clustersIn[i].slice[2] = 0u; clustersIn[i].slice[3] = 0u;
+            }
+            rhi::BufferDesc ciDesc;
+            ciDesc.size = clustersIn.size() * sizeof(ClusterIn);
+            ciDesc.initialData = clustersIn.data();
+            ciDesc.usage = rhi::BufferUsage::Storage;
+            auto clusterBuffer = device->CreateBuffer(ciDesc);
+
+            // The compacted survivor per-draw SSBO (model+color = 80 bytes; cluster_viz.vert reads
+            // PerDraw[gl_DrawID]). Sized for the worst case (all survive).
+            struct PerDrawCC { float model[16]; float color[4]; };
+            static_assert(sizeof(PerDrawCC) == 80, "PerDrawCC must match cluster_viz.vert PerDraw (80 bytes)");
+            rhi::BufferDesc pdDesc;
+            pdDesc.size = (uint64_t)kClusterInstances * sizeof(PerDrawCC);
+            pdDesc.usage = rhi::BufferUsage::Storage;
+            auto perDrawBuffer = device->CreateBuffer(pdDesc);
+
+            // The compacted survivor MDI command buffer (5x u32 each).
+            rhi::BufferDesc cmdDesc;
+            cmdDesc.size = (uint64_t)kClusterInstances * sizeof(render::mdi::MdiCommand);
+            cmdDesc.usage = rhi::BufferUsage::Indirect;
+            auto cmdBuffer = device->CreateBuffer(cmdDesc);
+
+            // Survivor count (1x u32 at [0]); the host reads it back for the drawCount.
+            uint32_t countInit = 0;
+            rhi::BufferDesc countDesc;
+            countDesc.size = sizeof(uint32_t);
+            countDesc.initialData = &countInit;
+            countDesc.usage = rhi::BufferUsage::Storage;
+            auto countBuffer = device->CreateBuffer(countDesc);
+
+            // Cull params (matches cluster_cull.comp.hlsl Params, std430): 6 planes (n.xyz,d) + counts. The
+            // planes are uploaded for the active frustum (rebuilt per render below).
+            struct CullParams { float planes[6][4]; uint32_t counts[4]; };
+            static_assert(sizeof(CullParams) == 112, "CullParams layout");
+            auto makeParams = [&](const fr::Frustum& f) {
+                CullParams p{};
+                for (int k = 0; k < 6; ++k) {
+                    p.planes[k][0] = f.planes[k].n.x; p.planes[k][1] = f.planes[k].n.y;
+                    p.planes[k][2] = f.planes[k].n.z; p.planes[k][3] = f.planes[k].d;
+                }
+                p.counts[0] = kClusterInstances;
+                return p;
+            };
+            CullParams narrowParamsData = makeParams(narrowFrustum);
+            rhi::BufferDesc paramDesc;
+            paramDesc.size = sizeof(CullParams);
+            paramDesc.initialData = &narrowParamsData;
+            paramDesc.usage = rhi::BufferUsage::Storage;
+            auto paramBuffer = device->CreateBuffer(paramDesc);
+
+            // --- Compute cull+compact pipeline: 5 storage buffers, one workgroup of 1024 threads (ordered
+            // prefix-sum compaction over <=1024 cluster-instances). NO new RHI. ---
+            auto cullCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cluster_cull.comp.hlsl.spv");
+            auto cullCs = device->CreateShaderModule({std::span<const uint32_t>(cullCsWords)});
+            rhi::ComputePipelineDesc cullCdesc;
+            cullCdesc.compute = cullCs.get();
+            cullCdesc.storageBufferCount = 5;
+            cullCdesc.pushConstantSize = 0;
+            cullCdesc.threadsPerGroupX = 1024;
+            auto cullCompute = device->CreateComputePipeline(cullCdesc);
+
+            // --- Pipelines: cluster_viz (MDI, reads PerDraw[gl_DrawID]) + meshlet_viz (push-constant, the
+            // CPU bound reference) sharing meshlet_viz.frag, + sky + post. The viz consumes pos(0)+normal(3).
+            auto ccVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/cluster_viz.vert.hlsl.spv");
+            auto mvFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/meshlet_viz.frag.hlsl.spv");
+            auto ccVs = device->CreateShaderModule({std::span<const uint32_t>(ccVsW)});
+            auto mvFs = device->CreateShaderModule({std::span<const uint32_t>(mvFsW)});
+            rhi::VertexLayout vizLayout;
+            vizLayout.stride = sizeof(scene::Vertex);  // 56
+            vizLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {3, rhi::Format::RGB32_Float, 32},
+            };
+            rhi::GraphicsPipelineDesc ccDesc;
+            ccDesc.vertex = ccVs.get(); ccDesc.fragment = mvFs.get();
+            ccDesc.vertexLayout = vizLayout;
+            ccDesc.colorFormat = device->Swapchain().ColorFormat();
+            ccDesc.depthTest = true; ccDesc.usesFrameUniforms = true;
+            // usesTexture so set 1 (material) is present and the per-draw SSBO sits at set 2 exactly where
+            // cluster_viz.vert declares it (the layout builder needs set 1 occupied to keep set indices
+            // consecutive — same as lit_gpudriven). The shared meshlet_viz.frag samples NO texture; a dummy
+            // material is bound to satisfy the set-1 slot.
+            ccDesc.usesTexture = true;
+            ccDesc.usesPerDrawData = true;   // set 2: the compacted PerDraw SSBO read by gl_DrawID
+            ccDesc.pushConstantSize = 0;
+            auto ccPipeline = device->CreateGraphicsPipeline(ccDesc);
+
+            // A 1x1 dummy material (base color + normal) for the cluster_viz set-1 slot (the frag ignores it).
+            const uint8_t dummyPx[4] = {255, 255, 255, 255};
+            auto dummyTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, dummyPx, sizeof(dummyPx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormalTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            auto mvVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/meshlet_viz.vert.hlsl.spv");
+            auto mvVs = device->CreateShaderModule({std::span<const uint32_t>(mvVsW)});
+            rhi::GraphicsPipelineDesc mvDesc;
+            mvDesc.vertex = mvVs.get(); mvDesc.fragment = mvFs.get();
+            mvDesc.vertexLayout = vizLayout;
+            mvDesc.colorFormat = device->Swapchain().ColorFormat();
+            mvDesc.depthTest = true; mvDesc.usesFrameUniforms = true;
+            mvDesc.pushConstantSize = sizeof(float) * 20;   // float4x4 model + float4 color
+            auto mvPipeline = device->CreateGraphicsPipeline(mvDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // Declare the (empty) shadow pass so the render graph + validation are happy (the DQ lesson):
+            // the viz reads no shadow map, but a declared shadow target keeps the pass topology consistent.
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // --- Frame uniforms for a given view-proj (deterministic). ---
+            auto makeFrame = [&](const Mat4& vp, const runtime::Camera& cam) {
+                FrameData fd{};
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 1.0f; fd.lightColor[2] = 1.0f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = cam.position.x; fd.viewPos[1] = cam.position.y;
+                fd.viewPos[2] = cam.position.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                runtime::CameraBasis cb = cam.Basis();
+                fd.camFwd[0]=cb.forward.x; fd.camFwd[1]=cb.forward.y; fd.camFwd[2]=cb.forward.z;
+                fd.camRight[0]=cb.right.x; fd.camRight[1]=cb.right.y; fd.camRight[2]=cb.right.z;
+                fd.camUp[0]=cb.up.x; fd.camUp[1]=cb.up.y; fd.camUp[2]=cb.up.z;
+                fd.skyParams[0] = cb.tanHalfFovY; fd.skyParams[1] = aspect;
+                return fd;
+            };
+            FrameData narrowFd = makeFrame(narrowVP, narrowCam);
+            FrameData wideFd   = makeFrame(wideVP, wideCam);
+
+            // The empty shadow pass (declared, records nothing — validation-clean).
+            auto recordEmptyShadow = [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&narrowFd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            };
+
+            // === The GPU-CULLED-AND-DRAWN frame: dispatch the compute cull/compact, then ONE
+            // DrawIndexedMultiIndirect(count) over the compacted survivor buffers. Returns pixels + count. ==
+            uint32_t gpuDrawnDeferred = 0;  // resolved by a compute-only pre-pass below
+            auto renderGpuCulled = [&](const FrameData& fd, std::vector<uint8_t>& outPx, uint32_t& outW,
+                                       uint32_t& outH, uint32_t& outDrawn) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("shadow", {}, {rgShadow}, recordEmptyShadow);
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BindComputePipeline(*cullCompute);
+                        cmd.BindStorageBuffer(*clusterBuffer, 0);
+                        cmd.BindStorageBuffer(*perDrawBuffer, 1);
+                        cmd.BindStorageBuffer(*cmdBuffer, 2);
+                        cmd.BindStorageBuffer(*countBuffer, 3);
+                        cmd.BindStorageBuffer(*paramBuffer, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*ccPipeline);
+                        cmd.BindMaterial(*dummyTex, *flatNormalTex);   // set 1 (ignored by meshlet_viz.frag)
+                        cmd.BindPerDrawData(*perDrawBuffer);
+                        cmd.BindVertexBuffer(*vbuf);
+                        cmd.BindIndexBuffer(*ibuf);
+                        cmd.DrawIndexedMultiIndirect(*cmdBuffer, gpuDrawnDeferred,
+                                                     (uint32_t)sizeof(render::mdi::MdiCommand));
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                device->ReadBuffer(*countBuffer, &outDrawn, sizeof(outDrawn), 0);
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            // === The CPU-reference frame: draw EXACTLY the CPU CullClusterInstances survivors (in source
+            // order), per-cluster bound via the meshlet_viz push-constant path — the render-invariant
+            // reference the GPU-culled image must match byte-for-byte (same vertex math, same color). ===
+            auto renderCpuRef = [&](const FrameData& fd, const std::vector<render::mdi::MdiCommand>& cmds,
+                                    std::vector<uint8_t>& outPx, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                graph.AddPass("shadow", {}, {rgShadow}, recordEmptyShadow);
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*mvPipeline);
+                        cmd.BindVertexBuffer(*vbuf);
+                        cmd.BindIndexBuffer(*ibuf);
+                        for (const render::mdi::MdiCommand& c : cmds) {
+                            const ClusterIn& src = clustersIn[c.firstInstance];  // source cluster-instance
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = src.model[k];
+                            pc[16] = src.color[0]; pc[17] = src.color[1];
+                            pc[18] = src.color[2]; pc[19] = src.color[3];
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.DrawIndexed(c.indexCount, c.firstIndex, (int32_t)c.vertexOffset);
+                        }
+                        cmd.EndRenderPass();
+                    });
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                device->WaitIdle();
+                return device->GetCapturedPixels(outPx, outW, outH);
+            };
+
+            auto fnv = [](const std::vector<uint8_t>& px) {
+                uint64_t hsh = 1469598103934665603ull;
+                for (uint8_t b : px) { hsh ^= b; hsh *= 1099511628211ull; }
+                return hsh;
+            };
+
+            // -- Pre-pass: dispatch the compute cull ALONE (narrow frustum) to obtain the GPU survivor count
+            // for the DrawIndexedMultiIndirect drawCount (the readback path; params already = narrow). ----
+            {
+                render::RenderGraph pre;
+                render::RgResource rgScene = pre.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                pre.AddPass("cull", {}, {rgScene},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*cullCompute);
+                        cmd.BindStorageBuffer(*clusterBuffer, 0);
+                        cmd.BindStorageBuffer(*perDrawBuffer, 1);
+                        cmd.BindStorageBuffer(*cmdBuffer, 2);
+                        cmd.BindStorageBuffer(*countBuffer, 3);
+                        cmd.BindStorageBuffer(*paramBuffer, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                pre.Execute(*device);
+                device->WaitIdle();
+                device->ReadBuffer(*countBuffer, &gpuDrawnDeferred, sizeof(gpuDrawnDeferred), 0);
+            }
+
+            std::printf("cluster-cull: {instances:%u, clustersPerMesh:%u, clusterInstances:%u, survivors:%u}\n",
+                        (uint32_t)kInstances, clustersPerMesh, kClusterInstances, gpuDrawnDeferred);
+
+            // PROOF (1): GPU draw-count == CPU SurvivorClusterCount EXACT.
+            if (gpuDrawnDeferred != cpuSurvivors) {
+                std::fprintf(stderr,
+                    "FATAL: cluster-cull GPU count %u != CPU frustum.h reference %u\n",
+                    gpuDrawnDeferred, cpuSurvivors);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cluster-cull GPU count == CPU frustum.h: %u EXACT\n", cpuSurvivors);
+            if (!(cpuSurvivors > 0 && cpuSurvivors < kClusterInstances)) {
+                std::fprintf(stderr,
+                    "FATAL: cluster-cull narrow frustum did not cull a STRICT subset (survivors=%u of %u) — "
+                    "the camera framing is wrong\n", cpuSurvivors, kClusterInstances);
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Render the GPU-CULLED narrow frame. ---
+            std::vector<uint8_t> gpuPx; uint32_t gw = 0, gh = 0, gpuDrawn = 0;
+            if (!renderGpuCulled(narrowFd, gpuPx, gw, gh, gpuDrawn)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (GPU-culled cluster render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (gpuDrawn != cpuSurvivors) {
+                std::fprintf(stderr, "FATAL: GPU survivor count %u != cpuRef %u (second pass)\n",
+                             gpuDrawn, cpuSurvivors);
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF (2): GPU-culled == CPU-culled BYTE-IDENTICAL.
+            std::vector<uint8_t> refPx; uint32_t rw = 0, rh = 0;
+            if (!renderCpuRef(narrowFd, cpuCmds, refPx, rw, rh)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (CPU-culled cluster reference)\n");
+                device->WaitIdle(); return 1;
+            }
+            uint64_t gpuHash = fnv(gpuPx), refHash = fnv(refPx);
+            std::printf("cluster-cull-hash: %016llx  ref-hash: %016llx  (survivors:%u)\n",
+                        (unsigned long long)gpuHash, (unsigned long long)refHash, gpuDrawn);
+            const bool identical = (gw == rw) && (gh == rh) && (gpuPx.size() == refPx.size()) &&
+                                   (std::memcmp(gpuPx.data(), refPx.data(), gpuPx.size()) == 0);
+            if (!identical) {
+                std::fprintf(stderr,
+                    "FATAL: cluster-cull GPU-culled image != CPU-culled reference — gpu-hash %016llx vs "
+                    "ref-hash %016llx\n", (unsigned long long)gpuHash, (unsigned long long)refHash);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cluster-cull GPU-culled == CPU-culled: BYTE-IDENTICAL\n");
+
+            // PROOF (3): all-in-frustum (wide camera) -> count == total AND == full unculled draw byte-
+            // identical. Reupload the WIDE params, dispatch, and assert every cluster-instance survives; then
+            // render the wide GPU-culled frame and the wide FULL unculled draw (CPU command list over ALL
+            // cluster-instances in source order) -> byte-identical.
+            {
+                CullParams wideParamsData = makeParams(wideFrustum);
+                // A fresh params buffer holding the WIDE frustum planes (the narrow buffer is reused below
+                // for the determinism proof, so we don't overwrite it).
+                rhi::BufferDesc wpDesc;
+                wpDesc.size = sizeof(CullParams);
+                wpDesc.initialData = &wideParamsData;
+                wpDesc.usage = rhi::BufferUsage::Storage;
+                auto wideParamBuffer = device->CreateBuffer(wpDesc);
+
+                // Compute-only pre-pass with the wide params to read the wide count back.
+                uint32_t wideGpuCount = 0;
+                {
+                    render::RenderGraph pre;
+                    render::RgResource rgScene = pre.ImportTarget(
+                        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                    pre.AddPass("cull", {}, {rgScene},
+                        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*cullCompute);
+                            cmd.BindStorageBuffer(*clusterBuffer, 0);
+                            cmd.BindStorageBuffer(*perDrawBuffer, 1);
+                            cmd.BindStorageBuffer(*cmdBuffer, 2);
+                            cmd.BindStorageBuffer(*countBuffer, 3);
+                            cmd.BindStorageBuffer(*wideParamBuffer, 4);
+                            cmd.DispatchCompute(1);
+                            cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.EndRenderPass();
+                        });
+                    pre.Execute(*device);
+                    device->WaitIdle();
+                    device->ReadBuffer(*countBuffer, &wideGpuCount, sizeof(wideGpuCount), 0);
+                }
+                if (wideGpuCount != kClusterInstances || cpuWideSurvivors != kClusterInstances) {
+                    std::fprintf(stderr,
+                        "FATAL: all-in-frustum count %u (cpu %u) != total %u\n",
+                        wideGpuCount, cpuWideSurvivors, kClusterInstances);
+                    device->WaitIdle(); return 1;
+                }
+
+                // The wide GPU-culled frame (draws all survivors via the wide params).
+                gpuDrawnDeferred = wideGpuCount;
+                auto renderGpuCulledWide = [&](std::vector<uint8_t>& outPx, uint32_t& oW, uint32_t& oH) -> bool {
+                    render::RenderGraph graph;
+                    render::RgResource rgShadow = graph.ImportTarget(
+                        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                    render::RgResource rgScene = graph.ImportTarget(
+                        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+                    graph.AddPass("shadow", {}, {rgShadow}, recordEmptyShadow);
+                    graph.AddPass("scene", {rgShadow}, {rgScene},
+                        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                            dev.SetFrameUniforms(&wideFd, sizeof(FrameData));
+                            cmd.BindComputePipeline(*cullCompute);
+                            cmd.BindStorageBuffer(*clusterBuffer, 0);
+                            cmd.BindStorageBuffer(*perDrawBuffer, 1);
+                            cmd.BindStorageBuffer(*cmdBuffer, 2);
+                            cmd.BindStorageBuffer(*countBuffer, 3);
+                            cmd.BindStorageBuffer(*wideParamBuffer, 4);
+                            cmd.DispatchCompute(1);
+                            cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                            cmd.BindPipeline(*skyPipe);
+                            cmd.Draw(3);
+                            cmd.BindPipeline(*ccPipeline);
+                            cmd.BindMaterial(*dummyTex, *flatNormalTex);  // set 1 (ignored by meshlet_viz.frag)
+                            cmd.BindPerDrawData(*perDrawBuffer);
+                            cmd.BindVertexBuffer(*vbuf);
+                            cmd.BindIndexBuffer(*ibuf);
+                            cmd.DrawIndexedMultiIndirect(*cmdBuffer, gpuDrawnDeferred,
+                                                         (uint32_t)sizeof(render::mdi::MdiCommand));
+                            cmd.EndRenderPass();
+                        });
+                    graph.AddPass("post", {rgScene}, {rgSwap},
+                        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.BindPipeline(*postPipe);
+                            cmd.BindTexture(*rt);
+                            cmd.Draw(3);
+                            cmd.EndRenderPass();
+                        });
+                    device->CaptureNextFrame();
+                    graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                    graph.Execute(*device);
+                    device->WaitIdle();
+                    return device->GetCapturedPixels(outPx, oW, oH);
+                };
+                std::vector<uint8_t> widePx; uint32_t ww = 0, wh = 0;
+                if (!renderGpuCulledWide(widePx, ww, wh)) {
+                    std::fprintf(stderr, "FATAL: no captured pixels (wide GPU-culled render)\n");
+                    device->WaitIdle(); return 1;
+                }
+                // The full unculled draw: every cluster-instance, in source order (a CPU command over ALL).
+                std::vector<render::mdi::MdiCommand> fullCmds;
+                fullCmds.reserve(kClusterInstances);
+                for (uint32_t i = 0; i < kClusterInstances; ++i) {
+                    render::mdi::MdiCommand c{};
+                    c.indexCount = clusters[i].triCount * 3u; c.instanceCount = 1u;
+                    c.firstIndex = clusters[i].triOffset * 3u; c.vertexOffset = 0u; c.firstInstance = i;
+                    fullCmds.push_back(c);
+                }
+                std::vector<uint8_t> fullPx; uint32_t fw = 0, fh = 0;
+                if (!renderCpuRef(wideFd, fullCmds, fullPx, fw, fh)) {
+                    std::fprintf(stderr, "FATAL: no captured pixels (full unculled reference)\n");
+                    device->WaitIdle(); return 1;
+                }
+                const bool wideIdentical = (ww == fw) && (wh == fh) && (widePx.size() == fullPx.size()) &&
+                                           (std::memcmp(widePx.data(), fullPx.data(), widePx.size()) == 0);
+                if (!wideIdentical) {
+                    std::fprintf(stderr, "FATAL: all-in-frustum GPU draw != full unculled draw (not a no-op)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cluster-cull all-in-frustum: count==total(%u) AND == full unculled draw "
+                            "BYTE-IDENTICAL\n", kClusterInstances);
+            }
+
+            // PROOF (4): two GPU-culled runs (narrow) byte-identical. Restore the narrow params (the buffer
+            // still holds them; the wide proof used a separate buffer) and render twice.
+            gpuDrawnDeferred = cpuSurvivors;
+            std::vector<uint8_t> run1, run2; uint32_t a = 0, b = 0, d1 = 0, d2 = 0;
+            if (!renderGpuCulled(narrowFd, run1, a, b, d1) ||
+                !renderGpuCulled(narrowFd, run2, a, b, d2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (determinism runs)\n");
+                device->WaitIdle(); return 1;
+            }
+            const bool det = (run1.size() == run2.size()) &&
+                             (std::memcmp(run1.data(), run2.data(), run1.size()) == 0) && (d1 == d2);
+            if (!det) {
+                std::fprintf(stderr, "FATAL: two GPU-culled runs differ (nondeterministic compaction)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cluster-cull determinism: two runs BYTE-IDENTICAL\n");
+
+            // The GPU-culled narrow capture is the golden (== the CPU-culled reference above).
+            bool ok = WriteBMP(clusterCullShotPath, gpuPx, gw, gh);
+            if (ok) std::printf("wrote %s (%ux%u) — GPU per-cluster-culled %u/%u cluster-instances via "
+                                "compute-cull -> MDI\n", clusterCullShotPath, gw, gh, gpuDrawn, kClusterInstances);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clusterCullShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -348,6 +348,15 @@ hf_compile_shaders(
     # lit_gpudriven.{vert,frag}. Composes AR (cull+compact) + BM (MDI) + BZ (bindless) + CB (combined
     # per-draw). Existing shaders + goldens untouched.
     "shaders/gpudriven_cull.comp.hlsl:cs"
+    # Virtual-geometry per-CLUSTER frustum cull (Slice DT): a NEAR-COPY of gpudriven_cull.comp with the
+    # (instance x cluster) record as the unit (a DS cluster is just an object with a per-cluster bounding
+    # sphere). One thread/cluster-instance: SphereOutside (copied VERBATIM) -> ORDERED single-workgroup
+    # prefix-sum compaction into the MdiCommand buffer + the compacted (model+color) per-draw SSBO +
+    # survivor count. cluster_viz.vert is the MDI variant of meshlet_viz.vert (reads PerDraw[gl_DrawID]
+    # model+color instead of a push constant); the shared meshlet_viz.frag is the flat-color pass. CPU
+    # mirror: render/cluster_cull.h. NO new RHI; existing shaders + goldens untouched.
+    "shaders/cluster_cull.comp.hlsl:cs"
+    "shaders/cluster_viz.vert.hlsl:vs"
     # Hi-Z OCCLUSION cull (Slice CJ): extends gpudriven_cull with a hierarchical-Z occlusion test —
     # after the frustum test, an object FULLY HIDDEN behind closer geometry (its screen-rect nearest
     # depth farther than the Hi-Z max everywhere it covers) is dropped from the compacted survivors.
