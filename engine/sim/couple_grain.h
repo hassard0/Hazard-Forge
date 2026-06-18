@@ -584,5 +584,137 @@ inline CGrainState MeasureCGrainState(const CGrainWorld& world, fx startY) {
     return s;
 }
 
+// ===== Slice CG5 — LOCKSTEP + ROLLBACK (the MULTI-BODY netcode HEADLINE) =============================
+// Prove the bit-exact CG4 coupled step (StepCGrain, itself bit-identical Vulkan/Metal) is true cross-platform
+// LOCKSTEP + ROLLBACK over a COUPLED rigid+granular system: a peer fed the INPUT command stream ALONE (NOT full
+// state) re-derives the authority's exact coupled state — BOTH the rigid bodies AND the sand — bit-for-bit, and
+// a mispredicted input is corrected by rolling back to a saved snapshot + re-simulating. PURE CPU, 0 backend
+// symbols, NO new shader / RHI: a determinism PROPERTY of the existing bit-exact StepCGrain. The DIRECT
+// COMPOSITION of the CP5 (coupled) + GR5 (grain) harnesses over CGrainWorld — the couple.h CoupleCommand/
+// ApplyCoupleCommand/SimCoupleTick/SnapshotCouple/RestoreCouple/RunCoupleLockstep/RunCoupleRollback shape with
+// grain::GrainParticle instead of fluid::FluidParticle and StepCGrain as the per-tick step. NO <cmath>, NO RNG,
+// NO clock. Shove the body, and two peers re-simulate the sink AND the sand-spray bit-for-bit.
+//
+// THE MULTI-BODY TWIST (the CP5 lesson): the world has TWO heterogeneous body sets — the rigid
+// std::vector<fpx::FxBody> bodies AND the std::vector<grain::GrainParticle> grains. SnapshotCGrain deep-copies
+// BOTH; RunCGrainLockstep's replica==authority must memcmp BOTH; a CGrainCommand can target a rigid body OR a
+// grain. This is a lockstep over a coupled rigid+granular system — the GR5 (grain) + CP5 (coupled) harnesses
+// fused. A CGrainCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full
+// state): kCmdBodyShove adds arg (a delta-velocity) to a rigid body's velocity (the "shove the body" headline);
+// kCmdBodyMove adds arg (a delta-position) to a body's position; kCmdGrainWind adds arg (a delta-velocity) to a
+// grain's velocity. Integer adds; static bodies (non-dynamic) / static grains (kFlagStatic) are never mutated;
+// out-of-range target / unknown kind -> a no-op (deterministic). A std::vector<CGrainCommand> is the command
+// STREAM, processed in ARRAY ORDER per tick (the deterministic-order contract — the same order on every peer).
+
+inline constexpr uint32_t kCmdBodyShove = 0u;   // arg added to target rigid body's velocity (the body shove)
+inline constexpr uint32_t kCmdBodyMove  = 1u;   // arg added to target rigid body's position (a position nudge)
+inline constexpr uint32_t kCmdGrainWind = 2u;   // arg added to target grain's velocity (a sand-wind gust)
+
+struct CGrainCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdBodyShove / kCmdBodyMove / kCmdGrainWind
+    uint32_t target = 0;   // the target index (a rigid body index for shove/move; a grain index for wind)
+    FxVec3   arg;          // the Q16.16 payload (delta-velocity for shove/wind; delta-position for move)
+};
+
+// ApplyCGrainCommand(world, c): apply ONE input command to the coupled world (pure integer — add to a body's
+// vel/pos or a grain's vel). Out-of-range target is a no-op (deterministic); unknown kind is a no-op; static
+// bodies (non-dynamic) and static grains (kFlagStatic) are never mutated (they hold). The input event the
+// lockstep/rollback streams are made of. The couple.h::ApplyCoupleCommand / grain.h::ApplyGrainCommand twin,
+// over the bodies+grains world.
+inline void ApplyCGrainCommand(CGrainWorld& world, const CGrainCommand& c) {
+    if (c.kind == kCmdBodyShove || c.kind == kCmdBodyMove) {
+        if (c.target >= (uint32_t)world.bodies.size()) return;     // out-of-range body target -> no-op
+        fpx::FxBody& b = world.bodies[(size_t)c.target];
+        if (!(b.flags & fpx::kFlagDynamic)) return;                // static/kinematic body holds — no input moves it
+        if (c.kind == kCmdBodyShove) { b.vel.x += c.arg.x; b.vel.y += c.arg.y; b.vel.z += c.arg.z; }
+        else                         { b.pos.x += c.arg.x; b.pos.y += c.arg.y; b.pos.z += c.arg.z; }
+    } else if (c.kind == kCmdGrainWind) {
+        if (c.target >= (uint32_t)world.grains.size()) return;     // out-of-range grain target -> no-op
+        grain::GrainParticle& g = world.grains[(size_t)c.target];
+        if (g.flags & grain::kFlagStatic) return;                  // static boundary grain holds
+        g.vel.x += c.arg.x; g.vel.y += c.arg.y; g.vel.z += c.arg.z;
+    }
+    // unknown kind -> a no-op (deterministic).
+}
+
+// SimCGrainTick(world, stream, tick, dt, iters): the deterministic per-tick step. (1) apply ALL commands in
+// `stream` whose .tick == `tick`, in ARRAY ORDER (the deterministic input-order contract); (2) StepCGrain one
+// step (CG4 — the bit-exact coupled tick over bodies + grains). Pure integer, fixed order -> bit-identical on
+// every peer/platform. The couple.h::SimCoupleTick / grain.h::SimGrainTick twin over CGrainWorld.
+inline void SimCGrainTick(CGrainWorld& world, const std::vector<CGrainCommand>& stream, uint32_t tick,
+                          fx dt, int iters) {
+    for (const CGrainCommand& c : stream)
+        if (c.tick == tick) ApplyCGrainCommand(world, c);
+    StepCGrain(world, dt, iters);
+}
+
+// CGrainSnapshot: the multi-body snapshot — a deep copy of BOTH the rigid `bodies` AND the `grains` vectors
+// (the rollback primitive — a lossless saved tick across the coupled rigid+granular state). The
+// couple.h::CoupleSnapshot twin, with the grain pool instead of the fluid particles.
+struct CGrainSnapshot {
+    std::vector<fpx::FxBody>           bodies;   // a deep copy of the rigid bodies
+    std::vector<grain::GrainParticle>  grains;   // a deep copy of the grains
+};
+
+// SnapshotCGrain(world): a deep copy of BOTH the bodies AND the grains vectors (std::vector copy is a deep
+// copy). The MULTI-BODY twist: the snapshot covers BOTH body sets. The couple.h::SnapshotCouple twin.
+inline CGrainSnapshot SnapshotCGrain(const CGrainWorld& world) {
+    CGrainSnapshot s;
+    s.bodies = world.bodies;   // value copy: deep-copies the rigid bodies
+    s.grains = world.grains;   // value copy: deep-copies the grains
+    return s;
+}
+
+// RestoreCGrain(world, snap): restore BOTH the bodies AND the grains to a saved snapshot (the rollback).
+// Bit-exact round-trip with SnapshotCGrain across BOTH vectors. The couple.h::RestoreCouple twin.
+inline void RestoreCGrain(CGrainWorld& world, const CGrainSnapshot& snap) {
+    world.bodies = snap.bodies;
+    world.grains = snap.grains;
+}
+
+// RunCGrainLockstep(init, stream, ticks, dt, iters): THE peer entry point. Run `ticks` SimCGrainTicks from a
+// COPY of `init`, applying the command stream -> the final coupled state (bodies + grains). authority =
+// RunCGrainLockstep(...); replica = RunCGrainLockstep(...) from the SAME init + stream (inputs ONLY — no state
+// shared) -> BIT-IDENTICAL by determinism (the lockstep proof memcmps BOTH the bodies AND the grains). The
+// couple.h::RunCoupleLockstep / grain.h::RunGrainLockstep twin over CGrainWorld.
+inline CGrainWorld RunCGrainLockstep(const CGrainWorld& init, const std::vector<CGrainCommand>& stream,
+                                     int ticks, fx dt, int iters) {
+    CGrainWorld world = init;
+    for (int t = 0; t < ticks; ++t)
+        SimCGrainTick(world, stream, (uint32_t)t, dt, iters);
+    return world;
+}
+
+// RunCGrainRollback(init, authStream, mispredictStream, ticks, mispredictTick, dt, iters): the rollback
+// harness. (1) run ticks 0..mispredictTick from init applying authStream, SAVING a snapshot AT mispredictTick
+// (before that tick is simulated); (2) speculatively advance a few ticks from the snapshot with the MISPREDICTED
+// stream (the wrong input) — the client prediction that diverges; (3) "receive" the authoritative input ->
+// RestoreCGrain to the snapshot + RE-SIMULATE mispredictTick..ticks with the CORRECT authStream -> the final
+// corrected coupled state. The proof asserts this == RunCGrainLockstep(init, authStream, ticks) (rollback
+// corrected the misprediction EXACTLY, BOTH bodies AND grains) AND that the mispredicted-before-rollback state
+// DIFFERED from the authority (a real divergence was fixed). The couple.h::RunCoupleRollback twin over CGrainWorld.
+inline CGrainWorld RunCGrainRollback(const CGrainWorld& init, const std::vector<CGrainCommand>& authStream,
+                                     const std::vector<CGrainCommand>& mispredictStream, int ticks,
+                                     int mispredictTick, fx dt, int iters) {
+    CGrainWorld world = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimCGrainTick(world, authStream, (uint32_t)t, dt, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point — BOTH bodies AND grains).
+    const CGrainSnapshot snap = SnapshotCGrain(world);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — the client
+    // prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimCGrainTick(world, mispredictStream, (uint32_t)(mispredictTick + s), dt, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreCGrain(world, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimCGrainTick(world, authStream, (uint32_t)t, dt, iters);
+    return world;
+}
+
 }  // namespace cgrain
 }  // namespace hf::sim

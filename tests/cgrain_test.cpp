@@ -772,6 +772,204 @@ int main() {
         check(st.restY > ctrlSt.restY, "step: the supported body rests ABOVE the support=0 control (coupling works)");
     }
 
+    // ============================================================================================
+    // ===== Slice CG5 — LOCKSTEP + ROLLBACK (the MULTI-BODY netcode HEADLINE) =====================
+    // ============================================================================================
+    // ApplyCGrainCommand (body-shove adds to body vel, grain-wind adds to grain vel, body-move adds to body
+    // pos, static unmoved, out-of-range no-op); SnapshotCGrain/RestoreCGrain round-trip (bodies AND grains);
+    // RunCGrainLockstep two runs identical; RunCGrainRollback corrected == authority AND mispredicted !=
+    // authority. A TINY bed + few ticks so the test stays FAST (StepCGrain is heavy; the harness runs it many
+    // times). Clean under windows-msvc-asan.
+
+    // ---- ApplyCGrainCommand: kCmdBodyShove adds the delta-velocity to a DYNAMIC body ----
+    {
+        cgrain::CGrainWorld w;
+        w.hSearch = h;
+        w.bodies = {BodyAt(0, 5, 0, 2)};               // dynamic
+        w.grains = {GrainAt(0, 0, 0, 0)};
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdBodyShove, 0u,
+                                                            fpx::FxVec3{FromInt(3), FromInt(-2), FromInt(1)}});
+        check(w.bodies[0].vel.x == FromInt(3) && w.bodies[0].vel.y == FromInt(-2) && w.bodies[0].vel.z == FromInt(1),
+              "CG5 ApplyCGrainCommand: kCmdBodyShove adds the delta-velocity to a dynamic body");
+    }
+
+    // ---- ApplyCGrainCommand: kCmdBodyMove adds the delta-position to a DYNAMIC body ----
+    {
+        cgrain::CGrainWorld w;
+        w.hSearch = h;
+        w.bodies = {BodyAt(4, 5, 6, 2)};
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdBodyMove, 0u,
+                                                            fpx::FxVec3{FromInt(5), 0, FromInt(-3)}});
+        check(w.bodies[0].pos.x == FromInt(9) && w.bodies[0].pos.y == FromInt(5) && w.bodies[0].pos.z == FromInt(3),
+              "CG5 ApplyCGrainCommand: kCmdBodyMove adds the delta-position to a dynamic body");
+    }
+
+    // ---- ApplyCGrainCommand: kCmdGrainWind adds the delta-velocity to a DYNAMIC grain ----
+    {
+        cgrain::CGrainWorld w;
+        w.hSearch = h;
+        w.bodies = {BodyAt(0, 5, 0, 2)};
+        w.grains = {GrainAt(0, 0, 0, 0), GrainAt(1, 0, 0, 0)};
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdGrainWind, 1u,
+                                                            fpx::FxVec3{FromInt(2), FromInt(-3), 0}});
+        check(w.grains[1].vel.x == FromInt(2) && w.grains[1].vel.y == FromInt(-3) && w.grains[1].vel.z == 0,
+              "CG5 ApplyCGrainCommand: kCmdGrainWind adds the delta-velocity to a dynamic grain");
+        check(w.grains[0].vel.x == 0 && w.grains[0].vel.y == 0,
+              "CG5 ApplyCGrainCommand: kCmdGrainWind only touches the target grain");
+    }
+
+    // ---- ApplyCGrainCommand: a STATIC body / a STATIC grain HOLDS (no-op) ----
+    {
+        cgrain::CGrainWorld w;
+        w.hSearch = h;
+        fpx::FxBody sb = BodyAt(0, 5, 0, 2); sb.flags = 0;     // NOT dynamic
+        w.bodies = {sb};
+        grain::GrainParticle sg = GrainAt(0, 0, 0, 0); sg.flags = grain::kFlagStatic; sg.invMass = 0;
+        w.grains = {sg};
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdBodyShove, 0u, fpx::FxVec3{FromInt(9), 0, 0}});
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdGrainWind, 0u, fpx::FxVec3{FromInt(9), 0, 0}});
+        check(w.bodies[0].vel.x == 0 && w.bodies[0].vel.y == 0 && w.bodies[0].vel.z == 0,
+              "CG5 ApplyCGrainCommand: a static body holds (shove is a no-op)");
+        check(w.grains[0].vel.x == 0 && w.grains[0].vel.y == 0 && w.grains[0].vel.z == 0,
+              "CG5 ApplyCGrainCommand: a static grain holds (wind is a no-op)");
+    }
+
+    // ---- ApplyCGrainCommand: an OUT-OF-RANGE target / an UNKNOWN kind is a no-op ----
+    {
+        cgrain::CGrainWorld w;
+        w.hSearch = h;
+        w.bodies = {BodyAt(0, 5, 0, 2)};
+        w.grains = {GrainAt(0, 0, 0, 0)};
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdBodyShove, 9999u, fpx::FxVec3{FromInt(9), 0, 0}});
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, cgrain::kCmdGrainWind, 9999u, fpx::FxVec3{FromInt(9), 0, 0}});
+        cgrain::ApplyCGrainCommand(w, cgrain::CGrainCommand{0, 999u /*unknown kind*/, 0u, fpx::FxVec3{FromInt(9), 0, 0}});
+        check(w.bodies[0].vel.x == 0 && w.grains[0].vel.x == 0,
+              "CG5 ApplyCGrainCommand: out-of-range target / unknown kind is a no-op");
+    }
+
+    // ---- SnapshotCGrain / RestoreCGrain round-trip == original (bodies AND grains) ----
+    {
+        cgrain::CGrainWorld w;
+        w.hSearch = h;
+        w.bodies = {BodyAt(1, 2, 3, 2), BodyAt(4, 5, 6, 2)};
+        for (int x = 0; x <= 4; ++x) w.grains.push_back(GrainAt(x, 0, 0, 0));
+        // Set distinctive velocities so the round-trip has something to verify.
+        w.bodies[0].vel = fpx::FxVec3{FromInt(7), FromInt(-1), 0};
+        w.grains[2].vel = fpx::FxVec3{0, FromInt(3), FromInt(2)};
+
+        const cgrain::CGrainSnapshot snap = cgrain::SnapshotCGrain(w);
+        // Mutate BOTH vectors.
+        w.bodies[0].pos.x += FromInt(100);
+        w.bodies[1].vel.y += FromInt(50);
+        w.grains[2].pos.z += FromInt(20);
+        w.grains[0].vel.x += FromInt(9);
+        cgrain::RestoreCGrain(w, snap);
+
+        bool bodiesSame = (w.bodies.size() == snap.bodies.size());
+        for (size_t i = 0; bodiesSame && i < w.bodies.size(); ++i)
+            if (std::memcmp(&w.bodies[i], &snap.bodies[i], sizeof(fpx::FxBody)) != 0) bodiesSame = false;
+        bool grainsSame = (w.grains.size() == snap.grains.size());
+        for (size_t i = 0; grainsSame && i < w.grains.size(); ++i)
+            if (std::memcmp(&w.grains[i], &snap.grains[i], sizeof(grain::GrainParticle)) != 0) grainsSame = false;
+        check(bodiesSame, "CG5 snapshot: SnapshotCGrain -> RestoreCGrain round-trip == original (bodies BIT-EXACT)");
+        check(grainsSame, "CG5 snapshot: SnapshotCGrain -> RestoreCGrain round-trip == original (grains BIT-EXACT)");
+    }
+
+    // ---- RunCGrainLockstep two runs identical + RunCGrainRollback corrected==authority, mispredict!=authority --
+    // A TINY coupled scene (a small dynamic grain bed in a static basin + one body) + a few ticks, so the
+    // harness (which runs the heavy StepCGrain several times) stays fast.
+    {
+        const fx dt = kOne / 60;
+        const fx hSearch = kOne + kOne / 2;                  // 1.5
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const int iters = 3;
+        const int ticks = 24;                                // FAST: a modest tick count, NOT 300
+        const int mispredictTick = 8;
+        const int span = 6;                                  // a SMALL basin (interior 0..3 world units)
+        const int fillH = 6;
+        const int r = 2;
+        const int cx = span / 4;
+
+        auto grainAtD = [&](double x, double y, double z, bool stat) {
+            grain::GrainParticle g;
+            g.pos  = fpx::FxVec3{(fx)(x * (double)kOne), (fx)(y * (double)kOne), (fx)(z * (double)kOne)};
+            g.prev = g.pos; g.vel = fpx::FxVec3{0, 0, 0};
+            g.invMass = stat ? 0 : kOne; g.radius = kOne / 4; g.flags = stat ? grain::kFlagStatic : 0u;
+            return g;
+        };
+        std::vector<grain::GrainParticle> bed;
+        {
+            const double s = 0.5;
+            const double wlo = -2 * s, whi = span * s + 2 * s;
+            for (double x = wlo; x <= whi + 1e-9; x += s)
+                for (double z = wlo; z <= whi + 1e-9; z += s) bed.push_back(grainAtD(x, 0, z, true));   // floor
+            for (double y = s; y <= fillH * s + 1e-9; y += s)
+                for (double x = wlo; x <= whi + 1e-9; x += s)
+                    for (double z = wlo; z <= whi + 1e-9; z += s) {
+                        const bool wall = (x < -1e-9 || x > span * s + 1e-9 || z < -1e-9 || z > span * s + 1e-9);
+                        if (wall) bed.push_back(grainAtD(x, y, z, true));                                // walls
+                    }
+            for (double y = s; y <= fillH * s + 1e-9; y += s)                                            // dynamic fill
+                for (double x = 0; x <= span * s + 1e-9; x += s)
+                    for (double z = 0; z <= span * s + 1e-9; z += s) bed.push_back(grainAtD(x, y, z, false));
+            grain::StepGrainFrictionSteps(bed, {}, fpx::FxVec3{0, kGravY, 0}, dt, 0, hSearch, grain::kGrainMu, 2, 40);
+        }
+        fx bedTopFx = -(fx)(1 << 28);
+        for (const grain::GrainParticle& g : bed)
+            if (!(g.flags & grain::kFlagStatic) && g.pos.y > bedTopFx) bedTopFx = g.pos.y;
+        const int bodyY = (bedTopFx >> fpx::kFrac) + r;
+
+        cgrain::CGrainWorld init;
+        init.grains = bed; init.hSearch = hSearch;
+        init.gravity = fpx::FxVec3{0, kGravY, 0}; init.dt = dt; init.groundY = 0;
+        fpx::FxBody b = BodyAt(cx, bodyY, cx, r);
+        b.invMass = kOne / iters;
+        init.bodies = {b};
+        const uint32_t grainCount = (uint32_t)init.grains.size();
+        const uint32_t windIdx = grainCount / 2u;
+
+        const std::vector<cgrain::CGrainCommand> authStream = {
+            cgrain::CGrainCommand{2,  cgrain::kCmdBodyShove, 0u, fpx::FxVec3{FromInt(4), 0, 0}},
+            cgrain::CGrainCommand{10, cgrain::kCmdBodyShove, 0u, fpx::FxVec3{0, 0, FromInt(3)}},
+            cgrain::CGrainCommand{6,  cgrain::kCmdGrainWind, windIdx, fpx::FxVec3{FromInt(3), 0, 0}},
+        };
+        std::vector<cgrain::CGrainCommand> mispredictStream = authStream;
+        mispredictStream.push_back(cgrain::CGrainCommand{(uint32_t)mispredictTick, cgrain::kCmdBodyShove, 0u,
+                                                         fpx::FxVec3{FromInt(40), 0, 0}});
+
+        auto coupledEqual = [&](const cgrain::CGrainWorld& a, const cgrain::CGrainWorld& bb) {
+            if (a.bodies.size() != bb.bodies.size() || a.grains.size() != bb.grains.size()) return false;
+            if (std::memcmp(a.bodies.data(), bb.bodies.data(), a.bodies.size() * sizeof(fpx::FxBody)) != 0) return false;
+            return std::memcmp(a.grains.data(), bb.grains.data(),
+                               a.grains.size() * sizeof(grain::GrainParticle)) == 0;
+        };
+
+        const cgrain::CGrainWorld authority = cgrain::RunCGrainLockstep(init, authStream, ticks, dt, iters);
+        const cgrain::CGrainWorld replica   = cgrain::RunCGrainLockstep(init, authStream, ticks, dt, iters);
+        check(coupledEqual(authority, replica),
+              "CG5 lockstep: replica == authority BIT-EXACT (inputs-only re-sim, bodies AND grains)");
+
+        const cgrain::CGrainWorld rolledBack =
+            cgrain::RunCGrainRollback(init, authStream, mispredictStream, ticks, mispredictTick, dt, iters);
+        check(coupledEqual(rolledBack, authority),
+              "CG5 rollback: corrected to authority BIT-EXACT (positive control)");
+
+        const cgrain::CGrainWorld mispredicted =
+            cgrain::RunCGrainLockstep(init, mispredictStream, ticks, dt, iters);
+        check(!coupledEqual(mispredicted, authority),
+              "CG5 rollback: mispredicted state DIFFERS from authority (negative control — the divergence was real)");
+
+        // Snapshot round-trip on a live partial run.
+        cgrain::CGrainWorld w = cgrain::RunCGrainLockstep(init, authStream, mispredictTick, dt, iters);
+        const cgrain::CGrainSnapshot snap = cgrain::SnapshotCGrain(w);
+        cgrain::SimCGrainTick(w, authStream, (uint32_t)mispredictTick, dt, iters);   // mutate
+        cgrain::RestoreCGrain(w, snap);
+        check(w.bodies.size() == snap.bodies.size() && w.grains.size() == snap.grains.size() &&
+              std::memcmp(w.bodies.data(), snap.bodies.data(), w.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+              std::memcmp(w.grains.data(), snap.grains.data(), w.grains.size() * sizeof(grain::GrainParticle)) == 0,
+              "CG5 snapshot: live round-trip after a SimCGrainTick mutation == original (bodies AND grains)");
+    }
+
     if (g_fail == 0) std::printf("cgrain_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
