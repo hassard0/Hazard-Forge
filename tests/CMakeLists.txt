@@ -601,6 +601,17 @@ hf_add_pure_test(mc_test)
 # (correct floor, not truncate-toward-zero). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(fpx_test)
 
+# Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
+# SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
+# copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE
+# coords — correct floor, not truncate-toward-zero), PointInTriXZ (the three-integer-edge cover test,
+# both windings), TriColumnAabb (clamped inclusive column range incl off-grid -> empty),
+# RasterizeTriangleSpans (a single tri -> the expected raw span count/offset/y-range; a ground quad fills
+# every column; the exclusive prefix-sum consistency), MergeColumnSpans (overlapping->1, disjoint->2
+# sorted, touching->1, empty->empty), empty input -> zero spans (the no-op the GPU disabled-path
+# mirrors), and determinism (two rasterizations byte-identical). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(nav_test)
+
 # Virtual Shadow Maps Slice 1 (Slice VA): the virtual clipmap PAGE TABLE + PAGE-NEEDED marking math
 # (render/vsm.h) the GPU shaders/vsm_mark.comp.hlsl copies verbatim. Pins PageId/UnpackPageId bijection
 # over [0,pageCount()), SelectClipmapLevel's INTEGER threshold-ladder edges (at-camera->level0, far->top,
