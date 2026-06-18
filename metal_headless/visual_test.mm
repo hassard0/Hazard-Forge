@@ -21470,6 +21470,314 @@ static int RunFpxRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic GPU Fluid LIT 3D RENDER CAPSTONE showcase (Slice FL6, the money-shot COMPLETING
+// FLAGSHIP #9). Mirrors the Vulkan --fluid-render-shot path EXACTLY: runs the bit-exact FL1-FL5 dam-break
+// sim (the SAME 8x8x8 block poured over a static FxBody sphere, host-side StepFluid — pure integer) to a
+// settled/dynamic POOL, builds one per-instance model matrix per FLUID PARTICLE (fluid.h::
+// FluidToRenderInstances — the ONE float divide pos/(float)kOne + droplet-radius scale, render-only), and
+// renders the pool as lit 3D INSTANCED spheres through the EXISTING instanced lit pipeline
+// (lit_instanced.vert.gen.metal + lit.frag.gen.metal — the --fpx-render wiring) over the ground + sky +
+// shadow (+ the collider sphere as a second lit mesh). The pool + transforms (hence the visual) are
+// byte-identical to the Vulkan path by construction (the SAME fluid.h scene). The FLOAT visresolve-bar:
+// Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run) + provenance (every instance transform IS
+// the bit-exact FluidParticle::pos). New golden tests/golden/metal/fluid_render.png. NO new shader, NO RHI.
+static int RunFluidRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace fluid = hf::sim::fluid;
+    namespace fpx = hf::sim::fpx;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The bit-exact FL1-FL5 dam-break sim -> a settled/dynamic pool (the SAME fluid.h scene as the
+    // Vulkan --fluid-render-shot — byte-identical transforms by construction). ===
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const int kSide = 8;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);
+    const int kSteps = 4;
+    const int kIters = 4;
+
+    fluid::FluidBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(5 * (int)fluid::kOne), 0};
+    const uint32_t kParticleCount = (uint32_t)(block.W * block.H * block.D);
+    std::vector<fluid::FluidParticle> particles = fluid::InitBlock(block);
+
+    fpx::FxBody collider;
+    collider.pos = fluid::FxVec3{(fluid::fx)(4 * (int)fluid::kOne), (fluid::fx)(2 * (int)fluid::kOne),
+                                 (fluid::fx)(4 * (int)fluid::kOne)};
+    collider.radius = (fluid::fx)(2 * (int)fluid::kOne);
+    const std::vector<fluid::SphereCollider> spheres{fluid::SphereFromBody(collider)};
+
+    const int kBins = fluid::kKernelBins;
+    const fluid::FluidGrid probeGrid = fluid::MakeGrid(particles, kH);
+    const fluid::FluidCellTable probeTab = fluid::BuildCellTable(particles, probeGrid);
+    const fluid::FluidNeighborList probeList = fluid::BuildNeighborList(particles, probeGrid, probeTab, kH);
+    const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, fluid::kOne, kBins, fluid::kOne / 100);
+    std::vector<fluid::fx> probeRho;
+    fluid::ComputeDensity(particles, probeList, kProbe, probeRho);
+    const fluid::fx kRestDensity = fluid::MeanDensity(probeRho);
+    const fluid::fx kEpsilon = fluid::kOne / 100;
+    const fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, kRestDensity, kBins, kEpsilon);
+
+    fluid::StepFluidSteps(particles, kernel, spheres, kGravity, kDt, kGroundY, kIters, kSteps);
+
+    const float kDropletRadius = 0.72f;
+    const std::vector<Mat4> mats = fluid::FluidToRenderInstances(particles, kDropletRadius);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    const Vec3 colliderCenter = fluid::FluidVertToWorld(collider.pos);
+    const float colliderRadius = fluid::FluidToFloat(collider.radius);
+    Mat4 colliderModel = Mat4::Translate(colliderCenter) *
+                         Mat4::Scale({colliderRadius, colliderRadius, colliderRadius});
+
+    // === Reuse the EXISTING instanced lit pipeline (the --fpx-render wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    // Fixed 3/4 camera + directional light (== the Vulkan --fluid-render-shot camera).
+    const Vec3 eye{15.0f, 12.0f, 15.0f};
+    const Vec3 center{3.5f, 6.0f, 3.5f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{3.5f, 5.0f, 3.5f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 22.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-16.0f, 16.0f, -16.0f, 16.0f, 1.0f, 52.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            cmd.PushConstants(colliderModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(sphere.vertices());
+            cmd.BindIndexBuffer(sphere.indices());
+            cmd.DrawIndexed(sphere.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = colliderModel.m[k];
+                pc[16] = 0.5f; pc[17] = 0.5f; pc[18] = 0.52f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexed(sphere.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                float material[4] = {0.15f, 0.35f, 0.85f, 0.0f};
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) provenance + stats. "shaded" = non-dark pixels (the lit ground + pool + sphere).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("fluid-render: {particles:%u, instances:%u, shaded:%u} (fixed-point fluid -> lit 3D render)\n",
+                kParticleCount, kInstanceCount, shaded);
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("fluid-render two renders DIFFER (nondeterministic)");
+    std::printf("fluid-render determinism: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (3) coverage / coherence.
+    if (shaded == 0) return fail("fluid-render coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("fluid-render uniform image (no coherent pool)");
+    std::printf("fluid-render coverage: %u shaded (coherent lit fluid)\n", shaded);
+
+    // PROOF (4) empty no-op: zero particles -> zero instances -> the cleared base scene.
+    {
+        std::vector<fluid::FluidParticle> emptyPool;
+        if (!fluid::FluidToRenderInstances(emptyPool, kDropletRadius).empty())
+            return fail("fluid-render empty pool not empty");
+    }
+    std::printf("fluid-render empty: base only (no-op)\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — fixed-point fluid pool lit 3D render (%u particles)\n",
+                outPath, cw, ch, kParticleCount);
+    return 0;
+}
+
 // --- Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE showcase (Slice NAV6, the money-shot COMPLETING
 // FLAGSHIP #7). Mirrors the Vulkan --nav-render-shot path EXACTLY: run the deterministic NAV1-NAV5 CPU
 // pipeline (the SAME 32x32 showcase heightfield -> rasterize/merge/filter/distance/regions/contour/
@@ -32497,6 +32805,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fluid-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fluid_lockstep.png";
             try { return RunFluidLockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fluid-render <out.png>: render the Deterministic GPU Fluid LIT 3D RENDER capstone showcase
+        // (Slice FL6, the money-shot COMPLETING FLAGSHIP #9). Runs the bit-exact FL1-FL5 dam-break sim (the
+        // SAME 8x8x8 block poured over a static FxBody sphere, host-side StepFluid — pure integer) to a
+        // settled/dynamic POOL, builds one per-instance model matrix per FLUID PARTICLE (FluidToRenderInstances
+        // — float, render-only) and renders the pool as lit 3D INSTANCED spheres through the EXISTING instanced
+        // lit pipeline (lit_instanced.vert + lit.frag, the --fpx-render wiring) over the ground/sky/shadow (+
+        // the collider sphere). The pool + transforms are byte-identical to the Vulkan --fluid-render-shot by
+        // construction. FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 + provenance; cross-vendor
+        // ~the float baseline. New golden tests/golden/metal/fluid_render.png. NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--fluid-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fluid_render.png";
+            try { return RunFluidRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE
