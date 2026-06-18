@@ -22,6 +22,7 @@
 
 using namespace hf;
 namespace fluid = hf::sim::fluid;
+namespace fpx = hf::sim::fpx;
 using fluid::fx;
 using fluid::kOne;
 using fluid::kFrac;
@@ -559,6 +560,160 @@ int main() {
         const fx mean = fluid::MeanDensity(rho);
         check(mean > 0, "density(block): mean ρ̄ > 0");
         check(mean >= rhoCorner && mean <= rhoInterior, "density(block): ρ̄ between corner and interior");
+    }
+
+    // ===================== Slice FL4 — the PBF DENSITY-CONSTRAINT SOLVE (JACOBI) ======================
+    // A small dam-break block: build the kernel (ρ0 = the settled-block mean so the interior is near ρ0),
+    // the FL2 neighbour list, then StepFluid. These cases pin: (a) a COMPRESSED pair is pushed apart by the
+    // solve (density error reduced); (b) the residual DECREASES (more iters -> closer to incompressible,
+    // monotone non-increasing on this scene); (c) iters=0 == pure FL1 integrate (no-op); (d) no particle
+    // tunnels through the ground / a sphere after solve+collide; (e) determinism (two runs identical).
+    const fx kGrav = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fx kDt = kOne / 60;
+    const fluid::FxVec3 kGravity{0, kGrav, 0};
+
+    // Build the FL4 kernel + neighbour list for a settled 6x6x6 block (shared by several cases below).
+    auto makeKernel = [&](const std::vector<fluid::FluidParticle>& ps, fx h) -> fluid::FluidKernel {
+        fluid::FluidGrid g = fluid::MakeGrid(ps, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(ps, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(ps, g, t, h);
+        const fluid::FluidKernel probeK = fluid::BuildKernelTable(h, kOne, fluid::kKernelBins, kOne / 100);
+        std::vector<fx> probe;
+        fluid::ComputeDensity(ps, nl, probeK, probe);
+        const fx rho0 = fluid::MeanDensity(probe);
+        return fluid::BuildKernelTable(h, rho0, fluid::kKernelBins, kOne / 100);
+    };
+
+    // ================= FL4: a COMPRESSED pair -> the solve pushes them apart (density error reduced) ===
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        // Two particles much CLOSER than rest -> over-dense -> C_i > 0 -> the solve must push them apart.
+        std::vector<fluid::FluidParticle> two(2);
+        two[0].pos = {0, 0, 0};                 two[0].invMass = kOne;
+        two[1].pos = {kOne / 4, 0, 0};          two[1].invMass = kOne;   // 0.25 apart (well inside h=2)
+        for (auto& p : two) p.prev = p.pos;
+        // ρ0 = the single-particle self density W[0] (so a CLOSE pair, whose density W[0]+W[bin]>W[0], is
+        // OVER-dense: C_i > 0 -> λ != 0 -> a real outward correction). A probe build reads W[0].
+        const fluid::FluidKernel probeK = fluid::BuildKernelTable(h, kOne, fluid::kKernelBins, kOne / 100);
+        const fx rho0 = probeK.W[0];                      // the self density -> a lone particle has C=0
+        const fluid::FluidKernel k = fluid::BuildKernelTable(h, rho0, fluid::kKernelBins, kOne / 100);
+        fluid::FluidGrid g = fluid::MakeGrid(two, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(two, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(two, g, t, h);
+        std::vector<fx> rho, lam;
+        fluid::ComputeDensity(two, nl, k, rho);
+        fluid::ComputeLambda(two, nl, k, rho, lam);
+        std::vector<fluid::FxVec3> dp;
+        fluid::SolveDensityConstraint(two, nl, k, lam, dp);
+        // The over-dense pair: particle 0 (left) is pushed -x, particle 1 (right) +x (apart along the axis).
+        check(dp[0].x <= 0 && dp[1].x >= 0, "solve(pair): over-dense pair pushed apart along the axis");
+        check(dp[0].x != 0 || dp[1].x != 0, "solve(pair): a real non-zero correction (not clamped to 0)");
+        // Density error after applying the correction is reduced (closer to ρ0).
+        const fx before0 = (rho[0] > k.restDensity) ? rho[0] - k.restDensity : k.restDensity - rho[0];
+        two[0].pos = fluid::FxAdd(two[0].pos, dp[0]);
+        two[1].pos = fluid::FxAdd(two[1].pos, dp[1]);
+        std::vector<fx> rho2;
+        fluid::ComputeDensity(two, nl, k, rho2);
+        const fx after0 = (rho2[0] > k.restDensity) ? rho2[0] - k.restDensity : k.restDensity - rho2[0];
+        check(after0 <= before0, "solve(pair): density error reduced after the correction");
+    }
+
+    // ================= FL4: residual DECREASES with iters (deterministic incompressibility) ===========
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 4, 0};
+        std::vector<fluid::FluidParticle> base = fluid::InitBlock(blk);
+        fluid::IntegrateFluidSteps(base, kGravity, kDt, 0, 20);   // settle to a mid-fall pile
+        const fluid::FluidKernel k = makeKernel(base, h);
+        const std::vector<fluid::SphereCollider> noSpheres;
+
+        // residual(iters) after ONE StepFluid with that many density iterations, over the SAME init.
+        auto residualAt = [&](int iters) -> int64_t {
+            std::vector<fluid::FluidParticle> ps = base;
+            fluid::StepFluid(ps, k, noSpheres, kGravity, kDt, 0, iters);
+            fluid::FluidGrid g = fluid::MakeGrid(ps, h);
+            fluid::FluidCellTable t = fluid::BuildCellTable(ps, g);
+            fluid::FluidNeighborList nl = fluid::BuildNeighborList(ps, g, t, h);
+            std::vector<fx> rho;
+            fluid::ComputeDensity(ps, nl, k, rho);
+            return fluid::DensityResidual(rho, k.restDensity);
+        };
+        const int64_t r0 = residualAt(0);   // no solve (pure integrate) — the largest error
+        const int64_t r1 = residualAt(1);
+        const int64_t r4 = residualAt(4);
+        // The solve REDUCES the incompressibility residual vs the unsolved free-fall (the core claim). The
+        // FIRST iteration is the big reducer; further Jacobi iterations stay BELOW the unsolved error (Jacobi
+        // can oscillate slightly between iterations, so we assert "stays below free-fall", NOT strict
+        // step-monotone — the honest deterministic-but-nonzero-residual caveat).
+        check(r1 <= r0, "solve(residual): 1 iter <= 0 iters (the solve reduced compression)");
+        check(r4 < r0, "solve(residual): solved residual strictly below the unsolved free-fall");
+    }
+
+    // ================= FL4: iters=0 == pure FL1 integrate (the no-solve no-op) =========================
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 4; blk.H = 4; blk.D = 4; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 6, 0};
+        std::vector<fluid::FluidParticle> a = fluid::InitBlock(blk);
+        std::vector<fluid::FluidParticle> b = a;
+        const fluid::FluidKernel k = fluid::BuildKernelTable(h, kOne, fluid::kKernelBins, kOne / 100);
+        const std::vector<fluid::SphereCollider> noSpheres;
+        // StepFluid with iters=0: integrate + (no density iterations) + velocity-from-dpos + collide.
+        fluid::StepFluid(a, k, noSpheres, kGravity, kDt, 0, 0);
+        // Pure FL1 reference: integrate one step, then CollidePlane (the same collide StepFluid applies),
+        // and the same velocity-from-dpos derivation StepFluid does (vel = (pos-prev)/dt). With iters=0 the
+        // positions equal the FL1 integrate, so this must be byte-identical.
+        fluid::IntegrateFluid(b, kGravity, kDt, 0);
+        for (auto& p : b) {
+            const fluid::FxVec3 d = fluid::FxSub(p.pos, p.prev);
+            p.vel = fluid::FxVec3{(fx)(((int64_t)d.x << kFrac) / (int64_t)kDt),
+                                  (fx)(((int64_t)d.y << kFrac) / (int64_t)kDt),
+                                  (fx)(((int64_t)d.z << kFrac) / (int64_t)kDt)};
+            if (p.pos.y < 0) p.pos.y = 0;
+        }
+        bool same = a.size() == b.size() &&
+                    std::memcmp(a.data(), b.data(), a.size() * sizeof(fluid::FluidParticle)) == 0;
+        check(same, "solve(no-op): iters=0 StepFluid == FL1 integrate + velocity + collide (byte-identical)");
+    }
+
+    // ================= FL4: no tunnelling through the ground / a sphere after solve+collide ============
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 6, 0};
+        std::vector<fluid::FluidParticle> ps = fluid::InitBlock(blk);
+        const fluid::FluidKernel k = makeKernel(ps, h);
+        // A static sphere centred under the block the fluid pours over (a SphereFromBody seam check).
+        fpx::FxBody body; body.pos = fluid::FxVec3{kOne * 2, kOne * 2, kOne * 2}; body.radius = (fx)(2 * (int)kOne);
+        std::vector<fluid::SphereCollider> spheres{fluid::SphereFromBody(body)};
+        check(spheres[0].radius == body.radius && spheres[0].center.x == body.pos.x,
+              "solve(collide): SphereFromBody copies the FxBody pos+radius");
+        fluid::StepFluidSteps(ps, k, spheres, kGravity, kDt, 0, 30, 4);   // settle over the sphere + ground
+        bool aboveGround = true, outsideSphere = true;
+        for (const auto& p : ps) {
+            if (p.pos.y < 0) aboveGround = false;
+            const fluid::FxVec3 d = fluid::FxSub(p.pos, spheres[0].center);
+            if (fluid::FxLength(d) < spheres[0].radius - fluid::kFluidCollideEps) outsideSphere = false;
+        }
+        check(aboveGround, "solve(collide): no particle tunnels through the ground after solve+collide");
+        check(outsideSphere, "solve(collide): no particle ends inside the sphere (projected to the surface)");
+    }
+
+    // ================= FL4: determinism — two StepFluidSteps runs byte-identical =======================
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 5, 0};
+        std::vector<fluid::FluidParticle> a = fluid::InitBlock(blk);
+        std::vector<fluid::FluidParticle> b = a;
+        const fluid::FluidKernel k = makeKernel(a, h);
+        const std::vector<fluid::SphereCollider> noSpheres;
+        fluid::StepFluidSteps(a, k, noSpheres, kGravity, kDt, 0, 5, 4);
+        fluid::StepFluidSteps(b, k, noSpheres, kGravity, kDt, 0, 5, 4);
+        bool same = a.size() == b.size() &&
+                    std::memcmp(a.data(), b.data(), a.size() * sizeof(fluid::FluidParticle)) == 0;
+        check(same, "solve(determinism): two StepFluidSteps runs BYTE-IDENTICAL");
     }
 
     if (g_fail == 0) std::printf("fluid_test: ALL PASS\n");

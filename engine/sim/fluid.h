@@ -597,5 +597,218 @@ inline fx MeanDensity(const std::vector<fx>& density) {
     return (fx)(sum / (int64_t)density.size());
 }
 
+// ===== Slice FL4 — the PBF DENSITY-CONSTRAINT SOLVE (the incompressibility solver, the make-or-break) ===
+// Project the FL3 density constraints with POSITION-BASED FLUIDS (Macklin & Müller 2013) so the fluid holds
+// its rest density (a dam-break SETTLES into an incompressible POOL instead of FL1's free-fall scatter) —
+// the density-constraint twin of the cloth CL3 PBD solver. The position correction is the cloth
+// SolveDistanceConstraint generalized from a distance EDGE to a density CONSTRAINT:
+//   Δp_i = (1/ρ0) Σ_{j∈neighbors(i)} (λ_i + λ_j) ∇W(p_i − p_j)
+// where ∇W is the spiky gradient (gradW[bin]·dir(p_i−p_j), the SAME LUT + FxNormalize as ComputeLambda).
+//
+// THE JACOBI DISCIPLINE (the bit-exactness + no-TDR crux — the FL4 design win over the cloth's
+// Gauss-Seidel): standard PBF is JACOBI within each solver iteration — (a) ρ_i for ALL particles (from the
+// iteration-start positions), (b) λ_i for ALL, (c) Δp_i for ALL (from the iteration-start positions + the
+// just-computed λ, written into a SEPARATE dp[] buffer — Jacobi double-buffering), (d) apply p_i += Δp_i
+// for ALL. Each sub-pass is PER-PARTICLE INDEPENDENT — every particle reads its neighbours' iteration-start
+// state (read-only) + the just-computed λ array (read-only) and writes only its OWN dp_i/p_i, so there is
+// NO race and the result is DETERMINISTIC regardless of thread order. Therefore the GPU runs MULTI-THREAD
+// (one thread per particle per sub-pass, a ComputeToComputeBarrier between sub-passes/iterations) and is
+// bit-exact to this sequential CPU StepFluid BY CONSTRUCTION — and there is NO single-thread
+// [numthreads(1,1,1)] dispatch and NO TDR particle-count ceiling (the cloth CL3 limit does NOT apply; this
+// is the key win of the density-constraint formulation over the cloth's order-dependent Gauss-Seidel).
+//
+// int64 throughout (the λ scaling fxmul, the gradW fxdiv, the FxNormalize FxISqrt) -> the solve passes
+// (fluid_dp.comp / fluid_apply.comp / fluid_collide.comp) are VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl) + the
+// Metal showcase runs THIS CPU StepFluid (byte-identical by construction, the FL1/FL3 convention).
+//
+// HONEST CAVEAT (FL3/CL3-identical): K Jacobi iterations leave a DETERMINISTIC-but-nonzero incompressibility
+// residual (stiffness ∝ iterations); the binned kernel LUT + fxdiv truncation make it bit-REPRODUCIBLE, not
+// analytically incompressible. The claim is DETERMINISM + cross-platform bit-identity, NOT "more physically
+// correct than Niagara". The tensile-instability term s_corr is OMITTED for FL4 (out of scope; documented in
+// the spec) — the bare λ-scaled gradient sum is the incompressibility solve.
+
+// SphereFromBody(b): build a fluid SphereCollider (a Q16.16 center + radius) from an fpx::FxBody (its pos +
+// radius). The composition seam — the fluid pours over the SAME rigid sphere the FPX sim integrates (the
+// SAME Q16.16 world units the CL4 cloth drapes over; cloth.h::SphereFromBody twin). Pure read of fpx::FxBody.
+struct SphereCollider {
+    FxVec3 center;        // Q16.16 world-space sphere center (== fpx::FxBody::pos)
+    fx     radius = 0;    // Q16.16 sphere radius (== fpx::FxBody::radius)
+};
+inline SphereCollider SphereFromBody(const fpx::FxBody& b) {
+    return SphereCollider{b.pos, b.radius};
+}
+
+// ----- SolveDensityConstraint: the PBF position correction Δp_i (the bit-exact core, JACOBI) -------------
+// Given the particle array + the FL2 neighbor list + the kernel LUT + the FL3 λ array, compute Δp_i for ALL
+// particles into a SEPARATE dp[] buffer (the Jacobi double-buffer — reads the iteration-start positions, NOT
+// the in-progress dp). For each particle i (if NOT static):
+//   Δp_i = (1/ρ0) Σ_{j∈neighbors(i)} (λ_i + λ_j) ∇W(p_i − p_j)
+// where ∇W is the SPIKY gradient. The FL3 LUT stores the spiky-gradient MAGNITUDE gradW[bin] = |∇W| (>= 0);
+// the spiky kernel DECREASES with r so the actual gradient ∇_{p_i}W(|p_i−p_j|) points along −(p_i−p_j),
+// i.e. ∇W(p_i − p_j) = gradW[bin]·FxNormalize(p_j − p_i) (the standard PBF sign — for an OVER-dense pair
+// λ_i+λ_j < 0 so the product points along (p_i − p_j): the two particles are pushed APART). So per neighbour
+// j within h: scale = fxmul(λ_i + λ_j, gradW[bin]); dir = FxNormalize(p_j − p_i); accumulate scale·dir; then
+// Δp_i = each-axis fxdiv(accum.axis, ρ0). This is the cloth SolveDistanceConstraint
+// generalized: where the cloth has a single edge's pen·n, the density constraint sums (λ_i+λ_j)·∇W over ALL
+// neighbours. STATIC particles (flags & kFlagStatic, invMass 0) -> Δp_i = 0 (the cloth pinned case). int64
+// (fxmul/fxdiv/FxNormalize via FxISqrt). The shader fluid_dp.comp copies THIS body VERBATIM. Deterministic
+// (the fixed FL2 neighbour order). dpOut is sized to particles (one Δp per particle).
+inline void SolveDensityConstraint(const std::vector<FluidParticle>& particles,
+                                   const FluidNeighborList& list, const FluidKernel& k,
+                                   const std::vector<fx>& lambda, std::vector<FxVec3>& dpOut) {
+    const uint32_t n = (uint32_t)particles.size();
+    const int64_t h2 = H2Of(k.h);
+    dpOut.assign((size_t)n, FxVec3{0, 0, 0});
+    for (uint32_t i = 0; i < n; ++i) {
+        if (particles[(size_t)i].flags & kFlagStatic) continue;   // static -> Δp = 0 (the pinned case)
+        const fx lami = lambda[(size_t)i];
+        FxVec3 accum{0, 0, 0};   // Σ_j (λ_i+λ_j)·∇W (the per-axis spiky-gradient sum, pre 1/ρ0 scale)
+        const uint32_t s0 = list.neighborStart[i], s1 = list.neighborStart[i + 1u];
+        for (uint32_t s = s0; s < s1; ++s) {
+            const uint32_t j = list.neighbors[s];
+            const int bin = BinOf(RadiusSq(particles[i].pos, particles[j].pos), h2, k.bins);
+            if (bin >= k.bins) continue;                          // r >= h -> zero gradient
+            // scale = (λ_i + λ_j) * gradW[bin] (Q16.16 fxmul); dir = unit(p_j − p_i) (the spiky-gradient
+            // sign: the kernel decreases with r so ∇W points along −(p_i−p_j) = (p_j−p_i)).
+            const fx scale = fxmul(lami + lambda[(size_t)j], k.gradW[(size_t)bin]);
+            const FxVec3 dir = FxNormalize(FxSub(particles[j].pos, particles[i].pos));
+            accum.x += fxmul(scale, dir.x);
+            accum.y += fxmul(scale, dir.y);
+            accum.z += fxmul(scale, dir.z);
+        }
+        // Δp_i = accum / ρ0 (each axis a Q16.16 truncating divide — the SAME fxdiv as the gradient scale).
+        dpOut[(size_t)i] = FxVec3{fxdiv(accum.x, k.restDensity), fxdiv(accum.y, k.restDensity),
+                                  fxdiv(accum.z, k.restDensity)};
+    }
+}
+
+// ----- The fluid colliders (the CL4 mold, generalized from ClothParticle to FluidParticle) --------------
+// CollideParticlePlane / CollideParticleSphere project ONE particle out of the ground plane + ONE static
+// sphere — the cloth.h::CollidePlane / CollideParticleSphere twins (the SAME Q16.16 push), operating on a
+// FluidParticle. STATIC particles are clamped by the plane (a fallen static is raised) but never projected
+// out of a sphere (they hold). Pure integer (FxLength/FxNormalize int64) — copied VERBATIM into
+// fluid_collide.comp. kFluidCollideEps: the surface-snap tolerance (FxNormalize+FxScale truncate toward
+// zero, so the snapped FxLength lands a few LSBs short of radius — the CL4 kCollideEps twin).
+inline constexpr fx kFluidCollideEps = 16;   // ~16 Q16.16 LSBs (the CL4 snap tolerance)
+
+// CollidePlane: clamp every particle to the ground plane (pos.y >= groundY). The FL1 floor-clamp factored
+// out as the plane collider (static particles ARE clamped too). Pure integer. The cloth.h::CollidePlane twin.
+inline void CollidePlane(std::vector<FluidParticle>& particles, fx groundY) {
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i)
+        if (particles[i].pos.y < groundY) particles[i].pos.y = groundY;
+}
+
+// CollideParticleSphere: project ONE particle out of ONE static sphere (the cloth.h::CollideParticleSphere
+// twin). If static -> untouched. Else an int32 AABB reject first; then if dist < radius, snap to the surface
+// along the outward normal (dist==0 -> the FxNormalize +Y fallback). Returns true iff projected (a contact).
+inline bool CollideParticleSphere(FluidParticle& p, const SphereCollider& s) {
+    if (p.flags & kFlagStatic) return false;
+    const fx dx = p.pos.x - s.center.x;
+    const fx dy = p.pos.y - s.center.y;
+    const fx dz = p.pos.z - s.center.z;
+    const fx ax = dx < 0 ? -dx : dx;
+    const fx ay = dy < 0 ? -dy : dy;
+    const fx az = dz < 0 ? -dz : dz;
+    if (ax > s.radius || ay > s.radius || az > s.radius) return false;   // outside the AABB -> no overlap
+    const FxVec3 d = FxVec3{dx, dy, dz};
+    const fx dist = FxLength(d);
+    if (dist >= s.radius) return false;                                  // outside the sphere -> untouched
+    const FxVec3 n = FxNormalize(d);                                     // dist==0 -> {0,kOne,0} fallback
+    p.pos = FxAdd(s.center, FxScale(n, s.radius));                       // snap to the surface
+    return true;
+}
+
+// CollideSpheres: project a particle array out of a STATIC sphere set (the cloth.h::CollideSpheres twin).
+// Per particle (index order), per sphere (fixed order), CollideParticleSphere. Returns the contact count.
+inline int CollideSpheres(std::vector<FluidParticle>& particles,
+                          const std::vector<SphereCollider>& spheres) {
+    int contacts = 0;
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i)
+        for (size_t s = 0; s < spheres.size(); ++s)
+            if (CollideParticleSphere(particles[i], spheres[s])) ++contacts;
+    return contacts;
+}
+
+// ----- StepFluid: one full JACOBI PBF step (predict -> neighbors -> K density iterations -> velocity ->
+// collide) — the make-or-break reference the GPU multi-pass driver memcmp's against -------------------
+//   (1) IntegrateFluid (predict positions; FL1 — vel += g*dt; prev = pos; pos += vel*dt; floor clamp).
+//   (2) MakeGrid + BuildCellTable + BuildNeighborList from the PREDICTED positions (FL2; built ONCE per
+//       step — the neighbour set is fixed across the `iters` density iterations, the standard PBF choice).
+//   (3) `iters` JACOBI density iterations, EACH: ComputeDensity (ALL, from iteration-start positions) ->
+//       ComputeLambda (ALL) -> SolveDensityConstraint (ALL, Δp_i into a SEPARATE dp[] buffer) -> apply
+//       p_i += dp_i (ALL). Each sub-pass per-particle independent (reads iteration-start state read-only).
+//   (4) derive velocity from the NET position change: vel = (pos − prev) / dt (the PBF velocity update —
+//       prev was snapshotted in step 1's integrate; this replaces the predicted velocity with the
+//       constraint-corrected one). Per axis fxdiv by dt.
+//   (5) CollidePlane + CollideSpheres (project out of the ground + the static FxBody spheres — AFTER the
+//       density solve + the velocity update, so the fluid holds ρ≈ρ0 AND stays out of the colliders).
+// The density constraints hold the fluid cohesive -> a dam-break SETTLES into an incompressible POOL
+// (unlike FL1's free-fall scatter). Pure integer, fixed op order -> two-run bit-identical AND bit-exact
+// GPU==CPU. Returns the contact count (a coverage stat). `kernel` carries h/ρ0/ε/bins/W/gradW.
+inline int StepFluid(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                     const std::vector<SphereCollider>& spheres, const FxVec3& gravity, fx dt, fx groundY,
+                     int iters) {
+    const size_t n = particles.size();
+    // (1) predict (FL1). prev = pos is snapshotted INSIDE IntegrateFluid (the PBF predicted-position anchor).
+    IntegrateFluid(particles, gravity, dt, groundY);
+    // (2) neighbour list from the predicted positions (FL2; built once for this step).
+    const FluidGrid grid = MakeGrid(particles, kernel.h);
+    const FluidCellTable table = BuildCellTable(particles, grid);
+    const FluidNeighborList list = BuildNeighborList(particles, grid, table, kernel.h);
+    // (3) `iters` JACOBI density iterations.
+    std::vector<fx> density, lambda;
+    std::vector<FxVec3> dp;
+    for (int it = 0; it < iters; ++it) {
+        ComputeDensity(particles, list, kernel, density);            // ρ_i for ALL (iteration-start pos)
+        ComputeLambda(particles, list, kernel, density, lambda);     // λ_i for ALL
+        SolveDensityConstraint(particles, list, kernel, lambda, dp); // Δp_i for ALL (separate dp buffer)
+        for (size_t i = 0; i < n; ++i) {                             // apply p_i += Δp_i for ALL (Jacobi)
+            if (particles[i].flags & kFlagStatic) continue;
+            particles[i].pos = FxAdd(particles[i].pos, dp[i]);
+        }
+    }
+    // (4) derive velocity from the net position change: vel = (pos − prev) / dt.
+    if (dt != 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (particles[i].flags & kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(particles[i].pos, particles[i].prev);
+            particles[i].vel = FxVec3{fxdiv(dpos.x, dt), fxdiv(dpos.y, dt), fxdiv(dpos.z, dt)};
+        }
+    }
+    // (5) collision: clamp to the ground plane THEN project out of every static sphere (deterministic).
+    CollidePlane(particles, groundY);
+    return CollideSpheres(particles, spheres);
+}
+
+// ----- StepFluidSteps: run K full JACOBI PBF steps (the showcase / GPU K-step driver) -------------------
+// K successive StepFluid steps. The GPU runs THIS exact K-step loop as a HOST-driven sequence of MULTI-
+// THREAD dispatches (predict -> neighbours[host] -> {density -> λ -> dp -> apply}×iters -> velocity ->
+// collide per step, a ComputeToComputeBarrier between sub-passes). Returns the FINAL step's contact count.
+inline int StepFluidSteps(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                          const std::vector<SphereCollider>& spheres, const FxVec3& gravity, fx dt,
+                          fx groundY, int iters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepFluid(particles, kernel, spheres, gravity, dt, groundY, iters);
+    return contacts;
+}
+
+// ----- DensityResidual: a deterministic integer incompressibility metric (summed |ρ_i − ρ0|) ------------
+// The summed absolute density error over all particles, in Q16.16 (int64 accumulator -> no overflow over
+// thousands of particles). DETERMINISTIC + bit-exact CPU<->GPU (pure integer compares over the read-back
+// density). A SETTLED incompressible pool keeps this small (the constraints held ρ≈ρ0); the unsolved FL1
+// free-fall (no density solve) leaves it LARGE (the cloth EdgeResidual twin — the coherence proof metric).
+// `density` is a ComputeDensity output; restDensity is ρ0.
+inline int64_t DensityResidual(const std::vector<fx>& density, fx restDensity) {
+    int64_t r = 0;
+    for (fx d : density) {
+        const fx err = d - restDensity;
+        r += (err < 0) ? -(int64_t)err : (int64_t)err;
+    }
+    return r;
+}
+
 }  // namespace fluid
 }  // namespace hf::sim
