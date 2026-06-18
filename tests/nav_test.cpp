@@ -684,6 +684,66 @@ int main() {
         check(cx.size() == 1u && cx[0] == 2 && cz[0] == 3, "NAV5 centroid: (0,0)+(6,0)+(0,9)/3 == (2,3)");
     }
 
+    // ================= NAV6: NavVertToWorld — the single render-only float coord conversion =========
+    {
+        // coord / (float)scale; the render-only host crossing (NAV1-5 stay integer).
+        check(nav::NavVertToWorld(0, 32) == 0.0f, "NAV6 NavVertToWorld 0/32 == 0");
+        check(nav::NavVertToWorld(32, 32) == 1.0f, "NAV6 NavVertToWorld 32/32 == 1");
+        check(nav::NavVertToWorld(16, 32) == 0.5f, "NAV6 NavVertToWorld 16/32 == 0.5");
+        check(nav::NavVertToWorld(8, 4) == 2.0f, "NAV6 NavVertToWorld 8/4 == 2");
+        // scale 0 guarded to 1 (never divides by zero -> coord passes through).
+        check(nav::NavVertToWorld(7, 0) == 7.0f, "NAV6 NavVertToWorld 7/0 guarded == 7");
+    }
+
+    // ================= NAV6: PolyMeshToRenderMesh — 3N verts, per-region colors, raised ==============
+    {
+        // Two polys in two DISTINCT regions sharing one flat-vertex array (region-by-region base).
+        // Region 1 contour verts at base 0: (0,0),(4,0),(0,4); region 2 verts at base 3: (8,8),(12,8),(8,12).
+        std::vector<nav::Poly> polys(2);
+        polys[0].idx[0] = 0u; polys[0].idx[1] = 1u; polys[0].idx[2] = 2u; polys[0].region = 1u;
+        polys[1].idx[0] = 0u; polys[1].idx[1] = 1u; polys[1].idx[2] = 2u; polys[1].region = 2u;
+        std::vector<int32_t> flat = {0, 0, 4, 0, 0, 4,   8, 8, 12, 8, 8, 12};   // (x,z) interleaved
+        std::vector<uint32_t> base = {0u, 3u};   // poly 0 -> region-1 base 0; poly 1 -> region-2 base 3
+        const int32_t kScale = 4;
+        const float kRaise = 0.05f;
+        std::vector<nav::NavWorldVertex> rmesh;
+        nav::PolyMeshToRenderMesh(polys, flat, base, kScale, kRaise, rmesh);
+        // 3 verts per poly -> 6 verts.
+        check(rmesh.size() == 6u, "NAV6 PolyMeshToRenderMesh: 2 polys -> 6 verts (3N)");
+        // Poly 0 vert 1 = corner (4,0)/4 -> world (1, raise, 0).
+        check(rmesh.size() == 6u && rmesh[1].px == 1.0f && rmesh[1].py == kRaise && rmesh[1].pz == 0.0f,
+              "NAV6 PolyMeshToRenderMesh: vertex world pos = coord/scale, raised");
+        // Per-region colors: the two regions get DISTINCT colors (region 1 vs region 2 palette entries).
+        float r1, g1, b1, r2, g2, b2;
+        nav::NavRegionColor(1u, r1, g1, b1);
+        nav::NavRegionColor(2u, r2, g2, b2);
+        bool poly0Region1 = rmesh.size() == 6u && rmesh[0].r == r1 && rmesh[0].g == g1 && rmesh[0].b == b1;
+        bool poly1Region2 = rmesh.size() == 6u && rmesh[3].r == r2 && rmesh[3].g == g2 && rmesh[3].b == b2;
+        bool distinct = (r1 != r2) || (g1 != g2) || (b1 != b2);
+        check(poly0Region1 && poly1Region2 && distinct,
+              "NAV6 PolyMeshToRenderMesh: per-region colors distinct (region1 != region2)");
+    }
+
+    // ================= NAV6: PathToWorldPolyline — one world point per corridor poly ================
+    {
+        // A 3-poly corridor over centroids; each -> one world point at coord/scale, fixed lineY.
+        std::vector<uint32_t> corridor = {0u, 2u, 4u};
+        std::vector<int32_t> cx = {0, 1, 8, 3, 16}, cz = {0, 1, 8, 3, 16};
+        const int32_t kScale = 8;
+        const float kLineY = 0.2f;
+        std::vector<nav::NavWorldPoint> poly;
+        nav::PathToWorldPolyline(corridor, cx, cz, kScale, kLineY, poly);
+        check(poly.size() == 3u, "NAV6 PathToWorldPolyline: 3-poly corridor -> 3 points");
+        // Point 1 = poly 2's centroid (8,8)/8 -> (1, lineY, 1).
+        check(poly.size() == 3u && poly[1].x == 1.0f && poly[1].y == kLineY && poly[1].z == 1.0f,
+              "NAV6 PathToWorldPolyline: centroid -> world point coord/scale at lineY");
+        // An empty corridor -> zero points (the empty no-op).
+        std::vector<uint32_t> empty;
+        std::vector<nav::NavWorldPoint> emptyPts;
+        nav::PathToWorldPolyline(empty, cx, cz, kScale, kLineY, emptyPts);
+        check(emptyPts.empty(), "NAV6 PathToWorldPolyline: empty corridor -> 0 points (no-op)");
+    }
+
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }
     std::printf("nav_test: %d failures\n", g_fail);
     return 1;

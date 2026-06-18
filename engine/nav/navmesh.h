@@ -1161,4 +1161,117 @@ inline int32_t FindPath(const std::vector<Poly>& polys, const std::vector<int32_
     return g[goal];
 }
 
+// =================================================================================================
+// Slice NAV6 — LIT 3D RENDER CAPSTONE: render-only FLOAT helpers (the money-shot, COMPLETES flagship
+// #7). These are the ONLY float-crossing functions in navmesh.h and are STRICTLY render-only — they
+// are NOT part of the bit-exact integer build/pathfind path (NAV1-NAV5 stay byte-identical above). The
+// navmesh GEOMETRY they convert is still the bit-exact integer result (the NAV4 BuildPolyMesh polys +
+// the NAV5 FindPath corridor) — the provenance — so the lit render derives from the integer navmesh;
+// only the final raster/shade is float (the FPX6/MC5 float visresolve-bar, NOT the NAV1-5 integer bar).
+//
+// THE ONE HOST FLOAT CONVERSION: world coord = voxelCoord / (float)scale (NavVertToWorld). The showcase
+// uses a 32x32 corner-coord grid (corner coords in [0,32]); it picks `scale` so the navmesh frames a
+// fixed camera (the showcase documents its scale, matching the showcase's voxel->world mapping). These
+// helpers depend on NOTHING but the integer navmesh types above (NO scene/math/rhi include) — they emit
+// a plain POD float-vertex the showcase trivially copies into scene::Vertex (the mc.h RenderVertex
+// convention), keeping navmesh.h header-only + backend-free.
+// =================================================================================================
+
+// ----- NavWorldVertex: a render-ready lit vertex (world position + per-region color) ---------------
+// POD float6 (no padding holes), trivially copied into scene::Vertex by the showcase (pos + color;
+// the showcase fills uv/normal/tangent — a flat upward normal for the ground-hugging navmesh sheet).
+struct NavWorldVertex {
+    float px, py, pz;   // world position = corner-coord / scale (the ONE host float divide), raised
+    float r, g, b;      // per-region color (the watershed region id -> a distinct hue)
+};
+
+// ----- NavWorldPoint: a render-ready world-space point (the corridor polyline / markers) ----------
+struct NavWorldPoint {
+    float x, y, z;
+};
+
+// ----- NavVertToWorld: the single host float crossing (render-only) -------------------------------
+// Convert an integer corner/voxel coord to a float world coord = coord / (float)scale. The showcase
+// passes the SAME scale for x and z so the navmesh keeps its aspect; the documented voxel->world
+// mapping. Pure render-only float (NOT on the bit-exact path).
+inline float NavVertToWorld(int32_t coord, int32_t scale) {
+    return (float)coord / (float)(scale != 0 ? scale : 1);
+}
+
+// ----- NavRegionColor: a deterministic per-region hue (render-only) -------------------------------
+// A small fixed palette indexed by region id so region 1 / region 2 / ... read as distinct translucent
+// sheets. Deterministic (same id -> same color every run). region 0 (none) is never rendered.
+inline void NavRegionColor(uint32_t region, float& r, float& g, float& b) {
+    // 6 legible, well-separated hues (cycled for >6 regions). [region][0..2] = r,g,b in [0,1].
+    static const float kPalette[6][3] = {
+        {0.20f, 0.65f, 0.95f},   // 1: blue
+        {0.95f, 0.55f, 0.20f},   // 2: orange
+        {0.35f, 0.85f, 0.40f},   // 3: green
+        {0.85f, 0.30f, 0.65f},   // 4: magenta
+        {0.90f, 0.85f, 0.25f},   // 5: yellow
+        {0.30f, 0.80f, 0.80f},   // 6: cyan
+    };
+    const uint32_t i = (region == 0u) ? 0u : ((region - 1u) % 6u);
+    r = kPalette[i][0]; g = kPalette[i][1]; b = kPalette[i][2];
+}
+
+// ----- PolyMeshToRenderMesh: the navmesh polys -> a lit triangle mesh (render-only float) ----------
+// Turn the bit-exact integer navmesh (the NAV4 polys + their per-region contour-local vertices) into a
+// float triangle mesh in world space, with PER-REGION vertex colors, RAISED slightly above the ground
+// so the translucent overlay sits over the lit ground plane (not z-fighting it). For each poly, emit
+// its 3 vertices (3*N total, an un-indexed soup — the showcase draws it flat) with the region's color.
+//
+// Inputs mirror the showcase's read-back layout (the SAME flat-vertex + per-region-base addressing the
+// A* uses): polys[] (NAV4 BuildPolyMesh order, contour-by-contour), flatVerts[] (interleaved (x,z) per
+// contour vertex, region-by-region), polyVertBase[p] (the vertex base of poly p's owning region — the
+// SAME array ComputePolyCentroids takes). `scale` is NavVertToWorld's divisor; `raiseY` lifts the sheet
+// above the ground (world units). Output: outVerts (3*polys.size() NavWorldVertex). Pure float, render-
+// only; the integer navmesh feeding it is UNCHANGED. outVerts.size() == 3*polys.size().
+inline void PolyMeshToRenderMesh(const std::vector<Poly>& polys,
+                                 const std::vector<int32_t>& flatVerts,
+                                 const std::vector<uint32_t>& polyVertBase,
+                                 int32_t scale, float raiseY,
+                                 std::vector<NavWorldVertex>& outVerts) {
+    outVerts.clear();
+    outVerts.reserve(polys.size() * 3u);
+    for (size_t p = 0; p < polys.size(); ++p) {
+        const uint32_t vb = polyVertBase[p];
+        float r, g, b;
+        NavRegionColor(polys[p].region, r, g, b);
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t vi = vb + polys[p].idx[k];
+            const int32_t cx = flatVerts[(size_t)vi * 2u];
+            const int32_t cz = flatVerts[(size_t)vi * 2u + 1u];
+            NavWorldVertex v;
+            v.px = NavVertToWorld(cx, scale);
+            v.py = raiseY;
+            v.pz = NavVertToWorld(cz, scale);
+            v.r = r; v.g = g; v.b = b;
+            outVerts.push_back(v);
+        }
+    }
+}
+
+// ----- PathToWorldPolyline: the A* corridor -> a float world-space line strip (render-only) --------
+// Convert the NAV5 corridor (a poly-id sequence start->goal) into a world-space polyline through each
+// corridor poly's INTEGER centroid (the SAME ComputePolyCentroids cx/cz the A* used — provenance), at a
+// fixed world height `lineY` (raised above the navmesh sheet so the bright line reads clearly). Output:
+// outPoints (one NavWorldPoint per corridor poly — corridor.size() points; the showcase draws segments
+// between consecutive points). Pure float, render-only; the corridor + centroids are the bit-exact
+// integer A* result. outPoints.size() == corridor.size().
+inline void PathToWorldPolyline(const std::vector<uint32_t>& corridor,
+                                const std::vector<int32_t>& cx, const std::vector<int32_t>& cz,
+                                int32_t scale, float lineY, std::vector<NavWorldPoint>& outPoints) {
+    outPoints.clear();
+    outPoints.reserve(corridor.size());
+    for (uint32_t pid : corridor) {
+        if (pid >= (uint32_t)cx.size()) continue;   // guard a malformed corridor id (never for a valid path)
+        NavWorldPoint pt;
+        pt.x = NavVertToWorld(cx[pid], scale);
+        pt.y = lineY;
+        pt.z = NavVertToWorld(cz[pid], scale);
+        outPoints.push_back(pt);
+    }
+}
+
 }  // namespace hf::nav
