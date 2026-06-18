@@ -20511,6 +20511,203 @@ static int RunCoupleLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CG5 — Deterministic Rigid<->Grain Coupling LOCKSTEP + ROLLBACK showcase (--cgrain-lockstep) ===
+// The MULTI-BODY netcode HEADLINE of FLAGSHIP #12 (the CP5/GR5 twin). PURE CPU: the harness runs the IDENTICAL
+// CPU code (engine/sim/couple_grain.h::RunCGrainLockstep/RunCGrainRollback) on Vulkan-Windows AND Metal-Mac, so
+// the converged coupled-state golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-
+// identity IS the lockstep evidence). The MULTI-BODY twist: the snapshot covers BOTH the rigid bodies AND the
+// grains, and replica==authority memcmps BOTH. Builds the SAME SMALL/FAST CG4 static-basin coupled scene +
+// command streams as the Vulkan --cgrain-lockstep-shot, runs authority=RunCGrainLockstep + replica=
+// RunCGrainLockstep + rolledBack=RunCGrainRollback, asserts the four proofs, CPU-colors the SAME converged
+// coupled side-view golden -> bit-identical cross-backend. New golden tests/golden/metal/cgrain_lockstep.png
+// (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU compute, NO new shader, NO new RHI.
+static int RunCGrainLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgrain = hf::sim::cgrain;
+    namespace grain  = hf::sim::grain;
+    namespace fpx    = hf::sim::fpx;
+
+    // The scene (== the Vulkan --cgrain-lockstep-shot config). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kGrainRadius = grain::kOne / 4;
+    const grain::fx kHSearch = grain::kOne + grain::kOne / 2;   // 1.5
+    const int kIters = 3;
+    const int kTicks = 40;
+    const int kMispredictTick = 12;
+    const int kSpan = 6, kFillH = 6;
+    const int kBodyR = 2;
+    const int kBodyCX = kSpan / 4;
+
+    auto grainAtD = [&](double x, double y, double z, bool stat) {
+        grain::GrainParticle g;
+        g.pos  = grain::FxVec3{(grain::fx)(x * (double)grain::kOne), (grain::fx)(y * (double)grain::kOne),
+                               (grain::fx)(z * (double)grain::kOne)};
+        g.prev = g.pos; g.vel = grain::FxVec3{0, 0, 0};
+        g.invMass = stat ? 0 : grain::kOne; g.radius = kGrainRadius;
+        g.flags = stat ? grain::kFlagStatic : 0u;
+        return g;
+    };
+    std::vector<grain::GrainParticle> bed;
+    {
+        const double s = 0.5;
+        const double wlo = -2 * s, whi = kSpan * s + 2 * s;
+        for (double x = wlo; x <= whi + 1e-9; x += s)
+            for (double z = wlo; z <= whi + 1e-9; z += s) bed.push_back(grainAtD(x, 0, z, true));
+        for (double y = s; y <= kFillH * s + 1e-9; y += s)
+            for (double x = wlo; x <= whi + 1e-9; x += s)
+                for (double z = wlo; z <= whi + 1e-9; z += s) {
+                    const bool wall = (x < -1e-9 || x > kSpan * s + 1e-9 || z < -1e-9 || z > kSpan * s + 1e-9);
+                    if (wall) bed.push_back(grainAtD(x, y, z, true));
+                }
+        for (double y = s; y <= kFillH * s + 1e-9; y += s)
+            for (double x = 0; x <= kSpan * s + 1e-9; x += s)
+                for (double z = 0; z <= kSpan * s + 1e-9; z += s) bed.push_back(grainAtD(x, y, z, false));
+        grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kHSearch, grain::kGrainMu, 2, 40);
+    }
+    grain::fx bedTopFx = -(grain::fx)(1 << 28);
+    for (const grain::GrainParticle& g : bed)
+        if (!(g.flags & grain::kFlagStatic) && g.pos.y > bedTopFx) bedTopFx = g.pos.y;
+    const int kBodyY = (bedTopFx >> grain::kFrac) + kBodyR;
+
+    cgrain::CGrainWorld init;
+    init.grains = bed; init.hSearch = kHSearch;
+    init.gravity = kGravity; init.dt = kDt; init.groundY = kGroundY;
+    {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(kBodyCX * (int)grain::kOne), (fpx::fx)(kBodyY * (int)grain::kOne),
+                            (fpx::fx)(kBodyCX * (int)grain::kOne)};
+        b.invMass = grain::kOne / kIters; b.flags = fpx::kFlagDynamic; b.radius = (fpx::fx)(kBodyR * (int)grain::kOne);
+        init.bodies = {b};
+    }
+    const int kBodyCount = (int)init.bodies.size();
+    const int kGrainCount = (int)init.grains.size();
+
+    const uint32_t kGrainWindIdx = (uint32_t)(kGrainCount / 2);
+    const std::vector<cgrain::CGrainCommand> authStream = {
+        cgrain::CGrainCommand{6,  cgrain::kCmdBodyShove, 0, fpx::FxVec3{(fpx::fx)(grain::kOne * 4), 0, 0}},
+        cgrain::CGrainCommand{20, cgrain::kCmdBodyShove, 0, fpx::FxVec3{0, 0, (fpx::fx)(grain::kOne * 3)}},
+        cgrain::CGrainCommand{30, cgrain::kCmdBodyShove, 0, fpx::FxVec3{(fpx::fx)(grain::kOne * 2), 0, 0}},
+        cgrain::CGrainCommand{16, cgrain::kCmdGrainWind, kGrainWindIdx, fpx::FxVec3{(fpx::fx)(grain::kOne * 4), 0, 0}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<cgrain::CGrainCommand> mispredictStream = authStream;
+    mispredictStream.push_back(cgrain::CGrainCommand{(uint32_t)kMispredictTick, cgrain::kCmdBodyShove, 0,
+                                                     fpx::FxVec3{(fpx::fx)(grain::kOne * 40), 0, 0}});
+
+    const cgrain::CGrainWorld authority  = cgrain::RunCGrainLockstep(init, authStream, kTicks, kDt, kIters);
+    const cgrain::CGrainWorld replica    = cgrain::RunCGrainLockstep(init, authStream, kTicks, kDt, kIters);
+    const cgrain::CGrainWorld rolledBack =
+        cgrain::RunCGrainRollback(init, authStream, mispredictStream, kTicks, kMispredictTick, kDt, kIters);
+
+    auto coupledEqual = [&](const cgrain::CGrainWorld& a, const cgrain::CGrainWorld& b) {
+        return a.bodies.size() == b.bodies.size() && a.grains.size() == b.grains.size() &&
+               std::memcmp(a.bodies.data(), b.bodies.data(), a.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+               std::memcmp(a.grains.data(), b.grains.data(),
+                           a.grains.size() * sizeof(grain::GrainParticle)) == 0;
+    };
+
+    if (!coupledEqual(authority, replica))
+        return fail("cgrain-lockstep: replica != authority (inputs-only re-sim diverged)");
+    std::printf("cgrain-lockstep: replica==authority {bodies:%d, grains:%d} BIT-EXACT (%d ticks, "
+                "inputs-only)\n", kBodyCount, kGrainCount, kTicks);
+
+    const cgrain::CGrainWorld mispredicted =
+        cgrain::RunCGrainLockstep(init, mispredictStream, kTicks, kDt, kIters);
+    const bool divergenceExisted = !coupledEqual(mispredicted, authority);
+    if (!coupledEqual(rolledBack, authority))
+        return fail("cgrain-lockstep: rollback != authority (misprediction not corrected)");
+    if (!divergenceExisted)
+        return fail("cgrain-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("cgrain-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d diverged "
+                "then converged)\n", kMispredictTick);
+
+    const cgrain::CGrainWorld authority2 = cgrain::RunCGrainLockstep(init, authStream, kTicks, kDt, kIters);
+    if (!coupledEqual(authority2, authority))
+        return fail("cgrain-lockstep: two runs differ (nondeterministic)");
+    {
+        cgrain::CGrainWorld w = cgrain::RunCGrainLockstep(init, authStream, kMispredictTick, kDt, kIters);
+        const cgrain::CGrainSnapshot snap = cgrain::SnapshotCGrain(w);
+        cgrain::SimCGrainTick(w, authStream, (uint32_t)kMispredictTick, kDt, kIters);
+        cgrain::RestoreCGrain(w, snap);
+        const bool roundTrip =
+            w.bodies.size() == snap.bodies.size() && w.grains.size() == snap.grains.size() &&
+            std::memcmp(w.bodies.data(), snap.bodies.data(), w.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+            std::memcmp(w.grains.data(), snap.grains.data(), w.grains.size() * sizeof(grain::GrainParticle)) == 0;
+        if (!roundTrip) return fail("cgrain-lockstep: snapshot round-trip != original (bodies/grains)");
+    }
+    std::printf("cgrain-lockstep determinism: two runs BYTE-IDENTICAL + snapshot round-trip exact\n");
+
+    const std::vector<cgrain::CGrainCommand> noStream;
+    const cgrain::CGrainWorld noInput = cgrain::RunCGrainLockstep(init, noStream, kTicks, kDt, kIters);
+    const int64_t sdx = (int64_t)authority.bodies[0].pos.x - (int64_t)noInput.bodies[0].pos.x;
+    const int64_t sdz = (int64_t)authority.bodies[0].pos.z - (int64_t)noInput.bodies[0].pos.z;
+    const int64_t shove = (sdx < 0 ? -sdx : sdx) + (sdz < 0 ? -sdz : sdz);
+    if (shove == 0) return fail("cgrain-lockstep: the command stream did not shove the body (degenerate)");
+    std::printf("cgrain-lockstep motion: shoved the body by %lld\n", (long long)shove);
+
+    std::printf("cgrain-lockstep: {bodies:%d, grains:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                kBodyCount, kGrainCount, kTicks, kCommandCount, kMispredictTick);
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the converged coupled state (IDENTICAL to the Vulkan
+    // --cgrain-lockstep-shot by construction; basin walls dark grey + dynamic sand warm tan + the shoved body
+    // a warm disk + an integer radius ring). ---
+    const int kPxPerUnit = 32, kMargin = 30;
+    const int kWorldLo = -2, kWorldW = 10, kWorldH = 16;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kMargin + (wx - kWorldLo) * kPxPerUnit;
+        cy = (int)imgH - kMargin - (wy - kWorldLo) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        int cx, cy; toPx(rolledBack.grains[(size_t)i].pos.x, rolledBack.grains[(size_t)i].pos.y, cx, cy);
+        if (rolledBack.grains[(size_t)i].flags & grain::kFlagStatic)
+            plot(cx, cy, Vec3{0.18f, 0.18f, 0.22f}, 0);
+        else
+            plot(cx, cy, Vec3{0.72f, 0.55f, 0.28f}, 0);
+    }
+    {
+        const fpx::FxBody& fb = rolledBack.bodies[0];
+        int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+        const int rPx = (fb.radius >> grain::kFrac) * kPxPerUnit;
+        for (int a = 0; a < 360; a += 3) {
+            const double rad = (double)a * 3.14159265358979 / 180.0;
+            const int rx = bcx + (int)((double)rPx * std::cos(rad));
+            const int ry = bcy - (int)((double)rPx * std::sin(rad));
+            if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+            }
+        }
+        plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgrain lockstep+rollback converged state (%d grains)\n",
+                outPath, imgW, imgH, kGrainCount);
+    return 0;
+}
+
 // ===== Slice GR2 — Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH showcase (--grain-neighbors) =
 // UNLIKE GR1's --grain-integrate (int64 grain_integrate.comp -> CPU on Metal), the neighbor search is PURE
 // INT32 (GrainCellOf = FloorDiv per axis + the per-axis |dx|<hSearch GrainNeighborAccept = integer divide +
@@ -36275,6 +36472,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--couple-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_couple_lockstep.png";
             try { return RunCoupleLockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgrain-lockstep <out.png>: render the Deterministic Rigid<->Grain Coupling LOCKSTEP + ROLLBACK
+        // showcase (Slice CG5, the multi-body netcode HEADLINE of FLAGSHIP #12, the CP5/GR5 twin). PURE CPU: the
+        // harness runs the IDENTICAL CPU code (cgrain::RunCGrainLockstep/RunCGrainRollback) on Metal-Mac that the
+        // Vulkan --cgrain-lockstep-shot runs on Windows -> the converged coupled-state golden is bit-identical
+        // cross-backend BY CONSTRUCTION. The snapshot covers BOTH the bodies AND the grains. New golden
+        // tests/golden/metal/cgrain_lockstep.png; two runs DIFF 0.0000. NO GPU compute, NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgrain-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgrain_lockstep.png";
+            try { return RunCGrainLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-contact <out.png>: render the Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION
