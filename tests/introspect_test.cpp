@@ -306,6 +306,8 @@ int main() {
             bool sawClothConstraintsFeature = false;
             // Slice CL3: the deterministic-cloth-solve capability is advertised.
             bool sawClothSolveFeature = false;
+            // Slice CL4: the deterministic-cloth-collide capability is advertised.
+            bool sawClothCollideFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -419,6 +421,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-cloth-integrate") sawClothIntegrateFeature = true;
                     if (AsString(el->value) == "deterministic-cloth-constraints") sawClothConstraintsFeature = true;
                     if (AsString(el->value) == "deterministic-cloth-solve") sawClothSolveFeature = true;
+                    if (AsString(el->value) == "deterministic-cloth-collide") sawClothCollideFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -516,6 +519,7 @@ int main() {
             check(sawClothIntegrateFeature, "engine.features includes deterministic-cloth-integrate");
             check(sawClothConstraintsFeature, "engine.features includes deterministic-cloth-constraints");
             check(sawClothSolveFeature, "engine.features includes deterministic-cloth-solve");
+            check(sawClothCollideFeature, "engine.features includes deterministic-cloth-collide");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -684,6 +688,8 @@ int main() {
         bool sawClothEdgesShot = false;
         // Slice CL3: the --cloth-solve-shot showcase flag is listed in the showcase manifest.
         bool sawClothSolveShot = false;
+        // Slice CL4: the --cloth-collide-shot showcase flag is listed in the showcase manifest.
+        bool sawClothCollideShot = false;
         // Slice FPX2: the --fpx-pairs-shot showcase flag is listed in the showcase manifest.
         bool sawFpxPairsShot = false;
         // Slice FPX3: the --fpx-solve-shot showcase flag is listed in the showcase manifest.
@@ -812,6 +818,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--cloth-integrate-shot") sawClothIntegrateShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cloth-edges-shot") sawClothEdgesShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cloth-solve-shot") sawClothSolveShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--cloth-collide-shot") sawClothCollideShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-pairs-shot") sawFpxPairsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-solve-shot") sawFpxSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-orient-shot") sawFpxOrientShot = true;
@@ -912,6 +919,7 @@ int main() {
         check(sawClothIntegrateShot, "showcases manifest includes --cloth-integrate-shot");
         check(sawClothEdgesShot, "showcases manifest includes --cloth-edges-shot");
         check(sawClothSolveShot, "showcases manifest includes --cloth-solve-shot");
+        check(sawClothCollideShot, "showcases manifest includes --cloth-collide-shot");
         check(sawFpxPairsShot, "showcases manifest includes --fpx-pairs-shot");
         check(sawFpxSolveShot, "showcases manifest includes --fpx-solve-shot");
         check(sawFpxOrientShot, "showcases manifest includes --fpx-orient-shot");
