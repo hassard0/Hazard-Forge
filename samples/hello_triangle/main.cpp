@@ -455,6 +455,7 @@ int main(int argc, char** argv) {
     const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~60 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
     const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
+    const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
@@ -620,6 +621,18 @@ int main(int argc, char** argv) {
         // as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's C1061, like the cl1/cl2/fpx shots.
         if (std::strcmp(argv[i], "--cloth-solve-shot") == 0 && i + 1 < argc) {
             clothSolveShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CL4: --cloth-collide-shot <out.bmp> — the Deterministic GPU Cloth INTEGER COLLISION. A 24x24
+        // sheet (top corners pinned) falls + DRAPES over a static FxBody sphere (the SphereCollider reuses
+        // fpx::FxBody pos+radius, the SAME Q16.16 world units), StepClothCollide K=40 steps x iters=6
+        // (CL3 solve + CollideSpheres + CollidePlane) on ONE GPU thread, GPU==CPU particle array bit-exact
+        // vs cloth.h::StepClothCollide. int64 FxLength/FxNormalize -> cloth_collide.comp is Vulkan-only;
+        // Metal --cloth-collide runs the CPU StepClothCollide. NO new RHI. Handled as a STANDALONE branch
+        // (not in the --shot else-if chain) to avoid MSVC's C1061, like the cl1/cl2/cl3/fpx shots.
+        if (std::strcmp(argv[i], "--cloth-collide-shot") == 0 && i + 1 < argc) {
+            clothCollideShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15565,6 +15578,314 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cloth PBD drape side-view (%u constraints, %d pinned)\n",
                                 clothSolveShotPath, imgW, imgH, kConstraintCount, kPinned);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothSolveShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Cloth INTEGER COLLISION (--cloth-collide-shot <out.bmp>, Slice CL4, the 4th
+        // slice of FLAGSHIP #8). The CL1 24x24 sheet (the two top corners PINNED), the CL2 constraints, is
+        // stepped K=40 times by a SINGLE-THREAD compute (shaders/cloth_collide.comp): each step = the CL3
+        // StepCloth (integrate + iters=6 Gauss-Seidel constraint passes + ground floor-clamp) THEN per-step
+        // COLLISION — project each non-pinned particle out of a small STATIC set of SPHERE colliders
+        // (cloth.h::CollideParticleSphere: int32 AABB reject -> int64 FxLength -> if inside, snap to the
+        // surface along FxNormalize(d)) + a ground plane clamp. The SphereCollider reuses fpx::FxBody's
+        // pos+radius (the SAME Q16.16 world units — the first deformable-meets-rigid INTEGER interaction),
+        // so the cloth DRAPES over the rigid sphere. ReadBuffer reads the integer Q16.16 particle array; the
+        // CPU cloth.h::StepClothCollide over the SAME sheet+spheres must match it BIT-EXACT (memcmp, NO tol
+        // — the GPU==CPU make-or-break). collideEnabled=false -> particles UNCHANGED; ZERO spheres ->
+        // byte-identical to CL3 cloth_solve (the no-collider no-op). int64 FxLength/FxNormalize ->
+        // cloth_collide.comp is VULKAN-ONLY (Metal --cloth-collide runs the CPU StepClothCollide). NO new RHI.
+        if (clothCollideShotPath) {
+            using math::Vec3;
+            namespace cloth = hf::sim::cloth;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic 24x24 sheet (== the Metal --cloth-collide config). gravity -9.8 host-snapped.
+            const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const cloth::fx kDt = cloth::kOne / 60;
+            const int kSide = 24;                      // 24x24 sheet -> 576 particles
+            // K=40 steps x iters=6 (== the CL3 cloth_solve budget — UNDER the single-thread [numthreads(1,1,1)]
+            // GPU-watchdog/TDR ceiling). The per-step collision ADDS a particleCount x sphereCount loop (576x1
+            // ~= 576 int32-AABB-reject + a handful of int64 normalize on overlaps), tiny vs the 40*6*3218
+            // constraint solves, so the dispatch stays well under TDR (deterministic 3/3). The cloth FALLS +
+            // DRAPES over the sphere (the collision holds it on the surface).
+            const int kSteps = 40;
+            const int kIters = 6;
+            // groundY well below so the focus is the DRAPE over the sphere (not the floor).
+            const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+            const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+            cloth::ClothGrid grid;
+            grid.W = kSide; grid.H = kSide;
+            grid.spacing = cloth::kOne;                // 1.0 world unit spacing
+            // Hang the sheet centered over the sphere: origin.x = -kSide/2 so x spans [-12, 11]; top at y=24.
+            grid.origin = cloth::FxVec3{(cloth::fx)(-(kSide / 2) * (int)cloth::kOne),
+                                        (cloth::fx)(kSide * (int)cloth::kOne), 0};
+            const int kParticleCount = grid.W * grid.H;
+            std::vector<cloth::ClothParticle> sheet0 = cloth::InitGrid(grid);
+            const int kPinned = cloth::CountPinned(sheet0);
+
+            // Build the CL2 constraint graph ONCE from the rest sheet (the edge list StepCloth iterates).
+            const std::vector<cloth::Constraint> constraints = cloth::BuildConstraints(grid, sheet0);
+            const uint32_t kConstraintCount = (uint32_t)constraints.size();
+            const uint32_t kConstraintAlloc = kConstraintCount > 0u ? kConstraintCount : 1u;
+
+            // The STATIC sphere collider set: ONE rigid FxBody sphere centered under the sheet, radius 8, so
+            // the falling cloth drapes over it. SphereFromBody reuses fpx::FxBody pos+radius (the SAME units).
+            fpx::FxBody sphereBody;
+            sphereBody.pos = cloth::FxVec3{0, (cloth::fx)(8 * (int)cloth::kOne), 0};
+            sphereBody.radius = (cloth::fx)(8 * (int)cloth::kOne);   // radius 8.0
+            std::vector<cloth::SphereCollider> spheres{ cloth::SphereFromBody(sphereBody) };
+            const uint32_t kSphereCount = (uint32_t)spheres.size();
+            const uint32_t kSphereAlloc = kSphereCount > 0u ? kSphereCount : 1u;
+
+            // std430 ClothParticle mirror (matches cloth_collide.comp ClothParticle): 11 x int32 (44 bytes).
+            struct ClothParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(ClothParticleGpu) == 44, "ClothParticleGpu std430 layout");
+            static_assert(sizeof(cloth::ClothParticle) == 44, "ClothParticle std430 layout");
+            auto packParticles = [&](const std::vector<cloth::ClothParticle>& ps) {
+                std::vector<ClothParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const cloth::ClothParticle& p = ps[i];
+                    out[i] = ClothParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+                }
+                return out;
+            };
+            const std::vector<ClothParticleGpu> particlesInit = packParticles(sheet0);
+
+            auto makeParticlesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = particlesInit.size() * sizeof(ClothParticleGpu);
+                d.initialData = particlesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // std430 Constraint mirror (matches cloth_collide.comp Constraint): 4 x int32 (16 bytes).
+            struct ConstraintGpu { uint32_t i, j; int32_t restLen; uint32_t kind; };
+            static_assert(sizeof(ConstraintGpu) == 16, "ConstraintGpu std430 layout");
+            static_assert(sizeof(cloth::Constraint) == 16, "Constraint std430 layout");
+            std::vector<ConstraintGpu> constraintsInit((size_t)kConstraintAlloc, ConstraintGpu{0u, 0u, 0, 0u});
+            for (uint32_t e = 0; e < kConstraintCount; ++e)
+                constraintsInit[e] = ConstraintGpu{constraints[e].i, constraints[e].j,
+                                                   constraints[e].restLen, constraints[e].kind};
+            rhi::BufferDesc cDesc;
+            cDesc.size = constraintsInit.size() * sizeof(ConstraintGpu);
+            cDesc.initialData = constraintsInit.data();
+            cDesc.usage = rhi::BufferUsage::Storage;
+            auto constraintsBuf = device->CreateBuffer(cDesc);
+
+            // std430 SphereCollider mirror (matches cloth_collide.comp SphereCollider): 4 x int32 (16 bytes).
+            struct SphereColliderGpu { int32_t cx, cy, cz, radius; };
+            static_assert(sizeof(SphereColliderGpu) == 16, "SphereColliderGpu std430 layout");
+            static_assert(sizeof(cloth::SphereCollider) == 16, "SphereCollider std430 layout");
+            auto makeSpheresBuf = [&](uint32_t count) {
+                std::vector<SphereColliderGpu> init((size_t)kSphereAlloc, SphereColliderGpu{0, 0, 0, 0});
+                for (uint32_t s = 0; s < count && s < kSphereCount; ++s)
+                    init[s] = SphereColliderGpu{spheres[s].center.x, spheres[s].center.y,
+                                                spheres[s].center.z, spheres[s].radius};
+                rhi::BufferDesc d;
+                d.size = init.size() * sizeof(SphereColliderGpu);
+                d.initialData = init.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches cloth_collide.comp ClothCollideParams std430): int4 grav {gx,gy,gz,dt} + int4
+            // cfg {groundY, particleCount, constraintCount, steps} + int4 cfg2 {iters, sphereCount,
+            // collideEnabled, _}.
+            struct ClothCollideParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(ClothCollideParams) == 48, "ClothCollideParams std430 layout");
+            auto makeParams = [&](int32_t sphereCount, int32_t collideEnabled) {
+                ClothCollideParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kParticleCount; p.cfg[2] = (int32_t)kConstraintCount; p.cfg[3] = kSteps;
+                p.cfg2[0] = kIters; p.cfg2[1] = sphereCount; p.cfg2[2] = collideEnabled; p.cfg2[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 4 storage buffers (particles, constraints, spheres, params); SINGLE thread.
+            auto clothCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cloth_collide.comp.hlsl.spv");
+            auto clothCs = device->CreateShaderModule({std::span<const uint32_t>(clothCsWords)});
+            rhi::ComputePipelineDesc clothCdesc;
+            clothCdesc.compute = clothCs.get();
+            clothCdesc.storageBufferCount = 4;
+            clothCdesc.pushConstantSize = 0;
+            clothCdesc.threadsPerGroupX = 1;
+            auto clothCompute = device->CreateComputePipeline(clothCdesc);
+
+            // Run the collide compute over a fresh particles buffer + params, read back gParticles.
+            auto runCollide = [&](int32_t sphereCount, int32_t collideEnabled,
+                                  std::vector<ClothParticleGpu>& outParticles) {
+                auto particlesBuf = makeParticlesBuf();
+                auto spheresBuf = makeSpheresBuf((uint32_t)sphereCount);
+                ClothCollideParams params = makeParams(sphereCount, collideEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(ClothCollideParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("cloth_collide", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*clothCompute);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*constraintsBuf, 1);
+                        cmd.BindStorageBuffer(*spheresBuf, 2);
+                        cmd.BindStorageBuffer(*paramsBuf, 3);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outParticles.assign((size_t)kParticleCount, ClothParticleGpu{});
+                device->ReadBuffer(*particlesBuf, outParticles.data(),
+                                   outParticles.size() * sizeof(ClothParticleGpu), 0);
+            };
+
+            // === GPU collide (enabled, K steps, the full sphere set) ===
+            std::vector<ClothParticleGpu> gpuParticles;
+            runCollide((int32_t)kSphereCount, 1, gpuParticles);
+
+            // === CPU reference: StepClothCollide K times over the SAME sheet + constraints + spheres ===
+            std::vector<cloth::ClothParticle> cpuSheet = sheet0;
+            const int cpuContacts = cloth::StepClothCollideSteps(grid, cpuSheet, constraints, spheres,
+                                                                 kGravity, kDt, kGroundY, kIters, kSteps);
+            std::vector<ClothParticleGpu> cpuParticles = packParticles(cpuSheet);
+
+            // PROOF (1) GPU==CPU particles BIT-EXACT after K collide steps (integer memcmp, NO tol) — the
+            // MAKE-OR-BREAK.
+            if (gpuParticles.size() != cpuParticles.size() ||
+                std::memcmp(gpuParticles.data(), cpuParticles.data(),
+                            (size_t)kParticleCount * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-collide GPU particle array != CPU StepClothCollide "
+                             "(a float/overflow/order divergence crept into the collision projection?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-collide: {particles:%d, spheres:%u, contacts:%d, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kParticleCount, kSphereCount, cpuContacts, kSteps);
+
+            // PROOF (2) determinism: two full runs byte-identical (the TDR/single-thread reliability check).
+            std::vector<ClothParticleGpu> gpuParticles2;
+            runCollide((int32_t)kSphereCount, 1, gpuParticles2);
+            if (gpuParticles.size() != gpuParticles2.size() ||
+                std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                            gpuParticles.size() * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-collide two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-collide determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) collision / coherence: NO particle ends up inside a sphere (every one projected to
+            // the surface deterministically) AND contacts>0 (the cloth touches the sphere — a real drape).
+            {
+                const int penetrating = cloth::CountPenetrating(cpuSheet, spheres);
+                if (penetrating != 0 || cpuContacts <= 0) {
+                    std::fprintf(stderr, "FATAL: cloth-collide incoherent (penetrating=%d, contacts=%d)\n",
+                                 penetrating, cpuContacts);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-collide coverage: %d contacts, %d penetrating (cloth drapes over sphere)\n",
+                            cpuContacts, penetrating);
+            }
+
+            // PROOF (4) no-collider / no-op: ZERO spheres + the SAME scene -> byte-identical to cloth_solve
+            // (collision is a no-op). Run the collide shader with sphereCount=0 + the CPU StepClothSteps
+            // (CL3, no collision) over the same sheet -> both must equal each other AND the GPU result.
+            {
+                std::vector<ClothParticleGpu> gpuNoCollider;
+                runCollide(0, 1, gpuNoCollider);
+                std::vector<cloth::ClothParticle> cpuSolve = sheet0;
+                cloth::StepClothSteps(grid, cpuSolve, constraints, kGravity, kDt, kGroundY, kIters, kSteps);
+                std::vector<ClothParticleGpu> cpuSolveP = packParticles(cpuSolve);
+                if (gpuNoCollider.size() != cpuSolveP.size() ||
+                    std::memcmp(gpuNoCollider.data(), cpuSolveP.data(),
+                                cpuSolveP.size() * sizeof(ClothParticleGpu)) != 0) {
+                    std::fprintf(stderr, "FATAL: cloth-collide no-collider != CL3 cloth_solve (collision not a no-op)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-collide no-collider: == solve (no-op)\n");
+            }
+
+            // The disabled-path no-op: collideEnabled=false -> particles UNCHANGED (byte-identical upload).
+            std::vector<ClothParticleGpu> disabledParticles;
+            runCollide((int32_t)kSphereCount, 0, disabledParticles);
+            if (disabledParticles.size() != particlesInit.size() ||
+                std::memcmp(disabledParticles.data(), particlesInit.data(),
+                            particlesInit.size() * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-collide collideEnabled=false changed the particles\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Golden: a PURE-INTEGER 3/4 side-view of the DRAPED cloth + the sphere outline. Project each
+            // particle's integer (pos.x>>kFrac + a small z-skew, pos.y>>kFrac) to a pixel; splat a hashColor
+            // dot (pinned corners white). Draw the sphere as a ring of integer points (center + radius) to
+            // show the cloth draping OVER it. CPU-colored from the read-back integers -> identical both
+            // backends by construction. ---
+            const int kPxPerUnit = 14;   // integer world-units -> pixels
+            const int kMargin = 30;
+            const int kWorldHalf = kSide;        // x spans [-12, 11]; allow a margin both sides
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + (kWorldHalf * 2 + 1) * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 2) * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // A fixed integer 3/4-ish transform: x maps with a small z-skew (z/4) so depth reads; y up.
+            auto worldToPx = [&](int worldX, int worldY, int worldZ, int& ix, int& iy) {
+                ix = kMargin + (worldX + kWorldHalf) * kPxPerUnit + (worldZ * kPxPerUnit) / 4;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            auto splat = [&](int cx, int cy, Vec3 col) {
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // The sphere outline (an integer-stepped ring in the XY plane through the center, z=0).
+            for (uint32_t s = 0; s < kSphereCount; ++s) {
+                const int scx = spheres[s].center.x >> cloth::kFrac;
+                const int scy = spheres[s].center.y >> cloth::kFrac;
+                const int srad = spheres[s].radius >> cloth::kFrac;
+                // The sphere outline as a deterministic integer ring: for each integer x in [-srad,srad],
+                // y = ±floor(sqrt(srad^2 - x^2)) (pure integer FxISqrt, identical both backends).
+                for (int wx = -srad; wx <= srad; ++wx) {
+                    const int64_t rem = (int64_t)srad * srad - (int64_t)wx * wx;
+                    if (rem < 0) continue;
+                    const int wy = (int)fpx::FxISqrt(rem);   // floor sqrt of the integer remainder
+                    int ix, iy;
+                    worldToPx(scx + wx, scy + wy, 0, ix, iy); splat(ix, iy, Vec3{0.30f, 0.30f, 0.34f});
+                    worldToPx(scx + wx, scy - wy, 0, ix, iy); splat(ix, iy, Vec3{0.30f, 0.30f, 0.34f});
+                }
+            }
+            // The draped cloth particles.
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = gpuParticles[(size_t)i].px >> cloth::kFrac;
+                const int wy = gpuParticles[(size_t)i].py >> cloth::kFrac;
+                const int wz = gpuParticles[(size_t)i].pz >> cloth::kFrac;
+                int cx, cy; worldToPx(wx, wy, wz, cx, cy);
+                const bool pinned = (gpuParticles[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+                Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+                splat(cx, cy, col);
+            }
+            bool ok = WriteBMP(clothCollideShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cloth draped over sphere (%u constraints, %u sphere, %d pinned)\n",
+                                clothCollideShotPath, imgW, imgH, kConstraintCount, kSphereCount, kPinned);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothCollideShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

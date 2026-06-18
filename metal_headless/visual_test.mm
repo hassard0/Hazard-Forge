@@ -17553,6 +17553,195 @@ static int RunClothSolveShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CL4 — Deterministic GPU Cloth INTEGER COLLISION showcase (--cloth-collide) =====
+// (the 4th slice of FLAGSHIP #8). Like CL1's --cloth-integrate + CL3's --cloth-solve (and UNLIKE the int32
+// CL2 --cloth-edges), the collision projection is int64 (FxLength/FxNormalize in CollideParticleSphere —
+// the SAME form as cloth_solve.comp/fpx_solve.comp), so shaders/cloth_collide.comp is VULKAN-SPIR-V-ONLY
+// (glslc can't parse int64 in HLSL) and is NOT in this dir's hf_gen_msl list; on Metal the --cloth-collide
+// showcase runs the CPU cloth::StepClothCollide — the EXACT bit-exact reference the Vulkan
+// --cloth-collide-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to
+// the Vulkan GPU result BY CONSTRUCTION (the cloth_solve.comp / fpx_solve.comp convention), while the
+// Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic 24x24 sheet (the two top
+// corners pinned, the CL2 constraints, gravity -9.8 host-snapped to Q16.16, groundY far below, dt=kOne/60)
+// + the SAME static FxBody sphere collider (SphereFromBody reuses fpx::FxBody pos+radius, the SAME Q16.16
+// units), runs cloth::StepClothCollide K=40 steps x iters=6 over it -> a cloth DRAPED over the rigid
+// sphere, and CPU-colors the SAME integer 3/4-view debug-viz as the Vulkan --cloth-collide-shot -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/cloth_collide.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000. NO GPU compute (int64 -> CPU on Metal), NO new RHI.
+static int RunClothCollideShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cloth = hf::sim::cloth;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic 24x24 sheet (== the Vulkan --cloth-collide-shot config). gravity -9.8 host-snapped.
+    const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const cloth::fx kDt = cloth::kOne / 60;
+    const int kSide = 24;
+    const int kSteps = 40;
+    const int kIters = 6;
+    const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+    const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+    cloth::ClothGrid grid;
+    grid.W = kSide; grid.H = kSide;
+    grid.spacing = cloth::kOne;
+    grid.origin = cloth::FxVec3{(cloth::fx)(-(kSide / 2) * (int)cloth::kOne),
+                                (cloth::fx)(kSide * (int)cloth::kOne), 0};
+    const int kParticleCount = grid.W * grid.H;
+    std::vector<cloth::ClothParticle> sheet0 = cloth::InitGrid(grid);
+    const int kPinned = cloth::CountPinned(sheet0);
+
+    // Build the CL2 constraint graph ONCE from the rest sheet (== the Vulkan path).
+    const std::vector<cloth::Constraint> constraints = cloth::BuildConstraints(grid, sheet0);
+    const uint32_t kConstraintCount = (uint32_t)constraints.size();
+
+    // The STATIC sphere collider set (== the Vulkan --cloth-collide-shot): ONE FxBody sphere, radius 8.
+    fpx::FxBody sphereBody;
+    sphereBody.pos = cloth::FxVec3{0, (cloth::fx)(8 * (int)cloth::kOne), 0};
+    sphereBody.radius = (cloth::fx)(8 * (int)cloth::kOne);
+    std::vector<cloth::SphereCollider> spheres{ cloth::SphereFromBody(sphereBody) };
+    const uint32_t kSphereCount = (uint32_t)spheres.size();
+
+    // std430 ClothParticle mirror (== the Vulkan --cloth-collide-shot ClothParticleGpu): 11 x int32 (44).
+    struct ClothParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+    };
+    static_assert(sizeof(ClothParticleGpu) == 44, "ClothParticleGpu std430 layout");
+    static_assert(sizeof(cloth::ClothParticle) == 44, "ClothParticle std430 layout");
+    auto packParticles = [&](const std::vector<cloth::ClothParticle>& ps) {
+        std::vector<ClothParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const cloth::ClothParticle& p = ps[i];
+            out[i] = ClothParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                      p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+        }
+        return out;
+    };
+    const std::vector<ClothParticleGpu> particlesInit = packParticles(sheet0);
+
+    // Image dims (fixed integer 3/4-view transform, == the Vulkan --cloth-collide-shot).
+    const int kPxPerUnit = 14, kMargin = 30, kWorldHalf = kSide;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + (kWorldHalf * 2 + 1) * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 2) * kPxPerUnit);
+
+    // CPU solver+collision (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    // sphereCount/collideEnabled control the no-collider + disabled paths. Returns the final contact count.
+    auto runCollide = [&](bool useSpheres, bool collideEnabled,
+                          std::vector<ClothParticleGpu>& outParticles) -> int {
+        if (!collideEnabled) { outParticles = particlesInit; return 0; }
+        std::vector<cloth::ClothParticle> sheet = sheet0;
+        std::vector<cloth::SphereCollider> empty;
+        const int contacts = cloth::StepClothCollideSteps(grid, sheet, constraints,
+                                                          useSpheres ? spheres : empty,
+                                                          kGravity, kDt, kGroundY, kIters, kSteps);
+        outParticles = packParticles(sheet);
+        return contacts;
+    };
+
+    // CPU collide (enabled, K steps, the full sphere set) — the Metal showcase particle array.
+    std::vector<ClothParticleGpu> gpuParticles;
+    const int contacts = runCollide(true, true, gpuParticles);
+
+    // GPU==CPU is N/A on the Metal CPU path: this particle array IS the CPU StepClothCollide reference the
+    // Vulkan --cloth-collide-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("cloth-collide: {particles:%d, spheres:%u, contacts:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cloth::StepClothCollide, byte-identical to the Vulkan GPU result by construction]\n",
+                kParticleCount, kSphereCount, contacts, kSteps);
+
+    // two-run determinism.
+    std::vector<ClothParticleGpu> gpuParticles2;
+    runCollide(true, true, gpuParticles2);
+    if (gpuParticles.size() != gpuParticles2.size() ||
+        std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                    gpuParticles.size() * sizeof(ClothParticleGpu)) != 0)
+        return fail("cloth-collide: two solves differ (nondeterministic)");
+    std::printf("cloth-collide determinism: two runs BYTE-IDENTICAL\n");
+
+    // collision / coherence: no particle penetrates + contacts>0 (the cloth drapes over the sphere).
+    {
+        std::vector<cloth::ClothParticle> sheet = sheet0;
+        cloth::StepClothCollideSteps(grid, sheet, constraints, spheres, kGravity, kDt, kGroundY, kIters, kSteps);
+        const int penetrating = cloth::CountPenetrating(sheet, spheres);
+        if (penetrating != 0 || contacts <= 0)
+            return fail("cloth-collide: coverage incoherent (penetrating/contacts)");
+        std::printf("cloth-collide coverage: %d contacts, %d penetrating (cloth drapes over sphere)\n",
+                    contacts, penetrating);
+    }
+
+    // no-collider / no-op: ZERO spheres -> byte-identical to the CL3 cloth_solve (StepClothSteps).
+    {
+        std::vector<ClothParticleGpu> noCollider;
+        runCollide(false, true, noCollider);
+        std::vector<cloth::ClothParticle> cpuSolve = sheet0;
+        cloth::StepClothSteps(grid, cpuSolve, constraints, kGravity, kDt, kGroundY, kIters, kSteps);
+        std::vector<ClothParticleGpu> cpuSolveP = packParticles(cpuSolve);
+        if (noCollider.size() != cpuSolveP.size() ||
+            std::memcmp(noCollider.data(), cpuSolveP.data(),
+                        cpuSolveP.size() * sizeof(ClothParticleGpu)) != 0)
+            return fail("cloth-collide: no-collider != CL3 cloth_solve (collision not a no-op)");
+        std::printf("cloth-collide no-collider: == solve (no-op)\n");
+    }
+
+    // disabled / no-op: collideEnabled=false -> particles UNCHANGED.
+    std::vector<ClothParticleGpu> disabledParticles;
+    runCollide(true, false, disabledParticles);
+    if (disabledParticles.size() != particlesInit.size() ||
+        std::memcmp(disabledParticles.data(), particlesInit.data(),
+                    particlesInit.size() * sizeof(ClothParticleGpu)) != 0)
+        return fail("cloth-collide: collideEnabled=false changed the particles");
+
+    // --- Golden: a PURE-INTEGER 3/4-view of the DRAPED cloth + the sphere outline (IDENTICAL to the Vulkan
+    // --cloth-collide-shot by construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int worldZ, int& ix, int& iy) {
+        ix = kMargin + (worldX + kWorldHalf) * kPxPerUnit + (worldZ * kPxPerUnit) / 4;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto splat = [&](int cx, int cy, Vec3 col) {
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (uint32_t s = 0; s < kSphereCount; ++s) {
+        const int scx = spheres[s].center.x >> cloth::kFrac;
+        const int scy = spheres[s].center.y >> cloth::kFrac;
+        const int srad = spheres[s].radius >> cloth::kFrac;
+        for (int wx = -srad; wx <= srad; ++wx) {
+            const int64_t rem = (int64_t)srad * srad - (int64_t)wx * wx;
+            if (rem < 0) continue;
+            const int wy = (int)fpx::FxISqrt(rem);
+            int ix, iy;
+            worldToPx(scx + wx, scy + wy, 0, ix, iy); splat(ix, iy, Vec3{0.30f, 0.30f, 0.34f});
+            worldToPx(scx + wx, scy - wy, 0, ix, iy); splat(ix, iy, Vec3{0.30f, 0.30f, 0.34f});
+        }
+    }
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = gpuParticles[(size_t)i].px >> cloth::kFrac;
+        const int wy = gpuParticles[(size_t)i].py >> cloth::kFrac;
+        const int wz = gpuParticles[(size_t)i].pz >> cloth::kFrac;
+        int cx, cy; worldToPx(wx, wy, wz, cx, cy);
+        const bool pinned = (gpuParticles[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+        Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+        splat(cx, cy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cloth draped over sphere (%u constraints, %u sphere, %d pinned)\n",
+                outPath, imgW, imgH, kConstraintCount, kSphereCount, kPinned);
+    return 0;
+}
+
 // --- Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION showcase (Slice NAV1, the
 // BEACHHEAD of FLAGSHIP #7). UNLIKE --fpx (int64 integrator -> CPU on Metal), the span rasterizer is
 // PURE INT32 (TriColumnAabb add/sub/compare + the three-edge PointInTriXZ cover test + TriYSpan, NO
@@ -30949,6 +31138,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cloth-solve") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cloth_solve.png";
             try { return RunClothSolveShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cloth-collide <out.png>: render the Deterministic GPU Cloth INTEGER COLLISION showcase (Slice
+        // CL4). On Metal this runs the CPU collider: cloth_collide.comp is int64/Vulkan-only (glslc can't
+        // parse the FxLength/FxNormalize int64 in CollideParticleSphere), so Metal runs the CPU
+        // cloth::StepClothCollide — byte-identical to the Vulkan GPU result by construction (the
+        // cloth_solve.comp/fpx_solve.comp convention). The SAME 24x24 sheet (top corners pinned, the CL2
+        // constraints) + the SAME static FxBody sphere (SphereFromBody reuses fpx::FxBody pos+radius) is
+        // stepped K=40 (iters=6) by cloth::StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) -> a
+        // cloth DRAPED over the rigid sphere; ZERO spheres -> byte-identical to cloth_solve (the no-collider
+        // no-op); collideEnabled=false -> particles unchanged; two runs byte-identical. The image golden is a
+        // PURE-INTEGER 3/4 drape view + sphere outline, identical to the Vulkan path BY CONSTRUCTION. New
+        // golden tests/golden/metal/cloth_collide.png.
+        if (argc > 1 && std::strcmp(argv[1], "--cloth-collide") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cloth_collide.png";
+            try { return RunClothCollideShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --nav-raster <out.png>: render the Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN

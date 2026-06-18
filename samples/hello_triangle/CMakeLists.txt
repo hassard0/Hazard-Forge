@@ -11,6 +11,11 @@ target_compile_definitions(hello_triangle PRIVATE HF_HAS_EDITOR=1)
 # (no logic / RHI / shader change); harmless on release.
 if (MSVC)
     target_link_options(hello_triangle PRIVATE /STACK:16777216)
+    # main.cpp is one ~42k-line translation unit with ~190 inline `--*-shot` showcase blocks; the COFF
+    # object's section count crossed the default 65535 limit (fatal error C1128) once the CL4
+    # --cloth-collide-shot block was added. /bigobj raises the section cap. Pure build-config (no logic /
+    # RHI / shader change); standard remedy for a large single TU.
+    target_compile_options(hello_triangle PRIVATE /bigobj)
 endif()
 
 # --- Material graph (Slice AV): regenerate the showcase fragment shader from its *.mat.json at build
@@ -502,6 +507,21 @@ hf_compile_shaders(
     # the fpx_solve.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle
     # array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/cloth_solve.comp.hlsl:cs"
+    # CL4 COLLISION. cloth_collide.comp FOLDS the CL3 PBD step (integrate + Gauss-Seidel constraint passes +
+    # ground floor-clamp, copied VERBATIM from cloth_solve.comp/cloth.h) AND per-step COLLISION (project each
+    # non-pinned particle out of a small STATIC set of SPHERE colliders along the outward normal, then a
+    # ground plane clamp — the int32 AABB reject + int64 FxLength/FxNormalize push to the surface copied
+    # VERBATIM from engine/sim/cloth.h::CollideParticleSphere) into ONE single-thread ([numthreads(1,1,1)])
+    # `steps` loop so the cloth DRAPES over the rigid sphere (the SphereCollider reuses fpx::FxBody pos+radius,
+    # the SAME Q16.16 units). The Gauss-Seidel order-dependence makes single-thread necessary for bit-
+    # exactness; the per-particle collision within it is order-independent but runs in the same thread.
+    # collideEnabled=0 -> particles UNCHANGED; sphereCount=0 -> byte-identical to cloth_solve (the zero-
+    # collider equivalence). Like cloth_solve.comp / fpx_solve.comp this is int64 (fxdiv/FxISqrt) ->
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal
+    # --cloth-collide showcase runs the CPU cloth::StepClothCollide (byte-identical by construction). Pure
+    # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle array + cross-backend, proven memcmp.
+    # NO new RHI; CL1-CL3 shaders + goldens untouched.
+    "shaders/cloth_collide.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
     # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp: ONE thread per body i scans j>i
     # and writes perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) (each unordered pair counted once,
