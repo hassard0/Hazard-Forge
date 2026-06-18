@@ -658,6 +658,21 @@ hf_add_pure_test(grain_test)
 # NO render — CP6). Pure C++ (hf_core), ASan-eligible. couple.h #includes fpx.h + fluid.h read-only.
 hf_add_pure_test(couple_test)
 
+# Deterministic Rigid<->Grain Coupling Slice 1 (Slice CG1, the BEACHHEAD of FLAGSHIP #12): the UNIFIED
+# bodies+grains WORLD + the BODY->GRAIN grid-hash QUERY core (engine/sim/couple_grain.h) the GPU
+# shaders/cgrain_body_{count,scan,emit}.comp.hlsl copy VERBATIM + prove bit-identical. The CP1 twin (couple.h's
+# body->fluid query) with the GRAIN grid instead of the fluid grid: over the GR2 grain grid + cell table it
+# gathers the grain particles inside each body's sphere, iterating the body's BodyAabb cell RANGE (not a fixed
+# 27-cell stencil), accepting iff the per-axis box reject |body.pos.axis - g.pos.axis| < body.radius passes
+# (PURE INT32, the exact radial sphere cull deferred to CG2/CG3). Pins BodyGrainAccept (the per-axis
+# abs-compare), GatherBodyGrains (one body over a hand-laid bed -> the EXACT 3x3 gathered box, CSR offsets
+# correct, ascending within-body order; a body clear of the bed -> empty; two bodies -> disjoint ascending
+# per-body lists; the empty world / no grains no-op; hSearch-independence of the gathered set; determinism: two
+# builds byte-identical) + CountGathered/MaxPerBody. CG1 claims ONLY the unified world + the per-body grain
+# query (NO momentum exchange — CG2 support/drag, CG3 displacement, CG4 step, CG5 lockstep, CG6 render). Pure
+# C++ (hf_core), ASan-eligible. couple_grain.h #includes fpx.h + grain.h read-only.
+hf_add_pure_test(cgrain_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE
