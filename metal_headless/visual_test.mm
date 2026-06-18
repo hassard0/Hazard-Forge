@@ -19732,6 +19732,152 @@ static int RunFpxOrientShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof showcase (Slice CL5, the HEADLINE of FLAGSHIP #8).
+// PURE CPU on BOTH backends — there is NO GPU dispatch, NO new shader, NO new RHI here: lockstep/rollback
+// is a determinism PROPERTY of the bit-exact CL1-CL4 cloth, so the harness runs the IDENTICAL CPU code
+// (engine/sim/cloth.h::RunClothLockstep/RunClothRollback) on Vulkan-Windows AND Metal-Mac -> the converged-
+// cloth-state golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS
+// the cross-platform-lockstep evidence — the same simulated cloth on two platforms from the same inputs).
+// This builds the SAME deterministic scene + command streams as the Vulkan --cloth-lockstep-shot, runs
+// authority=RunClothLockstep + replica=RunClothLockstep + rolledBack=RunClothRollback, asserts authority==
+// replica + rollback-corrects-to-authority BIT-EXACT (+ determinism + snapshot round-trip), and CPU-renders
+// the converged cloth state -> BYTE-IDENTICAL to the Vulkan path. The FPX5 twin over DEFORMABLE bodies.
+// New golden tests/golden/metal/cloth_lockstep.png.
+static int RunClothLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cloth = hf::sim::cloth;
+    namespace vg = render::vg;
+
+    const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const cloth::fx kDt = cloth::kOne / 60;
+    const int kSide = 16;
+    const int kIters = 6;
+    const int kTicks = 24;
+    const int kMispredictTick = 10;
+    const cloth::fx kGroundY = (cloth::fx)(-1000 * (int)cloth::kOne);
+    const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+    cloth::ClothGrid grid;
+    grid.W = kSide; grid.H = kSide;
+    grid.spacing = cloth::kOne;
+    grid.origin = cloth::FxVec3{(cloth::fx)(-(kSide / 2) * (int)cloth::kOne),
+                                (cloth::fx)(kSide * (int)cloth::kOne), 0};
+    const int kParticleCount = grid.W * grid.H;
+    const std::vector<cloth::ClothParticle> init = cloth::InitGrid(grid);
+    const int kPinned = cloth::CountPinned(init);
+    const std::vector<cloth::Constraint> constraints = cloth::BuildConstraints(grid, init);
+    const std::vector<cloth::SphereCollider> noSpheres;
+
+    const int wIdx = cloth::ParticleIndex(grid, kSide / 2, kSide / 2);
+    const std::vector<cloth::ClothCommand> authStream = {
+        cloth::ClothCommand{2,  cloth::kCmdWind, (uint32_t)wIdx, cloth::FxVec3{(cloth::fx)(cloth::kOne * 4), 0, 0}},
+        cloth::ClothCommand{6,  cloth::kCmdWind, (uint32_t)wIdx, cloth::FxVec3{0, 0, (cloth::fx)(cloth::kOne * 3)}},
+        cloth::ClothCommand{12, cloth::kCmdPin,  (uint32_t)wIdx, {}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<cloth::ClothCommand> mispredictStream = authStream;
+    mispredictStream.push_back(cloth::ClothCommand{(uint32_t)kMispredictTick, cloth::kCmdWind,
+                                                   (uint32_t)wIdx, cloth::FxVec3{(cloth::fx)(cloth::kOne * 40), 0, 0}});
+
+    const std::vector<cloth::ClothParticle> authority =
+        cloth::RunClothLockstep(grid, init, constraints, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    const std::vector<cloth::ClothParticle> replica =
+        cloth::RunClothLockstep(grid, init, constraints, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    const std::vector<cloth::ClothParticle> rolledBack =
+        cloth::RunClothRollback(grid, init, constraints, noSpheres, authStream, mispredictStream,
+                                kTicks, kMispredictTick, kGravity, kDt, kGroundY, kIters);
+
+    auto particleBytes = [](const std::vector<cloth::ClothParticle>& p) {
+        return p.size() * sizeof(cloth::ClothParticle);
+    };
+
+    // PROOF (1) LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+    if (authority.size() != replica.size() ||
+        std::memcmp(authority.data(), replica.data(), particleBytes(authority)) != 0)
+        return fail("cloth-lockstep: replica != authority (inputs-only re-sim diverged)");
+    std::printf("cloth-lockstep: replica==authority %d particles BIT-EXACT (%d ticks, inputs-only)\n",
+                kParticleCount, kTicks);
+
+    // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT, AND the mispredicted state DIFFERED.
+    const std::vector<cloth::ClothParticle> mispredicted =
+        cloth::RunClothLockstep(grid, init, constraints, noSpheres, mispredictStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    const bool divergenceExisted =
+        (mispredicted.size() != authority.size()) ||
+        std::memcmp(mispredicted.data(), authority.data(), particleBytes(authority)) != 0;
+    if (rolledBack.size() != authority.size() ||
+        std::memcmp(rolledBack.data(), authority.data(), particleBytes(authority)) != 0)
+        return fail("cloth-lockstep: rollback != authority (misprediction not corrected)");
+    if (!divergenceExisted)
+        return fail("cloth-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("cloth-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d "
+                "diverged then converged)\n", kMispredictTick);
+
+    // PROOF (3) determinism: two full runs byte-identical.
+    const std::vector<cloth::ClothParticle> authority2 =
+        cloth::RunClothLockstep(grid, init, constraints, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    if (authority2.size() != authority.size() ||
+        std::memcmp(authority2.data(), authority.data(), particleBytes(authority)) != 0)
+        return fail("cloth-lockstep: two runs differ (nondeterministic)");
+    std::printf("cloth-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (4) snapshot round-trip: RestoreCloth(SnapshotCloth(p)) == p BIT-EXACT.
+    {
+        std::vector<cloth::ClothParticle> p =
+            cloth::RunClothLockstep(grid, init, constraints, noSpheres, authStream, kMispredictTick, kGravity, kDt, kGroundY, kIters);
+        const std::vector<cloth::ClothParticle> snap = cloth::SnapshotCloth(p);
+        cloth::SimClothTick(grid, p, constraints, noSpheres, authStream, (uint32_t)kMispredictTick,
+                            kGravity, kDt, kGroundY, kIters);   // mutate
+        cloth::RestoreCloth(p, snap);
+        if (p.size() != snap.size() || std::memcmp(p.data(), snap.data(), particleBytes(snap)) != 0)
+            return fail("cloth-lockstep: snapshot round-trip != original");
+    }
+    std::printf("cloth-lockstep snapshot: round-trip BIT-EXACT\n");
+
+    // PROOF (5) stats.
+    std::printf("cloth-lockstep: {particles:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                kParticleCount, kTicks, kCommandCount, kMispredictTick);
+
+    // --- Golden: the converged cloth state side-view (IDENTICAL to the Vulkan --cloth-lockstep-shot by
+    // construction; authority==replica==rolledBack so the single converged state IS the viz). ---
+    const int kPxPerUnit = 18, kMargin = 30, kWorldHalf = kSide;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + (kWorldHalf * 2 + 1) * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 2) * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int worldZ, int& ix, int& iy) {
+        ix = kMargin + (worldX + kWorldHalf) * kPxPerUnit + (worldZ * kPxPerUnit) / 4;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto splat = [&](int cx, int cy, Vec3 col) {
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = rolledBack[(size_t)i].pos.x >> cloth::kFrac;
+        const int wy = rolledBack[(size_t)i].pos.y >> cloth::kFrac;
+        const int wz = rolledBack[(size_t)i].pos.z >> cloth::kFrac;
+        int cx, cy; worldToPx(wx, wy, wz, cx, cy);
+        const bool pinned = (rolledBack[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+        Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+        splat(cx, cy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cloth lockstep+rollback converged state (%d particles, %d pinned)\n",
+                outPath, imgW, imgH, kParticleCount, kPinned);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics LOCKSTEP + ROLLBACK proof showcase (Slice FPX5, the HEADLINE of
 // FLAGSHIP #6). PURE CPU on BOTH backends — there is NO GPU dispatch, NO new shader, NO new RHI here:
 // lockstep/rollback is a determinism PROPERTY of the fpx sim, so the harness runs the IDENTICAL CPU code
@@ -31154,6 +31300,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cloth-collide") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cloth_collide.png";
             try { return RunClothCollideShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cloth-lockstep <out.png>: render the Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof showcase
+        // (Slice CL5, the HEADLINE of FLAGSHIP #8). PURE CPU on BOTH backends (the FPX5 twin): runs the
+        // cloth.h lockstep/rollback harness (RunClothLockstep authority + replica, RunClothRollback) over a
+        // 16x16 cloth + scripted wind/pin command streams; authority==replica + rollback-corrects-to-
+        // authority BIT-EXACT; determinism + snapshot round-trip. The image golden is the converged cloth
+        // state, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/cloth_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--cloth-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cloth_lockstep.png";
+            try { return RunClothLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --nav-raster <out.png>: render the Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN
