@@ -627,6 +627,19 @@ hf_add_pure_test(cloth_test)
 # ASan-eligible.
 hf_add_pure_test(fluid_test)
 
+# Deterministic GPU Granular/Sand Slice 1 (Slice GR1, the BEACHHEAD of FLAGSHIP #10): the Q16.16 GRAIN POOL
+# INTEGRATOR + dropped-block core (engine/sim/grain.h) the GPU shaders/grain_integrate.comp.hlsl copies
+# VERBATIM + proves bit-identical. The FL1/CL1 integer-beachhead twin with TWO deltas: a first-class `radius`
+# field (48-byte std430 packing) + a RADIUS-AWARE ground rest (the grain's surface rests on the floor). Pins
+# the 48-byte packing, InitGrainBlock (W*H*D, uniform radius, all dynamic, prev==pos/vel==0), the one-step +
+# K-step semi-implicit-Euler closed form (hand-checked integer recurrence), the radius-aware ground rest
+# (pos.y pinned to groundY + radius, vel.y zeroed, stays settled; radius 0 -> the FL1 plain-ground degenerate),
+# IntegrateGrains ORDER-INDEPENDENCE (shuffled == in-order per grain, grains independent in GR1), determinism
+# (two runs byte-identical + a coherent dropped-block fall), and the STATIC no-op (invMass 0 / flags bit0 pool
+# UNCHANGED after K steps). GR1 is ONLY the integrator + block + ground (NO neighbours/contact/friction —
+# later GR slices). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(grain_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE
