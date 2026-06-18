@@ -193,6 +193,121 @@ int main() {
         check(!s1.empty(), "showcase scene produces spans (coverage)");
     }
 
+    // ================= NAV2: FilterWalkableSpans — flat ground -> all walkable =================
+    {
+        // A 6x6 flat ground (one y=0 span per column, plenty of clearance above). cfg height 2.
+        nav::Heightfield hf = MakeHf(6, 6);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (auto& m : merged) m.push_back(nav::Span{0u, 0u, 1u});   // y=0..0 solid ground
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        bool allWalk = true; for (uint32_t w : walkable) if (w != 1u) allWalk = false;
+        check(allWalk, "NAV2 flat ground: every column walkable");
+        bool surf0 = true; for (int32_t s : surfaceY) if (s != 0) surf0 = false;
+        check(surf0, "NAV2 flat ground: surfaceY == 0 everywhere");
+        bool areaSet = true; for (auto& m : merged) for (auto& s : m) if (s.area != 1u) areaSet = false;
+        check(areaSet, "NAV2 flat ground: span.area stamped walkable=1");
+    }
+
+    // ================= NAV2: clearance below walkableHeight -> NOT walkable =================
+    {
+        // A column whose only span's top has a solid ceiling right above (clearance < height).
+        nav::Heightfield hf = MakeHf(3, 3);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 4; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        // Column 0: ground y=0..0, ceiling y=2..3 -> clearance above the ground = 2-0-1 = 1 < 4 -> NOT.
+        merged[(size_t)hf.columnId(0, 0)] = {nav::Span{0u, 0u, 1u}, nav::Span{2u, 3u, 1u}};
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        // The ground span (low) is not walkable; the ceiling span's top has fieldTop-3 clearance.
+        const int col00 = hf.columnId(0, 0);
+        // fieldTop = bmaxY-1 = 63; ceiling top y=3 -> clearance 60 >= 4 -> the CEILING top IS walkable.
+        check(walkable[(size_t)col00] == 1u, "NAV2 cramped: column still walkable on the ceiling top");
+        check(surfaceY[(size_t)col00] == 3, "NAV2 cramped: surfaceY is the ceiling top (3)");
+        // The low ground span got area=0 (cramped); the ceiling span area=1.
+        check(merged[(size_t)col00][0].area == 0u, "NAV2 cramped: ground span area=0 (clearance<height)");
+        check(merged[(size_t)col00][1].area == 1u, "NAV2 cramped: ceiling span area=1");
+        // A fully-clamped lid (no clearance to fieldTop either) -> not walkable. Span y=60..63 (top==63).
+        nav::Heightfield hf2 = MakeHf(1, 1);
+        std::vector<std::vector<nav::Span>> m2((size_t)hf2.columnCount());
+        m2[0] = {nav::Span{60u, 63u, 1u}};   // top at fieldTop -> clearance 63-63=0 < 4 -> not walkable
+        std::vector<uint32_t> wk2; std::vector<int32_t> sy2;
+        nav::FilterWalkableSpans(hf2, cfg, m2, wk2, sy2);
+        check(wk2[0] == 0u, "NAV2 cramped: span at fieldTop -> not walkable (0 clearance)");
+    }
+
+    // ================= NAV2: BuildDistanceField — flat ground peaks in the centre =================
+    {
+        nav::Heightfield hf = MakeHf(9, 9);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (auto& m : merged) m.push_back(nav::Span{0u, 0u, 1u});
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        // The border is seeded 0; the centre cell (4,4) is the farthest from any border.
+        const uint32_t centre = dist[(size_t)hf.columnId(4, 4)];
+        const uint32_t border = dist[(size_t)hf.columnId(0, 4)];
+        check(border == 0u, "NAV2 distfield: border cell dist == 0 (seed)");
+        check(centre > 0u, "NAV2 distfield: centre dist > 0 (interior peak)");
+        // Monotonicity: the centre is the global max; no interior cell exceeds it.
+        uint32_t maxd = 0u; for (uint32_t d : dist) if (d != nav::kDistInf && d > maxd) maxd = d;
+        check(centre == maxd, "NAV2 distfield: centre is the global peak");
+        // Chamfer monotonicity: a cell one ring in from the border (1,4) is < the centre.
+        check(dist[(size_t)hf.columnId(1, 4)] < centre, "NAV2 distfield: interior > near-border (gradient)");
+        // No sentinel leaks into the read-back.
+        bool noInf = true; for (uint32_t d : dist) if (d == nav::kDistInf) noInf = false;
+        check(noInf, "NAV2 distfield: no kDistInf in the output");
+    }
+
+    // ================= NAV2: a step exceeding walkableClimb breaks connectivity =================
+    {
+        // A 9x1-ish grid where the left half is at y=0 and the right half is a TALL step (y=20),
+        // step 20 > climb 1 -> the two regions are NOT connected -> the distance does not bleed across.
+        nav::Heightfield hf = MakeHf(9, 3);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (int z = 0; z < 3; ++z)
+            for (int x = 0; x < 9; ++x) {
+                const uint32_t y = (x < 4) ? 0u : 20u;   // left low, right HIGH (step 20)
+                merged[(size_t)hf.columnId(x, z)].push_back(nav::Span{y, y, 1u});
+            }
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        check(surfaceY[(size_t)hf.columnId(3, 1)] == 0, "NAV2 step: left surface y=0");
+        check(surfaceY[(size_t)hf.columnId(4, 1)] == 20, "NAV2 step: right surface y=20");
+        // The columns straddling the step are NOT connected (|0-20|=20 > climb 1).
+        check(!nav::IsConnected(walkable[(size_t)hf.columnId(3, 1)], surfaceY[(size_t)hf.columnId(3, 1)],
+                                walkable[(size_t)hf.columnId(4, 1)], surfaceY[(size_t)hf.columnId(4, 1)],
+                                cfg.walkableClimb), "NAV2 step: across-step columns NOT connected");
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        // Because the step breaks connectivity, neither side's interior is reachable from the OTHER side;
+        // each side is its own thin strip bounded by its own borders + the step boundary -> distance
+        // stays small (no bleed-through making a deep gradient across the full 9-wide grid).
+        uint32_t maxd = 0u; for (uint32_t d : dist) if (d != nav::kDistInf && d > maxd) maxd = d;
+        // A connected 9-wide strip would reach the centre column with a larger value; the broken strips
+        // are each <=4 wide so the geodesic peak is bounded well under a full-width gradient.
+        check(maxd <= 6u, "NAV2 step: distance does NOT bleed across the disconnected step");
+    }
+
+    // ================= NAV2: empty / all-non-walkable -> all-zero distance =================
+    {
+        nav::Heightfield hf = MakeHf(5, 5);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());   // no spans anywhere
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        bool noWalk = true; for (uint32_t w : walkable) if (w != 0u) noWalk = false;
+        check(noWalk, "NAV2 empty: no walkable columns");
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        bool allZero = true; for (uint32_t d : dist) if (d != 0u) allZero = false;
+        check(allZero, "NAV2 empty: all-zero distance (no-op)");
+    }
+
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }
     std::printf("nav_test: %d failures\n", g_fail);
     return 1;

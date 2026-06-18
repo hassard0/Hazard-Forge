@@ -275,4 +275,165 @@ inline std::vector<NavTri> MakeShowcaseTriangles(const Heightfield& hf) {
     return tris;
 }
 
+// =================================================================================================
+// Slice NAV2 — WALKABLE FILTER + INTEGER DISTANCE FIELD (additive over the NAV1 heightfield above).
+// Pure integer (NO <cmath>, NO float, NO int64, NO backend symbols). The CPU reference the GPU
+// nav_filter.comp / nav_distance.comp shaders copy VERBATIM + memcmp bit-identical against. Operates
+// on the NAV1 MERGED per-column spans (MergeColumnSpans) so clearance-above is correct.
+// =================================================================================================
+
+// ----- WalkableConfig: the agent walkability parameters (voxel units) ----------------------------
+// walkableHeight = the min clearance (in voxel-y) an agent needs to stand on a span's top (the gap to
+// the next solid span above, or to the heightfield top, must be >= this). walkableClimb = the max
+// step height (in voxel-y) an agent can climb between two adjacent walkable columns (the 4-neighbour
+// max-step connectivity test). Both pure integer compares (the fpx.h::AabbOverlap discipline).
+struct WalkableConfig {
+    int walkableHeight = 1;   // min vertical clearance above a walkable surface (voxels)
+    int walkableClimb = 1;    // max step between adjacent walkable surfaces (voxels)
+};
+
+// A sentinel "infinity" distance for the chamfer seed (a large int32, far inside int32 range so
+// dist+3 never overflows). The grid is small (w,h <= a few thousand) and the chamfer weights are 2/3,
+// so a true geodesic distance is bounded by ~3*(w+h) << kDistInf; kDistInf is purely the unreachable
+// seed for walkable cells before the sweeps relax them.
+static constexpr uint32_t kDistInf = 0x3FFFFFFFu;   // ~1.07e9, < INT32_MAX; dist+3 stays in int32
+
+// ----- FilterWalkableSpans: mark walkable spans + derive the per-column walkable surface ----------
+// Given the NAV1 heightfield and, PER COLUMN, that column's MERGED spans (MergeColumnSpans output,
+// sorted-by-ymin non-overlapping), for each column:
+//   1) Walk its merged spans from TOP to BOTTOM. A span's TOP is a WALKABLE surface iff the clearance
+//      to the next solid span ABOVE it (gap = aboveSpan.ymin - thisSpan.ymax - 1), or to the
+//      heightfield top (gap = (bmaxY-1) - thisSpan.ymax) if it is the topmost span, is >=
+//      walkableHeight. Set span.area = 1 (walkable) else 0 (mutates mergedSpansPerColumn in place).
+//   2) walkable[col] = 1 iff the column has >= 1 walkable span; surfaceY[col] = the TOP walkable
+//      span's top-y (ymax) — the topmost walkable surface, the cell the distance field uses (0 if no
+//      walkable span, and walkable[col]==0 marks it not a surface).
+// Then a SECOND pass applies the 4-neighbour max-step CONNECTIVITY test: a walkable column is
+// CONNECTED to a neighbour iff that neighbour is walkable AND abs(surfaceY[col]-surfaceY[nbr]) <=
+// walkableClimb. A walkable column with NO connected walkable neighbour on a side borders the
+// non-walkable region (a distance-field seed comes from the BuildDistanceField border/non-walkable
+// rule below; connectivity is consumed there to keep the distance GEODESIC). Pure integer. The shader
+// nav_filter.comp computes walkable[]+surfaceY[] per thread (one thread per column).
+//
+// mergedSpansPerColumn: a vector of size hf.columnCount(); entry [col] is that column's merged spans
+// (already MergeColumnSpans'd). walkable[] / surfaceY[] are (re)sized to columnCount() and filled.
+inline void FilterWalkableSpans(const Heightfield& hf, const WalkableConfig& cfg,
+                                std::vector<std::vector<Span>>& mergedSpansPerColumn,
+                                std::vector<uint32_t>& walkable,
+                                std::vector<int32_t>& surfaceY) {
+    const size_t nCols = (size_t)hf.columnCount();
+    walkable.assign(nCols, 0u);
+    surfaceY.assign(nCols, 0);
+    const int32_t fieldTop = hf.bmaxY - 1;   // inclusive top voxel-y of the heightfield
+
+    for (size_t c = 0; c < nCols; ++c) {
+        std::vector<Span>& spans = mergedSpansPerColumn[c];
+        // Merged spans are sorted ascending by ymin (NAV1::MergeColumnSpans). Walk TOP -> BOTTOM (the
+        // last entry is the highest span). For span i, the span ABOVE is span i+1 (higher ymin).
+        int32_t topWalkableY = 0;
+        bool anyWalkable = false;
+        for (size_t i = spans.size(); i-- > 0;) {
+            Span& s = spans[i];
+            int32_t clearance;
+            if (i + 1 < spans.size()) {
+                // Gap to the next solid span above (its ymin - this ymax - 1).
+                clearance = (int32_t)spans[i + 1].ymin - (int32_t)s.ymax - 1;
+            } else {
+                // Topmost span: clearance to the heightfield top.
+                clearance = fieldTop - (int32_t)s.ymax;
+            }
+            const bool isWalkable = clearance >= cfg.walkableHeight;
+            s.area = isWalkable ? 1u : 0u;
+            if (isWalkable && !anyWalkable) {
+                // The first walkable surface seen walking top->bottom IS the topmost walkable surface.
+                topWalkableY = (int32_t)s.ymax;
+                anyWalkable = true;
+            }
+        }
+        if (anyWalkable) {
+            walkable[c] = 1u;
+            surfaceY[c] = topWalkableY;
+        }
+    }
+    // NOTE: the 4-neighbour max-step CONNECTIVITY test (abs(surfaceY[col]-surfaceY[nbr]) <=
+    // walkableClimb) is applied lazily inside BuildDistanceField (a neighbour is only traversed if
+    // walkable AND connected), so the distance is geodesic over the walkable surface. surfaceY[] +
+    // walkable[] are the inputs that test needs; no separate connectivity buffer is materialized
+    // (YAGNI — the spec's connectivity is a property of the distance sweep, not a stored array).
+    (void)cfg;
+}
+
+// ----- IsConnected: the 4-neighbour max-step connectivity predicate (pure integer) ----------------
+// Two walkable columns a,b (adjacent) are CONNECTED iff both walkable AND the step between their
+// surfaces is within climb: abs(surfaceY[a]-surfaceY[b]) <= walkableClimb. VERBATIM the shader test.
+inline bool IsConnected(uint32_t walkA, int32_t surfA, uint32_t walkB, int32_t surfB, int32_t climb) {
+    if (walkA == 0u || walkB == 0u) return false;
+    int32_t d = surfA - surfB;
+    if (d < 0) d = -d;
+    return d <= climb;
+}
+
+// ----- BuildDistanceField: the integer two-pass chamfer distance transform --------------------------
+// Over the w x h walkable grid, compute dist[col] = the integer chamfer distance from each walkable
+// cell to the nearest non-walkable / border / non-connected boundary. Seed: non-walkable cells (and
+// the grid border) = 0; walkable cells = kDistInf. Two sweeps (the standard Recast integer chamfer,
+// cardinal weight 2 / diagonal weight 3, NO sqrt, NO int64):
+//   FORWARD  row-major TL->BR: relax against the already-visited up/left neighbours (W, NW, N, NE).
+//   BACKWARD reverse  BR->TL: relax against the down/right neighbours (E, SE, S, SW).
+// A neighbour is only traversed if it is walkable AND CONNECTED to the cell (the max-step test) — so
+// the distance is GEODESIC over the walkable surface, not Euclidean-through-walls. Deterministic
+// single-thread serial -> bit-exact (the nav_raster_scan single-thread mirror). Output dist[] (w*h).
+inline void BuildDistanceField(const Heightfield& hf, const WalkableConfig& cfg,
+                               const std::vector<uint32_t>& walkable,
+                               const std::vector<int32_t>& surfaceY,
+                               std::vector<uint32_t>& dist) {
+    const int w = hf.w, h = hf.h;
+    const size_t nCols = (size_t)hf.columnCount();
+    dist.assign(nCols, 0u);
+    const int32_t climb = cfg.walkableClimb;
+
+    // Seed: walkable interior = kDistInf, everything else (non-walkable OR border) = 0.
+    for (int z = 0; z < h; ++z)
+        for (int x = 0; x < w; ++x) {
+            const size_t c = (size_t)hf.columnId(x, z);
+            const bool border = (x == 0 || z == 0 || x == w - 1 || z == h - 1);
+            dist[c] = (walkable[c] != 0u && !border) ? kDistInf : 0u;
+        }
+
+    const uint32_t kCard = 2u, kDiag = 3u;
+    // Relax dist[c] against neighbour (nx,nz) with weight wgt IF the neighbour is walkable+connected.
+    auto relax = [&](size_t c, int cx, int cz, int nx, int nz, uint32_t wgt) {
+        if (nx < 0 || nz < 0 || nx >= w || nz >= h) return;
+        const size_t nc = (size_t)hf.columnId(nx, nz);
+        if (!IsConnected(walkable[c], surfaceY[c], walkable[nc], surfaceY[nc], climb)) return;
+        const uint32_t cand = dist[nc] + wgt;
+        if (cand < dist[c]) dist[c] = cand;
+    };
+
+    // FORWARD sweep TL->BR: up/left neighbours (W, NW, N, NE) already finalized this pass.
+    for (int z = 0; z < h; ++z)
+        for (int x = 0; x < w; ++x) {
+            const size_t c = (size_t)hf.columnId(x, z);
+            if (dist[c] == 0u) continue;   // a seed (0) can only stay 0
+            relax(c, x, z, x - 1, z,     kCard);   // W
+            relax(c, x, z, x - 1, z - 1, kDiag);   // NW
+            relax(c, x, z, x,     z - 1, kCard);   // N
+            relax(c, x, z, x + 1, z - 1, kDiag);   // NE
+        }
+    // BACKWARD sweep BR->TL: down/right neighbours (E, SE, S, SW).
+    for (int z = h - 1; z >= 0; --z)
+        for (int x = w - 1; x >= 0; --x) {
+            const size_t c = (size_t)hf.columnId(x, z);
+            if (dist[c] == 0u) continue;
+            relax(c, x, z, x + 1, z,     kCard);   // E
+            relax(c, x, z, x + 1, z + 1, kDiag);   // SE
+            relax(c, x, z, x,     z + 1, kCard);   // S
+            relax(c, x, z, x - 1, z + 1, kDiag);   // SW
+        }
+    // Any walkable cell still at kDistInf (an isolated walkable island unreachable from a boundary)
+    // is clamped to 0 so the read-back never carries the sentinel (deterministic, documented).
+    for (size_t c = 0; c < nCols; ++c)
+        if (dist[c] == kDistInf) dist[c] = 0u;
+}
+
 }  // namespace hf::nav
