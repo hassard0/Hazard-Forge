@@ -565,6 +565,125 @@ int main() {
         check(polys.empty(), "NAV4 empty: 0 polys (no-op)");
     }
 
+    // ================= NAV5: integer A* — a 4-node line A-B-C-D -> the full corridor + cost =========
+    {
+        // 4 polys in a line; nbr links A<->B<->C<->D. Centroids spaced 10 apart on x (Manhattan = 10/hop).
+        // idx[]/region/pad are unused by FindPath; only nbr[] (the graph) + the centroid arrays matter.
+        std::vector<nav::Poly> polys(4);
+        auto link = [&](uint32_t a, int ea, uint32_t b, int eb) {
+            polys[a].nbr[ea] = b; polys[b].nbr[eb] = a;
+        };
+        for (auto& p : polys) { p.nbr[0] = nav::kNoNeighbour; p.nbr[1] = nav::kNoNeighbour; p.nbr[2] = nav::kNoNeighbour; }
+        link(0, 0, 1, 0); link(1, 1, 2, 0); link(2, 1, 3, 0);
+        std::vector<int32_t> cx = {0, 10, 20, 30}, cz = {0, 0, 0, 0};
+        std::vector<uint32_t> corridor;
+        int32_t cost = nav::FindPath(polys, cx, cz, 0u, 3u, corridor);
+        check(corridor.size() == 4u, "NAV5 line: corridor of 4 polys");
+        bool seq = corridor.size() == 4u && corridor[0] == 0u && corridor[1] == 1u &&
+                   corridor[2] == 2u && corridor[3] == 3u;
+        check(seq, "NAV5 line: corridor is exactly A,B,C,D");
+        check(cost == 30, "NAV5 line: total cost == 30 (3 hops * 10)");
+        // SelectStartGoal on this single-component line -> start=lowest id 0, goal=farthest 3.
+        std::vector<uint32_t> comp;
+        check(nav::ConnectedComponents(polys, comp) == 1u, "NAV5 line: 1 connected component");
+        uint32_t s, g;
+        check(nav::SelectStartGoal(polys, cx, cz, s, g) && s == 0u && g == 3u,
+              "NAV5 line: SelectStartGoal start=0 goal=3 (farthest)");
+    }
+
+    // ================= NAV5: two routes -> the LOWER-cost one (tie -> lowest id) =====================
+    {
+        // Diamond: 0 -> {1, 2} -> 3. Route via 1 is cheaper than via 2 -> corridor 0,1,3.
+        std::vector<nav::Poly> polys(4);
+        for (auto& p : polys) { p.nbr[0] = nav::kNoNeighbour; p.nbr[1] = nav::kNoNeighbour; p.nbr[2] = nav::kNoNeighbour; }
+        auto link = [&](uint32_t a, int ea, uint32_t b, int eb) { polys[a].nbr[ea] = b; polys[b].nbr[eb] = a; };
+        link(0, 0, 1, 0); link(0, 1, 2, 0); link(1, 1, 3, 0); link(2, 1, 3, 1);
+        // Centroids: 0 at (0,0); 1 at (5,0) [near-straight]; 2 at (5,20) [detour]; 3 at (10,0).
+        std::vector<int32_t> cx = {0, 5, 5, 10}, cz = {0, 0, 20, 0};
+        std::vector<uint32_t> corridor;
+        int32_t cost = nav::FindPath(polys, cx, cz, 0u, 3u, corridor);
+        bool viaOne = corridor.size() == 3u && corridor[0] == 0u && corridor[1] == 1u && corridor[2] == 3u;
+        check(viaOne, "NAV5 two-route: picks the lower-cost route 0,1,3");
+        check(cost == 10, "NAV5 two-route: cost == 10 (0->1->3 Manhattan)");
+
+        // Tie -> lowest id: make both routes equal cost; A* (lowest-id tie-break) takes via 1.
+        std::vector<int32_t> cx2 = {0, 5, 5, 10}, cz2 = {0, 0, 0, 0};   // 1 and 2 identical -> equal cost
+        std::vector<uint32_t> cor2;
+        nav::FindPath(polys, cx2, cz2, 0u, 3u, cor2);
+        bool tieLow = cor2.size() == 3u && cor2[1] == 1u;
+        check(tieLow, "NAV5 two-route tie: equal-cost routes -> lowest-id node (1, not 2)");
+    }
+
+    // ================= NAV5: start == goal -> single-node corridor ===================================
+    {
+        std::vector<nav::Poly> polys(2);
+        for (auto& p : polys) { p.nbr[0] = nav::kNoNeighbour; p.nbr[1] = nav::kNoNeighbour; p.nbr[2] = nav::kNoNeighbour; }
+        std::vector<int32_t> cx = {0, 5}, cz = {0, 0};
+        std::vector<uint32_t> corridor;
+        int32_t cost = nav::FindPath(polys, cx, cz, 1u, 1u, corridor);
+        check(corridor.size() == 1u && corridor[0] == 1u, "NAV5 start==goal: single-node corridor {goal}");
+        check(cost == 0, "NAV5 start==goal: cost 0");
+    }
+
+    // ================= NAV5: unreachable goal -> empty corridor ======================================
+    {
+        // Two disjoint components: {0,1} and {2,3}. Goal 2 is unreachable from start 0.
+        std::vector<nav::Poly> polys(4);
+        for (auto& p : polys) { p.nbr[0] = nav::kNoNeighbour; p.nbr[1] = nav::kNoNeighbour; p.nbr[2] = nav::kNoNeighbour; }
+        auto link = [&](uint32_t a, int ea, uint32_t b, int eb) { polys[a].nbr[ea] = b; polys[b].nbr[eb] = a; };
+        link(0, 0, 1, 0); link(2, 0, 3, 0);
+        std::vector<int32_t> cx = {0, 10, 100, 110}, cz = {0, 0, 0, 0};
+        std::vector<uint32_t> corridor;
+        int32_t cost = nav::FindPath(polys, cx, cz, 0u, 2u, corridor);
+        check(corridor.empty(), "NAV5 unreachable: empty corridor (no path across components)");
+        check(cost == 0, "NAV5 unreachable: cost 0 (no path)");
+        std::vector<uint32_t> comp;
+        check(nav::ConnectedComponents(polys, comp) == 2u, "NAV5 unreachable: 2 connected components");
+    }
+
+    // ================= NAV5: determinism + corridor adjacency-valid ==================================
+    {
+        // A 3x3 grid of polys (9 nodes) with 4-neighbour adjacency packed into nbr[0..2]+ (we only have
+        // 3 nbr slots per triangle, so use a sparse chain-with-branches graph that still exercises A*).
+        // Chain 0-1-2-3-4 plus a shortcut 0-4 that is LONGER -> the chain wins; deterministic two runs.
+        std::vector<nav::Poly> polys(5);
+        for (auto& p : polys) { p.nbr[0] = nav::kNoNeighbour; p.nbr[1] = nav::kNoNeighbour; p.nbr[2] = nav::kNoNeighbour; }
+        auto link = [&](uint32_t a, int ea, uint32_t b, int eb) { polys[a].nbr[ea] = b; polys[b].nbr[eb] = a; };
+        link(0, 0, 1, 0); link(1, 1, 2, 0); link(2, 1, 3, 0); link(3, 1, 4, 0);
+        link(0, 1, 4, 1);   // shortcut edge, but its Manhattan cost is large (detour centroid).
+        std::vector<int32_t> cx = {0, 4, 8, 12, 16}, cz = {0, 0, 0, 0, 0};
+        // Make the 0-4 shortcut expensive by centroids: it's still |0-16|=16 vs chain 4+4+4+4=16 -> tie,
+        // lowest-id tie-break expands node 1 first, so the chain is taken (corridor longer but cost ties).
+        std::vector<uint32_t> c1, c2;
+        int32_t cost1 = nav::FindPath(polys, cx, cz, 0u, 4u, c1);
+        int32_t cost2 = nav::FindPath(polys, cx, cz, 0u, 4u, c2);
+        bool same = c1.size() == c2.size() && cost1 == cost2 &&
+                    (c1.empty() || std::memcmp(c1.data(), c2.data(), c1.size() * sizeof(uint32_t)) == 0);
+        check(same, "NAV5 determinism: two FindPath runs byte-identical");
+        // Adjacency-valid: every consecutive corridor pair is adjacent in the poly graph; ends correct.
+        bool adjValid = c1.size() >= 2u && c1.front() == 0u && c1.back() == 4u;
+        for (size_t i = 0; i + 1 < c1.size() && adjValid; ++i) {
+            uint32_t a = c1[i], b = c1[i + 1];
+            bool adj = false;
+            for (int e = 0; e < 3; ++e) if (polys[a].nbr[e] == b) adj = true;
+            if (!adj) adjValid = false;
+        }
+        check(adjValid, "NAV5 validity: corridor adjacency-valid, start=0 end=4, len>=2");
+    }
+
+    // ================= NAV5: ComputePolyCentroids — integer average of contour-local verts ===========
+    {
+        // One poly, idx={0,1,2}; contour verts (0,0),(6,0),(0,9) -> centroid (2,3) (truncating /3).
+        std::vector<nav::Poly> polys(1);
+        polys[0].idx[0] = 0u; polys[0].idx[1] = 1u; polys[0].idx[2] = 2u;
+        polys[0].nbr[0] = nav::kNoNeighbour; polys[0].nbr[1] = nav::kNoNeighbour; polys[0].nbr[2] = nav::kNoNeighbour;
+        std::vector<int32_t> flat = {0, 0, 6, 0, 0, 9};   // (x,z) interleaved
+        std::vector<uint32_t> base = {0u};
+        std::vector<int32_t> cx, cz;
+        nav::ComputePolyCentroids(polys, flat, base, cx, cz);
+        check(cx.size() == 1u && cx[0] == 2 && cz[0] == 3, "NAV5 centroid: (0,0)+(6,0)+(0,9)/3 == (2,3)");
+    }
+
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }
     std::printf("nav_test: %d failures\n", g_fail);
     return 1;

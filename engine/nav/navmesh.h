@@ -952,4 +952,213 @@ inline void BuildPolyMesh(const std::vector<Contour>& contours, std::vector<Poly
     }
 }
 
+// =================================================================================================
+// Slice NAV5 — INTEGER A* PATHFINDING over the NAV4 poly adjacency graph (the FLAGSHIP HEADLINE).
+// Additive over NAV1-NAV4 (their functions stay byte-identical). Pure integer (NO <cmath>, NO float,
+// NO int64 on the bit-exact path — int32 only; see the overflow bound below). The CPU reference the
+// GPU shaders/nav_astar.comp.hlsl copies VERBATIM + memcmp's bit-identical against. Runs a fully
+// INTEGER A* (integer cost graph + integer-keyed deterministic frontier + lowest-id tie-break) over
+// the NAV4 polys (nodes) + per-edge adjacency (edges) to produce a CORRIDOR (the poly-id sequence
+// start->goal) + total integer cost — bit-exact, replayable, cross-platform-identical pathfinding
+// (the thing UE5's float Detour cannot guarantee bit-for-bit across machines; pairs with FPX5 lockstep).
+//
+// THE COST + HEURISTIC (locked, DOCUMENTED — the determinism + optimality contract):
+//   * Node anchor = the poly's INTEGER CENTROID: the truncating-integer average of its 3 contour
+//     vertices' (x,z) coords (ComputePolyCentroids below). The poly idx[] are CONTOUR-LOCAL, so the
+//     centroid needs the poly's owning-contour vertex base (the per-poly vertex base array, the same
+//     layout the GPU shader receives).
+//   * Edge cost g and heuristic h are BOTH the MANHATTAN distance |dx| + |dz| between centroids.
+//     Manhattan is a true metric -> h is ADMISSIBLE *and* CONSISTENT (h(n) <= cost(n,n') + h(n') and
+//     h(goal)=0), so A* is OPTIMAL; and integer Manhattan needs NO sqrt and NO int64 (the showcase
+//     corner coords <= 32 -> centroid coords in [0,32] -> a single edge cost <= 64, a whole-corridor
+//     cost <= 64*polys << INT32_MAX), so nav_astar.comp stays PURE INT32 / Metal-native (the NAV3/NAV4
+//     int32 convention, unlike fpx's int64). (Squared-Euclidean was rejected: it is NOT a metric, so
+//     it would break admissibility — Manhattan is the deterministic, optimal, int32-safe choice.)
+//   * Frontier: a LINEAR MIN-SCAN over the open set (the graph is small; obviously deterministic). Pop
+//     the open node with the lowest f = g + h, tie-break LOWEST poly id. came_from[] + g[]; reconstruct
+//     the corridor by walking came_from goal->start then reversing. Single-thread serial -> bit-exact.
+// =================================================================================================
+
+// A sentinel "infinity" cost for the A* g/f arrays (a large int32, far inside int32 range so g+h never
+// overflows). The Manhattan cost of any corridor in the bounded showcase is tiny (<< kPathInf); this is
+// purely the unreached-node seed. came_from uses kNoCameFrom for "no predecessor".
+static constexpr int32_t kPathInf     = 0x3FFFFFFF;   // ~1.07e9, < INT32_MAX; g+h stays in int32
+static constexpr uint32_t kNoCameFrom = 0xFFFFFFFFu;  // came_from sentinel (no predecessor / start)
+
+// ----- ComputePolyCentroids: the integer per-poly centroid anchors (the A* cost anchor) -----------
+// For each poly, centroid = the truncating-integer average of its 3 contour vertices' (x,z). The poly
+// idx[] are CONTOUR-LOCAL indices, so polyVertBase[p] is the base (into the flat contour-vertex array)
+// of poly p's owning contour — i.e. flatVerts[(polyVertBase[p] + idx[k]) * 2 + {0,1}] is vertex k's
+// (x,z). (polyVertBase mirrors the GPU layout: each region's polys share that region's gVOff[] base.)
+// Pure int32. The shader copies THIS verbatim. cx/cz are sized to polys.size().
+inline void ComputePolyCentroids(const std::vector<Poly>& polys,
+                                 const std::vector<int32_t>& flatVerts,
+                                 const std::vector<uint32_t>& polyVertBase,
+                                 std::vector<int32_t>& cx, std::vector<int32_t>& cz) {
+    const size_t nP = polys.size();
+    cx.assign(nP, 0); cz.assign(nP, 0);
+    for (size_t p = 0; p < nP; ++p) {
+        const uint32_t vb = polyVertBase[p];
+        int32_t sx = 0, sz = 0;
+        for (int k = 0; k < 3; ++k) {
+            const uint32_t vi = vb + polys[p].idx[k];
+            sx += flatVerts[(size_t)vi * 2u];
+            sz += flatVerts[(size_t)vi * 2u + 1u];
+        }
+        cx[p] = sx / 3;   // truncating integer average (deterministic).
+        cz[p] = sz / 3;
+    }
+}
+
+// ----- ManhattanDist: the integer cost/heuristic metric (centroid->centroid) ----------------------
+// |dx| + |dz| between two integer centroids. A true metric (admissible + consistent as a heuristic).
+// Pure int32 (bounded coords). The shader copies THIS verbatim.
+inline int32_t ManhattanDist(int32_t ax, int32_t az, int32_t bx, int32_t bz) {
+    int32_t dx = ax - bx; if (dx < 0) dx = -dx;
+    int32_t dz = az - bz; if (dz < 0) dz = -dz;
+    return dx + dz;
+}
+
+// ----- ConnectedComponents: the deterministic flood over poly adjacency (start/goal selection input) -
+// Label each poly with its connected-component id (a deterministic flood over the NAV4 per-edge
+// adjacency, ascending poly-id seed order so the labels are fixed). comp[p] in [0, nComp); returns
+// nComp. (NAV4 triangulates each region independently, so components are per-region — no inter-region
+// portals; NAV5 paths within the LARGEST component, the spec's documented scope.) Pure integer,
+// single-thread serial -> deterministic. The shader copies THIS verbatim.
+inline uint32_t ConnectedComponents(const std::vector<Poly>& polys, std::vector<uint32_t>& comp) {
+    const size_t nP = polys.size();
+    comp.assign(nP, kNoCameFrom);   // unassigned sentinel
+    uint32_t next = 0u;
+    // A fixed-capacity integer stack flood (ascending seed order, fixed neighbour order 0,1,2).
+    std::vector<uint32_t> stack;
+    for (uint32_t s = 0; s < (uint32_t)nP; ++s) {
+        if (comp[s] != kNoCameFrom) continue;
+        const uint32_t c = next++;
+        comp[s] = c;
+        stack.clear();
+        stack.push_back(s);
+        while (!stack.empty()) {
+            const uint32_t p = stack.back(); stack.pop_back();
+            for (int e = 0; e < 3; ++e) {
+                const uint32_t q = polys[p].nbr[e];
+                if (q == kNoNeighbour || q >= (uint32_t)nP) continue;
+                if (comp[q] != kNoCameFrom) continue;
+                comp[q] = c;
+                stack.push_back(q);
+            }
+        }
+    }
+    return next;
+}
+
+// ----- SelectStartGoal: the deterministic start + goal within the LARGEST component ----------------
+// Pick the LARGEST connected component (tie -> the one with the LOWEST min poly id); start = the lowest
+// poly id in it; goal = the poly in it with the MAXIMUM integer (Manhattan) centroid distance from start
+// (tie -> lowest id). Pure deterministic. Returns false (start=goal=0) if there are no polys. cx/cz are
+// the ComputePolyCentroids output. The shader copies THIS verbatim.
+inline bool SelectStartGoal(const std::vector<Poly>& polys, const std::vector<int32_t>& cx,
+                            const std::vector<int32_t>& cz, uint32_t& start, uint32_t& goal) {
+    start = 0u; goal = 0u;
+    const size_t nP = polys.size();
+    if (nP == 0) return false;
+    std::vector<uint32_t> comp;
+    const uint32_t nComp = ConnectedComponents(polys, comp);
+    if (nComp == 0u) return false;
+    // Per-component size + lowest min poly id (the first poly with that label, scanning ascending).
+    std::vector<uint32_t> sizeOf((size_t)nComp, 0u);
+    std::vector<uint32_t> minIdOf((size_t)nComp, kNoCameFrom);
+    for (uint32_t p = 0; p < (uint32_t)nP; ++p) {
+        const uint32_t c = comp[p];
+        ++sizeOf[c];
+        if (minIdOf[c] == kNoCameFrom) minIdOf[c] = p;   // first (lowest) poly id of this component.
+    }
+    // Largest component; tie -> lowest min poly id.
+    uint32_t bestC = 0u;
+    for (uint32_t c = 1u; c < nComp; ++c) {
+        if (sizeOf[c] > sizeOf[bestC] ||
+            (sizeOf[c] == sizeOf[bestC] && minIdOf[c] < minIdOf[bestC]))
+            bestC = c;
+    }
+    start = minIdOf[bestC];
+    // Goal = the poly in bestC with max Manhattan centroid distance from start (tie -> lowest id).
+    goal = start;
+    int32_t bestD = -1;
+    for (uint32_t p = 0; p < (uint32_t)nP; ++p) {
+        if (comp[p] != bestC) continue;
+        const int32_t d = ManhattanDist(cx[start], cz[start], cx[p], cz[p]);
+        if (d > bestD) { bestD = d; goal = p; }   // strict > -> ties keep the LOWEST id (ascending scan).
+    }
+    return true;
+}
+
+// ----- FindPath: the deterministic INTEGER A* (the headline) --------------------------------------
+// Runs A* over the poly adjacency graph from start to goal. Nodes = polys; edges = nbr[]; edge cost +
+// heuristic = ManhattanDist between centroids (cx/cz). Frontier = a linear min-scan (lowest f=g+h, tie
+// -> lowest poly id). Output: corridor = the poly-id sequence start->goal (empty if unreachable; a
+// single {start} if start==goal); returns the total integer g-cost at goal (0 for start==goal,
+// kPathInf-sentinel-free; the corridor being empty signals "no path"). Pure int32, single-thread serial
+// -> bit-exact CPU<->GPU<->both backends. The shader copies THIS body VERBATIM.
+inline int32_t FindPath(const std::vector<Poly>& polys, const std::vector<int32_t>& cx,
+                        const std::vector<int32_t>& cz, uint32_t start, uint32_t goal,
+                        std::vector<uint32_t>& corridor) {
+    corridor.clear();
+    const size_t nP = polys.size();
+    if (nP == 0u || start >= (uint32_t)nP || goal >= (uint32_t)nP) return 0;
+    if (start == goal) { corridor.push_back(start); return 0; }
+
+    std::vector<int32_t>  g((size_t)nP, kPathInf);       // best-known cost from start.
+    std::vector<uint8_t>  open((size_t)nP, 0u);          // 1 = node is in the open set.
+    std::vector<uint8_t>  closed((size_t)nP, 0u);        // 1 = node already expanded.
+    std::vector<uint32_t> cameFrom((size_t)nP, kNoCameFrom);
+
+    g[start] = 0;
+    open[start] = 1u;
+
+    while (true) {
+        // Pop the open node with the lowest f = g + h, tie-break LOWEST poly id (the linear min-scan).
+        uint32_t cur = kNoCameFrom;
+        int32_t bestF = kPathInf;
+        for (uint32_t p = 0; p < (uint32_t)nP; ++p) {
+            if (open[p] == 0u) continue;
+            const int32_t h = ManhattanDist(cx[p], cz[p], cx[goal], cz[goal]);
+            const int32_t f = g[p] + h;
+            if (cur == kNoCameFrom || f < bestF) { bestF = f; cur = p; }   // ascending scan -> tie keeps lowest id.
+        }
+        if (cur == kNoCameFrom) break;   // open empty -> goal unreachable.
+        if (cur == goal) break;          // goal popped -> done (consistent h -> optimal on pop).
+
+        open[cur] = 0u;
+        closed[cur] = 1u;
+
+        // Relax neighbours (fixed edge order 0,1,2).
+        for (int e = 0; e < 3; ++e) {
+            const uint32_t nb = polys[cur].nbr[e];
+            if (nb == kNoNeighbour || nb >= (uint32_t)nP) continue;
+            if (closed[nb] != 0u) continue;
+            const int32_t step = ManhattanDist(cx[cur], cz[cur], cx[nb], cz[nb]);
+            const int32_t tentative = g[cur] + step;
+            if (tentative < g[nb]) {
+                g[nb] = tentative;
+                cameFrom[nb] = cur;
+                open[nb] = 1u;
+            }
+        }
+    }
+
+    // Reconstruct: if the goal was reached (g[goal] < kPathInf), walk came_from goal->start then reverse.
+    if (g[goal] >= kPathInf) return 0;   // unreachable -> empty corridor.
+    std::vector<uint32_t> rev;
+    uint32_t node = goal;
+    // Guard the walk (<= nP steps) so a malformed came_from chain can't loop forever.
+    for (size_t guard = 0; guard <= nP; ++guard) {
+        rev.push_back(node);
+        if (node == start) break;
+        node = cameFrom[node];
+        if (node == kNoCameFrom) { rev.clear(); break; }   // broken chain -> no corridor.
+    }
+    if (rev.empty() || rev.back() != start) { corridor.clear(); return 0; }
+    for (size_t i = rev.size(); i-- > 0;) corridor.push_back(rev[i]);
+    return g[goal];
+}
+
 }  // namespace hf::nav
