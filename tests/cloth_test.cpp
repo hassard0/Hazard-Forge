@@ -698,6 +698,82 @@ int main() {
               "CL5 rollback: mispredicted state DIFFERS from authority (negative control — the divergence was real)");
     }
 
+    // ================= CL6: render-only float helpers (ClothVertToWorld + ClothToRenderMesh) =========
+    // The render mesh DERIVES from the bit-exact lattice (provenance) — these only test the float
+    // accessors (scale + counts + flat-sheet consistent normals); the render itself is golden-verified.
+    {
+        // --- ClothVertToWorld: a known integer Q16.16 position -> the expected float world position. ---
+        const cloth::FxVec3 p{FromInt(3), -FromInt(2), FromInt(7)};   // (3, -2, 7) in Q16.16
+        const math::Vec3 w = cloth::ClothVertToWorld(p);
+        check(w.x == 3.0f && w.y == -2.0f && w.z == 7.0f,
+              "CL6 ClothVertToWorld: integer pos / kOne -> exact float world position");
+        // A fractional Q16.16 value (half a unit) -> 0.5f exactly (kOne/2 is exactly representable).
+        const cloth::FxVec3 phalf{kOne / 2, 0, 0};
+        const math::Vec3 wh = cloth::ClothVertToWorld(phalf);
+        check(wh.x == 0.5f, "CL6 ClothVertToWorld: half-unit Q16.16 -> 0.5f");
+
+        // --- ClothToRenderMesh: a flat W x H sheet -> (W-1)(H-1)*2 triangles + W*H vertices, consistent
+        //     normals (a flat sheet in a plane -> every per-vertex normal == the sheet's plane normal). ---
+        cloth::ClothGrid grid;
+        grid.W = 5; grid.H = 4;
+        grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(10), 0};   // a flat sheet lying in the z=0 plane (XY)
+        const std::vector<cloth::ClothParticle> sheet = cloth::InitGrid(grid);   // flat (no sim run)
+
+        std::vector<cloth::ClothRenderVertex> rv;
+        std::vector<uint32_t> ri;
+        cloth::ClothToRenderMesh(grid, sheet, rv, ri);
+
+        check(rv.size() == (size_t)(grid.W * grid.H), "CL6 ClothToRenderMesh: W*H vertices");
+        check(ri.size() == (size_t)((grid.W - 1) * (grid.H - 1) * 2 * 3),
+              "CL6 ClothToRenderMesh: (W-1)(H-1)*2 triangles (6 indices per cell quad)");
+        // Every index is in range.
+        bool idxInRange = true;
+        for (uint32_t e : ri) if (e >= rv.size()) idxInRange = false;
+        check(idxInRange, "CL6 ClothToRenderMesh: every triangle index in [0, W*H)");
+
+        // Flat sheet lies in the z=0 plane (InitGrid: pos = origin + (c*spacing, -r*spacing, 0)), so every
+        // per-vertex normal is unit length and aligned to +/-Z (the plane normal) — a consistent flat sheet.
+        bool allUnitZ = true;
+        for (const cloth::ClothRenderVertex& v : rv) {
+            const float len = std::sqrt(v.nx*v.nx + v.ny*v.ny + v.nz*v.nz);
+            if (std::abs(len - 1.0f) > 1e-3f) allUnitZ = false;
+            if (std::abs(v.nx) > 1e-3f || std::abs(v.ny) > 1e-3f) allUnitZ = false;  // no X/Y component
+            if (std::abs(std::abs(v.nz) - 1.0f) > 1e-3f) allUnitZ = false;            // |nz| == 1
+        }
+        check(allUnitZ, "CL6 ClothToRenderMesh: flat sheet -> all per-vertex normals unit-length +/-Z");
+
+        // World positions match ClothVertToWorld of the particles (provenance: mesh derives from the lattice).
+        bool posMatch = true;
+        for (int i = 0; i < grid.W * grid.H; ++i) {
+            const math::Vec3 expect = cloth::ClothVertToWorld(sheet[(size_t)i].pos);
+            if (rv[(size_t)i].px != expect.x || rv[(size_t)i].py != expect.y || rv[(size_t)i].pz != expect.z)
+                posMatch = false;
+        }
+        check(posMatch, "CL6 ClothToRenderMesh: vertex positions == ClothVertToWorld(particle pos) (provenance)");
+
+        // Determinism: a second build is byte-identical.
+        std::vector<cloth::ClothRenderVertex> rv2;
+        std::vector<uint32_t> ri2;
+        cloth::ClothToRenderMesh(grid, sheet, rv2, ri2);
+        check(rv.size() == rv2.size() && ri == ri2 &&
+              std::memcmp(rv.data(), rv2.data(), rv.size() * sizeof(cloth::ClothRenderVertex)) == 0,
+              "CL6 ClothToRenderMesh: deterministic (two builds byte-identical)");
+
+        // --- Empty / degenerate no-op: an empty particle array -> zero geometry. ---
+        std::vector<cloth::ClothRenderVertex> ev;
+        std::vector<uint32_t> ei;
+        cloth::ClothGrid emptyGrid;  // W=0,H=0
+        cloth::ClothToRenderMesh(emptyGrid, {}, ev, ei);
+        check(ev.empty() && ei.empty(), "CL6 ClothToRenderMesh: empty grid -> zero geometry (no-op)");
+        // A 1-wide lattice has vertices but NO quads -> zero triangles.
+        cloth::ClothGrid strip; strip.W = 1; strip.H = 5; strip.spacing = kOne;
+        const std::vector<cloth::ClothParticle> stripPs = cloth::InitGrid(strip);
+        std::vector<cloth::ClothRenderVertex> sv; std::vector<uint32_t> si;
+        cloth::ClothToRenderMesh(strip, stripPs, sv, si);
+        check(sv.size() == 5 && si.empty(), "CL6 ClothToRenderMesh: 1xN strip -> verts but 0 triangles");
+    }
+
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
     else std::printf("cloth_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

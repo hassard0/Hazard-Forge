@@ -36,10 +36,12 @@
 // Euler + ground floor-clamp) — READ, NOT modified (cloth is the additive sibling; fpx.h #included
 // read-only + stays byte-unchanged).
 
+#include <cmath>       // CL6 render-only: std::fma / std::sqrt (the float normal math; NOT on the bit-exact sim path)
 #include <cstdint>
 #include <vector>
 
 #include "sim/fpx.h"   // read-only: fx / fxmul / FxVec3 / FxAdd / FxSub / FxScale / kOne / kFrac
+#include "math/math.h" // CL6 render-only: math::Vec3 (ClothVertToWorld output; NOT on the bit-exact sim path)
 
 namespace hf::sim {
 namespace cloth {
@@ -658,6 +660,117 @@ inline std::vector<ClothParticle> RunClothRollback(const ClothGrid& grid,
     for (int t = mispredictTick; t < ticks; ++t)
         SimClothTick(grid, particles, constraints, spheres, authStream, (uint32_t)t, gravity, dt, groundY, iters);
     return particles;
+}
+
+// ===== Slice CL6 — Deterministic GPU Cloth: LIT 3D RENDER helpers (the money-shot, COMPLETES flagship #8) =
+// CL1-CL5 above are STRICT integer / bit-exact (the cloth SIM is fixed-point, NO float). CL6 RENDERS the
+// bit-exact draped cloth as a lit 3D surface — the ONLY float in the cloth arc, and it is RENDER-ONLY,
+// cleanly separated from the sim below this banner. The mesh DERIVES from the bit-exact ClothParticle
+// lattice (StepClothCollide, CL4) -> provenance is exact; only the final raster/shade is float (the
+// MC6/FPX6/NAV6 "FLOAT visresolve-bar"). NO new RHI, NO new shader — the showcase feeds these float
+// vertices into the EXISTING lit-mesh pipeline (lit.vert + lit.frag, scene::MeshVertexLayout).
+//
+// This is the DIRECT TWIN of render/mc.h's RenderVertex / BuildRenderMesh (the MC5/MC6 render-mesh build):
+// ClothVertToWorld = the ONE host float divide (pos / (float)kOne); ClothToRenderMesh = the W x H particle
+// lattice -> a lit triangle mesh (two triangles per cell quad, (W-1)(H-1)*2 tris, W*H verts, per-vertex
+// normals = the normalized average of the adjacent face normals). These touch ZERO bit-exact sim state
+// (they consume a const particle array + grid by value) and add NO backend / RHI symbol (pure host float,
+// header-only). The integer sim (CL1-CL5) stays byte-identical.
+
+// ClothVertToWorld(p): the ONE documented host float crossing — a Q16.16 world position -> a float
+// math::Vec3 world position (pos / (float)kOne). Render-only; NOT used on the bit-exact sim path.
+inline math::Vec3 ClothVertToWorld(const FxVec3& pos) {
+    const float inv = 1.0f / (float)kOne;
+    return math::Vec3{(float)pos.x * inv, (float)pos.y * inv, (float)pos.z * inv};
+}
+
+// A render-ready cloth vertex: world position + smooth per-vertex normal. POD float6 (no padding holes),
+// trivially copied into scene::Vertex (pos/color/uv/normal/tangent) by the showcase — the render/mc.h
+// RenderVertex twin.
+struct ClothRenderVertex {
+    float px, py, pz;   // world position = particle pos / kOne (the ONE host float divide)
+    float nx, ny, nz;   // smooth per-vertex normal (unit length; averaged from adjacent cell-quad faces)
+};
+
+// ClothToRenderMesh(grid, particles, outVerts, outIdx): convert the W x H particle lattice into a lit
+// triangle mesh in the engine's vertex format. ONE vertex per particle (world position = ClothVertToWorld,
+// per-vertex normal = the normalized average of the adjacent cell-quad FACE normals); TWO triangles per
+// cell quad over (W-1)x(H-1) cells, the standard row-major split (a,b,c) + (a,c,d) with
+// a=(r,c), b=(r,c+1), c=(r+1,c+1), d=(r+1,c). outVerts.size() == W*H; outIdx.size() == (W-1)(H-1)*2*3.
+// A degenerate grid (W<2 || H<2 || empty particles) yields ZERO triangles (the empty no-op). Pure +
+// deterministic host float (same particles -> same floats every run); RENDER-ONLY, the sim is untouched.
+//
+// The face normal of a cell quad is normalize(cross(b-a, d-a)) — the cloth's two top corners are pinned
+// and it hangs y-down under gravity, so the lattice winding gives an outward-ish normal; the showcase
+// renders the lit-mesh pipeline double-sided-tolerant (the drape's back-faces are simply darker). std::fma
+// in the cross/length so a CPU shade mirror could reproduce the exact host floats (the visresolve FP
+// discipline, the MC5/MC6 precedent).
+inline void ClothToRenderMesh(const ClothGrid& grid, const std::vector<ClothParticle>& particles,
+                              std::vector<ClothRenderVertex>& outVerts, std::vector<uint32_t>& outIdx) {
+    const int W = grid.W, H = grid.H;
+    outVerts.clear();
+    outIdx.clear();
+    if (W < 1 || H < 1 || (size_t)(W * H) != particles.size() || particles.empty()) return;
+
+    // 1) one vertex per particle at its float world position (the ONE host float divide). Normals start at
+    //    zero and accumulate the adjacent face normals below.
+    outVerts.assign((size_t)(W * H), ClothRenderVertex{0, 0, 0, 0, 0, 0});
+    for (int i = 0; i < W * H; ++i) {
+        const math::Vec3 w = ClothVertToWorld(particles[(size_t)i].pos);
+        outVerts[(size_t)i].px = w.x; outVerts[(size_t)i].py = w.y; outVerts[(size_t)i].pz = w.z;
+    }
+    if (W < 2 || H < 2) return;   // a 1-wide/tall lattice has no quads -> no triangles (still valid verts)
+
+    // 2) two triangles per cell quad over (W-1)x(H-1) cells (row-major split), and accumulate each cell's
+    //    FACE normal onto its 4 corner vertices (so a shared vertex gets the average of its adjacent faces).
+    //    The winding is (a,d,cc) + (a,cc,b) — the FRONT of the rest sheet faces +Z (toward the showcase's
+    //    fixed +Z camera), so a single-sided lit pipeline shows the curtain front (NOT its culled back). The
+    //    face normal cross(d-a, b-a) therefore points +Z on the rest sheet (and follows the drape elsewhere).
+    outIdx.reserve((size_t)((W - 1) * (H - 1) * 6));
+    auto addFaceNormal = [&](uint32_t a, uint32_t d, uint32_t b) {
+        const ClothRenderVertex& va = outVerts[a];
+        const ClothRenderVertex& vd = outVerts[d];
+        const ClothRenderVertex& vb = outVerts[b];
+        const float e1x = vd.px - va.px, e1y = vd.py - va.py, e1z = vd.pz - va.pz;
+        const float e2x = vb.px - va.px, e2y = vb.py - va.py, e2z = vb.pz - va.pz;
+        float nx = std::fma(e1y, e2z, -e1z * e2y);
+        float ny = std::fma(e1z, e2x, -e1x * e2z);
+        float nz = std::fma(e1x, e2y, -e1y * e2x);
+        const float len2 = std::fma(nx, nx, std::fma(ny, ny, nz * nz));
+        const float invLen = (len2 > 0.0f) ? (1.0f / std::sqrt(len2)) : 0.0f;
+        nx *= invLen; ny *= invLen; nz *= invLen;
+        return math::Vec3{nx, ny, nz};
+    };
+    for (int r = 0; r < H - 1; ++r)
+        for (int c = 0; c < W - 1; ++c) {
+            const uint32_t a = (uint32_t)(r * W + c);
+            const uint32_t b = (uint32_t)(r * W + (c + 1));
+            const uint32_t cc = (uint32_t)((r + 1) * W + (c + 1));
+            const uint32_t d = (uint32_t)((r + 1) * W + c);
+            // The cell quad's face normal (the two triangles are coplanar in the rest sheet; for a draped
+            // sheet we use the quad's (a->d, a->b) normal — a deterministic per-cell value, +Z on the rest).
+            const math::Vec3 fn = addFaceNormal(a, d, b);
+            const uint32_t corners[4] = {a, b, cc, d};
+            for (int k = 0; k < 4; ++k) {
+                outVerts[corners[k]].nx += fn.x;
+                outVerts[corners[k]].ny += fn.y;
+                outVerts[corners[k]].nz += fn.z;
+            }
+            // Two triangles: (a,d,cc) + (a,cc,b) — the row-major quad split, wound so the front faces +Z.
+            outIdx.push_back(a);  outIdx.push_back(d);  outIdx.push_back(cc);
+            outIdx.push_back(a);  outIdx.push_back(cc); outIdx.push_back(b);
+        }
+
+    // 3) normalize the accumulated per-vertex normals (the average of the adjacent face normals). A vertex
+    //    with no contributing face (impossible for W,H>=2) keeps its zero normal.
+    for (size_t i = 0; i < outVerts.size(); ++i) {
+        ClothRenderVertex& v = outVerts[i];
+        const float len2 = std::fma(v.nx, v.nx, std::fma(v.ny, v.ny, v.nz * v.nz));
+        if (len2 > 0.0f) {
+            const float invLen = 1.0f / std::sqrt(len2);
+            v.nx *= invLen; v.ny *= invLen; v.nz *= invLen;
+        }
+    }
 }
 
 }  // namespace cloth
