@@ -332,6 +332,8 @@ int main() {
             bool sawGrainContactFeature = false;
             // Slice GR4: the deterministic-grain-friction capability is advertised.
             bool sawGrainFrictionFeature = false;
+            // Slice GR5: the deterministic-grain-lockstep capability is advertised.
+            bool sawGrainLockstepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -458,6 +460,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-grain-neighbors") sawGrainNeighborsFeature = true;
                     if (AsString(el->value) == "deterministic-grain-contact") sawGrainContactFeature = true;
                     if (AsString(el->value) == "deterministic-grain-friction") sawGrainFrictionFeature = true;
+                    if (AsString(el->value) == "deterministic-grain-lockstep") sawGrainLockstepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -568,6 +571,7 @@ int main() {
         check(sawGrainNeighborsFeature, "engine.features includes deterministic-grain-neighbors");
         check(sawGrainContactFeature, "engine.features includes deterministic-grain-contact");
         check(sawGrainFrictionFeature, "engine.features includes deterministic-grain-friction");
+        check(sawGrainLockstepFeature, "engine.features includes deterministic-grain-lockstep");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -740,6 +744,8 @@ int main() {
         bool sawGrainContactShot = false;
         // Slice GR4: the --grain-friction-shot showcase flag is listed in the showcase manifest.
         bool sawGrainFrictionShot = false;
+        // Slice GR5: the --grain-lockstep-shot showcase flag is listed in the showcase manifest.
+        bool sawGrainLockstepShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -892,6 +898,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-neighbors-shot") sawGrainNeighborsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-contact-shot") sawGrainContactShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-friction-shot") sawGrainFrictionShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--grain-lockstep-shot") sawGrainLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fluid-neighbors-shot") sawFluidNeighborsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fluid-density-shot") sawFluidDensityShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fluid-solve-shot") sawFluidSolveShot = true;
@@ -1005,6 +1012,7 @@ int main() {
         check(sawGrainNeighborsShot, "showcases manifest includes --grain-neighbors-shot");
         check(sawGrainContactShot, "showcases manifest includes --grain-contact-shot");
         check(sawGrainFrictionShot, "showcases manifest includes --grain-friction-shot");
+        check(sawGrainLockstepShot, "showcases manifest includes --grain-lockstep-shot");
         check(sawFluidNeighborsShot, "showcases manifest includes --fluid-neighbors-shot");
         check(sawFluidDensityShot, "showcases manifest includes --fluid-density-shot");
         check(sawFluidSolveShot, "showcases manifest includes --fluid-solve-shot");

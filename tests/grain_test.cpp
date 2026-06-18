@@ -853,6 +853,164 @@ int main() {
               "GR4 MeasureGrainRepose: single-column -> baseRadius 0, slope 0 (degenerate)");
     }
 
+    // ================= GR5: ApplyGrainCommand — wind / push / OOB no-op / static hold =================
+    {
+        std::vector<grain::GrainParticle> ps(4);
+        for (int i = 0; i < 4; ++i) { ps[(size_t)i].pos = {FromInt(i), 0, 0}; ps[(size_t)i].invMass = kOne; }
+
+        // kCmdWind adds to a dynamic grain's velocity.
+        const grain::GrainCommand wind{0, grain::kCmdWind, 1u, grain::FxVec3{FromInt(2), FromInt(-3), FromInt(1)}};
+        grain::ApplyGrainCommand(ps, wind);
+        check(ps[1].vel.x == FromInt(2) && ps[1].vel.y == FromInt(-3) && ps[1].vel.z == FromInt(1),
+              "GR5 ApplyGrainCommand: kCmdWind adds the delta-velocity to a dynamic grain");
+
+        // kCmdPush adds to a dynamic grain's position.
+        const grain::fx px0 = ps[2].pos.x;
+        grain::ApplyGrainCommand(ps, grain::GrainCommand{0, grain::kCmdPush, 2u, grain::FxVec3{FromInt(5), 0, 0}});
+        check(ps[2].pos.x == px0 + FromInt(5),
+              "GR5 ApplyGrainCommand: kCmdPush adds the delta-position to a dynamic grain");
+
+        // A static grain holds — wind/push are a no-op.
+        ps[0].flags = grain::kFlagStatic; ps[0].invMass = 0;
+        const grain::GrainParticle sBefore = ps[0];
+        grain::ApplyGrainCommand(ps, grain::GrainCommand{0, grain::kCmdWind, 0u, grain::FxVec3{FromInt(9), 0, 0}});
+        grain::ApplyGrainCommand(ps, grain::GrainCommand{0, grain::kCmdPush, 0u, grain::FxVec3{FromInt(9), 0, 0}});
+        check(std::memcmp(&sBefore, &ps[0], sizeof(grain::GrainParticle)) == 0,
+              "GR5 ApplyGrainCommand: a static grain holds (wind/push are no-ops)");
+
+        // Out-of-range target is a deterministic no-op (no crash, no mutation).
+        std::vector<grain::GrainParticle> before = ps;
+        grain::ApplyGrainCommand(ps, grain::GrainCommand{0, grain::kCmdWind, 9999u, grain::FxVec3{FromInt(5), 0, 0}});
+        check(before.size() == ps.size() &&
+              std::memcmp(before.data(), ps.data(), ps.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR5 ApplyGrainCommand: out-of-range target is a no-op");
+    }
+
+    // ================= GR5: SnapshotGrain / RestoreGrain round-trip == original ========================
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx kDt = kOne / 60;
+        const grain::FxVec3 kGravity{0, kGravY, 0};
+        const fx kHSearch = kOne * 2, kMu = grain::kGrainMu, kGroundY = 0;
+        const int iters = 2;
+        std::vector<grain::GrainParticle> ps;
+        for (int iy = 0; iy < 4; ++iy)
+            for (int iz = 0; iz < 4; ++iz)
+                for (int ix = 0; ix < 4; ++ix) {
+                    grain::GrainParticle p;
+                    p.pos = {FromInt(ix), FromInt(3 + iy), FromInt(iz)};
+                    p.prev = p.pos; p.invMass = kOne; p.radius = kOne / 2;
+                    ps.push_back(p);
+                }
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        // Advance a few steps so the state is non-trivial, then snapshot it.
+        grain::StepGrainFrictionSteps(ps, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, iters, 5);
+
+        const std::vector<grain::GrainParticle> snap = grain::SnapshotGrain(ps);
+        // Mutate (one more step), then restore -> must equal the snapshot exactly.
+        grain::StepGrainFriction(ps, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        check(std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(grain::GrainParticle)) != 0,
+              "GR5 snapshot: a step actually mutated the grains (control)");
+        grain::RestoreGrain(ps, snap);
+        check(ps.size() == snap.size() &&
+              std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR5 snapshot: SnapshotGrain -> RestoreGrain round-trip == original BIT-EXACT");
+    }
+
+    // ================= GR5: SimGrainTick determinism + deterministic command order ====================
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx kDt = kOne / 60;
+        const grain::FxVec3 kGravity{0, kGravY, 0};
+        const fx kHSearch = kOne * 2, kMu = grain::kGrainMu, kGroundY = 0;
+        const int iters = 2;
+        std::vector<grain::GrainParticle> base;
+        for (int iy = 0; iy < 4; ++iy)
+            for (int iz = 0; iz < 4; ++iz)
+                for (int ix = 0; ix < 4; ++ix) {
+                    grain::GrainParticle p;
+                    p.pos = {FromInt(ix), FromInt(3 + iy), FromInt(iz)};
+                    p.prev = p.pos; p.invMass = kOne; p.radius = kOne / 2;
+                    base.push_back(p);
+                }
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        const std::vector<grain::GrainCommand> stream{
+            grain::GrainCommand{0, grain::kCmdWind, 5u, grain::FxVec3{FromInt(3), 0, 0}},
+        };
+        // Two SimGrainTick runs over the SAME init+stream -> byte-identical.
+        std::vector<grain::GrainParticle> a = base, b = base;
+        grain::SimGrainTick(a, noSpheres, stream, 0, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        grain::SimGrainTick(b, noSpheres, stream, 0, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        check(std::memcmp(a.data(), b.data(), a.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR5 SimGrainTick: two runs byte-identical (deterministic)");
+
+        // A tick whose commands don't match -> no command applied (pure StepGrainFriction).
+        std::vector<grain::GrainParticle> noCmd = base, plain = base;
+        grain::SimGrainTick(noCmd, noSpheres, stream, 5, kGravity, kDt, kGroundY, kHSearch, kMu, iters);  // no cmd@5
+        grain::StepGrainFriction(plain, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        check(std::memcmp(noCmd.data(), plain.data(), plain.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR5 SimGrainTick: a tick with no matching command == pure StepGrainFriction");
+    }
+
+    // ================= GR5: RunGrainLockstep replica == authority (the lockstep headline) =============
+    // ================= + RunGrainRollback positive (converges) + negative (mispredict differs) ========
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx kDt = kOne / 60;
+        const grain::FxVec3 kGravity{0, kGravY, 0};
+        const fx kHSearch = kOne * 2, kMu = grain::kGrainMu, kGroundY = 0;
+        const int iters = 2;
+        const int ticks = 16, mispredictTick = 6;
+        const grain::fx kStagger = (grain::fx)(0.12 * (double)kOne + 0.5);
+        std::vector<grain::GrainParticle> init;
+        for (int iy = 0; iy < 5; ++iy)
+            for (int iz = 0; iz < 5; ++iz)
+                for (int ix = 0; ix < 5; ++ix) {
+                    grain::GrainParticle p;
+                    const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                    p.pos = {FromInt(ix) + ox, FromInt(3 + iy), FromInt(iz) + oz};
+                    p.prev = p.pos; p.invMass = kOne; p.radius = kOne / 2;
+                    init.push_back(p);
+                }
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+
+        const uint32_t wIdx = 62u;   // a mid-pile grain the wind shoves
+        const std::vector<grain::GrainCommand> authStream{
+            grain::GrainCommand{2,  grain::kCmdWind, wIdx, grain::FxVec3{FromInt(8), 0, 0}},
+            grain::GrainCommand{6,  grain::kCmdPush, wIdx, grain::FxVec3{0, 0, FromInt(2)}},
+            grain::GrainCommand{10, grain::kCmdWind, wIdx, grain::FxVec3{FromInt(4), 0, 0}},
+        };
+        // The MISPREDICTED stream: auth + a WRONG strong wind at mispredictTick (a real divergence).
+        std::vector<grain::GrainCommand> mispredictStream = authStream;
+        mispredictStream.push_back(grain::GrainCommand{(uint32_t)mispredictTick, grain::kCmdWind, wIdx,
+                                                       grain::FxVec3{FromInt(60), 0, 0}});
+
+        const std::vector<grain::GrainParticle> authority =
+            grain::RunGrainLockstep(init, noSpheres, authStream, ticks, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        const std::vector<grain::GrainParticle> replica =
+            grain::RunGrainLockstep(init, noSpheres, authStream, ticks, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+
+        // LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+        check(authority.size() == replica.size() &&
+              std::memcmp(authority.data(), replica.data(), authority.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR5 lockstep: replica == authority BIT-EXACT (inputs-only re-sim)");
+
+        // ROLLBACK positive: rolledBack == authority BIT-EXACT.
+        const std::vector<grain::GrainParticle> rolledBack =
+            grain::RunGrainRollback(init, noSpheres, authStream, mispredictStream,
+                                    ticks, mispredictTick, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        check(rolledBack.size() == authority.size() &&
+              std::memcmp(rolledBack.data(), authority.data(), authority.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR5 rollback: corrected to authority BIT-EXACT (positive control)");
+
+        // ROLLBACK negative control: the pre-rollback MISPREDICTED full run DIFFERED from authority.
+        const std::vector<grain::GrainParticle> mispredicted =
+            grain::RunGrainLockstep(init, noSpheres, mispredictStream, ticks, kGravity, kDt, kGroundY, kHSearch, kMu, iters);
+        check(mispredicted.size() == authority.size() &&
+              std::memcmp(mispredicted.data(), authority.data(), authority.size() * sizeof(grain::GrainParticle)) != 0,
+              "GR5 rollback: mispredicted state DIFFERS from authority (negative control — the divergence was real)");
+    }
+
     if (g_fail == 0) std::printf("grain_test: ALL PASS\n");
     else std::printf("grain_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

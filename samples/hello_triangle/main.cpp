@@ -459,6 +459,7 @@ int main(int argc, char** argv) {
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
+    const char* grainLockstepShotPath = nullptr; // --grain-lockstep-shot <out.bmp> (Slice GR5: Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #10 — PURE-CPU harness over the GR1-GR4 granular sim WITH friction (the FL5/CL5/FPX5 twin): a 5x5x5 staggered grain block (the GR4 friction scene, μ=0.8) fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-grain-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
     const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
     const char* fluidSolveShotPath = nullptr; // --fluid-solve-shot <out.bmp> (Slice FL4, the incompressibility solver of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY-CONSTRAINT SOLVE — a dam-break block (FL1) poured over the ground (+ a static FxBody sphere) is settled into an INCOMPRESSIBLE POOL by StepFluid K steps x iters JACOBI density iterations (predict -> neighbours -> {ComputeDensity -> ComputeLambda -> SolveDensityConstraint(Δp into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollidePlane+CollideSpheres). The K-step loop is HOST-driven over MULTI-THREAD per-particle passes (fluid_density/fluid_lambda reused per iteration + fluid_dp + fluid_apply + fluid_collide, ONE thread per particle, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepFluid. GPU==CPU particle array bit-exact vs fluid.h::StepFluid, a deterministic incompressibility residual (summed |ρ_i−ρ0|) small + below the unsolved free-fall, integer side-view of the settled pool. NO lockstep (FL5), NO float render (FL6))
@@ -730,6 +731,17 @@ int main(int argc, char** argv) {
         // to avoid MSVC's nested-block parse limit (the FPX5/CL5 lesson).
         if (std::strcmp(argv[i], "--fluid-lockstep-shot") == 0 && i + 1 < argc) {
             fluidLockstepShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GR5: --grain-lockstep-shot <out.bmp> — the Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK
+        // proof (the HEADLINE of FLAGSHIP #10, the FL5/CL5 twin). PURE CPU: runs the grain.h lockstep/rollback
+        // harness (RunGrainLockstep authority + replica, RunGrainRollback) over a scripted command stream on the
+        // GR4 friction scene, asserts authority==replica + rollback-corrects-to-authority BIT-EXACT, writes the
+        // converged-state golden. NO GPU dispatch, NO new shader, NO new RHI. STANDALONE branch (not in the
+        // --shot else-if chain) to avoid MSVC's nested-block parse limit (the FPX5/CL5/FL5 lesson).
+        if (std::strcmp(argv[i], "--grain-lockstep-shot") == 0 && i + 1 < argc) {
+            grainLockstepShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -17773,6 +17785,205 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fluid lockstep+rollback converged state (%d particles)\n",
                                 fluidLockstepShotPath, imgW, imgH, kParticleCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidLockstepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof (--grain-lockstep-shot <out.bmp>, Slice
+        // GR5, the HEADLINE of FLAGSHIP #10). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both
+        // Vulkan-Windows and Metal-Mac run the IDENTICAL CPU harness (grain.h::RunGrainLockstep/RunGrainRollback)
+        // so the converged-grain-state golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform
+        // bit-identity IS the lockstep evidence). Builds the GR4 staggered friction scene (5x5x5 block + μ) + a
+        // scripted authStream (wind/push commands over K ticks that VISIBLY DISPLACE the pile) + a mispredictStream
+        // (a WRONG strong wind at mispredictTick); runs authority=RunGrainLockstep, replica=RunGrainLockstep,
+        // rolledBack=RunGrainRollback; asserts authority==replica + rollback-corrects-to-authority BIT-EXACT (the
+        // headline) + determinism + snapshot round-trip + motion; CPU-colors the converged grain state (each
+        // grain's integer (pos>>kFrac) -> pixel, hashColor). The FL5/CL5/FPX5 twin over GRAIN. (STANDALONE branch.)
+        if (grainLockstepShotPath) {
+            using math::Vec3;
+            namespace grain = hf::sim::grain;
+
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 2;          // 0.5 radius (diameter 1.0)
+            const grain::fx kSpacing = grain::kOne;            // 1.0 spacing (== diameter, non-overlapping)
+            const grain::fx kStagger = (grain::fx)(0.12 * (double)grain::kOne + 0.5);  // 0.12 symmetry-break
+            const grain::fx kHSearch = grain::kOne * 2;        // 2.0 (>= the contact diameter 1.0)
+            const grain::fx kMu = grain::kGrainMu;             // 0.8 (the host-snapped friction coefficient)
+            const int kSide = 5;                               // 5x5x5 -> 125 grains
+            const int kIters = 2;
+            const int kTicks = 40;                             // K ticks: drop + settle the perturbed pile
+            const int kMispredictTick = 12;
+            if (kHSearch < 2 * kRadius) {
+                std::fprintf(stderr, "FATAL: grain-lockstep hSearch (%d) < 2*maxRadius (%d)\n",
+                             kHSearch, 2 * kRadius);
+                device->WaitIdle(); return 1;
+            }
+
+            // The STAGGERED 5x5x5 block (the GR4 friction scene). NO collider sphere — friction holds the heap.
+            std::vector<grain::GrainParticle> init;
+            for (int iy = 0; iy < kSide; ++iy)
+                for (int iz = 0; iz < kSide; ++iz)
+                    for (int ix = 0; ix < kSide; ++ix) {
+                        grain::GrainParticle p;
+                        const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                        p.pos = grain::FxVec3{(grain::fx)(ix * (int)kSpacing) + ox,
+                                              (grain::fx)(3 * (int)grain::kOne) + (grain::fx)(iy * (int)kSpacing),
+                                              (grain::fx)(iz * (int)kSpacing) + oz};
+                        p.prev = p.pos; p.invMass = grain::kOne; p.radius = kRadius; p.flags = 0;
+                        init.push_back(p);
+                    }
+            const int kGrainCount = (int)init.size();
+            const std::vector<grain::GrainSphereCollider> noSpheres;
+
+            // The scripted authoritative command stream (the deterministic inputs on the wire): wind gusts + a
+            // push on a few grains at chosen ticks that VISIBLY shove the pile sideways as it falls/settles.
+            const uint32_t wIdx0 = (uint32_t)((kSide / 2 * kSide + kSide / 2) * kSide + kSide / 2);  // a mid grain
+            const uint32_t wIdx1 = (uint32_t)((kSide - 1) * kSide * kSide + kSide / 2 * kSide + kSide / 2);
+            const std::vector<grain::GrainCommand> authStream = {
+                grain::GrainCommand{2,  grain::kCmdWind, wIdx0, grain::FxVec3{(grain::fx)(grain::kOne * 14), 0, 0}},
+                grain::GrainCommand{6,  grain::kCmdPush, wIdx1, grain::FxVec3{(grain::fx)(grain::kOne * 2), 0, 0}},
+                grain::GrainCommand{16, grain::kCmdWind, wIdx0, grain::FxVec3{0, 0, (grain::fx)(grain::kOne * 10)}},
+            };
+            const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+            // The MISPREDICTED stream: the auth stream + a WRONG strong wind at mispredictTick (a real
+            // divergence the rollback must correct).
+            std::vector<grain::GrainCommand> mispredictStream = authStream;
+            mispredictStream.push_back(grain::GrainCommand{(uint32_t)kMispredictTick, grain::kCmdWind, wIdx0,
+                                                           grain::FxVec3{(grain::fx)(grain::kOne * 50), 0, 0}});
+
+            // === The harness ===
+            const std::vector<grain::GrainParticle> authority =
+                grain::RunGrainLockstep(init, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+            const std::vector<grain::GrainParticle> replica =
+                grain::RunGrainLockstep(init, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+            const std::vector<grain::GrainParticle> rolledBack =
+                grain::RunGrainRollback(init, noSpheres, authStream, mispredictStream,
+                                        kTicks, kMispredictTick, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+
+            auto grainBytes = [](const std::vector<grain::GrainParticle>& p) {
+                return p.size() * sizeof(grain::GrainParticle);
+            };
+
+            // PROOF (1) LOCKSTEP: replica (fed INPUTS ONLY) == authority BIT-EXACT — THE HEADLINE.
+            if (authority.size() != replica.size() ||
+                std::memcmp(authority.data(), replica.data(), grainBytes(authority)) != 0) {
+                std::fprintf(stderr, "FATAL: grain-lockstep replica != authority (inputs-only re-sim diverged — "
+                             "a float/nondeterminism crept into the fixed-point granular sim?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-lockstep: replica==authority %d grains BIT-EXACT (%d ticks, inputs-only)\n",
+                        kGrainCount, kTicks);
+
+            // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT, AND the pre-rollback mispredicted state
+            // DIFFERED from authority (the rollback fixed a REAL divergence — positive + negative control).
+            const std::vector<grain::GrainParticle> mispredicted =
+                grain::RunGrainLockstep(init, noSpheres, mispredictStream, kTicks, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+            const bool divergenceExisted =
+                (mispredicted.size() != authority.size()) ||
+                std::memcmp(mispredicted.data(), authority.data(), grainBytes(authority)) != 0;
+            if (rolledBack.size() != authority.size() ||
+                std::memcmp(rolledBack.data(), authority.data(), grainBytes(authority)) != 0) {
+                std::fprintf(stderr, "FATAL: grain-lockstep rollback != authority (the rollback did NOT correct "
+                             "the misprediction to the authoritative grain state)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!divergenceExisted) {
+                std::fprintf(stderr, "FATAL: grain-lockstep mispredicted state == authority (the misprediction "
+                             "was a no-op — the rollback proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d "
+                        "diverged then converged)\n", kMispredictTick);
+
+            // PROOF (3) determinism + snapshot round-trip: two lockstep runs identical AND
+            // RestoreGrain(SnapshotGrain(p)) == p BIT-EXACT.
+            const std::vector<grain::GrainParticle> authority2 =
+                grain::RunGrainLockstep(init, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+            if (authority2.size() != authority.size() ||
+                std::memcmp(authority2.data(), authority.data(), grainBytes(authority)) != 0) {
+                std::fprintf(stderr, "FATAL: grain-lockstep two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            {
+                std::vector<grain::GrainParticle> p =
+                    grain::RunGrainLockstep(init, noSpheres, authStream, kMispredictTick, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+                const std::vector<grain::GrainParticle> snap = grain::SnapshotGrain(p);
+                grain::SimGrainTick(p, noSpheres, authStream, (uint32_t)kMispredictTick,
+                                    kGravity, kDt, kGroundY, kHSearch, kMu, kIters);   // mutate
+                grain::RestoreGrain(p, snap);
+                if (p.size() != snap.size() || std::memcmp(p.data(), snap.data(), grainBytes(snap)) != 0) {
+                    std::fprintf(stderr, "FATAL: grain-lockstep snapshot round-trip != original\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("grain-lockstep determinism: two runs BYTE-IDENTICAL + snapshot round-trip exact\n");
+
+            // PROOF (4) motion (non-trivial, the FL5 lesson): the command stream displaced the grains by a
+            // non-trivial amount (the converged state != the no-command baseline).
+            const std::vector<grain::GrainCommand> noStream;
+            const std::vector<grain::GrainParticle> noInput =
+                grain::RunGrainLockstep(init, noSpheres, noStream, kTicks, kGravity, kDt, kGroundY, kHSearch, kMu, kIters);
+            int64_t moved = 0;
+            for (int i = 0; i < kGrainCount; ++i) {
+                const int64_t dx = (int64_t)authority[(size_t)i].pos.x - (int64_t)noInput[(size_t)i].pos.x;
+                const int64_t dz = (int64_t)authority[(size_t)i].pos.z - (int64_t)noInput[(size_t)i].pos.z;
+                moved += (dx < 0 ? -dx : dx) + (dz < 0 ? -dz : dz);
+            }
+            if (moved == 0) {
+                std::fprintf(stderr, "FATAL: grain-lockstep motion: the command stream did not displace the "
+                             "pile (degenerate demo — the proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-lockstep motion: displaced the pile by %lld\n", (long long)moved);
+
+            // --- Golden: the converged grain state side-view (== the Metal --grain-lockstep by construction;
+            // authority==replica==rolledBack so the single converged state IS the viz). Each grain's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) -> a pixel, hashColor dot. ---
+            const int kPxPerUnit = 14, kMargin = 20;
+            const int kXLo = -8, kWorldW = 24, kWorldH = 12;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto hashColor = [](int idx) -> Vec3 {
+                uint32_t h = (uint32_t)idx * 2654435761u; h ^= h >> 15;
+                return Vec3{0.25f + 0.7f * (float)((h)       & 0xFF) / 255.0f,
+                            0.25f + 0.7f * (float)((h >> 8)  & 0xFF) / 255.0f,
+                            0.25f + 0.7f * (float)((h >> 16) & 0xFF) / 255.0f};
+            };
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+                cx = kMargin + (wx - kXLo) * kPxPerUnit;
+                cy = (int)imgH - kMargin - wy * kPxPerUnit;
+            };
+            int grainPx = 0;
+            for (int i = 0; i < kGrainCount; ++i) {
+                int cx, cy; toPx(rolledBack[(size_t)i].pos.x, rolledBack[(size_t)i].pos.y, cx, cy);
+                Vec3 col = hashColor(i);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                        ++grainPx;
+                    }
+            }
+            std::printf("grain-lockstep: {grains:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                        kGrainCount, kTicks, kCommandCount, kMispredictTick);
+            bool ok = WriteBMP(grainLockstepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — grain lockstep+rollback converged state (%d grain px)\n",
+                                grainLockstepShotPath, imgW, imgH, grainPx);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainLockstepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

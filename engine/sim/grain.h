@@ -840,5 +840,134 @@ inline GrainRepose MeasureGrainRepose(const std::vector<GrainParticle>& grains, 
     return out;
 }
 
+// ===== Slice GR5 — Deterministic GPU Granular/Sand: LOCKSTEP + ROLLBACK netcode harness (the HEADLINE) ====
+// Prove the bit-exact GR1-GR4 granular sim (WITH friction) is true cross-platform LOCKSTEP + ROLLBACK: a peer
+// fed the INPUT command stream ALONE (NOT full state) re-derives the authority's exact grain state bit-for-bit,
+// and a mispredicted input is corrected by rolling back to a saved snapshot + re-simulating the authoritative
+// stream. PURE CPU, 0 backend symbols, NO new shader / RHI: this is a determinism PROPERTY of the existing
+// bit-exact StepGrainFriction (GR4, which is itself bit-identical Vulkan/Metal) — the cross-backend zero-diff
+// golden (the converged grain state is bit-identical on Vulkan-Windows AND Metal-Mac from the same inputs) IS
+// the cross-platform-lockstep evidence. This is the DIRECT TWIN of fluid.h's FluidCommand/ApplyFluidCommand/
+// SimFluidTick/SnapshotFluid/RestoreFluid/RunFluidLockstep/RunFluidRollback (the FL5 harness, itself the CL5/
+// fpx.h twin) — the SAME shape over GrainParticle/StepGrainFriction. NO <cmath>, NO RNG, NO clock. This is the
+// deterministic-sim trilogy's 4th netcode headline (rigid fpx -> cloth -> fluid -> GRAIN): a deterministic,
+// rollback-able, bit-identical-cross-platform GRANULAR sim — UE5 has no such thing.
+//
+// A GrainCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full state).
+// kCmdWind adds `arg` (a wind delta-velocity) to a grain's velocity (an integer add, skipping static grains —
+// they hold); kCmdPush adds `arg` (a position delta) directly to a grain's position (a localized displacement
+// impulse — an integer add on pos, skipping static). A std::vector<GrainCommand> is the command STREAM,
+// processed in ARRAY ORDER for each tick (the deterministic-order contract — the same order on every peer/
+// platform), so authority + replica fed the same stream re-derive the same state exactly.
+
+inline constexpr uint32_t kCmdWind = 0u;   // arg added to target grain's velocity (a wind impulse)
+inline constexpr uint32_t kCmdPush = 1u;   // arg added to target grain's position (a localized push)
+
+struct GrainCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdWind / kCmdPush
+    uint32_t target = 0;   // the target grain index
+    FxVec3   arg;          // the Q16.16 payload (delta-velocity for kCmdWind; delta-position for kCmdPush)
+};
+
+// ApplyGrainCommand(grains, c): apply ONE input command to the grain pool (pure integer — add to vel / add to
+// pos). Out-of-range target is a no-op (deterministic). Unknown kind is a no-op. Static grains are never
+// mutated (they hold). The input event the lockstep/rollback streams are made of. The fluid.h::
+// ApplyFluidCommand twin.
+inline void ApplyGrainCommand(std::vector<GrainParticle>& grains, const GrainCommand& c) {
+    if (c.target >= (uint32_t)grains.size()) return;
+    GrainParticle& p = grains[(size_t)c.target];
+    if (p.flags & kFlagStatic) return;       // static grains hold — no input moves them
+    if (c.kind == kCmdWind) {
+        p.vel.x += c.arg.x;
+        p.vel.y += c.arg.y;
+        p.vel.z += c.arg.z;
+    } else if (c.kind == kCmdPush) {
+        p.pos.x += c.arg.x;
+        p.pos.y += c.arg.y;
+        p.pos.z += c.arg.z;
+    }
+}
+
+// SimGrainTick(grains, spheres, stream, tick, gravity, dt, groundY, hSearch, mu, iters): the deterministic
+// per-tick step. (1) apply ALL commands in `stream` whose .tick == `tick`, in ARRAY ORDER (the deterministic
+// input-order contract); (2) StepGrainFriction one step (GR4 — IntegrateGrains predict + neighbour list + iters
+// JACOBI {normal + friction} iterations + velocity update + CollideGrainPlane/CollideGrainSpheres). Pure
+// integer, fixed order -> bit-identical on every peer/platform. The fluid.h::SimFluidTick twin (StepGrainFriction
+// replaces StepFluid; StepGrainFriction rebuilds the neighbour list internally from the predicted positions).
+inline void SimGrainTick(std::vector<GrainParticle>& grains,
+                         const std::vector<GrainSphereCollider>& spheres,
+                         const std::vector<GrainCommand>& stream, uint32_t tick,
+                         const FxVec3& gravity, fx dt, fx groundY, fx hSearch, fx mu, int iters) {
+    for (const GrainCommand& c : stream)
+        if (c.tick == tick) ApplyGrainCommand(grains, c);
+    StepGrainFriction(grains, spheres, gravity, dt, groundY, hSearch, mu, iters);
+}
+
+// SnapshotGrain(grains): a deep copy of the full integer grain array (the rollback primitive — a lossless saved
+// tick). (std::vector copy is a deep copy.) The fluid.h::SnapshotFluid twin.
+inline std::vector<GrainParticle> SnapshotGrain(const std::vector<GrainParticle>& grains) {
+    return grains;   // value copy: deep-copies the grain array
+}
+
+// RestoreGrain(grains, snap): restore the grain pool to a saved snapshot (the rollback). Bit-exact round-trip
+// with SnapshotGrain (RestoreGrain(g, SnapshotGrain(g0)) leaves g == g0 byte-for-byte). The fluid.h::
+// RestoreFluid twin.
+inline void RestoreGrain(std::vector<GrainParticle>& grains, const std::vector<GrainParticle>& snap) {
+    grains = snap;
+}
+
+// RunGrainLockstep(init, spheres, stream, ticks, gravity, dt, groundY, hSearch, mu, iters): THE peer entry
+// point. Run `ticks` SimGrainTicks from a COPY of `init`, applying the command stream -> the final grain state.
+// authority = RunGrainLockstep(...); replica = RunGrainLockstep(...) from the SAME init + stream (inputs ONLY
+// — no state shared) -> BIT-IDENTICAL by determinism (the lockstep proof memcmps them). The fluid.h::
+// RunFluidLockstep twin.
+inline std::vector<GrainParticle> RunGrainLockstep(const std::vector<GrainParticle>& init,
+                                                   const std::vector<GrainSphereCollider>& spheres,
+                                                   const std::vector<GrainCommand>& stream, int ticks,
+                                                   const FxVec3& gravity, fx dt, fx groundY, fx hSearch, fx mu,
+                                                   int iters) {
+    std::vector<GrainParticle> grains = init;
+    for (int t = 0; t < ticks; ++t)
+        SimGrainTick(grains, spheres, stream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
+    return grains;
+}
+
+// RunGrainRollback(init, spheres, authStream, mispredictStream, ticks, mispredictTick, gravity, dt, groundY,
+// hSearch, mu, iters): the rollback harness. (1) run ticks 0..mispredictTick from init applying authStream,
+// SAVING a snapshot AT mispredictTick (before that tick is simulated); (2) speculatively advance a few ticks
+// from the snapshot with the MISPREDICTED stream (the wrong input) — this is the client prediction that
+// diverges; (3) "receive" the authoritative input -> RestoreGrain to the snapshot + RE-SIMULATE
+// mispredictTick..ticks with the CORRECT authStream -> the final corrected grain pool. The proof asserts this
+// == RunGrainLockstep(init, authStream, ticks) (rollback corrected the misprediction EXACTLY) AND that the
+// mispredicted-before-rollback state DIFFERED from the authority (a real divergence was fixed). The fluid.h::
+// RunFluidRollback twin.
+inline std::vector<GrainParticle> RunGrainRollback(const std::vector<GrainParticle>& init,
+                                                   const std::vector<GrainSphereCollider>& spheres,
+                                                   const std::vector<GrainCommand>& authStream,
+                                                   const std::vector<GrainCommand>& mispredictStream,
+                                                   int ticks, int mispredictTick,
+                                                   const FxVec3& gravity, fx dt, fx groundY, fx hSearch, fx mu,
+                                                   int iters) {
+    std::vector<GrainParticle> grains = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimGrainTick(grains, spheres, authStream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point).
+    const std::vector<GrainParticle> snap = SnapshotGrain(grains);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — this is the
+    // client prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimGrainTick(grains, spheres, mispredictStream, (uint32_t)(mispredictTick + s),
+                     gravity, dt, groundY, hSearch, mu, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreGrain(grains, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimGrainTick(grains, spheres, authStream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
+    return grains;
+}
+
 }  // namespace grain
 }  // namespace hf::sim
