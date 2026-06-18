@@ -526,5 +526,139 @@ inline int CountPenetrating(const std::vector<ClothParticle>& particles,
     return pen;
 }
 
+// ===== Slice CL5 — Deterministic GPU Cloth: LOCKSTEP + ROLLBACK netcode harness (the HEADLINE) =========
+// Prove the bit-exact CL1-CL4 cloth is true cross-platform LOCKSTEP + ROLLBACK: a peer fed the INPUT
+// command stream ALONE (NOT full state) re-derives the authority's exact cloth state bit-for-bit, and a
+// mispredicted input is corrected by rolling back to a saved snapshot + re-simulating the authoritative
+// stream. PURE CPU, 0 backend symbols, NO new shader / RHI: this is a determinism PROPERTY of the existing
+// bit-exact StepClothCollide (CL4) — the cross-backend zero-diff golden (the converged state is bit-
+// identical on Vulkan-Windows AND Metal-Mac from the same inputs) IS the cross-platform-lockstep evidence.
+// This is the DIRECT TWIN of fpx.h's FxCommand/ApplyCommand/SimTick/SnapshotWorld/RestoreWorld/RunLockstep/
+// RunRollback (~fpx.h:531-601) — the SAME shape over ClothParticle/StepClothCollide. NO <cmath>, NO RNG,
+// NO clock. This extends the FPX5 lockstep/rollback headline from RIGID to DEFORMABLE bodies — a
+// deterministic, rollback-able, bit-identical-cross-platform cloth UE5's float Chaos Cloth cannot provide.
+//
+// A ClothCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full
+// state). kCmdWind adds `arg` (a wind delta-velocity) to a particle's velocity (an integer add, skipping
+// pinned particles — they hold); kCmdPin/kCmdUnpin toggle a particle's PINNED flag (pin: invMass->0,
+// set kFlagPinned + zero its velocity so the pinned point is at rest; unpin: clear kFlagPinned, invMass->
+// kOne so it becomes dynamic). A std::vector<ClothCommand> is the command STREAM, processed in ARRAY ORDER
+// for each tick (the deterministic-order contract — the same order on every peer/platform), so authority +
+// replica fed the same stream re-derive the same state exactly.
+
+inline constexpr uint32_t kCmdWind  = 0u;   // arg added to target particle's velocity (a wind impulse)
+inline constexpr uint32_t kCmdPin   = 1u;   // target particle becomes PINNED (invMass 0, vel zeroed)
+inline constexpr uint32_t kCmdUnpin = 2u;   // target particle becomes DYNAMIC (kFlagPinned cleared, invMass kOne)
+
+struct ClothCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdWind / kCmdPin / kCmdUnpin
+    uint32_t target = 0;   // the target particle index
+    FxVec3   arg;          // the Q16.16 payload (wind delta-velocity for kCmdWind; ignored for pin/unpin)
+};
+
+// ApplyClothCommand(particles, c): apply ONE input command to the cloth (pure integer — add to vel / set
+// the pin flag + invMass). Out-of-range target is a no-op (deterministic). Unknown kind is a no-op. The
+// input event the lockstep/rollback streams are made of. The fpx.h::ApplyCommand twin.
+inline void ApplyClothCommand(std::vector<ClothParticle>& particles, const ClothCommand& c) {
+    if (c.target >= (uint32_t)particles.size()) return;
+    ClothParticle& p = particles[(size_t)c.target];
+    if (c.kind == kCmdWind) {
+        if (p.flags & kFlagPinned) return;   // pinned points hold — wind does not move them
+        p.vel.x += c.arg.x;
+        p.vel.y += c.arg.y;
+        p.vel.z += c.arg.z;
+    } else if (c.kind == kCmdPin) {
+        p.flags |= kFlagPinned;
+        p.invMass = 0;
+        p.vel = FxVec3{0, 0, 0};             // a pinned point is at rest
+    } else if (c.kind == kCmdUnpin) {
+        p.flags &= ~kFlagPinned;
+        p.invMass = kOne;                    // unit mass dynamic again
+    }
+}
+
+// SimClothTick(grid, particles, constraints, spheres, stream, tick, gravity, dt, groundY, iters): the
+// deterministic per-tick step. (1) apply ALL commands in `stream` whose .tick == `tick`, in ARRAY ORDER
+// (the deterministic input-order contract); (2) StepClothCollide one step (CL4 — integrate + K constraint
+// passes + ground clamp + sphere collision). Pure integer, fixed order -> bit-identical on every peer/
+// platform. The fpx.h::SimTick twin (StepClothCollide replaces StepWorld+IntegrateOrientation).
+inline void SimClothTick(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                         const std::vector<Constraint>& constraints,
+                         const std::vector<SphereCollider>& spheres,
+                         const std::vector<ClothCommand>& stream, uint32_t tick,
+                         const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    for (const ClothCommand& c : stream)
+        if (c.tick == tick) ApplyClothCommand(particles, c);
+    StepClothCollide(grid, particles, constraints, spheres, gravity, dt, groundY, iters);
+}
+
+// SnapshotCloth(particles): a deep copy of the full integer particle array (the rollback primitive — a
+// lossless saved tick). (std::vector copy is a deep copy.) The fpx.h::SnapshotWorld twin.
+inline std::vector<ClothParticle> SnapshotCloth(const std::vector<ClothParticle>& particles) {
+    return particles;   // value copy: deep-copies the particle array
+}
+
+// RestoreCloth(particles, snap): restore the cloth to a saved snapshot (the rollback). Bit-exact round-trip
+// with SnapshotCloth (RestoreCloth(p, SnapshotCloth(p0)) leaves p == p0 byte-for-byte). The fpx.h::
+// RestoreWorld twin.
+inline void RestoreCloth(std::vector<ClothParticle>& particles, const std::vector<ClothParticle>& snap) {
+    particles = snap;
+}
+
+// RunClothLockstep(grid, init, constraints, spheres, stream, ticks, gravity, dt, groundY, iters): THE peer
+// entry point. Run `ticks` SimClothTicks from a COPY of `init`, applying the command stream -> the final
+// cloth state. authority = RunClothLockstep(...); replica = RunClothLockstep(...) from the SAME init +
+// stream (inputs ONLY — no state shared) -> BIT-IDENTICAL by determinism (the lockstep proof memcmps them).
+// The fpx.h::RunLockstep twin.
+inline std::vector<ClothParticle> RunClothLockstep(const ClothGrid& grid,
+                                                   const std::vector<ClothParticle>& init,
+                                                   const std::vector<Constraint>& constraints,
+                                                   const std::vector<SphereCollider>& spheres,
+                                                   const std::vector<ClothCommand>& stream, int ticks,
+                                                   const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    std::vector<ClothParticle> particles = init;
+    for (int t = 0; t < ticks; ++t)
+        SimClothTick(grid, particles, constraints, spheres, stream, (uint32_t)t, gravity, dt, groundY, iters);
+    return particles;
+}
+
+// RunClothRollback(grid, init, constraints, spheres, authStream, mispredictStream, ticks, mispredictTick,
+// gravity, dt, groundY, iters): the rollback harness. (1) run ticks 0..mispredictTick from init applying
+// authStream, SAVING a snapshot AT mispredictTick (before that tick is simulated); (2) speculatively
+// advance a few ticks from the snapshot with the MISPREDICTED stream (the wrong input) — this is the
+// client prediction that diverges; (3) "receive" the authoritative input -> RestoreCloth to the snapshot +
+// RE-SIMULATE mispredictTick..ticks with the CORRECT authStream -> the final corrected cloth. The proof
+// asserts this == RunClothLockstep(init, authStream, ticks) (rollback corrected the misprediction EXACTLY)
+// AND that the mispredicted-before-rollback state DIFFERED from the authority (a real divergence was
+// fixed). The fpx.h::RunRollback twin.
+inline std::vector<ClothParticle> RunClothRollback(const ClothGrid& grid,
+                                                   const std::vector<ClothParticle>& init,
+                                                   const std::vector<Constraint>& constraints,
+                                                   const std::vector<SphereCollider>& spheres,
+                                                   const std::vector<ClothCommand>& authStream,
+                                                   const std::vector<ClothCommand>& mispredictStream,
+                                                   int ticks, int mispredictTick,
+                                                   const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    std::vector<ClothParticle> particles = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimClothTick(grid, particles, constraints, spheres, authStream, (uint32_t)t, gravity, dt, groundY, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point).
+    const std::vector<ClothParticle> snap = SnapshotCloth(particles);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — this is the
+    // client prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimClothTick(grid, particles, constraints, spheres, mispredictStream,
+                     (uint32_t)(mispredictTick + s), gravity, dt, groundY, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreCloth(particles, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimClothTick(grid, particles, constraints, spheres, authStream, (uint32_t)t, gravity, dt, groundY, iters);
+    return particles;
+}
+
 }  // namespace cloth
 }  // namespace hf::sim

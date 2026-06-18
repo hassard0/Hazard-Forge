@@ -553,6 +553,151 @@ int main() {
               "CL4 zero-sphere: StepClothCollide == CL3 StepCloth byte-identical (no-op equivalence)");
     }
 
+    // ================= CL5: ApplyClothCommand — wind / pin / unpin / OOB no-op =========================
+    {
+        cloth::ClothGrid grid; grid.W = 4; grid.H = 4; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(4), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+
+        // kCmdWind adds to a dynamic particle's velocity.
+        const int freeIdx = cloth::ParticleIndex(grid, 1, 1);   // an interior, dynamic particle
+        const cloth::ClothCommand wind{0, cloth::kCmdWind, (uint32_t)freeIdx,
+                                       cloth::FxVec3{FromInt(2), FromInt(-3), FromInt(1)}};
+        cloth::ApplyClothCommand(ps, wind);
+        check(ps[(size_t)freeIdx].vel.x == FromInt(2) && ps[(size_t)freeIdx].vel.y == FromInt(-3) &&
+              ps[(size_t)freeIdx].vel.z == FromInt(1),
+              "CL5 ApplyClothCommand: kCmdWind adds the delta-velocity to a dynamic particle");
+
+        // kCmdWind on a PINNED particle is a no-op (pinned points hold).
+        const int pinIdx = cloth::ParticleIndex(grid, 0, 0);    // a pinned top corner
+        check((ps[(size_t)pinIdx].flags & cloth::kFlagPinned) != 0u, "CL5 setup: corner is pinned");
+        cloth::ApplyClothCommand(ps, cloth::ClothCommand{0, cloth::kCmdWind, (uint32_t)pinIdx,
+                                                         cloth::FxVec3{FromInt(9), 0, 0}});
+        check(ps[(size_t)pinIdx].vel.x == 0 && ps[(size_t)pinIdx].vel.y == 0 && ps[(size_t)pinIdx].vel.z == 0,
+              "CL5 ApplyClothCommand: kCmdWind on a pinned particle is a no-op");
+
+        // kCmdPin: a dynamic particle becomes pinned (kFlagPinned set, invMass 0, vel zeroed).
+        cloth::ApplyClothCommand(ps, cloth::ClothCommand{0, cloth::kCmdPin, (uint32_t)freeIdx, {}});
+        check((ps[(size_t)freeIdx].flags & cloth::kFlagPinned) != 0u &&
+              ps[(size_t)freeIdx].invMass == 0 &&
+              ps[(size_t)freeIdx].vel.x == 0 && ps[(size_t)freeIdx].vel.y == 0 && ps[(size_t)freeIdx].vel.z == 0,
+              "CL5 ApplyClothCommand: kCmdPin sets kFlagPinned + invMass 0 + zeroes velocity");
+
+        // kCmdUnpin: a pinned particle becomes dynamic (kFlagPinned cleared, invMass kOne).
+        cloth::ApplyClothCommand(ps, cloth::ClothCommand{0, cloth::kCmdUnpin, (uint32_t)pinIdx, {}});
+        check((ps[(size_t)pinIdx].flags & cloth::kFlagPinned) == 0u && ps[(size_t)pinIdx].invMass == kOne,
+              "CL5 ApplyClothCommand: kCmdUnpin clears kFlagPinned + restores invMass kOne");
+
+        // Out-of-range target is a deterministic no-op (no crash, no mutation).
+        std::vector<cloth::ClothParticle> before = ps;
+        cloth::ApplyClothCommand(ps, cloth::ClothCommand{0, cloth::kCmdWind, 9999u,
+                                                         cloth::FxVec3{FromInt(5), 0, 0}});
+        check(before.size() == ps.size() &&
+              std::memcmp(before.data(), ps.data(), ps.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL5 ApplyClothCommand: out-of-range target is a no-op");
+    }
+
+    // ================= CL5: SnapshotCloth / RestoreCloth round-trip == original ========================
+    {
+        cloth::ClothGrid grid; grid.W = 8; grid.H = 8; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(8), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60; const fx groundY = FromInt(-1000); const int iters = 4;
+        std::vector<cloth::SphereCollider> noSpheres;
+        // Advance a few steps so the state is non-trivial, then snapshot it.
+        cloth::StepClothCollideSteps(grid, ps, es, noSpheres, grav, dt, groundY, iters, 5);
+
+        const std::vector<cloth::ClothParticle> snap = cloth::SnapshotCloth(ps);
+        // Mutate (one more step), then restore -> must equal the snapshot exactly.
+        cloth::StepClothCollide(grid, ps, es, noSpheres, grav, dt, groundY, iters);
+        check(std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(cloth::ClothParticle)) != 0,
+              "CL5 snapshot: a step actually mutated the cloth (control)");
+        cloth::RestoreCloth(ps, snap);
+        check(ps.size() == snap.size() &&
+              std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL5 snapshot: SnapshotCloth -> RestoreCloth round-trip == original BIT-EXACT");
+    }
+
+    // ================= CL5: SimClothTick determinism + deterministic command order ====================
+    {
+        cloth::ClothGrid grid; grid.W = 8; grid.H = 8; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(8), 0};
+        std::vector<cloth::ClothParticle> base = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, base);
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60; const fx groundY = FromInt(-1000); const int iters = 4;
+        std::vector<cloth::SphereCollider> noSpheres;
+
+        const int t0 = cloth::ParticleIndex(grid, 4, 3);
+        const std::vector<cloth::ClothCommand> stream{
+            cloth::ClothCommand{0, cloth::kCmdWind, (uint32_t)t0, cloth::FxVec3{FromInt(3), 0, 0}},
+        };
+        // Two SimClothTick runs over the SAME init+stream -> byte-identical.
+        std::vector<cloth::ClothParticle> a = base, b = base;
+        cloth::SimClothTick(grid, a, es, noSpheres, stream, 0, grav, dt, groundY, iters);
+        cloth::SimClothTick(grid, b, es, noSpheres, stream, 0, grav, dt, groundY, iters);
+        check(std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL5 SimClothTick: two runs byte-identical (deterministic)");
+
+        // A tick whose commands don't match -> no command applied (pure StepClothCollide).
+        std::vector<cloth::ClothParticle> noCmd = base, plain = base;
+        cloth::SimClothTick(grid, noCmd, es, noSpheres, stream, 5, grav, dt, groundY, iters);  // tick 5: no cmd at 5
+        cloth::StepClothCollide(grid, plain, es, noSpheres, grav, dt, groundY, iters);
+        check(std::memcmp(noCmd.data(), plain.data(), plain.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL5 SimClothTick: a tick with no matching command == pure StepClothCollide");
+    }
+
+    // ================= CL5: RunClothLockstep replica == authority (the lockstep headline) =============
+    // ================= + RunClothRollback positive (converges) + negative (mispredict differs) ========
+    {
+        cloth::ClothGrid grid; grid.W = 12; grid.H = 12; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(12), 0};
+        const std::vector<cloth::ClothParticle> init = cloth::InitGrid(grid);
+        const std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, init);
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60; const fx groundY = FromInt(-1000); const int iters = 4;
+        const int ticks = 16, mispredictTick = 6;
+        std::vector<cloth::SphereCollider> noSpheres;
+
+        const int wIdx = cloth::ParticleIndex(grid, 6, 6);
+        const std::vector<cloth::ClothCommand> authStream{
+            cloth::ClothCommand{2,  cloth::kCmdWind, (uint32_t)wIdx, cloth::FxVec3{FromInt(4), 0, 0}},
+            cloth::ClothCommand{6,  cloth::kCmdWind, (uint32_t)wIdx, cloth::FxVec3{0, 0, FromInt(3)}},
+            cloth::ClothCommand{10, cloth::kCmdPin,  (uint32_t)wIdx, {}},
+        };
+        // The MISPREDICTED stream: auth + a WRONG strong wind at mispredictTick (a real divergence).
+        std::vector<cloth::ClothCommand> mispredictStream = authStream;
+        mispredictStream.push_back(cloth::ClothCommand{(uint32_t)mispredictTick, cloth::kCmdWind,
+                                                       (uint32_t)wIdx, cloth::FxVec3{FromInt(40), 0, 0}});
+
+        const std::vector<cloth::ClothParticle> authority =
+            cloth::RunClothLockstep(grid, init, es, noSpheres, authStream, ticks, grav, dt, groundY, iters);
+        const std::vector<cloth::ClothParticle> replica =
+            cloth::RunClothLockstep(grid, init, es, noSpheres, authStream, ticks, grav, dt, groundY, iters);
+
+        // LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+        check(authority.size() == replica.size() &&
+              std::memcmp(authority.data(), replica.data(), authority.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL5 lockstep: replica == authority BIT-EXACT (inputs-only re-sim)");
+
+        // ROLLBACK positive: rolledBack == authority BIT-EXACT.
+        const std::vector<cloth::ClothParticle> rolledBack =
+            cloth::RunClothRollback(grid, init, es, noSpheres, authStream, mispredictStream,
+                                    ticks, mispredictTick, grav, dt, groundY, iters);
+        check(rolledBack.size() == authority.size() &&
+              std::memcmp(rolledBack.data(), authority.data(), authority.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL5 rollback: corrected to authority BIT-EXACT (positive control)");
+
+        // ROLLBACK negative control: the pre-rollback MISPREDICTED full run DIFFERED from authority.
+        const std::vector<cloth::ClothParticle> mispredicted =
+            cloth::RunClothLockstep(grid, init, es, noSpheres, mispredictStream, ticks, grav, dt, groundY, iters);
+        check(mispredicted.size() == authority.size() &&
+              std::memcmp(mispredicted.data(), authority.data(), authority.size() * sizeof(cloth::ClothParticle)) != 0,
+              "CL5 rollback: mispredicted state DIFFERS from authority (negative control — the divergence was real)");
+    }
+
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
     else std::printf("cloth_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
