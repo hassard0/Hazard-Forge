@@ -613,6 +613,20 @@ hf_add_pure_test(fpx_test)
 # ground (NO constraints/collision/render — later CL slices). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(cloth_test)
 
+# Deterministic GPU Fluid Slice 1 (Slice FL1, the BEACHHEAD of FLAGSHIP #9): the Q16.16 fixed-point
+# fluid PARTICLE POOL INTEGRATOR + dam-break block core (engine/sim/fluid.h) the GPU
+# shaders/fluid_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
+# toolbox (fx/fxmul/FxVec3/FxAdd/FxSub/FxScale) read-only. Pins InitBlock (a solid W x H x D block in a
+# corner, the x-major/y-mid/z-minor traversal order, spacing/origin host-snapped, every particle dynamic,
+# prev==pos, vel==0) + ParticleIndex strides, IntegrateFluidParticle one-step + K-step semi-implicit-Euler
+# closed form (a free particle falls the EXACT Q16.16 distance — hand-checked integer recurrence, prev=pos
+# each step) + the ground floor clamp (pos.y==groundY, vel.y zeroed on contact, stays settled) + a STATIC
+# particle never moves + two runs byte-identical + a coherent dam-break fall (every particle fell, some
+# pile at the ground) + a ZERO-gravity pool unchanged after K steps (the static no-op). FL1 is ONLY the
+# integrator + block + ground (NO neighbours/density/constraints — later FL slices). Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(fluid_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE
