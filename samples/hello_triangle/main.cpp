@@ -453,6 +453,7 @@ int main(int argc, char** argv) {
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~60 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
+    const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
@@ -592,6 +593,19 @@ int main(int argc, char** argv) {
         // to avoid MSVC's nested-block parse limit C1061, like the fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--cloth-integrate-shot") == 0 && i + 1 < argc) {
             clothIntegrateShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CL2: --cloth-edges-shot <out.bmp> — the Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH
+        // BUILD (the 2nd slice of FLAGSHIP #8). The CL1 24x24 rest sheet -> BuildConstraints (structural +
+        // shear + bend distance constraints) is meshed by three pure-INT32 compute passes
+        // (cloth_edge_count -> cloth_edge_scan -> cloth_edge_emit, the FPX2 count->scan->emit on lattice
+        // particles), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer
+        // lattice-graph viz (nodes + edges color-coded by kind). PURE int32 (restLen host-snapped, NO
+        // int64/sqrt in-shader) -> MSL-native on Metal. NO new RHI. Handled as a STANDALONE branch (not in
+        // the --shot else-if chain) to avoid MSVC's nested-block parse limit C1061, like the cl1/fpx/mc shots.
+        if (std::strcmp(argv[i], "--cloth-edges-shot") == 0 && i + 1 < argc) {
+            clothEdgesShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -14980,6 +14994,291 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cloth particle-lattice side-view (%d moved, %d pinned)\n",
                                 clothIntegrateShotPath, imgW, imgH, moved, kPinned);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothIntegrateShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD (--cloth-edges-shot <out.bmp>,
+        // Slice CL2, the 2nd slice of FLAGSHIP #8). The CL1 24x24 rest sheet -> the structural + shear +
+        // bend distance constraints (cloth.h::BuildConstraints) are enumerated by three pure-INT32 compute
+        // passes (the FPX2 count->scan->emit on lattice particles): cloth_edge_count.comp (one thread per
+        // particle counts its OWNED forward edges in bounds) -> (compute->compute barrier) ->
+        // cloth_edge_scan.comp (single-thread exclusive prefix-sum -> gEdgeOffset) -> (barrier) ->
+        // cloth_edge_emit.comp (one thread per particle emits its edges into gEdges at its DISJOINT range,
+        // NO atomics, restLen host-snapped int32 per kind). CountOwnedEdges/the fixed emit order copied
+        // VERBATIM from cloth.h (INT32: index arithmetic + bounds compares, NO int64/sqrt -> MSL-gens
+        // natively on Metal). ReadBuffer reads gEdges + gEdgeOffset; the CPU cloth.h::BuildConstraints over
+        // the SAME sheet must match BIT-EXACT (memcmp). enabled=false -> zero edges. The golden is an
+        // integer lattice-graph viz (nodes + edges color-coded by kind). NO solving (CL3+), NO new RHI.
+        if (clothEdgesShotPath) {
+            using math::Vec3;
+            namespace cloth = hf::sim::cloth;
+            namespace vg = hf::render::vg;
+
+            // The deterministic 24x24 rest sheet (== the CL1 --cloth-integrate-shot / Metal --cloth-edges).
+            const int kSide = 24;                       // 24x24 sheet -> 576 particles
+            cloth::ClothGrid grid;
+            grid.W = kSide; grid.H = kSide;
+            grid.spacing = cloth::kOne;                 // 1.0 world unit spacing
+            grid.origin = cloth::FxVec3{0, (cloth::fx)(kSide * (int)cloth::kOne), 0};
+            const int kParticleCount = grid.W * grid.H;
+            std::vector<cloth::ClothParticle> sheet = cloth::InitGrid(grid);
+
+            // Host reference: BuildConstraints -> the exact edge list the GPU memcmp's against.
+            std::vector<cloth::Constraint> cpuEdges = cloth::BuildConstraints(grid, sheet);
+            const uint32_t totalEdges = (uint32_t)cpuEdges.size();
+            int cpuStruct, cpuShear, cpuBend;
+            cloth::CountConstraintsByKind(cpuEdges, cpuStruct, cpuShear, cpuBend);
+
+            // Per-kind host-snapped rest lengths (the only int64 use, on the CPU): the flat sheet is uniform
+            // so each kind has one restLen — structural = spacing, shear = FxLength(spacing,spacing,0),
+            // bend = 2*spacing. These feed the shader (which stays pure int32).
+            const cloth::fx restStruct = grid.spacing;
+            const cloth::fx restShear  = hf::sim::fpx::FxLength(cloth::FxVec3{grid.spacing, grid.spacing, 0});
+            const cloth::fx restBend   = (cloth::fx)(2 * (int)grid.spacing);
+
+            // Worst-case capacity = totalEdges (the count is exact; reuse it as the alloc so the disabled
+            // run has a fixed-size cleared buffer too). Guard against 0.
+            const uint32_t kEdgeAlloc = totalEdges > 0u ? totalEdges : 1u;
+
+            // std430 Constraint mirror (matches cloth_edge_emit.comp Constraint): 4 x int32 (16 bytes).
+            struct ConstraintGpu { uint32_t i, j; int32_t restLen; uint32_t kind; };
+            static_assert(sizeof(ConstraintGpu) == 16, "ConstraintGpu std430 layout");
+            static_assert(sizeof(cloth::Constraint) == 16, "Constraint std430 layout");
+
+            // Fresh-cleared per-run output buffers (so the disabled no-op reads the cleared bytes back).
+            std::vector<uint32_t> countInit((size_t)kParticleCount, 0u);
+            std::vector<uint32_t> offsetInit((size_t)kParticleCount, 0u);
+            std::vector<ConstraintGpu> edgesInit((size_t)kEdgeAlloc, ConstraintGpu{0u, 0u, 0, 0u});
+            auto makeCountBuf = [&]() {
+                rhi::BufferDesc d; d.size = countInit.size() * sizeof(uint32_t);
+                d.initialData = countInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeOffsetBuf = [&]() {
+                rhi::BufferDesc d; d.size = offsetInit.size() * sizeof(uint32_t);
+                d.initialData = offsetInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeEdgesBuf = [&]() {
+                rhi::BufferDesc d; d.size = edgesInit.size() * sizeof(ConstraintGpu);
+                d.initialData = edgesInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Count/emit params (cloth_edge_count/emit ClothEdgeParams std430): int4 grid {W,H,count,enabled}
+            // + int4 rest {restStruct, restShear, restBend, _}.
+            struct ClothEdgeParams { int32_t grid[4]; int32_t rest[4]; };
+            static_assert(sizeof(ClothEdgeParams) == 32, "ClothEdgeParams std430 layout");
+            auto makeCeParams = [&](int32_t enabled) {
+                ClothEdgeParams p{};
+                p.grid[0] = grid.W; p.grid[1] = grid.H; p.grid[2] = kParticleCount; p.grid[3] = enabled;
+                p.rest[0] = restStruct; p.rest[1] = restShear; p.rest[2] = restBend; p.rest[3] = 0;
+                return p;
+            };
+            // Scan params (cloth_edge_scan Params std430): { particleCount, _, _, _ }.
+            struct ClothScanParams { uint32_t particleCount, pad0, pad1, pad2; };
+            static_assert(sizeof(ClothScanParams) == 16, "ClothScanParams std430 layout");
+            ClothScanParams scanParams{}; scanParams.particleCount = (uint32_t)kParticleCount;
+            rhi::BufferDesc spDesc;
+            spDesc.size = sizeof(ClothScanParams); spDesc.initialData = &scanParams;
+            spDesc.usage = rhi::BufferUsage::Storage;
+            auto scanParamsBuf = device->CreateBuffer(spDesc);
+
+            // Pipelines: count (2 SSBO, 64 threads), scan (3 SSBO, 1 thread), emit (3 SSBO, 64 threads).
+            auto countWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cloth_edge_count.comp.hlsl.spv");
+            auto countCs = device->CreateShaderModule({std::span<const uint32_t>(countWords)});
+            rhi::ComputePipelineDesc countCd;
+            countCd.compute = countCs.get(); countCd.storageBufferCount = 2; countCd.threadsPerGroupX = 64;
+            auto countCompute = device->CreateComputePipeline(countCd);
+
+            auto scanWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cloth_edge_scan.comp.hlsl.spv");
+            auto scanCs = device->CreateShaderModule({std::span<const uint32_t>(scanWords)});
+            rhi::ComputePipelineDesc scanCd;
+            scanCd.compute = scanCs.get(); scanCd.storageBufferCount = 3; scanCd.threadsPerGroupX = 1;
+            auto scanCompute = device->CreateComputePipeline(scanCd);
+
+            auto emitWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cloth_edge_emit.comp.hlsl.spv");
+            auto emitCs = device->CreateShaderModule({std::span<const uint32_t>(emitWords)});
+            rhi::ComputePipelineDesc emitCd;
+            emitCd.compute = emitCs.get(); emitCd.storageBufferCount = 3; emitCd.threadsPerGroupX = 64;
+            auto emitCompute = device->CreateComputePipeline(emitCd);
+
+            const uint32_t kGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+
+            // Run count->scan->emit over fresh count/offset/edges buffers; read offset + edges back.
+            auto runEdges = [&](int32_t enabled, std::vector<uint32_t>& outOffset,
+                                std::vector<ConstraintGpu>& outEdges) {
+                auto countBuf  = makeCountBuf();
+                auto offsetBuf = makeOffsetBuf();
+                auto edgesBuf  = makeEdgesBuf();
+                ClothEdgeParams ce = makeCeParams(enabled);
+                rhi::BufferDesc ceDesc;
+                ceDesc.size = sizeof(ClothEdgeParams); ceDesc.initialData = &ce;
+                ceDesc.usage = rhi::BufferUsage::Storage;
+                auto ceBuf = device->CreateBuffer(ceDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("cloth_edges", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-particle owned-edge count.
+                        cmd.BindComputePipeline(*countCompute);
+                        cmd.BindStorageBuffer(*countBuf, 0);
+                        cmd.BindStorageBuffer(*ceBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToComputeBarrier();   // count -> scan
+                        // Pass 2: single-thread exclusive prefix-sum -> gEdgeOffset.
+                        cmd.BindComputePipeline(*scanCompute);
+                        cmd.BindStorageBuffer(*countBuf, 0);
+                        cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*scanParamsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();   // scan -> emit
+                        // Pass 3: per-particle emit into the disjoint range.
+                        cmd.BindComputePipeline(*emitCompute);
+                        cmd.BindStorageBuffer(*offsetBuf, 0);
+                        cmd.BindStorageBuffer(*edgesBuf, 1);
+                        cmd.BindStorageBuffer(*ceBuf, 2);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outOffset.assign((size_t)kParticleCount, 0u);
+                device->ReadBuffer(*offsetBuf, outOffset.data(), outOffset.size() * sizeof(uint32_t), 0);
+                outEdges.assign((size_t)kEdgeAlloc, ConstraintGpu{0u, 0u, 0, 0u});
+                device->ReadBuffer(*edgesBuf, outEdges.data(), outEdges.size() * sizeof(ConstraintGpu), 0);
+            };
+
+            // === GPU edges (enabled) ===
+            std::vector<uint32_t> gpuOffset; std::vector<ConstraintGpu> gpuEdges;
+            runEdges(1, gpuOffset, gpuEdges);
+
+            // PROOF (1) GPU==CPU edge list BIT-EXACT (offset + edges, integer memcmp, NO tol).
+            bool edgesOk = (totalEdges == (uint32_t)cpuEdges.size()) &&
+                std::memcmp(gpuEdges.data(), cpuEdges.data(), (size_t)totalEdges * sizeof(ConstraintGpu)) == 0;
+            if (!edgesOk) {
+                std::fprintf(stderr, "FATAL: cloth-edges GPU constraint list != CPU BuildConstraints "
+                             "(a divergence in the count->scan->emit?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-edges: {particles:%d, edges:%u, struct:%d/shear:%d/bend:%d} "
+                        "GPU==CPU BIT-EXACT\n",
+                        kParticleCount, totalEdges, cpuStruct, cpuShear, cpuBend);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            std::vector<uint32_t> o2; std::vector<ConstraintGpu> e2;
+            runEdges(1, o2, e2);
+            if (o2.size() != gpuOffset.size() ||
+                std::memcmp(o2.data(), gpuOffset.data(), o2.size() * sizeof(uint32_t)) != 0 ||
+                std::memcmp(e2.data(), gpuEdges.data(), e2.size() * sizeof(ConstraintGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-edges two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-edges determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) coverage / coherence: the edge counts match the lattice formula, every edge's
+            // endpoints are in-bounds + i<j, restLen>0. (Checked on the bit-exact GPU list.)
+            {
+                const int W = grid.W, H = grid.H;
+                const int expectStruct = W * (H - 1) + H * (W - 1);
+                const int expectShear  = 2 * (W - 1) * (H - 1);
+                const int expectBend   = H * (W - 2) + W * (H - 2);
+                bool ok = (cpuStruct == expectStruct) && (cpuShear == expectShear) &&
+                          (cpuBend == expectBend);
+                for (uint32_t k = 0; k < totalEdges && ok; ++k) {
+                    const ConstraintGpu& e = gpuEdges[k];
+                    if (!(e.i < e.j)) ok = false;
+                    if ((int)e.j >= kParticleCount) ok = false;
+                    if (e.restLen <= 0) ok = false;
+                }
+                if (!ok) {
+                    std::fprintf(stderr, "FATAL: cloth-edges coverage incoherent (formula/invariant)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-edges coverage: %u edges over %d particles "
+                            "(structural/shear/bend, all in-bounds)\n", totalEdges, kParticleCount);
+            }
+
+            // PROOF (4) empty / degenerate: a 1x1 grid -> 0 edges (the disabled no-op + the degenerate
+            // CPU build). enabled=false -> the edge buffer stays cleared.
+            {
+                std::vector<uint32_t> dOffset; std::vector<ConstraintGpu> dEdges;
+                runEdges(0, dOffset, dEdges);
+                bool zero = true;
+                for (const auto& e : dEdges)
+                    if (e.i != 0u || e.j != 0u || e.restLen != 0 || e.kind != 0u) { zero = false; break; }
+                cloth::ClothGrid g1; g1.W = 1; g1.H = 1; g1.spacing = cloth::kOne;
+                g1.origin = cloth::FxVec3{0, 0, 0};
+                std::vector<cloth::ClothParticle> one = cloth::InitGrid(g1);
+                const bool emptyOk = cloth::BuildConstraints(g1, one).empty();
+                if (!zero || !emptyOk) {
+                    std::fprintf(stderr, "FATAL: cloth-edges empty path produced edges "
+                                 "(disabled=%d, 1x1=%d)\n", (int)zero, (int)emptyOk);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-edges empty: 0 edges (no-op)\n");
+            }
+
+            // --- Golden: an integer lattice-graph viz. Draw each lattice node at its integer (col,row)
+            // grid position + each edge as a line color-coded by kind (structural/shear/bend). CPU-colored
+            // from the read-back integer edge list -> identical both backends by construction. ---
+            const int kPxPerUnit = 22;   // grid step -> pixels
+            const int kMargin = 16;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + (kSide - 1) * kPxPerUnit + 1);
+            const uint32_t imgH = imgW;
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto nodePx = [&](uint32_t idx, int& ix, int& iy) {
+                const int c = (int)idx % kSide, r = (int)idx / kSide;
+                ix = kMargin + c * kPxPerUnit;
+                iy = kMargin + r * kPxPerUnit;
+            };
+            auto putPx = [&](int ix, int iy, uint8_t r8, uint8_t g8, uint8_t b8) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b8; dst[1] = g8; dst[2] = r8; dst[3] = 255;
+            };
+            // Integer Bresenham line.
+            auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t r8, uint8_t g8, uint8_t b8) {
+                int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+                int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+                int err = dx + dy;
+                for (;;) {
+                    putPx(x0, y0, r8, g8, b8);
+                    if (x0 == x1 && y0 == y1) break;
+                    int e2 = 2 * err;
+                    if (e2 >= dy) { err += dy; x0 += sx; }
+                    if (e2 <= dx) { err += dx; y0 += sy; }
+                }
+            };
+            // Edge colors by kind: structural=cyan, shear=orange, bend=magenta.
+            for (uint32_t k = 0; k < totalEdges; ++k) {
+                const ConstraintGpu& e = gpuEdges[k];
+                int ax, ay, bx, by; nodePx(e.i, ax, ay); nodePx(e.j, bx, by);
+                uint8_t r8 = 80, g8 = 80, b8 = 80;
+                if (e.kind == cloth::kConstraintStructural) { r8 = 40;  g8 = 200; b8 = 220; }
+                else if (e.kind == cloth::kConstraintShear)  { r8 = 230; g8 = 150; b8 = 30;  }
+                else if (e.kind == cloth::kConstraintBend)   { r8 = 200; g8 = 40;  b8 = 200; }
+                drawLine(ax, ay, bx, by, r8, g8, b8);
+            }
+            // Nodes on top (white; pinned corners bright).
+            for (int idx = 0; idx < kParticleCount; ++idx) {
+                int nx, ny; nodePx((uint32_t)idx, nx, ny);
+                const bool pinned = (sheet[(size_t)idx].flags & cloth::kFlagPinned) != 0u;
+                const uint8_t v = pinned ? 255 : 180;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) putPx(nx + dx, ny + dy, v, v, v);
+            }
+            bool ok = WriteBMP(clothEdgesShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cloth constraint-graph (%u edges: %d/%d/%d)\n",
+                                clothEdgesShotPath, imgW, imgH, totalEdges, cpuStruct, cpuShear, cpuBend);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothEdgesShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

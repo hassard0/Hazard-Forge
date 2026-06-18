@@ -472,6 +472,21 @@ hf_compile_shaders(
     # construction, the fpx_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/cloth_integrate.comp.hlsl:cs"
+    # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT
+    # GRAPH BUILD (the FPX2/MC3 count->scan->emit on lattice particles). cloth_edge_count.comp: ONE thread
+    # per particle counts its OWNED forward edges in bounds (right/down structural, the two cell diagonals
+    # shear, 2-away right/down bend) -> gEdgeCount[p]. cloth_edge_scan.comp: SINGLE-THREAD ([numthreads(1,1,1)])
+    # exclusive prefix-sum -> gEdgeOffset. cloth_edge_emit.comp: ONE thread per particle emits each owned edge
+    # {i,j,restLen,kind} into gEdges at its DISJOINT [offset[p],..) range (race-free, NO atomics; restLen the
+    # host-snapped int32 per kind). CountOwnedEdges + the fixed emit order copied VERBATIM from
+    # engine/sim/cloth.h::BuildConstraints — PURE INT32 (index arithmetic + bounds compares, NO products, NO
+    # int64, NO sqrt in-shader; the restLen FxLength is computed HOST-side), so unlike cloth_integrate.comp's
+    # int64 fxmul these MSL-generate NATIVELY on Metal. Pure integer SSBO compute + compute->compute barriers
+    # + ReadBuffer -> bit-exact GPU==CPU constraint list + cross-backend, proven memcmp. NO new RHI; existing
+    # shaders + goldens untouched.
+    "shaders/cloth_edge_count.comp.hlsl:cs"
+    "shaders/cloth_edge_scan.comp.hlsl:cs"
+    "shaders/cloth_edge_emit.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
     # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp: ONE thread per body i scans j>i
     # and writes perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) (each unordered pair counted once,

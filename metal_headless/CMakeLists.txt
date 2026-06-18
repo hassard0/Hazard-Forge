@@ -278,6 +278,21 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 hf_gen_msl(fpx_pair_count.comp   fpx_pair_count.comp.hlsl   comp fpx_pair_count_main)
 hf_gen_msl(fpx_pair_scan.comp    fpx_pair_scan.comp.hlsl    comp fpx_pair_scan_main)
 hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_main)
+# Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT GRAPH
+# BUILD (the FPX2 count->scan->emit on lattice particles). cloth_edge_count.comp (ONE thread per particle:
+# gEdgeCount[p]=#OWNED forward edges in bounds), cloth_edge_scan.comp (SINGLE-THREAD exclusive prefix-sum ->
+# gEdgeOffset), cloth_edge_emit.comp (ONE thread per particle: emit each owned edge {i,j,restLen,kind} into
+# gEdges at its DISJOINT range, NO atomics). CountOwnedEdges + the fixed emit order copied VERBATIM from
+# engine/sim/cloth.h::BuildConstraints. UNLIKE CL1's int64 cloth_integrate.comp (Vulkan-only -> CPU on
+# Metal), these are PURE INT32 (index arithmetic + bounds compares, NO products/int64, NO sqrt — restLen is
+# the host-snapped int32 per kind), so glslc CAN lower them and they MSL-generate NATIVELY (the default MSL
+# gen suffices, NO --msl-version 20200, the fpx_pair/nav_raster lesson). The Metal --cloth-edges showcase
+# dispatches the GPU shaders directly (NOT a CPU fallback) -> the GPU==CPU constraint-list proof runs on
+# Metal too. Edge list bit-exact GPU==CPU + cross-backend by construction. Behind --cloth-edges only;
+# existing shaders + goldens untouched.
+hf_gen_msl(cloth_edge_count.comp cloth_edge_count.comp.hlsl comp cloth_edge_count_main)
+hf_gen_msl(cloth_edge_scan.comp  cloth_edge_scan.comp.hlsl  comp cloth_edge_scan_main)
+hf_gen_msl(cloth_edge_emit.comp  cloth_edge_emit.comp.hlsl  comp cloth_edge_emit_main)
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7: deterministic GPU navmesh
 # + pathfinding): the integer HEIGHTFIELD SPAN RASTERIZATION (the MC3 count->scan->emit on voxel
 # columns). nav_raster_count.comp (ONE thread per column (cx,cz): colCount[col]=#triangles whose XZ
