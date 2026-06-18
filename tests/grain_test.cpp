@@ -1011,6 +1011,58 @@ int main() {
               "GR5 rollback: mispredicted state DIFFERS from authority (negative control — the divergence was real)");
     }
 
+    // ================= GR6 render helpers (GrainVertToWorld / GrainToRenderInstances) ===============
+    // The render-only float helpers (pos/(float)kOne -> world; one per-instance model matrix per grain).
+    // GR1-GR5 stay bit-exact integer; ONLY these helpers cross to float. The render is golden-verified
+    // (not unit-tested) — here we PIN the scale + count + per-instance translate/scale contracts (the FL6 twin).
+    {
+        // GrainVertToWorld: a known Q16.16 pos -> the exact float world position (pos / (float)kOne).
+        const grain::FxVec3 q{FromInt(3), FromInt(-2), kOne / 2};   // (3.0, -2.0, 0.5) in Q16.16
+        const math::Vec3 w = grain::GrainVertToWorld(q);
+        check(w.x == 3.0f && w.y == -2.0f && w.z == 0.5f,
+              "GR6 GrainVertToWorld: pos/(float)kOne -> exact float world position");
+        check(grain::GrainToFloat(kOne) == 1.0f && grain::GrainToFloat(0) == 0.0f,
+              "GR6 GrainToFloat: kOne -> 1.0, 0 -> 0.0");
+
+        // GrainParticleTransform: translate(pos/kOne) * scale(radius). The translation lands in the mat4's
+        // last column (m[12..14]); the diagonal scale lands in m[0]/m[5]/m[10] (no rotation -> off-diagonals 0).
+        const float kRadius = 0.5f;
+        grain::GrainParticle g;
+        g.pos = grain::FxVec3{FromInt(4), FromInt(6), FromInt(-8)};
+        const math::Mat4 m = grain::GrainParticleTransform(g, kRadius);
+        check(m.m[12] == 4.0f && m.m[13] == 6.0f && m.m[14] == -8.0f,
+              "GR6 GrainParticleTransform: translate == pos/(float)kOne (mat4 last column)");
+        check(m.m[0] == kRadius && m.m[5] == kRadius && m.m[10] == kRadius,
+              "GR6 GrainParticleTransform: diagonal scale == grain radius");
+        check(m.m[1] == 0.0f && m.m[2] == 0.0f && m.m[4] == 0.0f && m.m[6] == 0.0f &&
+              m.m[8] == 0.0f && m.m[9] == 0.0f && m.m[15] == 1.0f,
+              "GR6 GrainParticleTransform: no rotation (off-diagonals 0, w 1)");
+
+        // GrainToRenderInstances: N grains -> N transforms, each the right translate+scale (provenance:
+        // the transform derives from the bit-exact GrainParticle::pos).
+        grain::GrainBlock block;
+        block.W = 3; block.H = 2; block.D = 2;   // 12 grains
+        block.spacing = kOne;
+        block.radius = kOne / 2;
+        block.origin = grain::FxVec3{FromInt(1), FromInt(2), FromInt(3)};
+        const std::vector<grain::GrainParticle> gs = grain::InitGrainBlock(block);
+        const std::vector<math::Mat4> insts = grain::GrainToRenderInstances(gs, kRadius);
+        check(insts.size() == gs.size() && insts.size() == 12u,
+              "GR6 GrainToRenderInstances: one transform per grain (count == N)");
+        bool allMatch = true;
+        for (size_t i = 0; i < gs.size(); ++i) {
+            const math::Vec3 wp = grain::GrainVertToWorld(gs[i].pos);
+            if (insts[i].m[12] != wp.x || insts[i].m[13] != wp.y || insts[i].m[14] != wp.z) allMatch = false;
+            if (insts[i].m[0] != kRadius || insts[i].m[5] != kRadius || insts[i].m[10] != kRadius) allMatch = false;
+        }
+        check(allMatch, "GR6 GrainToRenderInstances: every instance translates to pos/kOne, scales by radius");
+
+        // Empty pool -> empty instance array (the empty no-op: zero instances -> the cleared base scene).
+        const std::vector<grain::GrainParticle> none;
+        check(grain::GrainToRenderInstances(none, kRadius).empty(),
+              "GR6 GrainToRenderInstances: empty pool -> empty (the empty no-op)");
+    }
+
     if (g_fail == 0) std::printf("grain_test: ALL PASS\n");
     else std::printf("grain_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

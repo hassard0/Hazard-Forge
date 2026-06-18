@@ -49,6 +49,10 @@
 #include <vector>
 
 #include "sim/fpx.h"   // read-only: fx / fxmul / FxVec3 / FxAdd / FxSub / FxScale / kOne / kFrac
+#include "math/math.h" // Slice GR6 (render-only): math::Mat4 / math::Vec3 for the GrainVertToWorld /
+                       // GrainToRenderInstances render helpers. The bit-exact GR1-GR5 sim uses NONE of
+                       // this — it stays pure integer, NO float; ONLY the GR6 render helpers (appended at
+                       // the bottom) cross to float. (fpx.h already pulls math/math.h; explicit for clarity.)
 
 namespace hf::sim {
 namespace grain {
@@ -967,6 +971,53 @@ inline std::vector<GrainParticle> RunGrainRollback(const std::vector<GrainPartic
     for (int t = mispredictTick; t < ticks; ++t)
         SimGrainTick(grains, spheres, authStream, (uint32_t)t, gravity, dt, groundY, hSearch, mu, iters);
     return grains;
+}
+
+// ===== Slice GR6 — Deterministic GPU Granular/Sand: LIT 3D RENDER helpers (the FLOAT visresolve-bar, render-only) =
+// The SIXTH and FINAL slice of FLAGSHIP #10 (the money-shot capstone — COMPLETES the TENTH flagship). GR1-GR5
+// are strict integer/bit-exact (the granular sim is fixed-point); GR6 RASTERIZES the bit-exact grain pile as
+// lit 3D INSTANCED SPHERES (a heap/cone of lit sand grains) — ONE sphere instance per GrainParticle, the
+// per-instance model matrix built from the BIT-EXACT integer pos. The ONLY float crossing is `pos / (float)kOne`
+// (GrainVertToWorld); the sim stays pure integer. The provenance: every render transform derives from
+// GrainParticle::pos, the settled output of the bit-exact StepGrainFriction. This is the DIRECT TWIN of
+// fluid.h::FluidVertToWorld / FluidToRenderInstances (the FL6 render helpers, themselves the fpx.h::FxToFloat /
+// FxBodyTransform twin) over a GRAIN instead of a fluid particle — render-only, NO sim mutation, NO new RHI, NO
+// new shader (reuse the EXISTING instanced lit-sphere pipeline). These helpers are kept OUT of the bit-exact
+// sim path (above). (A grain sphere is rotation-invariant, so the transform is translate * scale, NO rotation —
+// the FL6 droplet case, NOT the FPX6 rigid-body orient.)
+
+// GrainToFloat(v): the single host fixed-point->float conversion, v in Q16.16 -> float world units (the
+// fluid::FluidToFloat / fpx::FxToFloat twin; v / (float)kOne). The ONE place grain render touches float.
+inline float GrainToFloat(fx v) { return (float)v / (float)kOne; }
+
+// GrainVertToWorld(p): the float world position of a Q16.16 vector (pos.xyz / (float)kOne). The ONE host
+// float crossing the GR6 render uses — render-only; the bit-exact integer pos is untouched.
+inline math::Vec3 GrainVertToWorld(const FxVec3& p) {
+    return math::Vec3{GrainToFloat(p.x), GrainToFloat(p.y), GrainToFloat(p.z)};
+}
+
+// GrainParticleTransform(g, radius): the render-only model matrix for ONE grain — a unit sphere TRANSLATED to
+// the grain's float world position (GrainVertToWorld(g.pos)) and SCALED by the grain radius (a float world-unit
+// radius). translate(pos/kOne) * scale(radius) (no rotation — a sand grain sphere is rotation-invariant). Pure
+// deterministic host float (no RNG, no clock). The provenance: the transform IS the bit-exact GrainParticle::pos.
+// The fluid::FluidParticleTransform twin.
+inline math::Mat4 GrainParticleTransform(const GrainParticle& g, float radius) {
+    const math::Vec3 t = GrainVertToWorld(g.pos);
+    return math::Mat4::Translate(t) * math::Mat4::Scale(math::Vec3{radius, radius, radius});
+}
+
+// GrainToRenderInstances(grains, radius): build ONE per-instance model matrix per grain (the instanced lit-sphere
+// render input — a sphere at each grain's bit-exact world position, scaled by the grain radius). Output is a flat
+// array of column-major mat4 floats (16 per instance), the scene::InstanceData / InstanceTransformLayout packing
+// the EXISTING instanced lit pipeline consumes. The caller copies each 16-float block into a scene::InstanceData.
+// Empty pool -> empty output (the empty no-op: zero instances -> the cleared base scene). Render-only,
+// deterministic, NO sim mutation. The fluid::FluidToRenderInstances twin over GRAINS.
+inline std::vector<math::Mat4> GrainToRenderInstances(const std::vector<GrainParticle>& grains, float radius) {
+    std::vector<math::Mat4> out;
+    out.reserve(grains.size());
+    for (const GrainParticle& g : grains)
+        out.push_back(GrainParticleTransform(g, radius));
+    return out;
 }
 
 }  // namespace grain
