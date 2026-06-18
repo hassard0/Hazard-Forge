@@ -716,6 +716,150 @@ int main() {
         check(same, "solve(determinism): two StepFluidSteps runs BYTE-IDENTICAL");
     }
 
+    // ================= FL5: ApplyFluidCommand — wind / push / OOB no-op / static hold =================
+    {
+        fluid::FluidBlock blk;
+        blk.W = 3; blk.H = 3; blk.D = 3; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 4, 0};
+        std::vector<fluid::FluidParticle> ps = fluid::InitBlock(blk);
+
+        // kCmdWind adds to a dynamic particle's velocity.
+        const int idx = fluid::ParticleIndex(blk, 1, 1, 1);   // an interior, dynamic particle
+        const fluid::FluidCommand wind{0, fluid::kCmdWind, (uint32_t)idx,
+                                       fluid::FxVec3{FromInt(2), FromInt(-3), FromInt(1)}};
+        fluid::ApplyFluidCommand(ps, wind);
+        check(ps[(size_t)idx].vel.x == FromInt(2) && ps[(size_t)idx].vel.y == FromInt(-3) &&
+              ps[(size_t)idx].vel.z == FromInt(1),
+              "FL5 ApplyFluidCommand: kCmdWind adds the delta-velocity to a dynamic particle");
+
+        // kCmdPush adds to a dynamic particle's position.
+        const fluid::fx px0 = ps[(size_t)idx].pos.x;
+        fluid::ApplyFluidCommand(ps, fluid::FluidCommand{0, fluid::kCmdPush, (uint32_t)idx,
+                                                         fluid::FxVec3{FromInt(5), 0, 0}});
+        check(ps[(size_t)idx].pos.x == px0 + FromInt(5),
+              "FL5 ApplyFluidCommand: kCmdPush adds the delta-position to a dynamic particle");
+
+        // A static particle holds — wind/push are a no-op.
+        const int sIdx = fluid::ParticleIndex(blk, 0, 0, 0);
+        ps[(size_t)sIdx].flags = fluid::kFlagStatic;
+        ps[(size_t)sIdx].invMass = 0;
+        const fluid::FluidParticle sBefore = ps[(size_t)sIdx];
+        fluid::ApplyFluidCommand(ps, fluid::FluidCommand{0, fluid::kCmdWind, (uint32_t)sIdx,
+                                                         fluid::FxVec3{FromInt(9), 0, 0}});
+        fluid::ApplyFluidCommand(ps, fluid::FluidCommand{0, fluid::kCmdPush, (uint32_t)sIdx,
+                                                         fluid::FxVec3{FromInt(9), 0, 0}});
+        check(std::memcmp(&sBefore, &ps[(size_t)sIdx], sizeof(fluid::FluidParticle)) == 0,
+              "FL5 ApplyFluidCommand: a static particle holds (wind/push are no-ops)");
+
+        // Out-of-range target is a deterministic no-op (no crash, no mutation).
+        std::vector<fluid::FluidParticle> before = ps;
+        fluid::ApplyFluidCommand(ps, fluid::FluidCommand{0, fluid::kCmdWind, 9999u,
+                                                         fluid::FxVec3{FromInt(5), 0, 0}});
+        check(before.size() == ps.size() &&
+              std::memcmp(before.data(), ps.data(), ps.size() * sizeof(fluid::FluidParticle)) == 0,
+              "FL5 ApplyFluidCommand: out-of-range target is a no-op");
+    }
+
+    // ================= FL5: SnapshotFluid / RestoreFluid round-trip == original ========================
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 5, 0};
+        std::vector<fluid::FluidParticle> ps = fluid::InitBlock(blk);
+        const fluid::FluidKernel k = makeKernel(ps, h);
+        const std::vector<fluid::SphereCollider> noSpheres;
+        const int iters = 4;
+        // Advance a few steps so the state is non-trivial, then snapshot it.
+        fluid::StepFluidSteps(ps, k, noSpheres, kGravity, kDt, 0, 5, iters);
+
+        const std::vector<fluid::FluidParticle> snap = fluid::SnapshotFluid(ps);
+        // Mutate (one more step), then restore -> must equal the snapshot exactly.
+        fluid::StepFluid(ps, k, noSpheres, kGravity, kDt, 0, iters);
+        check(std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(fluid::FluidParticle)) != 0,
+              "FL5 snapshot: a step actually mutated the fluid (control)");
+        fluid::RestoreFluid(ps, snap);
+        check(ps.size() == snap.size() &&
+              std::memcmp(ps.data(), snap.data(), snap.size() * sizeof(fluid::FluidParticle)) == 0,
+              "FL5 snapshot: SnapshotFluid -> RestoreFluid round-trip == original BIT-EXACT");
+    }
+
+    // ================= FL5: SimFluidTick determinism + deterministic command order ====================
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 5, 0};
+        std::vector<fluid::FluidParticle> base = fluid::InitBlock(blk);
+        const fluid::FluidKernel k = makeKernel(base, h);
+        const std::vector<fluid::SphereCollider> noSpheres;
+        const int iters = 4;
+
+        const int t0 = fluid::ParticleIndex(blk, 2, 2, 2);
+        const std::vector<fluid::FluidCommand> stream{
+            fluid::FluidCommand{0, fluid::kCmdWind, (uint32_t)t0, fluid::FxVec3{FromInt(3), 0, 0}},
+        };
+        // Two SimFluidTick runs over the SAME init+stream -> byte-identical.
+        std::vector<fluid::FluidParticle> a = base, b = base;
+        fluid::SimFluidTick(a, k, noSpheres, stream, 0, kGravity, kDt, 0, iters);
+        fluid::SimFluidTick(b, k, noSpheres, stream, 0, kGravity, kDt, 0, iters);
+        check(std::memcmp(a.data(), b.data(), a.size() * sizeof(fluid::FluidParticle)) == 0,
+              "FL5 SimFluidTick: two runs byte-identical (deterministic)");
+
+        // A tick whose commands don't match -> no command applied (pure StepFluid).
+        std::vector<fluid::FluidParticle> noCmd = base, plain = base;
+        fluid::SimFluidTick(noCmd, k, noSpheres, stream, 5, kGravity, kDt, 0, iters);   // tick 5: no cmd at 5
+        fluid::StepFluid(plain, k, noSpheres, kGravity, kDt, 0, iters);
+        check(std::memcmp(noCmd.data(), plain.data(), plain.size() * sizeof(fluid::FluidParticle)) == 0,
+              "FL5 SimFluidTick: a tick with no matching command == pure StepFluid");
+    }
+
+    // ================= FL5: RunFluidLockstep replica == authority (the lockstep headline) =============
+    // ================= + RunFluidRollback positive (converges) + negative (mispredict differs) ========
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        fluid::FluidBlock blk;
+        blk.W = 5; blk.H = 5; blk.D = 5; blk.spacing = kOne; blk.origin = fluid::FxVec3{0, kOne * 6, 0};
+        const std::vector<fluid::FluidParticle> init = fluid::InitBlock(blk);
+        const fluid::FluidKernel k = makeKernel(init, h);
+        const std::vector<fluid::SphereCollider> noSpheres;
+        const int iters = 4;
+        const int ticks = 16, mispredictTick = 6;
+
+        const int wIdx = fluid::ParticleIndex(blk, 2, 4, 2);   // a top-layer particle the wind shoves
+        const std::vector<fluid::FluidCommand> authStream{
+            fluid::FluidCommand{2,  fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{FromInt(8), 0, 0}},
+            fluid::FluidCommand{6,  fluid::kCmdPush, (uint32_t)wIdx, fluid::FxVec3{0, 0, FromInt(2)}},
+            fluid::FluidCommand{10, fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{FromInt(4), 0, 0}},
+        };
+        // The MISPREDICTED stream: auth + a WRONG strong wind at mispredictTick (a real divergence).
+        std::vector<fluid::FluidCommand> mispredictStream = authStream;
+        mispredictStream.push_back(fluid::FluidCommand{(uint32_t)mispredictTick, fluid::kCmdWind,
+                                                       (uint32_t)wIdx, fluid::FxVec3{FromInt(60), 0, 0}});
+
+        const std::vector<fluid::FluidParticle> authority =
+            fluid::RunFluidLockstep(init, k, noSpheres, authStream, ticks, kGravity, kDt, 0, iters);
+        const std::vector<fluid::FluidParticle> replica =
+            fluid::RunFluidLockstep(init, k, noSpheres, authStream, ticks, kGravity, kDt, 0, iters);
+
+        // LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+        check(authority.size() == replica.size() &&
+              std::memcmp(authority.data(), replica.data(), authority.size() * sizeof(fluid::FluidParticle)) == 0,
+              "FL5 lockstep: replica == authority BIT-EXACT (inputs-only re-sim)");
+
+        // ROLLBACK positive: rolledBack == authority BIT-EXACT.
+        const std::vector<fluid::FluidParticle> rolledBack =
+            fluid::RunFluidRollback(init, k, noSpheres, authStream, mispredictStream,
+                                    ticks, mispredictTick, kGravity, kDt, 0, iters);
+        check(rolledBack.size() == authority.size() &&
+              std::memcmp(rolledBack.data(), authority.data(), authority.size() * sizeof(fluid::FluidParticle)) == 0,
+              "FL5 rollback: corrected to authority BIT-EXACT (positive control)");
+
+        // ROLLBACK negative control: the pre-rollback MISPREDICTED full run DIFFERED from authority.
+        const std::vector<fluid::FluidParticle> mispredicted =
+            fluid::RunFluidLockstep(init, k, noSpheres, mispredictStream, ticks, kGravity, kDt, 0, iters);
+        check(mispredicted.size() == authority.size() &&
+              std::memcmp(mispredicted.data(), authority.data(), authority.size() * sizeof(fluid::FluidParticle)) != 0,
+              "FL5 rollback: mispredicted state DIFFERS from authority (negative control — the divergence was real)");
+    }
+
     if (g_fail == 0) std::printf("fluid_test: ALL PASS\n");
     else std::printf("fluid_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

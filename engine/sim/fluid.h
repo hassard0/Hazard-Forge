@@ -810,5 +810,136 @@ inline int64_t DensityResidual(const std::vector<fx>& density, fx restDensity) {
     return r;
 }
 
+// ===== Slice FL5 — Deterministic GPU Fluid: LOCKSTEP + ROLLBACK netcode harness (the HEADLINE) =========
+// Prove the bit-exact FL1-FL4 fluid is true cross-platform LOCKSTEP + ROLLBACK: a peer fed the INPUT
+// command stream ALONE (NOT full state) re-derives the authority's exact fluid state bit-for-bit, and a
+// mispredicted input is corrected by rolling back to a saved snapshot + re-simulating the authoritative
+// stream. PURE CPU, 0 backend symbols, NO new shader / RHI: this is a determinism PROPERTY of the existing
+// bit-exact StepFluid (FL4) — the cross-backend zero-diff golden (the converged state is bit-identical on
+// Vulkan-Windows AND Metal-Mac from the same inputs) IS the cross-platform-lockstep evidence. This is the
+// DIRECT TWIN of cloth.h's ClothCommand/ApplyClothCommand/SimClothTick/SnapshotCloth/RestoreCloth/
+// RunClothLockstep/RunClothRollback (the CL5 harness, itself the fpx.h:531-601 twin) — the SAME shape over
+// FluidParticle/StepFluid. NO <cmath>, NO RNG, NO clock. This extends the FPX5/CL5 lockstep/rollback
+// headline from RIGID + cloth to FLUID — a deterministic, rollback-able, bit-identical-cross-platform
+// fluid UE5's float/non-deterministic Niagara cannot provide, COMPLETING the deterministic-sim trilogy's
+// lockstep story (rigid fpx + cloth + fluid).
+//
+// A FluidCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full
+// state). kCmdWind adds `arg` (a wind delta-velocity) to a particle's velocity (an integer add, skipping
+// static particles — they hold); kCmdPush adds `arg` (a position delta) directly to a particle's position
+// (a localized displacement impulse — an integer add on pos, skipping static). A std::vector<FluidCommand>
+// is the command STREAM, processed in ARRAY ORDER for each tick (the deterministic-order contract — the
+// same order on every peer/platform), so authority + replica fed the same stream re-derive the same state
+// exactly.
+
+inline constexpr uint32_t kCmdWind = 0u;   // arg added to target particle's velocity (a wind impulse)
+inline constexpr uint32_t kCmdPush = 1u;   // arg added to target particle's position (a localized push)
+
+struct FluidCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdWind / kCmdPush
+    uint32_t target = 0;   // the target particle index
+    FxVec3   arg;          // the Q16.16 payload (delta-velocity for kCmdWind; delta-position for kCmdPush)
+};
+
+// ApplyFluidCommand(particles, c): apply ONE input command to the fluid (pure integer — add to vel / add to
+// pos). Out-of-range target is a no-op (deterministic). Unknown kind is a no-op. Static particles are never
+// mutated (they hold). The input event the lockstep/rollback streams are made of. The cloth.h::
+// ApplyClothCommand twin.
+inline void ApplyFluidCommand(std::vector<FluidParticle>& particles, const FluidCommand& c) {
+    if (c.target >= (uint32_t)particles.size()) return;
+    FluidParticle& p = particles[(size_t)c.target];
+    if (p.flags & kFlagStatic) return;       // static particles hold — no input moves them
+    if (c.kind == kCmdWind) {
+        p.vel.x += c.arg.x;
+        p.vel.y += c.arg.y;
+        p.vel.z += c.arg.z;
+    } else if (c.kind == kCmdPush) {
+        p.pos.x += c.arg.x;
+        p.pos.y += c.arg.y;
+        p.pos.z += c.arg.z;
+    }
+}
+
+// SimFluidTick(particles, kernel, spheres, stream, tick, gravity, dt, groundY, iters): the deterministic
+// per-tick step. (1) apply ALL commands in `stream` whose .tick == `tick`, in ARRAY ORDER (the deterministic
+// input-order contract); (2) StepFluid one step (FL4 — IntegrateFluid predict + neighbour list + iters
+// JACOBI density iterations + velocity update + CollidePlane/CollideSpheres). Pure integer, fixed order ->
+// bit-identical on every peer/platform. The cloth.h::SimClothTick twin (StepFluid replaces StepClothCollide;
+// StepFluid rebuilds the neighbour list internally from the predicted positions).
+inline void SimFluidTick(std::vector<FluidParticle>& particles, const FluidKernel& kernel,
+                         const std::vector<SphereCollider>& spheres,
+                         const std::vector<FluidCommand>& stream, uint32_t tick,
+                         const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    for (const FluidCommand& c : stream)
+        if (c.tick == tick) ApplyFluidCommand(particles, c);
+    StepFluid(particles, kernel, spheres, gravity, dt, groundY, iters);
+}
+
+// SnapshotFluid(particles): a deep copy of the full integer particle array (the rollback primitive — a
+// lossless saved tick). (std::vector copy is a deep copy.) The cloth.h::SnapshotCloth twin.
+inline std::vector<FluidParticle> SnapshotFluid(const std::vector<FluidParticle>& particles) {
+    return particles;   // value copy: deep-copies the particle array
+}
+
+// RestoreFluid(particles, snap): restore the fluid to a saved snapshot (the rollback). Bit-exact round-trip
+// with SnapshotFluid (RestoreFluid(p, SnapshotFluid(p0)) leaves p == p0 byte-for-byte). The cloth.h::
+// RestoreCloth twin.
+inline void RestoreFluid(std::vector<FluidParticle>& particles, const std::vector<FluidParticle>& snap) {
+    particles = snap;
+}
+
+// RunFluidLockstep(init, kernel, spheres, stream, ticks, gravity, dt, groundY, iters): THE peer entry point.
+// Run `ticks` SimFluidTicks from a COPY of `init`, applying the command stream -> the final fluid state.
+// authority = RunFluidLockstep(...); replica = RunFluidLockstep(...) from the SAME init + stream (inputs
+// ONLY — no state shared) -> BIT-IDENTICAL by determinism (the lockstep proof memcmps them). The cloth.h::
+// RunClothLockstep twin.
+inline std::vector<FluidParticle> RunFluidLockstep(const std::vector<FluidParticle>& init,
+                                                   const FluidKernel& kernel,
+                                                   const std::vector<SphereCollider>& spheres,
+                                                   const std::vector<FluidCommand>& stream, int ticks,
+                                                   const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    std::vector<FluidParticle> particles = init;
+    for (int t = 0; t < ticks; ++t)
+        SimFluidTick(particles, kernel, spheres, stream, (uint32_t)t, gravity, dt, groundY, iters);
+    return particles;
+}
+
+// RunFluidRollback(init, kernel, spheres, authStream, mispredictStream, ticks, mispredictTick, gravity, dt,
+// groundY, iters): the rollback harness. (1) run ticks 0..mispredictTick from init applying authStream,
+// SAVING a snapshot AT mispredictTick (before that tick is simulated); (2) speculatively advance a few ticks
+// from the snapshot with the MISPREDICTED stream (the wrong input) — this is the client prediction that
+// diverges; (3) "receive" the authoritative input -> RestoreFluid to the snapshot + RE-SIMULATE
+// mispredictTick..ticks with the CORRECT authStream -> the final corrected fluid. The proof asserts this ==
+// RunFluidLockstep(init, authStream, ticks) (rollback corrected the misprediction EXACTLY) AND that the
+// mispredicted-before-rollback state DIFFERED from the authority (a real divergence was fixed). The cloth.h::
+// RunClothRollback twin.
+inline std::vector<FluidParticle> RunFluidRollback(const std::vector<FluidParticle>& init,
+                                                   const FluidKernel& kernel,
+                                                   const std::vector<SphereCollider>& spheres,
+                                                   const std::vector<FluidCommand>& authStream,
+                                                   const std::vector<FluidCommand>& mispredictStream,
+                                                   int ticks, int mispredictTick,
+                                                   const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    std::vector<FluidParticle> particles = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimFluidTick(particles, kernel, spheres, authStream, (uint32_t)t, gravity, dt, groundY, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point).
+    const std::vector<FluidParticle> snap = SnapshotFluid(particles);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — this is the
+    // client prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimFluidTick(particles, kernel, spheres, mispredictStream, (uint32_t)(mispredictTick + s),
+                     gravity, dt, groundY, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreFluid(particles, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimFluidTick(particles, kernel, spheres, authStream, (uint32_t)t, gravity, dt, groundY, iters);
+    return particles;
+}
+
 }  // namespace fluid
 }  // namespace hf::sim
