@@ -15808,15 +15808,19 @@ int main(int argc, char** argv) {
                 std::printf("couple-query empty: 0 gathered (no-op)\n");
             }
 
-            // --- Golden: a PURE-INTEGER per-body gathered-particle HEAT side-view. Project each fluid
-            // particle's integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel (the FL1 transform); color each
-            // particle by which body gathered it (body 0 = warm, body 1 = cool, un-gathered = dim grey) ->
-            // a coherent per-body heat map. CPU-colored from the read-back integers -> identical both backends
-            // by construction (PURE INTEGER, the strict zero-differing-pixel bar). ---
+            // --- Golden: a PURE-INTEGER per-body gathered-particle HEAT TOP-DOWN view. The pool is 10(x) x
+            // 4(y) x 10(z); the two submerged bodies sit at distinct (x,z) so a TOP-DOWN (x,z) projection (the
+            // y depth-into-water dropped) spatially SEPARATES the two bodies' gathered regions — a side-view
+            // (x,y) would collapse all 10 z-layers onto one column and the colored particles would be
+            // overdrawn. Project each fluid particle's integer (pos.x>>kFrac, pos.z>>kFrac) to a pixel, color
+            // it by which body gathered it (body 0 = warm, body 1 = cool, un-gathered = dim grey); draw the
+            // un-gathered particles FIRST then the gathered ones ON TOP (a deterministic owner-order z-sort) so
+            // the colored gathered regions are visible. CPU-colored from the read-back integers -> identical
+            // both backends by construction (PURE INTEGER, the strict zero-differing-pixel bar). ---
             const int kPxPerUnit = 22;
             const int kMargin = 20;
-            const int kWorldW = 10;
-            const int kWorldH = 10;
+            const int kWorldW = 10;   // x extent (world units)
+            const int kWorldH = 10;   // z extent (world units)
             const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
             const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
             std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
@@ -15835,12 +15839,11 @@ int main(int argc, char** argv) {
                                                 Vec3{0.4f, 1.0f, 0.4f}};
                 return palette[b % 3];
             };
-            for (int i = 0; i < kParticleCount; ++i) {
+            auto plot = [&](int i, const Vec3& col) {
                 const int wx = particlesInit[(size_t)i].px >> fluid::kFrac;
-                const int wy = particlesInit[(size_t)i].py >> fluid::kFrac;
+                const int wz = particlesInit[(size_t)i].pz >> fluid::kFrac;
                 int cx = kMargin + wx * kPxPerUnit;
-                int cy = (int)imgH - kMargin - wy * kPxPerUnit;
-                Vec3 col = ownerOf[(size_t)i] >= 0 ? bodyColor(ownerOf[(size_t)i]) : Vec3{0.18f, 0.18f, 0.2f};
+                int cy = (int)imgH - kMargin - wz * kPxPerUnit;
                 for (int dy = 0; dy <= 1; ++dy)
                     for (int dx = 0; dx <= 1; ++dx) {
                         const int ix = cx + dx, iy = cy + dy;
@@ -15851,7 +15854,13 @@ int main(int argc, char** argv) {
                         dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
                         dst[3] = 255;
                     }
-            }
+            };
+            // Pass A: the un-gathered pool (dim grey, the backdrop). Pass B: the gathered particles ON TOP
+            // (per-body color) so the colored regions win the overdraw.
+            for (int i = 0; i < kParticleCount; ++i)
+                if (ownerOf[(size_t)i] < 0) plot(i, Vec3{0.18f, 0.18f, 0.2f});
+            for (int i = 0; i < kParticleCount; ++i)
+                if (ownerOf[(size_t)i] >= 0) plot(i, bodyColor(ownerOf[(size_t)i]));
             bool ok = WriteBMP(coupleQueryShotPath, bgra, imgW, imgH);
             if (ok) std::printf("wrote %s (%ux%u) — couple body-particle gather heat (%u gathered, maxPerBody %u)\n",
                                 coupleQueryShotPath, imgW, imgH, kTotalGathered, maxPer);

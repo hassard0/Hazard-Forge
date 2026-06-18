@@ -18944,8 +18944,9 @@ static int RunCoupleQueryShowcase(const char* outPath) {
         std::printf("couple-query empty: 0 gathered (no-op)\n");
     }
 
-    // --- Golden: the integer per-body gathered-particle HEAT side-view (IDENTICAL to the Vulkan
-    // --couple-query-shot by construction; CPU-colored from the read-back integer CSR). ---
+    // --- Golden: the integer per-body gathered-particle HEAT TOP-DOWN (x,z) view (IDENTICAL to the Vulkan
+    // --couple-query-shot by construction; CPU-colored from the read-back integer CSR). Top-down so the two
+    // submerged bodies (at distinct x,z) separate; un-gathered drawn first, gathered ON TOP. ---
     std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
     for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
         bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
@@ -18959,12 +18960,11 @@ static int RunCoupleQueryShowcase(const char* outPath) {
                                         Vec3{0.4f, 1.0f, 0.4f}};
         return palette[b % 3];
     };
-    for (int i = 0; i < kParticleCount; ++i) {
+    auto plot = [&](int i, const Vec3& col) {
         const int wx = particlesInit[(size_t)i].px >> fluid::kFrac;
-        const int wy = particlesInit[(size_t)i].py >> fluid::kFrac;
+        const int wz = particlesInit[(size_t)i].pz >> fluid::kFrac;
         int cx = kMargin + wx * kPxPerUnit;
-        int cy = (int)imgH - kMargin - wy * kPxPerUnit;
-        Vec3 col = ownerOf[(size_t)i] >= 0 ? bodyColor(ownerOf[(size_t)i]) : Vec3{0.18f, 0.18f, 0.2f};
+        int cy = (int)imgH - kMargin - wz * kPxPerUnit;
         for (int dy = 0; dy <= 1; ++dy)
             for (int dx = 0; dx <= 1; ++dx) {
                 const int ix = cx + dx, iy = cy + dy;
@@ -18975,7 +18975,11 @@ static int RunCoupleQueryShowcase(const char* outPath) {
                 dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
                 dst[3] = 255;
             }
-    }
+    };
+    for (int i = 0; i < kParticleCount; ++i)
+        if (ownerOf[(size_t)i] < 0) plot(i, Vec3{0.18f, 0.18f, 0.2f});
+    for (int i = 0; i < kParticleCount; ++i)
+        if (ownerOf[(size_t)i] >= 0) plot(i, bodyColor(ownerOf[(size_t)i]));
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — couple body-particle gather heat (%u gathered, maxPerBody %u)\n",
                 outPath, imgW, imgH, kTotalGathered, maxPer);
