@@ -318,6 +318,8 @@ int main() {
             bool sawFluidNeighborsFeature = false;
             // Slice FL3: the deterministic-fluid-density capability is advertised.
             bool sawFluidDensityFeature = false;
+            // Slice FL4: the deterministic-fluid-solve capability is advertised.
+            bool sawFluidSolveFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -437,6 +439,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-fluid-integrate") sawFluidIntegrateFeature = true;
                     if (AsString(el->value) == "deterministic-fluid-neighbors") sawFluidNeighborsFeature = true;
                     if (AsString(el->value) == "deterministic-fluid-density") sawFluidDensityFeature = true;
+                    if (AsString(el->value) == "deterministic-fluid-solve") sawFluidSolveFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -540,6 +543,7 @@ int main() {
             check(sawFluidIntegrateFeature, "engine.features includes deterministic-fluid-integrate");
             check(sawFluidNeighborsFeature, "engine.features includes deterministic-fluid-neighbors");
             check(sawFluidDensityFeature, "engine.features includes deterministic-fluid-density");
+        check(sawFluidSolveFeature, "engine.features includes deterministic-fluid-solve");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -708,6 +712,8 @@ int main() {
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
         bool sawFluidDensityShot = false;
+        // Slice FL4: the --fluid-solve-shot showcase flag is listed in the showcase manifest.
+        bool sawFluidSolveShot = false;
         // Slice CL1: the --cloth-integrate-shot showcase flag is listed in the showcase manifest.
         bool sawClothIntegrateShot = false;
         // Slice CL2: the --cloth-edges-shot showcase flag is listed in the showcase manifest.
@@ -848,6 +854,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--fluid-integrate-shot") sawFluidIntegrateShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fluid-neighbors-shot") sawFluidNeighborsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fluid-density-shot") sawFluidDensityShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--fluid-solve-shot") sawFluidSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cloth-integrate-shot") sawClothIntegrateShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cloth-edges-shot") sawClothEdgesShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cloth-solve-shot") sawClothSolveShot = true;
@@ -954,6 +961,7 @@ int main() {
         check(sawFluidIntegrateShot, "showcases manifest includes --fluid-integrate-shot");
         check(sawFluidNeighborsShot, "showcases manifest includes --fluid-neighbors-shot");
         check(sawFluidDensityShot, "showcases manifest includes --fluid-density-shot");
+        check(sawFluidSolveShot, "showcases manifest includes --fluid-solve-shot");
         check(sawClothIntegrateShot, "showcases manifest includes --cloth-integrate-shot");
         check(sawClothEdgesShot, "showcases manifest includes --cloth-edges-shot");
         check(sawClothSolveShot, "showcases manifest includes --cloth-solve-shot");
