@@ -19382,6 +19382,403 @@ static int RunFpxRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE showcase (Slice NAV6, the money-shot COMPLETING
+// FLAGSHIP #7). Mirrors the Vulkan --nav-render-shot path EXACTLY: run the deterministic NAV1-NAV5 CPU
+// pipeline (the SAME 32x32 showcase heightfield -> rasterize/merge/filter/distance/regions/contour/
+// polygonize/FindPath) to a navmesh + A* corridor, convert the BIT-EXACT INTEGER polys + corridor to
+// FLOAT world geometry via navmesh.h::PolyMeshToRenderMesh + PathToWorldPolyline (the ONE host float
+// crossing, render-only), and render a lit ground + a translucent per-region navmesh overlay (the
+// EXISTING transparent pass) + the A* corridor as a bright debug LINE (the EXISTING debug-line pass) +
+// sky + post, from the SAME fixed 3/4 camera + directional light. The navmesh + transforms (hence the
+// visual) are byte-identical to the Vulkan path by construction. FLOAT visresolve-bar: the controller
+// bakes the golden on the Mac; the gate is Metal-render==Metal-golden DIFF 0.0000 + provenance, with
+// the Vulkan-vs-Metal cross-vendor delta the documented float baseline (~55-60 mean, NOT zero-diff).
+// REUSES the lit / transparent / debug-line / sky / post pipelines — NO new shader, NO new RHI.
+static int RunNavRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace nav = hf::nav;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The deterministic NAV1-NAV5 pipeline (the CPU reference; byte-identical to the Vulkan
+    // --nav-render-shot navmesh by construction — the SAME 32x32 showcase config). ===
+    const int kW = 32, kH = 32;
+    nav::Heightfield hf;
+    hf.w = kW; hf.h = kH;
+    hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+    hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+    hf.cs = 1; hf.ch = 1;
+    const int kColumnCount = hf.columnCount();
+    nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+    const int32_t kMaxError = 0;
+
+    std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+    for (int c = 0; c < kColumnCount; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+    }
+    std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+    nav::FilterWalkableSpans(hf, cfg, mergedPerCol, walkable, surfaceY);
+    std::vector<uint32_t> dist;
+    nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+    const uint32_t maxDist = nav::MaxDistOf(dist);
+    std::vector<uint32_t> region;
+    const uint32_t regionCount = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, region);
+    std::vector<nav::Contour> contours;
+    nav::TraceContours(hf, region, regionCount, contours);
+    for (auto& cc : contours) {
+        std::vector<nav::ContourVertex> s;
+        nav::SimplifyContour(cc.verts, kMaxError, s);
+        cc.verts = s;
+    }
+    std::vector<nav::Poly> polys;
+    nav::BuildPolyMesh(contours, polys);
+
+    std::vector<int32_t> flatVerts;
+    std::vector<uint32_t> vOff((size_t)regionCount, 0u);
+    {
+        std::vector<int> contourOfRegion((size_t)regionCount + 1u, -1);
+        for (size_t ci = 0; ci < contours.size(); ++ci)
+            contourOfRegion[(size_t)contours[ci].region] = (int)ci;
+        uint32_t base = 0u;
+        for (uint32_t R = 1u; R <= regionCount; ++R) {
+            vOff[(size_t)(R - 1u)] = base;
+            const int ci = contourOfRegion[(size_t)R];
+            if (ci < 0) continue;
+            const auto& vv = contours[(size_t)ci].verts;
+            for (const auto& v : vv) { flatVerts.push_back(v.x); flatVerts.push_back(v.z); }
+            base += (uint32_t)vv.size();
+        }
+    }
+    const uint32_t kPolyCount = (uint32_t)polys.size();
+    std::vector<uint32_t> polyVertBase((size_t)kPolyCount, 0u);
+    for (uint32_t pi = 0; pi < kPolyCount; ++pi) {
+        const uint32_t R = polys[pi].region;
+        polyVertBase[pi] = (R >= 1u && R <= regionCount) ? vOff[R - 1u] : 0u;
+    }
+    std::vector<int32_t> cx, cz;
+    nav::ComputePolyCentroids(polys, flatVerts, polyVertBase, cx, cz);
+    uint32_t startPoly = 0u, goalPoly = 0u;
+    nav::SelectStartGoal(polys, cx, cz, startPoly, goalPoly);
+    std::vector<uint32_t> corridor;
+    nav::FindPath(polys, cx, cz, startPoly, goalPoly, corridor);
+    const uint32_t kCorridorLen = (uint32_t)corridor.size();
+
+    // === The ONE host float crossing (render-only). Same voxel->world scale + framing as the Vulkan path. ===
+    const int32_t kScale = 4;
+    const float kWorldSpan = (float)kW / (float)kScale;   // 8.0
+    const float kHalfSpan = 0.5f * kWorldSpan;
+    const float kSheetY = 0.06f;
+    const float kLineY  = 0.18f;
+
+    std::vector<nav::NavWorldVertex> navVerts;
+    nav::PolyMeshToRenderMesh(polys, flatVerts, polyVertBase, kScale, kSheetY, navVerts);
+    std::vector<nav::NavWorldPoint> pathPts;
+    nav::PathToWorldPolyline(corridor, cx, cz, kScale, kLineY, pathPts);
+
+    std::vector<scene::Vertex> overlayVerts(navVerts.size());
+    for (size_t k = 0; k < navVerts.size(); ++k) {
+        scene::Vertex& v = overlayVerts[k];
+        v.pos[0] = navVerts[k].px - kHalfSpan;
+        v.pos[1] = navVerts[k].py;
+        v.pos[2] = navVerts[k].pz - kHalfSpan;
+        v.color[0] = navVerts[k].r; v.color[1] = navVerts[k].g; v.color[2] = navVerts[k].b;
+        v.uv[0] = 0.5f; v.uv[1] = 0.5f;
+        v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+    }
+    const uint32_t kOverlayVertCount = (uint32_t)overlayVerts.size();
+    struct OverlayRange { uint32_t first; uint32_t count; float r, g, b; };
+    std::vector<OverlayRange> overlayRanges;
+    for (uint32_t pi = 0; pi < kPolyCount; ) {
+        const uint32_t R = polys[pi].region;
+        const uint32_t firstVert = pi * 3u;
+        uint32_t pj = pi;
+        while (pj < kPolyCount && polys[pj].region == R) ++pj;
+        float rr, gg, bb; nav::NavRegionColor(R, rr, gg, bb);
+        overlayRanges.push_back(OverlayRange{firstVert, (pj - pi) * 3u, rr, gg, bb});
+        pi = pj;
+    }
+
+    // The corridor debug-line vertices (LINE_LIST) + start/goal markers (== the Vulkan path).
+    debug::DebugDraw dd;
+    auto worldPt = [&](const nav::NavWorldPoint& p) {
+        return Vec3{p.x - kHalfSpan, p.y, p.z - kHalfSpan};
+    };
+    for (size_t k = 0; k + 1 < pathPts.size(); ++k)
+        dd.Line(worldPt(pathPts[k]), worldPt(pathPts[k + 1]), {0.98f, 0.90f, 0.15f});
+    if (!pathPts.empty()) {
+        const Vec3 s = worldPt(pathPts.front());
+        const Vec3 g = worldPt(pathPts.back());
+        const float m = 0.18f;
+        dd.Line({s.x - m, s.y, s.z}, {s.x + m, s.y, s.z}, {0.15f, 0.95f, 0.25f});
+        dd.Line({s.x, s.y, s.z - m}, {s.x, s.y, s.z + m}, {0.15f, 0.95f, 0.25f});
+        dd.Line({g.x - m, g.y, g.z}, {g.x + m, g.y, g.z}, {0.95f, 0.20f, 0.20f});
+        dd.Line({g.x, g.y, g.z - m}, {g.x, g.y, g.z + m}, {0.95f, 0.20f, 0.20f});
+    }
+    const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+
+    // === Reuse the EXISTING lit (ground) + transparent (overlay) + debug-line (corridor) + sky + post
+    // pipelines (the SAME gen-MSL the other showcases load) — NO new shader, NO new RHI. ===
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto tVs = loadMSL("transparent.vert.gen.metal", "transparent_vertex");
+    auto tFs = loadMSL("transparent.frag.gen.metal", "transparent_fragment");
+    rhi::GraphicsPipelineDesc overlayDesc;
+    overlayDesc.vertex = tVs.get(); overlayDesc.fragment = tFs.get();
+    overlayDesc.vertexLayout = scene::MeshVertexLayout();
+    overlayDesc.colorFormat = device->Swapchain().ColorFormat();
+    overlayDesc.depthTest = true; overlayDesc.depthWrite = false;
+    overlayDesc.alphaBlend = true; overlayDesc.cullNone = true;
+    overlayDesc.usesFrameUniforms = true; overlayDesc.usesTexture = false;
+    overlayDesc.pushConstantSize = sizeof(float) * 20;
+    auto overlayPipeline = device->CreateGraphicsPipeline(overlayDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto dbgVs = loadMSL("debug_line.vert.gen.metal", "debug_line_vertex");
+    auto dbgFs = loadMSL("debug_line.frag.gen.metal", "debug_line_fragment");
+    rhi::GraphicsPipelineDesc dbgD;
+    dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+    dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+    dbgD.vertexLayout.attributes = {
+        {0, rhi::Format::RGB32_Float, 0},
+        {1, rhi::Format::RGB32_Float, 12},
+    };
+    dbgD.colorFormat = device->Swapchain().ColorFormat();
+    dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+    dbgD.usesFrameUniforms = true;
+    auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+
+    std::unique_ptr<rhi::IBuffer> overlayBuffer;
+    if (kOverlayVertCount > 0) {
+        rhi::BufferDesc ovb;
+        ovb.size = (uint64_t)overlayVerts.size() * sizeof(scene::Vertex);
+        ovb.initialData = overlayVerts.data();
+        ovb.usage = rhi::BufferUsage::Vertex;
+        overlayBuffer = device->CreateBuffer(ovb);
+    }
+    std::unique_ptr<rhi::IBuffer> lineBuffer;
+    if (kLineVertCount > 0) {
+        rhi::BufferDesc lbd;
+        lbd.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+        lbd.initialData = dd.Vertices().data();
+        lbd.usage = rhi::BufferUsage::Vertex;
+        lineBuffer = device->CreateBuffer(lbd);
+    }
+
+    Mat4 groundModel = Mat4::Scale({kWorldSpan, 1.0f, kWorldSpan});
+
+    const Vec3 eye{6.5f, 6.0f, 6.5f};
+    const Vec3 center{0.0f, 0.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 14.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 32.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+        render::RenderGraph graph;
+        render::RgResource rgShadow = graph.ImportTarget(
+            "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+        graph.AddPass("shadow", {}, {rgShadow},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("scene", {rgShadow}, {rgScene},
+            [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                cmd.BindPipeline(*skyPipe);
+                cmd.Draw(3);
+                cmd.BindPipeline(*litPipeline);
+                {
+                    float pc[20];
+                    for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                    pc[16] = 0.0f; pc[17] = 0.9f; pc[18] = 0.0f; pc[19] = 1.0f;
+                    cmd.PushConstants(pc, sizeof(pc));
+                    cmd.BindMaterial(*groundTex, *flatNormal);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                }
+                if (kOverlayVertCount > 0) {
+                    cmd.BindPipeline(*overlayPipeline);
+                    cmd.BindVertexBuffer(*overlayBuffer);
+                    Mat4 id = Mat4::Identity();
+                    for (const auto& rg : overlayRanges) {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = id.m[k];
+                        pc[16] = rg.r; pc[17] = rg.g; pc[18] = rg.b; pc[19] = 0.5f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.Draw(rg.count, rg.first);
+                    }
+                }
+                if (kLineVertCount > 0) {
+                    cmd.BindPipeline(*debugPipeline);
+                    cmd.BindVertexBuffer(*lineBuffer);
+                    cmd.Draw(kLineVertCount);
+                }
+                cmd.EndRenderPass();
+            });
+
+        graph.AddPass("post", {rgScene}, {rgSwap},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.BindPipeline(*postPipe);
+                cmd.BindTexture(*rt);
+                cmd.Draw(3);
+                cmd.EndRenderPass();
+            });
+
+        device->CaptureNextFrame();
+        graph.Execute(*device);
+        return device->GetCapturedPixels(outBGRA, outW, outH);
+    };
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!renderOnce(bgra, cw, ch)) return fail("nav-render no captured pixels");
+
+    auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+        uint32_t n = 0;
+        for (size_t p = 0; p + 3 < img.size(); p += 4) {
+            const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+            if (b + g + r > 60) ++n;
+        }
+        return n;
+    };
+    const uint32_t shaded = countShaded(bgra);
+
+    // PROOF (1) provenance/stats.
+    std::printf("nav-render: {regions:%u, polys:%u, corridor:%u, shaded:%u} (integer navmesh -> lit 3D render)\n",
+                regionCount, kPolyCount, kCorridorLen, shaded);
+
+    // PROOF (2) determinism: a second render is BYTE-IDENTICAL.
+    {
+        std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+        if (!renderOnce(bgra2, cw2, ch2) || bgra2.size() != bgra.size() ||
+            std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+            return fail("nav-render two renders DIFFER (nondeterministic)");
+        std::printf("nav-render determinism: two renders BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage / coherence.
+    if (shaded == 0) return fail("nav-render coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("nav-render uniform image (no coherent navmesh)");
+    std::printf("nav-render coverage: %u shaded (coherent navmesh + path)\n", shaded);
+
+    // PROOF (4) empty no-op: an empty navmesh -> zero render geometry (the lit ground only).
+    {
+        std::vector<nav::Poly> noPolys;
+        std::vector<int32_t> noFlat;
+        std::vector<uint32_t> noBase;
+        std::vector<nav::NavWorldVertex> noVerts;
+        nav::PolyMeshToRenderMesh(noPolys, noFlat, noBase, kScale, kSheetY, noVerts);
+        std::vector<uint32_t> noCorridor;
+        std::vector<int32_t> noCx, noCz;
+        std::vector<nav::NavWorldPoint> noPts;
+        nav::PathToWorldPolyline(noCorridor, noCx, noCz, kScale, kLineY, noPts);
+        if (!noVerts.empty() || !noPts.empty())
+            return fail("nav-render empty navmesh produced render geometry");
+    }
+    std::printf("nav-render empty: base only (no-op)\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — integer navmesh lit 3D render (%u regions, %u polys, corridor %u)\n",
+                outPath, cw, ch, regionCount, kPolyCount, kCorridorLen);
+    return 0;
+}
+
 // --- GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT showcase (Slice MC2, the 2nd slice
 // of FLAGSHIP #5). The TRUE pass is identical on both backends: the SAME MC1 sphere VoxelField (33³
 // corners -> 32³ cells, radius 12, iso 0) feeds the SAME shaders/mc_count.comp (here
@@ -29986,6 +30383,24 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--nav-path") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_nav_path.png";
             try { return RunNavPathShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --nav-render <out.png>: render the Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE showcase
+        // (Slice NAV6, the money-shot COMPLETING FLAGSHIP #7). Runs the deterministic NAV1-NAV5 CPU
+        // pipeline (engine/nav/navmesh.h, the SAME 32x32 showcase) to a navmesh + A* corridor, converts the
+        // bit-exact INTEGER polys + corridor to FLOAT via navmesh.h::PolyMeshToRenderMesh /
+        // PathToWorldPolyline, and renders a lit ground + a translucent per-region navmesh overlay (the
+        // EXISTING transparent pass) + the A* corridor as a bright debug LINE (the EXISTING debug-line pass)
+        // over sky + static-shadow + post, from the SAME fixed 3/4 camera + light as the Vulkan
+        // --nav-render-shot. The navmesh (hence the visual) is byte-identical to the Vulkan path by
+        // construction. FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (deterministic
+        // two-run) + provenance (the geometry derives from the bit-exact integer navmesh); the Vulkan-vs-
+        // Metal cross-vendor delta is the documented float baseline (~55-60 mean, NOT zero). REUSES the
+        // lit / transparent / debug-line / sky / post pipelines — NO new shader/RHI. New golden
+        // tests/golden/metal/nav_render.png (baked on the Mac by the controller).
+        if (argc > 1 && std::strcmp(argv[1], "--nav-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_nav_render.png";
+            try { return RunNavRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-solve <out.png>: render the Deterministic Fixed-Point Physics PBD POSITIONAL

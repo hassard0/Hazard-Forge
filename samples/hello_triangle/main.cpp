@@ -461,6 +461,7 @@ int main(int argc, char** argv) {
     const char* navRegionShotPath = nullptr; // --nav-region-shot <out.bmp> (Slice NAV3: Deterministic GPU Navmesh INTEGER WATERSHED REGION GENERATION, the 3rd slice + MAKE-OR-BREAK of FLAGSHIP #7 — partition the NAV2 walkable distance field into REGIONS via a single-thread level-descending fixed-order integer watershed (nav_region.comp); GPU==CPU region[] bit-exact, hash-colored region partition viz)
     const char* navPolymeshShotPath = nullptr; // --nav-polymesh-shot <out.bmp> (Slice NAV4: Deterministic GPU Navmesh CONTOUR TRACE + INTEGER POLYGONIZATION, the 4th slice of FLAGSHIP #7 — trace each NAV3 region's boundary into an integer contour (nav_contour.comp: trace+Douglas-Peucker), triangulate it (nav_polygonize.comp: ear-clip + adjacency); GPU==CPU contour verts + poly indices + adjacency bit-exact; region fill + contour edges + poly edges viz)
     const char* navPathShotPath = nullptr; // --nav-path-shot <out.bmp> (Slice NAV5: Deterministic GPU Navmesh INTEGER A* PATHFINDING, the 5th slice + HEADLINE of FLAGSHIP #7 — run integer A* (Manhattan cost+heuristic over poly centroids, lowest-id tie-break) over the NAV4 poly adjacency graph (nav_astar.comp, [numthreads(1,1,1)] single-thread) -> a deterministic CORRIDOR; GPU==CPU corridor+cost+start/goal bit-exact, navmesh faint + corridor polyline bright viz)
+    const char* navRenderShotPath = nullptr; // --nav-render-shot <out.bmp> (Slice NAV6: Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE, the 6th + FINAL slice COMPLETING FLAGSHIP #7 — run the deterministic NAV1-NAV5 pipeline to a navmesh + A* corridor, convert the bit-exact integer polys + corridor to FLOAT via navmesh.h::PolyMeshToRenderMesh/PathToWorldPolyline, render a lit ground + translucent per-region navmesh overlay + bright corridor line from a fixed 3/4 camera; FLOAT visresolve-bar, REUSES lit/alpha-blend/debug-line pipelines, NO new shader/RHI)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -561,6 +562,19 @@ int main(int argc, char** argv) {
         // fpx/mc/nav lesson: avoid MSVC's nested-block parse limit C1061).
         if (std::strcmp(argv[i], "--nav-path-shot") == 0 && i + 1 < argc) {
             navPathShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice NAV6: --nav-render-shot <out.bmp> — the Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE
+        // (the 6th + FINAL slice COMPLETING FLAGSHIP #7). Run the deterministic NAV1-NAV5 pipeline (CPU
+        // reference, the SAME bit-exact navmesh the GPU --nav-path-shot proves) to a polymesh + A* corridor,
+        // convert the integer polys + corridor to FLOAT (navmesh.h::PolyMeshToRenderMesh /
+        // PathToWorldPolyline — the ONE host float crossing, render-only), and render a lit ground + a
+        // translucent per-region navmesh overlay + a bright corridor LINE through the EXISTING lit /
+        // alpha-blend / debug-line pipelines. FLOAT visresolve-bar (Metal-baked golden). NO new shader/RHI.
+        // STANDALONE branch (the fpx/mc/nav lesson: avoid MSVC's nested-block parse limit C1061).
+        if (std::strcmp(argv[i], "--nav-render-shot") == 0 && i + 1 < argc) {
+            navRenderShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -17987,6 +18001,453 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fixed-point pile lit 3D render (%u bodies, %u settled)\n",
                                 fpxRenderShotPath, cw, ch2, kBodyCount, kSettled);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Navmesh LIT 3D RENDER CAPSTONE (--nav-render-shot <out.bmp>, Slice NAV6,
+        // the money-shot COMPLETING FLAGSHIP #7). Run the deterministic NAV1-NAV5 pipeline (the CPU
+        // reference over the showcase heightfield — the SAME bit-exact navmesh + corridor the GPU
+        // --nav-path-shot proves) to a polymesh + A* corridor, then convert the BIT-EXACT INTEGER polys +
+        // corridor to FLOAT world geometry via navmesh.h::PolyMeshToRenderMesh + PathToWorldPolyline (the
+        // ONE host float crossing, render-only — NAV1-NAV5 stay integer). Render: a lit ground plane (the
+        // EXISTING lit pipeline) + the walkable navmesh polys as a TRANSLUCENT per-region-colored overlay
+        // (the EXISTING lit pipeline with alphaBlend + depthWrite=false) + the A* corridor as a bright
+        // debug LINE (the EXISTING debug-line pipeline) + sky + post, from a fixed 3/4 camera + directional
+        // light. The geometry derives from the integer navmesh (provenance). FLOAT visresolve-bar
+        // (Metal-baked golden tests/golden/metal/nav_render.png). NO new shader, NO new RHI.
+        if (navRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace nav = hf::nav;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // === The deterministic NAV1-NAV5 pipeline (the CPU reference; byte-identical to the GPU
+            // --nav-path navmesh by construction — the SAME 32x32 showcase config). ===
+            const int kW = 32, kH = 32;
+            nav::Heightfield hf;
+            hf.w = kW; hf.h = kH;
+            hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+            hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+            hf.cs = 1; hf.ch = 1;
+            const int kColumnCount = hf.columnCount();
+            nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+            const int32_t kMaxError = 0;
+
+            std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+            std::vector<uint32_t> rColCount, rColOffset;
+            std::vector<nav::Span> rSpans;
+            nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+            std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+            for (int c = 0; c < kColumnCount; ++c) {
+                std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                          rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+                mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+            }
+            std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+            nav::FilterWalkableSpans(hf, cfg, mergedPerCol, walkable, surfaceY);
+            std::vector<uint32_t> dist;
+            nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+            const uint32_t maxDist = nav::MaxDistOf(dist);
+            std::vector<uint32_t> region;
+            const uint32_t regionCount = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, region);
+            std::vector<nav::Contour> contours;
+            nav::TraceContours(hf, region, regionCount, contours);
+            for (auto& cc : contours) {
+                std::vector<nav::ContourVertex> s;
+                nav::SimplifyContour(cc.verts, kMaxError, s);
+                cc.verts = s;
+            }
+            std::vector<nav::Poly> polys;
+            nav::BuildPolyMesh(contours, polys);
+
+            // Flatten contour verts region-by-region + per-region vertex base (the --nav-path layout).
+            std::vector<int32_t> flatVerts;
+            std::vector<uint32_t> vOff((size_t)regionCount, 0u);
+            {
+                std::vector<int> contourOfRegion((size_t)regionCount + 1u, -1);
+                for (size_t ci = 0; ci < contours.size(); ++ci)
+                    contourOfRegion[(size_t)contours[ci].region] = (int)ci;
+                uint32_t base = 0u;
+                for (uint32_t R = 1u; R <= regionCount; ++R) {
+                    vOff[(size_t)(R - 1u)] = base;
+                    const int ci = contourOfRegion[(size_t)R];
+                    if (ci < 0) continue;
+                    const auto& vv = contours[(size_t)ci].verts;
+                    for (const auto& v : vv) { flatVerts.push_back(v.x); flatVerts.push_back(v.z); }
+                    base += (uint32_t)vv.size();
+                }
+            }
+            const uint32_t kPolyCount = (uint32_t)polys.size();
+            std::vector<uint32_t> polyVertBase((size_t)kPolyCount, 0u);
+            for (uint32_t pi = 0; pi < kPolyCount; ++pi) {
+                const uint32_t R = polys[pi].region;
+                polyVertBase[pi] = (R >= 1u && R <= regionCount) ? vOff[R - 1u] : 0u;
+            }
+            std::vector<int32_t> cx, cz;
+            nav::ComputePolyCentroids(polys, flatVerts, polyVertBase, cx, cz);
+            uint32_t startPoly = 0u, goalPoly = 0u;
+            nav::SelectStartGoal(polys, cx, cz, startPoly, goalPoly);
+            std::vector<uint32_t> corridor;
+            nav::FindPath(polys, cx, cz, startPoly, goalPoly, corridor);
+            const uint32_t kCorridorLen = (uint32_t)corridor.size();
+
+            // === The ONE host float crossing (render-only). The showcase voxel->world scale: the 32-wide
+            // corner grid maps to a kWorldSpan-unit ground plane (corner coord / kScale -> [0, 32/kScale]),
+            // then centered on the origin so it frames the fixed camera. kScale=4 -> the navmesh spans
+            // 8x8 world units; the ground plane (scene::Mesh::Plane is a unit quad ±0.5) is scaled to match. ===
+            const int32_t kScale = 4;
+            const float kWorldSpan = (float)kW / (float)kScale;   // 8.0 world units across
+            const float kHalfSpan = 0.5f * kWorldSpan;            // center the navmesh on the origin
+            const float kSheetY = 0.06f;   // navmesh overlay sits just above the ground (no z-fight)
+            const float kLineY  = 0.18f;   // corridor line above the overlay
+
+            std::vector<nav::NavWorldVertex> navVerts;
+            nav::PolyMeshToRenderMesh(polys, flatVerts, polyVertBase, kScale, kSheetY, navVerts);
+            std::vector<nav::NavWorldPoint> pathPts;
+            nav::PathToWorldPolyline(corridor, cx, cz, kScale, kLineY, pathPts);
+
+            // Build the translucent navmesh overlay as scene::Vertex (the transparent pass's mesh layout).
+            // navVerts is 3 verts/poly in BuildPolyMesh order (contour-by-contour == region-ascending), so
+            // it is partitioned into CONTIGUOUS per-region vertex ranges. Center on the origin (subtract
+            // kHalfSpan), flat upward normal; the per-region tint comes from the transparent push constant
+            // (the carried navVerts[].r/g/b is the SAME NavRegionColor the per-range draw uses). The
+            // overlay sheet sits at kSheetY just above the lit ground.
+            std::vector<scene::Vertex> overlayVerts(navVerts.size());
+            for (size_t k = 0; k < navVerts.size(); ++k) {
+                scene::Vertex& v = overlayVerts[k];
+                v.pos[0] = navVerts[k].px - kHalfSpan;
+                v.pos[1] = navVerts[k].py;
+                v.pos[2] = navVerts[k].pz - kHalfSpan;
+                v.color[0] = navVerts[k].r; v.color[1] = navVerts[k].g; v.color[2] = navVerts[k].b;
+                v.uv[0] = 0.5f; v.uv[1] = 0.5f;
+                v.normal[0] = 0.0f; v.normal[1] = 1.0f; v.normal[2] = 0.0f;
+                v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+            }
+            const uint32_t kOverlayVertCount = (uint32_t)overlayVerts.size();
+            // Per-poly region id (3 verts each) -> contiguous [firstVert, vertCount, tint] draw ranges, so
+            // each region renders as ONE translucent draw with its NavRegionColor tint.
+            struct OverlayRange { uint32_t first; uint32_t count; float r, g, b; };
+            std::vector<OverlayRange> overlayRanges;
+            for (uint32_t pi = 0; pi < kPolyCount; ) {
+                const uint32_t R = polys[pi].region;
+                const uint32_t firstVert = pi * 3u;
+                uint32_t pj = pi;
+                while (pj < kPolyCount && polys[pj].region == R) ++pj;
+                float rr, gg, bb; nav::NavRegionColor(R, rr, gg, bb);
+                overlayRanges.push_back(OverlayRange{firstVert, (pj - pi) * 3u, rr, gg, bb});
+                pi = pj;
+            }
+
+            // Build the corridor debug-line vertices (LINE_LIST: a pair per segment) + start/goal markers,
+            // centered on the origin. Bright yellow line, green start cross, red goal cross.
+            debug::DebugDraw dd;
+            auto worldPt = [&](const nav::NavWorldPoint& p) {
+                return Vec3{p.x - kHalfSpan, p.y, p.z - kHalfSpan};
+            };
+            for (size_t k = 0; k + 1 < pathPts.size(); ++k)
+                dd.Line(worldPt(pathPts[k]), worldPt(pathPts[k + 1]), {0.98f, 0.90f, 0.15f});
+            if (!pathPts.empty()) {
+                const Vec3 s = worldPt(pathPts.front());
+                const Vec3 g = worldPt(pathPts.back());
+                const float m = 0.18f;
+                dd.Line({s.x - m, s.y, s.z}, {s.x + m, s.y, s.z}, {0.15f, 0.95f, 0.25f});   // start cross (green)
+                dd.Line({s.x, s.y, s.z - m}, {s.x, s.y, s.z + m}, {0.15f, 0.95f, 0.25f});
+                dd.Line({g.x - m, g.y, g.z}, {g.x + m, g.y, g.z}, {0.95f, 0.20f, 0.20f});   // goal cross (red)
+                dd.Line({g.x, g.y, g.z - m}, {g.x, g.y, g.z + m}, {0.95f, 0.20f, 0.20f});
+            }
+            const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
+
+            // === Reuse the EXISTING lit-mesh pipeline (ground + translucent overlay) + debug-line (corridor)
+            // + sky + static-shadow + post — NO new shader, NO new RHI. ===
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // The translucent navmesh-overlay pipeline: the EXISTING transparent ("glass") pass
+            // (transparent.vert + transparent.frag, the Slice T translucent showcase) — alphaBlend ON,
+            // depthTest ON / depthWrite OFF (reads opaque ground depth, never writes), double-sided
+            // (cullNone, the navmesh sheet is viewed from above). Per-region tint + alpha via its push
+            // constant { model(64), tintAlpha(16) } = 80 bytes. REUSED VERBATIM — NO new shader/RHI.
+            auto tVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/transparent.vert.hlsl.spv");
+            auto tFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/transparent.frag.hlsl.spv");
+            auto tVs = device->CreateShaderModule({std::span<const uint32_t>(tVsWords)});
+            auto tFs = device->CreateShaderModule({std::span<const uint32_t>(tFsWords)});
+            rhi::GraphicsPipelineDesc overlayDesc;
+            overlayDesc.vertex = tVs.get(); overlayDesc.fragment = tFs.get();
+            overlayDesc.vertexLayout = scene::MeshVertexLayout();
+            overlayDesc.colorFormat = device->Swapchain().ColorFormat();
+            overlayDesc.depthTest = true; overlayDesc.depthWrite = false;
+            overlayDesc.alphaBlend = true; overlayDesc.cullNone = true;
+            overlayDesc.usesFrameUniforms = true; overlayDesc.usesTexture = false;
+            overlayDesc.pushConstantSize = sizeof(float) * 20;   // model + float4 tintAlpha
+            auto overlayPipeline = device->CreateGraphicsPipeline(overlayDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            // The debug-line pipeline (LINE_LIST, frame uniforms, depth-test on / write off) — REUSED.
+            auto dbgVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.vert.hlsl.spv");
+            auto dbgFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.frag.hlsl.spv");
+            auto dbgVs = device->CreateShaderModule({std::span<const uint32_t>(dbgVsW)});
+            auto dbgFs = device->CreateShaderModule({std::span<const uint32_t>(dbgFsW)});
+            rhi::GraphicsPipelineDesc dbgD;
+            dbgD.vertex = dbgVs.get(); dbgD.fragment = dbgFs.get();
+            dbgD.vertexLayout.stride = sizeof(debug::LineVertex);
+            dbgD.vertexLayout.attributes = {
+                {0, rhi::Format::RGB32_Float, 0},
+                {1, rhi::Format::RGB32_Float, 12},
+            };
+            dbgD.colorFormat = device->Swapchain().ColorFormat();
+            dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+            dbgD.usesFrameUniforms = true;
+            auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+
+            // The translucent navmesh-overlay vertex buffer (kOverlayVertCount may be 0 -> empty no-op).
+            std::unique_ptr<rhi::IBuffer> overlayBuffer;
+            if (kOverlayVertCount > 0) {
+                rhi::BufferDesc ovb;
+                ovb.size = (uint64_t)overlayVerts.size() * sizeof(scene::Vertex);
+                ovb.initialData = overlayVerts.data();
+                ovb.usage = rhi::BufferUsage::Vertex;
+                overlayBuffer = device->CreateBuffer(ovb);
+            }
+            // The corridor line vertex buffer (kLineVertCount may be 0 -> empty no-op).
+            std::unique_ptr<rhi::IBuffer> lineBuffer;
+            if (kLineVertCount > 0) {
+                rhi::BufferDesc lbd;
+                lbd.size = (uint64_t)dd.Vertices().size() * sizeof(debug::LineVertex);
+                lbd.initialData = dd.Vertices().data();
+                lbd.usage = rhi::BufferUsage::Vertex;
+                lineBuffer = device->CreateBuffer(lbd);
+            }
+
+            // The ground plane: scaled to span the navmesh extent (the unit Plane quad ±0.5 -> kWorldSpan).
+            Mat4 groundModel = Mat4::Scale({kWorldSpan, 1.0f, kWorldSpan});
+
+            // Fixed 3/4 camera + directional light framing the centered navmesh (the ~8x8 unit sheet).
+            const Vec3 eye{6.5f, 6.0f, 6.5f};
+            const Vec3 center{0.0f, 0.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 0.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 14.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-7.0f, 7.0f, -7.0f, 7.0f, 1.0f, 32.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        // Lit ground plane (opaque, writes depth).
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.9f; pc[18] = 0.0f; pc[19] = 1.0f;   // dielectric, rough, alpha 1
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*groundTex, *flatNormal);
+                            cmd.BindVertexBuffer(plane.vertices());
+                            cmd.BindIndexBuffer(plane.indices());
+                            cmd.DrawIndexed(plane.indexCount());
+                        }
+                        // Translucent navmesh overlay: one transparent draw per region (its NavRegionColor
+                        // tint + baseAlpha), the glass pass blending over the lit ground. Identity model
+                        // (positions already centered in world space).
+                        if (kOverlayVertCount > 0) {
+                            cmd.BindPipeline(*overlayPipeline);
+                            cmd.BindVertexBuffer(*overlayBuffer);
+                            Mat4 id = Mat4::Identity();
+                            for (const auto& rg : overlayRanges) {
+                                float pc[20];
+                                for (int k = 0; k < 16; ++k) pc[k] = id.m[k];
+                                pc[16] = rg.r; pc[17] = rg.g; pc[18] = rg.b; pc[19] = 0.5f;   // tint + baseAlpha
+                                cmd.PushConstants(pc, sizeof(pc));
+                                cmd.Draw(rg.count, rg.first);
+                            }
+                        }
+                        // The A* corridor as a bright debug line (depth-tested, no write).
+                        if (kLineVertCount > 0) {
+                            cmd.BindPipeline(*debugPipeline);
+                            cmd.BindVertexBuffer(*lineBuffer);
+                            cmd.Draw(kLineVertCount);
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                return device->GetCapturedPixels(outBGRA, outW, outH);
+            };
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!renderOnce(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: nav-render no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // Coverage: count shaded (off near-black sky clear) pixels — the lit ground + overlay + line.
+            auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+                uint32_t n = 0;
+                for (size_t p = 0; p + 3 < img.size(); p += 4) {
+                    const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+                    if (b + g + r > 60) ++n;
+                }
+                return n;
+            };
+            const uint32_t shaded = countShaded(px);
+
+            // PROOF (1) provenance/stats: the rendered mesh + line derive from the bit-exact integer navmesh.
+            std::printf("nav-render: {regions:%u, polys:%u, corridor:%u, shaded:%u} (integer navmesh -> lit 3D render)\n",
+                        regionCount, kPolyCount, kCorridorLen, shaded);
+
+            // PROOF (2) determinism: a second render is BYTE-IDENTICAL.
+            {
+                std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+                if (!renderOnce(px2, cw2, ch3) || px2.size() != px.size() ||
+                    std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                    std::fprintf(stderr, "FATAL: nav-render two renders DIFFER (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-render determinism: two renders BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage / coherence: shaded>0 and not a uniform fill.
+            if (shaded == 0) {
+                std::fprintf(stderr, "FATAL: nav-render coverage 0 (nothing shaded)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (shaded == (uint32_t)(px.size() / 4)) {
+                std::fprintf(stderr, "FATAL: nav-render uniform image (no coherent navmesh)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("nav-render coverage: %u shaded (coherent navmesh + path)\n", shaded);
+
+            // PROOF (4) empty no-op: an empty navmesh (zero polys) -> the overlay + line are skipped (the
+            // lit ground only). Verify the float conversion of an EMPTY navmesh yields zero render geometry.
+            {
+                std::vector<nav::Poly> noPolys;
+                std::vector<int32_t> noFlat;
+                std::vector<uint32_t> noBase;
+                std::vector<nav::NavWorldVertex> noVerts;
+                nav::PolyMeshToRenderMesh(noPolys, noFlat, noBase, kScale, kSheetY, noVerts);
+                std::vector<uint32_t> noCorridor;
+                std::vector<int32_t> noCx, noCz;
+                std::vector<nav::NavWorldPoint> noPts;
+                nav::PathToWorldPolyline(noCorridor, noCx, noCz, kScale, kLineY, noPts);
+                if (!noVerts.empty() || !noPts.empty()) {
+                    std::fprintf(stderr, "FATAL: nav-render empty navmesh produced render geometry\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-render empty: base only (no-op)\n");
+            }
+
+            bool ok = WriteBMP(navRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — integer navmesh lit 3D render (%u regions, %u polys, corridor %u)\n",
+                                navRenderShotPath, cw, ch2, regionCount, kPolyCount, kCorridorLen);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", navRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
