@@ -457,6 +457,7 @@ int main(int argc, char** argv) {
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
+    const char* clothRenderShotPath = nullptr;   // --cloth-render-shot <out.bmp> (Slice CL6: Deterministic GPU Cloth LIT 3D RENDER capstone, COMPLETES FLAGSHIP #8 — the CL4 draped-cloth sim (a 24x24 sheet draped over a static FxBody sphere, host-side StepClothCollide, the sim bit-exact) -> cloth.h::ClothToRenderMesh (W*H lattice -> a lit triangle mesh, the ONE host float divide pos/kOne + smooth per-vertex normals) -> rendered lit + shadowed from a fixed 3/4 camera through the EXISTING lit-mesh pipeline (lit.vert + lit.frag, scene::MeshVertexLayout, the FrameData UBO, sky + static-shadow + post — REUSED VERBATIM from --mc-render-shot; NO new shader/RHI). FLOAT visresolve bar (the MC6/FPX6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CL1-CL4 bit-exact integer cloth (provenance exact))
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
@@ -645,6 +646,17 @@ int main(int argc, char** argv) {
         // else-if chain) to avoid MSVC's nested-block parse limit (the FPX5/CL4 lesson).
         if (std::strcmp(argv[i], "--cloth-lockstep-shot") == 0 && i + 1 < argc) {
             clothLockstepShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CL6: --cloth-render-shot <out.bmp> — the Deterministic GPU Cloth LIT 3D RENDER capstone
+        // (COMPLETES FLAGSHIP #8). Runs the CL4 draped-cloth sim (24x24 sheet over a static sphere,
+        // host-side StepClothCollide — the sim is bit-exact) -> ClothToRenderMesh -> lit render through the
+        // EXISTING lit-mesh pipeline (lit.vert + lit.frag), fixed 3/4 camera + directional light. FLOAT
+        // visresolve bar. STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's C1061, like
+        // the cl4/cl5/mc-render shots.
+        if (std::strcmp(argv[i], "--cloth-render-shot") == 0 && i + 1 < argc) {
+            clothRenderShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -19808,6 +19820,342 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cloth lockstep+rollback converged state (%d particles, %d pinned)\n",
                                 clothLockstepShotPath, imgW, imgH, kParticleCount, kPinned);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothLockstepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Cloth LIT 3D RENDER (--cloth-render-shot <out.bmp>, Slice CL6, the 6th and
+        // FINAL slice COMPLETING FLAGSHIP #8). Runs the CL4 draped-cloth sim host-side (a 24x24 sheet draped
+        // over a static FxBody sphere via cloth.h::StepClothCollide — the sim is bit-exact, CL1-CL4), then
+        // cloth.h::ClothToRenderMesh converts the W x H particle lattice into the EXISTING lit mesh vertex
+        // format (position = pos/kOne — the ONE host float divide; smooth per-vertex normals averaged from
+        // adjacent cell-quad faces; two triangles per cell quad), and renders the cloth lit + shadowed from
+        // a fixed 3/4 camera + directional light through the EXISTING lit mesh pipeline (lit.vert + lit.frag,
+        // scene::MeshVertexLayout, FrameData UBO, sky + static-shadow + post) — REUSED VERBATIM from
+        // --mc-render-shot; NO new shader / RHI seam. The collider sphere is INVISIBLE (the cloth is the
+        // hero — the spec's "sphere optional"); it only SHAPES the drape. One frame -> BMP -> exit. Golden =
+        // the lit draped cloth (Metal-baked, the FLOAT visresolve bar). ------------------------------------
+        if (clothRenderShotPath) {
+            namespace cloth = hf::sim::cloth;
+            namespace fpx = hf::sim::fpx;
+            using math::Mat4; using math::Vec3;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // 1) The CL4 draped-cloth sim (== the --cloth-collide-shot config: a 24x24 sheet over a static
+            //    sphere radius 8, StepClothCollide K=40 x iters=6). PURE INTEGER (the sim is bit-exact, the
+            //    provenance of the render mesh). The host StepClothCollide is the SAME bit-exact reference
+            //    the Vulkan --cloth-collide-shot GPU pass proved byte-identical against.
+            const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const cloth::fx kDt = cloth::kOne / 60;
+            const int kSide = 24;
+            const int kSteps = 40;
+            const int kIters = 6;
+            const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+            const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+            cloth::ClothGrid grid;
+            grid.W = kSide; grid.H = kSide;
+            grid.spacing = cloth::kOne;
+            grid.origin = cloth::FxVec3{(cloth::fx)(-(kSide / 2) * (int)cloth::kOne),
+                                        (cloth::fx)(kSide * (int)cloth::kOne), 0};
+            std::vector<cloth::ClothParticle> sheet = cloth::InitGrid(grid);
+            const std::vector<cloth::Constraint> constraints = cloth::BuildConstraints(grid, sheet);
+
+            // The static sphere collider (== the CL4 --cloth-collide-shot: center (0,8,0), radius 8). The
+            // CL1 sheet hangs in the z=0 plane (pinned top, y-down); the sphere — centered IN that plane —
+            // pushes the curtain OUT in-plane around its silhouette (x bulges to ~+/-12.6), so the cloth
+            // forms a lit curtain wrapping the sphere's outline. The SphereCollider reuses fpx::FxBody
+            // pos+radius (the SAME Q16.16 world units; the bit-exact CL4 sim). The collider itself is NOT
+            // drawn (the cloth is the hero — the spec's "sphere optional"); it only SHAPES the drape.
+            fpx::FxBody sphereBody;
+            sphereBody.pos = cloth::FxVec3{0, (cloth::fx)(8 * (int)cloth::kOne), 0};
+            sphereBody.radius = (cloth::fx)(8 * (int)cloth::kOne);
+            const std::vector<cloth::SphereCollider> spheres{ cloth::SphereFromBody(sphereBody) };
+
+            const int kFinalContacts = cloth::StepClothCollideSteps(grid, sheet, constraints, spheres,
+                                                                    kGravity, kDt, kGroundY, kIters, kSteps);
+            (void)kFinalContacts;
+
+            // 2) ClothToRenderMesh: the bit-exact lattice -> float lit-mesh vertices (the ONE host float
+            //    divide pos/kOne + smooth per-vertex normals). Then center on the cloth AABB + scale the
+            //    largest extent to ~kTargetExtent (frames the drape for the fixed camera).
+            std::vector<cloth::ClothRenderVertex> rv;
+            std::vector<uint32_t> clothIdx;
+            cloth::ClothToRenderMesh(grid, sheet, rv, clothIdx);
+
+            const uint32_t kVertCount = (uint32_t)rv.size();
+            const uint32_t kTriCount = (uint32_t)(clothIdx.size() / 3);
+            // PROOF (1) provenance: the render consumes EXACTLY the W*H lattice (verts == W*H) + the cell
+            // grid (tris == (W-1)(H-1)*2). The mesh derives from the bit-exact cloth (pos/kOne + normals).
+            if (kVertCount != (uint32_t)(grid.W * grid.H) ||
+                kTriCount != (uint32_t)((grid.W - 1) * (grid.H - 1) * 2)) {
+                std::fprintf(stderr, "FATAL: cloth-render mesh counts wrong (provenance broken)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // Center + scale (frame the drape). The cloth + the sphere share the SAME transform so the
+            // drape reads against its collider. AABB over the cloth verts (the sphere sits inside it).
+            const float kTargetExtent = 11.0f;
+            float minx = 1e30f, miny = 1e30f, minz = 1e30f, maxx = -1e30f, maxy = -1e30f, maxz = -1e30f;
+            for (const cloth::ClothRenderVertex& v : rv) {
+                if (v.px < minx) minx = v.px; if (v.px > maxx) maxx = v.px;
+                if (v.py < miny) miny = v.py; if (v.py > maxy) maxy = v.py;
+                if (v.pz < minz) minz = v.pz; if (v.pz > maxz) maxz = v.pz;
+            }
+            const float ctrx = 0.5f * (minx + maxx), ctry = 0.5f * (miny + maxy), ctrz = 0.5f * (minz + maxz);
+            const float exx = maxx - minx, exy = maxy - miny, exz = maxz - minz;
+            float ext = exx; if (exy > ext) ext = exy; if (exz > ext) ext = exz;
+            const float frameScale = (ext > 0.0f) ? (kTargetExtent / ext) : 1.0f;
+
+            // The cloth lit mesh in scene::Vertex (the lit pipeline layout). A constant light-grey base.
+            std::vector<scene::Vertex> clothVerts(rv.size());
+            for (size_t i = 0; i < rv.size(); ++i) {
+                scene::Vertex& v = clothVerts[i];
+                v.pos[0] = (rv[i].px - ctrx) * frameScale;
+                v.pos[1] = (rv[i].py - ctry) * frameScale;
+                v.pos[2] = (rv[i].pz - ctrz) * frameScale;
+                v.color[0] = 0.65f; v.color[1] = 0.30f; v.color[2] = 0.32f;   // a cloth red so it reads
+                v.uv[0] = 0.5f; v.uv[1] = 0.5f;
+                v.normal[0] = rv[i].nx; v.normal[1] = rv[i].ny; v.normal[2] = rv[i].nz;
+                v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+            }
+
+            rhi::BufferDesc cvbDesc;
+            cvbDesc.size = (uint64_t)clothVerts.size() * sizeof(scene::Vertex);
+            cvbDesc.initialData = clothVerts.data();
+            cvbDesc.usage = rhi::BufferUsage::Vertex;
+            auto clothVB = device->CreateBuffer(cvbDesc);
+            rhi::BufferDesc cibDesc;
+            cibDesc.size = (uint64_t)clothIdx.size() * sizeof(uint32_t);
+            cibDesc.initialData = clothIdx.data();
+            cibDesc.usage = rhi::BufferUsage::Index;
+            auto clothIB = device->CreateBuffer(cibDesc);
+            scene::Mesh clothMesh{std::move(clothVB), std::move(clothIB), (uint32_t)clothIdx.size()};
+
+            // Static lit pipeline (lit.vert + shared lit.frag) — REUSED VERBATIM from --mc-render-shot.
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true; litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            // Static depth-only shadow pipeline (the cloth + sphere casters).
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto shadowFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true; stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            // Sky + post (REUSED — the deterministic background + tonemap).
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            const uint8_t whitePx[4] = {255, 255, 255, 255};
+            auto whiteTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+            Mat4 meshModel = Mat4::Identity();  // the frame transform is baked into the vertices.
+
+            // Fixed 3/4 camera framing the draped cloth. The CL4 cloth is a VERTICAL planar curtain in the
+            // z=0 plane (the top edge pinned, hanging y-down), bulged in-plane around the sphere's outline.
+            // The camera looks mostly DOWN the +z axis (face-on to the curtain) with a slight x/y 3/4 tilt so
+            // the lit curtain surface fills the frame + its sphere-bulge reads. The directional light comes
+            // from the camera side (lightDir.z < 0) so the curtain's +z-facing front is well lit (N·L > 0)
+            // with a gradient over the bulge. centered at the origin (the mesh is centered).
+            const Vec3 eye{1.5f, 1.5f, 12.0f};
+            const Vec3 center{0.0f, 0.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.35f; fd.lightDir[1] = -0.6f; fd.lightDir[2] = -0.7f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.35f, -0.6f, -0.7f});
+                Vec3 sc{0.0f, 0.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 16.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-10.0f, 10.0f, -16.0f, 16.0f, 1.0f, 40.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            auto renderOnce = [&](std::vector<uint8_t>& outBGRA, uint32_t& outW, uint32_t& outH) -> bool {
+                render::RenderGraph graph;
+                render::RgResource rgShadow = graph.ImportTarget(
+                    "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+                render::RgResource rgScene = graph.ImportTarget(
+                    "sceneColor", render::RgResourceKind::SceneColor, *rt);
+                render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+                graph.AddPass("shadow", {}, {rgShadow},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*staticShadowPipeline);
+                        cmd.PushConstants(meshModel.m, sizeof(float) * 16);
+                        cmd.BindVertexBuffer(clothMesh.vertices());
+                        cmd.BindIndexBuffer(clothMesh.indices());
+                        cmd.DrawIndexed(clothMesh.indexCount());
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("scene", {rgShadow}, {rgScene},
+                    [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                        dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                        cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                        cmd.BindPipeline(*skyPipe);
+                        cmd.Draw(3);
+                        cmd.BindPipeline(*litPipeline);
+                        {
+                            float pc[20];
+                            for (int k = 0; k < 16; ++k) pc[k] = meshModel.m[k];
+                            pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                            cmd.PushConstants(pc, sizeof(pc));
+                            cmd.BindMaterial(*whiteTex, *flatNormal);
+                            // the lit draped cloth (the hero; the collider sphere is invisible).
+                            cmd.BindVertexBuffer(clothMesh.vertices());
+                            cmd.BindIndexBuffer(clothMesh.indices());
+                            cmd.DrawIndexed(clothMesh.indexCount());
+                        }
+                        cmd.EndRenderPass();
+                    });
+
+                graph.AddPass("post", {rgScene}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.BindPipeline(*postPipe);
+                        cmd.BindTexture(*rt);
+                        cmd.Draw(3);
+                        cmd.EndRenderPass();
+                    });
+
+                device->CaptureNextFrame();
+                graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+                graph.Execute(*device);
+                return device->GetCapturedPixels(outBGRA, outW, outH);
+            };
+
+            // === Render #1 (the golden frame) ===
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!renderOnce(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: cloth-render no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // PROOF (3) coverage / coherence (computed before the proof prints so the {stats} line carries
+            // the shaded count): the lit cloth covers a COHERENT shaded region — count pixels off the
+            // cleared sky background (top-left = pure background), require a substantial coherent count +
+            // a non-uniform lit gradient. BGRA8, 4 bytes/pixel.
+            uint32_t shaded = 0;
+            {
+                const uint8_t bgB = px[0], bgG = px[1], bgR = px[2];
+                uint8_t minL = 255, maxL = 0;
+                for (size_t p = 0; p + 3 < px.size(); p += 4) {
+                    const uint8_t b = px[p + 0], g = px[p + 1], r = px[p + 2];
+                    const int db = (int)b - bgB, dg = (int)g - bgG, dr = (int)r - bgR;
+                    if (db*db + dg*dg + dr*dr > 64) {
+                        ++shaded;
+                        const uint8_t lum = (uint8_t)(((int)r * 54 + (int)g * 183 + (int)b * 19) >> 8);
+                        if (lum < minL) minL = lum;
+                        if (lum > maxL) maxL = lum;
+                    }
+                }
+                if (shaded < 1000 || (maxL - minL) < 16) {
+                    std::fprintf(stderr,
+                        "FATAL: cloth-render coverage weak (shaded=%u, lumRange=%d) — not a lit drape\n",
+                        shaded, (int)maxL - (int)minL);
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            // PROOF (1) provenance / stats.
+            std::printf("cloth-render: {particles:%u, tris:%u, shaded:%u} (fixed-point cloth -> lit 3D render)\n",
+                        kVertCount, kTriCount, shaded);
+
+            // PROOF (2) determinism: a second render is BYTE-IDENTICAL (deterministic raster of a fixed
+            // mesh + camera + light).
+            {
+                std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+                if (!renderOnce(px2, cw2, ch3) || px2.size() != px.size() ||
+                    std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                    std::fprintf(stderr, "FATAL: cloth-render two renders differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-render determinism: two renders BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage line.
+            std::printf("cloth-render coverage: %u shaded (coherent lit drape)\n", shaded);
+
+            // PROOF (4) empty no-op: a degenerate/empty cloth -> ClothToRenderMesh yields zero geometry ->
+            // the cleared background / collider only (no cloth drawn). Verify the float conversion of an
+            // EMPTY lattice produces no render mesh.
+            {
+                std::vector<cloth::ClothRenderVertex> ev;
+                std::vector<uint32_t> ei;
+                cloth::ClothGrid emptyGrid;
+                cloth::ClothToRenderMesh(emptyGrid, {}, ev, ei);
+                if (!ev.empty() || !ei.empty()) {
+                    std::fprintf(stderr, "FATAL: cloth-render empty cloth produced render geometry\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-render empty: base only (no-op)\n");
+            }
+
+            bool ok = WriteBMP(clothRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — fixed-point cloth lit 3D render (%u particles, %u tris)\n",
+                                clothRenderShotPath, cw, ch2, kVertCount, kTriCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
