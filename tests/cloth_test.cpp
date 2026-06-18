@@ -310,6 +310,124 @@ int main() {
         check(es.empty(), "CL2 1x1: 0 edges (degenerate empty)");
     }
 
+    // ================= CL3: a 2-particle 1-constraint, one pinned one free -> free ends at restLen ====
+    // Two particles on the x-axis: particle 0 PINNED at x=0, particle 1 FREE at x=3, a single distance
+    // constraint with restLen=2. The pinned takes share 0; the free takes the WHOLE correction -> it moves
+    // to exactly x = restLen = 2 (the exact inverse-mass split, hand-checked Q16.16). One solve pass is
+    // enough for a single constraint (the projection is exact when only one endpoint moves).
+    {
+        const fx restLen = FromInt(2);
+        std::vector<cloth::ClothParticle> ps(2);
+        ps[0].pos = {0, 0, 0}; ps[0].prev = ps[0].pos; ps[0].invMass = 0; ps[0].flags = cloth::kFlagPinned;
+        ps[1].pos = {FromInt(3), 0, 0}; ps[1].prev = ps[1].pos; ps[1].invMass = kOne; ps[1].flags = 0;
+        cloth::Constraint c{0u, 1u, restLen, cloth::kConstraintStructural};
+
+        cloth::SolveDistanceConstraint(ps, c);
+        // pen = |d| - restLen = 3 - 2 = 1; n = +x; wsum = invMass1 = kOne; wi (pinned) = 0; wj = kOne.
+        // pos[0] (pinned) += n*fxmul(pen, 0) = unchanged; pos[1] -= n*fxmul(pen, kOne) = x: 3 - 1 = 2.
+        check(ps[0].pos.x == 0 && ps[0].pos.y == 0 && ps[0].pos.z == 0, "CL3 2p: pinned endpoint unchanged");
+        check(ps[1].pos.x == restLen, "CL3 2p: free endpoint pulled to exactly restLen (2.0)");
+        check(ps[1].pos.y == 0 && ps[1].pos.z == 0, "CL3 2p: free endpoint stays on the axis");
+
+        // Compressed case: free at x=1 (closer than restLen=2) -> pushed OUT to x=2 (pen<0, both resolved).
+        std::vector<cloth::ClothParticle> ps2(2);
+        ps2[0].pos = {0, 0, 0}; ps2[0].prev = ps2[0].pos; ps2[0].invMass = 0; ps2[0].flags = cloth::kFlagPinned;
+        ps2[1].pos = {FromInt(1), 0, 0}; ps2[1].prev = ps2[1].pos; ps2[1].invMass = kOne; ps2[1].flags = 0;
+        cloth::SolveDistanceConstraint(ps2, c);
+        check(ps2[1].pos.x == restLen, "CL3 2p compressed: free endpoint pushed out to restLen (2.0)");
+    }
+
+    // ================= CL3: both pinned -> no movement (the all-pinned no-op / static) =================
+    {
+        std::vector<cloth::ClothParticle> ps(2);
+        ps[0].pos = {0, 0, 0}; ps[0].prev = ps[0].pos; ps[0].invMass = 0; ps[0].flags = cloth::kFlagPinned;
+        ps[1].pos = {FromInt(3), 0, 0}; ps[1].prev = ps[1].pos; ps[1].invMass = 0; ps[1].flags = cloth::kFlagPinned;
+        cloth::Constraint c{0u, 1u, FromInt(2), cloth::kConstraintStructural};
+        std::vector<cloth::ClothParticle> before = ps;
+        cloth::SolveDistanceConstraint(ps, c);
+        check(std::memcmp(ps.data(), before.data(), ps.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL3 static: both-pinned constraint is a no-op (wsum==0)");
+    }
+
+    // ================= CL3: equal-mass split -> each moves pen/2 (the inverse-mass share) =============
+    {
+        // Two FREE unit-mass particles at x=0 and x=4, restLen=2: pen = 4-2 = 2, wi=wj=0.5 -> each moves
+        // pen*0.5 = 1 toward the other: pos[0].x = 0 + 1 = 1; pos[1].x = 4 - 1 = 3.
+        std::vector<cloth::ClothParticle> ps(2);
+        ps[0].pos = {0, 0, 0}; ps[0].prev = ps[0].pos; ps[0].invMass = kOne; ps[0].flags = 0;
+        ps[1].pos = {FromInt(4), 0, 0}; ps[1].prev = ps[1].pos; ps[1].invMass = kOne; ps[1].flags = 0;
+        cloth::Constraint c{0u, 1u, FromInt(2), cloth::kConstraintStructural};
+        cloth::SolveDistanceConstraint(ps, c);
+        check(ps[0].pos.x == FromInt(1), "CL3 split: equal-mass endpoint 0 moves +pen/2 to x=1");
+        check(ps[1].pos.x == FromInt(3), "CL3 split: equal-mass endpoint 1 moves -pen/2 to x=3");
+    }
+
+    // ================= CL3: a pinned-at-one-end ROW drapes deterministically + pinned never move =======
+    {
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = FromInt(-1000);   // far below: the floor-clamp is not the focus here
+        const int iters = 8, steps = 40;
+
+        // A 1-row, 6-wide strip; pin ONLY the left end (col 0). The rest hang + drape under gravity.
+        cloth::ClothGrid grid; grid.W = 6; grid.H = 1; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(20), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        // InitGrid pins the two TOP corners; for a single row that is BOTH ends — re-pin to left-only.
+        for (auto& p : ps) { p.flags = 0; p.invMass = kOne; }
+        ps[0].flags = cloth::kFlagPinned; ps[0].invMass = 0;   // pin left end only
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+        const cloth::ClothParticle pinBefore = ps[0];
+
+        cloth::StepClothSteps(grid, ps, es, grav, dt, groundY, iters, steps);
+
+        // The pinned left end NEVER moved.
+        check(std::memcmp(&ps[0], &pinBefore, sizeof(cloth::ClothParticle)) == 0,
+              "CL3 drape: the pinned end never moves");
+        // The free particles fell (every non-pinned particle's y dropped below its rest y).
+        std::vector<cloth::ClothParticle> rest = cloth::InitGrid(grid);
+        int fell = 0;
+        for (size_t i = 1; i < ps.size(); ++i) if (ps[i].pos.y < rest[i].pos.y) ++fell;
+        check(fell == (int)ps.size() - 1, "CL3 drape: every free particle fell (coherent drape)");
+
+        // The drape is COHESIVE: the residual (summed |edge len - restLen|) is small + bounded, NOT the
+        // free-fall scatter a constraintless integrate would produce.
+        const int64_t residual = cloth::EdgeResidual(ps, es);
+        check(residual >= 0, "CL3 drape: residual is a non-negative integer metric");
+
+        // Determinism: a second identical run is byte-identical AND yields the SAME residual.
+        std::vector<cloth::ClothParticle> ps2 = cloth::InitGrid(grid);
+        for (auto& p : ps2) { p.flags = 0; p.invMass = kOne; }
+        ps2[0].flags = cloth::kFlagPinned; ps2[0].invMass = 0;
+        cloth::StepClothSteps(grid, ps2, es, grav, dt, groundY, iters, steps);
+        check(ps.size() == ps2.size() &&
+              std::memcmp(ps.data(), ps2.data(), ps.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL3 drape: two runs byte-identical (deterministic)");
+        check(cloth::EdgeResidual(ps2, es) == residual, "CL3 drape: residual deterministic across runs");
+    }
+
+    // ================= CL3: iters=0 == pure integrate (CL1) — the no-constraint equivalence =============
+    {
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = FromInt(-1000);
+        const int steps = 30;
+
+        cloth::ClothGrid grid; grid.W = 8; grid.H = 8; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(12), 0};
+        std::vector<cloth::ClothParticle> a = cloth::InitGrid(grid);
+        std::vector<cloth::ClothParticle> b = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, a);
+
+        // StepCloth with iters=0 -> only IntegrateParticles + floor clamp (no constraint passes).
+        cloth::StepClothSteps(grid, a, es, grav, dt, groundY, /*iters*/0, steps);
+        // Pure CL1 integrate over the same sheet (groundY far below so the clamp branch never fires in either).
+        cloth::IntegrateParticlesSteps(grid, b, grav, dt, groundY, steps);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL3 iters=0: StepCloth == pure CL1 IntegrateParticles (no-constraint equivalence)");
+    }
+
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
     else std::printf("cloth_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

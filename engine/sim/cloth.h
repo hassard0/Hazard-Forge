@@ -282,5 +282,112 @@ inline void CountConstraintsByKind(const std::vector<Constraint>& constraints,
     }
 }
 
+// ===== Slice CL3 — Deterministic GPU Cloth: the PBD DISTANCE-CONSTRAINT SOLVER (the make-or-break) =====
+// Project the CL2 distance constraints with Position-Based Dynamics so the cloth holds its shape + DRAPES
+// (the pinned corners hold; the lattice stays cohesive instead of CL1's free-fall scatter). This is the
+// VERBATIM generalization of fpx.h::ResolvePair (fpx.h:340 — the sphere-pair positional projection) from a
+// sphere PAIR to a constraint EDGE: where ResolvePair has rest distance (a.radius + b.radius) and resolves
+// only OVERLAP (pen = restDist - dist > 0 -> push apart), a DISTANCE constraint has rest distance c.restLen
+// and resolves BOTH directions (pen = dist - restLen; pen>0 stretched -> pull together, pen<0 compressed ->
+// push apart). The inverse-mass split (wi = fxdiv(invMass_i, wsum)), the FxNormalize(d) (via FxISqrt, NO
+// std::sqrt), and the FxScale(n, fxmul(pen, w)) correction are otherwise IDENTICAL to ResolvePair — pinned
+// particles (invMass==0) take share 0 and never move. Pure integer, int64-backed Q16.16 (fxdiv/FxISqrt) —
+// shaders/cloth_solve.comp copies this VERBATIM so the GPU exercises the EXACT ops (Vulkan-only int64; the
+// Metal showcase runs THIS CPU StepCloth -> byte-identical by construction, the fpx_solve.comp convention).
+//
+// HONEST CAVEAT (FPX3-identical): PBD is ITERATIVE — after `iters` Gauss-Seidel passes the residual
+// constraint error is DETERMINISTIC but NOT zero (stiffness ∝ iterations); fxdiv/FxISqrt truncation makes
+// the solver bit-REPRODUCIBLE, not analytically exact. The headline is DETERMINISM + cross-platform
+// bit-identity (the UE5 Chaos differentiator), NOT "more physically correct".
+
+// Bring fpx's PBD primitives into the cloth namespace (read-only): the integer divide, the integer
+// normalize (via FxISqrt — NO std::sqrt), and FxLength. NO new fixed-point primitives.
+using fpx::fxdiv;
+using fpx::FxNormalize;
+using fpx::FxLength;
+
+// ----- SolveDistanceConstraint: project ONE distance constraint (the bit-exact core) -----------------
+// Given the particle array + a single Constraint c (endpoints c.i, c.j; rest distance c.restLen):
+//   d   = pos[j] - pos[i]
+//   len = FxLength(d); if len == 0 -> skip (degenerate; no deterministic direction)
+//   pen = len - c.restLen      (>0 stretched, <0 compressed — a distance constraint resolves BOTH)
+//   n   = FxNormalize(d)
+//   wsum = invMass_i + invMass_j; if wsum == 0 -> skip (both pinned)
+//   wi = fxdiv(invMass_i, wsum); wj = fxdiv(invMass_j, wsum)
+//   pos[i] += n * fxmul(pen, wi)   (the i endpoint moves toward j when stretched)
+//   pos[j] -= n * fxmul(pen, wj)
+// Pinned (invMass 0) -> its share is 0 -> never moves. This is fpx.h::ResolvePair with rest length
+// c.restLen instead of (a.radius+b.radius), resolving BOTH pen signs (NOT only overlap). int64-backed
+// (fxdiv/FxISqrt) — the shader copies this body VERBATIM.
+inline void SolveDistanceConstraint(std::vector<ClothParticle>& particles, const Constraint& c) {
+    ClothParticle& pi = particles[(size_t)c.i];
+    ClothParticle& pj = particles[(size_t)c.j];
+    const fx wsum = pi.invMass + pj.invMass;
+    if (wsum == 0) return;                              // both pinned -> skip
+    const FxVec3 d = FxSub(pj.pos, pi.pos);
+    const fx len = FxLength(d);
+    if (len == 0) return;                               // coincident -> no deterministic normal -> skip
+    const fx pen = len - c.restLen;
+    const FxVec3 n = FxNormalize(d);
+    const fx wi = fxdiv(pi.invMass, wsum);
+    const fx wj = fxdiv(pj.invMass, wsum);
+    const FxVec3 ci = FxScale(n, fxmul(pen, wi));       // i moves +ci (toward j when stretched)
+    const FxVec3 cj = FxScale(n, fxmul(pen, wj));       // j moves -cj
+    pi.pos = FxAdd(pi.pos, ci);
+    pj.pos = FxSub(pj.pos, cj);
+}
+
+// ----- StepCloth: one full PBD step (integrate + K Gauss-Seidel constraint passes + floor clamp) ------
+// The make-or-break reference the GPU cloth_solve.comp memcmp's against (copied VERBATIM into the shader):
+//   (1) IntegrateParticles(grid, particles, gravity, dt, groundY)  — CL1, one semi-implicit-Euler step.
+//   (2) `iters` Gauss-Seidel passes, EACH iterating ALL constraints in the FIXED CL2 emit order applying
+//       SolveDistanceConstraint. SEQUENTIAL — each constraint reads the positions already updated by the
+//       earlier constraints THIS pass -> order-dependent -> single-thread on the GPU (the fpx SolveContacts
+//       discipline). Pinned particles (invMass 0) never move.
+//   (3) ground floor-clamp: every particle with pos.y < groundY snaps pos.y = groundY (the non-penetration
+//       floor; the constraint passes can push a particle below ground, so clamp AFTER them).
+// The pinned corners hold + the constraints keep the lattice cohesive -> the sheet DRAPES (unlike CL1's
+// free-fall). Pure integer, fixed op order, no RNG/clock -> two-run bit-identical AND bit-exact GPU==CPU.
+inline void StepCloth(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                      const std::vector<Constraint>& constraints,
+                      const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    // (1) integrate one step (CL1).
+    IntegrateParticles(grid, particles, gravity, dt, groundY);
+    // (2) `iters` Gauss-Seidel constraint passes in the FIXED CL2 emit order (sequential -> order-dependent).
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < constraints.size(); ++e)
+            SolveDistanceConstraint(particles, constraints[e]);
+    // (3) ground floor clamp AFTER the constraint passes (a constraint may have pushed a particle below).
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i)
+        if (particles[i].pos.y < groundY) particles[i].pos.y = groundY;
+}
+
+// ----- StepClothSteps: run K full PBD steps (the showcase / GPU K-step driver) -------------------------
+// K successive StepCloth steps over the lattice. The GPU cloth_solve.comp runs THIS exact K-step loop on a
+// SINGLE thread (the Gauss-Seidel order-dependence makes single-thread necessary for bit-exactness).
+inline void StepClothSteps(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                           const std::vector<Constraint>& constraints,
+                           const FxVec3& gravity, fx dt, fx groundY, int iters, int steps) {
+    for (int s = 0; s < steps; ++s)
+        StepCloth(grid, particles, constraints, gravity, dt, groundY, iters);
+}
+
+// ----- EdgeResidual: a deterministic integer cohesion metric (summed |edge len - restLen|) -------------
+// The summed absolute distance-constraint error over all edges, in Q16.16 (int64 accumulator -> no
+// overflow over thousands of edges). DETERMINISTIC + bit-exact CPU<->GPU (pure integer FxLength compares).
+// A coherent DRAPE keeps this small (the constraints held the lattice); free-fall scatter would blow it up.
+inline int64_t EdgeResidual(const std::vector<ClothParticle>& particles,
+                            const std::vector<Constraint>& constraints) {
+    int64_t r = 0;
+    for (const Constraint& c : constraints) {
+        const FxVec3 d = FxSub(particles[(size_t)c.j].pos, particles[(size_t)c.i].pos);
+        const fx len = FxLength(d);
+        const fx err = len - c.restLen;
+        r += (err < 0) ? -(int64_t)err : (int64_t)err;
+    }
+    return r;
+}
+
 }  // namespace cloth
 }  // namespace hf::sim
