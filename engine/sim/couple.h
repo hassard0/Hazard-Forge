@@ -442,5 +442,125 @@ inline uint32_t CountDisplaced(const CoupleWorld& world) {
     return c;
 }
 
+// ===== Slice CP4 — THE COUPLED STEP (the bobbing barrel, the INTEGRATED two-way solver) ==============
+// The fourth slice of FLAGSHIP #11: ONE deterministic tick that runs the fluid's own incompressibility
+// (FL4) AND both exchange directions (CP2 fluid->body, CP3 body->fluid) AND the rigid integrate — a dynamic
+// fluid AND a dynamic body in one bidirectional loop. The result: a barrel BOBS under emergent buoyancy in
+// an INCOMPRESSIBLE fluid (no script). CP4 ORCHESTRATES the existing bit-exact pieces — it composes the FL4
+// SUB-passes (NOT StepFluid wholesale, which would re-predict + re-build the neighbour list and skip the
+// coupling) interleaved with CP2 AccumBodyForces + CP3 ApplyBodyToFluid + the rigid IntegrateBody/
+// ResolveGround, in the LOCKED order below. NO new shader, NO new RHI: the GPU showcase is a host-driven
+// multi-pass driver over the EXISTING FL4 fluid_* + CP2 couple_buoyancy + CP3 couple_displace shaders.
+//
+// THE COUPLED TICK (StepCouple, the locked make-or-break order):
+//   (1) PREDICT:  fluid IntegrateFluid(particles) [FL1: prev=pos, predict pos]; each DYNAMIC body
+//                 vel += gravity·dt  (velocity ONLY — the position integrates at (5)).
+//   (2) BUILD:    grid = MakeGrid; table = BuildCellTable; nbr = BuildNeighborList (FL2) — once per step,
+//                 FIXED across the K iters (the standard PBF choice); query = GatherBodyParticles (CP1),
+//                 also built ONCE per step (from the predicted fluid + the current body pos).
+//   (3) ITERATE (K JACOBI iters), EACH:
+//         (3a) FL4 density: ComputeDensity -> ComputeLambda -> SolveDensityConstraint -> apply pos+=Δp.
+//         (3b) CP3 body->fluid: ApplyBodyToFluid (displace fluid out of bodies + drag reaction).
+//         (3c) CP2 fluid->body: AccumBodyForces (buoyancy + drag -> body.vel delta, over the CP1 query).
+//   (4) FLUID VELOCITY: vel = (pos − prev)/dt   (the FL4 PBF velocity update).
+//   (5) BODY INTEGRATE: each DYNAMIC body pos += vel·dt; ResolveGround(body, groundY)   (the bed clamp).
+// The body accumulates gravity (1) + buoyancy/drag over the K iters (3c), THEN its position integrates (5);
+// over many steps it falls in, buoyancy builds, and it BOBS around the float line (damped by drag) —
+// emergent, no script. Pure integer, fixed op order -> two runs bit-identical AND bit-exact GPU==CPU. Bodies
+// do not collide with each other (single body / non-overlapping; body-body contacts are out of scope).
+//
+// The neighbour list + the CP1 query are built ONCE per step (the PBF choice); CP4 reuses the FL2/CP1
+// helpers VERBATIM. The kernel LUT (kernel.W/gradW/restDensity/epsilon/bins) the caller built (BuildKernelTable)
+// drives the FL4 density solve — CP4 reads world.kernel exactly as StepFluid reads its kernel.
+
+inline void StepCouple(CoupleWorld& world, fx dt, int iters) {
+    const size_t n = world.particles.size();
+    // (1) PREDICT: the fluid integrate (FL1 — vel += g·dt; prev = pos; pos += vel·dt; floor clamp) AND each
+    // dynamic body's gravity velocity integrate (velocity ONLY; the position integrates at (5)).
+    fluid::IntegrateFluid(world.particles, world.gravity, dt, world.groundY);
+    for (fpx::FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        b.vel.x += fpx::fxmul(world.gravity.x, dt);
+        b.vel.y += fpx::fxmul(world.gravity.y, dt);
+        b.vel.z += fpx::fxmul(world.gravity.z, dt);
+    }
+    // (2) BUILD: the FL2 neighbour list from the PREDICTED positions (built ONCE, fixed across the K iters)
+    // + the CP1 body->fluid query (built ONCE per step, from the predicted fluid + the current body pos).
+    const fluid::FluidGrid grid = fluid::MakeGrid(world.particles, world.kernel.h);
+    const fluid::FluidCellTable table = fluid::BuildCellTable(world.particles, grid);
+    const fluid::FluidNeighborList list = fluid::BuildNeighborList(world.particles, grid, table, world.kernel.h);
+    const CoupleQuery query = GatherBodyParticles(world);
+    // (3) K JACOBI iterations: FL4 density solve -> CP3 body->fluid -> CP2 fluid->body, each iteration.
+    std::vector<fx> density, lambda;
+    std::vector<FxVec3> dp;
+    for (int it = 0; it < iters; ++it) {
+        // (3a) FL4 density: ρ_i for ALL -> λ_i for ALL -> Δp_i for ALL (separate dp buffer) -> apply p+=Δp.
+        fluid::ComputeDensity(world.particles, list, world.kernel, density);
+        fluid::ComputeLambda(world.particles, list, world.kernel, density, lambda);
+        fluid::SolveDensityConstraint(world.particles, list, world.kernel, lambda, dp);
+        for (size_t i = 0; i < n; ++i) {
+            if (world.particles[i].flags & fluid::kFlagStatic) continue;
+            world.particles[i].pos = FxAdd(world.particles[i].pos, dp[i]);
+        }
+        // (3b) CP3 body->fluid: displace the fluid out of the bodies (+ drag reaction).
+        ApplyBodyToFluid(world, dt);
+        // (3c) CP2 fluid->body: accumulate buoyancy + drag into the body velocities (over the CP1 query).
+        AccumBodyForces(world, query, dt);
+    }
+    // (4) FLUID VELOCITY: vel = (pos − prev)/dt (the FL4 PBF velocity update).
+    if (dt != 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (world.particles[i].flags & fluid::kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(world.particles[i].pos, world.particles[i].prev);
+            world.particles[i].vel =
+                FxVec3{fpx::fxdiv(dpos.x, dt), fpx::fxdiv(dpos.y, dt), fpx::fxdiv(dpos.z, dt)};
+        }
+    }
+    // (5) BODY INTEGRATE: pos += vel·dt for each dynamic body THEN ResolveGround (the radius-aware bed clamp).
+    for (fpx::FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        b.pos.x += fpx::fxmul(b.vel.x, dt);
+        b.pos.y += fpx::fxmul(b.vel.y, dt);
+        b.pos.z += fpx::fxmul(b.vel.z, dt);
+        fpx::ResolveGround(b, world.groundY);
+    }
+}
+
+// StepCoupleSteps(world, dt, iters, steps): run K coupled ticks. The CPU reference the GPU multi-pass driver
+// memcmp's against byte-for-byte (the fluid + body state). Pure integer -> two runs byte-identical,
+// cross-backend identical (the GPU runs the FL4/CP2/CP3 int64 passes Vulkan-only; Metal runs THIS).
+inline void StepCoupleSteps(CoupleWorld& world, fx dt, int iters, int steps) {
+    for (int s = 0; s < steps; ++s) StepCouple(world, dt, iters);
+}
+
+// MeasureCoupleState(world): the honest emergent metrics helper. Returns the mean DYNAMIC-body float line
+// (pos.y), the FL4 summed |ρ−ρ0| density residual (the incompressibility coherence stat), and the dynamic
+// body count. Deterministic Q16.16 stats for the proofs (the GR4/FL4 caveat shape — the float line + the
+// bob are EMERGENT/within-band, NOT exact depths). The density residual is computed from the CURRENT fluid
+// (a fresh grid/neighbour list + ComputeDensity), bit-exact CPU<->GPU.
+struct CoupleState {
+    fx      floatY = 0;          // the mean settled DYNAMIC-body pos.y (the emergent float line)
+    int64_t densityResidual = 0; // the FL4 summed |ρ_i − ρ0| (the incompressibility coherence stat)
+    uint32_t dynamicBodies = 0;  // the count of dynamic bodies (floatY is their mean)
+};
+inline CoupleState MeasureCoupleState(const CoupleWorld& world) {
+    CoupleState s;
+    int64_t sum = 0;
+    for (const fpx::FxBody& b : world.bodies)
+        if (b.flags & fpx::kFlagDynamic) { sum += (int64_t)b.pos.y; ++s.dynamicBodies; }
+    s.floatY = s.dynamicBodies == 0u ? 0 : (fx)(sum / (int64_t)s.dynamicBodies);
+    // The density residual over the current fluid (the FL4 coherence metric). Empty pool -> 0.
+    if (!world.particles.empty() && world.kernel.bins > 0 && world.kernel.restDensity > 0) {
+        const fluid::FluidGrid grid = fluid::MakeGrid(world.particles, world.kernel.h);
+        const fluid::FluidCellTable table = fluid::BuildCellTable(world.particles, grid);
+        const fluid::FluidNeighborList list =
+            fluid::BuildNeighborList(world.particles, grid, table, world.kernel.h);
+        std::vector<fx> density;
+        fluid::ComputeDensity(world.particles, list, world.kernel, density);
+        s.densityResidual = fluid::DensityResidual(density, world.kernel.restDensity);
+    }
+    return s;
+}
+
 }  // namespace couple
 }  // namespace hf::sim

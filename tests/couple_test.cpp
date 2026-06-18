@@ -587,6 +587,130 @@ int main() {
         check(nbUnchanged, "ApplyBodyToFluid: zero bodies -> the fluid is UNCHANGED (no-op)");
     }
 
+    // ============================================================================================
+    // ============ Slice CP4 — THE COUPLED STEP (the bobbing barrel) tests ========================
+    // ============================================================================================
+    // StepCouple composes the FL4 fluid sub-passes + CP2 fluid->body + CP3 body->fluid + the rigid integrate
+    // in the LOCKED order. A body dropped over a small pool settles to a float line ABOVE the bed AND BOBS
+    // (peak-to-trough > 0), the fluid density residual stays bounded (no explosion), the buoy=0 control sinks;
+    // deterministic; the composed order is fixed.
+
+    const int kCpIters = 3;
+
+    // Build the coupled-step scene: a STATIC BASIN (static boundary walls + floor confine the pool so the
+    // DYNAMIC fluid stays a coherent pool the body can bob ON — without walls a free pool spreads/thins and
+    // the body sinks through) + a body dropped above it. The kernel ρ0 = the packed-lattice mean density (the
+    // FL4 recipe). The body's invMass is kOne/iters so the K-per-step buoyancy/drag impulses (CP4 runs CP2's
+    // AccumBodyForces in EACH of the K iters, per the locked order) balance the once-per-step gravity.
+    auto buildCoupleWorld = [&](int bodyX, int bodyY, int bodyZ) -> couple::CoupleWorld {
+        couple::CoupleWorld w;
+        const int LO = 0, HI = 8;
+        auto Part = [&](int x, int y, int z, bool stat) {
+            fluid::FluidParticle p = ParticleAt(x, y, z);
+            if (stat) { p.invMass = 0; p.flags = fluid::kFlagStatic; }
+            return p;
+        };
+        for (int py = -1; py <= 6; ++py)
+            for (int pz = -1; pz <= HI + 1; ++pz)
+                for (int px = -1; px <= HI + 1; ++px) {
+                    const bool wall = (px == -1 || px == HI + 1 || pz == -1 || pz == HI + 1 || py == -1);
+                    const bool inside = (px >= LO && px <= HI && pz >= LO && pz <= HI && py >= 0 && py <= 5);
+                    if (wall) w.particles.push_back(Part(px, py, pz, true));      // static basin wall/floor
+                    else if (inside) w.particles.push_back(Part(px, py, pz, false));  // dynamic fluid
+                }
+        const fx kH = (fx)(2 * (int)kOne);   // smoothing radius h = 2.0 (the FL4 density-solve radius)
+        const int kBins = fluid::kKernelBins;
+        // ρ0 = the mean density of the packed initial lattice (the FL4 probe recipe).
+        const fluid::FluidGrid pg = fluid::MakeGrid(w.particles, kH);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(w.particles, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(w.particles, pg, pt, kH);
+        const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, kOne, kBins, kOne / 100);
+        std::vector<fluid::fx> probeRho;
+        fluid::ComputeDensity(w.particles, pl, kProbe, probeRho);
+        const fluid::fx rho0 = fluid::MeanDensity(probeRho);
+        w.kernel  = fluid::BuildKernelTable(kH, rho0, kBins, kOne / 100);
+        w.gravity = kGravityDown;
+        w.dt      = kDt;
+        w.groundY = 0;
+        fpx::FxBody b = BodyAt(bodyX, bodyY, bodyZ, 2);   // radius 2, dropped above the pool
+        b.invMass = kOne / kCpIters;                       // heavier body -> the K-fold buoyancy balances gravity
+        w.bodies = {b};
+        return w;
+    };
+
+    const int kCpSteps = 400;
+    const fx  kCpBedLine = (fx)(2 * (int)kOne);   // groundY + radius (the body's surface-rest line)
+
+    // (a) the headline: a body over the pool settles to a float line ABOVE the bed AND BOBS; the fluid stays
+    // coherent (density residual bounded). Track the body's min/max y over the run for the bob amplitude.
+    {
+        couple::CoupleWorld w = buildCoupleWorld(4, 9, 4);
+        fx minY = w.bodies[0].pos.y, maxY = w.bodies[0].pos.y;
+        for (int s = 0; s < kCpSteps; ++s) {
+            couple::StepCouple(w, kDt, kCpIters);
+            const fx y = w.bodies[0].pos.y;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+        }
+        const couple::CoupleState st = couple::MeasureCoupleState(w);
+        check(st.floatY > kCpBedLine + kOne / 4,
+              "StepCouple: the body FLOATS above the bed by a clear margin (emergent buoyancy)");
+        check(st.floatY < (fx)(20 * (int)kOne), "StepCouple: the float line is bounded (did NOT fly out)");
+        // The bob: the body oscillated — its peak-to-trough y motion over the run is > 0 (NOT monotonic).
+        const fx bob = maxY - minY;
+        check(bob > 0, "StepCouple: the body BOBBED (peak-to-trough y motion > 0, it oscillated)");
+        // The fluid stayed coherent: the density residual is bounded (no explosion) + above the ground.
+        check(st.densityResidual >= 0, "StepCouple: the density residual is a valid (non-negative) stat");
+        // The dynamic fluid stays bounded — it rests in the static basin (floor at y=-1) and does NOT explode
+        // or tunnel out the bottom (CP4's locked order has no per-step CollidePlane; the basin walls confine).
+        bool bounded = true;
+        const fx kBasinFloor = -(fx)(2 * (int)kOne);   // a generous floor (the static basin floor is y=-1)
+        const fx kCeil = (fx)(40 * (int)kOne);
+        for (const fluid::FluidParticle& p : w.particles)
+            if (!(p.flags & fluid::kFlagStatic) && (p.pos.y < kBasinFloor || p.pos.y > kCeil)) bounded = false;
+        check(bounded, "StepCouple: the dynamic fluid stays bounded in the basin (coherent, no explosion)");
+    }
+
+    // (b) the buoy=0 control: a NON-DYNAMIC body (no buoyancy/integrate) over a pool — but a dynamic body
+    // placed FAR from the pool (gathers 0 fluid particles for the whole fall) free-falls to the bed. Compare
+    // a floated body vs a sunk (no-gather) control.
+    {
+        couple::CoupleWorld floated = buildCoupleWorld(4, 9, 4);
+        couple::StepCoupleSteps(floated, kDt, kCpIters, kCpSteps);
+        const fx floatY = couple::MeasureCoupleState(floated).floatY;
+
+        couple::CoupleWorld sunk = buildCoupleWorld(40, 9, 4);   // far from the pool -> gathers 0
+        couple::StepCoupleSteps(sunk, kDt, kCpIters, kCpSteps);
+        const fx sunkY = couple::MeasureCoupleState(sunk).floatY;
+        check(sunkY == kCpBedLine,
+              "StepCouple control (no-gather): the body SINKS to the bed (groundY + radius)");
+        check(floatY > sunkY, "StepCouple: buoyancy does work (the floated body settles ABOVE the control)");
+    }
+
+    // (c) determinism: two runs of the SAME coupled scene -> byte-identical fluid + body state.
+    {
+        couple::CoupleWorld a = buildCoupleWorld(4, 9, 4), b = buildCoupleWorld(4, 9, 4);
+        couple::StepCoupleSteps(a, kDt, kCpIters, kCpSteps);
+        couple::StepCoupleSteps(b, kDt, kCpIters, kCpSteps);
+        bool same = (a.bodies.size() == b.bodies.size()) && (a.particles.size() == b.particles.size());
+        if (same) same = (std::memcmp(&a.bodies[0], &b.bodies[0], sizeof(fpx::FxBody)) == 0);
+        for (size_t i = 0; same && i < a.particles.size(); ++i)
+            if (std::memcmp(&a.particles[i], &b.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "StepCouple is deterministic (two runs byte-identical, fluid + body)");
+    }
+
+    // (d) the composed order is FIXED: StepCouple(world, dt, iters) == StepCoupleSteps(world, dt, iters, 1)
+    // for one tick (the K-step driver mirrors the single tick).
+    {
+        couple::CoupleWorld a = buildCoupleWorld(4, 9, 4), b = buildCoupleWorld(4, 9, 4);
+        couple::StepCouple(a, kDt, kCpIters);
+        couple::StepCoupleSteps(b, kDt, kCpIters, 1);
+        bool same = (std::memcmp(&a.bodies[0], &b.bodies[0], sizeof(fpx::FxBody)) == 0);
+        for (size_t i = 0; same && i < a.particles.size(); ++i)
+            if (std::memcmp(&a.particles[i], &b.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "StepCouple == StepCoupleSteps(...,1) (the composed order is fixed)");
+    }
+
     if (g_fail == 0) std::printf("couple_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

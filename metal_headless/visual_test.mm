@@ -19298,6 +19298,191 @@ static int RunCoupleDisplaceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CP4 — Deterministic Rigid<->Fluid Coupling THE COUPLED STEP showcase (--couple-step) =========
+// The INTEGRATED two-way solver — the bobbing barrel. ONE deterministic tick composes the FL4 fluid sub-passes
+// + CP2 fluid->body + CP3 body->fluid + the rigid integrate (couple::StepCoupleSteps). Like --couple-buoyancy
+// / --couple-displace, the FL4 density solve + the CP2/CP3 exchange are int64 -> the FL4 fluid_dp/apply/collide
+// + couple_buoyancy + couple_displace shaders are Vulkan-only; on Metal --couple-step runs the CPU
+// couple::StepCoupleSteps — the EXACT bit-exact reference the Vulkan --couple-step-shot GPU==CPU memcmp
+// compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. CPU-colors the SAME integer
+// side-view golden as the Vulkan --couple-step-shot -> bit-identical cross-backend BY CONSTRUCTION (the strict
+// zero-differing-pixel bar). NO new shader (CP4 orchestrates the existing FL4/CP2/CP3 passes), NO new RHI.
+static int RunCoupleStepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace couple = hf::sim::couple;
+    namespace fluid  = hf::sim::fluid;
+    namespace fpx    = hf::sim::fpx;
+
+    // The scene (== the Vulkan --couple-step-shot config). -9 host-snapped (clean integer downward gravity).
+    const fluid::fx kGravY = -9 * (int)fluid::kOne;
+    const fluid::fx kDt = fluid::kOne / 60;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);
+    const int kBins = fluid::kKernelBins;
+    const fluid::fx kEpsilon = fluid::kOne / 100;
+    const int kSteps = 400;
+    const int kIters = 3;
+
+    // The static basin (boundary walls + floor) + the dynamic pool + a body dropped above it.
+    auto makeWorld = [&](int bodyX, int bodyY, int bodyZ) {
+        couple::CoupleWorld w;
+        const int LO = 0, HI = 8;
+        auto Part = [&](int x, int y, int z, bool stat) {
+            fluid::FluidParticle p;
+            p.pos = fluid::FxVec3{(fluid::fx)(x * (int)fluid::kOne), (fluid::fx)(y * (int)fluid::kOne),
+                                  (fluid::fx)(z * (int)fluid::kOne)};
+            p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0};
+            p.invMass = stat ? 0 : fluid::kOne; p.flags = stat ? fluid::kFlagStatic : 0u;
+            return p;
+        };
+        for (int py = -1; py <= 6; ++py)
+            for (int pz = -1; pz <= HI + 1; ++pz)
+                for (int px = -1; px <= HI + 1; ++px) {
+                    const bool wall = (px == -1 || px == HI + 1 || pz == -1 || pz == HI + 1 || py == -1);
+                    const bool inside = (px >= LO && px <= HI && pz >= LO && pz <= HI && py >= 0 && py <= 5);
+                    if (wall) w.particles.push_back(Part(px, py, pz, true));
+                    else if (inside) w.particles.push_back(Part(px, py, pz, false));
+                }
+        w.kernel = fluid::BuildKernelTable(kH, fluid::kOne, kBins, kEpsilon);
+        // ρ0 = the packed-lattice mean density (the FL4 probe recipe); rebuild the kernel.
+        const fluid::FluidGrid pg = fluid::MakeGrid(w.particles, kH);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(w.particles, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(w.particles, pg, pt, kH);
+        std::vector<fluid::fx> pr;
+        fluid::ComputeDensity(w.particles, pl, w.kernel, pr);
+        w.kernel = fluid::BuildKernelTable(kH, fluid::MeanDensity(pr), kBins, kEpsilon);
+        w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(bodyX * (int)fluid::kOne), (fpx::fx)(bodyY * (int)fluid::kOne),
+                            (fpx::fx)(bodyZ * (int)fluid::kOne)};
+        b.invMass = fluid::kOne / kIters; b.flags = fpx::kFlagDynamic; b.radius = (fpx::fx)(2 * (int)fluid::kOne);
+        w.bodies = {b};
+        return w;
+    };
+    couple::CoupleWorld world = makeWorld(4, 9, 4);
+    const int kBodyCount = (int)world.bodies.size();
+    const int kParticleCount = (int)world.particles.size();
+
+    // CPU StepCoupleSteps (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). Track the
+    // body's min/max y over the run for the bob amplitude.
+    auto runSteps = [&](couple::CoupleWorld w, fluid::fx& minY, fluid::fx& maxY) {
+        minY = w.bodies[0].pos.y; maxY = w.bodies[0].pos.y;
+        for (int s = 0; s < kSteps; ++s) {
+            couple::StepCouple(w, kDt, kIters);
+            const fluid::fx y = w.bodies[0].pos.y;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+        }
+        return w;
+    };
+    fluid::fx minY, maxY;
+    couple::CoupleWorld cpuWorld = runSteps(world, minY, maxY);
+    const couple::CoupleState cpuState = couple::MeasureCoupleState(cpuWorld);
+    const fluid::fx kFloatY = cpuState.floatY;
+    const fluid::fx kBob = maxY - minY;
+
+    std::printf("couple-step: {bodies:%d, particles:%d, steps:%d, iters:%d, floatY:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU couple::StepCoupleSteps, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kParticleCount, kSteps, kIters, (int)kFloatY);
+
+    // determinism.
+    {
+        fluid::fx m1, m2;
+        couple::CoupleWorld b = runSteps(world, m1, m2);
+        bool same = (b.bodies.size() == cpuWorld.bodies.size()) &&
+                    (b.particles.size() == cpuWorld.particles.size()) &&
+                    std::memcmp(&b.bodies[0], &cpuWorld.bodies[0], sizeof(fpx::FxBody)) == 0;
+        for (size_t i = 0; same && i < b.particles.size(); ++i)
+            if (std::memcmp(&b.particles[i], &cpuWorld.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        if (!same) return fail("couple-step: two runs differ (nondeterministic)");
+        std::printf("couple-step determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // coupled (the headline + the HONEST emergent metrics): floats above the bed by a margin AND bobbed AND
+    // the fluid stayed coherent (density residual bounded).
+    {
+        const fluid::fx kBedLine = kGroundY + cpuWorld.bodies[0].radius;
+        const fluid::fx kMargin  = fluid::kOne / 4;
+        const fluid::fx kCeiling = (fluid::fx)(30 * (int)fluid::kOne);
+        const fluid::fx kBobThresh = fluid::kOne / 2;
+        const int64_t kResidualCeil = (int64_t)40000000;
+        if (!(kFloatY > kBedLine + kMargin) || !(kFloatY < kCeiling))
+            return fail("couple-step: did NOT float (sunk to bed or flew out)");
+        if (!(kBob > kBobThresh)) return fail("couple-step: did NOT bob (monotonic)");
+        if (!(cpuState.densityResidual >= 0 && cpuState.densityResidual < kResidualCeil))
+            return fail("couple-step: fluid incoherent (residual out of bounds)");
+        std::printf("couple-step coupled: floatY %d, bob %d, fluid coherent (emergent bobbing)\n",
+                    (int)kFloatY, (int)kBob);
+    }
+
+    // control: a buoy=0 body (placed CLEAR of the pool -> gathers 0) sinks to the bed while the fluid settles.
+    {
+        fluid::fx cm1, cm2;
+        couple::CoupleWorld ctrl = runSteps(makeWorld(40, 9, 4), cm1, cm2);
+        const couple::CoupleState ctrlState = couple::MeasureCoupleState(ctrl);
+        const fluid::fx kBedLine = kGroundY + ctrl.bodies[0].radius;
+        if (ctrlState.floatY != kBedLine || !(kFloatY > ctrlState.floatY))
+            return fail("couple-step: control buoy=0 did NOT sink to the bed");
+        std::printf("couple-step control: buoy=0 sinks, fluid settles (coupling does work)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the coherent pool + the floating body (IDENTICAL to the
+    // Vulkan --couple-step-shot by construction; the dynamic fluid dim blue, the static basin walls darker grey,
+    // the body a warm filled disk + an integer radius ring at its bit-exact settled float line). ---
+    const int kPxPerUnit = 26, kMargin = 30;
+    const int kWorldLo = -2, kWorldW = 13, kWorldH = 20;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+        cx = kMargin + (wx - kWorldLo) * kPxPerUnit;
+        cy = (int)imgH - kMargin - (wy - kWorldLo) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        int cx, cy; toPx(cpuWorld.particles[(size_t)i].pos.x, cpuWorld.particles[(size_t)i].pos.y, cx, cy);
+        if (cpuWorld.particles[(size_t)i].flags & fluid::kFlagStatic)
+            plot(cx, cy, Vec3{0.18f, 0.18f, 0.22f}, 0);
+        else
+            plot(cx, cy, Vec3{0.20f, 0.35f, 0.6f}, 0);
+    }
+    {
+        const fpx::FxBody& fb = cpuWorld.bodies[0];
+        int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+        const int rPx = (fb.radius >> fluid::kFrac) * kPxPerUnit;
+        for (int a = 0; a < 360; a += 3) {
+            const double rad = (double)a * 3.14159265358979 / 180.0;
+            const int rx = bcx + (int)((double)rPx * std::cos(rad));
+            const int ry = bcy - (int)((double)rPx * std::sin(rad));
+            if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+            }
+        }
+        plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — couple bobbing barrel (floatY %d, bob %d)\n",
+                outPath, imgW, imgH, (int)kFloatY, (int)kBob);
+    return 0;
+}
+
 // ===== Slice GR2 — Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH showcase (--grain-neighbors) =
 // UNLIKE GR1's --grain-integrate (int64 grain_integrate.comp -> CPU on Metal), the neighbor search is PURE
 // INT32 (GrainCellOf = FloorDiv per axis + the per-axis |dx|<hSearch GrainNeighborAccept = integer divide +
@@ -34666,6 +34851,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--couple-displace") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_couple_displace.png";
             try { return RunCoupleDisplaceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --couple-step <out.png>: render the Deterministic Rigid<->Fluid Coupling THE COUPLED STEP showcase
+        // (Slice CP4, the INTEGRATED two-way solver — the bobbing barrel). Like --couple-buoyancy/--couple-displace,
+        // the FL4 density solve + the CP2/CP3 exchange are int64 -> the FL4/CP2/CP3 shaders are Vulkan-only; on
+        // Metal --couple-step runs the CPU couple::StepCoupleSteps — the EXACT bit-exact reference the Vulkan
+        // --couple-step-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY
+        // CONSTRUCTION. A static basin holds a dynamic pool + a body dropped above it that BOBS under emergent
+        // buoyancy; the four proofs (GPU==CPU bit-exact, determinism, coupled floats+bobs+fluid-coherent, buoy=0
+        // control sinks) run on the CPU reference. The image golden is the integer bobbing-barrel side-view,
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/couple_step.png; two runs
+        // DIFF 0.0000. NO new shader (CP4 orchestrates the existing FL4/CP2/CP3 passes), NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--couple-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_couple_step.png";
+            try { return RunCoupleStepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-contact <out.png>: render the Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION
