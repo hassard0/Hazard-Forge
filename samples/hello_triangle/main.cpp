@@ -459,6 +459,7 @@ int main(int argc, char** argv) {
     const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
+    const char* coupleDisplaceShotPath = nullptr; // --couple-displace-shot <out.bmp> (Slice CP3, the FLUID REACTION / DISPLACEMENT body->fluid pass, the Newton's-3rd-law half of CP2; the 3rd slice of FLAGSHIP #11. A body submerged in a fluid pool pushes BACK on the fluid: each fluid particle inside the body is projected out to the body surface (the body DISPLACES the fluid — a cavity/wake) + receives the equal-opposite drag impulse. couple_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) runs ApplyBodyToFluid VERBATIM from couple.h; the GPU fluid array PROVEN BIT-EXACT vs the CPU couple.h::ApplyBodyToFluid (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) no-penetration penAfter<penBefore + displaced>0 (the fluid parted, the Jacobi single-projection caveat — relieved NOT zero); (4) a body clear of the fluid -> unchanged (no-op). Metal --couple-displace runs the CPU ApplyBodyToFluid. NO new RHI; CP1/CP2 couple code+shaders + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleBuoyancyShotPath = nullptr; // --couple-buoyancy-shot <out.bmp> (Slice CP2, the BUOYANCY + DRAG fluid->body pass, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange. A settled fluid pool (FL1 InitBlock) + an FxBody sphere dropped ABOVE it: each step re-runs the CP1 body->fluid query (couple_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then couple_buoyancy.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a buoyant impulse (∝ the gathered count = the displaced volume, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, enters the pool, buoyancy builds as it submerges, and it settles to an emergent float line. AccumBodyForces copied VERBATIM from engine/sim/couple.h. GPU body state PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) FLOATS — floatY > groundY+radius by a margin, bounded above (the honest emergent float line, NOT an exact Archimedes depth — the GR4/FL4 caveat); (4) buoy=0 control SINKS to the bed (floatY == groundY+radius), proving buoyancy does work. Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO fluid reaction (CP3), NO coupled step (CP4), NO lockstep (CP5), NO float render (CP6), NO buoyancy torque, NO new RHI; CP1's query passes + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
@@ -684,6 +685,17 @@ int main(int argc, char** argv) {
         // branch (C1061 avoidance), like the couple-query/grain-contact shots.
         if (std::strcmp(argv[i], "--couple-buoyancy-shot") == 0 && i + 1 < argc) {
             coupleBuoyancyShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CP3: --couple-displace-shot <out.bmp> — the Deterministic Rigid<->Fluid Coupling FLUID REACTION
+        // / DISPLACEMENT body->fluid pass (the Newton's-3rd-law half of CP2). A body submerged in a fluid pool
+        // -> couple_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) projects each particle
+        // inside the body out to the body surface (parts the fluid) + a drag reaction. GPU fluid array bit-exact
+        // vs the CPU couple.h::ApplyBodyToFluid (memcmp). int64 -> Vulkan-only; Metal --couple-displace runs the
+        // CPU ApplyBodyToFluid. NO new RHI. STANDALONE branch (C1061 avoidance, like the other couple shots).
+        if (std::strcmp(argv[i], "--couple-displace-shot") == 0 && i + 1 < argc) {
+            coupleDisplaceShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16241,6 +16253,250 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — couple buoyancy float line (floatY %d, bed %d)\n",
                                 coupleBuoyancyShotPath, imgW, imgH, (int)kGpuFloatY, (int)kBedLine);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleBuoyancyShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Fluid Coupling FLUID REACTION / DISPLACEMENT body->fluid pass
+        // (--couple-displace-shot <out.bmp>, Slice CP3, the Newton's-3rd-law HALF of CP2 — completes the two-way
+        // exchange). A dense fluid pool with a dynamic FxBody sphere SUBMERGED in it: couple_displace.comp (ONE
+        // thread per fluid particle, int64 -> Vulkan-only) projects each particle INSIDE the body OUT to the body
+        // surface (the body DISPLACES the fluid — a cavity/wake) + applies the equal-opposite drag-reaction
+        // velocity. ApplyBodyToFluid copied VERBATIM from couple.h. ReadBuffer reads the fluid array, PROVEN
+        // BIT-EXACT vs the CPU couple.h::ApplyBodyToFluid reference (memcmp, NO tol — the make-or-break). int64 ->
+        // Vulkan-only; Metal --couple-displace runs the CPU ApplyBodyToFluid. NO new RHI. STANDALONE branch (C1061).
+        if (coupleDisplaceShotPath) {
+            using math::Vec3;
+            namespace couple = hf::sim::couple;
+            namespace fluid  = hf::sim::fluid;
+            namespace fpx    = hf::sim::fpx;
+
+            // The scene: a wide-but-THIN unit-lattice STILL pool (11 x 11 in x,y; 3 layers deep in z) + a
+            // dynamic FxBody sphere SUBMERGED in the pool centre (5,5,1) radius 3, moving so the drag reaction is
+            // non-trivial. The body displaces the fluid around it -> a CAVITY/wake clearly visible in the (x,y)
+            // SIDE view (the thin z keeps out-of-plane particles from cluttering the projection). (One
+            // displacement pass — CP3 is the body->fluid pass in isolation; the coupled step is CP4.)
+            const fluid::fx kDt = fluid::kOne / 60;
+            const fluid::fx kH  = fluid::kOne;
+            const int kSideXY = 11;   // 11x11 in x,y
+            const int kDepthZ = 3;    // 3 layers deep (z in [0,2]) — 11*11*3 = 363 particles
+            const int kBodyZ  = 1;    // the body sits in the z-centre
+
+            std::vector<fluid::FluidParticle> particles;
+            for (int py = 0; py < kSideXY; ++py)
+                for (int pz = 0; pz < kDepthZ; ++pz)
+                    for (int px = 0; px < kSideXY; ++px) {
+                        fluid::FluidParticle p;
+                        p.pos = fluid::FxVec3{(fluid::fx)(px * (int)fluid::kOne), (fluid::fx)(py * (int)fluid::kOne),
+                                              (fluid::fx)(pz * (int)fluid::kOne)};
+                        p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0}; p.invMass = fluid::kOne; p.flags = 0;
+                        particles.push_back(p);
+                    }
+
+            auto makeWorld = [&]() {
+                couple::CoupleWorld w;
+                w.particles = particles;
+                w.kernel.h  = kH;
+                w.dt = kDt;
+                fpx::FxBody b;
+                b.pos = fpx::FxVec3{(fpx::fx)(5 * (int)fluid::kOne), (fpx::fx)(5 * (int)fluid::kOne),
+                                    (fpx::fx)(kBodyZ * (int)fluid::kOne)};
+                b.vel = fpx::FxVec3{(fpx::fx)(2 * (int)fluid::kOne), (fpx::fx)(1 * (int)fluid::kOne), 0};  // moving
+                b.invMass = fluid::kOne; b.flags = fpx::kFlagDynamic;
+                b.radius  = (fpx::fx)(3 * (int)fluid::kOne);
+                w.bodies = {b};
+                return w;
+            };
+            couple::CoupleWorld world = makeWorld();
+            const int kBodyCount = (int)world.bodies.size();
+            const int kParticleCount = (int)world.particles.size();
+
+            // === CPU reference: ApplyBodyToFluid (the GPU fluid array memcmp's against this). ===
+            couple::CoupleWorld cpuWorld = world;
+            couple::ApplyBodyToFluid(cpuWorld, kDt);
+
+            // std430 mirrors (match couple_displace.comp).
+            struct FluidParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            struct CoupleBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+            static_assert(sizeof(CoupleBodyGpu) == 36, "CoupleBodyGpu std430 layout");
+            struct CoupleDisplaceParams { int32_t cfg[4]; };
+            static_assert(sizeof(CoupleDisplaceParams) == 16, "CoupleDisplaceParams std430 layout");
+
+            auto makeBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // The bodies are READ-ONLY in CP3 (the fluid reacts to them) -> one shared body buffer.
+            std::vector<CoupleBodyGpu> bodyGpu((size_t)kBodyCount);
+            for (int i = 0; i < kBodyCount; ++i) {
+                const fpx::FxBody& b = world.bodies[(size_t)i];
+                bodyGpu[(size_t)i] = CoupleBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                                   b.invMass, b.flags, b.radius};
+            }
+            auto bodyBuf = makeBuf(bodyGpu.data(), bodyGpu.size() * sizeof(CoupleBodyGpu));
+
+            CoupleDisplaceParams dp{};
+            dp.cfg[0] = kParticleCount; dp.cfg[1] = kBodyCount; dp.cfg[2] = 1; dp.cfg[3] = kDt;
+            auto dpBuf = makeBuf(&dp, sizeof(dp));
+
+            auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/couple_displace.comp.hlsl.spv");
+            auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+            rhi::ComputePipelineDesc pd; pd.compute = cs.get(); pd.storageBufferCount = 3; pd.threadsPerGroupX = 64;
+            auto displacePipe = device->CreateComputePipeline(pd);
+            const uint32_t kPartGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+
+            // runGpu: upload a FRESH fluid buffer, dispatch couple_displace.comp once, read back.
+            auto runGpu = [&](std::vector<FluidParticleGpu>& out) {
+                std::vector<FluidParticleGpu> partGpu((size_t)kParticleCount);
+                for (int i = 0; i < kParticleCount; ++i) {
+                    const fluid::FluidParticle& p = world.particles[(size_t)i];
+                    partGpu[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                        p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+                }
+                auto partBuf = makeBuf(partGpu.data(), partGpu.size() * sizeof(FluidParticleGpu));
+
+                render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                g.AddPass("cp_displace", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BindComputePipeline(*displacePipe);
+                    cmd.BindStorageBuffer(*partBuf, 0); cmd.BindStorageBuffer(*bodyBuf, 1);
+                    cmd.BindStorageBuffer(*dpBuf, 2);
+                    cmd.DispatchCompute(kPartGroups); cmd.ComputeToVertexBarrier();
+                    cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                });
+                g.Execute(*device); device->WaitIdle();
+                out.assign((size_t)kParticleCount, FluidParticleGpu{});
+                device->ReadBuffer(*partBuf, out.data(), out.size() * sizeof(FluidParticleGpu), 0);
+            };
+
+            std::vector<FluidParticleGpu> gpuPart;
+            runGpu(gpuPart);
+
+            // PROOF (1) GPU==CPU BIT-EXACT (integer memcmp, NO tol — the make-or-break).
+            const uint32_t kDisplaced = couple::CountDisplaced(world);
+            bool exact = ((int)gpuPart.size() == kParticleCount);
+            for (int i = 0; exact && i < kParticleCount; ++i) {
+                const fluid::FluidParticle& c = cpuWorld.particles[(size_t)i];
+                FluidParticleGpu ref{c.pos.x, c.pos.y, c.pos.z, c.prev.x, c.prev.y, c.prev.z,
+                    c.vel.x, c.vel.y, c.vel.z, c.invMass, c.flags};
+                if (std::memcmp(&gpuPart[(size_t)i], &ref, sizeof(FluidParticleGpu)) != 0) exact = false;
+            }
+            if (!exact) {
+                std::fprintf(stderr, "FATAL: couple-displace GPU != CPU ApplyBodyToFluid (a float crept into the "
+                             "fixed-point displacement?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-displace: {bodies:%d, particles:%d, displaced:%u} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kParticleCount, kDisplaced);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical.
+            {
+                std::vector<FluidParticleGpu> gpu2;
+                runGpu(gpu2);
+                bool same = (gpu2.size() == gpuPart.size());
+                for (size_t i = 0; same && i < gpu2.size(); ++i)
+                    if (std::memcmp(&gpu2[i], &gpuPart[i], sizeof(FluidParticleGpu)) != 0) same = false;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: couple-displace two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-displace determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) displacement / no-penetration (the HONEST FL4/GR3 metric): the body PARTED the fluid —
+            // penAfter < penBefore (the summed particle-into-body penetration RELIEVED; Jacobi single-projection
+            // so the residual is deterministic-but-nonzero, NOT zero) AND displaced > 0 (the body did part it).
+            {
+                const couple::FluidPenetration before = couple::MeasureFluidPenetration(world);
+                const couple::FluidPenetration after  = couple::MeasureFluidPenetration(cpuWorld);
+                if (!(kDisplaced > 0u)) {
+                    std::fprintf(stderr, "FATAL: couple-displace displaced 0 particles (the body parted nothing)\n");
+                    device->WaitIdle(); return 1;
+                }
+                if (!(after.summed < before.summed)) {
+                    std::fprintf(stderr, "FATAL: couple-displace did NOT part the fluid (penAfter %lld >= penBefore "
+                                 "%lld)\n", (long long)after.summed, (long long)before.summed);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-displace no-penetration: {penBefore:%lld, penAfter:%lld} (fluid parted)\n",
+                            (long long)before.summed, (long long)after.summed);
+            }
+
+            // PROOF (4) no-op: a body CLEAR of the fluid (here zero dynamic bodies) -> the fluid is unchanged.
+            {
+                couple::CoupleWorld clearWorld = world;
+                clearWorld.bodies.clear();                       // zero bodies -> no displacement
+                std::vector<fluid::FluidParticle> before = clearWorld.particles;
+                couple::ApplyBodyToFluid(clearWorld, kDt);
+                bool unchanged = true;
+                for (size_t i = 0; i < before.size(); ++i)
+                    if (std::memcmp(&before[i], &clearWorld.particles[i], sizeof(fluid::FluidParticle)) != 0)
+                        unchanged = false;
+                if (!unchanged) {
+                    std::fprintf(stderr, "FATAL: couple-displace clear (zero bodies) changed the fluid\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-displace clear: fluid unchanged (no-op)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER side-view (x,y) of the DISPLACED pool + the body. Project each fluid
+            // particle's integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel (dim blue) from the bit-exact CPU
+            // reference (GPU==CPU proven above) -> the CAVITY/wake where the body parted the fluid is visible; the
+            // body drawn as a warm filled disk + an integer radius ring. CPU-colored from the bit-exact state ->
+            // identical both backends by construction (the strict zero-differing-pixel bar). ---
+            const int kPxPerUnit = 26, kImgMargin = 24;
+            const int kWorldW = 11, kWorldH = 11;
+            const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+                cx = kImgMargin + wx * kPxPerUnit;
+                cy = (int)imgH - kImgMargin - wy * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // The displaced pool (dim blue water) — the cavity around the body is where NO particle plots.
+            for (int i = 0; i < kParticleCount; ++i) {
+                int cx, cy; toPx(cpuWorld.particles[(size_t)i].pos.x, cpuWorld.particles[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.20f, 0.35f, 0.6f}, 0);
+            }
+            // The submerged body: a warm filled disk + an integer radius ring (the parting source).
+            {
+                const fpx::FxBody& fb = world.bodies[0];
+                int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+                const int rPx = (fb.radius >> fluid::kFrac) * kPxPerUnit;
+                for (int a = 0; a < 360; a += 3) {
+                    const double rad = (double)a * 3.14159265358979 / 180.0;
+                    const int rx = bcx + (int)((double)rPx * std::cos(rad));
+                    const int ry = bcy - (int)((double)rPx * std::sin(rad));
+                    if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                        uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                        dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+                    }
+                }
+                plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);   // the body centre, a warm disk
+            }
+            bool ok = WriteBMP(coupleDisplaceShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — couple displacement cavity (displaced %u particles)\n",
+                                coupleDisplaceShotPath, imgW, imgH, kDisplaced);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleDisplaceShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

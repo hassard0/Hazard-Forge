@@ -19149,6 +19149,155 @@ static int RunCoupleBuoyancyShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CP3 — Deterministic Rigid<->Fluid Coupling FLUID REACTION / DISPLACEMENT showcase (--couple-displace)
+// (the Newton's-3rd-law HALF of CP2 — completes the two-way exchange). Like --couple-buoyancy / --grain-contact,
+// the CP3 displacement math is int64 (FxLength/FxNormalize via FxISqrt + the drag-reaction fxmul) -> glslc can't
+// parse int64 -> couple_displace.comp is VULKAN-SPIR-V-ONLY (NOT in this dir's hf_gen_msl list); on Metal the
+// --couple-displace showcase runs the CPU couple::ApplyBodyToFluid — the EXACT bit-exact reference the Vulkan
+// --couple-displace-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION (the couple_buoyancy.comp/grain_collide.comp convention). So this builds the SAME scene (a dense
+// 11x11x11 = 1331-particle unit-lattice pool + a dynamic FxBody sphere radius 3 SUBMERGED in the pool centre,
+// moving; dt=kOne/60), runs ApplyBodyToFluid ONCE (the body parts the fluid around it), and CPU-colors the SAME
+// integer side-view cavity golden as the Vulkan --couple-displace-shot -> bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). New golden tests/golden/metal/couple_displace.png (baked on
+// the Mac by the CONTROLLER); two runs DIFF 0.0000. NO new RHI.
+static int RunCoupleDisplaceShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace couple = hf::sim::couple;
+    namespace fluid  = hf::sim::fluid;
+    namespace fpx    = hf::sim::fpx;
+
+    // The scene (== the Vulkan --couple-displace-shot config).
+    const fluid::fx kDt = fluid::kOne / 60;
+    const fluid::fx kH  = fluid::kOne;
+    const int kSideXY = 11;   // 11x11 in x,y
+    const int kDepthZ = 3;    // 3 layers deep (z in [0,2]) — 11*11*3 = 363 particles
+    const int kBodyZ  = 1;    // the body sits in the z-centre
+
+    std::vector<fluid::FluidParticle> particles;
+    for (int py = 0; py < kSideXY; ++py)
+        for (int pz = 0; pz < kDepthZ; ++pz)
+            for (int px = 0; px < kSideXY; ++px) {
+                fluid::FluidParticle p;
+                p.pos = fluid::FxVec3{(fluid::fx)(px * (int)fluid::kOne), (fluid::fx)(py * (int)fluid::kOne),
+                                      (fluid::fx)(pz * (int)fluid::kOne)};
+                p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0}; p.invMass = fluid::kOne; p.flags = 0;
+                particles.push_back(p);
+            }
+
+    couple::CoupleWorld world;
+    world.particles = particles;
+    world.kernel.h  = kH;
+    world.dt = kDt;
+    {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(5 * (int)fluid::kOne), (fpx::fx)(5 * (int)fluid::kOne),
+                            (fpx::fx)(kBodyZ * (int)fluid::kOne)};
+        b.vel = fpx::FxVec3{(fpx::fx)(2 * (int)fluid::kOne), (fpx::fx)(1 * (int)fluid::kOne), 0};
+        b.invMass = fluid::kOne; b.flags = fpx::kFlagDynamic;
+        b.radius  = (fpx::fx)(3 * (int)fluid::kOne);
+        world.bodies = {b};
+    }
+    const int kBodyCount = (int)world.bodies.size();
+    const int kParticleCount = (int)world.particles.size();
+
+    // CPU ApplyBodyToFluid (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the Metal
+    // result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    const couple::FluidPenetration before = couple::MeasureFluidPenetration(world);
+    const uint32_t kDisplaced = couple::CountDisplaced(world);
+    couple::CoupleWorld cpuWorld = world;
+    couple::ApplyBodyToFluid(cpuWorld, kDt);
+
+    std::printf("couple-displace: {bodies:%d, particles:%d, displaced:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU couple::ApplyBodyToFluid, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kParticleCount, kDisplaced);
+
+    // determinism.
+    {
+        couple::CoupleWorld b = world;
+        couple::ApplyBodyToFluid(b, kDt);
+        bool same = (b.particles.size() == cpuWorld.particles.size());
+        for (size_t i = 0; same && i < b.particles.size(); ++i)
+            if (std::memcmp(&b.particles[i], &cpuWorld.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        if (!same) return fail("couple-displace: two runs differ (nondeterministic)");
+        std::printf("couple-displace determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // displacement / no-penetration (the HONEST FL4/GR3 metric): penAfter < penBefore + displaced > 0.
+    {
+        const couple::FluidPenetration after = couple::MeasureFluidPenetration(cpuWorld);
+        if (!(kDisplaced > 0u)) return fail("couple-displace: displaced 0 particles (parted nothing)");
+        if (!(after.summed < before.summed)) return fail("couple-displace: did NOT part the fluid");
+        std::printf("couple-displace no-penetration: {penBefore:%lld, penAfter:%lld} (fluid parted)\n",
+                    (long long)before.summed, (long long)after.summed);
+    }
+
+    // no-op: zero bodies -> the fluid is unchanged.
+    {
+        couple::CoupleWorld clearWorld = world;
+        clearWorld.bodies.clear();
+        std::vector<fluid::FluidParticle> b4 = clearWorld.particles;
+        couple::ApplyBodyToFluid(clearWorld, kDt);
+        bool unchanged = true;
+        for (size_t i = 0; i < b4.size(); ++i)
+            if (std::memcmp(&b4[i], &clearWorld.particles[i], sizeof(fluid::FluidParticle)) != 0) unchanged = false;
+        if (!unchanged) return fail("couple-displace: clear (zero bodies) changed the fluid");
+        std::printf("couple-displace clear: fluid unchanged (no-op)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the displaced pool + the body (IDENTICAL to the Vulkan
+    // --couple-displace-shot by construction; dim-blue water with a CAVITY around the body + a warm body disk +
+    // an integer radius ring). ---
+    const int kPxPerUnit = 26, kMargin = 24;
+    const int kWorldW = 11, kWorldH = 11;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+        cx = kMargin + wx * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        int cx, cy; toPx(cpuWorld.particles[(size_t)i].pos.x, cpuWorld.particles[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.20f, 0.35f, 0.6f}, 0);
+    }
+    {
+        const fpx::FxBody& fb = world.bodies[0];
+        int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+        const int rPx = (fb.radius >> fluid::kFrac) * kPxPerUnit;
+        for (int a = 0; a < 360; a += 3) {
+            const double rad = (double)a * 3.14159265358979 / 180.0;
+            const int rx = bcx + (int)((double)rPx * std::cos(rad));
+            const int ry = bcy - (int)((double)rPx * std::sin(rad));
+            if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+            }
+        }
+        plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — couple displacement cavity (displaced %u particles)\n",
+                outPath, imgW, imgH, kDisplaced);
+    return 0;
+}
+
 // ===== Slice GR2 — Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH showcase (--grain-neighbors) =
 // UNLIKE GR1's --grain-integrate (int64 grain_integrate.comp -> CPU on Metal), the neighbor search is PURE
 // INT32 (GrainCellOf = FloorDiv per axis + the per-axis |dx|<hSearch GrainNeighborAccept = integer divide +
@@ -34503,6 +34652,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--couple-buoyancy") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_couple_buoyancy.png";
             try { return RunCoupleBuoyancyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --couple-displace <out.png>: render the Deterministic Rigid<->Fluid Coupling FLUID REACTION /
+        // DISPLACEMENT body->fluid showcase (Slice CP3, the Newton's-3rd-law half of CP2). Like --couple-buoyancy,
+        // the CP3 displacement math is int64 -> couple_displace.comp is Vulkan-only; on Metal --couple-displace
+        // runs the CPU couple::ApplyBodyToFluid — the EXACT bit-exact reference the Vulkan --couple-displace-shot
+        // GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. The SAME
+        // dense pool + a SUBMERGED moving FxBody sphere parts the fluid around it; the four proofs (GPU==CPU
+        // bit-exact, determinism, penAfter<penBefore + displaced>0, zero-body no-op) run on the CPU reference. The
+        // image golden is the integer cavity side-view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/couple_displace.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--couple-displace") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_couple_displace.png";
+            try { return RunCoupleDisplaceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-contact <out.png>: render the Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION

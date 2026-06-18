@@ -334,5 +334,113 @@ inline fx MeasureFloatLine(const CoupleWorld& world) {
     return n == 0u ? 0 : (fx)(sum / (int64_t)n);
 }
 
+// ===== Slice CP3 — FLUID REACTION / DISPLACEMENT (body->fluid, Newton's 3rd law to CP2) ==============
+// The Newton's-3rd-law HALF of CP2: the body now pushes BACK on the fluid. Each fluid particle INSIDE a
+// dynamic body is (1) projected OUT to the body surface — the body DISPLACES the fluid (a parting / wake /
+// cavity where the body is) — and (2) receives the equal-opposite DRAG impulse — the body imparts its
+// momentum to the surrounding fluid. Completes the two-way exchange (CP2 fluid->body, CP3 body->fluid).
+//
+// THE MIRROR OF CP2 (the per-PARTICLE-over-the-body-set shape): CP2's body-force reduction was per-BODY
+// (over its gathered particles). CP3's fluid displacement is the mirror — ONE thread per FLUID PARTICLE,
+// each particle iterates the tiny body list (fixed order), and for each body that CONTAINS it accumulates
+// the surface-snap push into a SEPARATE dp[] (JACOBI) + applies the drag-reaction velocity impulse. Each
+// particle writes ONLY its own dp/vel -> per-particle-disjoint, race-free, NO atomics, [numthreads(64,1,1)]
+// MULTI-THREAD, NO TDR (the FL4/GR3 win). This is the EXACT shape of GR3 grain.h::CollideGrainSpheres
+// (which iterates per-particle per-sphere), with fpx::FxBody as the sphere (project the fluid POINT to
+// b.radius) + the drag-reaction term + the Jacobi dp[] double-buffer.
+//
+// int64 (FxLength/FxNormalize/fxmul) -> couple_displace.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64;
+// glslc cannot) + the Metal --couple-displace showcase runs THIS CPU ApplyBodyToFluid (byte-identical by
+// construction, the CP2/GR3/FL4 split). The CP1 query passes stay int32 MSL-native.
+
+using fpx::FxLength;       // read-only: the int64 length (FxISqrt of the sum of squares)
+using fpx::FxNormalize;    // read-only: the int64 normalize (+Y fallback on length 0)
+using fpx::fxmul;          // read-only: the int64-intermediate Q16.16 multiply
+
+// kDragReaction: the body->fluid drag-reaction coefficient (the CP2 kDrag partner — the equal-opposite of
+// the body's CP2 drag, now imparting the body's momentum to the fluid). Host-snapped Q16.16 (~1.5, matching
+// kDrag's firm linear damping). The showcase + the CPU reference + the GPU shader share THIS exact constant.
+inline constexpr fx kDragReaction = (fx)(1.5 * (double)kOne + 0.5);   // 98304 (Q16.16, ~1.5 reaction drag)
+
+// ApplyBodyToFluid(world): the per-fluid-particle projection-out-of-body + drag reaction (the GR3
+// CollideGrainSpheres mold over the body set + a Jacobi dp[]). For each fluid particle p (skip STATIC),
+// over each DYNAMIC body b (fixed order), with d = p.pos − b.pos, dist = FxLength(d): if dist < b.radius
+// (the particle is INSIDE the body) accumulate the surface-snap push into a SEPARATE dp[] buffer
+//   dp_p += FxAdd(b.pos, FxScale(FxNormalize(d), b.radius)) − p.pos    // snap to the body surface
+// (dist==0 -> the FxNormalize +Y fallback) AND apply the drag-reaction velocity impulse per axis
+//   p.vel += fxmul(kDragReaction, (b.vel − p.vel)) · dt                // toward the body velocity
+// then apply p.pos += dp_p for ALL particles after (JACOBI — each particle reads the iteration-start body
+// state, NOT the in-progress positions). STATIC particles (kFlagStatic / boundary) -> dp 0, vel untouched.
+// Non-dynamic bodies are SKIPPED (they hold; CP3 is the dynamic-body reaction). int64 (FxLength/FxNormalize/
+// fxmul). couple_displace.comp copies THIS body VERBATIM (one thread per fluid particle). Deterministic
+// (the fixed body order, fixed op order) -> bit-identical to the GPU memcmp + two-run byte-identical.
+inline void ApplyBodyToFluid(CoupleWorld& world, fx dt) {
+    const size_t n = world.particles.size();
+    const size_t bodyCount = world.bodies.size();
+    std::vector<FxVec3> dp((size_t)n, FxVec3{0, 0, 0});   // the Jacobi double-buffer (per-particle Δp)
+    for (size_t i = 0; i < n; ++i) {
+        fluid::FluidParticle& p = world.particles[i];
+        if (p.flags & fluid::kFlagStatic) continue;       // boundary particle -> dp 0, vel untouched
+        FxVec3 accum{0, 0, 0};
+        for (size_t bi = 0; bi < bodyCount; ++bi) {
+            const fpx::FxBody& b = world.bodies[bi];
+            if (!(b.flags & fpx::kFlagDynamic)) continue; // non-dynamic body -> holds (the pinned case)
+            const FxVec3 d = FxSub(p.pos, b.pos);         // particle relative to the body centre
+            const fx dist = FxLength(d);
+            if (dist >= b.radius) continue;               // outside the body sphere -> no displacement
+            // (1) POSITIONAL DISPLACEMENT: snap the particle to the body surface (the body parts the fluid).
+            const FxVec3 nrm = FxNormalize(d);            // outward normal (dist==0 -> {0,kOne,0} fallback)
+            const FxVec3 surf = FxAdd(b.pos, FxScale(nrm, b.radius));   // the surface point along the normal
+            accum = FxAdd(accum, FxSub(surf, p.pos));     // into the Jacobi dp[] (the CollideParticleSphere push)
+            // (2) DRAG REACTION: the body imparts momentum to the fluid (the equal-opposite of CP2's drag).
+            const FxVec3 dv = FxSub(b.vel, p.vel);        // toward the body velocity
+            p.vel.x += fxmul(fxmul(kDragReaction, dv.x), dt);
+            p.vel.y += fxmul(fxmul(kDragReaction, dv.y), dt);
+            p.vel.z += fxmul(fxmul(kDragReaction, dv.z), dt);
+        }
+        dp[i] = accum;
+    }
+    // Apply pos += dp for all particles (Jacobi — disjoint per-particle writes, race-free).
+    for (size_t i = 0; i < n; ++i) {
+        if (world.particles[i].flags & fluid::kFlagStatic) continue;
+        world.particles[i].pos = FxAdd(world.particles[i].pos, dp[i]);
+    }
+}
+
+// MeasureFluidPenetration(world): the honest no-penetration metric (the FL4/GR3 caveat) — over every fluid
+// particle / dynamic body pair, sum/max the particle-into-body penetration pen = b.radius − |p.pos − b.pos|
+// > 0. Returns {peak, summed} in Q16.16 (int64 accumulator). DETERMINISTIC + bit-exact. The showcase's
+// "fluid parted" proof compares this BEFORE vs AFTER ApplyBodyToFluid (penAfter < penBefore — the FL4/GR3
+// honesty: relieved, NOT zero; Jacobi single-projection so a particle inside MULTIPLE bodies leaves a
+// deterministic-but-nonzero residual). Static particles are counted (they CAN sit inside a body; CP3 does
+// not move them, so their penetration is part of the honest residual). Non-dynamic bodies skipped.
+struct FluidPenetration { int64_t peak = 0; int64_t summed = 0; };
+inline FluidPenetration MeasureFluidPenetration(const CoupleWorld& world) {
+    FluidPenetration out;
+    for (const fluid::FluidParticle& p : world.particles)
+        for (const fpx::FxBody& b : world.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            const fx pen = b.radius - FxLength(FxSub(p.pos, b.pos));
+            if (pen > 0) { out.summed += (int64_t)pen; if ((int64_t)pen > out.peak) out.peak = (int64_t)pen; }
+        }
+    return out;
+}
+
+// CountDisplaced(world): the deterministic count of fluid particles INSIDE at least one dynamic body
+// (dist < b.radius) — the "displaced > 0" coverage stat for the showcase proof. Static particles ARE
+// counted (they sit inside the body too). Pure int64 compare -> bit-exact CPU<->GPU.
+inline uint32_t CountDisplaced(const CoupleWorld& world) {
+    uint32_t c = 0;
+    for (const fluid::FluidParticle& p : world.particles) {
+        bool inside = false;
+        for (const fpx::FxBody& b : world.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            if (FxLength(FxSub(p.pos, b.pos)) < b.radius) { inside = true; break; }
+        }
+        if (inside) ++c;
+    }
+    return c;
+}
+
 }  // namespace couple
 }  // namespace hf::sim

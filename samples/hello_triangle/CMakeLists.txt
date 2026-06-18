@@ -564,6 +564,23 @@ hf_compile_shaders(
     # StepCoupleBuoyancySteps (memcmp — the make-or-break). NO new RHI; CP1's couple_body_{count,scan,emit}
     # shaders + their goldens UNCHANGED (CP2 is additive; the CP1 query passes stay int32 MSL-native).
     "shaders/couple_buoyancy.comp.hlsl:cs"
+    # Deterministic Rigid<->Fluid Coupling Slice 3 (Slice CP3, the FLUID REACTION / DISPLACEMENT body->fluid
+    # pass — the Newton's-3rd-law HALF of CP2, the 3rd slice of FLAGSHIP #11). ONE new int64 shader:
+    # couple_displace.comp — ONE THREAD PER FLUID PARTICLE (multi-thread OVER particles, the mirror of CP2's
+    # per-body dispatch), each thread serially iterates the TINY body list (fixed order) and for each DYNAMIC
+    # body that CONTAINS it (dist < b.radius) accumulates the surface-snap push into a LOCAL Jacobi accumulator
+    # (reads the iteration-start body state read-only, writes ONLY its own particle -> per-particle disjoint,
+    # NO atomics, NO TDR) + applies the equal-opposite DRAG-REACTION velocity impulse, then writes pos += accum
+    # + the updated vel; ApplyBodyToFluid copied VERBATIM from engine/sim/couple.h (the body parts the fluid +
+    # drags it along — a cavity/wake). The Vulkan --couple-displace-shot does the GPU pass then memcmp's the
+    # fluid array vs the CPU couple.h::ApplyBodyToFluid reference (the make-or-break). Because the FxLength/
+    # FxNormalize (FxISqrt) + the drag-reaction fxmul use int64, couple_displace.comp is VULKAN-SPIR-V-ONLY (DXC
+    # compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --couple-displace showcase
+    # runs the CPU couple::ApplyBodyToFluid (byte-identical by construction, the couple_buoyancy.comp/
+    # grain_collide.comp convention) — the Vulkan side carries the GPU==CPU proof. NO new RHI; CP1's couple_body_
+    # {count,scan,emit} + CP2's couple_buoyancy shaders + their goldens UNCHANGED (CP3 is additive; the CP1
+    # query passes stay int32 MSL-native).
+    "shaders/couple_displace.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 3 (Slice GR3, the FRICTIONLESS CONTACT PROJECTION of FLAGSHIP
     # #10, the FL4 fluid_dp/fluid_apply/fluid_collide twin): the JACOBI contact solve. The K-step JACOBI loop
     # is HOST-driven (predict[GR1] -> GR2 neighbour passes[host-rebuilt from the predicted positions] ->

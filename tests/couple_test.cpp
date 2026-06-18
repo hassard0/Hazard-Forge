@@ -407,6 +407,186 @@ int main() {
               "buoyancy is body-order-independent (each body's reduction is independent)");
     }
 
+    // ============================================================================================
+    // ============ Slice CP3 — FLUID REACTION / DISPLACEMENT (body->fluid) tests ==================
+    // ============================================================================================
+    using couple::FxLength;
+    using couple::FxNormalize;
+
+    // ---- ApplyBodyToFluid: a particle INSIDE a body is SNAPPED to the body surface (|p−b.pos| == radius
+    //      within an LSB) + gets a drag-reaction velocity toward the body. ----
+    {
+        couple::CoupleWorld world;
+        world.gravity = kGravityDown;
+        world.dt      = kDt;
+        world.bodies  = {BodyAt(0, 0, 0, 2)};            // dynamic, radius 2, at origin
+        world.bodies[0].vel = fpx::FxVec3{3 * (int)kOne, 0, 0};   // the body moves +x at 3.0
+        // One fluid particle deep INSIDE the body (at (1,0,0), dist 1 < radius 2).
+        world.particles = {ParticleAt(1, 0, 0)};
+
+        couple::ApplyBodyToFluid(world, kDt);
+
+        // The particle is snapped to the body surface: |p − b.pos| == radius within an LSB (FxNormalize +
+        // FxScale truncate toward zero, so the snapped length lands a few LSBs short of radius).
+        const fpx::FxVec3 d = fpx::FxSub(world.particles[0].pos, world.bodies[0].pos);
+        const fx dist = FxLength(d);
+        const fx radius = world.bodies[0].radius;
+        check(dist <= radius && dist > radius - 64,
+              "ApplyBodyToFluid: an inside particle is snapped to the body surface (|p−b.pos| ~ radius)");
+        // The particle was pushed in +x (it was at +x of the centre -> outward normal +x).
+        check(world.particles[0].pos.x > FromInt(1), "ApplyBodyToFluid: the particle is displaced OUTWARD");
+        // The drag reaction pulls the particle's velocity TOWARD the body's +x velocity (vel.x > 0).
+        check(world.particles[0].vel.x > 0,
+              "ApplyBodyToFluid: drag reaction drags the fluid toward the body velocity (+x)");
+    }
+
+    // ---- ApplyBodyToFluid: a particle OUTSIDE the body is UNTOUCHED (no push, no drag). ----
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        world.bodies = {BodyAt(0, 0, 0, 2)};
+        world.particles = {ParticleAt(10, 0, 0)};        // dist 10 >> radius 2 -> outside
+        const fpx::FxVec3 posBefore = world.particles[0].pos;
+        const fpx::FxVec3 velBefore = world.particles[0].vel;
+        couple::ApplyBodyToFluid(world, kDt);
+        check(world.particles[0].pos.x == posBefore.x && world.particles[0].pos.y == posBefore.y &&
+              world.particles[0].pos.z == posBefore.z, "ApplyBodyToFluid: an outside particle is UNTOUCHED (pos)");
+        check(world.particles[0].vel.x == velBefore.x && world.particles[0].vel.y == velBefore.y &&
+              world.particles[0].vel.z == velBefore.z, "ApplyBodyToFluid: an outside particle is UNTOUCHED (vel)");
+    }
+
+    // ---- ApplyBodyToFluid: a STATIC (boundary) particle inside a body is UNTOUCHED (dp 0, vel untouched). ----
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        world.bodies = {BodyAt(0, 0, 0, 2)};
+        world.bodies[0].vel = fpx::FxVec3{3 * (int)kOne, 0, 0};
+        fluid::FluidParticle sp = ParticleAt(1, 0, 0);   // INSIDE the body
+        sp.flags = fluid::kFlagStatic;                   // but a fixed boundary
+        world.particles = {sp};
+        const fpx::FxVec3 posBefore = world.particles[0].pos;
+        const fpx::FxVec3 velBefore = world.particles[0].vel;
+        couple::ApplyBodyToFluid(world, kDt);
+        check(world.particles[0].pos.x == posBefore.x && world.particles[0].pos.y == posBefore.y &&
+              world.particles[0].pos.z == posBefore.z, "ApplyBodyToFluid: a STATIC particle is UNTOUCHED (pos)");
+        check(world.particles[0].vel.x == velBefore.x && world.particles[0].vel.y == velBefore.y &&
+              world.particles[0].vel.z == velBefore.z, "ApplyBodyToFluid: a STATIC particle is UNTOUCHED (vel)");
+    }
+
+    // ---- ApplyBodyToFluid: a non-dynamic body does NOT displace (it holds). ----
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        fpx::FxBody stat = BodyAt(0, 0, 0, 2);
+        stat.flags = 0; stat.invMass = 0;                // NOT dynamic
+        world.bodies = {stat};
+        world.particles = {ParticleAt(1, 0, 0)};         // inside the (non-dynamic) body
+        const fpx::FxVec3 posBefore = world.particles[0].pos;
+        couple::ApplyBodyToFluid(world, kDt);
+        check(world.particles[0].pos.x == posBefore.x,
+              "ApplyBodyToFluid: a non-dynamic body does NOT displace the fluid (it holds)");
+    }
+
+    // ---- ApplyBodyToFluid: TWO bodies, fixed order — a particle inside body 0 only, projected to body 0's
+    //      surface; a particle inside body 1 only, projected to body 1's surface (the fixed-order projection). --
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        // Two bodies well separated so no particle is inside both (the single-projection case is exact).
+        world.bodies = {BodyAt(0, 0, 0, 2), BodyAt(20, 0, 0, 2)};
+        world.particles = {ParticleAt(1, 0, 0), ParticleAt(21, 0, 0)};   // p0 in body0, p1 in body1
+        couple::ApplyBodyToFluid(world, kDt);
+        const fx r = world.bodies[0].radius;
+        const fx d0 = FxLength(fpx::FxSub(world.particles[0].pos, world.bodies[0].pos));
+        const fx d1 = FxLength(fpx::FxSub(world.particles[1].pos, world.bodies[1].pos));
+        check(d0 <= r && d0 > r - 64, "ApplyBodyToFluid two bodies: p0 snapped to body 0's surface");
+        check(d1 <= r && d1 > r - 64, "ApplyBodyToFluid two bodies: p1 snapped to body 1's surface");
+    }
+
+    // ---- ApplyBodyToFluid: dist==0 (a particle exactly at the body centre) -> the +Y FxNormalize fallback
+    //      (deterministic) snaps it to (b.pos + (0,radius,0)). ----
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        world.bodies = {BodyAt(5, 5, 5, 2)};
+        world.particles = {ParticleAt(5, 5, 5)};         // exactly at the centre -> dist 0
+        couple::ApplyBodyToFluid(world, kDt);
+        // +Y fallback: snapped to (5, 5+radius, 5) within an LSB.
+        const fx r = world.bodies[0].radius;
+        check(world.particles[0].pos.x == FromInt(5) && world.particles[0].pos.z == FromInt(5),
+              "ApplyBodyToFluid dist==0: the +Y fallback keeps x,z at the centre");
+        check(world.particles[0].pos.y > FromInt(5) + r - 64 && world.particles[0].pos.y <= FromInt(5) + r,
+              "ApplyBodyToFluid dist==0: snapped to b.pos + (0, radius, 0) (the +Y fallback)");
+    }
+
+    // ---- MeasureFluidPenetration on a KNOWN overlap: penetration > 0; AND ApplyBodyToFluid RELIEVES it
+    //      (penAfter < penBefore — the fluid is parted). ----
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        world.bodies = {BodyAt(0, 0, 0, 3)};             // radius 3
+        // A small lattice of particles, several inside the body's sphere.
+        for (int x = -2; x <= 2; ++x)
+            for (int y = -2; y <= 2; ++y)
+                world.particles.push_back(ParticleAt(x, y, 0));
+
+        const couple::FluidPenetration before = couple::MeasureFluidPenetration(world);
+        check(before.summed > 0 && before.peak > 0, "MeasureFluidPenetration: a known overlap -> penetration > 0");
+        const uint32_t displaced = couple::CountDisplaced(world);
+        check(displaced > 0, "CountDisplaced: the body contains fluid particles (displaced > 0)");
+
+        couple::ApplyBodyToFluid(world, kDt);
+        const couple::FluidPenetration after = couple::MeasureFluidPenetration(world);
+        check(after.summed < before.summed,
+              "ApplyBodyToFluid: the fluid is parted (summed penetration RELIEVED, penAfter < penBefore)");
+    }
+
+    // ---- determinism: two ApplyBodyToFluid runs over the SAME world -> byte-identical particles. ----
+    {
+        auto build = [&]() -> couple::CoupleWorld {
+            couple::CoupleWorld w;
+            w.dt = kDt;
+            w.bodies = {BodyAt(0, 0, 0, 3)};
+            w.bodies[0].vel = fpx::FxVec3{2 * (int)kOne, (int)kOne, 0};
+            for (int x = -2; x <= 2; ++x)
+                for (int y = -2; y <= 2; ++y)
+                    w.particles.push_back(ParticleAt(x, y, 0));
+            return w;
+        };
+        couple::CoupleWorld a = build(), b = build();
+        couple::ApplyBodyToFluid(a, kDt);
+        couple::ApplyBodyToFluid(b, kDt);
+        bool same = (a.particles.size() == b.particles.size());
+        for (size_t i = 0; same && i < a.particles.size(); ++i)
+            if (std::memcmp(&a.particles[i], &b.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "ApplyBodyToFluid is deterministic (two runs byte-identical)");
+    }
+
+    // ---- no-op: a body CLEAR of the fluid (and zero bodies) -> the fluid is unchanged. ----
+    {
+        couple::CoupleWorld world;
+        world.dt     = kDt;
+        world.bodies = {BodyAt(100, 100, 100, 2)};       // far from the pool
+        for (int x = 0; x <= 3; ++x) world.particles.push_back(ParticleAt(x, 0, 0));
+        std::vector<fluid::FluidParticle> before = world.particles;
+        couple::ApplyBodyToFluid(world, kDt);
+        bool unchanged = true;
+        for (size_t i = 0; i < before.size(); ++i)
+            if (std::memcmp(&before[i], &world.particles[i], sizeof(fluid::FluidParticle)) != 0) unchanged = false;
+        check(unchanged, "ApplyBodyToFluid: a body clear of the fluid -> the fluid is UNCHANGED (no-op)");
+
+        // Zero bodies -> also a no-op.
+        couple::CoupleWorld nobody;
+        nobody.dt = kDt;
+        for (int x = 0; x <= 3; ++x) nobody.particles.push_back(ParticleAt(x, 0, 0));
+        std::vector<fluid::FluidParticle> nb = nobody.particles;
+        couple::ApplyBodyToFluid(nobody, kDt);
+        bool nbUnchanged = true;
+        for (size_t i = 0; i < nb.size(); ++i)
+            if (std::memcmp(&nb[i], &nobody.particles[i], sizeof(fluid::FluidParticle)) != 0) nbUnchanged = false;
+        check(nbUnchanged, "ApplyBodyToFluid: zero bodies -> the fluid is UNCHANGED (no-op)");
+    }
+
     if (g_fail == 0) std::printf("couple_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
