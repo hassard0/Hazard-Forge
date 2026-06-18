@@ -473,6 +473,7 @@ int main(int argc, char** argv) {
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
+    const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* fluidLockstepShotPath = nullptr; // --fluid-lockstep-shot <out.bmp> (Slice FL5: Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #9 — PURE-CPU harness over the FL1-FL4 fluid (the FPX5/CL5 twin): a dam-break fluid block fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-fluid-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* fluidRenderShotPath = nullptr;   // --fluid-render-shot <out.bmp> (Slice FL6: Deterministic GPU Fluid LIT 3D RENDER capstone, COMPLETES FLAGSHIP #9 — the FL4 dam-break sim (an 8x8x8 block poured over a static FxBody sphere, host-side StepFluid, the FL1-FL5 sim bit-exact) -> fluid.h::FluidToRenderInstances (one per-instance model matrix per particle, the ONE host float divide pos/(float)kOne + droplet-radius scale) -> rendered as lit 3D INSTANCED SPHERES (one per fluid particle) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fpx-render-shot; NO new shader/RHI). FLOAT visresolve bar (the FPX6/CL6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the FL1-FL5 bit-exact integer fluid (provenance exact))
     const char* grainRenderShotPath = nullptr;   // --grain-render-shot <out.bmp> (Slice GR6: Deterministic GPU Granular/Sand LIT 3D RENDER capstone, COMPLETES FLAGSHIP #10 — the GR4 friction sim (a staggered grain column dropped onto FLAT ground, host-side StepGrainFriction, the GR1-GR5 sim bit-exact) settled into an angle-of-repose CONE -> grain.h::GrainToRenderInstances (one per-instance model matrix per grain, the ONE host float divide pos/(float)kOne + grain-radius scale) -> rendered as lit 3D INSTANCED SPHERES (one per grain) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fluid-render-shot/--fpx-render-shot; NO new shader/RHI). FLOAT visresolve bar (the FPX6/FL6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the GR1-GR5 bit-exact integer granular sim (provenance exact))
@@ -709,6 +710,18 @@ int main(int argc, char** argv) {
         // Metal --couple-step runs the CPU StepCoupleSteps. NO new RHI. STANDALONE branch (C1061 avoidance).
         if (std::strcmp(argv[i], "--couple-step-shot") == 0 && i + 1 < argc) {
             coupleStepShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CP5: --couple-lockstep-shot <out.bmp> — the Deterministic Rigid<->Fluid Coupling LOCKSTEP +
+        // ROLLBACK proof (the multi-body netcode HEADLINE of FLAGSHIP #11, the FL5/GR5 twin). PURE CPU: runs
+        // the couple.h lockstep/rollback harness (RunCoupleLockstep authority + replica, RunCoupleRollback)
+        // over the CP4 coupled scene + a scripted command stream that SHOVES the body, asserts authority==
+        // replica + rollback-corrects-to-authority BIT-EXACT across BOTH the bodies AND the fluid, writes the
+        // converged-state golden. NO GPU dispatch, NO new shader, NO new RHI. STANDALONE branch (not in the
+        // --shot else-if chain) to avoid MSVC's nested-block parse limit (the FPX5/CL5/FL5/GR5 lesson).
+        if (std::strcmp(argv[i], "--couple-lockstep-shot") == 0 && i + 1 < argc) {
+            coupleLockstepShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -19515,6 +19528,240 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — grain lockstep+rollback converged state (%d grain px)\n",
                                 grainLockstepShotPath, imgW, imgH, grainPx);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainLockstepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof (--couple-lockstep-shot <out.bmp>,
+        // Slice CP5, the MULTI-BODY netcode HEADLINE of FLAGSHIP #11, the FL5/GR5 twin). PURE CPU — NO GPU
+        // dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the IDENTICAL CPU harness
+        // (couple.h::RunCoupleLockstep/RunCoupleRollback) so the converged coupled-state golden is bit-identical
+        // cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence). The FIRST
+        // MULTI-BODY lockstep: the snapshot covers BOTH the rigid bodies AND the fluid particles, and replica==
+        // authority memcmps BOTH. Builds the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody)
+        // + a scripted authStream that SHOVES the body (kCmdBodyShove) at chosen ticks + winds the fluid
+        // (kCmdFluidWind) so the body is displaced to a NON-TRIVIAL converged state; runs authority/replica/
+        // rolledBack; asserts authority==replica + rollback-corrects-to-authority BIT-EXACT (bodies AND fluid)
+        // + determinism + snapshot round-trip + non-trivial shove displacement; CPU-colors the converged coupled
+        // state (basin walls + dynamic water + the shoved body). The FPX5/CL5/FL5/GR5 twin over CoupleWorld.
+        if (coupleLockstepShotPath) {
+            using math::Vec3;
+            namespace couple = hf::sim::couple;
+            namespace fluid  = hf::sim::fluid;
+            namespace fpx    = hf::sim::fpx;
+
+            // The scene (== the CP4 --couple-step config / couple_test buildCoupleWorld). -9 host-snapped.
+            const fluid::fx kGravY = -9 * (int)fluid::kOne;
+            const fluid::fx kDt = fluid::kOne / 60;
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+            const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);   // smoothing radius h = 2.0
+            const int kBins = fluid::kKernelBins;
+            const fluid::fx kEpsilon = fluid::kOne / 100;
+            const int kIters = 3;
+            const int kTicks = 240;          // K ticks: drop, settle, then the scripted shoves displace the body
+            const int kMispredictTick = 80;  // a WRONG strong shove arrives here; the rollback must correct it
+
+            // Build the static basin (boundary walls + floor) + the dynamic pool + a body dropped above it.
+            auto makeWorld = [&](int bodyX, int bodyY, int bodyZ) {
+                couple::CoupleWorld w;
+                const int LO = 0, HI = 8;
+                auto Part = [&](int x, int y, int z, bool stat) {
+                    fluid::FluidParticle p;
+                    p.pos = fluid::FxVec3{(fluid::fx)(x * (int)fluid::kOne), (fluid::fx)(y * (int)fluid::kOne),
+                                          (fluid::fx)(z * (int)fluid::kOne)};
+                    p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0};
+                    p.invMass = stat ? 0 : fluid::kOne; p.flags = stat ? fluid::kFlagStatic : 0u;
+                    return p;
+                };
+                for (int py = -1; py <= 6; ++py)
+                    for (int pz = -1; pz <= HI + 1; ++pz)
+                        for (int px = -1; px <= HI + 1; ++px) {
+                            const bool wall = (px == -1 || px == HI + 1 || pz == -1 || pz == HI + 1 || py == -1);
+                            const bool inside = (px >= LO && px <= HI && pz >= LO && pz <= HI && py >= 0 && py <= 5);
+                            if (wall) w.particles.push_back(Part(px, py, pz, true));
+                            else if (inside) w.particles.push_back(Part(px, py, pz, false));
+                        }
+                w.kernel  = fluid::BuildKernelTable(kH, fluid::kOne, kBins, kEpsilon);  // ρ0 re-snapped below
+                w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+                fpx::FxBody b;
+                b.pos = fpx::FxVec3{(fpx::fx)(bodyX * (int)fluid::kOne), (fpx::fx)(bodyY * (int)fluid::kOne),
+                                    (fpx::fx)(bodyZ * (int)fluid::kOne)};
+                b.invMass = fluid::kOne / kIters;   // heavier body -> the K-fold buoyancy balances gravity
+                b.flags = fpx::kFlagDynamic; b.radius = (fpx::fx)(2 * (int)fluid::kOne);
+                w.bodies = {b};
+                // ρ0 = the mean density of the packed initial lattice (the FL4 probe recipe); rebuild the kernel.
+                const fluid::FluidGrid pg = fluid::MakeGrid(w.particles, kH);
+                const fluid::FluidCellTable pt = fluid::BuildCellTable(w.particles, pg);
+                const fluid::FluidNeighborList pl = fluid::BuildNeighborList(w.particles, pg, pt, kH);
+                std::vector<fluid::fx> probeRho;
+                fluid::ComputeDensity(w.particles, pl, w.kernel, probeRho);
+                w.kernel = fluid::BuildKernelTable(kH, fluid::MeanDensity(probeRho), kBins, kEpsilon);
+                return w;
+            };
+            const couple::CoupleWorld init = makeWorld(4, 9, 4);
+            const int kBodyCount = (int)init.bodies.size();
+            const int kParticleCount = (int)init.particles.size();
+
+            // The scripted authoritative command stream (the deterministic inputs on the wire): SHOVE the body
+            // sideways at chosen ticks (the "shove the barrel" headline) + a fluid wind gust — so the body is
+            // displaced to a NON-TRIVIAL converged state and the fluid is perturbed.
+            // Modest, on-screen shoves: the body settles to a NON-TRIVIAL displaced rest (≈10 units from the
+            // no-command baseline) while staying inside the side-view frame; a gentle fluid wind exercises
+            // kCmdFluidWind without spraying the pool beyond its (already-spreading) free baseline.
+            const uint32_t kFluidWindIdx = (uint32_t)(kParticleCount / 2);
+            const std::vector<couple::CoupleCommand> authStream = {
+                couple::CoupleCommand{40,  couple::kCmdBodyShove, 0, fpx::FxVec3{(fpx::fx)(fluid::kOne * 3), 0, 0}},
+                couple::CoupleCommand{110, couple::kCmdBodyShove, 0, fpx::FxVec3{0, 0, (fpx::fx)(fluid::kOne * 3)}},
+                couple::CoupleCommand{170, couple::kCmdBodyShove, 0, fpx::FxVec3{(fpx::fx)(fluid::kOne * 2), 0, 0}},
+                couple::CoupleCommand{90,  couple::kCmdFluidWind, kFluidWindIdx, fpx::FxVec3{(fpx::fx)(fluid::kOne * 4), 0, 0}},
+            };
+            const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+            // The MISPREDICTED stream: the auth stream + a WRONG strong shove at mispredictTick (a real
+            // divergence the rollback must correct).
+            std::vector<couple::CoupleCommand> mispredictStream = authStream;
+            mispredictStream.push_back(couple::CoupleCommand{(uint32_t)kMispredictTick, couple::kCmdBodyShove, 0,
+                                                             fpx::FxVec3{(fpx::fx)(fluid::kOne * 50), 0, 0}});
+
+            // === The harness ===
+            const couple::CoupleWorld authority = couple::RunCoupleLockstep(init, authStream, kTicks, kDt, kIters);
+            const couple::CoupleWorld replica   = couple::RunCoupleLockstep(init, authStream, kTicks, kDt, kIters);
+            const couple::CoupleWorld rolledBack =
+                couple::RunCoupleRollback(init, authStream, mispredictStream, kTicks, kMispredictTick, kDt, kIters);
+
+            auto bodyBytes = [](const couple::CoupleWorld& w) { return w.bodies.size() * sizeof(fpx::FxBody); };
+            auto fluidBytes = [](const couple::CoupleWorld& w) {
+                return w.particles.size() * sizeof(fluid::FluidParticle);
+            };
+            auto coupledEqual = [&](const couple::CoupleWorld& a, const couple::CoupleWorld& b) {
+                return a.bodies.size() == b.bodies.size() && a.particles.size() == b.particles.size() &&
+                       std::memcmp(a.bodies.data(), b.bodies.data(), bodyBytes(a)) == 0 &&
+                       std::memcmp(a.particles.data(), b.particles.data(), fluidBytes(a)) == 0;
+            };
+
+            // PROOF (1) LOCKSTEP: replica (fed INPUTS ONLY) == authority BIT-EXACT across BOTH bodies AND fluid.
+            if (!coupledEqual(authority, replica)) {
+                std::fprintf(stderr, "FATAL: couple-lockstep replica != authority (inputs-only re-sim diverged "
+                             "— a float/nondeterminism crept into the fixed-point coupled sim?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-lockstep: replica==authority {bodies:%d, particles:%d} BIT-EXACT (%d ticks, "
+                        "inputs-only)\n", kBodyCount, kParticleCount, kTicks);
+
+            // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT (bodies+fluid), AND the pre-rollback
+            // mispredicted state DIFFERED from authority (the rollback fixed a REAL divergence — pos + neg).
+            const couple::CoupleWorld mispredicted =
+                couple::RunCoupleLockstep(init, mispredictStream, kTicks, kDt, kIters);
+            const bool divergenceExisted = !coupledEqual(mispredicted, authority);
+            if (!coupledEqual(rolledBack, authority)) {
+                std::fprintf(stderr, "FATAL: couple-lockstep rollback != authority (the rollback did NOT correct "
+                             "the misprediction to the authoritative coupled state)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!divergenceExisted) {
+                std::fprintf(stderr, "FATAL: couple-lockstep mispredicted state == authority (the misprediction "
+                             "was a no-op — the rollback proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d diverged "
+                        "then converged)\n", kMispredictTick);
+
+            // PROOF (3) determinism + snapshot round-trip: two lockstep runs identical AND
+            // RestoreCouple(SnapshotCouple(w)) == w (bodies AND fluid).
+            const couple::CoupleWorld authority2 = couple::RunCoupleLockstep(init, authStream, kTicks, kDt, kIters);
+            if (!coupledEqual(authority2, authority)) {
+                std::fprintf(stderr, "FATAL: couple-lockstep two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            {
+                couple::CoupleWorld w = couple::RunCoupleLockstep(init, authStream, kMispredictTick, kDt, kIters);
+                const couple::CoupleSnapshot snap = couple::SnapshotCouple(w);
+                couple::SimCoupleTick(w, authStream, (uint32_t)kMispredictTick, kDt, kIters);   // mutate
+                couple::RestoreCouple(w, snap);
+                const bool roundTrip =
+                    w.bodies.size() == snap.bodies.size() && w.particles.size() == snap.particles.size() &&
+                    std::memcmp(w.bodies.data(), snap.bodies.data(), w.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+                    std::memcmp(w.particles.data(), snap.particles.data(),
+                                w.particles.size() * sizeof(fluid::FluidParticle)) == 0;
+                if (!roundTrip) {
+                    std::fprintf(stderr, "FATAL: couple-lockstep snapshot round-trip != original (bodies/fluid)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("couple-lockstep determinism: two runs BYTE-IDENTICAL + snapshot round-trip exact\n");
+
+            // PROOF (4) motion (non-trivial, the FL5/GR5 lesson): the command stream SHOVED the body by a
+            // non-trivial amount (the converged body pos != the no-command baseline).
+            const std::vector<couple::CoupleCommand> noStream;
+            const couple::CoupleWorld noInput = couple::RunCoupleLockstep(init, noStream, kTicks, kDt, kIters);
+            const int64_t sdx = (int64_t)authority.bodies[0].pos.x - (int64_t)noInput.bodies[0].pos.x;
+            const int64_t sdz = (int64_t)authority.bodies[0].pos.z - (int64_t)noInput.bodies[0].pos.z;
+            const int64_t shove = (sdx < 0 ? -sdx : sdx) + (sdz < 0 ? -sdz : sdz);
+            if (shove == 0) {
+                std::fprintf(stderr, "FATAL: couple-lockstep motion: the command stream did not shove the body "
+                             "(degenerate demo — the proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-lockstep motion: shoved the body by %lld\n", (long long)shove);
+
+            // --- Golden: a PURE-INTEGER side-view (x,y) of the converged coupled state (== the Metal
+            // --couple-lockstep by construction; authority==replica==rolledBack so the single converged state IS
+            // the viz). Basin walls (dark grey) + dynamic water (dim blue) + the shoved body (a warm disk + an
+            // integer radius ring). CPU-colored from the bit-exact rolledBack state. ---
+            const int kPxPerUnit = 26, kMargin = 30;
+            const int kWorldLo = -2, kWorldW = 14, kWorldH = 22;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+                cx = kMargin + (wx - kWorldLo) * kPxPerUnit;
+                cy = (int)imgH - kMargin - (wy - kWorldLo) * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            int waterPx = 0;
+            for (int i = 0; i < kParticleCount; ++i) {
+                int cx, cy; toPx(rolledBack.particles[(size_t)i].pos.x, rolledBack.particles[(size_t)i].pos.y, cx, cy);
+                if (rolledBack.particles[(size_t)i].flags & fluid::kFlagStatic)
+                    plot(cx, cy, Vec3{0.18f, 0.18f, 0.22f}, 0);   // the basin wall
+                else { plot(cx, cy, Vec3{0.20f, 0.35f, 0.6f}, 0); ++waterPx; }   // the dynamic water
+            }
+            {
+                const fpx::FxBody& fb = rolledBack.bodies[0];
+                int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+                const int rPx = (fb.radius >> fluid::kFrac) * kPxPerUnit;
+                for (int a = 0; a < 360; a += 3) {
+                    const double rad = (double)a * 3.14159265358979 / 180.0;
+                    const int rx = bcx + (int)((double)rPx * std::cos(rad));
+                    const int ry = bcy - (int)((double)rPx * std::sin(rad));
+                    if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                        uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                        dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+                    }
+                }
+                plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);   // the shoved body centre, a warm disk
+            }
+            std::printf("couple-lockstep: {bodies:%d, particles:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                        kBodyCount, kParticleCount, kTicks, kCommandCount, kMispredictTick);
+            bool ok = WriteBMP(coupleLockstepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — couple lockstep+rollback converged state (%d water px)\n",
+                                coupleLockstepShotPath, imgW, imgH, waterPx);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleLockstepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

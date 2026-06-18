@@ -562,5 +562,141 @@ inline CoupleState MeasureCoupleState(const CoupleWorld& world) {
     return s;
 }
 
+// ===== Slice CP5 — LOCKSTEP + ROLLBACK (the MULTI-BODY netcode HEADLINE) =============================
+// Prove the bit-exact CP4 coupled step (StepCouple, itself bit-identical Vulkan/Metal) is true cross-platform
+// LOCKSTEP + ROLLBACK — and the arc's FIRST MULTI-BODY lockstep: a peer fed the INPUT command stream ALONE
+// (NOT full state) re-derives the authority's exact COUPLED state — BOTH the rigid bodies AND the fluid —
+// bit-for-bit, and a mispredicted input is corrected by rolling back to a saved snapshot + re-simulating the
+// authoritative stream. PURE CPU, 0 backend symbols, NO new shader / RHI: a determinism PROPERTY of the
+// existing bit-exact StepCouple. The DIRECT COMPOSITION of the FPX5 (rigid) + FL5 (fluid) harnesses over
+// CoupleWorld — the fluid.h FluidCommand/ApplyFluidCommand/SimFluidTick/SnapshotFluid/RestoreFluid/
+// RunFluidLockstep/RunFluidRollback shape (and grain.h GR5) over CoupleWorld + StepCouple. NO <cmath>, NO
+// RNG, NO clock. The trilogy's netcode story now spans a COUPLED multi-material system: shove the barrel, and
+// two peers re-simulate the bob AND the splash bit-for-bit.
+//
+// THE MULTI-BODY TWIST (the new thing vs FL5/GR5): the world has TWO heterogeneous body sets — the rigid
+// std::vector<fpx::FxBody> bodies AND the std::vector<fluid::FluidParticle> particles. SnapshotCouple
+// deep-copies BOTH; RunCoupleLockstep's replica==authority must memcmp BOTH; a CoupleCommand can target a
+// rigid body OR a fluid particle. This is the FIRST lockstep over a coupled multi-material system — strictly
+// more than FL5 (fluid alone) or FPX5 (rigid alone).
+//
+// A CoupleCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT full state).
+// kCmdBodyShove adds `arg` (a delta-velocity) to a rigid body's velocity (the "shove the barrel" headline);
+// kCmdBodyMove adds `arg` (a delta-position) to a body's position; kCmdFluidWind adds `arg` (a delta-velocity)
+// to a fluid particle's velocity. Integer adds; static bodies (non-dynamic) / static particles (kFlagStatic)
+// are never mutated; out-of-range target / unknown kind -> a no-op (deterministic). A std::vector<CoupleCommand>
+// is the command STREAM, processed in ARRAY ORDER per tick (the deterministic-order contract — the same order
+// on every peer/platform), so authority + replica fed the same stream re-derive the same coupled state exactly.
+
+inline constexpr uint32_t kCmdBodyShove = 0u;   // arg added to target rigid body's velocity (the barrel shove)
+inline constexpr uint32_t kCmdBodyMove  = 1u;   // arg added to target rigid body's position (a position nudge)
+inline constexpr uint32_t kCmdFluidWind = 2u;   // arg added to target fluid particle's velocity (a wind gust)
+
+struct CoupleCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdBodyShove / kCmdBodyMove / kCmdFluidWind
+    uint32_t target = 0;   // the target index (a rigid body index for shove/move; a fluid particle for wind)
+    FxVec3   arg;          // the Q16.16 payload (delta-velocity for shove/wind; delta-position for move)
+};
+
+// ApplyCoupleCommand(world, c): apply ONE input command to the coupled world (pure integer — add to a body's
+// vel/pos or a fluid particle's vel). Out-of-range target is a no-op (deterministic); unknown kind is a no-op;
+// static bodies (non-dynamic) and static fluid particles (kFlagStatic) are never mutated (they hold). The
+// input event the lockstep/rollback streams are made of. The fluid.h::ApplyFluidCommand / grain.h::
+// ApplyGrainCommand twin, extended to the multi-body world.
+inline void ApplyCoupleCommand(CoupleWorld& world, const CoupleCommand& c) {
+    if (c.kind == kCmdBodyShove || c.kind == kCmdBodyMove) {
+        if (c.target >= (uint32_t)world.bodies.size()) return;     // out-of-range body target -> no-op
+        fpx::FxBody& b = world.bodies[(size_t)c.target];
+        if (!(b.flags & fpx::kFlagDynamic)) return;                // static/kinematic body holds — no input moves it
+        if (c.kind == kCmdBodyShove) { b.vel.x += c.arg.x; b.vel.y += c.arg.y; b.vel.z += c.arg.z; }
+        else                         { b.pos.x += c.arg.x; b.pos.y += c.arg.y; b.pos.z += c.arg.z; }
+    } else if (c.kind == kCmdFluidWind) {
+        if (c.target >= (uint32_t)world.particles.size()) return;  // out-of-range fluid target -> no-op
+        fluid::FluidParticle& p = world.particles[(size_t)c.target];
+        if (p.flags & fluid::kFlagStatic) return;                  // static boundary particle holds
+        p.vel.x += c.arg.x; p.vel.y += c.arg.y; p.vel.z += c.arg.z;
+    }
+    // unknown kind -> a no-op (deterministic).
+}
+
+// SimCoupleTick(world, stream, tick, dt, iters): the deterministic per-tick step. (1) apply ALL commands in
+// `stream` whose .tick == `tick`, in ARRAY ORDER (the deterministic input-order contract); (2) StepCouple one
+// step (CP4 — the bit-exact coupled tick over bodies + fluid). Pure integer, fixed order -> bit-identical on
+// every peer/platform. The fluid.h::SimFluidTick / grain.h::SimGrainTick twin over CoupleWorld.
+inline void SimCoupleTick(CoupleWorld& world, const std::vector<CoupleCommand>& stream, uint32_t tick,
+                          fx dt, int iters) {
+    for (const CoupleCommand& c : stream)
+        if (c.tick == tick) ApplyCoupleCommand(world, c);
+    StepCouple(world, dt, iters);
+}
+
+// CoupleSnapshot: the FIRST multi-body snapshot — a deep copy of BOTH the rigid `bodies` AND the fluid
+// `particles` vectors (the rollback primitive — a lossless saved tick across the coupled multi-material
+// state). The fluid.h::SnapshotFluid result extended to the two heterogeneous body sets.
+struct CoupleSnapshot {
+    std::vector<fpx::FxBody>           bodies;       // a deep copy of the rigid bodies
+    std::vector<fluid::FluidParticle>  particles;    // a deep copy of the fluid particles
+};
+
+// SnapshotCouple(world): a deep copy of BOTH the bodies AND the particles vectors (std::vector copy is a deep
+// copy). The MULTI-BODY twist: the snapshot covers BOTH body sets. The fluid.h::SnapshotFluid twin.
+inline CoupleSnapshot SnapshotCouple(const CoupleWorld& world) {
+    CoupleSnapshot s;
+    s.bodies    = world.bodies;       // value copy: deep-copies the rigid bodies
+    s.particles = world.particles;    // value copy: deep-copies the fluid particles
+    return s;
+}
+
+// RestoreCouple(world, snap): restore BOTH the bodies AND the particles to a saved snapshot (the rollback).
+// Bit-exact round-trip with SnapshotCouple across BOTH vectors. The fluid.h::RestoreFluid twin.
+inline void RestoreCouple(CoupleWorld& world, const CoupleSnapshot& snap) {
+    world.bodies    = snap.bodies;
+    world.particles = snap.particles;
+}
+
+// RunCoupleLockstep(init, stream, ticks, dt, iters): THE peer entry point. Run `ticks` SimCoupleTicks from a
+// COPY of `init`, applying the command stream -> the final coupled state (bodies + fluid). authority =
+// RunCoupleLockstep(...); replica = RunCoupleLockstep(...) from the SAME init + stream (inputs ONLY — no state
+// shared) -> BIT-IDENTICAL by determinism (the lockstep proof memcmps BOTH the bodies AND the particles). The
+// fluid.h::RunFluidLockstep / grain.h::RunGrainLockstep twin over CoupleWorld.
+inline CoupleWorld RunCoupleLockstep(const CoupleWorld& init, const std::vector<CoupleCommand>& stream,
+                                     int ticks, fx dt, int iters) {
+    CoupleWorld world = init;
+    for (int t = 0; t < ticks; ++t)
+        SimCoupleTick(world, stream, (uint32_t)t, dt, iters);
+    return world;
+}
+
+// RunCoupleRollback(init, authStream, mispredictStream, ticks, mispredictTick, dt, iters): the rollback
+// harness. (1) run ticks 0..mispredictTick from init applying authStream, SAVING a snapshot AT mispredictTick
+// (before that tick is simulated); (2) speculatively advance a few ticks from the snapshot with the MISPREDICTED
+// stream (the wrong input) — the client prediction that diverges; (3) "receive" the authoritative input ->
+// RestoreCouple to the snapshot + RE-SIMULATE mispredictTick..ticks with the CORRECT authStream -> the final
+// corrected coupled state. The proof asserts this == RunCoupleLockstep(init, authStream, ticks) (rollback
+// corrected the misprediction EXACTLY, BOTH bodies AND fluid) AND that the mispredicted-before-rollback state
+// DIFFERED from the authority (a real divergence was fixed). The fluid.h::RunFluidRollback twin over CoupleWorld.
+inline CoupleWorld RunCoupleRollback(const CoupleWorld& init, const std::vector<CoupleCommand>& authStream,
+                                     const std::vector<CoupleCommand>& mispredictStream, int ticks,
+                                     int mispredictTick, fx dt, int iters) {
+    CoupleWorld world = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimCoupleTick(world, authStream, (uint32_t)t, dt, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point — BOTH bodies AND fluid).
+    const CoupleSnapshot snap = SnapshotCouple(world);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — the client
+    // prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimCoupleTick(world, mispredictStream, (uint32_t)(mispredictTick + s), dt, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreCouple(world, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimCoupleTick(world, authStream, (uint32_t)t, dt, iters);
+    return world;
+}
+
 }  // namespace couple
 }  // namespace hf::sim

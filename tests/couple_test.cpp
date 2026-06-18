@@ -711,6 +711,156 @@ int main() {
         check(same, "StepCouple == StepCoupleSteps(...,1) (the composed order is fixed)");
     }
 
+    // ============================================================================================
+    // ============ Slice CP5 — LOCKSTEP + ROLLBACK (the multi-body netcode HEADLINE) tests ========
+    // ============================================================================================
+    // The FL5/GR5 harness over CoupleWorld + StepCouple — the FIRST MULTI-BODY lockstep (the snapshot covers
+    // BOTH the bodies AND the particles vectors). CoupleCommand kinds: kCmdBodyShove (add to body vel),
+    // kCmdBodyMove (add to body pos), kCmdFluidWind (add to fluid particle vel).
+
+    // ---- ApplyCoupleCommand: kCmdBodyShove adds to a DYNAMIC body's velocity. ----
+    {
+        couple::CoupleWorld w;
+        w.bodies = {BodyAt(0, 0, 0, 2)};
+        const fpx::FxVec3 velBefore = w.bodies[0].vel;
+        couple::CoupleCommand c{0, couple::kCmdBodyShove, 0, fpx::FxVec3{5 * (int)kOne, 0, 0}};
+        couple::ApplyCoupleCommand(w, c);
+        check(w.bodies[0].vel.x == velBefore.x + 5 * (int)kOne && w.bodies[0].vel.y == velBefore.y,
+              "ApplyCoupleCommand kCmdBodyShove: adds arg to the body velocity");
+    }
+
+    // ---- ApplyCoupleCommand: kCmdBodyMove adds to a DYNAMIC body's position. ----
+    {
+        couple::CoupleWorld w;
+        w.bodies = {BodyAt(3, 4, 5, 2)};
+        couple::CoupleCommand c{0, couple::kCmdBodyMove, 0, fpx::FxVec3{0, 2 * (int)kOne, 0}};
+        couple::ApplyCoupleCommand(w, c);
+        check(w.bodies[0].pos.x == FromInt(3) && w.bodies[0].pos.y == FromInt(4) + 2 * (int)kOne &&
+              w.bodies[0].pos.z == FromInt(5),
+              "ApplyCoupleCommand kCmdBodyMove: adds arg to the body position");
+    }
+
+    // ---- ApplyCoupleCommand: kCmdFluidWind adds to a (non-static) fluid particle's velocity. ----
+    {
+        couple::CoupleWorld w;
+        w.particles = {ParticleAt(0, 0, 0)};
+        couple::CoupleCommand c{0, couple::kCmdFluidWind, 0, fpx::FxVec3{0, 0, 7 * (int)kOne}};
+        couple::ApplyCoupleCommand(w, c);
+        check(w.particles[0].vel.z == 7 * (int)kOne,
+              "ApplyCoupleCommand kCmdFluidWind: adds arg to the fluid particle velocity");
+    }
+
+    // ---- ApplyCoupleCommand: a STATIC body / STATIC particle is NEVER mutated. ----
+    {
+        couple::CoupleWorld w;
+        fpx::FxBody stat = BodyAt(0, 0, 0, 2);
+        stat.flags = 0; stat.invMass = 0;               // NOT dynamic -> static body
+        w.bodies = {stat};
+        fluid::FluidParticle sp = ParticleAt(1, 0, 0);
+        sp.flags = fluid::kFlagStatic;                  // static boundary particle
+        w.particles = {sp};
+        const fpx::FxVec3 bVel = w.bodies[0].vel, bPos = w.bodies[0].pos;
+        const fpx::FxVec3 pVel = w.particles[0].vel;
+        couple::ApplyCoupleCommand(w, couple::CoupleCommand{0, couple::kCmdBodyShove, 0, fpx::FxVec3{9 * (int)kOne, 0, 0}});
+        couple::ApplyCoupleCommand(w, couple::CoupleCommand{0, couple::kCmdBodyMove, 0, fpx::FxVec3{9 * (int)kOne, 0, 0}});
+        couple::ApplyCoupleCommand(w, couple::CoupleCommand{0, couple::kCmdFluidWind, 0, fpx::FxVec3{9 * (int)kOne, 0, 0}});
+        check(w.bodies[0].vel.x == bVel.x && w.bodies[0].pos.x == bPos.x,
+              "ApplyCoupleCommand: a static (non-dynamic) body is never mutated");
+        check(w.particles[0].vel.x == pVel.x,
+              "ApplyCoupleCommand: a static fluid particle is never mutated");
+    }
+
+    // ---- ApplyCoupleCommand: out-of-range target / unknown kind -> a no-op (deterministic). ----
+    {
+        couple::CoupleWorld w;
+        w.bodies    = {BodyAt(0, 0, 0, 2)};
+        w.particles = {ParticleAt(0, 0, 0)};
+        const fpx::FxVec3 bVel = w.bodies[0].vel;
+        const fpx::FxVec3 pVel = w.particles[0].vel;
+        // body target 5 (>= 1 body) -> no-op
+        couple::ApplyCoupleCommand(w, couple::CoupleCommand{0, couple::kCmdBodyShove, 5, fpx::FxVec3{9 * (int)kOne, 0, 0}});
+        // fluid target 5 (>= 1 particle) -> no-op
+        couple::ApplyCoupleCommand(w, couple::CoupleCommand{0, couple::kCmdFluidWind, 5, fpx::FxVec3{9 * (int)kOne, 0, 0}});
+        // unknown kind -> no-op
+        couple::ApplyCoupleCommand(w, couple::CoupleCommand{0, 999u, 0, fpx::FxVec3{9 * (int)kOne, 0, 0}});
+        check(w.bodies[0].vel.x == bVel.x && w.particles[0].vel.x == pVel.x,
+              "ApplyCoupleCommand: out-of-range target / unknown kind -> no-op");
+    }
+
+    // ---- SnapshotCouple / RestoreCouple: a deep-copy round-trip of BOTH bodies AND particles. ----
+    {
+        couple::CoupleWorld w = buildCoupleWorld(4, 9, 4);
+        couple::StepCoupleSteps(w, kDt, kCpIters, 20);   // a non-trivial mixed state
+        const couple::CoupleSnapshot snap = couple::SnapshotCouple(w);
+        // Mutate BOTH vectors.
+        w.bodies[0].pos.x += 12345;
+        w.particles[10].vel.y -= 9999;
+        couple::RestoreCouple(w, snap);
+        bool bodiesSame = (w.bodies.size() == snap.bodies.size());
+        for (size_t i = 0; bodiesSame && i < w.bodies.size(); ++i)
+            if (std::memcmp(&w.bodies[i], &snap.bodies[i], sizeof(fpx::FxBody)) != 0) bodiesSame = false;
+        bool partsSame = (w.particles.size() == snap.particles.size());
+        for (size_t i = 0; partsSame && i < w.particles.size(); ++i)
+            if (std::memcmp(&w.particles[i], &snap.particles[i], sizeof(fluid::FluidParticle)) != 0) partsSame = false;
+        check(bodiesSame, "SnapshotCouple/RestoreCouple: the BODIES vector round-trips BIT-EXACT");
+        check(partsSame, "SnapshotCouple/RestoreCouple: the PARTICLES vector round-trips BIT-EXACT");
+    }
+
+    // ---- RunCoupleLockstep: two runs from the SAME init + stream are byte-identical (bodies AND fluid). ----
+    {
+        couple::CoupleWorld init = buildCoupleWorld(4, 9, 4);
+        const int kTicks = 30;
+        const std::vector<couple::CoupleCommand> stream = {
+            couple::CoupleCommand{2,  couple::kCmdBodyShove, 0, fpx::FxVec3{6 * (int)kOne, 0, 0}},
+            couple::CoupleCommand{8,  couple::kCmdBodyShove, 0, fpx::FxVec3{0, 0, 4 * (int)kOne}},
+            couple::CoupleCommand{14, couple::kCmdBodyMove,  0, fpx::FxVec3{0, (int)kOne, 0}},
+        };
+        const couple::CoupleWorld a = couple::RunCoupleLockstep(init, stream, kTicks, kDt, kCpIters);
+        const couple::CoupleWorld b = couple::RunCoupleLockstep(init, stream, kTicks, kDt, kCpIters);
+        bool same = (a.bodies.size() == b.bodies.size()) && (a.particles.size() == b.particles.size());
+        for (size_t i = 0; same && i < a.bodies.size(); ++i)
+            if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+        for (size_t i = 0; same && i < a.particles.size(); ++i)
+            if (std::memcmp(&a.particles[i], &b.particles[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "RunCoupleLockstep: two runs (inputs-only) are byte-identical (bodies AND fluid)");
+    }
+
+    // ---- RunCoupleRollback: corrected == authority BIT-EXACT (bodies AND fluid) AND mispredicted != authority. ----
+    {
+        couple::CoupleWorld init = buildCoupleWorld(4, 9, 4);
+        const int kTicks = 30;
+        const int kMispredictTick = 10;
+        const std::vector<couple::CoupleCommand> authStream = {
+            couple::CoupleCommand{2,  couple::kCmdBodyShove, 0, fpx::FxVec3{6 * (int)kOne, 0, 0}},
+            couple::CoupleCommand{8,  couple::kCmdBodyShove, 0, fpx::FxVec3{0, 0, 4 * (int)kOne}},
+            couple::CoupleCommand{14, couple::kCmdBodyMove,  0, fpx::FxVec3{0, (int)kOne, 0}},
+        };
+        std::vector<couple::CoupleCommand> mispredictStream = authStream;
+        mispredictStream.push_back(couple::CoupleCommand{(uint32_t)kMispredictTick, couple::kCmdBodyShove, 0,
+                                                         fpx::FxVec3{40 * (int)kOne, 0, 0}});  // WRONG strong shove
+
+        const couple::CoupleWorld authority = couple::RunCoupleLockstep(init, authStream, kTicks, kDt, kCpIters);
+        const couple::CoupleWorld corrected = couple::RunCoupleRollback(init, authStream, mispredictStream,
+                                                                        kTicks, kMispredictTick, kDt, kCpIters);
+        const couple::CoupleWorld mispredicted =
+            couple::RunCoupleLockstep(init, mispredictStream, kTicks, kDt, kCpIters);
+
+        bool correctedSame = (corrected.bodies.size() == authority.bodies.size()) &&
+                             (corrected.particles.size() == authority.particles.size());
+        for (size_t i = 0; correctedSame && i < authority.bodies.size(); ++i)
+            if (std::memcmp(&corrected.bodies[i], &authority.bodies[i], sizeof(fpx::FxBody)) != 0) correctedSame = false;
+        for (size_t i = 0; correctedSame && i < authority.particles.size(); ++i)
+            if (std::memcmp(&corrected.particles[i], &authority.particles[i], sizeof(fluid::FluidParticle)) != 0)
+                correctedSame = false;
+        check(correctedSame, "RunCoupleRollback: corrected == authority BIT-EXACT (bodies AND fluid)");
+
+        bool diverged = (std::memcmp(&mispredicted.bodies[0], &authority.bodies[0], sizeof(fpx::FxBody)) != 0);
+        for (size_t i = 0; !diverged && i < authority.particles.size(); ++i)
+            if (std::memcmp(&mispredicted.particles[i], &authority.particles[i], sizeof(fluid::FluidParticle)) != 0)
+                diverged = true;
+        check(diverged, "RunCoupleRollback: the mispredicted state DIFFERED from authority (a real divergence)");
+    }
+
     if (g_fail == 0) std::printf("couple_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
