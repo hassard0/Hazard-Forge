@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
@@ -439,6 +440,129 @@ int main() {
         check(rc == 0u, "NAV3 empty: 0 regions");
         bool allZero = true; for (uint32_t r : region) if (r != 0u) allZero = false;
         check(allZero, "NAV3 empty: region[] all zero (no-op)");
+    }
+
+    // ================= NAV4: TraceContours — a single square region -> a 4-vertex CW contour ========
+    {
+        // 4x4 grid; a 2x2 square region (cells (1,1),(2,1),(1,2),(2,2)) = region 1.
+        nav::Heightfield hf = MakeHf(4, 4);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);
+        auto set = [&](int x, int z) { region[(size_t)hf.columnId(x, z)] = 1u; };
+        set(1, 1); set(2, 1); set(1, 2); set(2, 2);
+        std::vector<nav::Contour> contours;
+        nav::TraceContours(hf, region, 1u, contours);
+        check(contours.size() == 1u, "NAV4 square: exactly 1 contour");
+        check(!contours.empty() && contours[0].region == 1u, "NAV4 square: contour region id == 1");
+        check(!contours.empty() && contours[0].verts.size() == 4u,
+              "NAV4 square: 4-vertex contour loop");
+        // The four corners of the 2x2 square: (1,1),(3,1),(3,3),(1,3).
+        if (!contours.empty() && contours[0].verts.size() == 4u) {
+            const auto& v = contours[0].verts;
+            bool corners = v[0].x == 1 && v[0].z == 1 && v[1].x == 3 && v[1].z == 1 &&
+                           v[2].x == 3 && v[2].z == 3 && v[3].x == 1 && v[3].z == 3;
+            check(corners, "NAV4 square: contour corners (1,1)(3,1)(3,3)(1,3)");
+        }
+
+        // ----- BuildPolyMesh on the square -> 2 triangles sharing the diagonal, mutually adjacent. ---
+        std::vector<nav::ContourVertex> simp;
+        nav::SimplifyContour(contours[0].verts, 0, simp);   // maxError 0 -> keep all 4 corners.
+        check(simp.size() == 4u, "NAV4 square: simplify(maxError=0) keeps 4 corners");
+        std::vector<nav::Contour> sc; sc.push_back(nav::Contour{1u, simp});
+        std::vector<nav::Poly> polys;
+        nav::BuildPolyMesh(sc, polys);
+        check(polys.size() == 2u, "NAV4 square: ear-clip -> 2 triangles");
+        if (polys.size() == 2u) {
+            // The two triangles share one edge (the diagonal) -> each is the other's neighbour on
+            // exactly one edge, and the other two edges of each are boundary (kNoNeighbour).
+            int adj0 = 0, adj1 = 0;
+            for (int e = 0; e < 3; ++e) {
+                if (polys[0].nbr[e] == 1u) ++adj0;
+                if (polys[1].nbr[e] == 0u) ++adj1;
+            }
+            check(adj0 == 1 && adj1 == 1, "NAV4 square: 2 triangles mutually adjacent (shared diagonal)");
+            int bnd0 = 0; for (int e = 0; e < 3; ++e) if (polys[0].nbr[e] == nav::kNoNeighbour) ++bnd0;
+            check(bnd0 == 2, "NAV4 square: each triangle has 2 boundary edges");
+        }
+    }
+
+    // ================= NAV4: an L-shaped region -> the expected simplified contour vert count ========
+    {
+        // 5x5 grid; an L: vertical bar x=1 (z=1..3) + horizontal foot z=3 (x=1..3) = region 1.
+        nav::Heightfield hf = MakeHf(5, 5);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);
+        auto set = [&](int x, int z) { region[(size_t)hf.columnId(x, z)] = 1u; };
+        set(1, 1); set(1, 2); set(1, 3); set(2, 3); set(3, 3);
+        std::vector<nav::Contour> contours;
+        nav::TraceContours(hf, region, 1u, contours);
+        check(contours.size() == 1u, "NAV4 L-shape: exactly 1 contour");
+        // The L outline has 6 right-angle corners; maxError 0 keeps them all.
+        std::vector<nav::ContourVertex> simp;
+        nav::SimplifyContour(contours[0].verts, 0, simp);
+        check(simp.size() == 6u, "NAV4 L-shape: simplified contour has 6 corners");
+        // Ear-clip an n=6 contour -> n-2 = 4 triangles.
+        std::vector<nav::Contour> sc; sc.push_back(nav::Contour{1u, simp});
+        std::vector<nav::Poly> polys;
+        nav::BuildPolyMesh(sc, polys);
+        check(polys.size() == 4u, "NAV4 L-shape: ear-clip -> 4 triangles (n-2)");
+        // Adjacency symmetry: a is b's neighbour <=> b is a's.
+        bool symmetric = true;
+        for (size_t i = 0; i < polys.size(); ++i)
+            for (int e = 0; e < 3; ++e) {
+                uint32_t q = polys[i].nbr[e];
+                if (q == nav::kNoNeighbour) continue;
+                bool back = false;
+                for (int f = 0; f < 3; ++f) if (polys[q].nbr[f] == (uint32_t)i) back = true;
+                if (!back) symmetric = false;
+            }
+        check(symmetric, "NAV4 L-shape: adjacency symmetric (a~b <=> b~a)");
+    }
+
+    // ================= NAV4: ear-clip produces n-2 triangles for a convex n-gon ======================
+    {
+        // A convex hexagon (CCW); ear-clip -> 6-2 = 4 triangles.
+        std::vector<nav::ContourVertex> hex = {{2, 0}, {4, 0}, {6, 3}, {4, 6}, {2, 6}, {0, 3}};
+        std::vector<nav::Contour> sc; sc.push_back(nav::Contour{1u, hex});
+        std::vector<nav::Poly> polys;
+        nav::BuildPolyMesh(sc, polys);
+        check(polys.size() == 4u, "NAV4 n-gon: convex hexagon -> 4 triangles (n-2)");
+        // Every poly carries the source region id.
+        bool regionOk = true; for (const auto& p : polys) if (p.region != 1u) regionOk = false;
+        check(regionOk, "NAV4 n-gon: every poly carries its source region id");
+    }
+
+    // ================= NAV4: determinism — two full pipelines byte-identical =========================
+    {
+        nav::Heightfield hf = MakeHf(5, 5);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);
+        auto set = [&](int x, int z) { region[(size_t)hf.columnId(x, z)] = 1u; };
+        set(1, 1); set(1, 2); set(1, 3); set(2, 3); set(3, 3);
+        auto run = [&](std::vector<nav::Poly>& outPolys, std::vector<nav::Contour>& outC) {
+            nav::TraceContours(hf, region, 1u, outC);
+            for (auto& c : outC) {
+                std::vector<nav::ContourVertex> s;
+                nav::SimplifyContour(c.verts, 0, s);
+                c.verts = s;
+            }
+            nav::BuildPolyMesh(outC, outPolys);
+        };
+        std::vector<nav::Contour> c1, c2;
+        std::vector<nav::Poly> p1, p2;
+        run(p1, c1); run(p2, c2);
+        bool same = (p1.size() == p2.size()) &&
+                    (p1.empty() || std::memcmp(p1.data(), p2.data(), p1.size() * sizeof(nav::Poly)) == 0);
+        check(same, "NAV4 determinism: two full pipeline runs byte-identical");
+    }
+
+    // ================= NAV4: empty -> zero contours / zero polys =====================================
+    {
+        nav::Heightfield hf = MakeHf(6, 6);
+        std::vector<uint32_t> region((size_t)hf.columnCount(), 0u);   // no regions.
+        std::vector<nav::Contour> contours;
+        nav::TraceContours(hf, region, 0u, contours);
+        check(contours.empty(), "NAV4 empty: 0 contours");
+        std::vector<nav::Poly> polys;
+        nav::BuildPolyMesh(contours, polys);
+        check(polys.empty(), "NAV4 empty: 0 polys (no-op)");
     }
 
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }

@@ -34,8 +34,10 @@
 // + parallel; fpx.h stays byte-identical).
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "sim/fpx.h"   // FloorDiv (deterministic floor-division for negative voxel coords); read-only
@@ -543,6 +545,411 @@ inline uint32_t BuildRegions(const Heightfield& hf, const WalkableConfig& cfg,
             }
     }
     return nextRegion - 1u;   // regionCount (0 if no walkable cells got a region)
+}
+
+// =================================================================================================
+// Slice NAV4 — CONTOUR TRACING + INTEGER POLYGONIZATION (additive over the NAV3 region partition
+// above). Pure integer (NO <cmath>, NO float, NO int64 on the bit-exact path — int32 only; see the
+// overflow bound below). The CPU reference the GPU nav_contour.comp / nav_polygonize.comp shaders
+// copy VERBATIM + memcmp bit-identical against. Turns each NAV3 region into a closed integer CONTOUR
+// (a deterministic boundary walk), SIMPLIFIES it (integer Douglas–Peucker, perpendicular-distance
+// SQUARED — no sqrt), and TRIANGULATES it into convex polygons (ear-clip) + per-edge cross-poly
+// ADJACENCY (the graph NAV5's A* runs over). Every ordering decision is PINNED so the result is
+// identical CPU<->GPU<->both backends (the NAV3 single-thread discipline, extended to 3 sequential
+// algorithms).
+//
+// THE INT32 OVERFLOW BOUND (why the shaders stay Metal-MSL-native, int32 only): all coordinates are
+// cell-corner voxel ints in [0, max(w,h)]. The showcase grid is 32x32 -> corner coords in [0,32].
+//   - Douglas–Peucker perpendicular-distance-squared: cross = (bx-ax)*(pz-az) - (bz-az)*(px-ax);
+//     |delta| <= 32 -> |cross| <= 2*32*32 = 2048 -> cross*cross <= ~4.2e6; the denominator
+//     dx*dx+dz*dz <= 2*32*32 = 2048; numerator = cross*cross <= 4.2e6 << INT32_MAX (~2.1e9). Safe.
+//   - Ear-clip orientation / point-in-triangle: the SAME PointInTriXZ int64 reference reduces to int32
+//     products (each <= 32*64 = 2048) for these coords (NAV1's documented bound). Safe.
+// For a general (larger) grid where corner coords could exceed ~32767, the DP numerator (cross*cross,
+// a 4th-power term) would need int64 -> that ONE shader would go Vulkan-only + CPU-ref on Metal (the
+// FPX1/swraster convention). For NAV4's bounded showcase int32 is exact and the shaders are native.
+// =================================================================================================
+
+// ----- ContourVertex: an integer cell-CORNER vertex on a region boundary loop --------------------
+// (x,z) are corner-lattice voxel coords: a cell (cx,cz) occupies the unit square with corners
+// (cx,cz)..(cx+1,cz+1), so corner coords range [0, w] x [0, h]. A contour is a closed CCW/CW loop of
+// these (the walk pins one fixed winding). 2 x int32 = 8 bytes, no padding (memcmp-able, std430).
+struct ContourVertex {
+    int32_t x, z;
+};
+
+// ----- Contour: one region's closed boundary loop ------------------------------------------------
+// region = the NAV3 region id this loop bounds; verts = the (simplified) closed integer corner loop
+// (implicitly closed: the last vertex connects back to the first; the loop is NOT duplicated).
+struct Contour {
+    uint32_t region = 0u;
+    std::vector<ContourVertex> verts;
+};
+
+// ----- Poly: one convex polygon (a triangle for NAV4) + its per-edge neighbour ids ----------------
+// idx[0..2] = indices into the OWNING contour's simplified vertex list (a triangle, CCW by the
+// ear-clip winding). nbr[e] = the poly id (index into the BuildPolyMesh output) sharing edge e
+// (idx[e]->idx[(e+1)%3]); kNoNeighbour if that edge is a contour boundary (no adjacent poly). region
+// carries the source region id (for the showcase coloring + NAV5). 8 x uint32 = 32 bytes (std430).
+static constexpr uint32_t kNoNeighbour = 0xFFFFFFFFu;
+struct Poly {
+    uint32_t idx[3];     // contour-local vertex indices (triangle, CCW)
+    uint32_t nbr[3];     // per-edge neighbour poly id (global), kNoNeighbour if boundary
+    uint32_t region;     // source NAV3 region id
+    uint32_t _pad;       // -> 32 bytes, std430-clean, memcmp-able
+};
+
+// ----- Edge2 (signed area / cross product) — the integer orientation primitive --------------------
+// Cross2(ax,az, bx,bz, px,pz) = (bx-ax)*(pz-az) - (bz-az)*(px-ax): twice the signed area of triangle
+// (a,b,p) — the SAME 2D edge function NAV1's PointInTriXZ uses. >0 = p left of a->b (CCW), <0 = right
+// (CW), 0 = collinear. Pure int32 for the bounded grid (see the overflow bound above). The shader
+// copies THIS verbatim.
+inline int32_t Cross2(int32_t ax, int32_t az, int32_t bx, int32_t bz, int32_t px, int32_t pz) {
+    return (bx - ax) * (pz - az) - (bz - az) * (px - ax);
+}
+
+// ----- TraceContours: the deterministic integer boundary walk (per region) ------------------------
+// For each region id in ASCENDING order (1..regionCount), find its LOWEST-cellId boundary cell and
+// walk the region boundary in a FIXED turn order, emitting an integer corner vertex at each boundary
+// CORNER (a turn) until the walk returns to the start. The walk keeps the region cells on its RIGHT
+// (a clockwise loop in (x,z) screen space where z grows downward — the Recast left-wall-follow, here
+// pinned as: at each cell-edge step, prefer to turn so the boundary stays on the right). Determinism:
+// the start cell is the lowest cellId in the region (so its TOP edge, z-1 neighbour, is guaranteed a
+// boundary because a region cell above would have a lower cellId), the start corner + heading are
+// fixed, and the per-step turn order is fixed. Output: one Contour per region (region id ascending),
+// regions with no cells skipped. Pure int32, single-thread serial -> bit-exact.
+//
+// The walk is a corner turtle on the cell-edge graph. State: a corner (px,pz) and a heading dir in
+// {0:+x, 1:+z, 2:-x, 3:-z}. We walk the boundary so the IN-region cell is on the right of the heading.
+// At each corner we choose the next heading by the fixed priority: try to turn LEFT (keep hugging),
+// else go STRAIGHT, else turn RIGHT, else turn BACK — the standard wall-follower. A vertex is emitted
+// whenever the heading CHANGES (a corner), giving the minimal integer corner loop (degenerate single
+// cell -> its 4 corners).
+inline void TraceContours(const Heightfield& hf, const std::vector<uint32_t>& region,
+                          uint32_t regionCount, std::vector<Contour>& contours) {
+    const int w = hf.w, h = hf.h;
+    contours.clear();
+
+    // inReg(R, x, z): is cell (x,z) in-grid AND region[cell]==R? (out-of-bounds = not in region).
+    auto inReg = [&](uint32_t R, int x, int z) -> bool {
+        if (x < 0 || z < 0 || x >= w || z >= h) return false;
+        return region[(size_t)(z * w + x)] == R;
+    };
+
+    // The 4 headings as (dx,dz): 0:+x, 1:+z, 2:-x, 3:-z. For a heading d walking an edge with the
+    // in-region cell on its RIGHT, the cell on the right of the heading is at the offset rightCell[d]
+    // relative to the edge's "lower-left" corner convention used below.
+    const int dx[4] = {1, 0, -1, 0};
+    const int dz[4] = {0, 1, 0, -1};
+
+    for (uint32_t R = 1u; R <= regionCount; ++R) {
+        // Find the lowest-cellId cell in region R (ascending z, then x).
+        int sx = -1, sz = -1;
+        for (int z = 0; z < h && sx < 0; ++z)
+            for (int x = 0; x < w; ++x)
+                if (region[(size_t)(z * w + x)] == R) { sx = x; sz = z; break; }
+        if (sx < 0) continue;   // region id with no cells (shouldn't happen for dense ids) -> skip.
+
+        // Start at the TOP-LEFT corner of the start cell, heading +x along its top edge. Because the
+        // start cell is the lowest cellId in R, the cell ABOVE it (z-1) is NOT in R, so this top edge
+        // IS a boundary edge with the region cell below-right -> the in-region cell sits on the RIGHT
+        // of the +x heading. (Corner coords: cell (cx,cz) top-left corner is (cx,cz).)
+        const int startX = sx, startZ = sz;
+        int curX = startX, curZ = startZ;
+        int dir = 0;   // +x
+        Contour c;
+        c.region = R;
+
+        // Walk until we return to (startX,startZ) heading +x again (a full loop). A guard bound caps
+        // the step count (perimeter <= 2*(w+h)*#cells, generously 8*w*h) so a logic bug can't hang.
+        const int maxSteps = 8 * (w * h) + 16;
+        int lastDir = -1;
+        for (int step = 0; step < maxSteps; ++step) {
+            // Emit a vertex at the current corner whenever the heading just changed (a real corner).
+            if (dir != lastDir) {
+                c.verts.push_back(ContourVertex{curX, curZ});
+                lastDir = dir;
+            }
+            // Advance one unit along the heading to the next corner.
+            curX += dx[dir];
+            curZ += dz[dir];
+            // Terminate when we are back at the start corner about to repeat the first edge.
+            if (curX == startX && curZ == startZ) break;
+
+            // Decide the next heading. Walking heading dir with the region on the RIGHT: examine the
+            // two cells incident to the corner we just reached that determine the next boundary edge.
+            // We pick the next dir by the fixed wall-follow priority: LEFT, STRAIGHT, RIGHT, BACK,
+            // choosing the first whose RIGHT-side cell is in-region and LEFT-side cell is out.
+            // For a heading, the cell on the right of the edge ending at corner (curX,curZ) and the
+            // cell on the left are computed from the heading. We test candidate headings in order
+            // {turnRight, straight, turnLeft} relative to dir — this hugs the wall clockwise (region
+            // on the right) and is the FIXED, deterministic turn order.
+            //   turnRight = (dir+1)&3, straight = dir, turnLeft = (dir+3)&3.
+            // A heading nd is VALID iff the cell to its right is in-region and the cell to its left is
+            // out-of-region (a boundary edge with the wall on the right).
+            auto edgeRightLeftCells = [&](int nd, int ex, int ez, int& rcx, int& rcz, int& lcx, int& lcz) {
+                // The edge starts at corner (ex,ez) heading nd. The cell on the RIGHT and LEFT of that
+                // directed edge (corner-lattice convention: cell (cx,cz) spans corners (cx,cz)-(cx+1,cz+1)).
+                if (nd == 0) {        // +x : right cell is below the edge (z), left is above (z-1)
+                    rcx = ex;     rcz = ez;     lcx = ex;     lcz = ez - 1;
+                } else if (nd == 1) { // +z : right cell is left of the edge (x-1), left is right (x)
+                    rcx = ex - 1; rcz = ez;     lcx = ex;     lcz = ez;
+                } else if (nd == 2) { // -x : right cell is above (z-1), left is below (z)
+                    rcx = ex - 1; rcz = ez - 1; lcx = ex - 1; lcz = ez;
+                } else {              // -z : right cell is right (x), left is left (x-1)
+                    rcx = ex;     rcz = ez - 1; lcx = ex - 1; lcz = ez - 1;
+                }
+            };
+            const int turnRight = (dir + 1) & 3;
+            const int straight  = dir;
+            const int turnLeft  = (dir + 3) & 3;
+            const int cand[3] = {turnRight, straight, turnLeft};
+            int nextDir = (dir + 2) & 3;   // default = turn back (only if nothing else valid)
+            for (int k = 0; k < 3; ++k) {
+                int rcx, rcz, lcx, lcz;
+                edgeRightLeftCells(cand[k], curX, curZ, rcx, rcz, lcx, lcz);
+                if (inReg(R, rcx, rcz) && !inReg(R, lcx, lcz)) { nextDir = cand[k]; break; }
+            }
+            dir = nextDir;
+        }
+        contours.push_back(std::move(c));
+    }
+}
+
+// ----- PerpDistSq: integer perpendicular-distance-SQUARED of point p from segment a->b -------------
+// Returns (cross^2) where cross = Cross2(a,b,p) — i.e. (2*area)^2 — and the segment's squared length
+// dd = (bx-ax)^2 + (bz-az)^2 via the out param. The true perpendicular distance squared is
+// cross^2 / dd; Douglas–Peucker compares cross^2 vs maxError^2 * dd (cross-multiplied, so NO division,
+// NO sqrt, pure int32 for the bounded grid). Degenerate a==b (dd==0) -> returns the squared point
+// distance |p-a|^2 (so a zero-length "segment" still simplifies sanely). Pure int32 (overflow bound
+// above). The shader copies THIS verbatim.
+inline int64_t PerpDistSqNum(const ContourVertex& a, const ContourVertex& b, const ContourVertex& p,
+                             int32_t& dd) {
+    dd = (b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z);
+    if (dd == 0) {
+        const int32_t ex = p.x - a.x, ez = p.z - a.z;
+        return (int64_t)(ex * ex + ez * ez);   // |p-a|^2 (still int32 magnitude; widened only to match)
+    }
+    const int32_t cr = Cross2(a.x, a.z, b.x, b.z, p.x, p.z);
+    return (int64_t)cr * (int64_t)cr;          // cross^2 (the perpendicular-dist^2 numerator)
+}
+
+// ----- SimplifyContour: integer Douglas–Peucker (perpendicular-distance-squared) ------------------
+// Simplify a closed integer contour loop with an integer perpendicular-distance test vs maxError
+// (compared SQUARED: keep a vertex iff its perpendicular-dist^2 from the chord exceeds maxError^2, so
+// NO sqrt). A closed loop is split at its two extreme anchors first (the lowest-index vertex + the
+// vertex farthest from it), then each open span is Douglas–Peucker'd with an EXPLICIT fixed-order
+// stack (push [hi,lo]; pop, find the max-deviation index in (lo,hi), TIE -> LOWEST index; if its
+// dist^2 > maxError^2*dd keep it + recurse both halves, else drop all interior). A minimum of 3
+// vertices is kept (a triangle is the smallest polygon). Deterministic by the fixed anchor choice +
+// fixed stack order + lowest-index tie-break. Pure int32. The shader copies THIS verbatim.
+inline void SimplifyContour(const std::vector<ContourVertex>& in, int32_t maxError,
+                            std::vector<ContourVertex>& out) {
+    out.clear();
+    const int n = (int)in.size();
+    if (n <= 3) { out = in; return; }          // already minimal (or degenerate) -> keep as-is.
+    const int64_t err2 = (int64_t)maxError * (int64_t)maxError;
+
+    // The two fixed anchors of the closed loop: index 0 (the lowest-index vertex, deterministic) and
+    // the index FARTHEST (max squared distance) from vertex 0 (tie -> lowest index). These split the
+    // loop into two open chains DP simplifies independently.
+    int far = 0; int64_t farD = -1;
+    for (int i = 1; i < n; ++i) {
+        const int32_t ex = in[(size_t)i].x - in[0].x, ez = in[(size_t)i].z - in[0].z;
+        const int64_t d = (int64_t)(ex * ex + ez * ez);
+        if (d > farD) { farD = d; far = i; }   // strict > -> ties keep the LOWEST index.
+    }
+
+    // keep[] marks which input vertices survive. Anchors 0 and far are always kept.
+    std::vector<uint8_t> keep((size_t)n, 0u);
+    keep[0] = 1u; keep[(size_t)far] = 1u;
+
+    // DP a half-open chain [lo..hi] (endpoints fixed-kept) via an explicit stack of (lo,hi) spans.
+    // The chord endpoint `hi` may be `n` (the loop-close anchor) -> it maps to vertex 0 (chordVert).
+    auto chordVert = [&](int idx) -> const ContourVertex& { return (idx >= n) ? in[0] : in[(size_t)idx]; };
+    auto dpChain = [&](int lo, int hi) {
+        // Stack of index pairs; process in a FIXED order (LIFO, push order pinned) -> deterministic.
+        std::vector<std::pair<int,int>> stack;
+        stack.push_back({lo, hi});
+        while (!stack.empty()) {
+            const auto seg = stack.back(); stack.pop_back();
+            const int a = seg.first, b = seg.second;
+            if (b <= a + 1) continue;          // no interior vertices.
+            // Find the interior index of MAX perpendicular-dist^2 from the chord (in[a]->chordVert(b));
+            // the comparison is cross-multiplied (num > err2*dd) to stay integer. TIE -> LOWEST index.
+            int bestIdx = -1; int64_t bestNum = 0; int32_t bestDd = 1;
+            for (int i = a + 1; i < b; ++i) {
+                int32_t dd;
+                const int64_t num = PerpDistSqNum(in[(size_t)a], chordVert(b), in[(size_t)i], dd);
+                // Compare num/dd > bestNum/bestDd as num*bestDd > bestNum*dd (positive denominators).
+                if (bestIdx < 0 ||
+                    (int64_t)num * (int64_t)bestDd > (int64_t)bestNum * (int64_t)dd) {
+                    bestIdx = i; bestNum = num; bestDd = dd;
+                }
+            }
+            if (bestIdx < 0) continue;
+            // Keep it iff its perpendicular-dist^2 exceeds maxError^2: num/dd > err2  <=>  num > err2*dd.
+            if (bestNum > err2 * (int64_t)bestDd) {
+                keep[(size_t)bestIdx] = 1u;
+                // Push the two halves; pinned push order (LOWER half last -> popped FIRST) so the
+                // traversal order is fixed + deterministic.
+                stack.push_back({bestIdx, b});
+                stack.push_back({a, bestIdx});
+            }
+        }
+    };
+    dpChain(0, far);
+    dpChain(far, n);   // the second chain wraps far..n-1..back-to-0; index n maps to vertex 0 below.
+
+    // The far..end chain's far endpoint is `far`, its other endpoint is vertex 0 (the loop close).
+    // dpChain(far, n) treated index n as vertex 0 conceptually; emit kept vertices in [0,n) order.
+    for (int i = 0; i < n; ++i)
+        if (keep[(size_t)i]) out.push_back(in[(size_t)i]);
+
+    // Guarantee >= 3 vertices: if simplification collapsed too far (e.g. a near-collinear loop), fall
+    // back to keeping evenly-spaced anchors from the input (deterministic) until 3 remain.
+    if ((int)out.size() < 3) {
+        out.clear();
+        keep.assign((size_t)n, 0u);
+        keep[0] = 1u;
+        keep[(size_t)(n / 3)] = 1u;
+        keep[(size_t)((2 * n) / 3)] = 1u;
+        for (int i = 0; i < n; ++i) if (keep[(size_t)i]) out.push_back(in[(size_t)i]);
+    }
+}
+
+// ----- BuildPolyMesh: ear-clip triangulation + per-edge cross-poly adjacency ----------------------
+// Triangulate each simplified contour into convex polygons (triangles — convex by construction) by
+// ear-clipping, then build per-triangle-edge ADJACENCY (two polys sharing an undirected edge are
+// neighbours; a contour-boundary edge has no neighbour). The ear-clip repeatedly clips the
+// LOWEST-index valid EAR: an ear is a convex vertex (relative to the contour's winding) whose triangle
+// (prev,cur,next) contains NO OTHER contour vertex (the integer Cross2 orientation + point-in-triangle
+// tests — the PointInTriXZ form). Deterministic by the fixed lowest-index ear order. Pure int32.
+//
+// Output `polys`: all triangles across all contours, laid out CONTOUR BY CONTOUR (the count->scan->emit
+// ordering: each contour contributes (vertexCount-2) triangles; offsets are implicit in the emit
+// order). poly.idx[] are indices into THAT contour's simplified vertex list; poly.nbr[] are GLOBAL
+// poly ids (into `polys`). The shader copies THIS verbatim.
+//
+// Adjacency: after triangulating a contour, every directed edge (a->b) of every triangle is recorded;
+// two triangles sharing the UNDIRECTED edge {a,b} (one as a->b, the other as b->a) are neighbours.
+// Adjacency is built PER CONTOUR (a contour is a single simple polygon; triangles only share edges
+// within their own contour). The shared diagonal of a quad -> the two triangles are mutual neighbours.
+inline void BuildPolyMesh(const std::vector<Contour>& contours, std::vector<Poly>& polys) {
+    polys.clear();
+
+    for (const Contour& c : contours) {
+        const std::vector<ContourVertex>& v = c.verts;
+        const int n = (int)v.size();
+        if (n < 3) continue;   // not a polygon (shouldn't happen post-SimplifyContour).
+
+        const uint32_t firstPolyId = (uint32_t)polys.size();   // base for this contour's triangles.
+
+        // Determine the contour's winding (signed area sign) so "convex" is winding-relative. Shoelace
+        // via Cross2 sum from vertex 0.
+        int64_t area2 = 0;
+        for (int i = 1; i + 1 < n; ++i)
+            area2 += (int64_t)Cross2(v[0].x, v[0].z, v[(size_t)i].x, v[(size_t)i].z,
+                                     v[(size_t)(i + 1)].x, v[(size_t)(i + 1)].z);
+        // ccw = true if the loop is counter-clockwise (area2 > 0). For a convex vertex, the turn
+        // prev->cur->next has the SAME sign as the loop winding.
+        const int windSign = (area2 > 0) ? 1 : -1;
+
+        // Remaining vertex indices (into v), in order; clipped as ears are removed.
+        std::vector<int> rem((size_t)n);
+        for (int i = 0; i < n; ++i) rem[(size_t)i] = i;
+
+        // pointInTri(a,b,cc, p): is corner p strictly-or-on inside triangle (a,b,cc)? Uses the NAV1
+        // PointInTriXZ sign discipline (all edge-cross signs consistent with the winding).
+        auto pointInTri = [&](const ContourVertex& A, const ContourVertex& B, const ContourVertex& C,
+                              const ContourVertex& P) -> bool {
+            const int32_t d0 = Cross2(A.x, A.z, B.x, B.z, P.x, P.z);
+            const int32_t d1 = Cross2(B.x, B.z, C.x, C.z, P.x, P.z);
+            const int32_t d2 = Cross2(C.x, C.z, A.x, A.z, P.x, P.z);
+            const bool anyNeg = (d0 < 0) || (d1 < 0) || (d2 < 0);
+            const bool anyPos = (d0 > 0) || (d1 > 0) || (d2 > 0);
+            return !(anyNeg && anyPos);   // inside (or on an edge) iff signs are consistent.
+        };
+
+        // Triangles produced for THIS contour: each is the triple of contour-local vertex indices.
+        std::vector<std::array<int, 3>> tris;
+
+        // Ear-clip: while >3 remain, find the LOWEST-index valid ear among rem[] and clip it.
+        int guard = 0;
+        const int guardMax = n * n + 16;
+        while ((int)rem.size() > 3 && guard++ < guardMax) {
+            const int m = (int)rem.size();
+            int earAt = -1;   // position in rem[] of the lowest-index valid ear.
+            for (int i = 0; i < m; ++i) {
+                const int ip = rem[(size_t)((i + m - 1) % m)];
+                const int ic = rem[(size_t)i];
+                const int in_ = rem[(size_t)((i + 1) % m)];
+                const ContourVertex& A = v[(size_t)ip];
+                const ContourVertex& B = v[(size_t)ic];
+                const ContourVertex& C = v[(size_t)in_];
+                // Convex iff the turn A->B->C matches the loop winding (cross sign == windSign).
+                const int32_t cr = Cross2(A.x, A.z, B.x, B.z, C.x, C.z);
+                if (cr == 0) continue;                       // collinear -> not a valid ear.
+                if ((cr > 0 ? 1 : -1) != windSign) continue; // reflex -> not an ear.
+                // No OTHER remaining vertex inside triangle (A,B,C).
+                bool clean = true;
+                for (int j = 0; j < m && clean; ++j) {
+                    const int vj = rem[(size_t)j];
+                    if (vj == ip || vj == ic || vj == in_) continue;
+                    if (pointInTri(A, B, C, v[(size_t)vj])) clean = false;
+                }
+                if (clean) { earAt = i; break; }             // LOWEST-index valid ear.
+            }
+            if (earAt < 0) {
+                // No ear found (degenerate / collinear contour) -> fan-triangulate the remainder from
+                // rem[0] (deterministic fallback) and stop.
+                break;
+            }
+            const int ip = rem[(size_t)((earAt + m - 1) % m)];
+            const int ic = rem[(size_t)earAt];
+            const int in_ = rem[(size_t)((earAt + 1) % m)];
+            tris.push_back({ip, ic, in_});
+            rem.erase(rem.begin() + earAt);
+        }
+        // Emit the final triangle (or fan the leftover if the ear search bailed).
+        if ((int)rem.size() == 3) {
+            tris.push_back({rem[0], rem[1], rem[2]});
+        } else if ((int)rem.size() > 3) {
+            for (int i = 1; i + 1 < (int)rem.size(); ++i)
+                tris.push_back({rem[0], rem[(size_t)i], rem[(size_t)(i + 1)]});
+        }
+
+        // Append the triangles as Polys (neighbours filled below).
+        for (const auto& t : tris) {
+            Poly p{};
+            p.idx[0] = (uint32_t)t[0]; p.idx[1] = (uint32_t)t[1]; p.idx[2] = (uint32_t)t[2];
+            p.nbr[0] = kNoNeighbour; p.nbr[1] = kNoNeighbour; p.nbr[2] = kNoNeighbour;
+            p.region = c.region; p._pad = 0u;
+            polys.push_back(p);
+        }
+
+        // Per-edge adjacency WITHIN this contour: for each pair of this contour's triangles, an edge
+        // e of poly P (idx[e]->idx[(e+1)%3]) matches the REVERSED edge f of poly Q -> neighbours.
+        const uint32_t lastPolyId = (uint32_t)polys.size();
+        for (uint32_t pi = firstPolyId; pi < lastPolyId; ++pi)
+            for (int e = 0; e < 3; ++e) {
+                if (polys[pi].nbr[e] != kNoNeighbour) continue;
+                const uint32_t a = polys[pi].idx[e];
+                const uint32_t b = polys[pi].idx[(e + 1) % 3];
+                for (uint32_t qi = firstPolyId; qi < lastPolyId && polys[pi].nbr[e] == kNoNeighbour; ++qi) {
+                    if (qi == pi) continue;
+                    for (int f = 0; f < 3; ++f) {
+                        const uint32_t qa = polys[qi].idx[f];
+                        const uint32_t qb = polys[qi].idx[(f + 1) % 3];
+                        if (qa == b && qb == a) {            // reversed shared edge -> neighbours.
+                            polys[pi].nbr[e] = qi;
+                            polys[qi].nbr[f] = pi;
+                            break;
+                        }
+                    }
+                }
+            }
+    }
 }
 
 }  // namespace hf::nav
