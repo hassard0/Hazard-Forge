@@ -209,6 +209,204 @@ int main() {
               "two GatherBodyParticles builds are byte-identical (deterministic)");
     }
 
+    // ============================================================================================
+    // ============ Slice CP2 — BUOYANCY + DRAG (fluid->body, the CRUX) tests ======================
+    // ============================================================================================
+    const fpx::FxVec3 kGravityDown{0, -9 * (int)kOne, 0};   // a clean integer downward gravity (|g|=9.0)
+    const fx kDt = kOne / 60;
+
+    // ---- AccumBodyForces: a body over a HAND-LAID gathered list -> the EXACT Q16.16 vel delta. ----
+    // The body's gathered list is constructed directly via a CoupleQuery so the reduction order + arithmetic
+    // are pinned independently of the CP1 grid query. We re-derive the buoyancy + drag math by hand and assert
+    // the exact resulting velocity (NO tolerance — the integer bar).
+    {
+        // 3 fluid particles with KNOWN velocities (the gathered set). vFluidAvg = the fixed-order int sum/count.
+        std::vector<fluid::FluidParticle> particles(3);
+        particles[0].vel = fpx::FxVec3{0,           0, 0};
+        particles[1].vel = fpx::FxVec3{2 * (int)kOne, 0, 0};   // vx = 2.0
+        particles[2].vel = fpx::FxVec3{4 * (int)kOne, 0, 0};   // vx = 4.0
+        // -> Σvx = 6.0, count 3 -> vFluidAvg.x = 2.0 (exact integer divide), vFluidAvg.y=z=0.
+
+        couple::CoupleWorld world;
+        world.particles = particles;
+        world.gravity   = kGravityDown;
+        world.dt        = kDt;
+        world.bodies    = {BodyAt(0, 0, 0, 2)};   // invMass=kOne, dynamic, radius 2
+        // A hand-laid CSR: body 0 gathers particles {0,1,2} in ascending order.
+        couple::CoupleQuery q;
+        q.bodyStart     = {0u, 3u};
+        q.bodyParticles = {0u, 1u, 2u};
+
+        // The body starts at rest. Apply ONE AccumBodyForces.
+        couple::AccumBodyForces(world, q, kDt);
+
+        // Hand-computed expected (mirror of the header math, the same fxmul/FxScale ops):
+        // up = -normalize((0,-9,0)) = (0,1,0).
+        const fpx::FxVec3 up = fpx::FxNormalize(fpx::FxVec3{0, 9 * (int)kOne, 0});
+        const fx countFx = (fx)(3 << fpx::kFrac);
+        const fx buoyMag = fpx::fxmul(couple::kBuoyPerParticle, countFx);
+        const fpx::FxVec3 fBuoy = fpx::FxScale(up, buoyMag);
+        const fpx::FxVec3 vFluidAvg{2 * (int)kOne, 0, 0};
+        const fpx::FxVec3 dv = fpx::FxSub(vFluidAvg, fpx::FxVec3{0,0,0});
+        const fpx::FxVec3 fDrag{fpx::fxmul(couple::kDrag, dv.x), fpx::fxmul(couple::kDrag, dv.y),
+                                fpx::fxmul(couple::kDrag, dv.z)};
+        const fpx::FxVec3 fTotal = fpx::FxAdd(fBuoy, fDrag);
+        const fpx::FxVec3 expectVel = fpx::FxScale(fpx::FxScale(fTotal, kOne /*invMass*/), kDt);
+
+        const fpx::FxVec3 got = world.bodies[0].vel;
+        check(got.x == expectVel.x && got.y == expectVel.y && got.z == expectVel.z,
+              "AccumBodyForces: exact Q16.16 vel delta (buoyancy up + drag toward fluid avg)");
+        // Sanity on direction: buoyancy is UP (vel.y > 0) and drag pulls toward the fluid's +x flow (vel.x>0).
+        check(got.y > 0, "AccumBodyForces: buoyancy pushes the body UP (vel.y > 0)");
+        check(got.x > 0, "AccumBodyForces: drag pulls the body toward the fluid's +x velocity (vel.x > 0)");
+    }
+
+    // ---- buoyancy up is PROPORTIONAL to the gathered count (the displaced-volume Archimedes proxy). ----
+    {
+        // Two bodies, identical except one gathers 2 particles, the other gathers 4 (still water, vel 0 ->
+        // drag is 0, so the ONLY force is buoyancy). The 4-particle body must get ~2x the upward vel.
+        std::vector<fluid::FluidParticle> particles(4);   // all vel = 0 (still water)
+        couple::CoupleWorld world;
+        world.particles = particles;
+        world.gravity   = kGravityDown;
+        world.bodies    = {BodyAt(0, 0, 0, 2), BodyAt(10, 0, 0, 2)};
+        couple::CoupleQuery q;
+        q.bodyStart     = {0u, 2u, 6u};          // body 0 gathers 2, body 1 gathers 4
+        q.bodyParticles = {0u, 1u, 0u, 1u, 2u, 3u};
+
+        couple::AccumBodyForces(world, q, kDt);
+        const fx vy2 = world.bodies[0].vel.y;    // 2-particle buoyancy
+        const fx vy4 = world.bodies[1].vel.y;    // 4-particle buoyancy
+        check(vy2 > 0 && vy4 > 0, "buoyancy: both bodies pushed up");
+        check(vy4 == 2 * vy2, "buoyancy up is EXACTLY proportional to the gathered count (4 == 2x2)");
+        // Drag is zero in still water (vFluidAvg == 0, body at rest) -> no horizontal velocity.
+        check(world.bodies[0].vel.x == 0 && world.bodies[1].vel.x == 0,
+              "still water (vel 0, body at rest) -> drag contributes 0");
+    }
+
+    // ---- drag DAMPS: a moving body in still water gets a velocity correction TOWARD the fluid (opposing
+    //      its own motion) — and a body gathering 0 particles is untouched (free-fall). ----
+    {
+        std::vector<fluid::FluidParticle> particles(2);   // still water (vel 0)
+        couple::CoupleWorld world;
+        world.particles = particles;
+        world.gravity   = kGravityDown;
+        world.bodies    = {BodyAt(0, 0, 0, 2), BodyAt(50, 0, 0, 2)};   // body1 far away -> gathers 0
+        world.bodies[0].vel = fpx::FxVec3{3 * (int)kOne, 0, 0};        // moving +x at 3.0
+        const fpx::FxVec3 vel1Before = world.bodies[1].vel;
+        couple::CoupleQuery q;
+        q.bodyStart     = {0u, 2u, 2u};          // body 0 gathers 2, body 1 gathers 0
+        q.bodyParticles = {0u, 1u};
+
+        couple::AccumBodyForces(world, q, kDt);
+        // Drag opposes the body's +x motion (fluid at rest) -> the x-velocity delta is NEGATIVE.
+        check(world.bodies[0].vel.x < 3 * (int)kOne, "drag damps the moving body (vel.x reduced toward fluid)");
+        // The body that gathered 0 particles is UNTOUCHED (no buoyancy, no drag).
+        check(world.bodies[1].vel.x == vel1Before.x && world.bodies[1].vel.y == vel1Before.y,
+              "a body gathering 0 particles is untouched (free-fall, AccumBodyForces no-op)");
+    }
+
+    // ---- a STATIC (non-dynamic) body is untouched even when it gathers particles. ----
+    {
+        std::vector<fluid::FluidParticle> particles(3);
+        couple::CoupleWorld world;
+        world.particles = particles;
+        world.gravity   = kGravityDown;
+        fpx::FxBody stat = BodyAt(0, 0, 0, 2);
+        stat.flags   = 0;       // NOT dynamic
+        stat.invMass = 0;       // static / infinite mass
+        world.bodies = {stat};
+        const fpx::FxVec3 velBefore = world.bodies[0].vel;
+        couple::CoupleQuery q;
+        q.bodyStart     = {0u, 3u};
+        q.bodyParticles = {0u, 1u, 2u};
+        couple::AccumBodyForces(world, q, kDt);
+        check(world.bodies[0].vel.x == velBefore.x && world.bodies[0].vel.y == velBefore.y &&
+              world.bodies[0].vel.z == velBefore.z, "a static body is untouched by buoyancy/drag");
+    }
+
+    // ---- StepCoupleBuoyancy: a body dropped above a pool SETTLES to a float line ABOVE the bed; the
+    //      buoy=0 control SINKS to the bed. Deterministic + body-order-independent. ----
+    {
+        // A still-water pool (a deep slab of particles at the ground) + a body dropped above it. The pool is
+        // DEEP (y in [0,7]) so the body has room to settle at a PARTIAL-submersion float line WELL ABOVE the
+        // bed (groundY + radius = 2.0) — a real float line, not a bed rest.
+        auto buildWorld = [&](int bodyX, fx buoyTestY) -> couple::CoupleWorld {
+            (void)buoyTestY;
+            couple::CoupleWorld world;
+            // 9x9x8 slab of particles (y in [0,7], a deep pool) at x,z=0..8.
+            for (int py = 0; py <= 7; ++py)
+                for (int pz = 0; pz <= 8; ++pz)
+                    for (int px = 0; px <= 8; ++px)
+                        world.particles.push_back(ParticleAt(px, py, pz));
+            world.kernel  = KernelWithH(kOne);
+            world.gravity = kGravityDown;
+            world.dt      = kDt;
+            world.groundY = 0;
+            // The body dropped above the pool centre (x=4,z=4), radius 2.
+            world.bodies = {BodyAt(bodyX, 12, 4, 2)};
+            return world;
+        };
+
+        const fx kBedLine = (fx)(2 * (int)kOne);   // groundY + radius = 0 + 2.0 (the body's surface-rest line)
+        const int kSteps = 240;
+
+        // (a) buoyancy ON: the body settles ABOVE the bed (it floats) and is bounded (it did not fly out).
+        couple::CoupleWorld floated = buildWorld(4, 0);
+        couple::StepCoupleBuoyancySteps(floated, kDt, kSteps);
+        const fx floatY = couple::MeasureFloatLine(floated);
+        check(floatY > kBedLine + kOne / 4, "buoyancy ON: the body FLOATS above the bed by a clear margin");
+        check(floatY < (fx)(12 * (int)kOne), "buoyancy ON: the float line is bounded (did NOT fly out)");
+
+        // (b) buoy=0 CONTROL: a kBuoyPerParticle=0 body sinks to the bed (floatY == groundY + radius). We
+        // emulate the control by setting invMass=0 buoyancy? No — the control must keep mass but kill buoyancy.
+        // The header's coefficient is a compile-time constant; the control here is a body that gathers 0
+        // particles for the WHOLE fall (placed far in x so the pool query never reaches it) -> pure free-fall
+        // + ground clamp -> it rests at the bed groundY + radius. This is the "no buoyancy work" baseline.
+        couple::CoupleWorld sunk = buildWorld(40, 0);   // far from the pool -> gathers 0 -> no buoyancy
+        couple::StepCoupleBuoyancySteps(sunk, kDt, kSteps);
+        const fx sunkY = couple::MeasureFloatLine(sunk);
+        check(sunkY == kBedLine, "buoy=0 control (no gathered particles): SINKS to the bed (groundY + radius)");
+        check(floatY > sunkY, "buoyancy does work: the floated body settles ABOVE the sunk control");
+
+        // (c) determinism: two runs of the SAME scene -> byte-identical body state.
+        couple::CoupleWorld a = buildWorld(4, 0), b = buildWorld(4, 0);
+        couple::StepCoupleBuoyancySteps(a, kDt, kSteps);
+        couple::StepCoupleBuoyancySteps(b, kDt, kSteps);
+        check(std::memcmp(&a.bodies[0], &b.bodies[0], sizeof(fpx::FxBody)) == 0,
+              "StepCoupleBuoyancy is deterministic (two runs byte-identical)");
+    }
+
+    // ---- body-order independence: two bodies in DISJOINT pools settle to the SAME float line regardless of
+    //      the order they appear in world.bodies (the per-body reduction is independent across bodies). ----
+    {
+        auto buildTwo = [&](bool swapped) -> couple::CoupleWorld {
+            couple::CoupleWorld world;
+            // Two disjoint shallow pools: pool A around x=4, pool B around x=24 (well separated).
+            for (int py = 0; py <= 2; ++py)
+                for (int pz = 0; pz <= 8; ++pz)
+                    for (int px = 0; px <= 8; ++px) world.particles.push_back(ParticleAt(px, py, pz));
+            for (int py = 0; py <= 2; ++py)
+                for (int pz = 0; pz <= 8; ++pz)
+                    for (int px = 20; px <= 28; ++px) world.particles.push_back(ParticleAt(px, py, pz));
+            world.kernel  = KernelWithH(kOne);
+            world.gravity = kGravityDown;
+            world.dt      = kDt;
+            world.groundY = 0;
+            const fpx::FxBody A = BodyAt(4, 8, 4, 2);
+            const fpx::FxBody B = BodyAt(24, 8, 4, 2);
+            world.bodies = swapped ? std::vector<fpx::FxBody>{B, A} : std::vector<fpx::FxBody>{A, B};
+            return world;
+        };
+        couple::CoupleWorld w0 = buildTwo(false), w1 = buildTwo(true);
+        couple::StepCoupleBuoyancySteps(w0, kDt, 200);
+        couple::StepCoupleBuoyancySteps(w1, kDt, 200);
+        // body A is index 0 in w0, index 1 in w1; body B is index 1 in w0, index 0 in w1.
+        check(std::memcmp(&w0.bodies[0], &w1.bodies[1], sizeof(fpx::FxBody)) == 0 &&
+              std::memcmp(&w0.bodies[1], &w1.bodies[0], sizeof(fpx::FxBody)) == 0,
+              "buoyancy is body-order-independent (each body's reduction is independent)");
+    }
+
     if (g_fail == 0) std::printf("couple_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

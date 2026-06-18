@@ -54,6 +54,9 @@ using fpx::fx;
 using fpx::FxVec3;
 using fpx::FxCell;
 using fpx::FloorDiv;
+using fpx::FxAdd;     // Slice CP2: the buoyancy/drag vector toolbox (reused from fpx.h, no new primitives)
+using fpx::FxSub;
+using fpx::FxScale;
 inline constexpr int kFrac = fpx::kFrac;   // Q16.16 fractional bits (== fpx::kFrac, MUST match the shader)
 inline constexpr fx  kOne  = fpx::kOne;    // 1.0 in Q16.16 (65536)
 
@@ -207,6 +210,128 @@ inline uint32_t MaxPerBody(const CoupleQuery& q) {
         if (c > m) m = c;
     }
     return m;
+}
+
+// ===== Slice CP2 — BUOYANCY + DRAG (fluid->body, the CRUX) ==========================================
+// THE FIRST MOMENTUM EXCHANGE of FLAGSHIP #11: each fpx::FxBody sums, over its CP1 gathered fluid-particle
+// list (in the FIXED CP1 emit order, ascending), a BUOYANT impulse (the displaced-fluid restoring force, up
+// = -normalize(gravity), proportional to the gathered count = the displaced volume) + a DRAG impulse (toward
+// the local fluid velocity, which CP2 damps since the fluid is held STATIC), and floats/sinks/damps. ONE-WAY
+// for now (fluid -> body; the body->fluid reaction is CP3). LINEAR only — a sphere body's buoyancy acts
+// through its centre (no torque), so angVel is untouched until CP4's non-uniform coupling.
+//
+// THE int64 DECISION (the GR3/FL4 split): the buoyancy/drag math is int64 (fxmul/fxdiv/FxScale) ->
+// shaders/couple_buoyancy.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) + the Metal
+// --couple-buoyancy showcase runs the CPU StepCoupleBuoyancy (byte-identical by construction). The CP1
+// grid-hash query (re-run each step) stays int32 MSL-native.
+//
+// THE CRUX — the order-sensitive body-force reduction: summing N fluid-particle impulses onto one body is a
+// reduction; the integer zero-diff bar demands a PINNED summation order. CP2 sums each body's contributions
+// in the FIXED CP1 gathered order (bodyParticles[bodyStart[i] .. bodyStart[i+1]), ascending). The GPU
+// dispatch is ONE THREAD PER BODY (a serial inner loop over that body's short gathered list) -> multi-thread
+// OVER bodies, NOT over particles. With a TINY body count (1-few, << the ~2s watchdog), no body's inner loop
+// approaches the single-thread TDR ceiling that sank CL3/FPX3. (Integer addition is exact regardless of
+// order, but the fixed order keeps it provably bit-identical to the CPU reference and future-proof.) IF body
+// counts ever scale up, a deterministic integer atomic-add reduction would be needed — explicitly OUT of
+// scope for CP1-CP6 (flag loudly, like the swraster 64-bit-atomics caveat).
+
+// The host-snapped Q16.16 coupling coefficients. Tuned so a unit-mass FxBody (invMass=kOne, radius 2)
+// dropped above the CP1 pool settles at an emergent FLOAT LINE inside the pool (buoyancy ~ gravity) — NOT
+// sunk to the bed, NOT flying out. BUOYANCY: F_buoy per displaced particle, summed over the gathered count,
+// so a deeper (more-submerged) body feels MORE upward force -> a stable equilibrium depth (the Archimedes
+// proxy: displaced volume ∝ gathered count). DRAG: a linear damping toward the (static) fluid's mean
+// velocity, so the body settles instead of oscillating. The float line is EMERGENT/iterative (the GR4/FL4
+// caveat), NOT an exact Archimedes depth.
+//   kBuoyPerParticle = 0.42 (Q16.16): with a ~30-particle submerged gather the upward force ~12.6 >> |g|=9.8
+//     near the surface but the gather SHRINKS as the body rises out of the pool, so it balances gravity at a
+//     partial-submersion float line. (host-snapped: 0.42 * 65536 ~ 27525.)
+//   kDrag = 1.5 (Q16.16): a firm linear damping so the bob settles within K steps instead of ringing.
+inline constexpr fx kBuoyPerParticle = (fx)(0.42 * (double)kOne + 0.5);   // 27525 (Q16.16, ~0.42/particle)
+inline constexpr fx kDrag            = (fx)(1.5  * (double)kOne + 0.5);   // 98304 (Q16.16, ~1.5 damping)
+
+// AccumBodyForces(world, query, dt): the per-body buoyancy+drag impulse accumulate (the FIXED-ORDER
+// reduction). For each DYNAMIC body i (static / non-dynamic skipped), over its CP1 gathered list in ASCENDING
+// order: up = -FxNormalize(gravity); F_buoy = fxmul(kBuoyPerParticle, count<<kFrac) along up (count<<kFrac
+// promotes the integer gathered count to Q16.16 so the buoyant force is kBuoyPerParticle PER displaced
+// particle); vFluidAvg = (Σ particle.vel)/count per axis (the fixed-order int64 sum / the integer count);
+// F_drag = fxmul(kDrag, vFluidAvg - body.vel) per axis; body.vel += FxScale(F_buoy + F_drag, body.invMass)·dt.
+// A body that gathers 0 particles feels no buoyancy/drag (free-fall). LINEAR only (angVel untouched). int64.
+// couple_buoyancy.comp copies THIS body VERBATIM (one thread per body i). Deterministic (fixed gathered order,
+// fixed op order) -> bit-identical to the GPU memcmp.
+inline void AccumBodyForces(CoupleWorld& world, const CoupleQuery& query, fx dt) {
+    const uint32_t bodyCount = (uint32_t)world.bodies.size();
+    // up = -normalize(gravity) (the buoyant direction). gravity 0 -> a deterministic +Y fallback.
+    const FxVec3 up = fpx::FxNormalize(FxVec3{-world.gravity.x, -world.gravity.y, -world.gravity.z});
+    for (uint32_t i = 0; i < bodyCount; ++i) {
+        fpx::FxBody& b = world.bodies[(size_t)i];
+        if (!(b.flags & fpx::kFlagDynamic)) continue;   // static/kinematic -> no buoyancy/drag (the pinned case)
+        const uint32_t s0 = query.bodyStart[(size_t)i];
+        const uint32_t s1 = query.bodyStart[(size_t)i + 1u];
+        const uint32_t count = s1 - s0;
+        if (count == 0u) continue;                      // gathers nothing (out of the pool) -> free-fall
+
+        // BUOYANCY: F_buoy = kBuoyPerParticle * count along up. count<<kFrac promotes the integer count to
+        // Q16.16 so fxmul yields kBuoyPerParticle PER particle (the displaced-volume proxy).
+        const fx countFx = (fx)((int32_t)count << kFrac);
+        const fx buoyMag = fpx::fxmul(kBuoyPerParticle, countFx);
+        const FxVec3 fBuoy = fpx::FxScale(up, buoyMag);
+
+        // DRAG: vFluidAvg = (Σ_j particle[j].vel) / count, summed in the FIXED CP1 gathered (ascending) order.
+        // int64 accumulate (a sum of ~count velocities never overflows int64), then a truncating int64 divide
+        // by the integer count -> deterministic, bit-identical CPU<->shader.
+        int64_t sumX = 0, sumY = 0, sumZ = 0;
+        for (uint32_t s = s0; s < s1; ++s) {
+            const fluid::FluidParticle& p = world.particles[(size_t)query.bodyParticles[(size_t)s]];
+            sumX += (int64_t)p.vel.x;
+            sumY += (int64_t)p.vel.y;
+            sumZ += (int64_t)p.vel.z;
+        }
+        const FxVec3 vFluidAvg{
+            (fx)(sumX / (int64_t)count), (fx)(sumY / (int64_t)count), (fx)(sumZ / (int64_t)count)};
+        // F_drag = kDrag * (vFluidAvg - body.vel) per axis.
+        const FxVec3 dv = FxSub(vFluidAvg, b.vel);
+        const FxVec3 fDrag{fpx::fxmul(kDrag, dv.x), fpx::fxmul(kDrag, dv.y), fpx::fxmul(kDrag, dv.z)};
+
+        // Apply the impulse as a velocity delta: vel += (F_buoy + F_drag) * invMass * dt (linear only).
+        const FxVec3 fTotal = FxAdd(fBuoy, fDrag);
+        const FxVec3 dvel = FxScale(FxScale(fTotal, b.invMass), dt);
+        b.vel = FxAdd(b.vel, dvel);
+    }
+}
+
+// StepCoupleBuoyancy(world, dt): ONE coupled step (the driver — the fluid is held STATIC). (1) re-query the
+// body->fluid neighbour lists from the bodies' CURRENT positions (CP1 GatherBodyParticles) -> (2) accumulate
+// the buoyancy+drag velocity delta (AccumBodyForces) -> (3) IntegrateBody per body (gravity + the buoyancy-
+// adjusted vel — the fpx.h integrate VERBATIM) THEN ResolveGround (the fpx.h RADIUS-AWARE floor: the body's
+// SURFACE rests on the floor at groundY + radius — the fpx.h ground contact VERBATIM). The fluid particles
+// are NOT moved (the reaction is CP3). Over K steps a body dropped above the pool falls, enters, buoyancy
+// builds as it submerges, and it settles to an emergent float line damped by drag (or sinks to the bed
+// groundY + radius if it never gathers particles — the buoy=0 control). Both IntegrateBody + ResolveGround
+// are copied VERBATIM by couple_buoyancy.comp's host driver (the GPU runs the SAME per-step sequence).
+inline void StepCoupleBuoyancy(CoupleWorld& world, fx dt) {
+    const CoupleQuery query = GatherBodyParticles(world);   // CP1 re-query (fluid static -> the pool unchanged)
+    AccumBodyForces(world, query, dt);                      // CP2 buoyancy + drag velocity delta
+    for (fpx::FxBody& b : world.bodies) {                   // fpx.h integrate + radius-aware floor, VERBATIM
+        fpx::IntegrateBody(b, world.gravity, world.groundY, dt);
+        fpx::ResolveGround(b, world.groundY);               // the body SURFACE rests at groundY + radius
+    }
+}
+
+// StepCoupleBuoyancySteps(world, dt, steps): run K StepCoupleBuoyancy steps. The CPU reference the GPU body
+// state memcmp's against byte-for-byte. Pure integer -> two runs byte-identical, cross-backend identical.
+inline void StepCoupleBuoyancySteps(CoupleWorld& world, fx dt, int steps) {
+    for (int s = 0; s < steps; ++s) StepCoupleBuoyancy(world, dt);
+}
+
+// MeasureFloatLine(world): the honest float-line metric — the mean settled body pos.y over the DYNAMIC bodies
+// (a deterministic Q16.16 stat for the float-line proof). 0 dynamic bodies -> 0. The float line is
+// EMERGENT/iterative (the GR4/FL4 caveat), NOT an exact Archimedes depth: the proof asserts the body floats
+// by a margin above the bed (groundY + radius) + is bounded above + is deterministic + two-run byte-identical.
+inline fx MeasureFloatLine(const CoupleWorld& world) {
+    int64_t sum = 0; uint32_t n = 0;
+    for (const fpx::FxBody& b : world.bodies)
+        if (b.flags & fpx::kFlagDynamic) { sum += (int64_t)b.pos.y; ++n; }
+    return n == 0u ? 0 : (fx)(sum / (int64_t)n);
 }
 
 }  // namespace couple
