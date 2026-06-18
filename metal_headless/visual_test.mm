@@ -92,6 +92,7 @@
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
+#include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -18986,6 +18987,333 @@ static int RunCoupleQueryShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CG1 — Deterministic Rigid<->Grain Coupling BODY->GRAIN grid-hash QUERY showcase (--cgrain-query) =
+// The query is PURE INT32 (FloorDiv + the per-axis |body.pos.axis - g.pos.axis| < body.radius BodyGrainAccept
+// = integer divide + abs-compare, NO int64/fxmul/sqrt, NO radial sphere cull), so the reused GR2
+// grain_cell_{count,scan,emit} + the NEW cgrain_body_{count,scan,emit} shaders MSL-gen natively and Metal
+// DISPATCHES THE GPU passes directly: the SAME settled grain bed (GR1 InitGrainBlock 12x4x12=576 grains, 40 GR4
+// StepGrainFriction steps) + the SAME 3 FxBody spheres (two buried, one clear) feed the SAME six passes ->
+// ReadBuffer reads the cell table + per-body query, PROVEN BIT-EXACT vs the CPU couple_grain.h::
+// BuildGrainCellTable + GatherBodyGrains reference (memcmp — the same proofs the Vulkan --cgrain-query-shot
+// runs); all bodies clear -> 0 gathered; two runs byte-identical. The image golden is the integer per-body
+// gathered-grain heat top-down viz, IDENTICAL to the Vulkan path BY CONSTRUCTION. New golden
+// tests/golden/metal/cgrain_query.png; two runs DIFF 0.0000. NO new RHI.
+static int RunCgrainQueryShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgrain = hf::sim::cgrain;
+    namespace grain  = hf::sim::grain;
+    namespace fpx    = hf::sim::fpx;
+
+    // The grain bed + bodies (== the Vulkan --cgrain-query-shot config, verbatim).
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+    const grain::fx kHSearch = grain::kOne + grain::kOne / 2;  // 1.5 (host-snapped Q16.16)
+
+    grain::GrainBlock block;
+    block.W = 12; block.H = 4; block.D = 12;                   // 576 grains
+    block.spacing = grain::kOne;
+    block.radius = kRadius;
+    block.origin = grain::FxVec3{0, (grain::fx)(3 * (int)grain::kOne), 0};
+    std::vector<grain::GrainParticle> grains = grain::InitGrainBlock(block);
+    grain::StepGrainFrictionSteps(grains, {}, kGravity, kDt, kGroundY, kHSearch, grain::kGrainMu, 2, 40);
+
+    auto makeBody = [&](int wx, int wy, int wz, int rUnits) {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(wx * (int)grain::kOne), (fpx::fx)(wy * (int)grain::kOne),
+                            (fpx::fx)(wz * (int)grain::kOne)};
+        b.invMass = grain::kOne; b.flags = fpx::kFlagDynamic;
+        b.radius = (fpx::fx)(rUnits * (int)grain::kOne);
+        return b;
+    };
+    cgrain::CGrainWorld world;
+    world.grains  = grains;
+    world.hSearch = kHSearch;
+    world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+    world.bodies = {makeBody(3, 1, 4, 2), makeBody(8, 1, 7, 2), makeBody(5, 20, 5, 2)};
+    const int kBodyCount = (int)world.bodies.size();
+    const int kGrainCount = (int)world.grains.size();
+
+    // The CPU reference grid + cell table + per-body query (the GPU memcmp's against this).
+    const grain::GrainGrid grid = grain::MakeGrainGrid(world.grains, kHSearch);
+    const uint32_t kCellCount = grain::GrainCellCount(grid);
+    const grain::GrainCellTable cpuTable = grain::BuildGrainCellTable(world.grains, grid);
+    const cgrain::CGrainQuery cpuQuery = cgrain::GatherBodyGrains(world);
+    const uint32_t kTotalGathered = cgrain::CountGathered(cpuQuery);
+    const uint32_t kGatherAlloc = kTotalGathered > 0u ? kTotalGathered : 1u;
+
+    // Image dims (fixed integer top-down transform, == the Vulkan --cgrain-query-shot).
+    const int kPxPerUnit = 22, kMargin = 20, kWorldW = 12, kWorldH = 12;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 GrainParticle mirror (== the Vulkan --cgrain-query-shot GrainParticleGpu): 12 x int32 (48).
+    struct GrainParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+    };
+    static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+    std::vector<GrainParticleGpu> grainsInit((size_t)kGrainCount);
+    for (int i = 0; i < kGrainCount; ++i) {
+        const grain::GrainParticle& p = world.grains[(size_t)i];
+        grainsInit[(size_t)i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+            p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+    }
+    rhi::BufferDesc grainDesc;
+    grainDesc.size = grainsInit.size() * sizeof(GrainParticleGpu);
+    grainDesc.initialData = grainsInit.data();
+    grainDesc.usage = rhi::BufferUsage::Storage;
+    auto grainsBuf = device->CreateBuffer(grainDesc);
+
+    struct CGrainBodyGpu { int32_t bx, by, bz, radius; };
+    static_assert(sizeof(CGrainBodyGpu) == 16, "CGrainBodyGpu std430 layout");
+    std::vector<CGrainBodyGpu> bodiesInit((size_t)kBodyCount);
+    for (int i = 0; i < kBodyCount; ++i) {
+        const fpx::FxBody& b = world.bodies[(size_t)i];
+        bodiesInit[(size_t)i] = CGrainBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.radius};
+    }
+    rhi::BufferDesc bodyDesc;
+    bodyDesc.size = bodiesInit.size() * sizeof(CGrainBodyGpu);
+    bodyDesc.initialData = bodiesInit.data();
+    bodyDesc.usage = rhi::BufferUsage::Storage;
+    auto bodiesBuf = device->CreateBuffer(bodyDesc);
+
+    struct CGrainParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(CGrainParams) == 48, "CGrainParams std430 layout");
+    auto makeParams = [&](int32_t countW, int32_t enabled) {
+        CGrainParams p{};
+        p.grid[0] = kHSearch; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y; p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z; p.dim[3] = countW;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellGrainInit((size_t)kGrainCount, 0u);
+    std::vector<uint32_t> perBodyInit((size_t)kBodyCount, 0u);
+    std::vector<uint32_t> bodyStartInit((size_t)kBodyCount + 1u, 0u);
+    std::vector<uint32_t> bodyGrainInit((size_t)kGatherAlloc, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    auto cellCountPipe = mkPipe("grain_cell_count.comp.gen.metal", "grain_cell_count_main", 3, 64);
+    auto cellScanPipe  = mkPipe("grain_cell_scan.comp.gen.metal", "grain_cell_scan_main", 3, 1);
+    auto cellEmitPipe  = mkPipe("grain_cell_emit.comp.gen.metal", "grain_cell_emit_main", 5, 1);
+    auto bodyCountPipe = mkPipe("cgrain_body_count.comp.gen.metal", "cgrain_body_count_main", 6, 64);
+    auto bodyScanPipe  = mkPipe("cgrain_body_scan.comp.gen.metal", "cgrain_body_scan_main", 3, 1);
+    auto bodyEmitPipe  = mkPipe("cgrain_body_emit.comp.gen.metal", "cgrain_body_emit_main", 7, 64);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGrainGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+    const uint32_t kBodyGroups  = ((uint32_t)kBodyCount + 63u) / 64u;
+
+    auto runQuery = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                        std::vector<uint32_t>& outCellGrains, std::vector<uint32_t>& outBodyStart,
+                        std::vector<uint32_t>& outBodyGrains, std::vector<uint32_t>& outPerBody) {
+        auto cellCountBuf = makeUintBuf(cellCountInit);
+        auto cellStartBuf = makeUintBuf(cellStartInit);
+        auto cellCursorBuf = makeUintBuf(cellCursorInit);
+        auto cellGrainBuf = makeUintBuf(cellGrainInit);
+        auto perBodyBuf = makeUintBuf(perBodyInit);
+        auto bodyStartBuf = makeUintBuf(bodyStartInit);
+        auto bodyGrainBuf = makeUintBuf(bodyGrainInit);
+        CGrainParams grainParams = makeParams(kGrainCount, enabled);
+        CGrainParams bodyParams = makeParams(kBodyCount, enabled);
+        rhi::BufferDesc gpd; gpd.size = sizeof(CGrainParams); gpd.initialData = &grainParams;
+        gpd.usage = rhi::BufferUsage::Storage;
+        auto grainParamsBuf = device->CreateBuffer(gpd);
+        rhi::BufferDesc bpd; bpd.size = sizeof(CGrainParams); bpd.initialData = &bodyParams;
+        bpd.usage = rhi::BufferUsage::Storage;
+        auto bodyParamsBuf = device->CreateBuffer(bpd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("cgrain_query", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*cellCountPipe.second);
+                cmd.BindStorageBuffer(*grainsBuf, 0);
+                cmd.BindStorageBuffer(*cellCountBuf, 1);
+                cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                cmd.DispatchCompute(kGrainGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellScanPipe.second);
+                cmd.BindStorageBuffer(*cellCountBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellEmitPipe.second);
+                cmd.BindStorageBuffer(*grainsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                cmd.BindStorageBuffer(*cellGrainBuf, 3);
+                cmd.BindStorageBuffer(*grainParamsBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*bodyCountPipe.second);
+                cmd.BindStorageBuffer(*grainsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellGrainBuf, 2);
+                cmd.BindStorageBuffer(*bodiesBuf, 3);
+                cmd.BindStorageBuffer(*perBodyBuf, 4);
+                cmd.BindStorageBuffer(*bodyParamsBuf, 5);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*bodyScanPipe.second);
+                cmd.BindStorageBuffer(*perBodyBuf, 0);
+                cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                cmd.BindStorageBuffer(*bodyParamsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*bodyEmitPipe.second);
+                cmd.BindStorageBuffer(*grainsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellGrainBuf, 2);
+                cmd.BindStorageBuffer(*bodiesBuf, 3);
+                cmd.BindStorageBuffer(*bodyStartBuf, 4);
+                cmd.BindStorageBuffer(*bodyGrainBuf, 5);
+                cmd.BindStorageBuffer(*bodyParamsBuf, 6);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCellStart.assign((size_t)kCellCount + 1u, 0u);
+        device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+        outCellGrains.assign((size_t)kGrainCount, 0u);
+        device->ReadBuffer(*cellGrainBuf, outCellGrains.data(), outCellGrains.size() * sizeof(uint32_t), 0);
+        outBodyStart.assign((size_t)kBodyCount + 1u, 0u);
+        device->ReadBuffer(*bodyStartBuf, outBodyStart.data(), outBodyStart.size() * sizeof(uint32_t), 0);
+        outBodyGrains.assign((size_t)kGatherAlloc, 0u);
+        device->ReadBuffer(*bodyGrainBuf, outBodyGrains.data(), outBodyGrains.size() * sizeof(uint32_t), 0);
+        outPerBody.assign((size_t)kBodyCount, 0u);
+        device->ReadBuffer(*perBodyBuf, outPerBody.data(), outPerBody.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU query (enabled).
+    std::vector<uint32_t> gCellStart, gCellGrains, gBodyStart, gBodyGrains, gPerBody;
+    runQuery(1, gCellStart, gCellGrains, gBodyStart, gBodyGrains, gPerBody);
+
+    // PROOF (1) GPU==CPU cell table + per-body query BIT-EXACT.
+    uint32_t maxPer = 0; for (uint32_t c : gPerBody) if (c > maxPer) maxPer = c;
+    bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+        std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                    cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+    bool cellGrainsOk = (gCellGrains.size() == cpuTable.cellGrains.size()) &&
+        std::memcmp(gCellGrains.data(), cpuTable.cellGrains.data(),
+                    cpuTable.cellGrains.size() * sizeof(uint32_t)) == 0;
+    bool bodyStartOk = (gBodyStart.size() == cpuQuery.bodyStart.size()) &&
+        std::memcmp(gBodyStart.data(), cpuQuery.bodyStart.data(),
+                    cpuQuery.bodyStart.size() * sizeof(uint32_t)) == 0;
+    bool bodyGrainsOk = (kTotalGathered == (uint32_t)cpuQuery.bodyGrains.size()) &&
+        std::memcmp(gBodyGrains.data(), cpuQuery.bodyGrains.data(),
+                    (size_t)kTotalGathered * sizeof(uint32_t)) == 0;
+    if (!cellStartOk || !cellGrainsOk || !bodyStartOk || !bodyGrainsOk)
+        return fail("cgrain-query: GPU != CPU BuildGrainCellTable/GatherBodyGrains");
+    std::printf("cgrain-query: {bodies:%d, grains:%d, gathered:%u, maxPerBody:%u} GPU==CPU BIT-EXACT\n",
+                kBodyCount, kGrainCount, kTotalGathered, maxPer);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint32_t> c2, cg2, bs2, bg2, pb2;
+        runQuery(1, c2, cg2, bs2, bg2, pb2);
+        if (c2 != gCellStart || cg2 != gCellGrains || bs2 != gBodyStart || bg2 != gBodyGrains || pb2 != gPerBody)
+            return fail("cgrain-query: two runs differ (nondeterministic)");
+        std::printf("cgrain-query determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage / coherence: every gathered grain passes BodyGrainAccept; buried populated, clear empty.
+    {
+        bool coherent = true;
+        for (uint32_t i = 0; i < (uint32_t)kBodyCount && coherent; ++i)
+            for (uint32_t s = gBodyStart[i]; s < gBodyStart[i + 1u]; ++s) {
+                uint32_t j = gBodyGrains[s];
+                if (!cgrain::BodyGrainAccept(world.bodies[i], world.grains[j])) coherent = false;
+            }
+        const uint32_t clearGathered = gBodyStart[(uint32_t)kBodyCount] - gBodyStart[(uint32_t)kBodyCount - 1];
+        const bool buriedPopulated = (gBodyStart[1] - gBodyStart[0]) > 0u &&
+                                     (gBodyStart[2] - gBodyStart[1]) > 0u;
+        if (!coherent || clearGathered != 0u || !buriedPopulated)
+            return fail("cgrain-query: coverage incoherent");
+        std::printf("cgrain-query coverage: %u body-grain pairs (buried bodies populated, "
+                    "clear bodies empty)\n", kTotalGathered);
+    }
+
+    // PROOF (4) empty no-op: all bodies clear of the bed -> 0 gathered.
+    {
+        cgrain::CGrainWorld empty;
+        empty.grains = world.grains;
+        empty.hSearch = kHSearch;
+        empty.bodies = {makeBody(5, 50, 5, 2), makeBody(2, 60, 2, 2)};
+        cgrain::CGrainQuery eq = cgrain::GatherBodyGrains(empty);
+        if (cgrain::CountGathered(eq) != 0u || !eq.bodyGrains.empty())
+            return fail("cgrain-query: empty produced gathered grains");
+        std::printf("cgrain-query empty: 0 gathered (no-op)\n");
+    }
+
+    // --- Golden: the integer per-body gathered-grain HEAT TOP-DOWN (x,z) view (IDENTICAL to the Vulkan
+    // --cgrain-query-shot by construction; CPU-colored from the read-back integer CSR). Top-down so the two
+    // buried bodies (at distinct x,z) separate; un-gathered drawn first, gathered ON TOP. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    std::vector<int> ownerOf((size_t)kGrainCount, -1);
+    for (uint32_t i = 0; i < (uint32_t)kBodyCount; ++i)
+        for (uint32_t s = gBodyStart[i]; s < gBodyStart[i + 1u]; ++s)
+            ownerOf[(size_t)gBodyGrains[s]] = (int)i;
+    auto bodyColor = [](int b) -> Vec3 {
+        static const Vec3 palette[3] = {Vec3{1.0f, 0.45f, 0.15f}, Vec3{0.2f, 0.6f, 1.0f},
+                                        Vec3{0.4f, 1.0f, 0.4f}};
+        return palette[b % 3];
+    };
+    auto plot = [&](int i, const Vec3& col) {
+        const int wx = grainsInit[(size_t)i].px >> grain::kFrac;
+        const int wz = grainsInit[(size_t)i].pz >> grain::kFrac;
+        int cx = kMargin + wx * kPxPerUnit;
+        int cy = (int)imgH - kMargin - wz * kPxPerUnit;
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kGrainCount; ++i)
+        if (ownerOf[(size_t)i] < 0) plot(i, Vec3{0.18f, 0.18f, 0.2f});
+    for (int i = 0; i < kGrainCount; ++i)
+        if (ownerOf[(size_t)i] >= 0) plot(i, bodyColor(ownerOf[(size_t)i]));
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgrain body-grain gather heat (%u gathered, maxPerBody %u)\n",
+                outPath, imgW, imgH, kTotalGathered, maxPer);
+    return 0;
+}
+
 // ===== Slice CP2 — Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG showcase (--couple-buoyancy) =======
 // (the CRUX of FLAGSHIP #11, the FIRST momentum exchange). Like --grain-contact / --fluid-solve, the CP2
 // buoyancy/drag math is int64 (the buoyancy/drag fxmul/fxdiv + the vFluidAvg int64 sum + FxNormalize via
@@ -35327,6 +35655,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--couple-query") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_couple_query.png";
             try { return RunCoupleQueryShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgrain-query <out.png>: render the Deterministic Rigid<->Grain Coupling UNIFIED bodies+grains WORLD +
+        // BODY->GRAIN grid-hash QUERY showcase (Slice CG1, the BEACHHEAD of FLAGSHIP #12). Like --couple-query,
+        // the query is PURE INT32 (FloorDiv + the per-axis |body.pos.axis - g.pos.axis| < body.radius
+        // BodyGrainAccept = integer divide + abs-compare, NO int64/sqrt), so the reused GR2
+        // grain_cell_{count,scan,emit} + the NEW cgrain_body_{count,scan,emit} shaders MSL-gen natively and
+        // Metal DISPATCHES THE GPU passes directly: the SAME settled grain bed + the SAME 3 FxBody spheres feed
+        // the SAME six passes -> ReadBuffer reads the cell table + per-body query PROVEN BIT-EXACT vs the CPU
+        // couple_grain.h::BuildGrainCellTable + GatherBodyGrains (the same proofs the Vulkan --cgrain-query-shot
+        // runs). The image golden is the integer per-body gathered-grain heat viz, identical to the Vulkan path
+        // BY CONSTRUCTION. New golden tests/golden/metal/cgrain_query.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgrain-query") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgrain_query.png";
+            try { return RunCgrainQueryShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-buoyancy <out.png>: render the Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG

@@ -354,6 +354,23 @@ hf_gen_msl(grain_neighbor_emit.comp  grain_neighbor_emit.comp.hlsl  comp grain_n
 hf_gen_msl(couple_body_count.comp couple_body_count.comp.hlsl comp couple_body_count_main)
 hf_gen_msl(couple_body_scan.comp  couple_body_scan.comp.hlsl  comp couple_body_scan_main)
 hf_gen_msl(couple_body_emit.comp  couple_body_emit.comp.hlsl  comp couple_body_emit_main)
+# Deterministic Rigid<->Grain Coupling Slice 1 (Slice CG1, the BEACHHEAD of FLAGSHIP #12): the BODY->GRAIN
+# grid-hash QUERY (the CP1 couple_body twin, per BODY) OVER the reused GR2 GRAIN cell table
+# (grain_cell_{count,scan,emit} above build the cellStart/cellGrains the query iterates — no new cell-table
+# passes). cgrain_body_count.comp (ONE thread per body: count the grains in the body's BodyAabb cell RANGE
+# [CellOf(pos-radius) .. CellOf(pos+radius)] passing the per-axis |body.pos.axis - g.pos.axis| < body.radius
+# reject — BodyGrainAccept VERBATIM; a body spans MANY cells, NOT a fixed 27-cell stencil), cgrain_body_scan.comp
+# (SINGLE-THREAD exclusive prefix-sum -> bodyStart CSR + sentinel), cgrain_body_emit.comp (ONE thread per body
+# emits its gathered grain indices into its DISJOINT bodyGrains[] slice, NO atomics). ALL PURE INT32 (FloorDiv
+# integer divide + per-axis abs-compare, NO products/int64/fxmul/sqrt, NO radial sphere cull — deferred to
+# CG2/CG3), so glslc CAN lower them and they MSL-generate NATIVELY (the default MSL gen suffices, the
+# couple_body/grain_neighbor lesson). The Metal --cgrain-query showcase dispatches the GPU shaders directly
+# (NOT a CPU fallback) -> the GPU==CPU cell-table+query proof runs on Metal too. Bit-exact GPU==CPU +
+# cross-backend by construction. Behind --cgrain-query only; the GR2 pipelines + their goldens untouched;
+# couple_grain.h #includes fpx.h + grain.h read-only (the additive sibling).
+hf_gen_msl(cgrain_body_count.comp cgrain_body_count.comp.hlsl comp cgrain_body_count_main)
+hf_gen_msl(cgrain_body_scan.comp  cgrain_body_scan.comp.hlsl  comp cgrain_body_scan_main)
+hf_gen_msl(cgrain_body_emit.comp  cgrain_body_emit.comp.hlsl  comp cgrain_body_emit_main)
 # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT GRAPH
 # BUILD (the FPX2 count->scan->emit on lattice particles). cloth_edge_count.comp (ONE thread per particle:
 # gEdgeCount[p]=#OWNED forward edges in bounds), cloth_edge_scan.comp (SINGLE-THREAD exclusive prefix-sum ->

@@ -544,6 +544,23 @@ hf_compile_shaders(
     "shaders/couple_body_count.comp.hlsl:cs"
     "shaders/couple_body_scan.comp.hlsl:cs"
     "shaders/couple_body_emit.comp.hlsl:cs"
+    # Deterministic Rigid<->Grain Coupling Slice 1 (Slice CG1, the BEACHHEAD of FLAGSHIP #12): the BODY->GRAIN
+    # grid-hash QUERY meshed by THREE pure-INT32 count->scan->emit passes (the CP1 couple_body twin, over the
+    # reused GR2 GRAIN cell table — grain_cell_{count,scan,emit} above build the cellStart/cellGrains the query
+    # iterates — no new cell-table passes). cgrain_body_count.comp (ONE thread per body: count the grains in the
+    # body's BodyAabb cell RANGE [CellOf(pos-radius) .. CellOf(pos+radius)] passing the per-axis |body.pos.axis -
+    # g.pos.axis| < body.radius reject — BodyGrainAccept VERBATIM; a body spans MANY cells, NOT a fixed 27-cell
+    # stencil), cgrain_body_scan.comp (SINGLE-THREAD [numthreads(1,1,1)] exclusive prefix-sum -> bodyStart CSR +
+    # sentinel), cgrain_body_emit.comp (ONE thread per body emits its gathered grain indices into its DISJOINT
+    # bodyGrains[] slice, NO atomics — the per-body-disjoint pattern). ALL PURE INT32 (FloorDiv integer divide +
+    # per-axis abs-compare, NO int64/fxmul/sqrt, NO radial sphere cull — deferred to CG2/CG3), so these
+    # MSL-GENERATE NATIVELY (they ARE in the Metal hf_gen_msl list) and Metal dispatches the GPU passes (a true
+    # GPU pass on both backends, the CP1/GR2 precedent). ReadBuffer reads cellStart + cellGrains + bodyStart +
+    # bodyGrains, PROVEN BIT-EXACT vs the CPU couple_grain.h::BuildGrainCellTable + GatherBodyGrains (memcmp). NO
+    # momentum exchange (CG2-CG4), NO new RHI; couple_grain.h #includes fpx.h + grain.h read-only (additive).
+    "shaders/cgrain_body_count.comp.hlsl:cs"
+    "shaders/cgrain_body_scan.comp.hlsl:cs"
+    "shaders/cgrain_body_emit.comp.hlsl:cs"
     # Deterministic Rigid<->Fluid Coupling Slice 2 (Slice CP2, the BUOYANCY + DRAG fluid->body pass — the CRUX
     # of FLAGSHIP #11, the FIRST momentum exchange). ONE new int64 shader: couple_buoyancy.comp — ONE THREAD
     # PER BODY (multi-thread OVER bodies, NOT per particle), each thread SERIALLY sums its body's CP1 gathered
