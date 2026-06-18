@@ -209,5 +209,140 @@ inline uint32_t MaxPerBody(const CGrainQuery& q) {
     return m;
 }
 
+// ===== Slice CG2 — CONTACT SUPPORT + DRAG (grain->body, the CRUX) ====================================
+// THE FIRST MOMENTUM EXCHANGE of FLAGSHIP #12: each fpx::FxBody sums, over its CG1 gathered grain list (in
+// the FIXED CG1 emit order, ascending), a CONTACT-SUPPORT impulse (the grain bed pushes the body OUT/up
+// along each overlapping grain's contact normal, ∝ the penetration) + a DRAG impulse (toward the local
+// grain velocity, which CG2 damps since the grains are held STATIC), and the body decelerates and RESTS on
+// the bed at an emergent rest line. ONE-WAY for now (grain -> body; the body->grain reaction is CG3).
+// LINEAR only — a sphere body's contact support acts through its centre (no torque), so angVel is untouched
+// until a future asymmetric-bed refinement. The CP2 buoyancy/drag twin, with contact-support physics (Σ
+// penetration·normal over overlapping grains) instead of buoyancy (∝ the gathered count).
+//
+// THE int64 DECISION (the CP2/GR3/FL4 split): the support/drag math is int64 (FxLength/FxNormalize/fxmul/
+// fxdiv) -> shaders/cgrain_support.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) + the Metal
+// --cgrain-support showcase runs the CPU StepCGrainSupport (byte-identical by construction). The CG1
+// grid-hash query (re-run each step) stays int32 MSL-native.
+//
+// THE CRUX — the order-sensitive body-force reduction: summing N grain impulses onto one body is a
+// reduction; the integer zero-diff bar demands a PINNED summation order. CG2 sums each body's contributions
+// in the FIXED CG1 gathered order (bodyGrains[bodyStart[i] .. bodyStart[i+1]), ascending). The GPU dispatch
+// is ONE THREAD PER BODY (a serial inner loop over that body's gathered list) -> multi-thread OVER bodies,
+// NOT over grains. With a TINY body count (1-few, << the ~2s watchdog), no body's inner loop approaches the
+// single-thread TDR ceiling. CAVEAT (the new wrinkle vs CP2): a body resting ON a sand bed gathers MORE
+// grains than a body floating in fluid (a bed supports through many simultaneous contacts), so the per-body
+// inner loop is LONGER than CP2's case — still bounded and far under the ~2s watchdog for a tiny body count,
+// but flagged. IF body counts ever scale up, a deterministic integer atomic-add reduction is needed —
+// explicitly OUT of scope for CG1-CG6 (the swraster 64-bit-atomics caveat).
+
+using fpx::FxAdd;          // read-only: the fpx.h vector toolbox (reused verbatim, no new primitives)
+using fpx::FxSub;
+using fpx::FxScale;
+using fpx::FxLength;       // read-only: the int64 length (FxISqrt of the sum of squares)
+using fpx::FxNormalize;    // read-only: the int64 normalize (+Y fallback on length 0)
+using fpx::fxmul;          // read-only: the int64-intermediate Q16.16 multiply
+
+// The host-snapped Q16.16 coupling coefficients. Tuned so a unit-mass FxBody (invMass=kOne, radius 2)
+// dropped above the CG1 grain bed settles at an emergent REST LINE on the bed (the net upward contact
+// support balances gravity) — NOT crashing through, NOT bouncing out. SUPPORT: F_support per overlapping
+// grain ∝ its penetration depth, summed over the gathered contacts, so a body pressed DEEPER into the bed
+// overlaps MORE grains by MORE penetration and feels a larger restoring push -> a stable equilibrium rest
+// line (the contact-support proxy: the bed pushes harder the more the body sinks). DRAG: a linear damping
+// toward the (static) grains' mean velocity, so the body settles instead of bouncing. The rest line is
+// EMERGENT/iterative (the GR4/CP2 caveat), NOT an exact sink depth.
+//   kSupport = 6.0 (Q16.16): a firm per-penetration contact stiffness. With a settled bed of ~0.25-radius
+//     grains a body overlaps MANY grains at small penetrations; the summed Σ pen·n builds the upward force
+//     that balances |g|=9.8 a short distance into the bed surface, NOT crashing through. (host-snapped.)
+//   kDrag = 3.0 (Q16.16): a firm linear damping so the body settles within K steps instead of ringing.
+inline constexpr fx kSupport = (fx)(12.0 * (double)kOne + 0.5);  // 786432 (Q16.16, ~12 per-pen stiffness)
+inline constexpr fx kDrag    = (fx)(6.0  * (double)kOne + 0.5);  // 393216 (Q16.16, ~6.0 damping)
+
+// AccumBodyGrainForces(world, query, dt): the per-body contact-support+drag impulse accumulate (the
+// FIXED-ORDER reduction). For each DYNAMIC body i (static / non-dynamic skipped), over its CG1 gathered list
+// in ASCENDING order: SUPPORT — for each overlapping grain (d = body.pos − grain.pos, dist = FxLength(d),
+// pen = (body.radius + grain.radius) − dist > 0): F_support += FxScale(FxNormalize(d), fxmul(kSupport, pen))
+// (the bed pushes the body AWAY from the grain along the contact normal, ∝ penetration, summed). DRAG —
+// vGrainAvg = (Σ grain.vel)/count per axis (the fixed-order int64 sum / the integer count); F_drag =
+// fxmul(kDrag, vGrainAvg − body.vel) per axis. Apply body.vel += FxScale(F_support + F_drag, body.invMass)·dt.
+// A body that gathers 0 grains feels no support/drag (free-fall). LINEAR only (angVel untouched). int64.
+// cgrain_support.comp copies THIS body VERBATIM (one thread per body i). Deterministic (fixed gathered
+// order, fixed op order) -> bit-identical to the GPU memcmp.
+inline void AccumBodyGrainForces(CGrainWorld& world, const CGrainQuery& query, fx dt) {
+    const uint32_t bodyCount = (uint32_t)world.bodies.size();
+    for (uint32_t i = 0; i < bodyCount; ++i) {
+        fpx::FxBody& b = world.bodies[(size_t)i];
+        if (!(b.flags & fpx::kFlagDynamic)) continue;   // static/kinematic -> no support/drag (the pinned case)
+        const uint32_t s0 = query.bodyStart[(size_t)i];
+        const uint32_t s1 = query.bodyStart[(size_t)i + 1u];
+        const uint32_t count = s1 - s0;
+        if (count == 0u) continue;                      // gathers nothing (clear of the bed) -> free-fall
+
+        // SUPPORT: Σ over the gathered grains of the contact push (∝ penetration along the contact normal),
+        // summed in the FIXED CG1 gathered (ascending) order. A grain only contributes when it OVERLAPS the
+        // body (pen > 0) — the exact radial cull deferred from CG1's over-inclusive box happens HERE.
+        FxVec3 fSupport{0, 0, 0};
+        // DRAG: vGrainAvg = (Σ_j grain[j].vel) / count, the fixed-order int64 sum / the integer count.
+        int64_t sumX = 0, sumY = 0, sumZ = 0;
+        for (uint32_t s = s0; s < s1; ++s) {
+            const grain::GrainParticle& g = world.grains[(size_t)query.bodyGrains[(size_t)s]];
+            const FxVec3 d = FxSub(b.pos, g.pos);       // body relative to the grain (push body AWAY from grain)
+            const fx dist = FxLength(d);
+            const fx pen = (b.radius + g.radius) - dist;
+            if (pen > 0) {
+                const FxVec3 n = FxNormalize(d);        // contact normal (dist==0 -> the +Y fallback)
+                fSupport = FxAdd(fSupport, FxScale(n, fpx::fxmul(kSupport, pen)));
+            }
+            sumX += (int64_t)g.vel.x;
+            sumY += (int64_t)g.vel.y;
+            sumZ += (int64_t)g.vel.z;
+        }
+        const FxVec3 vGrainAvg{
+            (fx)(sumX / (int64_t)count), (fx)(sumY / (int64_t)count), (fx)(sumZ / (int64_t)count)};
+        // F_drag = kDrag * (vGrainAvg - body.vel) per axis.
+        const FxVec3 dv = FxSub(vGrainAvg, b.vel);
+        const FxVec3 fDrag{fpx::fxmul(kDrag, dv.x), fpx::fxmul(kDrag, dv.y), fpx::fxmul(kDrag, dv.z)};
+
+        // Apply the impulse as a velocity delta: vel += (F_support + F_drag) * invMass * dt (linear only).
+        const FxVec3 fTotal = FxAdd(fSupport, fDrag);
+        const FxVec3 dvel = FxScale(FxScale(fTotal, b.invMass), dt);
+        b.vel = FxAdd(b.vel, dvel);
+    }
+}
+
+// StepCGrainSupport(world, dt): ONE coupled step (the driver — the grains are held STATIC). (1) re-query the
+// body->grain neighbour lists from the bodies' CURRENT positions (CG1 GatherBodyGrains) -> (2) accumulate
+// the contact-support+drag velocity delta (AccumBodyGrainForces) -> (3) IntegrateBody per body (gravity +
+// the support-adjusted vel — the fpx.h integrate VERBATIM) THEN ResolveGround (the fpx.h RADIUS-AWARE floor:
+// the body's SURFACE rests on the floor at groundY + radius — the bed-floor clamp, VERBATIM). The grains are
+// NOT moved (the reaction is CG3). Over K steps a body dropped above the bed falls, contacts the bed, support
+// builds as it overlaps grains, and it settles to an emergent rest line damped by drag (or sinks to the bed
+// floor groundY + radius if it never gathers grains — the support=0 control). Both IntegrateBody +
+// ResolveGround are copied VERBATIM by cgrain_support.comp's host driver (the GPU runs the SAME per-step seq).
+inline void StepCGrainSupport(CGrainWorld& world, fx dt) {
+    const CGrainQuery query = GatherBodyGrains(world);   // CG1 re-query (grains static -> the bed unchanged)
+    AccumBodyGrainForces(world, query, dt);              // CG2 contact support + drag velocity delta
+    for (fpx::FxBody& b : world.bodies) {                // fpx.h integrate + radius-aware floor, VERBATIM
+        fpx::IntegrateBody(b, world.gravity, world.groundY, dt);
+        fpx::ResolveGround(b, world.groundY);            // the body SURFACE rests at groundY + radius
+    }
+}
+
+// StepCGrainSupportSteps(world, dt, steps): run K StepCGrainSupport steps. The CPU reference the GPU body
+// state memcmp's against byte-for-byte. Pure integer -> two runs byte-identical, cross-backend identical.
+inline void StepCGrainSupportSteps(CGrainWorld& world, fx dt, int steps) {
+    for (int s = 0; s < steps; ++s) StepCGrainSupport(world, dt);
+}
+
+// MeasureRestLine(world): the honest rest-line metric — the mean settled body pos.y over the DYNAMIC bodies
+// (a deterministic Q16.16 stat for the rest-line proof). 0 dynamic bodies -> 0. The rest line is
+// EMERGENT/iterative (the GR4/CP2 caveat), NOT an exact sink depth: the proof asserts the body rests by a
+// margin above the bed floor (groundY + radius) + is bounded above + is deterministic + two-run byte-identical.
+inline fx MeasureRestLine(const CGrainWorld& world) {
+    int64_t sum = 0; uint32_t n = 0;
+    for (const fpx::FxBody& b : world.bodies)
+        if (b.flags & fpx::kFlagDynamic) { sum += (int64_t)b.pos.y; ++n; }
+    return n == 0u ? 0 : (fx)(sum / (int64_t)n);
+}
+
 }  // namespace cgrain
 }  // namespace hf::sim

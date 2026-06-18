@@ -464,6 +464,7 @@ int main(int argc, char** argv) {
     const char* coupleDisplaceShotPath = nullptr; // --couple-displace-shot <out.bmp> (Slice CP3, the FLUID REACTION / DISPLACEMENT body->fluid pass, the Newton's-3rd-law half of CP2; the 3rd slice of FLAGSHIP #11. A body submerged in a fluid pool pushes BACK on the fluid: each fluid particle inside the body is projected out to the body surface (the body DISPLACES the fluid — a cavity/wake) + receives the equal-opposite drag impulse. couple_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) runs ApplyBodyToFluid VERBATIM from couple.h; the GPU fluid array PROVEN BIT-EXACT vs the CPU couple.h::ApplyBodyToFluid (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) no-penetration penAfter<penBefore + displaced>0 (the fluid parted, the Jacobi single-projection caveat — relieved NOT zero); (4) a body clear of the fluid -> unchanged (no-op). Metal --couple-displace runs the CPU ApplyBodyToFluid. NO new RHI; CP1/CP2 couple code+shaders + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleStepShotPath = nullptr; // --couple-step-shot <out.bmp> (Slice CP4, THE COUPLED STEP — the bobbing barrel, the INTEGRATED two-way solver of FLAGSHIP #11. ONE deterministic tick composes the FL4 fluid sub-passes + CP2 fluid->body + CP3 body->fluid + the rigid integrate in the LOCKED (1)-(5) order -> a barrel BOBS under emergent buoyancy in an incompressible fluid, NO script. CP4 ORCHESTRATES the existing FL4 fluid_* + CP2 couple_buoyancy + CP3 couple_displace shaders (NO new shader, NO new RHI): the Vulkan GPU driver is the host-driven multi-pass mold of --fluid-solve-shot, re-running per step the FL2 query + FL4 density + CP3 displace + CP2 buoyancy passes with ComputeToComputeBarrier between, ReadBuffer reads the fluid + body arrays PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleSteps. A static basin holds a dynamic pool + a body dropped above it (radius 2, invMass=kOne/iters; h=2.0, iters=3, K=400). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) coupled — the body floats above the bed by a margin AND bobbed peak-to-trough>threshold AND the fluid stayed coherent (density residual bounded); (4) buoy=0 control sinks while the fluid settles. The HONEST emergent float line + bob (the GR4/FL4 caveat). int64 -> the FL4/CP2/CP3 shaders are Vulkan-only; Metal --couple-step runs the CPU StepCoupleSteps. CP1-CP3 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleBuoyancyShotPath = nullptr; // --couple-buoyancy-shot <out.bmp> (Slice CP2, the BUOYANCY + DRAG fluid->body pass, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange. A settled fluid pool (FL1 InitBlock) + an FxBody sphere dropped ABOVE it: each step re-runs the CP1 body->fluid query (couple_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then couple_buoyancy.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a buoyant impulse (∝ the gathered count = the displaced volume, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, enters the pool, buoyancy builds as it submerges, and it settles to an emergent float line. AccumBodyForces copied VERBATIM from engine/sim/couple.h. GPU body state PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) FLOATS — floatY > groundY+radius by a margin, bounded above (the honest emergent float line, NOT an exact Archimedes depth — the GR4/FL4 caveat); (4) buoy=0 control SINKS to the bed (floatY == groundY+radius), proving buoyancy does work. Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO fluid reaction (CP3), NO coupled step (CP4), NO lockstep (CP5), NO float render (CP6), NO buoyancy torque, NO new RHI; CP1's query passes + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
+    const char* cgrainSupportShotPath = nullptr; // --cgrain-support-shot <out.bmp> (Slice CG2, the CONTACT SUPPORT + DRAG grain->body pass, the CRUX of FLAGSHIP #12 — the FIRST momentum exchange. A settled grain bed (GR1 InitGrainBlock + GR4 friction steps) + an FxBody sphere dropped ABOVE it: each step re-runs the CG1 body->grain query (cgrain_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then cgrain_support.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a contact-support impulse (Σ pen·n over the OVERLAPPING grains — the bed pushes the body out/up along each contact normal, ∝ penetration) + a drag impulse (toward the static grains' mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, contacts the bed, support builds as it overlaps grains, and it settles to an emergent REST LINE. AccumBodyGrainForces copied VERBATIM from engine/sim/couple_grain.h. GPU body state PROVEN BIT-EXACT vs the CPU couple_grain.h::StepCGrainSupportSteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) RESTS — restY > groundY+radius by a margin, bounded above (the honest emergent rest line, NOT an exact sink depth — the GR4/CP2 caveat); (4) support=0 control SINKS through to the bed floor (restY == groundY+radius), proving contact support does work. Metal --cgrain-support runs the CPU StepCGrainSupport. NO grain reaction (CG3), NO coupled step (CG4), NO lockstep (CG5), NO lit render (CG6), NO support torque, NO new RHI; CG1's query passes + their goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h + engine/physics/ UNTOUCHED)
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
     const char* grainLockstepShotPath = nullptr; // --grain-lockstep-shot <out.bmp> (Slice GR5: Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #10 — PURE-CPU harness over the GR1-GR4 granular sim WITH friction (the FL5/CL5/FPX5 twin): a 5x5x5 staggered grain block (the GR4 friction scene, μ=0.8) fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-grain-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
@@ -690,6 +691,20 @@ int main(int argc, char** argv) {
         // STANDALONE branch (C1061 avoidance, like the couple-query/grain-neighbors shots).
         if (std::strcmp(argv[i], "--cgrain-query-shot") == 0 && i + 1 < argc) {
             cgrainQueryShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CG2: --cgrain-support-shot <out.bmp> — the Deterministic Rigid<->Grain Coupling CONTACT
+        // SUPPORT + DRAG grain->body pass (the CRUX of FLAGSHIP #12, the FIRST momentum exchange). A settled
+        // grain bed + an FxBody dropped above it settles to an emergent REST LINE by StepCGrainSupportSteps K
+        // steps: each step re-runs the CG1 query (int32 MSL-native) from the body's CURRENT position ->
+        // cgrain_support.comp (ONE thread per body, int64 -> Vulkan-only) -> the host integrate (IntegrateBody
+        // + ResolveGround). The K-step loop is HOST-driven; GPU body state bit-exact vs
+        // couple_grain.h::StepCGrainSupportSteps (memcmp). int64 -> Vulkan-only; Metal --cgrain-support runs
+        // the CPU StepCGrainSupport. NO new RHI. STANDALONE branch (C1061 avoidance), like the
+        // couple-buoyancy/cgrain-query shots.
+        if (std::strcmp(argv[i], "--cgrain-support-shot") == 0 && i + 1 < argc) {
+            cgrainSupportShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16333,6 +16348,380 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cgrain body-grain gather heat (%u gathered, maxPerBody %u)\n",
                                 cgrainQueryShotPath, imgW, imgH, kTotalGathered, maxPer);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgrainQueryShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG grain->body pass (--cgrain-support-shot
+        // <out.bmp>, Slice CG2, the CRUX of FLAGSHIP #12 — the FIRST momentum exchange). A settled grain bed (GR1
+        // InitGrainBlock + a few GR4 friction steps so it piles into a bed) + an FxBody sphere dropped ABOVE it.
+        // Each step is HOST-driven over GPU passes: (a) re-run the CG1 body->grain QUERY (the THREE reused GR2
+        // cell passes + the THREE cgrain_body_{count,scan,emit} passes, int32 MSL-native) from the body's CURRENT
+        // position -> bodyStart + bodyGrains; (b) cgrain_support.comp (ONE thread per body, int64 -> Vulkan-only)
+        // sums over the gathered list the contact-support (Σ pen·n over the overlapping grains) + drag (toward
+        // the static grains' mean vel) impulse into the body's vel; (c) read back + host IntegrateBody +
+        // ResolveGround (the fpx.h integrate VERBATIM, the SAME ops the CPU reference runs) + re-upload. The
+        // grains are held STATIC (the reaction is CG3). Over K steps the body falls, contacts the bed, support
+        // builds as it overlaps grains, and it settles to an emergent REST LINE damped by drag. The GPU body
+        // array is PROVEN BIT-EXACT vs the CPU couple_grain.h::StepCGrainSupportSteps (memcmp, NO tol — the
+        // make-or-break). int64 -> Vulkan-only; Metal --cgrain-support runs the CPU StepCGrainSupport. NO new RHI.
+        // STANDALONE branch (C1061).
+        if (cgrainSupportShotPath) {
+            using math::Vec3;
+            namespace cgrain = hf::sim::cgrain;
+            namespace grain  = hf::sim::grain;
+            namespace fpx    = hf::sim::fpx;
+
+            // The grain bed: a GR1 dropped block settled (GR4 friction) into a low bed at the ground (== the
+            // CG1 --cgrain-query-shot bed config). hSearch = 1.5, 0.25-radius grains, 12x4x12 = 576 grains.
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+            const grain::fx kHSearch = grain::kOne + grain::kOne / 2;  // 1.5 (host-snapped Q16.16)
+            const int kSteps = 300;
+
+            // A DENSE PACKED bed (spacing == 2*radius so grains touch -> a real load-bearing bed, NOT the
+            // sparse 1.0-spaced CG1 query bed): 16x8x16 = 2048 grains, 0.25-radius, 0.5 spacing, settled.
+            grain::GrainBlock block;
+            block.W = 16; block.H = 8; block.D = 16;                   // 2048 grains
+            block.spacing = grain::kOne / 2;                          // 0.5 spacing == 2*radius (packed)
+            block.radius = kRadius;
+            block.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+            std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(block);
+            grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kHSearch, grain::kGrainMu, 2, 60);
+
+            // ONE body dropped above the bed centre, radius 2 (the rest-line headline). Body invMass = kOne.
+            auto makeWorld = [&](int bodyX, int bodyY, int bodyZ) {
+                cgrain::CGrainWorld w;
+                w.grains  = bed;
+                w.hSearch = kHSearch;
+                w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+                fpx::FxBody b;
+                b.pos = fpx::FxVec3{(fpx::fx)(bodyX * (int)grain::kOne), (fpx::fx)(bodyY * (int)grain::kOne),
+                                    (fpx::fx)(bodyZ * (int)grain::kOne)};
+                b.invMass = grain::kOne; b.flags = fpx::kFlagDynamic;
+                b.radius  = (fpx::fx)(2 * (int)grain::kOne);
+                w.bodies = {b};
+                return w;
+            };
+            cgrain::CGrainWorld world = makeWorld(5, 14, 5);   // dropped well above the bed
+            const int kBodyCount = (int)world.bodies.size();
+            const int kGrainCount = (int)world.grains.size();
+            const grain::fx kBedFloor = kGroundY + world.bodies[0].radius;   // groundY + radius (the bed floor)
+
+            // === CPU reference: StepCGrainSupportSteps K steps (the GPU memcmp's against this). ===
+            cgrain::CGrainWorld cpuWorld = world;
+            cgrain::StepCGrainSupportSteps(cpuWorld, kDt, kSteps);
+
+            // std430 mirrors (match the shaders).
+            struct GrainParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+            };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            struct CGrainBodyGpu { int32_t bx, by, bz, radius; };   // the CG1 query body pack (pos+radius)
+            static_assert(sizeof(CGrainBodyGpu) == 16, "CGrainBodyGpu std430 layout");
+            struct CGrainSupportBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+            static_assert(sizeof(CGrainSupportBodyGpu) == 36, "CGrainSupportBodyGpu std430 layout");
+            struct CGrainParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };   // CG1 query params
+            static_assert(sizeof(CGrainParams) == 48, "CGrainParams std430 layout");
+            struct CGrainSupportParams { int32_t cfg[4]; int32_t grav[4]; int32_t coef[4]; };  // CG2 support
+            static_assert(sizeof(CGrainSupportParams) == 48, "CGrainSupportParams std430 layout");
+
+            auto makeBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // The grain bed is STATIC -> one shared read-only grain buffer (pos+vel+radius read by the query +
+            // cgrain_support). Built ONCE from the settled bed.
+            std::vector<GrainParticleGpu> grainGpu((size_t)kGrainCount);
+            for (int i = 0; i < kGrainCount; ++i) {
+                const grain::GrainParticle& p = world.grains[(size_t)i];
+                grainGpu[(size_t)i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                    p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+            }
+            auto grainsBuf = makeBuf(grainGpu.data(), grainGpu.size() * sizeof(GrainParticleGpu));
+
+            // The CG1 grid is FIXED (the bed is static) -> build the grid once for the cell-table dims.
+            const grain::GrainGrid grid = grain::MakeGrainGrid(world.grains, kHSearch);
+            const uint32_t kCellCount = grain::GrainCellCount(grid);
+
+            // Pipelines: the CG1 query (reused GR2 cell + new cgrain_body) + the CG2 support.
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                return std::make_pair(std::move(cs), device->CreateComputePipeline(d));
+            };
+            auto cellCountPipe = mkPipe("grain_cell_count.comp.hlsl.spv", 3, 64);
+            auto cellScanPipe  = mkPipe("grain_cell_scan.comp.hlsl.spv", 3, 1);
+            auto cellEmitPipe  = mkPipe("grain_cell_emit.comp.hlsl.spv", 5, 1);
+            auto bodyCountPipe = mkPipe("cgrain_body_count.comp.hlsl.spv", 6, 64);
+            auto bodyScanPipe  = mkPipe("cgrain_body_scan.comp.hlsl.spv", 3, 1);
+            auto bodyEmitPipe  = mkPipe("cgrain_body_emit.comp.hlsl.spv", 7, 64);
+            auto supportPipe   = mkPipe("cgrain_support.comp.hlsl.spv", 5, 64);
+
+            const uint32_t kGrainGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+            const uint32_t kBodyGroups  = ((uint32_t)kBodyCount + 63u) / 64u;
+
+            // runGpu: the full host-driven coupled support sim. supportEnabled=0 -> the support=0 control (the
+            // body free-falls: no support/drag delta, only IntegrateBody + ResolveGround -> sinks to the bed floor).
+            // peakGathered tracks the LARGEST per-body gathered count seen across the K steps (the per-body
+            // support-loop length at active contact — the CRUX reduction-length stat).
+            uint32_t peakGathered = 0;
+            auto runGpu = [&](int supportEnabled, cgrain::CGrainWorld& outWorld) {
+                cgrain::CGrainWorld w = world;   // a fresh copy of the init scene
+
+                for (int step = 0; step < kSteps; ++step) {
+                    // The support body pack (pos+vel+invMass+flags+radius), re-created each step from the host
+                    // w.bodies state (which carries the prior step's integrated result). cgrain_support writes
+                    // the support-updated vel into it; we read it back + host-integrate.
+                    std::vector<CGrainSupportBodyGpu> bodyGpu((size_t)kBodyCount);
+                    for (int i = 0; i < kBodyCount; ++i) {
+                        const fpx::FxBody& b = w.bodies[(size_t)i];
+                        bodyGpu[(size_t)i] = CGrainSupportBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y,
+                                                                 b.vel.z, b.invMass, b.flags, b.radius};
+                    }
+                    auto bodyBuf = makeBuf(bodyGpu.data(), bodyGpu.size() * sizeof(CGrainSupportBodyGpu));
+
+                    // --- (a) the CG1 query from the body's CURRENT position. The bed is static -> the SAME grid
+                    // each step, but we follow the CG1 contract of querying from the current body pos. The query
+                    // body pack carries pos + radius. Size the gather buffer from the CPU query (the GPU
+                    // recomputes it bit-exact). ---
+                    const cgrain::CGrainQuery cpuQ = cgrain::GatherBodyGrains(w);
+                    const uint32_t total = cgrain::CountGathered(cpuQ);
+                    const uint32_t alloc = total > 0u ? total : 1u;
+                    if (supportEnabled) { const uint32_t mpb = cgrain::MaxPerBody(cpuQ); if (mpb > peakGathered) peakGathered = mpb; }
+
+                    std::vector<CGrainBodyGpu> qbodies((size_t)kBodyCount);
+                    for (int i = 0; i < kBodyCount; ++i) {
+                        const fpx::FxBody& b = w.bodies[(size_t)i];
+                        qbodies[(size_t)i] = CGrainBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.radius};
+                    }
+                    auto qBodyBuf = makeBuf(qbodies.data(), qbodies.size() * sizeof(CGrainBodyGpu));
+
+                    auto makeParams = [&](int32_t countW, int32_t enabled) {
+                        CGrainParams p{};
+                        p.grid[0] = kHSearch; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+                        p.grid[3] = grid.cellMin.z;
+                        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+                        p.dim[3] = countW;
+                        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; return p;
+                    };
+                    CGrainParams grainParams = makeParams(kGrainCount, 1);
+                    CGrainParams bodyParams = makeParams(kBodyCount, 1);
+                    auto grainParamsBuf = makeBuf(&grainParams, sizeof(grainParams));
+                    auto bodyParamsBuf = makeBuf(&bodyParams, sizeof(bodyParams));
+
+                    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+                    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> cellGrainInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> perBodyInit((size_t)kBodyCount, 0u);
+                    std::vector<uint32_t> bodyStartInit((size_t)kBodyCount + 1u, 0u);
+                    std::vector<uint32_t> bodyGrainInit((size_t)alloc, 0u);
+                    auto cellCountBuf = makeBuf(cellCountInit.data(), cellCountInit.size() * sizeof(uint32_t));
+                    auto cellStartBuf = makeBuf(cellStartInit.data(), cellStartInit.size() * sizeof(uint32_t));
+                    auto cellCursorBuf = makeBuf(cellCursorInit.data(), cellCursorInit.size() * sizeof(uint32_t));
+                    auto cellGrainBuf = makeBuf(cellGrainInit.data(), cellGrainInit.size() * sizeof(uint32_t));
+                    auto perBodyBuf = makeBuf(perBodyInit.data(), perBodyInit.size() * sizeof(uint32_t));
+                    auto bodyStartBuf = makeBuf(bodyStartInit.data(), bodyStartInit.size() * sizeof(uint32_t));
+                    auto bodyGrainBuf = makeBuf(bodyGrainInit.data(), bodyGrainInit.size() * sizeof(uint32_t));
+
+                    // The CG2 support params.
+                    CGrainSupportParams sp{};
+                    sp.cfg[0] = kBodyCount; sp.cfg[1] = supportEnabled;
+                    sp.grav[0] = 0; sp.grav[1] = kGravY; sp.grav[2] = 0; sp.grav[3] = kDt;
+                    sp.coef[0] = cgrain::kSupport; sp.coef[1] = cgrain::kDrag;
+                    auto spBuf = makeBuf(&sp, sizeof(sp));
+
+                    render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                    g.AddPass("cg_support", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // CG1 query: grain cell table (3 reused GR2 passes).
+                        cmd.BindComputePipeline(*cellCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellCountBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                        cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*cellScanPipe.second);
+                        cmd.BindStorageBuffer(*cellCountBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*cellEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellCursorBuf, 2); cmd.BindStorageBuffer(*cellGrainBuf, 3);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 4);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        // CG1 query: per-body gather (3 new cgrain_body passes).
+                        cmd.BindComputePipeline(*bodyCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellGrainBuf, 2); cmd.BindStorageBuffer(*qBodyBuf, 3);
+                        cmd.BindStorageBuffer(*perBodyBuf, 4); cmd.BindStorageBuffer(*bodyParamsBuf, 5);
+                        cmd.DispatchCompute(kBodyGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*bodyScanPipe.second);
+                        cmd.BindStorageBuffer(*perBodyBuf, 0); cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*bodyEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellGrainBuf, 2); cmd.BindStorageBuffer(*qBodyBuf, 3);
+                        cmd.BindStorageBuffer(*bodyStartBuf, 4); cmd.BindStorageBuffer(*bodyGrainBuf, 5);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 6);
+                        cmd.DispatchCompute(kBodyGroups); cmd.ComputeToComputeBarrier();
+                        // CG2 contact support + drag (ONE thread per body, int64).
+                        cmd.BindComputePipeline(*supportPipe.second);
+                        cmd.BindStorageBuffer(*bodyBuf, 0); cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                        cmd.BindStorageBuffer(*bodyGrainBuf, 2); cmd.BindStorageBuffer(*grainsBuf, 3);
+                        cmd.BindStorageBuffer(*spBuf, 4);
+                        cmd.DispatchCompute(kBodyGroups); cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                    });
+                    g.Execute(*device); device->WaitIdle();
+
+                    // (c) read back the support-updated body vel + host IntegrateBody + ResolveGround (the fpx.h
+                    // integrate VERBATIM, the SAME ops the CPU reference runs -> bit-exact), re-upload.
+                    std::vector<CGrainSupportBodyGpu> rb((size_t)kBodyCount);
+                    device->ReadBuffer(*bodyBuf, rb.data(), rb.size() * sizeof(CGrainSupportBodyGpu), 0);
+                    for (int i = 0; i < kBodyCount; ++i) {
+                        fpx::FxBody& b = w.bodies[(size_t)i];
+                        b.vel = fpx::FxVec3{rb[(size_t)i].vx, rb[(size_t)i].vy, rb[(size_t)i].vz};
+                        fpx::IntegrateBody(b, w.gravity, w.groundY, kDt);
+                        fpx::ResolveGround(b, w.groundY);
+                    }
+                }
+                outWorld = w;
+            };
+
+            // === GPU coupled support (K steps, support ON) ===
+            cgrain::CGrainWorld gpuWorld;
+            runGpu(1, gpuWorld);
+            const fpx::fx kGpuRestY = cgrain::MeasureRestLine(gpuWorld);
+
+            // The PEAK gathered count per body over the run (the per-body support-loop length at active
+            // contact — the CRUX reduction-length caveat stat; the body gathers many bed grains as it sinks
+            // in and settles, even though at the final hovering rest the box just clears the bed top).
+            const uint32_t kMaxGathered = peakGathered;
+
+            // PROOF (1) GPU==CPU BIT-EXACT (integer memcmp, NO tol — the make-or-break).
+            bool exact = (gpuWorld.bodies.size() == cpuWorld.bodies.size());
+            for (size_t i = 0; exact && i < gpuWorld.bodies.size(); ++i)
+                if (std::memcmp(&gpuWorld.bodies[i], &cpuWorld.bodies[i], sizeof(fpx::FxBody)) != 0) exact = false;
+            if (!exact) {
+                std::fprintf(stderr, "FATAL: cgrain-support GPU != CPU StepCGrainSupport (a float crept into "
+                             "the fixed-point support/drag reduction?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgrain-support: {bodies:%d, grains:%d, steps:%d, restY:%d} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kGrainCount, kSteps, (int)kGpuRestY);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical.
+            {
+                cgrain::CGrainWorld gpu2;
+                runGpu(1, gpu2);
+                bool same = (gpu2.bodies.size() == gpuWorld.bodies.size());
+                for (size_t i = 0; same && i < gpu2.bodies.size(); ++i)
+                    if (std::memcmp(&gpu2.bodies[i], &gpuWorld.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: cgrain-support two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgrain-support determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) RESTS (the headline + the HONEST metric): the body settles at a rest line ON the bed —
+            // restY > groundY + radius by a clear margin (it did NOT crash through to the floor) AND restY is
+            // bounded above (it did NOT bounce out), deterministic + two-run byte-identical. (The HONEST framing,
+            // the GR4/CP2 caveat: the rest line is EMERGENT + iterative — NOT an exact sink depth.)
+            {
+                const fpx::fx kMargin = grain::kOne / 4;        // a clear margin above the bed floor
+                const fpx::fx kCeiling = (fpx::fx)(14 * (int)grain::kOne);   // a generous upper bound (no fly-out)
+                if (!(kGpuRestY > kBedFloor + kMargin) || !(kGpuRestY < kCeiling)) {
+                    std::fprintf(stderr, "FATAL: cgrain-support did NOT rest (restY=%d bed floor+r=%d ceiling=%d)\n",
+                                 (int)kGpuRestY, (int)kBedFloor, (int)kCeiling);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgrain-support rests: restY %d (above bed floor groundY+r=%d, supported on the bed)\n",
+                            (int)kGpuRestY, (int)kBedFloor);
+            }
+
+            // PROOF (4) zero-support control SINKS: supportEnabled=0 -> the body free-falls to the bed floor
+            // (restY == groundY + radius) — proving the contact support does the work. The GPU path with
+            // supportEnabled=0 is byte-identical to the CPU free-fall by construction.
+            {
+                cgrain::CGrainWorld ctrlWorld;
+                runGpu(0, ctrlWorld);
+                const fpx::fx kCtrlY = cgrain::MeasureRestLine(ctrlWorld);
+                if (kCtrlY != kBedFloor) {
+                    std::fprintf(stderr, "FATAL: cgrain-support control support=0 did NOT sink to bed floor "
+                                 "(ctrlY=%d bed floor+r=%d)\n", (int)kCtrlY, (int)kBedFloor);
+                    device->WaitIdle(); return 1;
+                }
+                if (!(kGpuRestY > kCtrlY)) {
+                    std::fprintf(stderr, "FATAL: cgrain-support rested body not above the support=0 control\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgrain-support control: support=0 sinks through (support does work)\n");
+            }
+            std::printf("cgrain-support reduction: maxGathered/body %u (the per-body support loop length)\n",
+                        kMaxGathered);
+
+            // --- Golden: a PURE-INTEGER side-view (x,y) of the settled bed + the resting body. Project each
+            // grain's integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel (dim sand), then the body as a warm
+            // filled disk at its settled (x,y) rest line + an integer ring of its radius. CPU-colored from the
+            // bit-exact CPU reference state -> identical both backends by construction (PURE INTEGER, the strict
+            // zero-differing-pixel bar; the GPU body == the CPU body, proven above). ---
+            const int kPxPerUnit = 26, kMargin = 24;
+            const int kWorldW = 12, kWorldH = 14;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+                cx = kMargin + wx * kPxPerUnit;
+                cy = (int)imgH - kMargin - wy * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // The static grain bed (dim sand).
+            for (int i = 0; i < kGrainCount; ++i) {
+                int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.55f, 0.42f, 0.22f}, 0);
+            }
+            // The resting body: a warm filled disk + an integer radius ring (from the bit-exact CPU state).
+            {
+                const fpx::FxBody& fb = cpuWorld.bodies[0];
+                int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+                const int rPx = (fb.radius >> grain::kFrac) * kPxPerUnit;
+                for (int a = 0; a < 360; a += 4) {
+                    const double rad = (double)a * 3.14159265358979 / 180.0;
+                    const int rx = bcx + (int)((double)rPx * std::cos(rad));
+                    const int ry = bcy - (int)((double)rPx * std::sin(rad));
+                    if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                        uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                        dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+                    }
+                }
+                plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);   // the body centre, a warm disk at the rest line
+            }
+            bool ok = WriteBMP(cgrainSupportShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cgrain support rest line (restY %d, bed floor %d)\n",
+                                cgrainSupportShotPath, imgW, imgH, (int)kGpuRestY, (int)kBedFloor);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgrainSupportShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

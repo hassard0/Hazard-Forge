@@ -561,6 +561,28 @@ hf_compile_shaders(
     "shaders/cgrain_body_count.comp.hlsl:cs"
     "shaders/cgrain_body_scan.comp.hlsl:cs"
     "shaders/cgrain_body_emit.comp.hlsl:cs"
+    # Deterministic Rigid<->Grain Coupling Slice 2 (Slice CG2, the CONTACT SUPPORT + DRAG grain->body pass — the
+    # CRUX of FLAGSHIP #12, the FIRST momentum exchange). ONE new int64 shader: cgrain_support.comp — ONE THREAD
+    # PER BODY (multi-thread OVER bodies, NOT per grain), each thread SERIALLY sums its body's CG1 gathered grain
+    # list (bodyGrains[bodyStart[i]..bodyStart[i+1]), the FIXED ascending CG1 emit order) into a contact-support
+    # (Σ pen·n over the OVERLAPPING grains — the exact radial cull deferred from CG1's box happens here — the bed
+    # pushes the body out/up along each contact normal, ∝ penetration) + drag (toward the static grains' mean
+    # velocity) impulse, then writes the body's new vel; AccumBodyGrainForces copied VERBATIM from
+    # engine/sim/couple_grain.h (linear only — a sphere body has no support torque; the host driver runs
+    # IntegrateBody + ResolveGround AFTER). The body count is TINY so each body's inner loop (LONGER than CP2's —
+    # a bed supports through many simultaneous contacts) is still far below the ~2s watchdog -> NO single-thread
+    # [numthreads(1,1,1)] / TDR ceiling (the CL3/FPX3 limit does not apply; if body counts scale, an integer
+    # atomic-add reduction is needed — OUT of scope CG1-CG6). The K-step loop is HOST-driven: each step re-runs the
+    # CG1 query passes (cgrain_body_{count,scan,emit}, int32 MSL-native) from the bodies' CURRENT positions ->
+    # cgrain_support -> the host integrate (IntegrateBody + ResolveGround), a ComputeToComputeBarrier between
+    # sub-passes; the grains are held STATIC (the reaction is CG3). Because the support/drag fxmul/fxdiv + the
+    # vGrainAvg int64 sum + FxNormalize (FxISqrt) use int64, cgrain_support.comp is VULKAN-SPIR-V-ONLY (DXC
+    # compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --cgrain-support showcase runs
+    # the CPU cgrain::StepCGrainSupport (byte-identical by construction, the couple_buoyancy.comp convention) —
+    # the Vulkan side carries the GPU==CPU proof. ReadBuffer reads the body array, PROVEN BIT-EXACT vs the CPU
+    # couple_grain.h::StepCGrainSupportSteps (memcmp — the make-or-break). NO new RHI; CG1's cgrain_body_
+    # {count,scan,emit} shaders + their goldens UNCHANGED (CG2 is additive; the CG1 query passes stay int32 MSL-native).
+    "shaders/cgrain_support.comp.hlsl:cs"
     # Deterministic Rigid<->Fluid Coupling Slice 2 (Slice CP2, the BUOYANCY + DRAG fluid->body pass — the CRUX
     # of FLAGSHIP #11, the FIRST momentum exchange). ONE new int64 shader: couple_buoyancy.comp — ONE THREAD
     # PER BODY (multi-thread OVER bodies, NOT per particle), each thread SERIALLY sums its body's CP1 gathered

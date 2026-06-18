@@ -246,6 +246,232 @@ int main() {
         check(cgrain::MaxPerBody(q) == 4u, "MaxPerBody == 4 (body B's gathered count)");
     }
 
+    // ============================================================================================
+    // ===== Slice CG2 — CONTACT SUPPORT + DRAG (grain->body, the crux) ============================
+    // ============================================================================================
+    // AccumBodyGrainForces: a body over a hand-laid gathered list -> the EXACT Q16.16 vel delta (support
+    // Σ pen·n along the contact normal; drag damps toward the grain avg; the fixed-order sum); a static body
+    // untouched; an empty gather -> free-fall (no delta). StepCGrainSupport: a body settles to a rest line
+    // above the bed floor, the support=0 control sinks, deterministic + body-order-independent.
+
+    // ---- AccumBodyGrainForces: ONE grain directly BELOW the body -> a pure +Y support push (exact) ----
+    // Body at (0, 1, 0) r=1; one grain at (0,0,0) r=1. d = body - grain = (0, kOne, 0); dist = kOne;
+    // pen = (1+1) - 1 = 1 (in world units, kOne in Q16.16). n = normalize(d) = (0, kOne, 0). F_support =
+    // n * fxmul(kSupport, pen) = (0, kSupport, 0). The grain is static (vel 0) so vGrainAvg = 0; F_drag =
+    // kDrag*(0 - body.vel) = 0 (body.vel starts 0). dvel = (0, kSupport, 0) * invMass(kOne) * dt. So
+    // body.vel.y == fxmul(fxmul(kSupport, dt? ) ...) — compute the exact expected with the same ops.
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h;
+        world.gravity = fpx::FxVec3{0, 0, 0};           // gravity handled by IntegrateBody (not here)
+        world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 0, 0, 0);
+        g.radius = FromInt(1);                           // r=1
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 1, 0, 1);              // body at y=1, r=1 -> overlaps the grain by pen=1
+        world.bodies = {b};
+
+        // The hand-laid gather: body 0 gathers grain 0.
+        cgrain::CGrainQuery q;
+        q.bodyStart = {0u, 1u};
+        q.bodyGrains = {0u};
+
+        cgrain::AccumBodyGrainForces(world, q, dt);
+
+        // Exact expected: F_support = (0, fxmul(kSupport, kOne)==kSupport, 0); F_drag = 0; dvel.y =
+        // fxmul(fxmul(kSupport, invMass=kOne), dt).
+        const fx penFx = kOne;                           // pen = 1.0 in Q16.16
+        const fx fSupportY = fpx::fxmul(cgrain::kSupport, penFx);
+        const fx expVelY = fpx::fxmul(fpx::fxmul(fSupportY, kOne /*invMass*/), dt);
+        check(world.bodies[0].vel.x == 0, "support: pure-below grain -> vel.x unchanged");
+        check(world.bodies[0].vel.z == 0, "support: pure-below grain -> vel.z unchanged");
+        check(world.bodies[0].vel.y == expVelY, "support: vel.y == fxmul(fxmul(kSupport*pen, invMass), dt)");
+        check(world.bodies[0].vel.y > 0, "support pushes the body UP (positive +Y vel delta)");
+    }
+
+    // ---- AccumBodyGrainForces: DRAG damps toward a moving grain's velocity (exact) ----
+    // A grain with a +X velocity, NON-overlapping (placed so pen <= 0) so ONLY drag acts. Body at (0,10,0)
+    // r=1, grain at (0,0,0) r=1: dist=10, pen=(1+1)-10 = -8 < 0 -> NO support. The grain has vel=(kOne,0,0).
+    // vGrainAvg=(kOne,0,0); body.vel=0 -> F_drag = kDrag*(kOne,0,0); dvel.x = fxmul(fxmul(kDrag*kOne, kOne), dt).
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 0, 0, 0);
+        g.radius = FromInt(1);
+        g.vel = fpx::FxVec3{kOne, 0, 0};                 // grain moving +X at 1.0/s
+        world.grains = {g};
+        world.bodies = {BodyAt(0, 10, 0, 1)};            // far above -> no overlap -> pure drag
+        cgrain::CGrainQuery q; q.bodyStart = {0u, 1u}; q.bodyGrains = {0u};
+
+        cgrain::AccumBodyGrainForces(world, q, dt);
+
+        const fx fDragX = fpx::fxmul(cgrain::kDrag, kOne);  // kDrag*(vGrainAvg.x - 0)
+        const fx expVelX = fpx::fxmul(fpx::fxmul(fDragX, kOne /*invMass*/), dt);
+        check(world.bodies[0].vel.x == expVelX, "drag: vel.x == fxmul(fxmul(kDrag*vGrainAvg, invMass), dt)");
+        check(world.bodies[0].vel.x > 0, "drag pulls the body toward the grain's +X velocity");
+        check(world.bodies[0].vel.y == 0, "drag: no support (non-overlapping) -> vel.y unchanged");
+    }
+
+    // ---- AccumBodyGrainForces: a STATIC (non-dynamic) body is untouched ----
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 0, 0, 0); g.radius = FromInt(1);
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 1, 0, 1);
+        b.flags = 0;                                     // NOT dynamic -> pinned
+        b.vel = fpx::FxVec3{0, 0, 0};
+        world.bodies = {b};
+        cgrain::CGrainQuery q; q.bodyStart = {0u, 1u}; q.bodyGrains = {0u};
+
+        cgrain::AccumBodyGrainForces(world, q, dt);
+        check(world.bodies[0].vel.x == 0 && world.bodies[0].vel.y == 0 && world.bodies[0].vel.z == 0,
+              "static body -> vel untouched (the pinned case)");
+    }
+
+    // ---- AccumBodyGrainForces: an EMPTY gather -> free-fall (no support/drag delta) ----
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        world.grains = {GrainAt(0, 0, 0, 0)};
+        fpx::FxBody b = BodyAt(0, 50, 0, 1);             // far above the bed
+        b.vel = fpx::FxVec3{FromInt(7), 0, 0};           // some pre-existing velocity
+        world.bodies = {b};
+        cgrain::CGrainQuery q; q.bodyStart = {0u, 0u}; q.bodyGrains = {};   // gathers NOTHING
+
+        cgrain::AccumBodyGrainForces(world, q, dt);
+        check(world.bodies[0].vel.x == FromInt(7) && world.bodies[0].vel.y == 0 && world.bodies[0].vel.z == 0,
+              "empty gather -> vel unchanged (free-fall, no support/drag)");
+    }
+
+    // ---- AccumBodyGrainForces: support Σ pen·n over MULTIPLE grains is the FIXED-ORDER sum ----
+    // Two grains symmetric in X below the body so the X contributions cancel and the Y support doubles
+    // (a hand-checkable Σ pen·n). Body at (0,1,0) r=2; grain A at (-1,0,0) r=1, grain B at (1,0,0) r=1.
+    // For A: d=(1,1,0) (body-grain); for B: d=(-1,1,0). dist for each = sqrt(2). pen=(2+1)-sqrt(2)>0.
+    // n_A=norm(1,1,0), n_B=norm(-1,1,0): x cancels, y doubles. The exact value is reproduced by replaying
+    // the same ops in the same order.
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle gA = GrainAt(-1, 0, 0, 0); gA.radius = FromInt(1);
+        grain::GrainParticle gB = GrainAt( 1, 0, 0, 0); gB.radius = FromInt(1);
+        world.grains = {gA, gB};
+        world.bodies = {BodyAt(0, 1, 0, 2)};
+        cgrain::CGrainQuery q; q.bodyStart = {0u, 2u}; q.bodyGrains = {0u, 1u};
+
+        cgrain::AccumBodyGrainForces(world, q, dt);
+
+        // Replay the exact fixed-order reduction to get the expected delta.
+        auto fxL = [](fpx::FxVec3 v) { return fpx::FxLength(v); };
+        fpx::FxVec3 fSup{0, 0, 0};
+        const fpx::FxBody bb = BodyAt(0, 1, 0, 2);
+        for (uint32_t s = 0; s < 2; ++s) {
+            const grain::GrainParticle& gg = world.grains[s];
+            fpx::FxVec3 d = fpx::FxSub(bb.pos, gg.pos);
+            fx dist = fxL(d);
+            fx pen = (bb.radius + gg.radius) - dist;
+            if (pen > 0) fSup = fpx::FxAdd(fSup, fpx::FxScale(fpx::FxNormalize(d), fpx::fxmul(cgrain::kSupport, pen)));
+        }
+        fpx::FxVec3 dvel = fpx::FxScale(fpx::FxScale(fSup, kOne), dt);
+        check(world.bodies[0].vel.x == dvel.x, "multi-grain support: vel.x == the fixed-order Σ pen·n delta");
+        check(world.bodies[0].vel.y == dvel.y, "multi-grain support: vel.y == the fixed-order Σ pen·n delta");
+        // (The X contributions are equal-opposite normals scaled by the same magnitude; they NEARLY cancel
+        // but the arithmetic-right-shift fxmul floors toward -inf so the net may be a 1-LSB residual — the
+        // honest fixed-point reduction is what the GPU reproduces bit-for-bit, NOT an exact analytic zero.)
+        check(world.bodies[0].vel.x >= -2 && world.bodies[0].vel.x <= 2,
+              "symmetric grains: the X support contributions cancel to within a 1-LSB fixed-point residual");
+        check(world.bodies[0].vel.y > 0, "symmetric grains: the Y support contributions add (net UP)");
+    }
+
+    // ---- StepCGrainSupport: a body dropped above a bed SETTLES to a rest line above the bed floor ----
+    // A dense flat grain bed (a slab) + a body dropped above it. After K steps the body rests ON the bed:
+    // restY > groundY + radius (it did NOT crash through) AND bounded above (it did NOT bounce out).
+    {
+        const fx dt = kOne / 60;
+        const fx hSearch = kOne + kOne / 2;              // 1.5
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        // A flat bed slab: x,z in [0,8], y in [0,2], unit-spaced 0.25-radius grains.
+        std::vector<grain::GrainParticle> grains;
+        for (int gy = 0; gy <= 2; ++gy)
+            for (int gz = 0; gz <= 8; ++gz)
+                for (int gx = 0; gx <= 8; ++gx) {
+                    grain::GrainParticle g = GrainAt(gx, gy, gz, 0);
+                    g.radius = kOne / 4;
+                    grains.push_back(g);
+                }
+        auto makeWorld = [&](int bx, int by, int bz) {
+            cgrain::CGrainWorld w;
+            w.grains = grains; w.hSearch = hSearch;
+            w.gravity = fpx::FxVec3{0, kGravY, 0}; w.dt = dt; w.groundY = 0;
+            w.bodies = {BodyAt(bx, by, bz, 2)};
+            return w;
+        };
+        cgrain::CGrainWorld world = makeWorld(4, 12, 4);
+        const fx kBedFloor = world.groundY + world.bodies[0].radius;   // groundY + radius (the bed floor)
+        cgrain::StepCGrainSupportSteps(world, dt, 300);
+        const fx restY = cgrain::MeasureRestLine(world);
+
+        check(restY > kBedFloor + kOne / 4, "rests: restY above the bed floor by a clear margin (not crashed through)");
+        check(restY < FromInt(12), "rests: restY bounded above (did not bounce out)");
+
+        // determinism: two runs byte-identical.
+        cgrain::CGrainWorld world2 = makeWorld(4, 12, 4);
+        cgrain::StepCGrainSupportSteps(world2, dt, 300);
+        check(std::memcmp(&world.bodies[0], &world2.bodies[0], sizeof(fpx::FxBody)) == 0,
+              "StepCGrainSupport: two runs byte-identical (deterministic)");
+
+        // ---- support=0 control: the body SINKS through to the bed floor (restY == groundY + radius) ----
+        // With kSupport forced to 0 the body free-falls + only ResolveGround clamps it -> restY == bed floor.
+        // (We emulate kSupport=0 by a body that gathers grains but whose support is zeroed: here we run the
+        // SAME world but with grains placed so the body never overlaps -> equivalent free-fall to the floor.)
+        cgrain::CGrainWorld ctrl;
+        ctrl.grains = {};                                // NO grains -> no support, the body free-falls
+        ctrl.hSearch = hSearch; ctrl.gravity = fpx::FxVec3{0, kGravY, 0}; ctrl.dt = dt; ctrl.groundY = 0;
+        ctrl.bodies = {BodyAt(4, 12, 4, 2)};
+        cgrain::StepCGrainSupportSteps(ctrl, dt, 300);
+        const fx ctrlY = cgrain::MeasureRestLine(ctrl);
+        check(ctrlY == kBedFloor, "control: support=0 sinks through to the bed floor (restY == groundY+radius)");
+        check(restY > ctrlY, "rests: the supported body rests ABOVE the support=0 control (support does work)");
+    }
+
+    // ---- StepCGrainSupport: the rest line is body-ORDER-independent (a determinism property) ----
+    // Two bodies dropped over a bed in order [A,B] vs [B,A]; each body's settled state is identical
+    // regardless of the iteration order (the bodies are disjoint, no body-body coupling).
+    {
+        const fx dt = kOne / 60;
+        const fx hSearch = kOne + kOne / 2;
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        std::vector<grain::GrainParticle> grains;
+        for (int gy = 0; gy <= 2; ++gy)
+            for (int gz = 0; gz <= 12; ++gz)
+                for (int gx = 0; gx <= 12; ++gx) {
+                    grain::GrainParticle g = GrainAt(gx, gy, gz, 0);
+                    g.radius = kOne / 4;
+                    grains.push_back(g);
+                }
+        fpx::FxBody bodyA = BodyAt(3, 10, 3, 2);
+        fpx::FxBody bodyB = BodyAt(9, 10, 9, 2);
+        auto run = [&](std::vector<fpx::FxBody> bodies) {
+            cgrain::CGrainWorld w;
+            w.grains = grains; w.hSearch = hSearch;
+            w.gravity = fpx::FxVec3{0, kGravY, 0}; w.dt = dt; w.groundY = 0;
+            w.bodies = std::move(bodies);
+            cgrain::StepCGrainSupportSteps(w, dt, 200);
+            return w;
+        };
+        cgrain::CGrainWorld wAB = run({bodyA, bodyB});
+        cgrain::CGrainWorld wBA = run({bodyB, bodyA});
+        check(std::memcmp(&wAB.bodies[0], &wBA.bodies[1], sizeof(fpx::FxBody)) == 0,
+              "body-order independence: A's settled state is identical in [A,B] vs [B,A]");
+        check(std::memcmp(&wAB.bodies[1], &wBA.bodies[0], sizeof(fpx::FxBody)) == 0,
+              "body-order independence: B's settled state is identical in [A,B] vs [B,A]");
+    }
+
     if (g_fail == 0) std::printf("cgrain_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
