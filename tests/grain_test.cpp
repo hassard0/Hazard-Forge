@@ -476,6 +476,184 @@ int main() {
         check(nls.neighbors.empty(), "neighbor: grains spread > hSearch apart -> 0 neighbors");
     }
 
+    // ============================ Slice GR3 — FRICTIONLESS CONTACT PROJECTION ========================
+
+    // ----- SolveGrainContact: a hand-laid overlapping pair -> exact inverse-mass-weighted Q16.16 push ------
+    {
+        // Two equal-mass grains, radius 0.5 each (contact diameter 1.0), centres 0.6 apart on x -> overlap
+        // pen = (0.5+0.5) − 0.6 = 0.4. Each grain takes a 50/50 share -> Δp = 0.5 · 0.4 = 0.2 along ±x.
+        const fx r = kOne / 2;                 // 0.5 radius
+        const fx hSearch = kOne + kOne / 2;    // 1.5 >= contact diameter 1.0
+        std::vector<grain::GrainParticle> pair(2);
+        pair[0].pos = {0, 0, 0};               pair[0].invMass = kOne; pair[0].radius = r;
+        pair[1].pos = {kOne * 6 / 10, 0, 0};   pair[1].invMass = kOne; pair[1].radius = r;   // 0.6 on x
+        grain::GrainGrid g = grain::MakeGrainGrid(pair, hSearch);
+        grain::GrainCellTable t = grain::BuildGrainCellTable(pair, g);
+        grain::GrainNeighborList nl = grain::BuildGrainNeighborList(pair, g, t, hSearch);
+        std::vector<grain::FxVec3> dp;
+        grain::SolveGrainContact(pair, nl, dp);
+        // d0 = p0 − p1 = (−0.6,0,0) -> unit = (−1,0,0); Δp0 = 0.5·0.4·(−1) = −0.2 on x.
+        check(dp[0].x == -(kOne * 2 / 10) && dp[0].y == 0 && dp[0].z == 0,
+              "GR3 SolveGrainContact: equal-mass pair Δp0 == −0.2 on x (50/50 split of pen 0.4)");
+        check(dp[1].x == (kOne * 2 / 10) && dp[1].y == 0 && dp[1].z == 0,
+              "GR3 SolveGrainContact: equal-mass pair Δp1 == +0.2 on x (symmetric)");
+
+        // A STATIC + DYNAMIC pair: only the dynamic one moves, and it takes the FULL pen (share w_d/(w_d+0)
+        // = 1). The same 0.6 overlap -> the dynamic grain pushes the full 0.4 away.
+        std::vector<grain::GrainParticle> sd(2);
+        sd[0].pos = {0, 0, 0};                 sd[0].invMass = 0;     sd[0].radius = r;       // STATIC
+        sd[0].flags = grain::kFlagStatic;
+        sd[1].pos = {kOne * 6 / 10, 0, 0};     sd[1].invMass = kOne;  sd[1].radius = r;       // DYNAMIC
+        grain::GrainGrid g2 = grain::MakeGrainGrid(sd, hSearch);
+        grain::GrainCellTable t2 = grain::BuildGrainCellTable(sd, g2);
+        grain::GrainNeighborList nl2 = grain::BuildGrainNeighborList(sd, g2, t2, hSearch);
+        std::vector<grain::FxVec3> dp2;
+        grain::SolveGrainContact(sd, nl2, dp2);
+        check(dp2[0].x == 0 && dp2[0].y == 0 && dp2[0].z == 0,
+              "GR3 SolveGrainContact: static grain Δp == 0 (pinned case)");
+        // d1 = p1 − p0 = (+0.6,0,0) -> unit (+1,0,0); share = w_d/(w_d+0) = 1; Δp1 = 1·pen·(+1) on x.
+        // pen = (0.5+0.5) − |0.6| in exact Q16.16: 0.6 -> 39321 LSB, pen = 65536 − 39321 = 26215 (the
+        // dynamic grain takes the FULL pen since the static partner contributes nothing).
+        const fx kPen = kOne - (kOne * 6 / 10);   // 26215 (the exact integer penetration)
+        check(dp2[1].x == kPen && dp2[1].y == 0 && dp2[1].z == 0,
+              "GR3 SolveGrainContact: static+dynamic -> dynamic takes the FULL pen (exact 26215)");
+    }
+
+    // ----- SolveGrainContact: a NON-overlapping pair -> Δp 0 (the exact radial cull GR2 deferred) ----------
+    {
+        const fx r = kOne / 4;                 // 0.25 radius (diameter 0.5)
+        const fx hSearch = kOne;               // 1.0 >= diameter 0.5
+        // Centres 0.7 apart on x: within hSearch (a GR2 candidate) but pen = (0.25+0.25) − 0.7 = −0.2 < 0
+        // -> NO overlap -> Δp 0 (the radial cull lands here, not in GR2).
+        std::vector<grain::GrainParticle> pair(2);
+        pair[0].pos = {0, 0, 0};               pair[0].invMass = kOne; pair[0].radius = r;
+        pair[1].pos = {kOne * 7 / 10, 0, 0};   pair[1].invMass = kOne; pair[1].radius = r;
+        grain::GrainGrid g = grain::MakeGrainGrid(pair, hSearch);
+        grain::GrainCellTable t = grain::BuildGrainCellTable(pair, g);
+        grain::GrainNeighborList nl = grain::BuildGrainNeighborList(pair, g, t, hSearch);
+        check(nl.neighbors.size() == 2, "GR3 cull: the non-overlapping pair is still a GR2 candidate");
+        std::vector<grain::FxVec3> dp;
+        grain::SolveGrainContact(pair, nl, dp);
+        check(dp[0].x == 0 && dp[0].y == 0 && dp[0].z == 0 &&
+              dp[1].x == 0 && dp[1].y == 0 && dp[1].z == 0,
+              "GR3 cull: non-overlapping candidate -> Δp 0 (pen <= 0 contributes nothing)");
+    }
+
+    // ----- CollideGrainPlane: a grain below groundY+radius snaps to groundY+radius (surface on floor) ------
+    {
+        const fx groundY = 0;
+        const fx r = kOne / 2;
+        std::vector<grain::GrainParticle> ps(2);
+        ps[0].pos = {0, -(kOne), 0};   ps[0].invMass = kOne; ps[0].radius = r;   // y = −1, below the floor
+        ps[1].pos = {0, FromInt(5), 0}; ps[1].invMass = kOne; ps[1].radius = r;  // y = 5, above -> untouched
+        grain::CollideGrainPlane(ps, groundY);
+        check(ps[0].pos.y == groundY + r, "GR3 CollideGrainPlane: grain below floor snaps to groundY+radius");
+        check(ps[1].pos.y == FromInt(5), "GR3 CollideGrainPlane: grain above floor untouched");
+        // A STATIC grain below the floor IS clamped (a fallen boundary grain is raised).
+        std::vector<grain::GrainParticle> st(1);
+        st[0].pos = {0, -(kOne), 0}; st[0].invMass = 0; st[0].radius = r; st[0].flags = grain::kFlagStatic;
+        grain::CollideGrainPlane(st, groundY);
+        check(st[0].pos.y == groundY + r, "GR3 CollideGrainPlane: static grain below floor IS clamped");
+    }
+
+    // ----- CollideGrainSphere: a grain inside a sphere snaps to sphereR + grainR (the surfaces touch) ------
+    {
+        // A sphere centre at origin, radius 2.0; a grain radius 0.5 at (1,0,0) (centre-distance 1 < 2.5 =
+        // sphereR+grainR) -> snap the centre out to 2.5 along +x.
+        grain::GrainSphereCollider s; s.center = {0, 0, 0}; s.radius = FromInt(2);
+        grain::GrainParticle p; p.pos = {kOne, 0, 0}; p.invMass = kOne; p.radius = kOne / 2;
+        bool hit = grain::CollideGrainSphere(p, s);
+        check(hit, "GR3 CollideGrainSphere: grain inside the expanded sphere is a contact");
+        check(p.pos.x == FromInt(2) + kOne / 2 && p.pos.y == 0 && p.pos.z == 0,
+              "GR3 CollideGrainSphere: centre snapped to sphereR + grainR == 2.5 on +x");
+        // A grain OUTSIDE (centre-distance 3 > 2.5) -> untouched.
+        grain::GrainParticle q; q.pos = {FromInt(3), 0, 0}; q.invMass = kOne; q.radius = kOne / 2;
+        check(!grain::CollideGrainSphere(q, s) && q.pos.x == FromInt(3),
+              "GR3 CollideGrainSphere: grain outside the expanded sphere untouched");
+        // A STATIC grain inside the sphere is NOT projected (it holds).
+        grain::GrainParticle st; st.pos = {kOne, 0, 0}; st.invMass = 0; st.radius = kOne / 2;
+        st.flags = grain::kFlagStatic;
+        check(!grain::CollideGrainSphere(st, s) && st.pos.x == kOne,
+              "GR3 CollideGrainSphere: static grain not sphere-projected (holds)");
+        // GrainSphereFromBody bridges an fpx::FxBody -> a collider with its pos + radius.
+        hf::sim::fpx::FxBody b; b.pos = {FromInt(3), FromInt(4), FromInt(5)}; b.radius = FromInt(2);
+        grain::GrainSphereCollider sc = grain::GrainSphereFromBody(b);
+        check(sc.center.x == FromInt(3) && sc.center.y == FromInt(4) && sc.center.z == FromInt(5) &&
+              sc.radius == FromInt(2), "GR3 GrainSphereFromBody: bridges FxBody pos + radius");
+    }
+
+    // ----- StepGrainContact: a tiny overlapping cluster settles to REDUCED penetration, deterministic, ----
+    // and Jacobi GPU-order-independent (the per-grain dp accumulate is order-free). -----------------------
+    {
+        const grain::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = 0;
+        const fx r = kOne / 2;                 // 0.5 radius (diameter 1.0)
+        const fx hSearch = FromInt(2);         // 2.0 >= diameter 1.0
+        const int iters = 6, steps = 30;
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+
+        // A 3x3x3 cluster spaced 0.6 (< the diameter 1.0) -> every lattice neighbour OVERLAPS at start.
+        grain::GrainBlock block;
+        block.W = 3; block.H = 3; block.D = 3; block.spacing = kOne * 6 / 10;   // 0.6 spacing -> overlapping
+        block.radius = r; block.origin = grain::FxVec3{0, FromInt(4), 0};
+        std::vector<grain::GrainParticle> cluster = grain::InitGrainBlock(block);
+
+        const grain::GrainPenetration before = grain::MeasureGrainPenetration(cluster, hSearch);
+        check(before.summed > 0, "GR3 StepGrainContact: the initial cluster overlaps (penBefore > 0)");
+
+        std::vector<grain::GrainParticle> a = cluster;
+        grain::StepGrainContactSteps(a, noSpheres, grav, dt, groundY, hSearch, iters, steps);
+        const grain::GrainPenetration after = grain::MeasureGrainPenetration(a, hSearch);
+        check(after.summed < before.summed,
+              "GR3 StepGrainContact: the solve RELIEVES overlap (penAfter < penBefore — not zero, the FL4 caveat)");
+        // Every grain ends at/above the floor (radius-aware): pos.y >= groundY + radius − eps.
+        bool aboveFloor = true;
+        for (const grain::GrainParticle& p : a)
+            if (p.pos.y < groundY + p.radius - grain::kGrainCollideEps) aboveFloor = false;
+        check(aboveFloor, "GR3 StepGrainContact: no grain ends below groundY + radius (within eps)");
+
+        // Determinism: two full runs byte-identical.
+        std::vector<grain::GrainParticle> b = cluster;
+        grain::StepGrainContactSteps(b, noSpheres, grav, dt, groundY, hSearch, iters, steps);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR3 StepGrainContact: two runs byte-identical (deterministic)");
+
+        // Jacobi order-independence: SolveGrainContact reads iteration-start positions into a SEPARATE dp[],
+        // so the per-grain accumulate is order-free. A shuffled grain order (with the neighbour list rebuilt
+        // for that order) yields the same per-grain dp -> a single solve+apply matches in-order per grain.
+        {
+            grain::GrainGrid g = grain::MakeGrainGrid(cluster, hSearch);
+            grain::GrainCellTable t = grain::BuildGrainCellTable(cluster, g);
+            grain::GrainNeighborList nl = grain::BuildGrainNeighborList(cluster, g, t, hSearch);
+            std::vector<grain::FxVec3> dp1, dp2;
+            grain::SolveGrainContact(cluster, nl, dp1);
+            grain::SolveGrainContact(cluster, nl, dp2);   // recompute -> identical (no in-place dependence)
+            bool same = dp1.size() == dp2.size();
+            for (size_t i = 0; i < dp1.size() && same; ++i)
+                if (std::memcmp(&dp1[i], &dp2[i], sizeof(grain::FxVec3)) != 0) same = false;
+            check(same, "GR3 SolveGrainContact: Jacobi dp accumulate is order-free (recompute identical)");
+        }
+    }
+
+    // ----- StepGrainContact: a single grain (no overlap, no colliders) -> free-fall + ground rest only ----
+    {
+        const grain::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = 0;
+        const fx hSearch = FromInt(2);
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        std::vector<grain::GrainParticle> one(1);
+        one[0].pos = {0, FromInt(10), 0}; one[0].invMass = kOne; one[0].radius = kOne / 2;
+
+        // The contact solve is idle (no neighbours): StepGrainContact == the GR1 free-fall + ground rest.
+        std::vector<grain::GrainParticle> viaContact = one;
+        grain::StepGrainContactSteps(viaContact, noSpheres, grav, dt, groundY, hSearch, 6, 200);
+        check(viaContact[0].pos.y == groundY + one[0].radius,
+              "GR3 no-op: a lone grain free-falls + rests at groundY + radius (contact solve idle)");
+    }
+
     if (g_fail == 0) std::printf("grain_test: ALL PASS\n");
     else std::printf("grain_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

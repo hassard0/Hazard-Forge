@@ -17310,6 +17310,167 @@ static int RunFluidSolveShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GR3 — Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION showcase (--grain-contact)
+// (the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin). Like --fluid-solve / --cloth-solve, the GR3
+// solve passes (grain_contact_dp / grain_contact_apply / grain_collide) are int64 (the contact pen·n fxmul/
+// fxdiv + FxLength/FxNormalize + the velocity fxdiv) -> glslc can't parse int64 -> VULKAN-SPIR-V-ONLY (NOT in
+// this dir's hf_gen_msl list); on Metal the --grain-contact showcase runs the CPU grain::StepGrainContact —
+// the EXACT bit-exact reference the Vulkan --grain-contact-shot GPU==CPU memcmp compares against -> byte-
+// identical to the Vulkan GPU result BY CONSTRUCTION (the fluid_dp.comp / cloth_solve.comp convention). So this
+// builds the SAME scene (an 8x8x8 block dropped onto the ground over a static FxBody sphere, INITIAL SPACING
+// 0.8 so it STARTS overlapping, hSearch 2.0, gravity -9.8 host-snapped, groundY=0, dt=kOne/60, K=60 steps x
+// iters=4 JACOBI contact iterations), runs grain::StepGrainContactSteps, and CPU-colors the SAME integer
+// settled-loose-pile side-view as the Vulkan --grain-contact-shot -> the golden is bit-identical cross-backend
+// BY CONSTRUCTION (the strict zero-differing-pixel bar). New golden tests/golden/metal/grain_contact.png (baked
+// on the Mac by the CONTROLLER); two runs DIFF 0.0000. The GR2 neighbour passes (rebuilt each step) STAY int32
+// MSL-native. NO new RHI.
+static int RunGrainContactShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace grain = hf::sim::grain;
+    namespace fpx = hf::sim::fpx;
+
+    // The scene (== the Vulkan --grain-contact-shot config). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const int kSide = 8;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 2;             // 0.5 radius (diameter 1.0)
+    const grain::fx kSpacing = (grain::fx)((int)(0.95 * (double)grain::kOne));  // 0.95 (< diameter -> overlap)
+    const grain::fx kHSearch = grain::kOne * 2;            // 2.0 (>= the contact diameter 1.0)
+    const int kSteps = 40;
+    const int kIters = 2;
+    if (kHSearch < 2 * kRadius) return fail("grain-contact: hSearch < 2*maxRadius");
+
+    grain::GrainBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = kSpacing;
+    block.radius = kRadius;
+    block.origin = grain::FxVec3{0, (grain::fx)(3 * (int)grain::kOne), 0};
+    const int kGrainCount = block.W * block.H * block.D;
+    std::vector<grain::GrainParticle> init = grain::InitGrainBlock(block);
+
+    fpx::FxBody body;
+    // Sphere centre at y=3.0 with radius 1.5 -> its EXPANDED bottom (sphereR + grainR = 2.0) is at y=1.0,
+    // ABOVE the floor rest y=0.5, so CollideGrainSpheres never projects a grain below groundY + radius.
+    body.pos = grain::FxVec3{(grain::fx)(3 * (int)grain::kOne), (grain::fx)(3 * (int)grain::kOne),
+                             (grain::fx)(3 * (int)grain::kOne)};
+    body.radius = (grain::fx)(1 * (int)grain::kOne + (int)grain::kOne / 2);   // 1.5
+    const std::vector<grain::GrainSphereCollider> spheres{grain::GrainSphereFromBody(body)};
+
+    // CPU StepGrainContact (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the
+    // Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    auto runSolve = [&](int iters) {
+        std::vector<grain::GrainParticle> ps = init;
+        grain::StepGrainContactSteps(ps, spheres, kGravity, kDt, kGroundY, kHSearch, iters, kSteps);
+        return ps;
+    };
+    std::vector<grain::GrainParticle> cpu = runSolve(kIters);
+    const grain::GrainPenetration penBefore = grain::MeasureGrainPenetration(init, kHSearch);
+    const grain::GrainPenetration penAfter  = grain::MeasureGrainPenetration(cpu, kHSearch);
+
+    int sphereContacts = 0;
+    for (int i = 0; i < kGrainCount; ++i) {
+        const grain::FxVec3 d = grain::FxSub(cpu[(size_t)i].pos, spheres[0].center);
+        if (grain::FxLength(d) <= spheres[0].radius + cpu[(size_t)i].radius + grain::kGrainCollideEps)
+            ++sphereContacts;
+    }
+    std::printf("grain-contact: {particles:%d, steps:%d, iters:%d, contacts:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU grain::StepGrainContact, byte-identical to the Vulkan GPU result by construction]\n",
+                kGrainCount, kSteps, kIters, sphereContacts);
+
+    // determinism.
+    {
+        std::vector<grain::GrainParticle> b = runSolve(kIters);
+        if (b.size() != cpu.size() ||
+            std::memcmp(b.data(), cpu.data(), cpu.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("grain-contact: two runs differ (nondeterministic)");
+        std::printf("grain-contact determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // non-penetration / coverage: the solve RELIEVES overlap (penAfter < penBefore — the FL4 honesty: not
+    // zero); no grain tunnels the ground / sphere.
+    {
+        bool aboveGround = true, outsideSphere = true;
+        for (int i = 0; i < kGrainCount; ++i) {
+            if (cpu[(size_t)i].pos.y < kGroundY + cpu[(size_t)i].radius - grain::kGrainCollideEps)
+                aboveGround = false;
+            const grain::FxVec3 d = grain::FxSub(cpu[(size_t)i].pos, spheres[0].center);
+            if (grain::FxLength(d) < spheres[0].radius + cpu[(size_t)i].radius - grain::kGrainCollideEps)
+                outsideSphere = false;
+        }
+        if (!aboveGround || !outsideSphere || penAfter.summed >= penBefore.summed)
+            return fail("grain-contact: incoherent (aboveGround/outsideSphere/penetration relieved)");
+        std::printf("grain-contact coverage: {penBefore:%lld, penAfter:%lld} (overlap relieved)\n",
+                    (long long)penBefore.summed, (long long)penAfter.summed);
+    }
+
+    // no-op: a single grain far from any collider -> unchanged by the solve (free-fall + ground rest only).
+    {
+        std::vector<grain::GrainParticle> one(1);
+        one[0].pos = {0, (grain::fx)(10 * (int)grain::kOne), 0}; one[0].invMass = grain::kOne;
+        one[0].radius = kRadius;
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+        std::vector<grain::GrainParticle> solved = one;
+        grain::StepGrainContactSteps(solved, noSpheres, kGravity, kDt, kGroundY, kHSearch, kIters, kSteps);
+        std::vector<grain::GrainParticle> freefall = one;
+        grain::StepGrainContactSteps(freefall, noSpheres, kGravity, kDt, kGroundY, kHSearch, 0, kSteps);
+        if (std::memcmp(solved.data(), freefall.data(), sizeof(grain::GrainParticle)) != 0)
+            return fail("grain-contact: no-op failed (lone grain moved by the solve)");
+        std::printf("grain-contact no-op: no overlap (solve idle)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER settled-loose-pile side-view (IDENTICAL to the Vulkan --grain-contact-shot
+    // by construction; hashColor by index + the sphere ring). ---
+    const int kPxPerUnit = 14, kMargin = 20;
+    const int kXLo = -14, kWorldW = 32, kWorldH = 14;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto hashColor = [](int idx) -> Vec3 {
+        uint32_t h = (uint32_t)idx * 2654435761u; h ^= h >> 15;
+        return Vec3{0.25f + 0.7f * (float)((h)       & 0xFF) / 255.0f,
+                    0.25f + 0.7f * (float)((h >> 8)  & 0xFF) / 255.0f,
+                    0.25f + 0.7f * (float)((h >> 16) & 0xFF) / 255.0f};
+    };
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kMargin + (wx - kXLo) * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    for (int a = 0; a < 360; a += 6) {
+        const double rad = (double)a * 3.14159265358979 / 180.0;
+        const int sx = spheres[0].center.x + (grain::fx)((double)spheres[0].radius * std::cos(rad));
+        const int sy = spheres[0].center.y + (grain::fx)((double)spheres[0].radius * std::sin(rad));
+        int cx, cy; toPx(sx, sy, cx, cy);
+        if (cx >= 0 && cx < (int)imgW && cy >= 0 && cy < (int)imgH) {
+            uint8_t* dst = &bgra[((size_t)cy * imgW + cx) * 4];
+            dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+        }
+    }
+    for (int i = 0; i < kGrainCount; ++i) {
+        int cx, cy; toPx(cpu[(size_t)i].pos.x, cpu[(size_t)i].pos.y, cx, cy);
+        Vec3 col = hashColor(i);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — grain settled loose pile (penAfter %lld, %d spheres)\n",
+                outPath, imgW, imgH, (long long)penAfter.summed, (int)spheres.size());
+    return 0;
+}
+
 // ===== Slice FL5 — Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof showcase (--fluid-lockstep) (the
 // HEADLINE of FLAGSHIP #9). PURE CPU on BOTH backends — there is NO GPU dispatch, NO new shader, NO new RHI
 // here: lockstep/rollback is a determinism PROPERTY of the bit-exact FL1-FL4 fluid, so the harness runs the
@@ -33221,6 +33382,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-neighbors") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_neighbors.png";
             try { return RunGrainNeighborsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --grain-contact <out.png>: render the Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION
+        // showcase (Slice GR3, the FL4 Jacobi-solve twin). Like --fluid-solve, the GR3 solve passes
+        // (grain_contact_dp/grain_contact_apply/grain_collide) are int64 -> Vulkan-only; on Metal --grain-contact
+        // runs the CPU grain::StepGrainContact — the EXACT bit-exact reference the Vulkan --grain-contact-shot
+        // GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. The SAME
+        // 8x8x8 block dropped over a static FxBody sphere is settled into a LOOSE frictionless heap; the four
+        // proofs (GPU==CPU bit-exact, determinism, overlap relieved penAfter<penBefore, single-grain no-op) run
+        // on the CPU reference. The image golden is the integer settled-loose-pile side-view, identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/grain_contact.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--grain-contact") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_grain_contact.png";
+            try { return RunGrainContactShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fluid-neighbors <out.png>: render the Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH showcase

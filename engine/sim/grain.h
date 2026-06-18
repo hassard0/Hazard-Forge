@@ -427,5 +427,227 @@ inline GrainNeighborList BuildGrainNeighborList(const std::vector<GrainParticle>
     return list;
 }
 
+// ===== Slice GR3 — the FRICTIONLESS CONTACT PROJECTION (the FL4 Jacobi-solve twin) ======================
+// Resolve grain-grain OVERLAP (non-penetration) + ground/fpx::FxBody colliders by an inverse-mass-weighted
+// NORMAL push-apart over the GR2 candidate list — the FL4 JACOBI multi-thread position-based solve. The
+// contact correction is per-grain INDEPENDENT in the Jacobi formulation: each grain i reads the iteration-
+// START positions (read-only) and accumulates its OWN Δp_i into a SEPARATE dp[] double-buffer, then ALL
+// grains apply pos_i += dp_i (the FL4 SolveDensityConstraint + apply pattern). So the GPU solve is
+// [numthreads(64,1,1)] MULTI-THREAD — NO single-thread serial dispatch, NO TDR ceiling (the cloth CL3 limit
+// does NOT apply; the FL4 win). The math is int64 (FxLength/FxNormalize via FxISqrt, fxmul, fxdiv) ->
+// grain_contact_dp.comp + grain_collide.comp are VULKAN-SPIR-V-ONLY (glslc can't parse int64), NOT in
+// hf_gen_msl; the Metal --grain-contact showcase runs THIS CPU StepGrainContact (the SAME bit-exact
+// reference — byte-identical by construction, the FL4/GR1 convention). grain_contact_apply is a plain
+// int32 pos+=dp add (it COULD MSL-generate) but, like fluid_apply.comp, the FL4 host-driven solve keeps it
+// Vulkan-only alongside the other two solve passes.
+//
+// THE CONTACT CONSTRAINT (the one new bit of math — the cloth-edge / FL4-density hybrid): for an overlapping
+// grain PAIR (i, j) with centre distance d = |p_i − p_j| and pen = (r_i + r_j) − d > 0, push them apart along
+// n_ij = unit(p_i − p_j) by their inverse-mass-weighted share. In the per-grain Jacobi accumulate over the
+// SYMMETRIC GR2 neighbor list (j in i's list AND i in j's list), each grain i handles its OWN half:
+//   Δp_i += ( w_i / (w_i + w_j) ) · pen · n_ij          // w = invMass; w_i+w_j==0 (both static) -> skip
+// (grain j independently accumulates Δp_j += (w_j/(w_i+w_j))·pen·n_ji from the same pair — no double-apply,
+// the FL4 "each i sums over its neighbours" structure). d == 0 (coincident) -> the FxNormalize +Y fallback
+// (deterministic). Only pairs with pen > 0 contribute (the EXACT radial overlap cull GR2 deferred). Static
+// grains (flags bit0 / invMass 0) -> Δp = 0 (the cloth pinned / FL4 static case). int64 throughout.
+//
+// HONEST CAVEAT (the FL4/CL3 discipline): K Jacobi iterations leave a DETERMINISTIC-but-nonzero contact
+// residual (stiffness ∝ iterations); the fxdiv truncation makes it bit-REPRODUCIBLE, NOT analytically
+// non-penetrating. The claim is DETERMINISM + cross-platform bit-identity; the showcase proof reports
+// peak/summed penetration RELIEVED (penAfter < penBefore), NOT zero.
+
+using fpx::fxdiv;       // read-only: the int64 Q16.16 divide
+using fpx::FxLength;    // read-only: the int64 length (FxISqrt of the sum of squares)
+using fpx::FxNormalize; // read-only: the int64 normalize (+Y fallback on length 0)
+
+// kGrainCollideEps: the surface-snap tolerance (the kFluidCollideEps twin). FxNormalize+FxScale truncate
+// toward zero, so the snapped FxLength lands a few LSBs short of radius — the assert band for "no grain
+// inside a collider / below the floor".
+inline constexpr fx kGrainCollideEps = 16;   // ~16 Q16.16 LSBs (the FL4 snap tolerance)
+
+// ----- GrainSphereCollider + GrainSphereFromBody: the CL4/FL4 collider bridge (radius-aware) --------------
+// A static sphere collider in the SAME Q16.16 world as the grains (the grain/rigid share — the CL4 deformable-
+// meets-rigid precedent). GrainSphereFromBody bridges an fpx::FxBody (its pos + radius) to a collider so the
+// sand piles AROUND the SAME rigid sphere the FPX sim integrates. Pure read of fpx::FxBody.
+struct GrainSphereCollider {
+    FxVec3 center;        // Q16.16 world-space sphere center (== fpx::FxBody::pos)
+    fx     radius = 0;    // Q16.16 sphere radius (== fpx::FxBody::radius)
+};
+inline GrainSphereCollider GrainSphereFromBody(const fpx::FxBody& b) {
+    return GrainSphereCollider{b.pos, b.radius};
+}
+
+// ----- SolveGrainContact: the Jacobi per-grain Δp accumulate (the FL4 SolveDensityConstraint twin) --------
+// Given the grain array + the GR2 neighbor list, compute Δp_i for ALL grains into a SEPARATE dp[] buffer
+// (the Jacobi double-buffer — reads the iteration-start positions, NOT the in-progress dp). For each grain i
+// (if NOT static): accumulate over its GR2 neighbours j where pen = (r_i+r_j) − |p_i−p_j| > 0,
+//   Δp_i += ( w_i / (w_i + w_j) ) · pen · unit(p_i − p_j)
+// where w = invMass (both-static w_i+w_j==0 -> skip the pair), d==0 -> the +Y FxNormalize fallback. STATIC
+// grains (flags & kFlagStatic, invMass 0) -> Δp_i = 0 (the cloth pinned case). int64 (FxLength/FxNormalize/
+// fxmul/fxdiv). The shader grain_contact_dp.comp copies THIS body VERBATIM. Deterministic (the fixed GR2
+// neighbour order). dpOut is sized to the grain count (one Δp per grain).
+inline void SolveGrainContact(const std::vector<GrainParticle>& grains, const GrainNeighborList& list,
+                              std::vector<FxVec3>& dpOut) {
+    const uint32_t n = (uint32_t)grains.size();
+    dpOut.assign((size_t)n, FxVec3{0, 0, 0});
+    for (uint32_t i = 0; i < n; ++i) {
+        if (grains[(size_t)i].flags & kFlagStatic) continue;   // static -> Δp = 0 (the pinned case)
+        const fx wi = grains[(size_t)i].invMass;
+        FxVec3 accum{0, 0, 0};
+        const uint32_t s0 = list.neighborStart[i], s1 = list.neighborStart[i + 1u];
+        for (uint32_t s = s0; s < s1; ++s) {
+            const uint32_t j = list.neighbors[s];
+            const fx wj = grains[(size_t)j].invMass;
+            const fx wsum = wi + wj;
+            if (wsum == 0) continue;                           // both static -> no push
+            // d = p_i − p_j ; pen = (r_i + r_j) − |d| ; only pen > 0 contributes (the exact radial cull).
+            const FxVec3 d = FxSub(grains[(size_t)i].pos, grains[(size_t)j].pos);
+            const fx dist = FxLength(d);
+            const fx pen = (grains[(size_t)i].radius + grains[(size_t)j].radius) - dist;
+            if (pen <= 0) continue;                            // non-overlapping candidate -> no-op
+            // share = w_i / (w_i + w_j) ; n = unit(p_i − p_j) (d==0 -> the +Y fallback) ; scale = share·pen.
+            const fx share = fxdiv(wi, wsum);
+            const fx scale = fxmul(share, pen);
+            const FxVec3 nrm = FxNormalize(d);
+            accum.x += fxmul(scale, nrm.x);
+            accum.y += fxmul(scale, nrm.y);
+            accum.z += fxmul(scale, nrm.z);
+        }
+        dpOut[(size_t)i] = accum;
+    }
+}
+
+// ----- The radius-aware grain colliders (the CL4/FL4 mold, made radius-aware) ----------------------------
+// CollideGrainPlane clamps the grain's SURFACE to the floor (pos.y >= groundY + radius — the GR1 rest);
+// static grains ARE clamped (a fallen boundary grain is raised). CollideGrainSphere projects the grain
+// CENTRE out to sphereRadius + grainRadius (the surfaces touch); static grains are plane-clamped but NOT
+// sphere-projected (they hold). int32 AABB reject (against sphereR + grainR) then the int64 FxLength/
+// FxNormalize snap (d==0 -> the +Y fallback). Copied VERBATIM into grain_collide.comp (int64 -> Vulkan-only).
+
+// CollideGrainPlane: clamp every grain's surface to the ground plane (pos.y >= groundY + radius). The GR1
+// radius-aware rest, factored out as the plane collider (static grains ARE clamped). Pure integer.
+inline void CollideGrainPlane(std::vector<GrainParticle>& grains, fx groundY) {
+    const size_t n = grains.size();
+    for (size_t i = 0; i < n; ++i) {
+        const fx restY = groundY + grains[i].radius;
+        if (grains[i].pos.y < restY) grains[i].pos.y = restY;
+    }
+}
+
+// CollideGrainSphere: project ONE grain out of ONE static sphere — its CENTRE snaps to sphereR + grainR (the
+// surfaces touch). If static -> untouched. Else an int32 AABB reject (against sphereR + grainR) first; then
+// if centre-distance < sphereR + grainR, snap along the outward normal (dist==0 -> the +Y fallback). Returns
+// true iff projected (a contact). The CollideParticleSphere twin, made radius-aware.
+inline bool CollideGrainSphere(GrainParticle& p, const GrainSphereCollider& s) {
+    if (p.flags & kFlagStatic) return false;
+    const fx surf = s.radius + p.radius;                 // the surfaces-touch distance
+    const fx dx = p.pos.x - s.center.x;
+    const fx dy = p.pos.y - s.center.y;
+    const fx dz = p.pos.z - s.center.z;
+    const fx ax = dx < 0 ? -dx : dx;
+    const fx ay = dy < 0 ? -dy : dy;
+    const fx az = dz < 0 ? -dz : dz;
+    if (ax > surf || ay > surf || az > surf) return false;   // outside the AABB -> no overlap
+    const FxVec3 d = FxVec3{dx, dy, dz};
+    const fx dist = FxLength(d);
+    if (dist >= surf) return false;                          // outside the (expanded) sphere -> untouched
+    const FxVec3 nrm = FxNormalize(d);                       // dist==0 -> {0,kOne,0} fallback
+    p.pos = FxAdd(s.center, FxScale(nrm, surf));             // snap the centre to sphereR + grainR
+    return true;
+}
+
+// CollideGrainSpheres: project a grain array out of a STATIC sphere set (the CollideSpheres twin). Per grain
+// (index order), per sphere (fixed order), CollideGrainSphere. Returns the contact count.
+inline int CollideGrainSpheres(std::vector<GrainParticle>& grains,
+                               const std::vector<GrainSphereCollider>& spheres) {
+    int contacts = 0;
+    const size_t n = grains.size();
+    for (size_t i = 0; i < n; ++i)
+        for (size_t s = 0; s < spheres.size(); ++s)
+            if (CollideGrainSphere(grains[i], spheres[s])) ++contacts;
+    return contacts;
+}
+
+// ----- StepGrainContact: one full JACOBI contact step (predict -> neighbors -> K iters -> velocity ->
+// collide) — the make-or-break reference the GPU multi-pass driver memcmp's against -------------------
+//   (1) IntegrateGrains predict (GR1 — vel += g*dt; prev = pos; pos += vel*dt; radius-aware ground rest).
+//   (2) MakeGrainGrid + BuildGrainCellTable + BuildGrainNeighborList from the PREDICTED positions (GR2;
+//       built ONCE per step — the neighbour set is fixed across the `iters` contact iterations; cell-size
+//       = the GR2 hSearch, which is >= the contact diameter).
+//   (3) `iters` JACOBI contact iterations, EACH: SolveGrainContact (ALL, Δp_i into a SEPARATE dp[] buffer)
+//       -> apply pos_i += dp_i (ALL). Each sub-pass per-grain independent (reads iteration-start state).
+//   (4) derive velocity from the NET position change: vel = (pos − prev) / dt (the FL4 PBF velocity update).
+//   (5) CollideGrainPlane + CollideGrainSpheres (project out of the ground + the static FxBody spheres —
+//       AFTER the solve + the velocity update). Returns the contact count (a coverage stat).
+// Pure integer, fixed op order -> two-run bit-identical AND bit-exact GPU==CPU. `hSearch` is the GR2 search
+// radius (caller asserts >= the max contact diameter).
+inline int StepGrainContact(std::vector<GrainParticle>& grains,
+                            const std::vector<GrainSphereCollider>& spheres, const FxVec3& gravity, fx dt,
+                            fx groundY, fx hSearch, int iters) {
+    const size_t n = grains.size();
+    // (1) predict (GR1). prev = pos is snapshotted INSIDE IntegrateGrains (the predicted-position anchor).
+    IntegrateGrains(grains, gravity, dt, groundY);
+    // (2) neighbour list from the predicted positions (GR2; built once for this step).
+    const GrainGrid grid = MakeGrainGrid(grains, hSearch);
+    const GrainCellTable table = BuildGrainCellTable(grains, grid);
+    const GrainNeighborList list = BuildGrainNeighborList(grains, grid, table, hSearch);
+    // (3) `iters` JACOBI contact iterations.
+    std::vector<FxVec3> dp;
+    for (int it = 0; it < iters; ++it) {
+        SolveGrainContact(grains, list, dp);                 // Δp_i for ALL (separate dp buffer)
+        for (size_t i = 0; i < n; ++i) {                     // apply pos_i += Δp_i for ALL (Jacobi)
+            if (grains[i].flags & kFlagStatic) continue;
+            grains[i].pos = FxAdd(grains[i].pos, dp[i]);
+        }
+    }
+    // (4) derive velocity from the net position change: vel = (pos − prev) / dt.
+    if (dt != 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (grains[i].flags & kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(grains[i].pos, grains[i].prev);
+            grains[i].vel = FxVec3{fxdiv(dpos.x, dt), fxdiv(dpos.y, dt), fxdiv(dpos.z, dt)};
+        }
+    }
+    // (5) collision: clamp to the ground plane THEN project out of every static sphere (deterministic).
+    CollideGrainPlane(grains, groundY);
+    return CollideGrainSpheres(grains, spheres);
+}
+
+// ----- StepGrainContactSteps: run K full JACOBI contact steps (the showcase / GPU K-step driver) ---------
+// K successive StepGrainContact steps. The GPU runs THIS exact K-step loop as a HOST-driven sequence of
+// MULTI-THREAD dispatches (predict -> neighbours[GPU passes] -> {dp -> apply}×iters -> velocity -> collide
+// per step, a ComputeToComputeBarrier between sub-passes). Returns the FINAL step's contact count.
+inline int StepGrainContactSteps(std::vector<GrainParticle>& grains,
+                                 const std::vector<GrainSphereCollider>& spheres, const FxVec3& gravity,
+                                 fx dt, fx groundY, fx hSearch, int iters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepGrainContact(grains, spheres, gravity, dt, groundY, hSearch, iters);
+    return contacts;
+}
+
+// ----- GrainPenetration: a deterministic integer overlap metric (peak + summed pair penetration) ---------
+// Over the GR2 neighbor list, sum/max the pair penetration pen = (r_i+r_j) − |p_i−p_j| > 0 (each unordered
+// pair counted ONCE, i<j). Returns {peak, summed} in Q16.16 (int64 accumulator). DETERMINISTIC + bit-exact
+// CPU<->GPU. The showcase's "overlap relieved" proof compares this BEFORE vs AFTER the solve (penAfter <
+// penBefore — the FL4 honesty: relieved, NOT zero). Rebuilds the neighbor list internally from the grains.
+struct GrainPenetration { int64_t peak = 0; int64_t summed = 0; };
+inline GrainPenetration MeasureGrainPenetration(const std::vector<GrainParticle>& grains, fx hSearch) {
+    GrainPenetration out;
+    const GrainGrid grid = MakeGrainGrid(grains, hSearch);
+    const GrainCellTable table = BuildGrainCellTable(grains, grid);
+    const GrainNeighborList list = BuildGrainNeighborList(grains, grid, table, hSearch);
+    const uint32_t n = (uint32_t)grains.size();
+    for (uint32_t i = 0; i < n; ++i)
+        for (uint32_t s = list.neighborStart[i]; s < list.neighborStart[i + 1u]; ++s) {
+            const uint32_t j = list.neighbors[s];
+            if (j <= i) continue;                            // count each unordered pair ONCE
+            const FxVec3 d = FxSub(grains[(size_t)i].pos, grains[(size_t)j].pos);
+            const fx pen = (grains[(size_t)i].radius + grains[(size_t)j].radius) - FxLength(d);
+            if (pen > 0) { out.summed += (int64_t)pen; if ((int64_t)pen > out.peak) out.peak = (int64_t)pen; }
+        }
+    return out;
+}
+
 }  // namespace grain
 }  // namespace hf::sim

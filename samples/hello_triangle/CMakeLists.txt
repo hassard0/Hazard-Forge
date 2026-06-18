@@ -526,6 +526,29 @@ hf_compile_shaders(
     "shaders/grain_neighbor_count.comp.hlsl:cs"
     "shaders/grain_neighbor_scan.comp.hlsl:cs"
     "shaders/grain_neighbor_emit.comp.hlsl:cs"
+    # Deterministic GPU Granular/Sand Slice 3 (Slice GR3, the FRICTIONLESS CONTACT PROJECTION of FLAGSHIP
+    # #10, the FL4 fluid_dp/fluid_apply/fluid_collide twin): the JACOBI contact solve. The K-step JACOBI loop
+    # is HOST-driven (predict[GR1] -> GR2 neighbour passes[host-rebuilt from the predicted positions] ->
+    # {grain_contact_dp -> grain_contact_apply}×iters -> grain_collide per step, a ComputeToComputeBarrier
+    # between sub-passes). grain_contact_dp.comp: ONE thread per grain computes Δp_i = Σ_{j, pen>0}
+    # (w_i/(w_i+w_j))·pen·unit(p_i−p_j) into a SEPARATE dp[] buffer (the Jacobi double-buffer); only pen>0
+    # contributes (the exact radial overlap cull GR2 deferred); grain_contact_apply.comp: ONE thread per grain
+    # applies p_i += dp_i; grain_collide.comp: ONE thread per grain derives vel = (pos−prev)/dt then projects
+    # RADIUS-AWARE out of the ground (pos.y >= groundY + radius) + the static spheres (centre -> sphereR +
+    # grainR). ALL per-grain INDEPENDENT (reads iteration-start state read-only, writes only its own grain) ->
+    # MULTI-THREAD [numthreads(64,1,1)], NO atomics, NO single-thread, NO TDR ceiling (the FL4 Jacobi win over
+    # the cloth's order-dependent Gauss-Seidel). SolveGrainContact + the collide math copied VERBATIM from
+    # engine/sim/grain.h. Because the contact pen·n fxmul/fxdiv + FxLength/FxNormalize (FxISqrt) + the velocity
+    # fxdiv use int64, grain_contact_dp.comp + grain_collide.comp are VULKAN-SPIR-V-ONLY (DXC compiles int64;
+    # glslc cannot) -> NOT in the Metal hf_gen_msl list; grain_contact_apply.comp is a plain int32 pos+=dp add
+    # (it COULD MSL-generate) but is kept Vulkan-only alongside its two int64 siblings (the simplest correct
+    # split — the whole solve trio is one Vulkan-only group), the Metal --grain-contact showcase running the
+    # CPU grain::StepGrainContact (byte-identical by construction). ReadBuffer reads gGrains, PROVEN BIT-EXACT
+    # vs the CPU grain.h::StepGrainContactSteps (memcmp — the make-or-break). NO new RHI; GR1's grain_integrate
+    # + GR2's grain_cell/grain_neighbor shaders + their goldens untouched.
+    "shaders/grain_contact_dp.comp.hlsl:cs"
+    "shaders/grain_contact_apply.comp.hlsl:cs"
+    "shaders/grain_collide.comp.hlsl:cs"
     # Deterministic GPU Fluid Slice 2 (Slice FL2, the 2nd slice of FLAGSHIP #9): the GRID-HASH NEIGHBOR
     # SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FPX2 fpx_pair / CL2 cloth_edge twin).
     # The CELL TABLE: fluid_cell_count.comp (ONE thread per particle: InterlockedAdd into its cell's counter
