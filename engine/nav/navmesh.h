@@ -436,4 +436,113 @@ inline void BuildDistanceField(const Heightfield& hf, const WalkableConfig& cfg,
         if (dist[c] == kDistInf) dist[c] = 0u;
 }
 
+// =================================================================================================
+// Slice NAV3 — WATERSHED REGION GENERATION (additive over the NAV2 distance field above). Pure
+// integer (NO <cmath>, NO float, NO int64, NO backend symbols). The CPU reference the GPU
+// nav_region.comp shader copies VERBATIM + memcmp bit-identical against. The MAKE-OR-BREAK slice:
+// an integer watershed partitions the walkable distance field into REGIONS (connected basins) so
+// each gets a distinct deterministic id, bit-exact CPU<->Vulkan<->Metal by a FIXED scan order.
+// =================================================================================================
+
+// ----- MaxDistOf: the peak chamfer distance over the field (the watershed's descending loop bound) --
+// Returns the largest dist[] value (the highest "water level"); 0 if the field is empty/all-zero. The
+// watershed descends level = maxDist..1. Pure integer; the shader recomputes the same max.
+inline uint32_t MaxDistOf(const std::vector<uint32_t>& dist) {
+    uint32_t m = 0u;
+    for (uint32_t d : dist)
+        if (d != kDistInf && d > m) m = d;
+    return m;
+}
+
+// ----- BuildRegions: the LOCKED level-descending fixed-order integer watershed (the make-or-break) --
+// Partitions the NAV2 walkable distance field into REGIONS: each connected walkable basin gets a
+// distinct deterministic region id. region[c] = 0 for non-walkable / unassigned-isolated cells; ids
+// are dense from 1. The algorithm (the spec's LOCKED pseudocode, verbatim — EVERY ordering decision
+// is PINNED so the converged assignment is identical CPU<->GPU<->both backends):
+//   for level = maxDist down to 1 (descending water level — ridge tops first):
+//     (A) GROW: fixed-point expansion of existing regions into THIS level's unassigned cells. Repeat
+//         a full ASCENDING-cellId scan until no change: an unassigned walkable cell at dist==level
+//         adopts the LOWEST region id among its 4 neighbours (fixed order up,down,left,right) that are
+//         assigned AND IsConnected (the NAV2 max-step predicate).
+//     (B) SEED: any still-unassigned walkable cell AT this level (ASCENDING cellId) starts a NEW
+//         region (nextRegion++), then that seed is GROWN across this level (same fixed-point scan,
+//         restricted to dist==level cells connected to a cell already in the seed's region).
+// Single-thread serial (the shader is [numthreads(1,1,1)]) so there is NO GPU race; the fixed scan
+// order + lowest-id tie-break make the result order-independent regardless. Pure int32 (region ids /
+// levels are small). Output region[] (one uint per column; 0 = none). regionCount = the returned
+// nextRegion-1 (also derivable as the max region id).
+inline uint32_t BuildRegions(const Heightfield& hf, const WalkableConfig& cfg,
+                             const std::vector<uint32_t>& walkable,
+                             const std::vector<int32_t>& surfaceY,
+                             const std::vector<uint32_t>& dist, uint32_t maxDist,
+                             std::vector<uint32_t>& region) {
+    const int w = hf.w, h = hf.h;
+    const size_t nCols = (size_t)hf.columnCount();
+    region.assign(nCols, 0u);
+    const int32_t climb = cfg.walkableClimb;
+    uint32_t nextRegion = 1u;
+
+    // connected(c, nx, nz): is in-grid neighbour (nx,nz) walkable AND within climb of cell c?
+    // (the NAV2 IsConnected max-step predicate, applied to a 4-neighbour). Returns the neighbour's
+    // flat id in nc (valid only when it returns true).
+    auto connected = [&](size_t c, int nx, int nz, size_t& nc) -> bool {
+        if (nx < 0 || nz < 0 || nx >= w || nz >= h) return false;
+        nc = (size_t)hf.columnId(nx, nz);
+        return IsConnected(walkable[c], surfaceY[c], walkable[nc], surfaceY[nc], climb);
+    };
+
+    // Descend level = maxDist..1. Use a signed loop counter so the >=1 guard terminates (an unsigned
+    // counter would wrap below 1 and never end). maxDist is small (~28), well inside int range.
+    for (int32_t level = (int32_t)maxDist; level >= 1; --level) {
+        // (A) GROW: existing regions expand into this level's unassigned cells (fixed-point).
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (int z = 0; z < h; ++z)
+                for (int x = 0; x < w; ++x) {
+                    const size_t c = (size_t)hf.columnId(x, z);
+                    if (region[c] != 0u || walkable[c] == 0u || dist[c] != (uint32_t)level) continue;
+                    // Adopt the LOWEST region id among the 4 neighbours assigned AND connected
+                    // (fixed neighbour order: up (z-1), down (z+1), left (x-1), right (x+1)).
+                    uint32_t best = 0u;
+                    size_t nc;
+                    if (connected(c, x, z - 1, nc) && region[nc] != 0u) { if (best == 0u || region[nc] < best) best = region[nc]; }
+                    if (connected(c, x, z + 1, nc) && region[nc] != 0u) { if (best == 0u || region[nc] < best) best = region[nc]; }
+                    if (connected(c, x - 1, z, nc) && region[nc] != 0u) { if (best == 0u || region[nc] < best) best = region[nc]; }
+                    if (connected(c, x + 1, z, nc) && region[nc] != 0u) { if (best == 0u || region[nc] < best) best = region[nc]; }
+                    if (best != 0u) { region[c] = best; changed = true; }
+                }
+        }
+        // (B) SEED: any still-unassigned walkable cell AT this level starts a NEW region (ascending
+        // cellId), then is grown across this level (same fixed-point, restricted to dist==level cells
+        // connected to a cell already in THIS seed's region).
+        for (int z = 0; z < h; ++z)
+            for (int x = 0; x < w; ++x) {
+                const size_t c = (size_t)hf.columnId(x, z);
+                if (region[c] != 0u || walkable[c] == 0u || dist[c] != (uint32_t)level) continue;
+                const uint32_t thisSeed = nextRegion;
+                region[c] = thisSeed;
+                ++nextRegion;
+                // Grow this seed across the current level.
+                bool grew = true;
+                while (grew) {
+                    grew = false;
+                    for (int gz = 0; gz < h; ++gz)
+                        for (int gx = 0; gx < w; ++gx) {
+                            const size_t c2 = (size_t)hf.columnId(gx, gz);
+                            if (region[c2] != 0u || walkable[c2] == 0u || dist[c2] != (uint32_t)level) continue;
+                            size_t nc;
+                            bool adopt =
+                                (connected(c2, gx, gz - 1, nc) && region[nc] == thisSeed) ||
+                                (connected(c2, gx, gz + 1, nc) && region[nc] == thisSeed) ||
+                                (connected(c2, gx - 1, gz, nc) && region[nc] == thisSeed) ||
+                                (connected(c2, gx + 1, gz, nc) && region[nc] == thisSeed);
+                            if (adopt) { region[c2] = thisSeed; grew = true; }
+                        }
+                }
+            }
+    }
+    return nextRegion - 1u;   // regionCount (0 if no walkable cells got a region)
+}
+
 }  // namespace hf::nav

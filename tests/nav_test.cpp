@@ -308,6 +308,139 @@ int main() {
         check(allZero, "NAV2 empty: all-zero distance (no-op)");
     }
 
+    // ================= NAV3: BuildRegions — a single open basin -> exactly 1 region =================
+    {
+        // A flat connected ground: every walkable cell reachable from every other -> one basin.
+        nav::Heightfield hf = MakeHf(10, 10);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (auto& m : merged) m.push_back(nav::Span{0u, 0u, 1u});
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        std::vector<uint32_t> region;
+        const uint32_t maxDist = nav::MaxDistOf(dist);
+        const uint32_t rc = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, region);
+        check(rc == 1u, "NAV3 open basin: exactly 1 region");
+        // Every walkable cell (dist>0 interior) is assigned region 1; non-walkable / border (dist 0)
+        // -> region 0. (Border cells are walkable but seeded dist 0 -> they get NO region.)
+        bool walkAssigned = true, nonZeroOk = true;
+        for (size_t c = 0; c < region.size(); ++c) {
+            if (dist[c] > 0u && region[c] != 1u) walkAssigned = false;
+            if (dist[c] == 0u && region[c] != 0u) nonZeroOk = false;
+        }
+        check(walkAssigned, "NAV3 open basin: every interior walkable cell -> region 1");
+        check(nonZeroOk, "NAV3 open basin: every dist-0 cell -> region 0");
+    }
+
+    // ================= NAV3: a too-tall wall splits the space -> >=2 regions =================
+    {
+        // Left half y=0, right half a TALL step y=20 (step 20 > climb 1 -> disconnected). The two
+        // sides become DIFFERENT regions; a cell on each side has a different region id.
+        nav::Heightfield hf = MakeHf(11, 7);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        for (int z = 0; z < hf.h; ++z)
+            for (int x = 0; x < hf.w; ++x) {
+                const uint32_t y = (x < hf.w / 2) ? 0u : 20u;
+                merged[(size_t)hf.columnId(x, z)].push_back(nav::Span{y, y, 1u});
+            }
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        std::vector<uint32_t> region;
+        const uint32_t maxDist = nav::MaxDistOf(dist);
+        const uint32_t rc = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, region);
+        check(rc >= 2u, "NAV3 wall split: >=2 regions");
+        // A cell on the left interior vs a cell on the right interior have DIFFERENT region ids.
+        const size_t leftCell = (size_t)hf.columnId(2, 3);
+        const size_t rightCell = (size_t)hf.columnId(8, 3);
+        check(region[leftCell] != 0u && region[rightCell] != 0u,
+              "NAV3 wall split: both sides have interior walkable cells assigned");
+        check(region[leftCell] != region[rightCell],
+              "NAV3 wall split: left-side region id != right-side region id");
+    }
+
+    // ================= NAV3: determinism — two BuildRegions runs byte-identical =================
+    {
+        nav::Heightfield hf = MakeHf(12, 12);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());
+        // A mild bump in the middle (a y=2 patch) to make a non-trivial region structure.
+        for (int z = 0; z < hf.h; ++z)
+            for (int x = 0; x < hf.w; ++x) {
+                const bool bump = (x >= 4 && x <= 7 && z >= 4 && z <= 7);
+                const uint32_t y = bump ? 2u : 0u;
+                merged[(size_t)hf.columnId(x, z)].push_back(nav::Span{y, y, 1u});
+            }
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        const uint32_t maxDist = nav::MaxDistOf(dist);
+        std::vector<uint32_t> r1, r2;
+        const uint32_t c1 = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, r1);
+        const uint32_t c2 = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, r2);
+        check(c1 == c2, "NAV3 determinism: region count identical across two runs");
+        check(r1 == r2, "NAV3 determinism: region[] byte-identical across two runs");
+
+        // Connectivity: each region id forms a SINGLE 4-connected component (flood from the first
+        // cell of each id over connected walkable neighbours; every cell of that id must be reached).
+        const int w = hf.w, h = hf.h;
+        bool allConnected = true;
+        for (uint32_t id = 1u; id <= c1; ++id) {
+            // find the first cell with this id.
+            int startX = -1, startZ = -1;
+            for (int z = 0; z < h && startX < 0; ++z)
+                for (int x = 0; x < w; ++x)
+                    if (r1[(size_t)hf.columnId(x, z)] == id) { startX = x; startZ = z; break; }
+            if (startX < 0) continue;
+            std::vector<uint8_t> seen((size_t)(w * h), 0u);
+            std::vector<int> stack;
+            stack.push_back(hf.columnId(startX, startZ));
+            seen[(size_t)hf.columnId(startX, startZ)] = 1u;
+            uint32_t reached = 0u;
+            while (!stack.empty()) {
+                const int cc = stack.back(); stack.pop_back();
+                ++reached;
+                const int cx = cc % w, cz = cc / w;
+                const int nbrs[4][2] = {{cx, cz - 1}, {cx, cz + 1}, {cx - 1, cz}, {cx + 1, cz}};
+                for (auto& nb : nbrs) {
+                    const int nx = nb[0], nz = nb[1];
+                    if (nx < 0 || nz < 0 || nx >= w || nz >= h) continue;
+                    const int nc = hf.columnId(nx, nz);
+                    if (seen[(size_t)nc]) continue;
+                    if (r1[(size_t)nc] != id) continue;
+                    seen[(size_t)nc] = 1u;
+                    stack.push_back(nc);
+                }
+            }
+            uint32_t total = 0u;
+            for (uint32_t v : r1) if (v == id) ++total;
+            if (reached != total) allConnected = false;
+        }
+        check(allConnected, "NAV3 connectivity: each region id is a single 4-connected component");
+    }
+
+    // ================= NAV3: empty / all-non-walkable -> 0 regions =================
+    {
+        nav::Heightfield hf = MakeHf(6, 6);
+        nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+        std::vector<std::vector<nav::Span>> merged((size_t)hf.columnCount());   // no spans
+        std::vector<uint32_t> walkable; std::vector<int32_t> surfaceY;
+        nav::FilterWalkableSpans(hf, cfg, merged, walkable, surfaceY);
+        std::vector<uint32_t> dist;
+        nav::BuildDistanceField(hf, cfg, walkable, surfaceY, dist);
+        std::vector<uint32_t> region;
+        const uint32_t maxDist = nav::MaxDistOf(dist);
+        const uint32_t rc = nav::BuildRegions(hf, cfg, walkable, surfaceY, dist, maxDist, region);
+        check(rc == 0u, "NAV3 empty: 0 regions");
+        bool allZero = true; for (uint32_t r : region) if (r != 0u) allZero = false;
+        check(allZero, "NAV3 empty: region[] all zero (no-op)");
+    }
+
     if (g_fail == 0) { std::printf("nav_test OK\n"); return 0; }
     std::printf("nav_test: %d failures\n", g_fail);
     return 1;
