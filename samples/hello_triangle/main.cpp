@@ -68,6 +68,7 @@
 #include "render/vt.h"          // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp
 #include "render/mc.h"          // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp
 #include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
+#include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
 #include "render/water.h"  // Slice CF: Gerstner water displacement/normal + the fixed showcase wave set
@@ -455,6 +456,7 @@ int main(int argc, char** argv) {
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
     const char* fpxLockstepShotPath = nullptr; // --fpx-lockstep-shot <out.bmp> (Slice FPX5: Deterministic Fixed-Point Physics LOCKSTEP + ROLLBACK proof — PURE-CPU harness over the FPX1-4 sim: authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT; converged-state side-view golden bit-identical cross-backend; NO GPU shader, NO new RHI)
     const char* fpxPairsShotPath = nullptr; // --fpx-pairs-shot <out.bmp> (Slice FPX2: Deterministic Fixed-Point Physics integer-AABB BROADPHASE — a clustered 8x8 grid meshed by INT32 count->scan->emit (fpx_pair_count/scan/emit.comp) into the deterministic candidate-pair list, GPU==CPU pair list bit-exact, integer N×N pair-matrix viz)
+    const char* navRasterShotPath = nullptr; // --nav-raster-shot <out.bmp> (Slice NAV1: Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION, the BEACHHEAD of FLAGSHIP #7 — host-snapped voxel triangles (ground plane + box-step + ramp) rasterized into per-column SOLID SPANS by INT32 count->scan->emit (nav_raster_count/scan/emit.comp), GPU==CPU span list bit-exact, top-down per-column span-count viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -499,6 +501,18 @@ int main(int argc, char** argv) {
         // solveIters=8), GPU==CPU body array bit-exact vs fpx.h::StepWorld. int64 fxdiv/FxISqrt ->
         // fpx_solve.comp is Vulkan-only; Metal --fpx-solve runs the CPU StepWorld. NO new RHI. Handled as a
         // STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse limit.
+        // Slice NAV1: --nav-raster-shot <out.bmp> — the Deterministic GPU Navmesh INTEGER HEIGHTFIELD
+        // SPAN RASTERIZATION (the BEACHHEAD of FLAGSHIP #7). Host-snapped voxel triangles are rasterized
+        // into per-column SOLID SPANS by three pure-INT32 compute passes (nav_raster_count/scan/emit.comp;
+        // the MC3 count->scan->emit on voxel columns), GPU==CPU span buffer bit-exact vs
+        // navmesh.h::RasterizeTriangleSpans. PURE INT32 -> the shaders MSL-gen natively on Metal. NO new
+        // RHI. Handled as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's
+        // nested-block parse limit (C1061), like the fpx/mc shots.
+        if (std::strcmp(argv[i], "--nav-raster-shot") == 0 && i + 1 < argc) {
+            navRasterShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
         if (std::strcmp(argv[i], "--fpx-solve-shot") == 0 && i + 1 < argc) {
             fpxSolveShotPath = argv[i + 1];
             ++i;
@@ -15244,6 +15258,276 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — integer broadphase pair-matrix (%u pairs)\n",
                                 fpxPairsShotPath, imgW, imgH, totalPairs);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxPairsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION (--nav-raster-shot
+        // <out.bmp>, Slice NAV1, the BEACHHEAD of FLAGSHIP #7). A deterministic showcase mesh (a ground
+        // plane + a raised box-step + a ramp, host-snapped to int32 voxel coords by
+        // nav::MakeShowcaseTriangles) is rasterized into a per-column SOLID-SPAN heightfield by three
+        // pure-INT32 compute passes (the MC3 count->scan->emit on voxel columns): nav_raster_count.comp
+        // (one thread per column (cx,cz): colCount[col]=#triangles whose XZ projection covers the
+        // column-center) -> (compute->compute barrier) -> nav_raster_scan.comp (single-thread exclusive
+        // prefix-sum -> colOffset) -> (barrier) -> nav_raster_emit.comp (one thread per column emits each
+        // covering tri's integer y-span into gSpans at its DISJOINT [offset[col],..) range, NO atomics).
+        // TriColumnAabb + PointInTriXZ + TriYSpan copied VERBATIM from engine/nav/navmesh.h (INT32: integer
+        // add/sub/compare + small edge-function products that fit int32, NO int64 -> MSL-gens natively on
+        // Metal). ReadBuffer reads gSpans + gColOffset; the CPU nav::RasterizeTriangleSpans over the SAME
+        // mesh must match BIT-EXACT (memcmp). enabled=false -> zero spans. The golden is a top-down
+        // per-column span-count viz. NO walkable filter (NAV2+), NO new RHI. One BMP -> exit.
+        if (navRasterShotPath) {
+            using math::Vec3;
+            namespace nav = hf::nav;
+            namespace vg = hf::render::vg;
+
+            // The deterministic heightfield (== the Metal --nav-raster config). A 32x32 column grid.
+            const int kW = 32, kH = 32;
+            nav::Heightfield hf;
+            hf.w = kW; hf.h = kH;
+            hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+            hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+            hf.cs = 1; hf.ch = 1;
+            const int kColumnCount = hf.columnCount();   // 1024
+
+            // The deterministic showcase triangles (ground plane + box-step + ramp), host-snapped.
+            std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+            const int kTriCount = (int)tris.size();
+
+            // Host reference: RasterizeTriangleSpans -> the exact colCount + colOffset + raw span list the
+            // GPU memcmp's against.
+            std::vector<uint32_t> cpuColCount, cpuColOffset;
+            std::vector<nav::Span> cpuSpans;
+            nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris),
+                                        cpuColCount, cpuColOffset, cpuSpans);
+            const uint32_t totalSpans = (uint32_t)cpuSpans.size();
+            // Span buffer capacity: worst case = triCount per column (so the disabled run has a fixed-size
+            // cleared buffer too). kTriCount*kColumnCount upper-bounds the raw emit.
+            const uint32_t kSpanCap = (uint32_t)kTriCount * (uint32_t)kColumnCount;
+            const uint32_t kSpanAlloc = kSpanCap > 0u ? kSpanCap : 1u;
+
+            // std430 NavTri mirror (matches nav_raster_*.comp NavTri): 9 x int32 (36 bytes).
+            struct NavTriGpu { int32_t v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z; };
+            static_assert(sizeof(NavTriGpu) == 36, "NavTriGpu std430 layout");
+            std::vector<NavTriGpu> trisInit((size_t)kTriCount);
+            for (int i = 0; i < kTriCount; ++i) {
+                const nav::NavTri& t = tris[(size_t)i];
+                trisInit[(size_t)i] = NavTriGpu{t.v0.x, t.v0.y, t.v0.z, t.v1.x, t.v1.y, t.v1.z,
+                                                t.v2.x, t.v2.y, t.v2.z};
+            }
+            rhi::BufferDesc tDesc;
+            tDesc.size = trisInit.size() * sizeof(NavTriGpu);
+            tDesc.initialData = trisInit.data();
+            tDesc.usage = rhi::BufferUsage::Storage;
+            auto trisBuf = device->CreateBuffer(tDesc);   // read-only on the GPU (shared across runs)
+
+            // std430 Span mirror: 3 x uint32 (12 bytes).
+            struct SpanGpu { uint32_t ymin, ymax, area; };
+            static_assert(sizeof(SpanGpu) == 12, "SpanGpu std430 layout");
+
+            // Fresh-cleared per-run output buffers (so the disabled no-op reads the cleared bytes back).
+            std::vector<uint32_t> countInit((size_t)kColumnCount, 0u);
+            std::vector<uint32_t> offsetInit((size_t)kColumnCount, 0u);
+            std::vector<SpanGpu> spansInit((size_t)kSpanAlloc, SpanGpu{0u, 0u, 0u});
+            auto makeCountBuf = [&]() {
+                rhi::BufferDesc d; d.size = countInit.size() * sizeof(uint32_t);
+                d.initialData = countInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeOffsetBuf = [&]() {
+                rhi::BufferDesc d; d.size = offsetInit.size() * sizeof(uint32_t);
+                d.initialData = offsetInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeSpansBuf = [&]() {
+                rhi::BufferDesc d; d.size = spansInit.size() * sizeof(SpanGpu);
+                d.initialData = spansInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Count/emit params (nav_raster_count/emit Params std430): int4 cfg {w, h, triCount, enabled}.
+            struct NavParams { int32_t cfg[4]; };
+            static_assert(sizeof(NavParams) == 16, "NavParams std430 layout");
+            auto makeCeParams = [&](int32_t enabled) {
+                NavParams p{}; p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = kTriCount; p.cfg[3] = enabled;
+                return p;
+            };
+            // Scan params (nav_raster_scan Params std430): { columnCount, _, _, _ }.
+            struct NavScanParams { uint32_t columnCount, pad0, pad1, pad2; };
+            static_assert(sizeof(NavScanParams) == 16, "NavScanParams std430 layout");
+            NavScanParams scanParams{}; scanParams.columnCount = (uint32_t)kColumnCount;
+            rhi::BufferDesc spDesc;
+            spDesc.size = sizeof(NavScanParams); spDesc.initialData = &scanParams;
+            spDesc.usage = rhi::BufferUsage::Storage;
+            auto scanParamsBuf = device->CreateBuffer(spDesc);
+
+            // Pipelines: count (3 SSBO, 64 threads), scan (3 SSBO, 1 thread), emit (4 SSBO, 64 threads).
+            auto countWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/nav_raster_count.comp.hlsl.spv");
+            auto countCs = device->CreateShaderModule({std::span<const uint32_t>(countWords)});
+            rhi::ComputePipelineDesc countCd;
+            countCd.compute = countCs.get(); countCd.storageBufferCount = 3; countCd.threadsPerGroupX = 64;
+            auto countCompute = device->CreateComputePipeline(countCd);
+
+            auto scanWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/nav_raster_scan.comp.hlsl.spv");
+            auto scanCs = device->CreateShaderModule({std::span<const uint32_t>(scanWords)});
+            rhi::ComputePipelineDesc scanCd;
+            scanCd.compute = scanCs.get(); scanCd.storageBufferCount = 3; scanCd.threadsPerGroupX = 1;
+            auto scanCompute = device->CreateComputePipeline(scanCd);
+
+            auto emitWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/nav_raster_emit.comp.hlsl.spv");
+            auto emitCs = device->CreateShaderModule({std::span<const uint32_t>(emitWords)});
+            rhi::ComputePipelineDesc emitCd;
+            emitCd.compute = emitCs.get(); emitCd.storageBufferCount = 4; emitCd.threadsPerGroupX = 64;
+            auto emitCompute = device->CreateComputePipeline(emitCd);
+
+            const uint32_t kGroups = ((uint32_t)kColumnCount + 63u) / 64u;
+
+            // Run count->scan->emit over fresh count/offset/spans buffers; read all three back.
+            auto runRaster = [&](int32_t enabled, std::vector<uint32_t>& outCount,
+                                 std::vector<uint32_t>& outOffset, std::vector<SpanGpu>& outSpans) {
+                auto countBuf  = makeCountBuf();
+                auto offsetBuf = makeOffsetBuf();
+                auto spansBuf  = makeSpansBuf();
+                NavParams ce = makeCeParams(enabled);
+                rhi::BufferDesc ceDesc;
+                ceDesc.size = sizeof(NavParams); ceDesc.initialData = &ce;
+                ceDesc.usage = rhi::BufferUsage::Storage;
+                auto ceBuf = device->CreateBuffer(ceDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("nav_raster", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-column raw span count.
+                        cmd.BindComputePipeline(*countCompute);
+                        cmd.BindStorageBuffer(*trisBuf, 0);
+                        cmd.BindStorageBuffer(*countBuf, 1);
+                        cmd.BindStorageBuffer(*ceBuf, 2);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToComputeBarrier();   // count -> scan (colCount written, read by scan)
+                        // Pass 2: single-thread exclusive prefix-sum -> colOffset.
+                        cmd.BindComputePipeline(*scanCompute);
+                        cmd.BindStorageBuffer(*countBuf, 0);
+                        cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*scanParamsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();   // scan -> emit (colOffset written, read by emit)
+                        // Pass 3: per-column emit into the disjoint range.
+                        cmd.BindComputePipeline(*emitCompute);
+                        cmd.BindStorageBuffer(*trisBuf, 0);
+                        cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*spansBuf, 2);
+                        cmd.BindStorageBuffer(*ceBuf, 3);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outCount.assign((size_t)kColumnCount, 0u);
+                device->ReadBuffer(*countBuf, outCount.data(), outCount.size() * sizeof(uint32_t), 0);
+                outOffset.assign((size_t)kColumnCount, 0u);
+                device->ReadBuffer(*offsetBuf, outOffset.data(), outOffset.size() * sizeof(uint32_t), 0);
+                outSpans.assign((size_t)kSpanAlloc, SpanGpu{0u, 0u, 0u});
+                device->ReadBuffer(*spansBuf, outSpans.data(), outSpans.size() * sizeof(SpanGpu), 0);
+            };
+
+            // === GPU spans (enabled) ===
+            std::vector<uint32_t> gpuCount, gpuOffset; std::vector<SpanGpu> gpuSpans;
+            runRaster(1, gpuCount, gpuOffset, gpuSpans);
+
+            // PROOF (1) GPU==CPU span list BIT-EXACT (count + scan + emit, integer memcmp, NO tol).
+            bool countOk = (gpuCount.size() == cpuColCount.size()) &&
+                std::memcmp(gpuCount.data(), cpuColCount.data(), cpuColCount.size() * sizeof(uint32_t)) == 0;
+            bool offsetOk = (gpuOffset.size() == cpuColOffset.size()) &&
+                std::memcmp(gpuOffset.data(), cpuColOffset.data(), cpuColOffset.size() * sizeof(uint32_t)) == 0;
+            bool spansOk = (totalSpans == (uint32_t)cpuSpans.size()) &&
+                std::memcmp(gpuSpans.data(), cpuSpans.data(), (size_t)totalSpans * sizeof(SpanGpu)) == 0;
+            if (!countOk || !offsetOk || !spansOk) {
+                std::fprintf(stderr, "FATAL: nav-raster GPU span list != CPU RasterizeTriangleSpans "
+                             "(count=%d scan=%d emit=%d)\n", (int)countOk, (int)offsetOk, (int)spansOk);
+                device->WaitIdle(); return 1;
+            }
+            // Columns with >=1 span (the heightfield footprint).
+            uint32_t coveredColumns = 0u; for (uint32_t c : gpuCount) if (c > 0u) ++coveredColumns;
+            std::printf("nav-raster: {tris:%d, columns:%u, spans:%u} GPU==CPU BIT-EXACT\n",
+                        kTriCount, coveredColumns, totalSpans);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<uint32_t> c2, o2; std::vector<SpanGpu> s2;
+                runRaster(1, c2, o2, s2);
+                if (c2.size() != gpuCount.size() ||
+                    std::memcmp(c2.data(), gpuCount.data(), c2.size() * sizeof(uint32_t)) != 0 ||
+                    std::memcmp(o2.data(), gpuOffset.data(), o2.size() * sizeof(uint32_t)) != 0 ||
+                    std::memcmp(s2.data(), gpuSpans.data(), s2.size() * sizeof(SpanGpu)) != 0) {
+                    std::fprintf(stderr, "FATAL: nav-raster two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-raster determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage / coherence: spans>0, the ground plane fills every column (coveredColumns
+            // == kColumnCount), and the span count is non-uniform (the box/ramp stack extra spans).
+            {
+                bool groundFillsAll = (coveredColumns == (uint32_t)kColumnCount);
+                uint32_t minC = 0xFFFFFFFFu, maxC = 0u;
+                for (uint32_t c : gpuCount) { if (c < minC) minC = c; if (c > maxC) maxC = c; }
+                bool coherent = (totalSpans > 0u) && groundFillsAll && (maxC > minC);
+                if (!coherent) {
+                    std::fprintf(stderr, "FATAL: nav-raster coverage incoherent "
+                                 "(spans=%u groundFillsAll=%d minC=%u maxC=%u)\n",
+                                 totalSpans, (int)groundFillsAll, minC, maxC);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-raster coverage: %u spans across %u columns (coherent heightfield)\n",
+                            totalSpans, coveredColumns);
+            }
+
+            // PROOF (4) empty no-op: enabled=false -> count all-zero, gSpans untouched (cleared).
+            {
+                std::vector<uint32_t> dCount, dOffset; std::vector<SpanGpu> dSpans;
+                runRaster(0, dCount, dOffset, dSpans);
+                bool zero = true;
+                for (uint32_t c : dCount) if (c != 0u) { zero = false; break; }
+                if (zero) for (const auto& s : dSpans) if (s.ymin != 0u || s.ymax != 0u || s.area != 0u) { zero = false; break; }
+                if (!zero) {
+                    std::fprintf(stderr, "FATAL: nav-raster disabled path produced spans\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-raster empty: 0 spans (no-op)\n");
+            }
+
+            // --- Golden: a top-down per-column SPAN-COUNT viz. Pixel (cx,cz) colored by its span count via
+            // hashColor(count), empty columns dark. CPU-colored from the read-back integer span counts ->
+            // identical both backends by construction. Scaled to 16px/cell -> 512x512. ---
+            const int kCell = 16;                 // 16px/cell -> 512x512
+            const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto fillCell = [&](int row, int col, uint8_t r, uint8_t g2, uint8_t b2) {
+                for (int dy = 0; dy < kCell; ++dy)
+                    for (int dx = 0; dx < kCell; ++dx) {
+                        const int ix = col * kCell + dx, iy = row * kCell + dy;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            for (int cz = 0; cz < kH; ++cz)
+                for (int cx = 0; cx < kW; ++cx) {
+                    const uint32_t cnt = gpuCount[(size_t)hf.columnId(cx, cz)];
+                    if (cnt == 0u) continue;   // empty column stays dark
+                    Vec3 col = vg::hashColor(cnt);
+                    fillCell(cz, cx, (uint8_t)(col.x * 255.0f + 0.5f),
+                             (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+                }
+            bool ok = WriteBMP(navRasterShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — integer heightfield span-count viz (%u spans)\n",
+                                navRasterShotPath, imgW, imgH, totalSpans);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", navRasterShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

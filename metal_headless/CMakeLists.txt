@@ -265,6 +265,22 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 hf_gen_msl(fpx_pair_count.comp   fpx_pair_count.comp.hlsl   comp fpx_pair_count_main)
 hf_gen_msl(fpx_pair_scan.comp    fpx_pair_scan.comp.hlsl    comp fpx_pair_scan_main)
 hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_main)
+# Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7: deterministic GPU navmesh
+# + pathfinding): the integer HEIGHTFIELD SPAN RASTERIZATION (the MC3 count->scan->emit on voxel
+# columns). nav_raster_count.comp (ONE thread per column (cx,cz): colCount[col]=#triangles whose XZ
+# projection covers the column-center), nav_raster_scan.comp (SINGLE-THREAD exclusive prefix-sum ->
+# colOffset), nav_raster_emit.comp (ONE thread per column: emit each covering tri's integer y-span into
+# gSpans at its DISJOINT range, NO atomics). TriColumnAabb + PointInTriXZ (three integer edge functions)
+# + TriYSpan copied VERBATIM from engine/nav/navmesh.h. Like the FPX2 broadphase + UNLIKE
+# fpx_integrate.comp, these are PURE INT32 (integer add/sub/compare + small edge-function products that
+# fit int32, NO int64), so glslc CAN lower them and they MSL-generate NATIVELY (the default MSL gen
+# suffices, NO --msl-version 20200, the mc_classify/fpx_pair lesson). The Metal --nav-raster showcase
+# dispatches the GPU shaders directly (NOT a CPU fallback) -> the GPU==CPU span-list proof runs on Metal
+# too. Span list bit-exact GPU==CPU + cross-backend by construction. Behind --nav-raster only; existing
+# shaders + goldens untouched.
+hf_gen_msl(nav_raster_count.comp nav_raster_count.comp.hlsl comp nav_raster_count_main)
+hf_gen_msl(nav_raster_scan.comp  nav_raster_scan.comp.hlsl  comp nav_raster_scan_main)
+hf_gen_msl(nav_raster_emit.comp  nav_raster_emit.comp.hlsl  comp nav_raster_emit_main)
 # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6): fpx_solve.comp
 # is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)]) runs `steps` of
 # StepWorld = IntegrateStep then SolveContacts (K=solveIters Gauss-Seidel sweeps: ground then sphere-sphere

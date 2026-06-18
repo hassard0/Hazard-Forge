@@ -473,6 +473,23 @@ hf_compile_shaders(
     "shaders/fpx_pair_count.comp.hlsl:cs"
     "shaders/fpx_pair_scan.comp.hlsl:cs"
     "shaders/fpx_pair_emit.comp.hlsl:cs"
+    # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7: deterministic GPU
+    # navmesh + pathfinding): the integer HEIGHTFIELD SPAN RASTERIZATION (the MC3 count->scan->emit on
+    # voxel columns). nav_raster_count.comp: ONE thread per column (cx,cz) scans every host-snapped voxel
+    # triangle and writes colCount[col] = #triangles whose XZ projection covers the column-center (raw
+    # span count). nav_raster_scan.comp: SINGLE-THREAD ([numthreads(1,1,1)]) exclusive prefix-sum ->
+    # colOffset. nav_raster_emit.comp: ONE thread per column re-scans the triangles + emits each covering
+    # tri's integer y-span {ymin,ymax,area} into gSpans at its DISJOINT [offset[col],..) range (race-free,
+    # NO atomics). enabled=0 -> count 0 / emit nothing. TriColumnAabb + PointInTriXZ (three integer edge
+    # functions) + TriYSpan copied VERBATIM from engine/nav/navmesh.h — PURE INT32 (the voxel coords are
+    # small enough the edge-function products fit int32; the CPU reference widens to int64 to be
+    # overflow-safe but is bit-identical for these bounded coords), so these MSL-generate NATIVELY on Metal
+    # (unlike fpx_integrate.comp's int64 fxmul). Pure integer SSBO compute + compute->compute barriers +
+    # ReadBuffer -> bit-exact GPU==CPU span list + cross-backend, proven memcmp. NO new RHI; existing
+    # shaders + goldens untouched.
+    "shaders/nav_raster_count.comp.hlsl:cs"
+    "shaders/nav_raster_scan.comp.hlsl:cs"
+    "shaders/nav_raster_emit.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6):
     # fpx_solve.comp is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)],
     # the mc_scan/vt_alloc allocator pattern) runs `steps` of StepWorld = IntegrateStep then SolveContacts
