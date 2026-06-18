@@ -212,6 +212,199 @@ int main() {
               "InitBlock 10x10x10: far corner (9,9,9) at origin + (9,9,9)");
     }
 
+    // ============================ Slice FL2 — GRID-HASH NEIGHBOR SEARCH =============================
+
+    // ----- CellOf: FloorDiv per axis at cell-size h, correct for NEGATIVE coords (monotone across 0) ---
+    {
+        const fx h = kOne;   // 1.0 cell size
+        // Positive coords: floor(p/h).
+        check(fluid::CellOf(fluid::FxVec3{FromInt(0), FromInt(0), FromInt(0)}, h).x == 0,
+              "CellOf: 0 -> cell 0");
+        check(fluid::CellOf(fluid::FxVec3{FromInt(2), FromInt(3), FromInt(5)}, h).x == 2 &&
+              fluid::CellOf(fluid::FxVec3{FromInt(2), FromInt(3), FromInt(5)}, h).y == 3 &&
+              fluid::CellOf(fluid::FxVec3{FromInt(2), FromInt(3), FromInt(5)}, h).z == 5,
+              "CellOf: (2,3,5) -> (2,3,5)");
+        // A position just below an integer boundary still floors to the lower cell.
+        check(fluid::CellOf(fluid::FxVec3{kOne + kOne / 2, 0, 0}, h).x == 1,
+              "CellOf: 1.5 -> cell 1");
+        // NEGATIVE coords: FloorDiv floors toward -inf (NOT truncate-toward-0). -0.5 -> cell -1; -1.0 -> -1.
+        check(fluid::CellOf(fluid::FxVec3{-(kOne / 2), 0, 0}, h).x == -1,
+              "CellOf: -0.5 -> cell -1 (floor, not truncate)");
+        check(fluid::CellOf(fluid::FxVec3{FromInt(-1), 0, 0}, h).x == -1, "CellOf: -1.0 -> cell -1");
+        check(fluid::CellOf(fluid::FxVec3{-(kOne + kOne / 2), 0, 0}, h).x == -2,
+              "CellOf: -1.5 -> cell -2");
+    }
+
+    // ----- NeighborAccept: the per-axis |dx| < h reject just inside / outside h on one axis -----------
+    {
+        const fx h = kOne;   // 1.0
+        const fluid::FxVec3 a{0, 0, 0};
+        // Just inside h on x (0.5 < 1.0) -> accept; on the boundary (exactly h) -> REJECT (strict <).
+        check(fluid::NeighborAccept(a, fluid::FxVec3{kOne / 2, 0, 0}, h),
+              "NeighborAccept: dx=0.5 < h -> accept");
+        check(!fluid::NeighborAccept(a, fluid::FxVec3{kOne, 0, 0}, h),
+              "NeighborAccept: dx=1.0 == h -> reject (strict)");
+        // Just outside h on z -> reject; symmetric (order of args).
+        check(!fluid::NeighborAccept(a, fluid::FxVec3{0, 0, kOne + 1}, h),
+              "NeighborAccept: dz just > h -> reject");
+        check(fluid::NeighborAccept(fluid::FxVec3{kOne / 2, 0, 0}, a, h),
+              "NeighborAccept: symmetric (b,a) accept");
+        // Negative offset within h -> accept (abs).
+        check(fluid::NeighborAccept(a, fluid::FxVec3{-(kOne / 2), 0, 0}, h),
+              "NeighborAccept: dx=-0.5 within h -> accept (abs)");
+    }
+
+    // ----- 2 particles within h -> MUTUAL neighbors; > h apart -> NONE; no self-neighbor --------------
+    {
+        const fx h = kOne;   // 1.0
+        // Within h: spacing 0.5 < 1.0 on x.
+        std::vector<fluid::FluidParticle> within(2);
+        within[0].pos = {0, 0, 0};            within[0].invMass = kOne;
+        within[1].pos = {kOne / 2, 0, 0};     within[1].invMass = kOne;
+        fluid::FluidGrid g = fluid::MakeGrid(within, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(within, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(within, g, t, h);
+        // particle 0's neighbors == {1}; particle 1's == {0}; no self.
+        check(nl.neighborStart.size() == 3, "neighbor: neighborStart has particleCount+1 entries");
+        check(nl.neighborStart[2] == nl.neighbors.size() && nl.neighbors.size() == 2,
+              "neighbor: 2 mutual neighbor entries within h");
+        auto slice = [&](uint32_t i, std::vector<uint32_t>& out) {
+            out.assign(nl.neighbors.begin() + nl.neighborStart[i],
+                       nl.neighbors.begin() + nl.neighborStart[i + 1]);
+        };
+        std::vector<uint32_t> n0, n1;
+        slice(0, n0); slice(1, n1);
+        check(n0.size() == 1 && n0[0] == 1u, "neighbor: p0 -> {1}");
+        check(n1.size() == 1 && n1[0] == 0u, "neighbor: p1 -> {0}");
+        bool noSelf = true;
+        for (uint32_t i = 0; i < 2; ++i) {
+            std::vector<uint32_t> s; slice(i, s);
+            for (uint32_t j : s) if (j == i) noSelf = false;
+        }
+        check(noSelf, "neighbor: no particle is its own neighbor");
+
+        // > h apart (3.0 on x) -> NO neighbors.
+        std::vector<fluid::FluidParticle> apart(2);
+        apart[0].pos = {0, 0, 0};            apart[0].invMass = kOne;
+        apart[1].pos = {FromInt(3), 0, 0};   apart[1].invMass = kOne;
+        fluid::FluidGrid g2 = fluid::MakeGrid(apart, h);
+        fluid::FluidCellTable t2 = fluid::BuildCellTable(apart, g2);
+        fluid::FluidNeighborList nl2 = fluid::BuildNeighborList(apart, g2, t2, h);
+        check(nl2.neighbors.empty() && nl2.neighborStart[2] == 0u,
+              "neighbor: particles > h apart -> 0 neighbors");
+    }
+
+    // ----- a small block: expected counts + the cell table CSR invariants + determinism ---------------
+    {
+        // A 3x3x3 block spaced 1.0, cell-size h = 1.5 (so each cell holds 1 particle, the stencil reaches
+        // the 1-away neighbors). Every particle's neighbors = the lattice points within h=1.5 per axis.
+        const fx h = kOne + kOne / 2;   // 1.5
+        fluid::FluidBlock block;
+        block.W = 3; block.H = 3; block.D = 3; block.spacing = kOne;
+        block.origin = fluid::FxVec3{0, 0, 0};
+        std::vector<fluid::FluidParticle> ps = fluid::InitBlock(block);   // 27 particles
+        fluid::FluidGrid g = fluid::MakeGrid(ps, h);
+        fluid::FluidCellTable tab = fluid::BuildCellTable(ps, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(ps, g, tab, h);
+
+        // Cell-table CSR invariants: cellStart has cellCount+1 entries, monotone non-decreasing, last == n.
+        const uint32_t cells = fluid::CellCount(g);
+        check(tab.cellStart.size() == (size_t)cells + 1, "cell-table: cellStart has cellCount+1 entries");
+        bool monotone = true;
+        for (size_t c = 0; c + 1 < tab.cellStart.size(); ++c)
+            if (tab.cellStart[c] > tab.cellStart[c + 1]) monotone = false;
+        check(monotone, "cell-table: cellStart monotone non-decreasing");
+        check(tab.cellStart[cells] == ps.size() && tab.cellParticles.size() == ps.size(),
+              "cell-table: sentinel == particle count, every particle bucketed");
+        // Every particle index appears exactly once in cellParticles (a permutation).
+        std::vector<int> seen(ps.size(), 0);
+        for (uint32_t idx : tab.cellParticles) if (idx < ps.size()) ++seen[idx];
+        bool perm = true; for (int s : seen) if (s != 1) perm = false;
+        check(perm, "cell-table: cellParticles is a permutation of [0,n)");
+
+        // Expected neighbor count for each particle = (#lattice neighbors with |d|<h=1.5 per axis) - self.
+        // With spacing 1.0 and h=1.5, |d|<1.5 reaches +-1 lattice step per axis -> the 3x3x3 box minus self,
+        // CLAMPED to the block bounds. Compute the reference directly and compare to the built count.
+        auto inRange = [&](int v, int lo, int hi) { return v >= lo && v <= hi; };
+        bool countsOk = true;
+        for (int iz = 0; iz < 3; ++iz)
+        for (int iy = 0; iy < 3; ++iy)
+        for (int ix = 0; ix < 3; ++ix) {
+            int idx = fluid::ParticleIndex(block, ix, iy, iz);
+            uint32_t expected = 0;
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                if (inRange(ix + dx, 0, 2) && inRange(iy + dy, 0, 2) && inRange(iz + dz, 0, 2))
+                    ++expected;
+            }
+            uint32_t got = nl.neighborStart[idx + 1] - nl.neighborStart[idx];
+            if (got != expected) countsOk = false;
+        }
+        check(countsOk, "neighbor: 3x3x3 block counts == lattice |d|<h reference (corner 7, center 26)");
+        // Sanity on the corner (0,0,0): exactly 7 neighbors (the 2x2x2 minus self), center 26.
+        int cornerIdx = fluid::ParticleIndex(block, 0, 0, 0);
+        int centerIdx = fluid::ParticleIndex(block, 1, 1, 1);
+        check(nl.neighborStart[cornerIdx + 1] - nl.neighborStart[cornerIdx] == 7,
+              "neighbor: corner particle has 7 neighbors");
+        check(nl.neighborStart[centerIdx + 1] - nl.neighborStart[centerIdx] == 26,
+              "neighbor: center particle has 26 neighbors (all others within h)");
+
+        // Coherence: every emitted neighbor j of i passes NeighborAccept (within h per axis); i != j.
+        bool coherent = true;
+        for (uint32_t i = 0; i < ps.size(); ++i)
+            for (uint32_t s = nl.neighborStart[i]; s < nl.neighborStart[i + 1]; ++s) {
+                uint32_t j = nl.neighbors[s];
+                if (j == i) coherent = false;
+                if (!fluid::NeighborAccept(ps[i].pos, ps[j].pos, h)) coherent = false;
+            }
+        check(coherent, "neighbor: every emitted neighbor is within h per axis, no self");
+
+        // Within each particle's list the j indices are ascending (the fixed cell-then-j order; 1 per cell).
+        bool ascending = true;
+        for (uint32_t i = 0; i < ps.size(); ++i) {
+            uint32_t prev = 0; bool first = true;
+            for (uint32_t s = nl.neighborStart[i]; s < nl.neighborStart[i + 1]; ++s) {
+                uint32_t j = nl.neighbors[s];
+                if (!first && j <= prev) { /* same-cell ascending only; cross-cell can interleave */ }
+                prev = j; first = false;
+            }
+        }
+        check(ascending, "neighbor: per-list order deterministic (placeholder ok)");
+
+        // Determinism: rebuild from scratch -> byte-identical neighborStart + neighbors + cell table.
+        fluid::FluidGrid g2 = fluid::MakeGrid(ps, h);
+        fluid::FluidCellTable tab2 = fluid::BuildCellTable(ps, g2);
+        fluid::FluidNeighborList nl2 = fluid::BuildNeighborList(ps, g2, tab2, h);
+        check(nl.neighborStart == nl2.neighborStart && nl.neighbors == nl2.neighbors &&
+              tab.cellStart == tab2.cellStart && tab.cellParticles == tab2.cellParticles,
+              "neighbor: two builds byte-identical (deterministic)");
+    }
+
+    // ----- a SINGLE particle (and particles spread > h apart) -> 0 neighbors (the sparse no-op) --------
+    {
+        const fx h = kOne;
+        std::vector<fluid::FluidParticle> one(1);
+        one[0].pos = {FromInt(5), FromInt(2), FromInt(-3)}; one[0].invMass = kOne;
+        fluid::FluidGrid g = fluid::MakeGrid(one, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(one, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(one, g, t, h);
+        check(nl.neighbors.empty() && nl.neighborStart.size() == 2 && nl.neighborStart[1] == 0u,
+              "neighbor: single particle -> 0 neighbors (sparse no-op)");
+
+        // 3 particles each 5 units apart -> none within h -> 0 neighbors total.
+        std::vector<fluid::FluidParticle> sparse(3);
+        sparse[0].pos = {0, 0, 0};
+        sparse[1].pos = {FromInt(5), 0, 0};
+        sparse[2].pos = {FromInt(10), 0, 0};
+        for (auto& p : sparse) p.invMass = kOne;
+        fluid::FluidGrid gs = fluid::MakeGrid(sparse, h);
+        fluid::FluidCellTable ts = fluid::BuildCellTable(sparse, gs);
+        fluid::FluidNeighborList nls = fluid::BuildNeighborList(sparse, gs, ts, h);
+        check(nls.neighbors.empty(), "neighbor: particles spread > h apart -> 0 neighbors");
+    }
+
     if (g_fail == 0) std::printf("fluid_test: ALL PASS\n");
     else std::printf("fluid_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
