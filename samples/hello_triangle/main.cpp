@@ -462,6 +462,7 @@ int main(int argc, char** argv) {
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
+    const char* fluidLockstepShotPath = nullptr; // --fluid-lockstep-shot <out.bmp> (Slice FL5: Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #9 — PURE-CPU harness over the FL1-FL4 fluid (the FPX5/CL5 twin): a dam-break fluid block fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-fluid-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* clothRenderShotPath = nullptr;   // --cloth-render-shot <out.bmp> (Slice CL6: Deterministic GPU Cloth LIT 3D RENDER capstone, COMPLETES FLAGSHIP #8 — the CL4 draped-cloth sim (a 24x24 sheet draped over a static FxBody sphere, host-side StepClothCollide, the sim bit-exact) -> cloth.h::ClothToRenderMesh (W*H lattice -> a lit triangle mesh, the ONE host float divide pos/kOne + smooth per-vertex normals) -> rendered lit + shadowed from a fixed 3/4 camera through the EXISTING lit-mesh pipeline (lit.vert + lit.frag, scene::MeshVertexLayout, the FrameData UBO, sky + static-shadow + post — REUSED VERBATIM from --mc-render-shot; NO new shader/RHI). FLOAT visresolve bar (the MC6/FPX6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CL1-CL4 bit-exact integer cloth (provenance exact))
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
@@ -656,6 +657,17 @@ int main(int argc, char** argv) {
         // --shot else-if chain) to avoid MSVC's nested-block parse limit C1061, like the other fluid shots.
         if (std::strcmp(argv[i], "--fluid-solve-shot") == 0 && i + 1 < argc) {
             fluidSolveShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice FL5: --fluid-lockstep-shot <out.bmp> — the Deterministic GPU Fluid LOCKSTEP + ROLLBACK
+        // proof (the HEADLINE of FLAGSHIP #9). PURE CPU: runs the fluid.h lockstep/rollback harness
+        // (RunFluidLockstep authority + replica, RunFluidRollback) over a scripted command stream, asserts
+        // authority==replica + rollback-corrects-to-authority BIT-EXACT, writes the converged-state golden.
+        // NO GPU dispatch, NO new shader, NO new RHI. STANDALONE branch (not in the --shot else-if chain)
+        // to avoid MSVC's nested-block parse limit (the FPX5/CL5 lesson).
+        if (std::strcmp(argv[i], "--fluid-lockstep-shot") == 0 && i + 1 < argc) {
+            fluidLockstepShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16105,6 +16117,196 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fluid settled pool (residual %lld, %d spheres)\n",
                                 fluidSolveShotPath, imgW, imgH, (long long)kResidual, kSphereCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidSolveShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof (--fluid-lockstep-shot <out.bmp>, Slice
+        // FL5, the HEADLINE of FLAGSHIP #9). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both
+        // Vulkan-Windows and Metal-Mac run the IDENTICAL CPU harness (fluid.h::RunFluidLockstep/
+        // RunFluidRollback) so the converged-fluid-state golden is bit-identical cross-backend BY
+        // CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence). Builds a deterministic
+        // dam-break fluid block + the FL4 kernel + a scripted authStream (wind/push commands over K ticks
+        // that VISIBLY MOVE the fluid) + a mispredictStream (a WRONG strong wind at mispredictTick); runs
+        // authority=RunFluidLockstep, replica=RunFluidLockstep (same init+stream), rolledBack=
+        // RunFluidRollback; asserts authority==replica + rollback-corrects-to-authority BIT-EXACT (the
+        // headline) + determinism + snapshot round-trip; CPU-colors the converged fluid state (each
+        // particle's integer (pos>>kFrac) -> pixel, hashColor). The FPX5/CL5 twin over FLUID.
+        if (fluidLockstepShotPath) {
+            using math::Vec3;
+            namespace fluid = hf::sim::fluid;
+            namespace vg = hf::render::vg;
+
+            const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fluid::fx kDt = fluid::kOne / 60;
+            const int kSide = 8;                       // 8x8x8 -> 512 particles (the FL4 dam-break scene)
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+            const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);   // smoothing radius h = 2.0
+            const int kIters = 4;
+            const int kTicks = 24;
+            const int kMispredictTick = 8;
+
+            fluid::FluidBlock block;
+            block.W = kSide; block.H = kSide; block.D = kSide;
+            block.spacing = fluid::kOne;
+            block.origin = fluid::FxVec3{0, (fluid::fx)(7 * (int)fluid::kOne), 0};   // above the ground
+            const int kParticleCount = block.W * block.H * block.D;
+            const std::vector<fluid::FluidParticle> init = fluid::InitBlock(block);
+            const std::vector<fluid::SphereCollider> noSpheres;  // FL5 proves the netcode property, not collision
+
+            // The kernel LUT: ρ0 = the rest density of the packed initial lattice (the FL4 probe).
+            const int kBins = fluid::kKernelBins;
+            const fluid::FluidGrid probeGrid = fluid::MakeGrid(init, kH);
+            const fluid::FluidCellTable probeTab = fluid::BuildCellTable(init, probeGrid);
+            const fluid::FluidNeighborList probeList = fluid::BuildNeighborList(init, probeGrid, probeTab, kH);
+            const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, fluid::kOne, kBins, fluid::kOne / 100);
+            std::vector<fluid::fx> probeRho;
+            fluid::ComputeDensity(init, probeList, kProbe, probeRho);
+            const fluid::fx kRestDensity = fluid::MeanDensity(probeRho);
+            const fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, kRestDensity, kBins, fluid::kOne / 100);
+
+            // The scripted authoritative command stream (the deterministic inputs on the wire): strong wind
+            // gusts + a push on a top-layer particle that VISIBLY shove the fluid sideways as it falls.
+            const int wIdx = fluid::ParticleIndex(block, kSide / 2, kSide - 1, kSide / 2);
+            const std::vector<fluid::FluidCommand> authStream = {
+                fluid::FluidCommand{2,  fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{(fluid::fx)(fluid::kOne * 30), 0, 0}},
+                fluid::FluidCommand{6,  fluid::kCmdPush, (uint32_t)wIdx, fluid::FxVec3{(fluid::fx)(fluid::kOne * 2), 0, 0}},
+                fluid::FluidCommand{12, fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{0, 0, (fluid::fx)(fluid::kOne * 20)}},
+            };
+            const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+            // The MISPREDICTED stream: the auth stream + a WRONG strong wind at mispredictTick (a real
+            // divergence the rollback must correct).
+            std::vector<fluid::FluidCommand> mispredictStream = authStream;
+            mispredictStream.push_back(fluid::FluidCommand{(uint32_t)kMispredictTick, fluid::kCmdWind,
+                                                           (uint32_t)wIdx, fluid::FxVec3{(fluid::fx)(fluid::kOne * 80), 0, 0}});
+
+            // === The harness ===
+            const std::vector<fluid::FluidParticle> authority =
+                fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+            const std::vector<fluid::FluidParticle> replica =
+                fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+            const std::vector<fluid::FluidParticle> rolledBack =
+                fluid::RunFluidRollback(init, kernel, noSpheres, authStream, mispredictStream,
+                                        kTicks, kMispredictTick, kGravity, kDt, kGroundY, kIters);
+
+            auto particleBytes = [](const std::vector<fluid::FluidParticle>& p) {
+                return p.size() * sizeof(fluid::FluidParticle);
+            };
+
+            // PROOF (1) LOCKSTEP: replica (fed INPUTS ONLY) == authority BIT-EXACT — THE HEADLINE.
+            if (authority.size() != replica.size() ||
+                std::memcmp(authority.data(), replica.data(), particleBytes(authority)) != 0) {
+                std::fprintf(stderr, "FATAL: fluid-lockstep replica != authority (inputs-only re-sim "
+                             "diverged — a float/nondeterminism crept into the fixed-point fluid?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-lockstep: replica==authority %d particles BIT-EXACT (%d ticks, inputs-only)\n",
+                        kParticleCount, kTicks);
+
+            // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT, AND the pre-rollback mispredicted
+            // state DIFFERED from authority (the rollback fixed a REAL divergence — positive + negative).
+            const std::vector<fluid::FluidParticle> mispredicted =
+                fluid::RunFluidLockstep(init, kernel, noSpheres, mispredictStream, kTicks, kGravity, kDt, kGroundY, kIters);
+            const bool divergenceExisted =
+                (mispredicted.size() != authority.size()) ||
+                std::memcmp(mispredicted.data(), authority.data(), particleBytes(authority)) != 0;
+            if (rolledBack.size() != authority.size() ||
+                std::memcmp(rolledBack.data(), authority.data(), particleBytes(authority)) != 0) {
+                std::fprintf(stderr, "FATAL: fluid-lockstep rollback != authority (the rollback did NOT "
+                             "correct the misprediction to the authoritative fluid state)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (!divergenceExisted) {
+                std::fprintf(stderr, "FATAL: fluid-lockstep mispredicted state == authority (the "
+                             "misprediction was a no-op — the rollback proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d "
+                        "diverged then converged)\n", kMispredictTick);
+
+            // PROOF (3) determinism: running the lockstep twice -> byte-identical converged state.
+            const std::vector<fluid::FluidParticle> authority2 =
+                fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+            if (authority2.size() != authority.size() ||
+                std::memcmp(authority2.data(), authority.data(), particleBytes(authority)) != 0) {
+                std::fprintf(stderr, "FATAL: fluid-lockstep two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (4) snapshot round-trip: RestoreFluid(SnapshotFluid(p)) == p BIT-EXACT.
+            {
+                std::vector<fluid::FluidParticle> p =
+                    fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kMispredictTick, kGravity, kDt, kGroundY, kIters);
+                const std::vector<fluid::FluidParticle> snap = fluid::SnapshotFluid(p);
+                fluid::SimFluidTick(p, kernel, noSpheres, authStream, (uint32_t)kMispredictTick,
+                                    kGravity, kDt, kGroundY, kIters);   // mutate
+                fluid::RestoreFluid(p, snap);
+                if (p.size() != snap.size() ||
+                    std::memcmp(p.data(), snap.data(), particleBytes(snap)) != 0) {
+                    std::fprintf(stderr, "FATAL: fluid-lockstep snapshot round-trip != original\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("fluid-lockstep snapshot: round-trip BIT-EXACT\n");
+
+            // PROOF (5) stats.
+            std::printf("fluid-lockstep: {particles:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                        kParticleCount, kTicks, kCommandCount, kMispredictTick);
+
+            // Sanity: confirm the wind/push commands VISIBLY moved the fluid vs a no-input run (a weak demo
+            // guard — the converged state must differ noticeably from the pure free-fall settle).
+            const std::vector<fluid::FluidCommand> noStream;
+            const std::vector<fluid::FluidParticle> noInput =
+                fluid::RunFluidLockstep(init, kernel, noSpheres, noStream, kTicks, kGravity, kDt, kGroundY, kIters);
+            int64_t moved = 0;
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int64_t dx = (int64_t)authority[(size_t)i].pos.x - (int64_t)noInput[(size_t)i].pos.x;
+                const int64_t dz = (int64_t)authority[(size_t)i].pos.z - (int64_t)noInput[(size_t)i].pos.z;
+                moved += (dx < 0 ? -dx : dx) + (dz < 0 ? -dz : dz);
+            }
+            std::printf("fluid-lockstep motion: commands displaced the fluid by %lld (vs no-input settle)\n",
+                        (long long)moved);
+
+            // --- Golden: the converged fluid state side-view (== the Metal --fluid-lockstep by construction;
+            // authority==replica==rolledBack so the single converged state IS the viz). Each particle's
+            // integer (pos.x>>kFrac + z-skew, pos.y>>kFrac) -> a pixel, hashColor dot. ---
+            const int kPxPerUnit = 22, kMargin = 30, kWorldHalf = kSide + 6;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + (kWorldHalf * 2 + 1) * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 10) * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldY, int worldZ, int& ix, int& iy) {
+                ix = kMargin + (worldX + kWorldHalf) * kPxPerUnit + (worldZ * kPxPerUnit) / 4;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            auto splat = [&](int cx, int cy, Vec3 col) {
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = rolledBack[(size_t)i].pos.x >> fluid::kFrac;
+                const int wy = rolledBack[(size_t)i].pos.y >> fluid::kFrac;
+                const int wz = rolledBack[(size_t)i].pos.z >> fluid::kFrac;
+                int cx, cy; worldToPx(wx, wy, wz, cx, cy);
+                splat(cx, cy, vg::hashColor((uint32_t)i));
+            }
+            bool ok = WriteBMP(fluidLockstepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fluid lockstep+rollback converged state (%d particles)\n",
+                                fluidLockstepShotPath, imgW, imgH, kParticleCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidLockstepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

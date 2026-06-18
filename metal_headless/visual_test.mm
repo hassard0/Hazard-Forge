@@ -17156,6 +17156,159 @@ static int RunFluidSolveShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FL5 — Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof showcase (--fluid-lockstep) (the
+// HEADLINE of FLAGSHIP #9). PURE CPU on BOTH backends — there is NO GPU dispatch, NO new shader, NO new RHI
+// here: lockstep/rollback is a determinism PROPERTY of the bit-exact FL1-FL4 fluid, so the harness runs the
+// IDENTICAL CPU code (engine/sim/fluid.h::RunFluidLockstep/RunFluidRollback) on Vulkan-Windows AND Metal-Mac
+// -> the converged-fluid-state golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform
+// bit-identity IS the cross-platform-lockstep evidence — the same simulated fluid on two platforms from the
+// same inputs). This builds the SAME deterministic scene + command streams as the Vulkan --fluid-lockstep-shot,
+// runs authority=RunFluidLockstep + replica=RunFluidLockstep + rolledBack=RunFluidRollback, asserts
+// authority==replica + rollback-corrects-to-authority BIT-EXACT (+ determinism + snapshot round-trip), and
+// CPU-renders the converged fluid state -> BYTE-IDENTICAL to the Vulkan path. The FPX5/CL5 twin over FLUID,
+// completing the deterministic-sim trilogy's lockstep story. New golden tests/golden/metal/fluid_lockstep.png.
+static int RunFluidLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fluid = hf::sim::fluid;
+    namespace vg = render::vg;
+
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const int kSide = 8;                       // 8x8x8 -> 512 particles (the FL4 dam-break scene)
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);   // smoothing radius h = 2.0
+    const int kIters = 4;
+    const int kTicks = 24;
+    const int kMispredictTick = 8;
+
+    fluid::FluidBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(7 * (int)fluid::kOne), 0};   // above the ground
+    const int kParticleCount = block.W * block.H * block.D;
+    const std::vector<fluid::FluidParticle> init = fluid::InitBlock(block);
+    const std::vector<fluid::SphereCollider> noSpheres;
+
+    // The kernel LUT: ρ0 = the rest density of the packed initial lattice (the FL4 probe).
+    const int kBins = fluid::kKernelBins;
+    const fluid::FluidGrid probeGrid = fluid::MakeGrid(init, kH);
+    const fluid::FluidCellTable probeTab = fluid::BuildCellTable(init, probeGrid);
+    const fluid::FluidNeighborList probeList = fluid::BuildNeighborList(init, probeGrid, probeTab, kH);
+    const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, fluid::kOne, kBins, fluid::kOne / 100);
+    std::vector<fluid::fx> probeRho;
+    fluid::ComputeDensity(init, probeList, kProbe, probeRho);
+    const fluid::fx kRestDensity = fluid::MeanDensity(probeRho);
+    const fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, kRestDensity, kBins, fluid::kOne / 100);
+
+    const int wIdx = fluid::ParticleIndex(block, kSide / 2, kSide - 1, kSide / 2);
+    const std::vector<fluid::FluidCommand> authStream = {
+        fluid::FluidCommand{2,  fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{(fluid::fx)(fluid::kOne * 30), 0, 0}},
+        fluid::FluidCommand{6,  fluid::kCmdPush, (uint32_t)wIdx, fluid::FxVec3{(fluid::fx)(fluid::kOne * 2), 0, 0}},
+        fluid::FluidCommand{12, fluid::kCmdWind, (uint32_t)wIdx, fluid::FxVec3{0, 0, (fluid::fx)(fluid::kOne * 20)}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<fluid::FluidCommand> mispredictStream = authStream;
+    mispredictStream.push_back(fluid::FluidCommand{(uint32_t)kMispredictTick, fluid::kCmdWind,
+                                                   (uint32_t)wIdx, fluid::FxVec3{(fluid::fx)(fluid::kOne * 80), 0, 0}});
+
+    const std::vector<fluid::FluidParticle> authority =
+        fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    const std::vector<fluid::FluidParticle> replica =
+        fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    const std::vector<fluid::FluidParticle> rolledBack =
+        fluid::RunFluidRollback(init, kernel, noSpheres, authStream, mispredictStream,
+                                kTicks, kMispredictTick, kGravity, kDt, kGroundY, kIters);
+
+    auto particleBytes = [](const std::vector<fluid::FluidParticle>& p) {
+        return p.size() * sizeof(fluid::FluidParticle);
+    };
+
+    // PROOF (1) LOCKSTEP: replica (inputs-only) == authority BIT-EXACT.
+    if (authority.size() != replica.size() ||
+        std::memcmp(authority.data(), replica.data(), particleBytes(authority)) != 0)
+        return fail("fluid-lockstep: replica != authority (inputs-only re-sim diverged)");
+    std::printf("fluid-lockstep: replica==authority %d particles BIT-EXACT (%d ticks, inputs-only)\n",
+                kParticleCount, kTicks);
+
+    // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT, AND the mispredicted state DIFFERED.
+    const std::vector<fluid::FluidParticle> mispredicted =
+        fluid::RunFluidLockstep(init, kernel, noSpheres, mispredictStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    const bool divergenceExisted =
+        (mispredicted.size() != authority.size()) ||
+        std::memcmp(mispredicted.data(), authority.data(), particleBytes(authority)) != 0;
+    if (rolledBack.size() != authority.size() ||
+        std::memcmp(rolledBack.data(), authority.data(), particleBytes(authority)) != 0)
+        return fail("fluid-lockstep: rollback != authority (misprediction not corrected)");
+    if (!divergenceExisted)
+        return fail("fluid-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("fluid-lockstep rollback: corrected to authority BIT-EXACT (mispredict@tick%d "
+                "diverged then converged)\n", kMispredictTick);
+
+    // PROOF (3) determinism: two full runs byte-identical.
+    const std::vector<fluid::FluidParticle> authority2 =
+        fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kTicks, kGravity, kDt, kGroundY, kIters);
+    if (authority2.size() != authority.size() ||
+        std::memcmp(authority2.data(), authority.data(), particleBytes(authority)) != 0)
+        return fail("fluid-lockstep: two runs differ (nondeterministic)");
+    std::printf("fluid-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (4) snapshot round-trip: RestoreFluid(SnapshotFluid(p)) == p BIT-EXACT.
+    {
+        std::vector<fluid::FluidParticle> p =
+            fluid::RunFluidLockstep(init, kernel, noSpheres, authStream, kMispredictTick, kGravity, kDt, kGroundY, kIters);
+        const std::vector<fluid::FluidParticle> snap = fluid::SnapshotFluid(p);
+        fluid::SimFluidTick(p, kernel, noSpheres, authStream, (uint32_t)kMispredictTick,
+                            kGravity, kDt, kGroundY, kIters);   // mutate
+        fluid::RestoreFluid(p, snap);
+        if (p.size() != snap.size() || std::memcmp(p.data(), snap.data(), particleBytes(snap)) != 0)
+            return fail("fluid-lockstep: snapshot round-trip != original");
+    }
+    std::printf("fluid-lockstep snapshot: round-trip BIT-EXACT\n");
+
+    // PROOF (5) stats.
+    std::printf("fluid-lockstep: {particles:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                kParticleCount, kTicks, kCommandCount, kMispredictTick);
+
+    // --- Golden: the converged fluid state side-view (IDENTICAL to the Vulkan --fluid-lockstep-shot by
+    // construction; authority==replica==rolledBack so the single converged state IS the viz). ---
+    const int kPxPerUnit = 22, kMargin = 30, kWorldHalf = kSide + 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + (kWorldHalf * 2 + 1) * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 10) * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int worldZ, int& ix, int& iy) {
+        ix = kMargin + (worldX + kWorldHalf) * kPxPerUnit + (worldZ * kPxPerUnit) / 4;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto splat = [&](int cx, int cy, Vec3 col) {
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = rolledBack[(size_t)i].pos.x >> fluid::kFrac;
+        const int wy = rolledBack[(size_t)i].pos.y >> fluid::kFrac;
+        const int wz = rolledBack[(size_t)i].pos.z >> fluid::kFrac;
+        int cx, cy; worldToPx(wx, wy, wz, cx, cy);
+        splat(cx, cy, vg::hashColor((uint32_t)i));
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fluid lockstep+rollback converged state (%d particles)\n",
+                outPath, imgW, imgH, kParticleCount);
+    return 0;
+}
+
 // ===== Slice CL1 — Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR showcase (--cloth-integrate)
 // (the BEACHHEAD of FLAGSHIP #8). Like FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the cloth
 // integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fpx_integrate.comp), so
@@ -32333,6 +32486,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fluid-solve") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fluid_solve.png";
             try { return RunFluidSolveShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fluid-lockstep <out.png>: render the Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof showcase
+        // (Slice FL5, the HEADLINE of FLAGSHIP #9). PURE CPU on BOTH backends (the FPX5/CL5 twin over FLUID):
+        // runs the fluid.h lockstep/rollback harness (RunFluidLockstep authority + replica, RunFluidRollback)
+        // over an 8x8x8 dam-break block + scripted wind/push command streams; authority==replica + rollback-
+        // corrects-to-authority BIT-EXACT; determinism + snapshot round-trip. The image golden is the converged
+        // fluid state, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/fluid_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fluid-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fluid_lockstep.png";
+            try { return RunFluidLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE
