@@ -292,6 +292,8 @@ int main() {
             bool sawNavRasterFeature = false;
             // Slice NAV2: the deterministic-navmesh-distancefield capability is advertised.
             bool sawNavDistanceFeature = false;
+            // Slice NAV3: the deterministic-navmesh-regions capability is advertised.
+            bool sawNavRegionFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -398,6 +400,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-fixedpoint-physics-render") sawFpxRenderFeature = true;
                     if (AsString(el->value) == "deterministic-navmesh-rasterization") sawNavRasterFeature = true;
                     if (AsString(el->value) == "deterministic-navmesh-distancefield") sawNavDistanceFeature = true;
+                    if (AsString(el->value) == "deterministic-navmesh-regions") sawNavRegionFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -488,6 +491,7 @@ int main() {
             check(sawFpxRenderFeature, "engine.features includes deterministic-fixedpoint-physics-render");
             check(sawNavRasterFeature, "engine.features includes deterministic-navmesh-rasterization");
             check(sawNavDistanceFeature, "engine.features includes deterministic-navmesh-distancefield");
+            check(sawNavRegionFeature, "engine.features includes deterministic-navmesh-regions");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -664,6 +668,8 @@ int main() {
         bool sawNavRasterShot = false;
         // Slice NAV2: the --nav-distance-shot showcase flag is listed in the showcase manifest.
         bool sawNavDistanceShot = false;
+        // Slice NAV3: the --nav-region-shot showcase flag is listed in the showcase manifest.
+        bool sawNavRegionShot = false;
         // Slice CV: the --froxellights-shot showcase flag is listed in the showcase manifest.
         bool sawFroxelLightsShot = false;
         // Slice CX: the --volshadows-shot showcase flag is listed in the showcase manifest.
@@ -774,6 +780,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-render-shot") sawFpxRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--nav-raster-shot") sawNavRasterShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--nav-distance-shot") sawNavDistanceShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--nav-region-shot") sawNavRegionShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--froxellights-shot") sawFroxelLightsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--volshadows-shot") sawVolShadowsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--contactshadow-shot") sawContactShadowShot = true;
@@ -867,6 +874,7 @@ int main() {
         check(sawFpxRenderShot, "showcases manifest includes --fpx-render-shot");
         check(sawNavRasterShot, "showcases manifest includes --nav-raster-shot");
         check(sawNavDistanceShot, "showcases manifest includes --nav-distance-shot");
+        check(sawNavRegionShot, "showcases manifest includes --nav-region-shot");
         check(sawFroxelLightsShot, "showcases manifest includes --froxellights-shot");
         check(sawVolShadowsShot, "showcases manifest includes --volshadows-shot");
         check(sawContactShadowShot, "showcases manifest includes --contactshadow-shot");
