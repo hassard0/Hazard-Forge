@@ -716,5 +716,37 @@ inline CGrainWorld RunCGrainRollback(const CGrainWorld& init, const std::vector<
     return world;
 }
 
+// ===== Slice CG6 — LIT 3D RENDER CAPSTONE (the money-shot, COMPLETES FLAGSHIP #12; FLOAT, render-only) =====
+// The SIXTH and FINAL slice RENDERS the bit-exact coupled state as a lit 3D scene — the FxBody half-buried in
+// the sand bed as lit 3D INSTANCED SPHERES (one LARGE body sphere among the small grain spheres). The CG1-CG5
+// sim above stays strict integer/bit-exact; here — and ONLY here — we cross to float to build the per-instance
+// render transforms for the rasterizer. This is the documented FLOAT visresolve-bar (the FPX6/FL6/GR6/CP6
+// precedent): the SIM is bit-exact, the final raster/shade is float (cross-vendor ~the engine baseline, NOT
+// held to the integer zero-diff bar). The DIRECT TWIN of couple.h::CoupleToRenderInstances over the GRAIN sim.
+//
+// CGrainToRenderInstances builds a COMBINED instance set DIRECTLY from the bit-exact CGrainWorld state — one
+// LARGE sphere per fpx::FxBody (via fpx::FxBodyTransform: translate(pos/kOne) * rotate(orient) * scale(radius),
+// the FPX6 render bridge VERBATIM) followed by one SMALL sphere per grain::GrainParticle (via
+// grain::GrainToRenderInstances: translate(pos/kOne) * scale(grainRadius), the GR6 render bridge VERBATIM). The
+// bodies come FIRST so the caller can distinguish them (the body is a LARGE sphere among small grains — NO
+// per-instance color, NO new shader). The instance count is bodies.size() + grains.size(). Pure deterministic
+// host float (no RNG, no clock). The provenance: every body transform derives from FxBody::pos/orient/radius
+// (the settled output of StepCGrain) + every grain from GrainParticle::pos. Empty world (no bodies + no grains)
+// -> empty output (the empty no-op: the cleared base scene). Render-only, NO sim mutation — this is the ONLY
+// float crossing of the whole flagship. (CALLER NOTE: the static basin-wall grains are a containment detail;
+// the showcase PREFERS rendering only the DYNAMIC grains + the body — it passes a world whose `grains` are the
+// dynamic subset, exactly as CP6 drops the static wall particles from the render.)
+inline std::vector<math::Mat4> CGrainToRenderInstances(const CGrainWorld& world, float grainRadius) {
+    std::vector<math::Mat4> out;
+    out.reserve(world.bodies.size() + world.grains.size());
+    // The bodies FIRST (the LARGE spheres, scaled by body radius via the FPX6 bridge).
+    for (const fpx::FxBody& b : world.bodies)
+        out.push_back(fpx::FxBodyTransform(b));
+    // Then the grains (the SMALL spheres, the GR6 bridge — translate(pos/kOne) * scale(grainRadius)).
+    const std::vector<math::Mat4> grainMats = grain::GrainToRenderInstances(world.grains, grainRadius);
+    out.insert(out.end(), grainMats.begin(), grainMats.end());
+    return out;
+}
+
 }  // namespace cgrain
 }  // namespace hf::sim

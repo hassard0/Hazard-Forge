@@ -970,6 +970,76 @@ int main() {
               "CG5 snapshot: live round-trip after a SimCGrainTick mutation == original (bodies AND grains)");
     }
 
+    // ================= CG6 render helpers (CGrainToRenderInstances — the lit 3D render capstone) ============
+    // The render-only float helper: a known coupled state -> the COMBINED instance set (one LARGE sphere per
+    // FxBody via fpx::FxBodyTransform FIRST, then one SMALL sphere per grain via the GR6 translate+scale),
+    // instance count B+N. CG1-CG5 stay bit-exact integer; ONLY this helper crosses to float. The render is
+    // golden-verified (not unit-tested) — here we PIN the count + the per-instance transform contracts (the
+    // CP6 twin: body via FxBodyTransform, grains via pos/kOne + grainRadius scale).
+    {
+        cgrain::CGrainWorld world;
+        // Two bodies at known positions, identity orient, integer radii.
+        fpx::FxBody b0 = BodyAt(3, 5, -2, 2);   // pos (3,5,-2), radius 2
+        b0.orient = fpx::FxQuat{0, 0, 0, kOne}; // identity quaternion (no rotation)
+        fpx::FxBody b1 = BodyAt(-4, 1, 6, 3);   // pos (-4,1,6), radius 3
+        b1.orient = fpx::FxQuat{0, 0, 0, kOne};
+        world.bodies = {b0, b1};
+        // Three grains at known positions (radius 1 each, irrelevant to the render scale below).
+        world.grains = {GrainAt(1, 2, 3, 1), GrainAt(-5, 0, 7, 1), GrainAt(8, -3, 0, 1)};
+
+        const float kGrainRadius = 0.25f;
+        const std::vector<math::Mat4> insts = cgrain::CGrainToRenderInstances(world, kGrainRadius);
+
+        // Count = B + N (2 bodies + 3 grains = 5), bodies FIRST.
+        check(insts.size() == world.bodies.size() + world.grains.size() && insts.size() == 5u,
+              "CG6 CGrainToRenderInstances: count == B + N (bodies + grains), bodies first");
+
+        // The body instances (indices 0..B-1) == fpx::FxBodyTransform(body) byte-for-byte (the FPX6 bridge).
+        bool bodiesMatch = true;
+        for (size_t i = 0; i < world.bodies.size(); ++i) {
+            const math::Mat4 ref = fpx::FxBodyTransform(world.bodies[i]);
+            for (int k = 0; k < 16; ++k) if (insts[i].m[k] != ref.m[k]) bodiesMatch = false;
+        }
+        check(bodiesMatch, "CG6 CGrainToRenderInstances: each body instance == FxBodyTransform (the body)");
+
+        // The body translation is pos/(float)kOne (provenance — the bit-exact body pos) and scale is radius.
+        check(insts[0].m[12] == 3.0f && insts[0].m[13] == 5.0f && insts[0].m[14] == -2.0f,
+              "CG6 CGrainToRenderInstances: body 0 translate == pos/(float)kOne");
+        check(insts[0].m[0] == 2.0f && insts[0].m[5] == 2.0f && insts[0].m[10] == 2.0f,
+              "CG6 CGrainToRenderInstances: body 0 scale == body radius (2.0)");
+
+        // The grain instances (indices B..B+N-1) == grain::GrainToRenderInstances(grains, radius) — a small
+        // sphere at pos/(float)kOne scaled by the grain radius (the GR6 bridge VERBATIM).
+        const std::vector<math::Mat4> grainRef =
+            grain::GrainToRenderInstances(world.grains, kGrainRadius);
+        bool grainsMatch = (grainRef.size() == world.grains.size());
+        for (size_t i = 0; grainsMatch && i < world.grains.size(); ++i) {
+            const math::Mat4& m = insts[world.bodies.size() + i];
+            for (int k = 0; k < 16; ++k) if (m.m[k] != grainRef[i].m[k]) grainsMatch = false;
+        }
+        check(grainsMatch, "CG6 CGrainToRenderInstances: each grain instance == GrainToRenderInstances");
+
+        // First grain (world index 2 == body count 2): translate (1,2,3), scale grainRadius, no rotation.
+        const math::Mat4& g0 = insts[world.bodies.size() + 0];
+        check(g0.m[12] == 1.0f && g0.m[13] == 2.0f && g0.m[14] == 3.0f,
+              "CG6 CGrainToRenderInstances: grain 0 translate == pos/(float)kOne");
+        check(g0.m[0] == kGrainRadius && g0.m[5] == kGrainRadius && g0.m[10] == kGrainRadius,
+              "CG6 CGrainToRenderInstances: grain 0 scale == grain radius");
+
+        // Empty world (no bodies + no grains) -> empty instance array (the empty no-op: cleared base scene).
+        cgrain::CGrainWorld empty;
+        check(cgrain::CGrainToRenderInstances(empty, kGrainRadius).empty(),
+              "CG6 CGrainToRenderInstances: empty world -> empty (the empty no-op)");
+
+        // Bodies-only -> B instances; grains-only -> N instances (each set independently correct).
+        cgrain::CGrainWorld bodiesOnly;  bodiesOnly.bodies = {b0};
+        check(cgrain::CGrainToRenderInstances(bodiesOnly, kGrainRadius).size() == 1u,
+              "CG6 CGrainToRenderInstances: bodies-only -> B instances");
+        cgrain::CGrainWorld grainsOnly;  grainsOnly.grains = {GrainAt(0, 0, 0, 1)};
+        check(cgrain::CGrainToRenderInstances(grainsOnly, kGrainRadius).size() == 1u,
+              "CG6 CGrainToRenderInstances: grains-only -> N instances");
+    }
+
     if (g_fail == 0) std::printf("cgrain_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

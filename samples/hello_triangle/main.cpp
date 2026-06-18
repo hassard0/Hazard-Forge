@@ -482,6 +482,7 @@ int main(int argc, char** argv) {
     const char* fluidLockstepShotPath = nullptr; // --fluid-lockstep-shot <out.bmp> (Slice FL5: Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #9 — PURE-CPU harness over the FL1-FL4 fluid (the FPX5/CL5 twin): a dam-break fluid block fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-fluid-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* cgrainLockstepShotPath = nullptr; // --cgrain-lockstep-shot <out.bmp> (Slice CG5: Deterministic Rigid<->Grain Coupling LOCKSTEP + ROLLBACK proof, the MULTI-BODY netcode HEADLINE of FLAGSHIP #12 — PURE-CPU harness over the CG1-CG4 coupled step StepCGrain (the CP5/GR5 twin, a MULTI-BODY lockstep over a coupled rigid+granular system): a SMALL/FAST static-basin coupled scene (a modest dynamic sand bed + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the sand (kCmdGrainWind); authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the grains + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the grains vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CG1-CG4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h + engine/physics/ UNTOUCHED)
     const char* coupleRenderShotPath = nullptr;  // --couple-render-shot <out.bmp> (Slice CP6: Deterministic Rigid<->Fluid Coupling LIT 3D RENDER capstone, COMPLETES FLAGSHIP #11 — the CP1-CP5 coupled sim (a denser confined pool + a dynamic FxBody barrel, host-side StepCoupleSteps, the sim bit-exact) settled to the body floating at the waterline -> couple.h::CoupleToRenderInstances (one LARGE-sphere model matrix per body via fpx::FxBodyTransform + one SMALL-sphere per fluid particle via fluid::FluidToRenderInstances, render-only float) -> rendered as lit 3D INSTANCED SPHERES (the barrel among the droplets) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fluid-render-shot/--grain-render-shot/--fpx-render-shot; NO new shader/RHI). Renders only the DYNAMIC fluid + the body (static wall particles dropped — a containment detail). FLOAT visresolve bar (the FPX6/FL6/GR6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CP1-CP5 bit-exact integer coupled sim (provenance exact))
+    const char* cgrainRenderShotPath = nullptr;  // --cgrain-render-shot <out.bmp> (Slice CG6: Deterministic Rigid<->Grain Coupling LIT 3D RENDER capstone, COMPLETES FLAGSHIP #12 — the CG1-CG5 coupled sim (a static-grain basin confining a dynamic sand bed + a dynamic FxBody, host-side StepCGrainSteps, the sim bit-exact) settled to the body half-buried in the bed -> couple_grain.h::CGrainToRenderInstances (one LARGE-sphere model matrix per body via fpx::FxBodyTransform + one SMALL-sphere per DYNAMIC grain via grain::GrainToRenderInstances, render-only float) -> rendered as lit 3D INSTANCED SPHERES (the body among the sand grains) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --couple-render-shot/--grain-render-shot/--fpx-render-shot; NO new shader/RHI). Renders only the DYNAMIC grains + the body (static basin-wall grains dropped — a containment detail). FLOAT visresolve bar (the FPX6/FL6/GR6/CP6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CG1-CG5 bit-exact integer coupled sim (provenance exact))
     const char* fluidRenderShotPath = nullptr;   // --fluid-render-shot <out.bmp> (Slice FL6: Deterministic GPU Fluid LIT 3D RENDER capstone, COMPLETES FLAGSHIP #9 — the FL4 dam-break sim (an 8x8x8 block poured over a static FxBody sphere, host-side StepFluid, the FL1-FL5 sim bit-exact) -> fluid.h::FluidToRenderInstances (one per-instance model matrix per particle, the ONE host float divide pos/(float)kOne + droplet-radius scale) -> rendered as lit 3D INSTANCED SPHERES (one per fluid particle) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fpx-render-shot; NO new shader/RHI). FLOAT visresolve bar (the FPX6/CL6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the FL1-FL5 bit-exact integer fluid (provenance exact))
     const char* grainRenderShotPath = nullptr;   // --grain-render-shot <out.bmp> (Slice GR6: Deterministic GPU Granular/Sand LIT 3D RENDER capstone, COMPLETES FLAGSHIP #10 — the GR4 friction sim (a staggered grain column dropped onto FLAT ground, host-side StepGrainFriction, the GR1-GR5 sim bit-exact) settled into an angle-of-repose CONE -> grain.h::GrainToRenderInstances (one per-instance model matrix per grain, the ONE host float divide pos/(float)kOne + grain-radius scale) -> rendered as lit 3D INSTANCED SPHERES (one per grain) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fluid-render-shot/--fpx-render-shot; NO new shader/RHI). FLOAT visresolve bar (the FPX6/FL6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the GR1-GR5 bit-exact integer granular sim (provenance exact))
     const char* clothRenderShotPath = nullptr;   // --cloth-render-shot <out.bmp> (Slice CL6: Deterministic GPU Cloth LIT 3D RENDER capstone, COMPLETES FLAGSHIP #8 — the CL4 draped-cloth sim (a 24x24 sheet draped over a static FxBody sphere, host-side StepClothCollide, the sim bit-exact) -> cloth.h::ClothToRenderMesh (W*H lattice -> a lit triangle mesh, the ONE host float divide pos/kOne + smooth per-vertex normals) -> rendered lit + shadowed from a fixed 3/4 camera through the EXISTING lit-mesh pipeline (lit.vert + lit.frag, scene::MeshVertexLayout, the FrameData UBO, sky + static-shadow + post — REUSED VERBATIM from --mc-render-shot; NO new shader/RHI). FLOAT visresolve bar (the MC6/FPX6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CL1-CL4 bit-exact integer cloth (provenance exact))
@@ -1005,6 +1006,20 @@ int main(int argc, char** argv) {
         // body. FLOAT visresolve-bar (Metal-baked golden). NO new shader, NO new RHI. STANDALONE branch.
         if (std::strcmp(argv[i], "--couple-render-shot") == 0 && i + 1 < argc) {
             coupleRenderShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CG6: --cgrain-render-shot <out.bmp> — Deterministic Rigid<->Grain Coupling LIT 3D RENDER (the
+        // money-shot capstone, COMPLETING FLAGSHIP #12 — the TWELFTH flagship). Runs the bit-exact CG1-CG5
+        // coupled sim (a static-grain basin confining a dynamic sand bed + a dynamic FxBody, host-side
+        // StepCGrainSteps) to the body half-buried in the bed, builds a COMBINED instance set (one LARGE sphere
+        // per body via FxBodyTransform + one SMALL sphere per DYNAMIC grain via GrainToRenderInstances —
+        // CGrainToRenderInstances, float, render-only), and renders the body-in-sand as lit 3D instanced spheres
+        // through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag) over the ground/sky.
+        // Renders only the DYNAMIC grains + the body. FLOAT visresolve-bar (Metal-baked golden). NO new shader,
+        // NO new RHI. STANDALONE branch.
+        if (std::strcmp(argv[i], "--cgrain-render-shot") == 0 && i + 1 < argc) {
+            cgrainRenderShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -26032,6 +26047,398 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fixed-point pile lit 3D render (%u bodies, %u settled)\n",
                                 fpxRenderShotPath, cw, ch2, kBodyCount, kSettled);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Grain Coupling LIT 3D RENDER CAPSTONE (--cgrain-render-shot <out.bmp>,
+        // Slice CG6, the money-shot COMPLETING FLAGSHIP #12 — the TWELFTH flagship). Runs the bit-exact
+        // CG1-CG5 coupled sim (a static-grain basin confining a dynamic sand bed + a dynamic FxBody, host-side
+        // StepCGrainSteps — the sim stays pure integer) to the body half-buried in the bed, builds a COMBINED
+        // instance set (one LARGE sphere per body via fpx::FxBodyTransform + one SMALL sphere per DYNAMIC grain
+        // via grain::GrainToRenderInstances — couple_grain.h::CGrainToRenderInstances, render-only float; the
+        // bit-exact sim is untouched), and renders the body-in-sand as lit 3D INSTANCED spheres through the
+        // EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, the --couple-render-shot /
+        // --grain-render-shot / --fpx-render-shot wiring) over the ground plane + sky + shadow. Renders only the
+        // DYNAMIC grains + the body (static basin-wall grains dropped — a sim containment detail, not the
+        // headline). The provenance: every instance transform derives from the bit-exact FxBody::pos/orient/
+        // radius + GrainParticle::pos. FLOAT visresolve-bar (Metal-baked golden tests/golden/metal/
+        // cgrain_render.png). NO new shader, NO new RHI. STANDALONE branch.
+        if (cgrainRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace cgrain = hf::sim::cgrain;
+            namespace grain  = hf::sim::grain;
+            namespace fpx    = hf::sim::fpx;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // === The bit-exact CG1-CG5 coupled sim -> the FxBody half-buried in a coherent sand bed (the input;
+            // deterministic, shared with the Metal --cgrain-render by construction via the SAME couple_grain.h
+            // scene). THE SCENE (the CG4 static-basin recipe — a body settling half-buried in a confined grain
+            // bed — at a MODEST grain count + step count per the CG6 perf note so the showcase setup is a minute
+            // or two, NOT an hour): a STATIC-grain BASIN (floor + 2-cell walls of static grains) confines a
+            // DYNAMIC 0.25-radius sand bed + an FxBody (radius 2, invMass=kOne/iters so the K-per-step support
+            // balances once-per-step gravity) dropped to the bed top; it sinks and settles half-buried. NO RNG,
+            // fully deterministic. The basin walls are a containment detail — DROPPED from the render below (the
+            // CP6 precedent). ===
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kGrainRadiusFx = grain::kOne / 4;             // 0.25 grain radius, 0.5 spacing (packed)
+            const grain::fx kHSearch = grain::kOne + grain::kOne / 2;     // 1.5
+            const int kIters = 3;
+            const int kSteps = 55;         // a SHORT settle — the body sinks/contacts BEFORE the PBF-repulsive bed balloons (the CP6 early-drape precedent)
+            const int kSpan = 8, kFillH = 10;                            // interior 0..4 units, fill ~5 deep (a DEEP bed to bury)
+            const int kBodyR = 2;
+            const int kBodyCX = kSpan / 4;                               // basin centre (0.5*span/2 in world units)
+
+            auto grainAtD = [&](double x, double y, double z, bool stat) {
+                grain::GrainParticle g;
+                g.pos  = grain::FxVec3{(grain::fx)(x * (double)grain::kOne), (grain::fx)(y * (double)grain::kOne),
+                                       (grain::fx)(z * (double)grain::kOne)};
+                g.prev = g.pos; g.vel = grain::FxVec3{0, 0, 0};
+                g.invMass = stat ? 0 : grain::kOne; g.radius = kGrainRadiusFx;
+                g.flags = stat ? grain::kFlagStatic : 0u;
+                return g;
+            };
+            // Build the basin + dynamic fill, settle it (GR4 friction) — the coherent bed before the drop.
+            std::vector<grain::GrainParticle> bed;
+            {
+                const double s = 0.5;
+                const double wlo = -2 * s, whi = kSpan * s + 2 * s;
+                for (double x = wlo; x <= whi + 1e-9; x += s)
+                    for (double z = wlo; z <= whi + 1e-9; z += s) bed.push_back(grainAtD(x, 0, z, true));  // floor
+                for (double y = s; y <= kFillH * s + 1e-9; y += s)
+                    for (double x = wlo; x <= whi + 1e-9; x += s)
+                        for (double z = wlo; z <= whi + 1e-9; z += s) {
+                            const bool wall = (x < -1e-9 || x > kSpan * s + 1e-9 || z < -1e-9 || z > kSpan * s + 1e-9);
+                            if (wall) bed.push_back(grainAtD(x, y, z, true));                              // walls
+                        }
+                for (double y = s; y <= kFillH * s + 1e-9; y += s)                                         // dynamic fill
+                    for (double x = 0; x <= kSpan * s + 1e-9; x += s)
+                        for (double z = 0; z <= kSpan * s + 1e-9; z += s) bed.push_back(grainAtD(x, y, z, false));
+                grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kHSearch, grain::kGrainMu, 2, 60);
+            }
+            grain::fx bedTopFx = -(grain::fx)(1 << 28);
+            for (const grain::GrainParticle& g : bed)
+                if (!(g.flags & grain::kFlagStatic) && g.pos.y > bedTopFx) bedTopFx = g.pos.y;
+            const int kBodyY = (bedTopFx >> grain::kFrac) + kBodyR;   // body bottom just touches the settled top
+
+            cgrain::CGrainWorld world;
+            world.grains  = bed;
+            world.hSearch = kHSearch;
+            world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+            {
+                fpx::FxBody b;
+                b.pos = fpx::FxVec3{(fpx::fx)(kBodyCX * (int)grain::kOne), (fpx::fx)(kBodyY * (int)grain::kOne),
+                                    (fpx::fx)(kBodyCX * (int)grain::kOne)};
+                b.invMass = grain::kOne / kIters;   // the CP4 compensation (CG2 runs each of the K iters)
+                b.flags = fpx::kFlagDynamic; b.radius = (fpx::fx)(kBodyR * (int)grain::kOne);
+                b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+                world.bodies = {b};
+            }
+            const uint32_t kBodyCount = (uint32_t)world.bodies.size();
+
+            // Run the bit-exact CG1-CG5 coupled sim to the settled half-buried state (the integer sim output ->
+            // the render input; provenance: the transforms below derive from THIS bit-exact state).
+            cgrain::StepCGrainSteps(world, kDt, kIters, kSteps);
+
+            // === Build the RENDER world: only the DYNAMIC grains + the body (drop the static basin-wall grains —
+            // a sim containment detail, not the headline; the CP6 precedent). The body comes through unchanged. ===
+            cgrain::CGrainWorld renderWorld;
+            renderWorld.bodies = world.bodies;
+            for (const grain::GrainParticle& g : world.grains)
+                if (!(g.flags & grain::kFlagStatic)) renderWorld.grains.push_back(g);
+            const uint32_t kRenderGrainCount = (uint32_t)renderWorld.grains.size();
+
+            // The combined instance set (one LARGE sphere per body via FxBodyTransform + one SMALL sphere per
+            // dynamic grain via the GR6 translate+scale) — the ONLY float crossing, render-only. The grain render
+            // radius slightly overlaps the 0.5 spacing so the grains read as a coherent sand bed.
+            const float kGrainRenderRadius = 0.32f;
+            const std::vector<Mat4> mats = cgrain::CGrainToRenderInstances(renderWorld, kGrainRenderRadius);
+            std::vector<scene::InstanceData> instances;
+            instances.reserve(mats.size());
+            for (const Mat4& m : mats) {
+                scene::InstanceData inst;
+                for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+                instances.push_back(inst);
+            }
+            const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+            // === Reuse the EXISTING instanced lit pipeline (the --couple-render-shot / --grain-render-shot
+            // / --fpx-render-shot wiring). ===
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get();
+            instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = device->Swapchain().ColorFormat();
+            instDesc.depthTest = true;
+            instDesc.usesFrameUniforms = true;
+            instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto instShWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_instanced.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto instShVs = device->CreateShaderModule({std::span<const uint32_t>(instShWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc instShDesc;
+            instShDesc.vertex = instShVs.get();
+            instShDesc.fragment = shadowFs.get();
+            instShDesc.vertexLayout = scene::MeshVertexLayout();
+            instShDesc.instanceLayout = scene::InstanceTransformLayout();
+            instShDesc.depthTest = true;
+            instShDesc.depthOnly = true;
+            instShDesc.usesFrameUniforms = true;
+            instShDesc.pushConstantSize = 0;
+            auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get();
+            stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true;
+            stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // Instance buffer of the combined body + grain transforms (kInstanceCount may be 0 -> no-op).
+            std::unique_ptr<rhi::IBuffer> instanceBuffer;
+            if (kInstanceCount > 0) {
+                rhi::BufferDesc instBufDesc;
+                instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+                instBufDesc.initialData = instances.data();
+                instBufDesc.usage = rhi::BufferUsage::Vertex;
+                instanceBuffer = device->CreateBuffer(instBufDesc);
+            }
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // Fixed 3/4 camera + directional light reading the body half-buried in the sand bed (deterministic).
+            // The dynamic bed spans x,z in ~[0,4] with the body at the basin centre (2, ~bed top, 2) half-buried;
+            // aim at the bed centre, elevated, close enough that the LARGE body + the small grains both read.
+            const Vec3 eye{12.0f, 9.0f, 12.0f};
+            const Vec3 center{2.0f, 2.0f, 2.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{2.0f, 2.0f, 2.0f};
+                Vec3 lightEye = sc - lightDir * 18.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 44.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instShadowPipeline);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*instanceBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instPipeline);
+                        // a warm SAND material (the body + grains share the pipeline; the body is distinguished
+                        // by being a LARGE sphere among small grains — NO per-instance color).
+                        float material[4] = {0.78f, 0.66f, 0.40f, 0.0f};
+                        cmd.PushConstants(material, sizeof(material));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*instanceBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!device->GetCapturedPixels(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOFS ===
+            auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+                uint32_t n = 0;
+                for (size_t p = 0; p + 3 < img.size(); p += 4) {
+                    const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+                    if (b + g + r > 60) ++n;   // above the near-black sky clear
+                }
+                return n;
+            };
+            const uint32_t shaded = countShaded(px);
+
+            // (1) provenance: {bodies, grains, instances, shaded}. instances == bodies + dynamic grains.
+            std::printf("cgrain-render: {bodies:%u, grains:%u, instances:%u, shaded:%u} "
+                        "(fixed-point coupling -> lit 3D render)\n",
+                        kBodyCount, kRenderGrainCount, kInstanceCount, shaded);
+
+            // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+            if (!device->GetCapturedPixels(px2, cw2, ch3)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (2nd render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (px.size() != px2.size() || std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                std::fprintf(stderr, "FATAL: cgrain-render two renders DIFFER (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgrain-render determinism: two renders BYTE-IDENTICAL\n");
+
+            // (3) coverage / coherence: shaded>0 and not uniform (a recognizable body-in-sand).
+            if (shaded == 0) {
+                std::fprintf(stderr, "FATAL: cgrain-render coverage 0 (nothing shaded)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (shaded == (uint32_t)(px.size() / 4)) {
+                std::fprintf(stderr, "FATAL: cgrain-render uniform image (no coherent scene)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgrain-render coverage: %u shaded (coherent lit body + sand)\n", shaded);
+
+            // (4) empty no-op: zero bodies + zero grains -> zero instances -> the cleared base scene.
+            {
+                cgrain::CGrainWorld emptyWorld;
+                const std::vector<Mat4> emptyInst =
+                    cgrain::CGrainToRenderInstances(emptyWorld, kGrainRenderRadius);
+                if (!emptyInst.empty()) {
+                    std::fprintf(stderr, "FATAL: cgrain-render empty world not empty\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("cgrain-render empty: base only (no-op)\n");
+
+            bool ok = WriteBMP(cgrainRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — fixed-point coupling body-in-sand lit 3D render "
+                                "(%u bodies, %u grains)\n",
+                                cgrainRenderShotPath, cw, ch2, kBodyCount, kRenderGrainCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgrainRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

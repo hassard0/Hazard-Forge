@@ -25050,6 +25050,334 @@ static int RunCoupleRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Rigid<->Grain Coupling LIT 3D RENDER CAPSTONE showcase (Slice CG6, the money-shot
+// COMPLETING FLAGSHIP #12 — the TWELFTH flagship). Mirrors the Vulkan --cgrain-render-shot path EXACTLY: runs
+// the bit-exact CG1-CG5 coupled sim (the SAME static-grain basin + dynamic sand bed + dynamic FxBody, kSpan=8
+// kFillH=8 hSearch=1.5 iters=3 K=140 — pure integer) to the body half-buried in the bed, builds a COMBINED
+// instance set (one LARGE sphere per body via fpx::FxBodyTransform + one SMALL sphere per dynamic grain via
+// grain::GrainToRenderInstances — couple_grain.h::CGrainToRenderInstances, the ONE float crossing, render-only),
+// and renders the body-in-sand as lit 3D INSTANCED spheres through the EXISTING instanced lit pipeline
+// (lit_instanced.vert.gen.metal + lit.frag.gen.metal — the --couple-render / --grain-render wiring) over the
+// ground + sky + shadow. Only the DYNAMIC grains + the body are rendered (static basin-wall grains dropped). The
+// state + transforms (hence the visual) are byte-identical to the Vulkan path by construction (the SAME
+// couple_grain.h scene). The FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run)
+// + provenance (every instance transform IS the bit-exact FxBody::pos/orient/radius + GrainParticle::pos). New
+// golden tests/golden/metal/cgrain_render.png. NO new shader, NO RHI.
+static int RunCGrainRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace cgrain = hf::sim::cgrain;
+    namespace grain  = hf::sim::grain;
+    namespace fpx    = hf::sim::fpx;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The bit-exact CG1-CG5 coupled sim -> the body half-buried in a coherent sand bed (the SAME
+    // couple_grain.h scene as the Vulkan --cgrain-render-shot — byte-identical state + transforms by
+    // construction). A STATIC-grain basin (floor + 2-cell walls) confines a DYNAMIC 0.25-radius sand bed + an
+    // FxBody (radius 2, invMass=kOne/iters), settled K=140 modest steps; the body sinks half-buried. The basin
+    // walls are a containment detail — DROPPED from the render below (the CP6 precedent). ===
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kGrainRadiusFx = grain::kOne / 4;             // 0.25 grain radius, 0.5 spacing (packed)
+    const grain::fx kHSearch = grain::kOne + grain::kOne / 2;     // 1.5
+    const int kIters = 3;
+    const int kSteps = 55;
+    const int kSpan = 8, kFillH = 10;
+    const int kBodyR = 2;
+    const int kBodyCX = kSpan / 4;
+
+    auto grainAtD = [&](double x, double y, double z, bool stat) {
+        grain::GrainParticle g;
+        g.pos  = grain::FxVec3{(grain::fx)(x * (double)grain::kOne), (grain::fx)(y * (double)grain::kOne),
+                               (grain::fx)(z * (double)grain::kOne)};
+        g.prev = g.pos; g.vel = grain::FxVec3{0, 0, 0};
+        g.invMass = stat ? 0 : grain::kOne; g.radius = kGrainRadiusFx;
+        g.flags = stat ? grain::kFlagStatic : 0u;
+        return g;
+    };
+    std::vector<grain::GrainParticle> bed;
+    {
+        const double s = 0.5;
+        const double wlo = -2 * s, whi = kSpan * s + 2 * s;
+        for (double x = wlo; x <= whi + 1e-9; x += s)
+            for (double z = wlo; z <= whi + 1e-9; z += s) bed.push_back(grainAtD(x, 0, z, true));   // floor
+        for (double y = s; y <= kFillH * s + 1e-9; y += s)
+            for (double x = wlo; x <= whi + 1e-9; x += s)
+                for (double z = wlo; z <= whi + 1e-9; z += s) {
+                    const bool wall = (x < -1e-9 || x > kSpan * s + 1e-9 || z < -1e-9 || z > kSpan * s + 1e-9);
+                    if (wall) bed.push_back(grainAtD(x, y, z, true));                                // walls
+                }
+        for (double y = s; y <= kFillH * s + 1e-9; y += s)                                           // dynamic fill
+            for (double x = 0; x <= kSpan * s + 1e-9; x += s)
+                for (double z = 0; z <= kSpan * s + 1e-9; z += s) bed.push_back(grainAtD(x, y, z, false));
+        grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kHSearch, grain::kGrainMu, 2, 60);
+    }
+    grain::fx bedTopFx = -(grain::fx)(1 << 28);
+    for (const grain::GrainParticle& g : bed)
+        if (!(g.flags & grain::kFlagStatic) && g.pos.y > bedTopFx) bedTopFx = g.pos.y;
+    const int kBodyY = (bedTopFx >> grain::kFrac) + kBodyR;
+
+    cgrain::CGrainWorld world;
+    world.grains  = bed;
+    world.hSearch = kHSearch;
+    world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+    {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(kBodyCX * (int)grain::kOne), (fpx::fx)(kBodyY * (int)grain::kOne),
+                            (fpx::fx)(kBodyCX * (int)grain::kOne)};
+        b.invMass = grain::kOne / kIters;
+        b.flags = fpx::kFlagDynamic; b.radius = (fpx::fx)(kBodyR * (int)grain::kOne);
+        b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+        world.bodies = {b};
+    }
+    const uint32_t kBodyCount = (uint32_t)world.bodies.size();
+
+    cgrain::StepCGrainSteps(world, kDt, kIters, kSteps);
+
+    // The RENDER world: only the DYNAMIC grains + the body (drop the static basin-wall grains).
+    cgrain::CGrainWorld renderWorld;
+    renderWorld.bodies = world.bodies;
+    for (const grain::GrainParticle& g : world.grains)
+        if (!(g.flags & grain::kFlagStatic)) renderWorld.grains.push_back(g);
+    const uint32_t kRenderGrainCount = (uint32_t)renderWorld.grains.size();
+
+    const float kGrainRenderRadius = 0.32f;
+    const std::vector<Mat4> mats = cgrain::CGrainToRenderInstances(renderWorld, kGrainRenderRadius);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // === Reuse the EXISTING instanced lit pipeline (the --couple-render / --grain-render wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    // Fixed 3/4 camera + directional light (== the Vulkan --cgrain-render-shot camera).
+    const Vec3 eye{12.0f, 9.0f, 12.0f};
+    const Vec3 center{2.0f, 2.0f, 2.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 sc{2.0f, 2.0f, 2.0f};
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 lightEye = sc - lightDir * 18.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 44.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                float material[4] = {0.78f, 0.66f, 0.40f, 0.0f};   // a warm SAND material
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) provenance + stats. "shaded" = non-dark pixels (the lit ground + body + grains).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("cgrain-render: {bodies:%u, grains:%u, instances:%u, shaded:%u} "
+                "(fixed-point coupling -> lit 3D render)\n",
+                kBodyCount, kRenderGrainCount, kInstanceCount, shaded);
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("cgrain-render two renders DIFFER (nondeterministic)");
+    std::printf("cgrain-render determinism: two renders BYTE-IDENTICAL\n");
+
+    // PROOF (3) coverage / coherence.
+    if (shaded == 0) return fail("cgrain-render coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("cgrain-render uniform image (no coherent scene)");
+    std::printf("cgrain-render coverage: %u shaded (coherent lit body + sand)\n", shaded);
+
+    // PROOF (4) empty no-op: zero bodies + zero grains -> zero instances -> the cleared base scene.
+    {
+        cgrain::CGrainWorld emptyWorld;
+        if (!cgrain::CGrainToRenderInstances(emptyWorld, kGrainRenderRadius).empty())
+            return fail("cgrain-render empty world not empty");
+    }
+    std::printf("cgrain-render empty: base only (no-op)\n");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — fixed-point coupling body-in-sand lit 3D render (%u bodies, %u grains)\n",
+                outPath, cw, ch, kBodyCount, kRenderGrainCount);
+    return 0;
+}
+
 // --- Deterministic GPU Granular/Sand LIT 3D RENDER CAPSTONE showcase (Slice GR6, the money-shot COMPLETING
 // FLAGSHIP #10 — the TENTH flagship). Mirrors the Vulkan --grain-render-shot path EXACTLY: runs the bit-exact
 // GR1-GR5 friction sim (the SAME tall/narrow 4x8x4 staggered column dropped onto FLAT ground, NO container,
@@ -36625,6 +36953,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--couple-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_couple_render.png";
             try { return RunCoupleRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgrain-render <out.png>: render the Deterministic Rigid<->Grain Coupling LIT 3D RENDER capstone
+        // showcase (Slice CG6, the money-shot COMPLETING FLAGSHIP #12 — the TWELFTH flagship). Runs the
+        // bit-exact CG1-CG5 coupled sim (the SAME static-grain basin + dynamic sand bed + dynamic FxBody,
+        // host-side StepCGrainSteps — pure integer) to the body half-buried in the bed, builds the COMBINED
+        // instance set (one LARGE sphere per body via FxBodyTransform + one SMALL sphere per DYNAMIC grain via
+        // GrainToRenderInstances — CGrainToRenderInstances, float, render-only) and renders the body-in-sand as
+        // lit 3D INSTANCED spheres through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag,
+        // the --couple-render/--grain-render wiring) over the ground/sky/shadow. The state + transforms are
+        // byte-identical to the Vulkan --cgrain-render-shot by construction. FLOAT visresolve-bar:
+        // Metal-render==Metal-golden DIFF 0.0000 + provenance; cross-vendor ~the float baseline. New golden
+        // tests/golden/metal/cgrain_render.png. NO new shader/RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgrain-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgrain_render.png";
+            try { return RunCGrainRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE
