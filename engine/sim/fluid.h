@@ -50,6 +50,10 @@
 #include <vector>
 
 #include "sim/fpx.h"   // read-only: fx / fxmul / FxVec3 / FxAdd / FxSub / FxScale / kOne / kFrac
+#include "math/math.h" // Slice FL6 (render-only): math::Mat4 / math::Vec3 for the FluidVertToWorld /
+                       // FluidToRenderInstances render helpers. The bit-exact FL1-FL5 sim uses NONE of
+                       // this — it stays pure integer, NO float; ONLY the FL6 render helpers (appended at
+                       // the bottom) cross to float. (fpx.h already pulls math/math.h; explicit for clarity.)
 
 namespace hf::sim {
 namespace fluid {
@@ -939,6 +943,52 @@ inline std::vector<FluidParticle> RunFluidRollback(const std::vector<FluidPartic
     for (int t = mispredictTick; t < ticks; ++t)
         SimFluidTick(particles, kernel, spheres, authStream, (uint32_t)t, gravity, dt, groundY, iters);
     return particles;
+}
+
+// ===== Slice FL6 — Deterministic GPU Fluid: LIT 3D RENDER helpers (the FLOAT visresolve-bar, render-only) =
+// The SIXTH and FINAL slice of FLAGSHIP #9 (the money-shot capstone). FL1-FL5 are strict integer/bit-exact;
+// FL6 RASTERIZES the bit-exact fluid state as lit 3D INSTANCED SPHERES (a pool/splash of lit droplets) —
+// ONE sphere instance per FluidParticle, the per-instance model matrix built from the BIT-EXACT integer
+// pos. The ONLY float crossing is `pos / (float)kOne` (FluidVertToWorld); the sim stays pure integer. The
+// provenance: every render transform derives from FluidParticle::pos, the settled output of the bit-exact
+// StepFluid. This is the DIRECT TWIN of fpx.h::FxToFloat / FxBodyTransform (the FPX6 render helpers) over a
+// FLUID PARTICLE instead of a rigid FxBody — render-only, NO sim mutation, NO new RHI, NO new shader (reuse
+// the EXISTING instanced lit-sphere pipeline). These helpers are kept OUT of the bit-exact sim path (above).
+
+// FluidToFloat(v): the single host fixed-point->float conversion, v in Q16.16 -> float world units (the
+// fpx::FxToFloat twin; v / (float)kOne). The ONE place fluid render touches float.
+inline float FluidToFloat(fx v) { return (float)v / (float)kOne; }
+
+// FluidVertToWorld(p): the float world position of a Q16.16 vector (pos.xyz / (float)kOne). The ONE host
+// float crossing the FL6 render uses — render-only; the bit-exact integer pos is untouched.
+inline math::Vec3 FluidVertToWorld(const FxVec3& p) {
+    return math::Vec3{FluidToFloat(p.x), FluidToFloat(p.y), FluidToFloat(p.z)};
+}
+
+// FluidParticleTransform(p, radius): the render-only model matrix for ONE fluid particle — a unit sphere
+// TRANSLATED to the particle's float world position (FluidVertToWorld(p.pos)) and SCALED by the droplet
+// radius (a float world-unit radius). translate(pos/kOne) * scale(radius) (no rotation — a droplet sphere
+// is rotation-invariant, unlike the FPX6 rigid body's orient). Pure deterministic host float (no RNG, no
+// clock). The provenance: the transform IS the bit-exact FluidParticle::pos. The fpx::FxBodyTransform twin.
+inline math::Mat4 FluidParticleTransform(const FluidParticle& p, float radius) {
+    const math::Vec3 t = FluidVertToWorld(p.pos);
+    return math::Mat4::Translate(t) * math::Mat4::Scale(math::Vec3{radius, radius, radius});
+}
+
+// FluidToRenderInstances(particles, radius): build ONE per-instance model matrix per fluid particle (the
+// instanced lit-sphere render input — a small sphere at each particle's bit-exact world position, scaled by
+// the droplet radius). Output is a flat array of column-major mat4 floats (16 per instance), the
+// scene::InstanceData / InstanceTransformLayout packing the EXISTING instanced lit pipeline consumes. The
+// caller copies each 16-float block into a scene::InstanceData. Empty pool -> empty output (the empty
+// no-op: zero instances -> the cleared base scene). Render-only, deterministic, NO sim mutation. The
+// FxBodyTransform-per-body loop in RunFpxRenderShowcase, generalized to FLUID PARTICLES.
+inline std::vector<math::Mat4> FluidToRenderInstances(const std::vector<FluidParticle>& particles,
+                                                      float radius) {
+    std::vector<math::Mat4> out;
+    out.reserve(particles.size());
+    for (const FluidParticle& p : particles)
+        out.push_back(FluidParticleTransform(p, radius));
+    return out;
 }
 
 }  // namespace fluid
