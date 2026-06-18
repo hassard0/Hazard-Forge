@@ -389,5 +389,142 @@ inline int64_t EdgeResidual(const std::vector<ClothParticle>& particles,
     return r;
 }
 
+// ===== Slice CL4 — Deterministic GPU Cloth: INTEGER COLLISION (cloth-vs-FPX rigid sphere + ground) ====
+// Project the CL3-solved cloth particles OUT of a small STATIC set of rigid SPHERE colliders + the ground
+// plane, so the cloth DRAPES over a rigid sphere. This is the FIRST deformable-meets-rigid INTEGER
+// interaction: the cloth particle and the rigid sphere are the SAME Q16.16 world units (a SphereCollider
+// reuses fpx::FxBody's pos + radius), so the projection is exactly fpx.h::ResolvePair's sphere-vs-point
+// push generalized to a particle vs a STATIC sphere (the particle takes the FULL correction; the sphere
+// never moves). Per particle it is INDEPENDENT (each particle vs the read-only collider set), order-
+// independent; but the normalize uses int64 (FxNormalize via FxISqrt) so the GPU shader is Vulkan-only +
+// Metal runs THIS CPU reference (the CL3 convention). Applied each step AFTER the CL3 constraint passes
+// (so the cloth holds together AND stays out of the sphere). Pure integer, copied VERBATIM into
+// shaders/cloth_collide.comp.
+//
+// HONEST CAVEAT (CL3-identical): a single positional projection per step is NOT a full contact solve —
+// transient interpenetration can occur and is resolved over steps (deterministic). The headline is
+// DETERMINISM + cross-platform bit-identity + a visible drape, NOT a physically perfect contact model.
+// Self-collision (cloth-vs-cloth) + DYNAMIC (FPX-moving) colliders + friction are OUT of scope (later
+// CL slices). CL4's colliders are a small STATIC set.
+
+// A static SPHERE collider: a Q16.16 world-space center + radius (the SAME units as ClothParticle.pos).
+// std430-packable as 4 x int32 (center.xyz, radius) — the GPU SphereCollider mirror. Reuses fpx::FxBody's
+// pos+radius semantics; a free helper FromBody builds one from an fpx::FxBody (the cloth-vs-FPX seam).
+struct SphereCollider {
+    FxVec3 center;        // Q16.16 world-space sphere center (== fpx::FxBody::pos)
+    fx     radius = 0;    // Q16.16 sphere radius (== fpx::FxBody::radius)
+};
+
+// SphereFromBody(b): build a cloth SphereCollider from an fpx::FxBody (its pos + radius). The composition
+// seam — the cloth drapes over the SAME rigid sphere the FPX sim integrates (same Q16.16 world units).
+inline SphereCollider SphereFromBody(const fpx::FxBody& b) {
+    return SphereCollider{b.pos, b.radius};
+}
+
+// ----- CollideParticleSphere: project ONE particle out of ONE sphere (the bit-exact core) -------------
+// If the particle is PINNED -> untouched. Else: an int32 AABB reject first (skip if |p-center| per-axis >
+// radius — the common no-overlap case, NO int64); then d = p.pos - s.center; dist = FxLength(d); if
+// dist < s.radius the particle is INSIDE -> push it to the surface along the OUTWARD normal:
+// n = FxNormalize(d) (dist==0 -> FxNormalize's fixed +Y fallback {0,kOne,0}); p.pos = s.center +
+// FxScale(n, s.radius) (snap to the surface). The static sphere takes no correction (the particle gets
+// the full push — the ResolvePair "one body static" case). Pure integer, int64-backed (FxLength/
+// FxNormalize). Returns true iff this particle was projected (a CONTACT — for the coverage stat).
+inline bool CollideParticleSphere(ClothParticle& p, const SphereCollider& s) {
+    if (p.flags & kFlagPinned) return false;
+    // int32 AABB reject: if the particle is outside the sphere's AABB on ANY axis, it cannot be inside
+    // (NO int64 — the cheap common-case skip before the FxLength). |p-center| per-axis compared to radius.
+    const fx dx = p.pos.x - s.center.x;
+    const fx dy = p.pos.y - s.center.y;
+    const fx dz = p.pos.z - s.center.z;
+    const fx ax = dx < 0 ? -dx : dx;
+    const fx ay = dy < 0 ? -dy : dy;
+    const fx az = dz < 0 ? -dz : dz;
+    if (ax > s.radius || ay > s.radius || az > s.radius) return false;   // outside the AABB -> no overlap
+    const FxVec3 d = FxVec3{dx, dy, dz};
+    const fx dist = FxLength(d);
+    if (dist >= s.radius) return false;                                  // outside the sphere -> untouched
+    const FxVec3 n = FxNormalize(d);                                     // dist==0 -> {0,kOne,0} fallback
+    p.pos = FxAdd(s.center, FxScale(n, s.radius));                       // snap to the surface
+    return true;
+}
+
+// ----- CollideSpheres: project a particle array out of a STATIC sphere set -----------------------------
+// For each particle (in index order), for each sphere (in the FIXED collider order), apply
+// CollideParticleSphere. Deterministic (fixed sphere order, fixed per-particle order). Returns the total
+// number of (particle, sphere) projections this call (the CONTACT count — a coverage stat, deterministic
+// + bit-exact CPU<->GPU). Pinned particles never move. The shader copies THIS double loop VERBATIM.
+inline int CollideSpheres(std::vector<ClothParticle>& particles,
+                          const std::vector<SphereCollider>& spheres) {
+    int contacts = 0;
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i)
+        for (size_t s = 0; s < spheres.size(); ++s)
+            if (CollideParticleSphere(particles[i], spheres[s])) ++contacts;
+    return contacts;
+}
+
+// ----- CollidePlane: clamp every particle to a ground plane (pos.y >= groundY) -------------------------
+// The CL3 floor-clamp, factored out as the plane collider (pinned particles ARE clamped too — a pinned
+// corner above the floor is unaffected; the clamp only raises a particle that fell below). Pure integer.
+inline void CollidePlane(std::vector<ClothParticle>& particles, fx groundY) {
+    const size_t n = particles.size();
+    for (size_t i = 0; i < n; ++i)
+        if (particles[i].pos.y < groundY) particles[i].pos.y = groundY;
+}
+
+// ----- StepClothCollide: one full PBD step WITH collision (CL3 StepCloth + CollideSpheres) --------------
+// IDENTICAL to CL3's StepCloth (integrate -> `iters` Gauss-Seidel constraint passes -> ground floor-clamp)
+// EXCEPT it applies CollideSpheres AFTER the constraint passes + the floor clamp (so the cloth both holds
+// together AND stays out of the spheres). With an EMPTY sphere set this is BYTE-IDENTICAL to StepCloth
+// (CollideSpheres is a no-op + the floor clamp is the same) — the CL3 zero-collider equivalence. Returns
+// the contact count for this step. The GPU cloth_collide.comp runs THIS exact body per step on one thread.
+inline int StepClothCollide(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                            const std::vector<Constraint>& constraints,
+                            const std::vector<SphereCollider>& spheres,
+                            const FxVec3& gravity, fx dt, fx groundY, int iters) {
+    // (1)-(3) the CL3 step VERBATIM (integrate + constraint passes + ground floor-clamp).
+    StepCloth(grid, particles, constraints, gravity, dt, groundY, iters);
+    // (4) collision: clamp to the ground plane (already clamped by StepCloth; CollidePlane is idempotent)
+    //     THEN project out of every static sphere. Deterministic, pinned never move.
+    CollidePlane(particles, groundY);
+    return CollideSpheres(particles, spheres);
+}
+
+// ----- StepClothCollideSteps: run K full PBD+collision steps (the showcase / GPU K-step driver) --------
+// K successive StepClothCollide steps. The GPU cloth_collide.comp runs THIS exact K-step loop on a SINGLE
+// thread (the Gauss-Seidel order-dependence in the inner constraint solve makes single-thread necessary).
+// Returns the contact count of the FINAL step (the settled-drape contact stat).
+inline int StepClothCollideSteps(const ClothGrid& grid, std::vector<ClothParticle>& particles,
+                                 const std::vector<Constraint>& constraints,
+                                 const std::vector<SphereCollider>& spheres,
+                                 const FxVec3& gravity, fx dt, fx groundY, int iters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepClothCollide(grid, particles, constraints, spheres, gravity, dt, groundY, iters);
+    return contacts;
+}
+
+// kCollideEps: the fixed-point penetration tolerance (Q16.16 LSBs). CollideParticleSphere snaps a particle
+// to the surface via FxNormalize + FxScale, both of which TRUNCATE toward zero — so the snapped FxLength
+// lands a few LSBs SHORT of radius (the FPX3 "residual is deterministic, not analytically zero" reality).
+// A particle within this slack is "on the surface", NOT penetrating. Small (a handful of LSBs); the snap
+// error is bounded by the per-axis truncation. Pure integer; bit-exact CPU<->GPU.
+inline constexpr fx kCollideEps = 16;   // ~16 Q16.16 LSBs (a tiny fraction of a world unit)
+
+// CountPenetrating(particles, spheres): the deterministic count of particles still INSIDE any sphere
+// beyond the snap tolerance (dist < radius - kCollideEps) — a coverage/diagnostic helper (0 after
+// StepClothCollide projects them all to the surface). Pure integer FxLength compares -> bit-exact CPU<->GPU.
+inline int CountPenetrating(const std::vector<ClothParticle>& particles,
+                            const std::vector<SphereCollider>& spheres) {
+    int pen = 0;
+    for (const ClothParticle& p : particles) {
+        for (const SphereCollider& s : spheres) {
+            const FxVec3 d = FxSub(p.pos, s.center);
+            if (FxLength(d) < s.radius - kCollideEps) { ++pen; break; }
+        }
+    }
+    return pen;
+}
+
 }  // namespace cloth
 }  // namespace hf::sim

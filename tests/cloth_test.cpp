@@ -23,6 +23,7 @@
 
 using namespace hf;
 namespace cloth = hf::sim::cloth;
+namespace fpx = hf::sim::fpx;
 using cloth::fx;
 using cloth::kOne;
 using cloth::kFrac;
@@ -426,6 +427,130 @@ int main() {
         check(a.size() == b.size() &&
               std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) == 0,
               "CL3 iters=0: StepCloth == pure CL1 IntegrateParticles (no-constraint equivalence)");
+    }
+
+    // ================= CL4: a particle INSIDE a sphere -> projected to EXACTLY the surface =============
+    {
+        // A sphere of radius 4 at the origin; a free particle at (1,0,0) is inside -> pushed out to the
+        // surface along +X -> exactly (radius, 0, 0). FxLength(p-center) == radius (the on-surface property).
+        cloth::SphereCollider s{cloth::FxVec3{0, 0, 0}, FromInt(4)};
+        cloth::ClothParticle p;
+        p.pos = cloth::FxVec3{FromInt(1), 0, 0}; p.prev = p.pos; p.invMass = kOne; p.flags = 0;
+        const bool hit = cloth::CollideParticleSphere(p, s);
+        check(hit, "CL4 inside: a particle inside the sphere is projected (a contact)");
+        check(p.pos.x == FromInt(4) && p.pos.y == 0 && p.pos.z == 0,
+              "CL4 inside: projected to exactly the surface along the axis (radius,0,0)");
+        const fx len = cloth::FxLength(cloth::FxSub(p.pos, s.center));
+        // On-surface to fixed-point tolerance (FxNormalize+FxScale truncation can land within a few units).
+        const fx tol = 4;  // a handful of Q16.16 LSBs
+        check(len >= s.radius - tol && len <= s.radius + tol,
+              "CL4 inside: FxLength(p-center) == radius within fixed-point tolerance");
+    }
+
+    // ================= CL4: a particle OUTSIDE a sphere -> UNTOUCHED ===================================
+    {
+        cloth::SphereCollider s{cloth::FxVec3{0, 0, 0}, FromInt(4)};
+        cloth::ClothParticle p;
+        p.pos = cloth::FxVec3{FromInt(10), FromInt(3), 0}; p.prev = p.pos; p.invMass = kOne; p.flags = 0;
+        const cloth::ClothParticle before = p;
+        const bool hit = cloth::CollideParticleSphere(p, s);
+        check(!hit, "CL4 outside: a particle outside the sphere is NOT a contact");
+        check(std::memcmp(&p, &before, sizeof(cloth::ClothParticle)) == 0,
+              "CL4 outside: the particle is byte-unchanged (no projection)");
+    }
+
+    // ================= CL4: a PINNED particle inside a sphere -> NEVER moves ===========================
+    {
+        cloth::SphereCollider s{cloth::FxVec3{0, 0, 0}, FromInt(4)};
+        cloth::ClothParticle p;
+        p.pos = cloth::FxVec3{FromInt(1), 0, 0}; p.prev = p.pos; p.invMass = 0; p.flags = cloth::kFlagPinned;
+        const cloth::ClothParticle before = p;
+        const bool hit = cloth::CollideParticleSphere(p, s);
+        check(!hit && std::memcmp(&p, &before, sizeof(cloth::ClothParticle)) == 0,
+              "CL4 pinned: a pinned particle inside a sphere is untouched");
+    }
+
+    // ================= CL4: dist==0 (particle AT the center) -> +Y default normal =====================
+    {
+        cloth::SphereCollider s{cloth::FxVec3{0, 0, 0}, FromInt(4)};
+        cloth::ClothParticle p;
+        p.pos = cloth::FxVec3{0, 0, 0}; p.prev = p.pos; p.invMass = kOne; p.flags = 0;
+        const bool hit = cloth::CollideParticleSphere(p, s);
+        check(hit && p.pos.x == 0 && p.pos.y == FromInt(4) && p.pos.z == 0,
+              "CL4 center: a particle at the center projects to +Y surface (the deterministic fallback)");
+    }
+
+    // ================= CL4: the ground clamp (CollidePlane) ===========================================
+    {
+        std::vector<cloth::ClothParticle> ps(3);
+        ps[0].pos = cloth::FxVec3{0, FromInt(-5), 0};   // below ground -> clamped
+        ps[1].pos = cloth::FxVec3{0, FromInt(3), 0};    // above ground -> untouched
+        ps[2].pos = cloth::FxVec3{0, 0, 0};             // exactly at ground -> untouched
+        const fx groundY = 0;
+        cloth::CollidePlane(ps, groundY);
+        check(ps[0].pos.y == 0, "CL4 plane: a particle below ground is clamped to groundY");
+        check(ps[1].pos.y == FromInt(3), "CL4 plane: a particle above ground is unchanged");
+        check(ps[2].pos.y == 0, "CL4 plane: a particle at ground is unchanged");
+    }
+
+    // ================= CL4: a sheet over a sphere -> NO penetration after K steps + deterministic ======
+    {
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = FromInt(-1000);
+        const int iters = 6, steps = 40;
+
+        cloth::ClothGrid grid; grid.W = 12; grid.H = 12; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{FromInt(-6), FromInt(8), 0};   // hang the sheet above a sphere
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+        // A static sphere centered under the sheet's middle (FromBody seam check below uses the same units).
+        std::vector<cloth::SphereCollider> spheres{ cloth::SphereCollider{cloth::FxVec3{0, FromInt(2), 0}, FromInt(3)} };
+
+        std::vector<cloth::ClothParticle> a = ps;
+        cloth::StepClothCollideSteps(grid, a, es, spheres, grav, dt, groundY, iters, steps);
+        // No particle ends strictly inside the sphere (every one projected to the surface, deterministically).
+        check(cloth::CountPenetrating(a, spheres) == 0,
+              "CL4 drape: no particle penetrates the sphere after K steps");
+
+        // Determinism: a second identical run is byte-identical.
+        std::vector<cloth::ClothParticle> b = ps;
+        cloth::StepClothCollideSteps(grid, b, es, spheres, grav, dt, groundY, iters, steps);
+        check(a.size() == b.size() &&
+              std::memcmp(a.data(), b.data(), a.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL4 drape: two runs byte-identical (deterministic)");
+
+        // The FromBody seam: a SphereCollider built from an fpx::FxBody has the SAME center+radius.
+        fpx::FxBody body; body.pos = cloth::FxVec3{0, FromInt(2), 0}; body.radius = FromInt(3);
+        const cloth::SphereCollider fromBody = cloth::SphereFromBody(body);
+        check(fromBody.center.x == spheres[0].center.x && fromBody.center.y == spheres[0].center.y &&
+              fromBody.center.z == spheres[0].center.z && fromBody.radius == spheres[0].radius,
+              "CL4 seam: SphereFromBody reuses fpx::FxBody pos+radius (same Q16.16 units)");
+    }
+
+    // ================= CL4: ZERO spheres -> byte-identical to the CL3 StepCloth (the no-op equivalence) =
+    {
+        const cloth::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = FromInt(-1000);
+        const int iters = 6, steps = 40;
+
+        cloth::ClothGrid grid; grid.W = 16; grid.H = 16; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(16), 0};
+        std::vector<cloth::ClothParticle> base = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, base);
+
+        std::vector<cloth::ClothParticle> withCollide = base;
+        std::vector<cloth::SphereCollider> noSpheres;   // EMPTY collider set
+        cloth::StepClothCollideSteps(grid, withCollide, es, noSpheres, grav, dt, groundY, iters, steps);
+
+        std::vector<cloth::ClothParticle> pureSolve = base;
+        cloth::StepClothSteps(grid, pureSolve, es, grav, dt, groundY, iters, steps);
+
+        check(withCollide.size() == pureSolve.size() &&
+              std::memcmp(withCollide.data(), pureSolve.data(),
+                          withCollide.size() * sizeof(cloth::ClothParticle)) == 0,
+              "CL4 zero-sphere: StepClothCollide == CL3 StepCloth byte-identical (no-op equivalence)");
     }
 
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
