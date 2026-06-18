@@ -18101,7 +18101,7 @@ int main(int argc, char** argv) {
             const float kWorldSpan = (float)kW / (float)kScale;   // 8.0 world units across
             const float kHalfSpan = 0.5f * kWorldSpan;            // center the navmesh on the origin
             const float kSheetY = 0.06f;   // navmesh overlay sits just above the ground (no z-fight)
-            const float kLineY  = 0.18f;   // corridor line above the overlay
+            const float kLineY  = 0.25f;   // corridor line above the overlay (clears the sheet)
 
             std::vector<nav::NavWorldVertex> navVerts;
             nav::PolyMeshToRenderMesh(polys, flatVerts, polyVertBase, kScale, kSheetY, navVerts);
@@ -18141,21 +18141,51 @@ int main(int argc, char** argv) {
             }
 
             // Build the corridor debug-line vertices (LINE_LIST: a pair per segment) + start/goal markers,
-            // centered on the origin. Bright yellow line, green start cross, red goal cross.
+            // centered on the origin. PURE saturated colors: the post chain (exposure 1.7 + ACES tonemap +
+            // bloom) desaturates colors toward white, so the source must be near-primary for the displayed
+            // pixels to read clearly yellow/green/red (B<<R,G for yellow; G dominant for start; R dominant for
+            // goal). The debug-line pipeline draws 1px lines, so the corridor is widened into a "ribbon" of
+            // parallel offset polylines and each marker cross into a small stack of parallel strokes — pure
+            // geometry through the SAME pipeline (NO new RHI / line-width state). This makes the path the clear
+            // visual headline of the capstone (hundreds of corridor px + dozens per marker), not a hairline.
+            const Vec3 kCorridorCol{1.00f, 0.85f, 0.00f};   // pure yellow (B=0 survives bloom -> reads yellow)
+            const Vec3 kStartCol{0.00f, 0.70f, 0.00f};      // green, kept below the bloom luma threshold so it
+                                                            // doesn't bloom white (B stays low -> reads green)
+            const Vec3 kGoalCol{1.00f, 0.03f, 0.03f};       // pure red
             debug::DebugDraw dd;
             auto worldPt = [&](const nav::NavWorldPoint& p) {
                 return Vec3{p.x - kHalfSpan, p.y, p.z - kHalfSpan};
             };
-            for (size_t k = 0; k + 1 < pathPts.size(); ++k)
-                dd.Line(worldPt(pathPts[k]), worldPt(pathPts[k + 1]), {0.98f, 0.90f, 0.15f});
+            // Corridor as a thick ribbon: kRibbon parallel copies offset in X and Z (and a small Y stack) so
+            // the projected line covers a band several pixels wide regardless of segment direction.
+            const int   kRibbon = 5;
+            const float kRibStep = 0.045f;   // world-space offset between ribbon strands
+            for (size_t k = 0; k + 1 < pathPts.size(); ++k) {
+                const Vec3 a = worldPt(pathPts[k]);
+                const Vec3 b = worldPt(pathPts[k + 1]);
+                for (int o = -kRibbon; o <= kRibbon; ++o) {
+                    const float dx = (float)o * kRibStep;
+                    const float dz = (float)o * kRibStep;
+                    dd.Line({a.x + dx, a.y, a.z}, {b.x + dx, b.y, b.z}, kCorridorCol);
+                    dd.Line({a.x, a.y, a.z + dz}, {b.x, b.y, b.z + dz}, kCorridorCol);
+                }
+            }
+            // Start/goal markers as thick filled crosses: a stack of parallel strokes per arm.
+            auto thickCross = [&](const Vec3& c, float half, const Vec3& col) {
+                const int kArm = 6;
+                const float armStep = 0.03f;
+                for (int o = -kArm; o <= kArm; ++o) {
+                    const float off = (float)o * armStep;
+                    dd.Line({c.x - half, c.y, c.z + off}, {c.x + half, c.y, c.z + off}, col);  // horizontal arm band
+                    dd.Line({c.x + off, c.y, c.z - half}, {c.x + off, c.y, c.z + half}, col);  // vertical arm band
+                }
+            };
             if (!pathPts.empty()) {
                 const Vec3 s = worldPt(pathPts.front());
                 const Vec3 g = worldPt(pathPts.back());
-                const float m = 0.18f;
-                dd.Line({s.x - m, s.y, s.z}, {s.x + m, s.y, s.z}, {0.15f, 0.95f, 0.25f});   // start cross (green)
-                dd.Line({s.x, s.y, s.z - m}, {s.x, s.y, s.z + m}, {0.15f, 0.95f, 0.25f});
-                dd.Line({g.x - m, g.y, g.z}, {g.x + m, g.y, g.z}, {0.95f, 0.20f, 0.20f});   // goal cross (red)
-                dd.Line({g.x, g.y, g.z - m}, {g.x, g.y, g.z + m}, {0.95f, 0.20f, 0.20f});
+                const float m = 0.35f;
+                thickCross(s, m, kStartCol);   // start cross (green)
+                thickCross(g, m, kGoalCol);    // goal cross (red)
             }
             const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
 
@@ -18224,7 +18254,11 @@ int main(int argc, char** argv) {
             postD.usesTexture = true; postD.fullscreen = true;
             auto postPipe = device->CreateGraphicsPipeline(postD);
 
-            // The debug-line pipeline (LINE_LIST, frame uniforms, depth-test on / write off) — REUSED.
+            // The debug-line pipeline (LINE_LIST, frame uniforms). The A* corridor + start/goal markers are
+            // a PATH OVERLAY (a HUD-style nav gizmo), so depth-test is OFF — always-on-top — guaranteeing the
+            // corridor + markers draw over the lit ground + translucent navmesh sheet regardless of the 3/4
+            // camera's depth. (With depthTest on, the near-ground line was occluded by the scene and produced
+            // ZERO visible corridor/marker pixels.) depthWrite stays off (it never occludes later geometry). — REUSED.
             auto dbgVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.vert.hlsl.spv");
             auto dbgFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/debug_line.frag.hlsl.spv");
             auto dbgVs = device->CreateShaderModule({std::span<const uint32_t>(dbgVsW)});
@@ -18237,7 +18271,7 @@ int main(int argc, char** argv) {
                 {1, rhi::Format::RGB32_Float, 12},
             };
             dbgD.colorFormat = device->Swapchain().ColorFormat();
-            dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+            dbgD.lineList = true; dbgD.depthTest = false; dbgD.depthWrite = false;
             dbgD.usesFrameUniforms = true;
             auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
 

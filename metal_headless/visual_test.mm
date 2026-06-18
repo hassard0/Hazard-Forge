@@ -19481,7 +19481,7 @@ static int RunNavRenderShowcase(const char* outPath) {
     const float kWorldSpan = (float)kW / (float)kScale;   // 8.0
     const float kHalfSpan = 0.5f * kWorldSpan;
     const float kSheetY = 0.06f;
-    const float kLineY  = 0.18f;
+    const float kLineY  = 0.25f;   // corridor line above the overlay (clears the sheet)
 
     std::vector<nav::NavWorldVertex> navVerts;
     nav::PolyMeshToRenderMesh(polys, flatVerts, polyVertBase, kScale, kSheetY, navVerts);
@@ -19513,20 +19513,44 @@ static int RunNavRenderShowcase(const char* outPath) {
     }
 
     // The corridor debug-line vertices (LINE_LIST) + start/goal markers (== the Vulkan path).
+    // PURE saturated colors + a widened ribbon/cross (the post chain — exposure 1.7 + ACES + bloom —
+    // desaturates toward white, and the 1px debug line is too thin), so the corridor + markers read as the
+    // clear yellow/green/red headline. Same geometry math as the Vulkan --nav-render-shot path; SAME pipeline
+    // (NO new RHI / line-width). Start green kept below the bloom luma threshold so it doesn't bloom white.
+    const Vec3 kCorridorCol{1.00f, 0.85f, 0.00f};   // pure yellow
+    const Vec3 kStartCol{0.00f, 0.70f, 0.00f};      // green (below bloom luma threshold)
+    const Vec3 kGoalCol{1.00f, 0.03f, 0.03f};       // pure red
     debug::DebugDraw dd;
     auto worldPt = [&](const nav::NavWorldPoint& p) {
         return Vec3{p.x - kHalfSpan, p.y, p.z - kHalfSpan};
     };
-    for (size_t k = 0; k + 1 < pathPts.size(); ++k)
-        dd.Line(worldPt(pathPts[k]), worldPt(pathPts[k + 1]), {0.98f, 0.90f, 0.15f});
+    const int   kRibbon = 5;
+    const float kRibStep = 0.045f;
+    for (size_t k = 0; k + 1 < pathPts.size(); ++k) {
+        const Vec3 a = worldPt(pathPts[k]);
+        const Vec3 b = worldPt(pathPts[k + 1]);
+        for (int o = -kRibbon; o <= kRibbon; ++o) {
+            const float dx = (float)o * kRibStep;
+            const float dz = (float)o * kRibStep;
+            dd.Line({a.x + dx, a.y, a.z}, {b.x + dx, b.y, b.z}, kCorridorCol);
+            dd.Line({a.x, a.y, a.z + dz}, {b.x, b.y, b.z + dz}, kCorridorCol);
+        }
+    }
+    auto thickCross = [&](const Vec3& c, float half, const Vec3& col) {
+        const int kArm = 6;
+        const float armStep = 0.03f;
+        for (int o = -kArm; o <= kArm; ++o) {
+            const float off = (float)o * armStep;
+            dd.Line({c.x - half, c.y, c.z + off}, {c.x + half, c.y, c.z + off}, col);
+            dd.Line({c.x + off, c.y, c.z - half}, {c.x + off, c.y, c.z + half}, col);
+        }
+    };
     if (!pathPts.empty()) {
         const Vec3 s = worldPt(pathPts.front());
         const Vec3 g = worldPt(pathPts.back());
-        const float m = 0.18f;
-        dd.Line({s.x - m, s.y, s.z}, {s.x + m, s.y, s.z}, {0.15f, 0.95f, 0.25f});
-        dd.Line({s.x, s.y, s.z - m}, {s.x, s.y, s.z + m}, {0.15f, 0.95f, 0.25f});
-        dd.Line({g.x - m, g.y, g.z}, {g.x + m, g.y, g.z}, {0.95f, 0.20f, 0.20f});
-        dd.Line({g.x, g.y, g.z - m}, {g.x, g.y, g.z + m}, {0.95f, 0.20f, 0.20f});
+        const float m = 0.35f;
+        thickCross(s, m, kStartCol);
+        thickCross(g, m, kGoalCol);
     }
     const uint32_t kLineVertCount = (uint32_t)dd.VertexCount();
 
@@ -19589,7 +19613,10 @@ static int RunNavRenderShowcase(const char* outPath) {
         {1, rhi::Format::RGB32_Float, 12},
     };
     dbgD.colorFormat = device->Swapchain().ColorFormat();
-    dbgD.lineList = true; dbgD.depthTest = true; dbgD.depthWrite = false;
+    // The A* corridor + start/goal markers are a PATH OVERLAY (HUD-style nav gizmo): depth-test OFF
+    // (always-on-top) so they draw over the lit ground + translucent navmesh sheet regardless of the 3/4
+    // camera's depth (with it ON the near-ground line was occluded -> ZERO visible corridor/marker pixels).
+    dbgD.lineList = true; dbgD.depthTest = false; dbgD.depthWrite = false;
     dbgD.usesFrameUniforms = true;
     auto debugPipeline = device->CreateGraphicsPipeline(dbgD);
 
