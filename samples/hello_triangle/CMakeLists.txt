@@ -490,6 +490,20 @@ hf_compile_shaders(
     "shaders/nav_raster_count.comp.hlsl:cs"
     "shaders/nav_raster_scan.comp.hlsl:cs"
     "shaders/nav_raster_emit.comp.hlsl:cs"
+    # Deterministic GPU Navmesh Slice 2 (Slice NAV2, the 2nd slice of FLAGSHIP #7): the WALKABLE FILTER +
+    # INTEGER CHAMFER DISTANCE FIELD over the NAV1 heightfield. nav_filter.comp: ONE thread per column —
+    # walk that column's MERGED spans (top->bottom), mark each span's top walkable iff the integer
+    # clearance ABOVE it (gap to the next solid span / the heightfield top) >= walkableHeight, write the
+    # per-column walkable mask + the topmost walkable surface y. nav_distance.comp: SINGLE-THREAD
+    # ([numthreads(1,1,1)], the nav_raster_scan/mc_scan serial mirror) two-pass integer chamfer (seed
+    # non-walkable+border=0/walkable=INF; forward TL->BR then backward BR->TL min-sweep; cardinal weight 2
+    # / diagonal weight 3, NO sqrt; only traverse walkable+connected neighbours via the abs(surfaceY)
+    # max-step test -> geodesic). The clearance/step + chamfer math is copied VERBATIM from
+    # engine/nav/navmesh.h — PURE INT32 (NO int64), so these MSL-generate NATIVELY on Metal. Pure integer
+    # SSBO compute + a compute->compute barrier + ReadBuffer -> bit-exact GPU==CPU walkable[]+dist[] +
+    # cross-backend, proven memcmp. NO new RHI; NAV1 shaders + goldens untouched.
+    "shaders/nav_filter.comp.hlsl:cs"
+    "shaders/nav_distance.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6):
     # fpx_solve.comp is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)],
     # the mc_scan/vt_alloc allocator pattern) runs `steps` of StepWorld = IntegrateStep then SolveContacts

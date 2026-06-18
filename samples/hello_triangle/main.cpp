@@ -456,6 +456,7 @@ int main(int argc, char** argv) {
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
     const char* fpxLockstepShotPath = nullptr; // --fpx-lockstep-shot <out.bmp> (Slice FPX5: Deterministic Fixed-Point Physics LOCKSTEP + ROLLBACK proof — PURE-CPU harness over the FPX1-4 sim: authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT; converged-state side-view golden bit-identical cross-backend; NO GPU shader, NO new RHI)
     const char* fpxPairsShotPath = nullptr; // --fpx-pairs-shot <out.bmp> (Slice FPX2: Deterministic Fixed-Point Physics integer-AABB BROADPHASE — a clustered 8x8 grid meshed by INT32 count->scan->emit (fpx_pair_count/scan/emit.comp) into the deterministic candidate-pair list, GPU==CPU pair list bit-exact, integer N×N pair-matrix viz)
+    const char* navDistanceShotPath = nullptr; // --nav-distance-shot <out.bmp> (Slice NAV2: Deterministic GPU Navmesh WALKABLE FILTER + INTEGER CHAMFER DISTANCE FIELD, the 2nd slice of FLAGSHIP #7 — rasterize+merge the NAV1 heightfield, filter walkable spans (integer clearance/step), build the integer two-pass chamfer distance field; GPU==CPU bit-exact, heat-ramp distance viz)
     const char* navRasterShotPath = nullptr; // --nav-raster-shot <out.bmp> (Slice NAV1: Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION, the BEACHHEAD of FLAGSHIP #7 — host-snapped voxel triangles (ground plane + box-step + ramp) rasterized into per-column SOLID SPANS by INT32 count->scan->emit (nav_raster_count/scan/emit.comp), GPU==CPU span list bit-exact, top-down per-column span-count viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
@@ -510,6 +511,18 @@ int main(int argc, char** argv) {
         // nested-block parse limit (C1061), like the fpx/mc shots.
         if (std::strcmp(argv[i], "--nav-raster-shot") == 0 && i + 1 < argc) {
             navRasterShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice NAV2: --nav-distance-shot <out.bmp> — the Deterministic GPU Navmesh WALKABLE FILTER +
+        // INTEGER CHAMFER DISTANCE FIELD (the 2nd slice of FLAGSHIP #7). Rasterize+merge the NAV1
+        // heightfield, then two pure-INT32 compute passes: nav_filter.comp (one thread per column ->
+        // walkable[]+surfaceY[]) -> (barrier) -> nav_distance.comp (single-thread two-pass chamfer ->
+        // dist[]). GPU==CPU bit-exact vs navmesh.h::FilterWalkableSpans+BuildDistanceField. PURE INT32 ->
+        // the shaders MSL-gen natively on Metal. NO new RHI. STANDALONE branch (the fpx/mc/nav1 lesson:
+        // avoid MSVC's nested-block parse limit C1061).
+        if (std::strcmp(argv[i], "--nav-distance-shot") == 0 && i + 1 < argc) {
+            navDistanceShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15528,6 +15541,281 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — integer heightfield span-count viz (%u spans)\n",
                                 navRasterShotPath, imgW, imgH, totalSpans);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", navRasterShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Navmesh WALKABLE FILTER + INTEGER CHAMFER DISTANCE FIELD (--nav-distance-shot
+        // <out.bmp>, Slice NAV2, the 2nd slice of FLAGSHIP #7). The NAV1 showcase heightfield (ground plane +
+        // box-step + ramp) is rasterized (nav::RasterizeTriangleSpans) + per-column MERGED
+        // (nav::MergeColumnSpans) on the HOST; the merged spans (flat buffer + per-column offset/count) feed
+        // two pure-INT32 compute passes: nav_filter.comp (ONE thread per column: walk merged spans, mark
+        // walkable by integer clearance-above >= walkableHeight -> gWalkable[col]+gSurfaceY[col]) ->
+        // (compute->compute barrier) -> nav_distance.comp ([numthreads(1,1,1)] single-thread two-pass integer
+        // chamfer: seed non-walkable+border=0/walkable=INF, forward TL->BR then backward BR->TL min-sweep,
+        // cardinal weight 2/diagonal weight 3, only traverse walkable+connected neighbours -> geodesic
+        // dist[]). The filter + chamfer math is copied VERBATIM from engine/nav/navmesh.h (PURE INT32, NO
+        // int64 -> MSL-gens natively on Metal). ReadBuffer reads gWalkable + gDist; the CPU
+        // FilterWalkableSpans+BuildDistanceField over the SAME merged spans must match BIT-EXACT (memcmp).
+        // enabled=false -> walkable 0 / dist 0. The golden is a heat-ramp distance-field viz. NO new RHI.
+        if (navDistanceShotPath) {
+            using math::Vec3;
+            namespace nav = hf::nav;
+
+            // The deterministic heightfield (== the Metal --nav-distance config). A 32x32 column grid.
+            const int kW = 32, kH = 32;
+            nav::Heightfield hf;
+            hf.w = kW; hf.h = kH;
+            hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+            hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+            hf.cs = 1; hf.ch = 1;
+            const int kColumnCount = hf.columnCount();   // 1024
+            nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+
+            std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+
+            // Host: rasterize -> per-column merged spans -> a flat merged-span buffer + offset/count.
+            std::vector<uint32_t> rColCount, rColOffset;
+            std::vector<nav::Span> rSpans;
+            nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+            std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+            std::vector<nav::Span> flatMerged;
+            std::vector<uint32_t> mOffset((size_t)kColumnCount, 0u), mCount((size_t)kColumnCount, 0u);
+            for (int c = 0; c < kColumnCount; ++c) {
+                std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                          rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+                mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+                mOffset[(size_t)c] = (uint32_t)flatMerged.size();
+                mCount[(size_t)c] = (uint32_t)mergedPerCol[(size_t)c].size();
+                for (const auto& s : mergedPerCol[(size_t)c]) flatMerged.push_back(s);
+            }
+            const uint32_t kMergedTotal = (uint32_t)flatMerged.size();
+            const uint32_t kMergedAlloc = kMergedTotal > 0u ? kMergedTotal : 1u;
+
+            // CPU reference: filter (over a COPY of mergedPerCol so the GPU run sees fresh area) + distance.
+            std::vector<std::vector<nav::Span>> cpuMerged = mergedPerCol;
+            std::vector<uint32_t> cpuWalkable; std::vector<int32_t> cpuSurfaceY;
+            nav::FilterWalkableSpans(hf, cfg, cpuMerged, cpuWalkable, cpuSurfaceY);
+            std::vector<uint32_t> cpuDist;
+            nav::BuildDistanceField(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist);
+
+            // std430 Span mirror: 3 x uint32 (12 bytes).
+            struct SpanGpu { uint32_t ymin, ymax, area; };
+            static_assert(sizeof(SpanGpu) == 12, "SpanGpu std430 layout");
+            std::vector<SpanGpu> mergedInit((size_t)kMergedAlloc, SpanGpu{0u, 0u, 0u});
+            for (uint32_t i = 0; i < kMergedTotal; ++i)
+                mergedInit[i] = SpanGpu{flatMerged[i].ymin, flatMerged[i].ymax, flatMerged[i].area};
+
+            auto makeBufU32 = [&](const std::vector<uint32_t>& v) {
+                rhi::BufferDesc d; d.size = v.size() * sizeof(uint32_t);
+                d.initialData = v.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto offsetBuf = makeBufU32(mOffset);
+            auto countBuf  = makeBufU32(mCount);
+
+            // Fresh per-run buffers (so the disabled no-op reads cleared bytes).
+            std::vector<int32_t> surfaceInit((size_t)kColumnCount, 0);
+            std::vector<uint32_t> walkableInit((size_t)kColumnCount, 0u);
+            std::vector<uint32_t> distInit((size_t)kColumnCount, 0u);
+            auto makeSpansBuf = [&]() {
+                rhi::BufferDesc d; d.size = mergedInit.size() * sizeof(SpanGpu);
+                d.initialData = mergedInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeWalkBuf = [&]() {
+                rhi::BufferDesc d; d.size = walkableInit.size() * sizeof(uint32_t);
+                d.initialData = walkableInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeSurfBuf = [&]() {
+                rhi::BufferDesc d; d.size = surfaceInit.size() * sizeof(int32_t);
+                d.initialData = surfaceInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeDistBuf = [&]() {
+                rhi::BufferDesc d; d.size = distInit.size() * sizeof(uint32_t);
+                d.initialData = distInit.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Filter params (nav_filter Params std430): int4 cfg {w,h,walkableHeight,enabled} + int4 ext {fieldTop,..}.
+            struct NavFilterParams { int32_t cfg[4]; int32_t ext[4]; };
+            static_assert(sizeof(NavFilterParams) == 32, "NavFilterParams std430 layout");
+            auto makeFilterParams = [&](int32_t enabled) {
+                NavFilterParams p{};
+                p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableHeight; p.cfg[3] = enabled;
+                p.ext[0] = hf.bmaxY - 1;
+                return p;
+            };
+            // Distance params (nav_distance Params std430): int4 cfg {w,h,walkableClimb,enabled}.
+            struct NavDistParams { int32_t cfg[4]; };
+            static_assert(sizeof(NavDistParams) == 16, "NavDistParams std430 layout");
+            auto makeDistParams = [&](int32_t enabled) {
+                NavDistParams p{}; p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled;
+                return p;
+            };
+
+            auto filterWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/nav_filter.comp.hlsl.spv");
+            auto filterCs = device->CreateShaderModule({std::span<const uint32_t>(filterWords)});
+            rhi::ComputePipelineDesc filterCd;
+            filterCd.compute = filterCs.get(); filterCd.storageBufferCount = 6; filterCd.threadsPerGroupX = 64;
+            auto filterCompute = device->CreateComputePipeline(filterCd);
+
+            auto distWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/nav_distance.comp.hlsl.spv");
+            auto distCs = device->CreateShaderModule({std::span<const uint32_t>(distWords)});
+            rhi::ComputePipelineDesc distCd;
+            distCd.compute = distCs.get(); distCd.storageBufferCount = 4; distCd.threadsPerGroupX = 1;
+            auto distCompute = device->CreateComputePipeline(distCd);
+
+            const uint32_t kGroups = ((uint32_t)kColumnCount + 63u) / 64u;
+
+            auto runFilterDist = [&](int32_t enabled, std::vector<uint32_t>& outWalk,
+                                     std::vector<uint32_t>& outDist) {
+                auto spansBuf = makeSpansBuf();
+                auto walkBuf  = makeWalkBuf();
+                auto surfBuf  = makeSurfBuf();
+                auto distBuf  = makeDistBuf();
+                NavFilterParams fp = makeFilterParams(enabled);
+                rhi::BufferDesc fpDesc; fpDesc.size = sizeof(NavFilterParams);
+                fpDesc.initialData = &fp; fpDesc.usage = rhi::BufferUsage::Storage;
+                auto fpBuf = device->CreateBuffer(fpDesc);
+                NavDistParams dp = makeDistParams(enabled);
+                rhi::BufferDesc dpDesc; dpDesc.size = sizeof(NavDistParams);
+                dpDesc.initialData = &dp; dpDesc.usage = rhi::BufferUsage::Storage;
+                auto dpBuf = device->CreateBuffer(dpDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("nav_distance", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-column walkable filter.
+                        cmd.BindComputePipeline(*filterCompute);
+                        cmd.BindStorageBuffer(*spansBuf, 0);
+                        cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*countBuf, 2);
+                        cmd.BindStorageBuffer(*walkBuf, 3);
+                        cmd.BindStorageBuffer(*surfBuf, 4);
+                        cmd.BindStorageBuffer(*fpBuf, 5);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToComputeBarrier();   // filter -> distance (walkable/surfaceY read)
+                        // Pass 2: single-thread two-pass chamfer.
+                        cmd.BindComputePipeline(*distCompute);
+                        cmd.BindStorageBuffer(*walkBuf, 0);
+                        cmd.BindStorageBuffer(*surfBuf, 1);
+                        cmd.BindStorageBuffer(*distBuf, 2);
+                        cmd.BindStorageBuffer(*dpBuf, 3);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outWalk.assign((size_t)kColumnCount, 0u);
+                device->ReadBuffer(*walkBuf, outWalk.data(), outWalk.size() * sizeof(uint32_t), 0);
+                outDist.assign((size_t)kColumnCount, 0u);
+                device->ReadBuffer(*distBuf, outDist.data(), outDist.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU walkable + distance (enabled) ===
+            std::vector<uint32_t> gpuWalk, gpuDist;
+            runFilterDist(1, gpuWalk, gpuDist);
+
+            // PROOF (1) GPU==CPU walkable mask + distance BIT-EXACT (integer memcmp, NO tol).
+            bool walkOk = (gpuWalk.size() == cpuWalkable.size()) &&
+                std::memcmp(gpuWalk.data(), cpuWalkable.data(), cpuWalkable.size() * sizeof(uint32_t)) == 0;
+            bool distOk = (gpuDist.size() == cpuDist.size()) &&
+                std::memcmp(gpuDist.data(), cpuDist.data(), cpuDist.size() * sizeof(uint32_t)) == 0;
+            if (!walkOk || !distOk) {
+                std::fprintf(stderr, "FATAL: nav-distance GPU != CPU FilterWalkableSpans+BuildDistanceField "
+                             "(walkable=%d dist=%d)\n", (int)walkOk, (int)distOk);
+                device->WaitIdle(); return 1;
+            }
+            uint32_t walkCount = 0u; for (uint32_t w : gpuWalk) if (w != 0u) ++walkCount;
+            uint32_t maxDist = 0u; for (uint32_t d : gpuDist) if (d > maxDist) maxDist = d;
+            std::printf("nav-distance: {columns:%d, walkable:%u, maxdist:%u} GPU==CPU BIT-EXACT\n",
+                        kColumnCount, walkCount, maxDist);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<uint32_t> w2, d2;
+                runFilterDist(1, w2, d2);
+                if (w2.size() != gpuWalk.size() ||
+                    std::memcmp(w2.data(), gpuWalk.data(), w2.size() * sizeof(uint32_t)) != 0 ||
+                    std::memcmp(d2.data(), gpuDist.data(), d2.size() * sizeof(uint32_t)) != 0) {
+                    std::fprintf(stderr, "FATAL: nav-distance two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-distance determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage / coherence: walkable>0, the distance peaks in the walkable interior
+            // (maxDist>0 and the interior is farther than the border).
+            {
+                bool coherent = (walkCount > 0u) && (maxDist > 0u);
+                if (!coherent) {
+                    std::fprintf(stderr, "FATAL: nav-distance coverage incoherent "
+                                 "(walkable=%u maxdist=%u)\n", walkCount, maxDist);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-distance coverage: %u walkable cells, peak dist %u (coherent gradient)\n",
+                            walkCount, maxDist);
+            }
+
+            // PROOF (4) empty no-op: enabled=false -> walkable all-zero, dist all-zero.
+            {
+                std::vector<uint32_t> dWalk, dDist;
+                runFilterDist(0, dWalk, dDist);
+                bool zero = true;
+                for (uint32_t w : dWalk) if (w != 0u) { zero = false; break; }
+                if (zero) for (uint32_t d : dDist) if (d != 0u) { zero = false; break; }
+                if (!zero) {
+                    std::fprintf(stderr, "FATAL: nav-distance disabled path produced walkable/dist\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-distance empty: 0 walkable (no-op)\n");
+            }
+
+            // --- Golden: a top-down heat-ramp distance-field viz. Walkable cell (cx,cz) colored by its
+            // integer chamfer distance via a fixed blue->cyan->green->yellow->red ramp (normalized by
+            // maxDist); non-walkable columns the dark background. CPU-colored from the read-back integer
+            // dist[] -> identical both backends by construction. 16px/cell -> 512x512. ---
+            const int kCell = 16;
+            const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto fillCell = [&](int row, int col, uint8_t r, uint8_t g2, uint8_t b2) {
+                for (int dy = 0; dy < kCell; ++dy)
+                    for (int dx = 0; dx < kCell; ++dx) {
+                        const int ix = col * kCell + dx, iy = row * kCell + dy;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            // A fixed heat ramp t in [0,1] -> (r,g,b). Pure deterministic float-from-integer (color only,
+            // OUT of the bit-exact path; the dist[] bytes are what the cross-backend check compares).
+            auto heat = [&](float t, uint8_t& r, uint8_t& g2, uint8_t& b2) {
+                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                float rr = t < 0.5f ? 0.0f : (t - 0.5f) * 2.0f;
+                float gg = t < 0.5f ? t * 2.0f : 1.0f - (t - 0.5f) * 2.0f;
+                float bb = t < 0.5f ? 1.0f - t * 2.0f : 0.0f;
+                r = (uint8_t)(rr * 255.0f + 0.5f); g2 = (uint8_t)(gg * 255.0f + 0.5f); b2 = (uint8_t)(bb * 255.0f + 0.5f);
+            };
+            const float invMax = maxDist > 0u ? 1.0f / (float)maxDist : 0.0f;
+            for (int cz = 0; cz < kH; ++cz)
+                for (int cx = 0; cx < kW; ++cx) {
+                    const size_t c = (size_t)hf.columnId(cx, cz);
+                    if (gpuWalk[c] == 0u) continue;   // non-walkable stays dark background
+                    uint8_t r, g2, b2; heat((float)gpuDist[c] * invMax, r, g2, b2);
+                    fillCell(cz, cx, r, g2, b2);
+                }
+            bool ok = WriteBMP(navDistanceShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — integer chamfer distance-field viz (peak %u)\n",
+                                navDistanceShotPath, imgW, imgH, maxDist);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", navDistanceShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

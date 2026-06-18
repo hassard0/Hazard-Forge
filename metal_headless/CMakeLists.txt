@@ -281,6 +281,20 @@ hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_m
 hf_gen_msl(nav_raster_count.comp nav_raster_count.comp.hlsl comp nav_raster_count_main)
 hf_gen_msl(nav_raster_scan.comp  nav_raster_scan.comp.hlsl  comp nav_raster_scan_main)
 hf_gen_msl(nav_raster_emit.comp  nav_raster_emit.comp.hlsl  comp nav_raster_emit_main)
+# Deterministic GPU Navmesh Slice 2 (Slice NAV2, the 2nd slice of FLAGSHIP #7): the WALKABLE FILTER +
+# INTEGER CHAMFER DISTANCE FIELD over the NAV1 heightfield. nav_filter.comp (ONE thread per column: walk
+# the column's MERGED spans, mark each span's top walkable by integer clearance-above >= walkableHeight,
+# write the per-column walkable mask + the topmost walkable surface y), nav_distance.comp (SINGLE-THREAD
+# [numthreads(1,1,1)] two-pass integer chamfer: seed non-walkable+border=0/walkable=INF, forward TL->BR
+# then backward BR->TL min-sweep, cardinal weight 2 / diagonal weight 3, only traverse walkable+connected
+# neighbours -> geodesic). The clearance/step + chamfer math is copied VERBATIM from
+# engine/nav/navmesh.h. Like the NAV1 rasterizer + UNLIKE fpx_integrate.comp, these are PURE INT32 (NO
+# int64), so glslc CAN lower them and they MSL-generate NATIVELY (the default MSL gen suffices). The Metal
+# --nav-distance showcase dispatches the GPU shaders directly -> the GPU==CPU walkable[]+dist[] proof runs
+# on Metal too; bit-exact cross-backend by construction. Behind --nav-distance only; NAV1 + existing
+# shaders + goldens untouched.
+hf_gen_msl(nav_filter.comp   nav_filter.comp.hlsl   comp nav_filter_main)
+hf_gen_msl(nav_distance.comp nav_distance.comp.hlsl comp nav_distance_main)
 # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6): fpx_solve.comp
 # is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)]) runs `steps` of
 # StepWorld = IntegrateStep then SolveContacts (K=solveIters Gauss-Seidel sweeps: ground then sphere-sphere

@@ -17228,6 +17228,260 @@ static int RunNavRasterShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic GPU Navmesh WALKABLE FILTER + INTEGER CHAMFER DISTANCE FIELD showcase (Slice NAV2, the
+// 2nd slice of FLAGSHIP #7). Like --nav-raster (and UNLIKE --fpx-solve's int64 -> CPU on Metal), the
+// filter + chamfer are PURE INT32 (clearance/step compares + the integer chamfer weights 2/3, NO int64),
+// so nav_filter.comp + nav_distance.comp MSL-gen natively and Metal DISPATCHES THE GPU passes: the SAME
+// NAV1 showcase heightfield (ground + box-step + ramp) is rasterized + per-column MERGED on the HOST, then
+// nav_filter.comp (one thread per column -> walkable[]+surfaceY[]) -> (barrier) -> nav_distance.comp
+// (single-thread two-pass chamfer -> dist[]) -> ReadBuffer walkable[]+dist[], PROVEN BIT-EXACT vs the CPU
+// nav::FilterWalkableSpans+BuildDistanceField reference (memcmp — the same proofs the Vulkan
+// --nav-distance-shot runs); enabled=false -> walkable 0 / dist 0; two runs byte-identical. The image
+// golden is the heat-ramp distance-field viz, identical to the Vulkan path BY CONSTRUCTION. New golden
+// tests/golden/metal/nav_distfield.png; two runs DIFF 0.0000. NO new RHI.
+static int RunNavDistanceShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace nav = hf::nav;
+
+    // The deterministic heightfield (== the Vulkan --nav-distance-shot config). A 32x32 column grid.
+    const int kW = 32, kH = 32;
+    nav::Heightfield hf;
+    hf.w = kW; hf.h = kH;
+    hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+    hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+    hf.cs = 1; hf.ch = 1;
+    const int kColumnCount = hf.columnCount();   // 1024
+    nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+
+    std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+
+    // Host: rasterize -> per-column merged spans -> a flat merged-span buffer + offset/count.
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+    std::vector<nav::Span> flatMerged;
+    std::vector<uint32_t> mOffset((size_t)kColumnCount, 0u), mCount((size_t)kColumnCount, 0u);
+    for (int c = 0; c < kColumnCount; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+        mOffset[(size_t)c] = (uint32_t)flatMerged.size();
+        mCount[(size_t)c] = (uint32_t)mergedPerCol[(size_t)c].size();
+        for (const auto& s : mergedPerCol[(size_t)c]) flatMerged.push_back(s);
+    }
+    const uint32_t kMergedTotal = (uint32_t)flatMerged.size();
+    const uint32_t kMergedAlloc = kMergedTotal > 0u ? kMergedTotal : 1u;
+
+    // CPU reference: filter (over a COPY) + distance.
+    std::vector<std::vector<nav::Span>> cpuMerged = mergedPerCol;
+    std::vector<uint32_t> cpuWalkable; std::vector<int32_t> cpuSurfaceY;
+    nav::FilterWalkableSpans(hf, cfg, cpuMerged, cpuWalkable, cpuSurfaceY);
+    std::vector<uint32_t> cpuDist;
+    nav::BuildDistanceField(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist);
+
+    const int kCell = 16;                 // 16px/cell -> 512x512
+    const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    struct SpanGpu { uint32_t ymin, ymax, area; };
+    static_assert(sizeof(SpanGpu) == 12, "SpanGpu std430 layout");
+    std::vector<SpanGpu> mergedInit((size_t)kMergedAlloc, SpanGpu{0u, 0u, 0u});
+    for (uint32_t i = 0; i < kMergedTotal; ++i)
+        mergedInit[i] = SpanGpu{flatMerged[i].ymin, flatMerged[i].ymax, flatMerged[i].area};
+
+    auto makeBufU32 = [&](const std::vector<uint32_t>& v) {
+        rhi::BufferDesc d; d.size = v.size() * sizeof(uint32_t);
+        d.initialData = v.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto offsetBuf = makeBufU32(mOffset);
+    auto countBuf  = makeBufU32(mCount);
+
+    std::vector<int32_t> surfaceInit((size_t)kColumnCount, 0);
+    std::vector<uint32_t> walkableInit((size_t)kColumnCount, 0u);
+    std::vector<uint32_t> distInit((size_t)kColumnCount, 0u);
+    auto makeSpansBuf = [&]() {
+        rhi::BufferDesc d; d.size = mergedInit.size() * sizeof(SpanGpu);
+        d.initialData = mergedInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeWalkBuf = [&]() {
+        rhi::BufferDesc d; d.size = walkableInit.size() * sizeof(uint32_t);
+        d.initialData = walkableInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeSurfBuf = [&]() {
+        rhi::BufferDesc d; d.size = surfaceInit.size() * sizeof(int32_t);
+        d.initialData = surfaceInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeDistBuf = [&]() {
+        rhi::BufferDesc d; d.size = distInit.size() * sizeof(uint32_t);
+        d.initialData = distInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct NavFilterParams { int32_t cfg[4]; int32_t ext[4]; };
+    static_assert(sizeof(NavFilterParams) == 32, "NavFilterParams std430 layout");
+    auto makeFilterParams = [&](int32_t enabled) {
+        NavFilterParams p{};
+        p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableHeight; p.cfg[3] = enabled;
+        p.ext[0] = hf.bmaxY - 1;
+        return p;
+    };
+    struct NavDistParams { int32_t cfg[4]; };
+    static_assert(sizeof(NavDistParams) == 16, "NavDistParams std430 layout");
+    auto makeDistParams = [&](int32_t enabled) {
+        NavDistParams p{}; p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled;
+        return p;
+    };
+
+    auto filterCs = loadMSL("nav_filter.comp.gen.metal", "nav_filter_main");
+    rhi::ComputePipelineDesc filterCd;
+    filterCd.compute = filterCs.get(); filterCd.storageBufferCount = 6; filterCd.threadsPerGroupX = 64;
+    auto filterCompute = device->CreateComputePipeline(filterCd);
+
+    auto distCs = loadMSL("nav_distance.comp.gen.metal", "nav_distance_main");
+    rhi::ComputePipelineDesc distCd;
+    distCd.compute = distCs.get(); distCd.storageBufferCount = 4; distCd.threadsPerGroupX = 1;
+    auto distCompute = device->CreateComputePipeline(distCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)kColumnCount + 63u) / 64u;
+
+    auto runFilterDist = [&](int32_t enabled, std::vector<uint32_t>& outWalk,
+                             std::vector<uint32_t>& outDist) {
+        auto spansBuf = makeSpansBuf();
+        auto walkBuf  = makeWalkBuf();
+        auto surfBuf  = makeSurfBuf();
+        auto distBuf  = makeDistBuf();
+        NavFilterParams fp = makeFilterParams(enabled);
+        rhi::BufferDesc fpDesc; fpDesc.size = sizeof(NavFilterParams);
+        fpDesc.initialData = &fp; fpDesc.usage = rhi::BufferUsage::Storage;
+        auto fpBuf = device->CreateBuffer(fpDesc);
+        NavDistParams dp = makeDistParams(enabled);
+        rhi::BufferDesc dpDesc; dpDesc.size = sizeof(NavDistParams);
+        dpDesc.initialData = &dp; dpDesc.usage = rhi::BufferUsage::Storage;
+        auto dpBuf = device->CreateBuffer(dpDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("nav_distance", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*filterCompute);
+                cmd.BindStorageBuffer(*spansBuf, 0);
+                cmd.BindStorageBuffer(*offsetBuf, 1);
+                cmd.BindStorageBuffer(*countBuf, 2);
+                cmd.BindStorageBuffer(*walkBuf, 3);
+                cmd.BindStorageBuffer(*surfBuf, 4);
+                cmd.BindStorageBuffer(*fpBuf, 5);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*distCompute);
+                cmd.BindStorageBuffer(*walkBuf, 0);
+                cmd.BindStorageBuffer(*surfBuf, 1);
+                cmd.BindStorageBuffer(*distBuf, 2);
+                cmd.BindStorageBuffer(*dpBuf, 3);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outWalk.assign((size_t)kColumnCount, 0u);
+        device->ReadBuffer(*walkBuf, outWalk.data(), outWalk.size() * sizeof(uint32_t), 0);
+        outDist.assign((size_t)kColumnCount, 0u);
+        device->ReadBuffer(*distBuf, outDist.data(), outDist.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU walkable + distance (enabled).
+    std::vector<uint32_t> gpuWalk, gpuDist;
+    runFilterDist(1, gpuWalk, gpuDist);
+
+    // PROOF (1) GPU==CPU walkable mask + distance BIT-EXACT.
+    bool walkOk = (gpuWalk.size() == cpuWalkable.size()) &&
+        std::memcmp(gpuWalk.data(), cpuWalkable.data(), cpuWalkable.size() * sizeof(uint32_t)) == 0;
+    bool distOk = (gpuDist.size() == cpuDist.size()) &&
+        std::memcmp(gpuDist.data(), cpuDist.data(), cpuDist.size() * sizeof(uint32_t)) == 0;
+    if (!walkOk || !distOk)
+        return fail("nav-distance: GPU != CPU FilterWalkableSpans+BuildDistanceField");
+    uint32_t walkCount = 0u; for (uint32_t w : gpuWalk) if (w != 0u) ++walkCount;
+    uint32_t maxDist = 0u; for (uint32_t d : gpuDist) if (d > maxDist) maxDist = d;
+    std::printf("nav-distance: {columns:%d, walkable:%u, maxdist:%u} GPU==CPU BIT-EXACT\n",
+                kColumnCount, walkCount, maxDist);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint32_t> w2, d2;
+        runFilterDist(1, w2, d2);
+        if (w2.size() != gpuWalk.size() ||
+            std::memcmp(w2.data(), gpuWalk.data(), w2.size() * sizeof(uint32_t)) != 0 ||
+            std::memcmp(d2.data(), gpuDist.data(), d2.size() * sizeof(uint32_t)) != 0)
+            return fail("nav-distance: two runs differ (nondeterministic)");
+        std::printf("nav-distance determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage / coherence.
+    {
+        if (!((walkCount > 0u) && (maxDist > 0u)))
+            return fail("nav-distance: coverage incoherent");
+        std::printf("nav-distance coverage: %u walkable cells, peak dist %u (coherent gradient)\n",
+                    walkCount, maxDist);
+    }
+
+    // PROOF (4) empty no-op.
+    {
+        std::vector<uint32_t> dWalk, dDist;
+        runFilterDist(0, dWalk, dDist);
+        bool zero = true;
+        for (uint32_t w : dWalk) if (w != 0u) { zero = false; break; }
+        if (zero) for (uint32_t d : dDist) if (d != 0u) { zero = false; break; }
+        if (!zero) return fail("nav-distance: disabled path produced walkable/dist");
+        std::printf("nav-distance empty: 0 walkable (no-op)\n");
+    }
+
+    // --- Golden: the top-down heat-ramp distance-field viz (IDENTICAL to the Vulkan --nav-distance-shot
+    // by construction; CPU-colored from the read-back integer dist[]). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto fillCell = [&](int row, int col, uint8_t r, uint8_t g2, uint8_t b2) {
+        for (int dy = 0; dy < kCell; ++dy)
+            for (int dx = 0; dx < kCell; ++dx) {
+                const int ix = col * kCell + dx, iy = row * kCell + dy;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+            }
+    };
+    auto heat = [&](float t, uint8_t& r, uint8_t& g2, uint8_t& b2) {
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        float rr = t < 0.5f ? 0.0f : (t - 0.5f) * 2.0f;
+        float gg = t < 0.5f ? t * 2.0f : 1.0f - (t - 0.5f) * 2.0f;
+        float bb = t < 0.5f ? 1.0f - t * 2.0f : 0.0f;
+        r = (uint8_t)(rr * 255.0f + 0.5f); g2 = (uint8_t)(gg * 255.0f + 0.5f); b2 = (uint8_t)(bb * 255.0f + 0.5f);
+    };
+    const float invMax = maxDist > 0u ? 1.0f / (float)maxDist : 0.0f;
+    for (int cz = 0; cz < kH; ++cz)
+        for (int cx = 0; cx < kW; ++cx) {
+            const size_t c = (size_t)hf.columnId(cx, cz);
+            if (gpuWalk[c] == 0u) continue;
+            uint8_t r, g2, b2; heat((float)gpuDist[c] * invMax, r, g2, b2);
+            fillCell(cz, cx, r, g2, b2);
+        }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — integer chamfer distance-field viz (peak %u)\n",
+                outPath, imgW, imgH, maxDist);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver showcase (Slice FPX3, the
 // MAKE-OR-BREAK of FLAGSHIP #6). On Metal this runs the CPU SOLVER, NOT a GPU compute dispatch.
 // fpx_solve.comp is int64/Vulkan-only (glslc can't parse int64 — fxdiv/FxISqrt for the sphere-sphere
@@ -28534,6 +28788,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--nav-raster") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_nav_spans.png";
             try { return RunNavRasterShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --nav-distance <out.png>: render the Deterministic GPU Navmesh WALKABLE FILTER + INTEGER CHAMFER
+        // DISTANCE FIELD showcase (Slice NAV2, the 2nd slice of FLAGSHIP #7). Like --nav-raster (and UNLIKE
+        // --fpx-solve's int64 -> CPU on Metal), the filter + chamfer are PURE INT32, so nav_filter.comp +
+        // nav_distance.comp MSL-gen natively and Metal DISPATCHES THE GPU passes: the SAME NAV1 showcase
+        // heightfield is rasterized + per-column MERGED on the host, then nav_filter.comp (one thread per
+        // column -> walkable[]+surfaceY[]) -> (barrier) -> nav_distance.comp (single-thread two-pass chamfer
+        // -> dist[]) -> ReadBuffer walkable[]+dist[], PROVEN BIT-EXACT vs the CPU
+        // nav::FilterWalkableSpans+BuildDistanceField reference (memcmp — the same proofs the Vulkan
+        // --nav-distance-shot runs); enabled=false -> walkable 0 / dist 0; two runs byte-identical. The image
+        // golden is the heat-ramp distance-field viz, identical to the Vulkan path BY CONSTRUCTION. New
+        // golden tests/golden/metal/nav_distfield.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--nav-distance") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_nav_distfield.png";
+            try { return RunNavDistanceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-solve <out.png>: render the Deterministic Fixed-Point Physics PBD POSITIONAL
