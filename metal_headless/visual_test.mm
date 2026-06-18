@@ -17274,6 +17274,299 @@ static int RunFpxPairsShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FL2 — Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH showcase (--fluid-neighbors) ======
+// UNLIKE FL1's --fluid-integrate (int64 fluid_integrate.comp -> CPU on Metal), the neighbor search is PURE
+// INT32 (CellOf = FloorDiv per axis + the per-axis |dx|<h NeighborAccept = integer divide + abs-compare, NO
+// int64/fxmul/sqrt, NO radial r<h cull), so the fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,
+// emit} shaders MSL-gen natively and Metal DISPATCHES THE GPU passes directly: the SAME FL1 dam-break block
+// (settled a few steps) feeds the SAME six passes -> ReadBuffer reads the cell table + neighbor list, PROVEN
+// BIT-EXACT vs the CPU fluid.h::BuildCellTable + BuildNeighborList reference (memcmp — the same proofs the
+// Vulkan --fluid-neighbors-shot runs); a single particle -> 0 neighbors; enabled=false -> cleared; two runs
+// byte-identical. The image golden is the integer per-particle neighbor-count heat viz, identical to the
+// Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/fluid_neighbors.png; two runs DIFF 0.0000. NO
+// new RHI.
+static int RunFluidNeighborsShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fluid = hf::sim::fluid;
+
+    // The FL1 dam-break block, settled to a mid-fall pile (== the Vulkan --fluid-neighbors-shot config).
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const int kSide = 10;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);   // smoothing radius h = 2.0
+
+    fluid::FluidBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(12 * (int)fluid::kOne), 0};
+    const int kParticleCount = block.W * block.H * block.D;
+    std::vector<fluid::FluidParticle> particles = fluid::InitBlock(block);
+    fluid::IntegrateFluidSteps(particles, kGravity, kDt, kGroundY, 90);
+
+    // The CPU reference grid + cell table + neighbor list (the GPU memcmp's against this).
+    const fluid::FluidGrid grid = fluid::MakeGrid(particles, kH);
+    const uint32_t kCellCount = fluid::CellCount(grid);
+    const fluid::FluidCellTable cpuTable = fluid::BuildCellTable(particles, grid);
+    const fluid::FluidNeighborList cpuList = fluid::BuildNeighborList(particles, grid, cpuTable, kH);
+    const uint32_t kTotalNeighbors = (uint32_t)cpuList.neighbors.size();
+    const uint32_t kNeighAlloc = kTotalNeighbors > 0u ? kTotalNeighbors : 1u;
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --fluid-neighbors-shot).
+    const int kPxPerUnit = 18, kMargin = 20, kWorldW = kSide, kWorldH = kSide + 12;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 FluidParticle mirror (== the Vulkan --fluid-neighbors-shot FluidParticleGpu): 11 x int32 (44).
+    struct FluidParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+    };
+    static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+    std::vector<FluidParticleGpu> particlesInit((size_t)kParticleCount);
+    for (int i = 0; i < kParticleCount; ++i) {
+        const fluid::FluidParticle& p = particles[(size_t)i];
+        particlesInit[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+            p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+    }
+    rhi::BufferDesc partDesc;
+    partDesc.size = particlesInit.size() * sizeof(FluidParticleGpu);
+    partDesc.initialData = particlesInit.data();
+    partDesc.usage = rhi::BufferUsage::Storage;
+    auto particlesBuf = device->CreateBuffer(partDesc);
+
+    struct FluidGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(FluidGridParams) == 48, "FluidGridParams std430 layout");
+    auto makeGridParams = [&](int32_t enabled) {
+        FluidGridParams p{};
+        p.grid[0] = kH; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y; p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+        p.dim[3] = kParticleCount;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellPartInit((size_t)kParticleCount, 0u);
+    std::vector<uint32_t> perPartInit((size_t)kParticleCount, 0u);
+    std::vector<uint32_t> nbrStartInit((size_t)kParticleCount + 1u, 0u);
+    std::vector<uint32_t> nbrInit((size_t)kNeighAlloc, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    auto cellCountPipe = mkPipe("fluid_cell_count.comp.gen.metal", "fluid_cell_count_main", 3, 64);
+    auto cellScanPipe  = mkPipe("fluid_cell_scan.comp.gen.metal", "fluid_cell_scan_main", 3, 1);
+    auto cellEmitPipe  = mkPipe("fluid_cell_emit.comp.gen.metal", "fluid_cell_emit_main", 5, 1);
+    auto nbrCountPipe  = mkPipe("fluid_neighbor_count.comp.gen.metal", "fluid_neighbor_count_main", 5, 64);
+    auto nbrScanPipe   = mkPipe("fluid_neighbor_scan.comp.gen.metal", "fluid_neighbor_scan_main", 3, 1);
+    auto nbrEmitPipe   = mkPipe("fluid_neighbor_emit.comp.gen.metal", "fluid_neighbor_emit_main", 6, 64);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kPartGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+
+    auto runNeighbors = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                            std::vector<uint32_t>& outCellPart, std::vector<uint32_t>& outNbrStart,
+                            std::vector<uint32_t>& outNbr, std::vector<uint32_t>& outPerPart) {
+        auto cellCountBuf = makeUintBuf(cellCountInit);
+        auto cellStartBuf = makeUintBuf(cellStartInit);
+        auto cellCursorBuf = makeUintBuf(cellCursorInit);
+        auto cellPartBuf = makeUintBuf(cellPartInit);
+        auto perPartBuf = makeUintBuf(perPartInit);
+        auto nbrStartBuf = makeUintBuf(nbrStartInit);
+        auto nbrBuf = makeUintBuf(nbrInit);
+        FluidGridParams params = makeGridParams(enabled);
+        rhi::BufferDesc pd; pd.size = sizeof(FluidGridParams); pd.initialData = &params;
+        pd.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("fluid_neighbors", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*cellCountPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellCountBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kPartGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellScanPipe.second);
+                cmd.BindStorageBuffer(*cellCountBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellEmitPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                cmd.BindStorageBuffer(*cellPartBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*nbrCountPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellPartBuf, 2);
+                cmd.BindStorageBuffer(*perPartBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kPartGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*nbrScanPipe.second);
+                cmd.BindStorageBuffer(*perPartBuf, 0);
+                cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*nbrEmitPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellPartBuf, 2);
+                cmd.BindStorageBuffer(*nbrStartBuf, 3);
+                cmd.BindStorageBuffer(*nbrBuf, 4);
+                cmd.BindStorageBuffer(*paramsBuf, 5);
+                cmd.DispatchCompute(kPartGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCellStart.assign((size_t)kCellCount + 1u, 0u);
+        device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+        outCellPart.assign((size_t)kParticleCount, 0u);
+        device->ReadBuffer(*cellPartBuf, outCellPart.data(), outCellPart.size() * sizeof(uint32_t), 0);
+        outNbrStart.assign((size_t)kParticleCount + 1u, 0u);
+        device->ReadBuffer(*nbrStartBuf, outNbrStart.data(), outNbrStart.size() * sizeof(uint32_t), 0);
+        outNbr.assign((size_t)kNeighAlloc, 0u);
+        device->ReadBuffer(*nbrBuf, outNbr.data(), outNbr.size() * sizeof(uint32_t), 0);
+        outPerPart.assign((size_t)kParticleCount, 0u);
+        device->ReadBuffer(*perPartBuf, outPerPart.data(), outPerPart.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU neighbors (enabled).
+    std::vector<uint32_t> gCellStart, gCellPart, gNbrStart, gNbr, gPerPart;
+    runNeighbors(1, gCellStart, gCellPart, gNbrStart, gNbr, gPerPart);
+
+    // PROOF (1) GPU==CPU cell table + neighbor list BIT-EXACT.
+    uint32_t maxPer = 0; for (uint32_t c : gPerPart) if (c > maxPer) maxPer = c;
+    bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+        std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                    cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+    bool cellPartOk = (gCellPart.size() == cpuTable.cellParticles.size()) &&
+        std::memcmp(gCellPart.data(), cpuTable.cellParticles.data(),
+                    cpuTable.cellParticles.size() * sizeof(uint32_t)) == 0;
+    bool nbrStartOk = (gNbrStart.size() == cpuList.neighborStart.size()) &&
+        std::memcmp(gNbrStart.data(), cpuList.neighborStart.data(),
+                    cpuList.neighborStart.size() * sizeof(uint32_t)) == 0;
+    bool nbrOk = (kTotalNeighbors == (uint32_t)cpuList.neighbors.size()) &&
+        std::memcmp(gNbr.data(), cpuList.neighbors.data(),
+                    (size_t)kTotalNeighbors * sizeof(uint32_t)) == 0;
+    if (!cellStartOk || !cellPartOk || !nbrStartOk || !nbrOk)
+        return fail("fluid-neighbors: GPU != CPU BuildCellTable/BuildNeighborList");
+    std::printf("fluid-neighbors: {particles:%d, cells:%u, neighbors:%u, maxPer:%u} GPU==CPU BIT-EXACT\n",
+                kParticleCount, kCellCount, kTotalNeighbors, maxPer);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint32_t> c2, cp2, ns2, n2, pp2;
+        runNeighbors(1, c2, cp2, ns2, n2, pp2);
+        if (c2 != gCellStart || cp2 != gCellPart || ns2 != gNbrStart || n2 != gNbr || pp2 != gPerPart)
+            return fail("fluid-neighbors: two runs differ (nondeterministic)");
+        std::printf("fluid-neighbors determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage / coherence: every emitted neighbor is within h per-axis; i != j.
+    {
+        bool coherent = true;
+        for (uint32_t i = 0; i < (uint32_t)kParticleCount && coherent; ++i)
+            for (uint32_t s = gNbrStart[i]; s < gNbrStart[i + 1u]; ++s) {
+                uint32_t j = gNbr[s];
+                if (j == i) coherent = false;
+                if (!fluid::NeighborAccept(particles[i].pos, particles[j].pos, kH)) coherent = false;
+            }
+        if (!coherent) return fail("fluid-neighbors: coverage incoherent (a neighbor outside h)");
+        std::printf("fluid-neighbors coverage: %u neighbor-pairs over %d particles (all within h)\n",
+                    kTotalNeighbors, kParticleCount);
+    }
+
+    // PROOF (4) sparse: a single particle -> 0 neighbors.
+    {
+        std::vector<fluid::FluidParticle> one(1);
+        one[0].pos = {fluid::kOne * 3, fluid::kOne * 5, 0}; one[0].invMass = fluid::kOne;
+        fluid::FluidGrid g1 = fluid::MakeGrid(one, kH);
+        fluid::FluidCellTable t1 = fluid::BuildCellTable(one, g1);
+        fluid::FluidNeighborList l1 = fluid::BuildNeighborList(one, g1, t1, kH);
+        if (!l1.neighbors.empty() || l1.neighborStart[1] != 0u)
+            return fail("fluid-neighbors: single particle produced neighbors");
+        std::printf("fluid-neighbors sparse: 0 neighbors (no-op)\n");
+    }
+
+    // PROOF (5) disabled-path no-op.
+    {
+        std::vector<uint32_t> dCs, dCp, dNs, dN, dPp;
+        runNeighbors(0, dCs, dCp, dNs, dN, dPp);
+        bool zero = true;
+        for (uint32_t v : dPp) if (v != 0u) { zero = false; break; }
+        if (zero) for (uint32_t v : dN) if (v != 0u) { zero = false; break; }
+        if (!zero) return fail("fluid-neighbors: disabled path produced neighbors");
+        std::printf("fluid-neighbors disabled: zero neighbors (no-op)\n");
+    }
+
+    // --- Golden: the integer per-particle neighbor-count HEAT side-view (IDENTICAL to the Vulkan
+    // --fluid-neighbors-shot by construction; CPU-colored from the read-back integer perParticleCount). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto heat = [](float t) -> Vec3 {
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 3.0f)));
+        float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 2.0f)));
+        float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 1.0f)));
+        return Vec3{r, g, b};
+    };
+    const float maxPerF = maxPer > 0 ? (float)maxPer : 1.0f;
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = particlesInit[(size_t)i].px >> fluid::kFrac;
+        const int wy = particlesInit[(size_t)i].py >> fluid::kFrac;
+        int cx = kMargin + wx * kPxPerUnit;
+        int cy = (int)imgH - kMargin - wy * kPxPerUnit;
+        Vec3 col = heat((float)gPerPart[(size_t)i] / maxPerF);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fluid neighbor-count heat (%u neighbors, maxPer %u)\n",
+                outPath, imgW, imgH, kTotalNeighbors, maxPer);
+    return 0;
+}
+
 // ===== Slice CL2 — Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD showcase (--cloth-edges) =====
 // UNLIKE CL1's --cloth-integrate (int64 cloth_integrate.comp -> CPU on Metal), the constraint-graph build
 // is PURE INT32 (CountOwnedEdges + the fixed emit order = index arithmetic + bounds compares, NO int64, NO
@@ -31683,6 +31976,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fluid-integrate") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fluid_integrate.png";
             try { return RunFluidIntegrateShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fluid-neighbors <out.png>: render the Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH showcase
+        // (Slice FL2). UNLIKE --fluid-integrate (int64 integrator -> CPU on Metal), the neighbor search is
+        // PURE INT32 (CellOf = FloorDiv per axis + the per-axis |dx|<h NeighborAccept, NO int64/sqrt, NO
+        // radial r<h cull), so the fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit} shaders
+        // MSL-gen natively and Metal DISPATCHES THE GPU passes: the SAME settled dam-break block feeds the
+        // SAME six passes -> ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs the CPU
+        // fluid.h::BuildCellTable + BuildNeighborList reference (memcmp — the same proofs the Vulkan
+        // --fluid-neighbors-shot runs); single particle -> 0 neighbors; enabled=false -> cleared; two runs
+        // byte-identical. The image golden is the integer per-particle neighbor-count heat viz, identical to
+        // the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/fluid_neighbors.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fluid-neighbors") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fluid_neighbors.png";
+            try { return RunFluidNeighborsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE

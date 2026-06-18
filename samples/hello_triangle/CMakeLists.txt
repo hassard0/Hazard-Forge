@@ -489,6 +489,29 @@ hf_compile_shaders(
     # construction, the cloth_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/fluid_integrate.comp.hlsl:cs"
+    # Deterministic GPU Fluid Slice 2 (Slice FL2, the 2nd slice of FLAGSHIP #9): the GRID-HASH NEIGHBOR
+    # SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FPX2 fpx_pair / CL2 cloth_edge twin).
+    # The CELL TABLE: fluid_cell_count.comp (ONE thread per particle: InterlockedAdd into its cell's counter
+    # — the cell id is CellOf = FloorDiv per axis at cell-size h, the bounded-dense-grid linearization,
+    # VERBATIM engine/sim/fluid.h), fluid_cell_scan.comp (SINGLE-THREAD [numthreads(1,1,1)] exclusive
+    # prefix-sum -> cellStart CSR + sentinel), fluid_cell_emit.comp (SINGLE-THREAD ascending-particle scatter
+    # into cellParticles — single-thread because the within-cell order must be ascending particle index,
+    # NOT GPU-scheduling order). The NEIGHBOR LIST: fluid_neighbor_count.comp (ONE thread per particle:
+    # count candidates in its 27-cell stencil passing the per-axis |dx|<h reject — NeighborAccept VERBATIM),
+    # fluid_neighbor_scan.comp (SINGLE-THREAD exclusive prefix-sum -> neighborStart), fluid_neighbor_emit.comp
+    # (ONE thread per particle emits its candidates into its DISJOINT neighbors[] slice, NO atomics — the
+    # FPX2 per-particle-disjoint pattern). ALL PURE INT32 (FloorDiv integer divide + per-axis abs-compare,
+    # NO int64/fxmul/sqrt, NO radial r<h cull — deferred to FL3's kernel=0-beyond-h), so UNLIKE
+    # fluid_integrate.comp these MSL-GENERATE NATIVELY (they ARE in the Metal hf_gen_msl list) and Metal
+    # dispatches the GPU passes. ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs the
+    # CPU fluid.h::BuildCellTable + BuildNeighborList (memcmp). NO new RHI; FL1's fluid_integrate + goldens
+    # untouched.
+    "shaders/fluid_cell_count.comp.hlsl:cs"
+    "shaders/fluid_cell_scan.comp.hlsl:cs"
+    "shaders/fluid_cell_emit.comp.hlsl:cs"
+    "shaders/fluid_neighbor_count.comp.hlsl:cs"
+    "shaders/fluid_neighbor_scan.comp.hlsl:cs"
+    "shaders/fluid_neighbor_emit.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT
     # GRAPH BUILD (the FPX2/MC3 count->scan->emit on lattice particles). cloth_edge_count.comp: ONE thread
     # per particle counts its OWNED forward edges in bounds (right/down structural, the two cell diagonals

@@ -278,6 +278,28 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 hf_gen_msl(fpx_pair_count.comp   fpx_pair_count.comp.hlsl   comp fpx_pair_count_main)
 hf_gen_msl(fpx_pair_scan.comp    fpx_pair_scan.comp.hlsl    comp fpx_pair_scan_main)
 hf_gen_msl(fpx_pair_emit.comp    fpx_pair_emit.comp.hlsl    comp fpx_pair_emit_main)
+# Deterministic GPU Fluid Slice 2 (Slice FL2, the 2nd slice of FLAGSHIP #9): the GRID-HASH NEIGHBOR SEARCH
+# (the FPX2 count->scan->emit twin, applied to fluid particles). The CELL TABLE: fluid_cell_count.comp (ONE
+# thread per particle: InterlockedAdd into its cell's counter — CellOf = FloorDiv per axis at cell-size h,
+# the bounded-dense-grid linearization, VERBATIM engine/sim/fluid.h), fluid_cell_scan.comp (SINGLE-THREAD
+# exclusive prefix-sum -> cellStart CSR), fluid_cell_emit.comp (SINGLE-THREAD ascending-particle scatter ->
+# cellParticles, single-thread because the within-cell order must be ascending particle index). The NEIGHBOR
+# LIST: fluid_neighbor_count.comp (ONE thread per particle: count 27-cell-stencil candidates passing the
+# per-axis |dx|<h reject — NeighborAccept VERBATIM), fluid_neighbor_scan.comp (SINGLE-THREAD exclusive
+# prefix-sum -> neighborStart), fluid_neighbor_emit.comp (ONE thread per particle emits its candidates into
+# its DISJOINT neighbors[] slice, NO atomics). UNLIKE FL1's int64 fluid_integrate.comp (Vulkan-only -> CPU on
+# Metal), these are PURE INT32 (FloorDiv integer divide + per-axis abs-compare, NO products/int64/fxmul/sqrt,
+# NO radial r<h cull — deferred to FL3's kernel=0-beyond-h), so glslc CAN lower them and they MSL-generate
+# NATIVELY (the default MSL gen suffices, the fpx_pair/cloth_edge lesson). The Metal --fluid-neighbors
+# showcase dispatches the GPU shaders directly (NOT a CPU fallback) -> the GPU==CPU cell-table+neighbor-list
+# proof runs on Metal too. Bit-exact GPU==CPU + cross-backend by construction. Behind --fluid-neighbors only;
+# FL1's fluid_integrate + existing goldens untouched.
+hf_gen_msl(fluid_cell_count.comp     fluid_cell_count.comp.hlsl     comp fluid_cell_count_main)
+hf_gen_msl(fluid_cell_scan.comp      fluid_cell_scan.comp.hlsl      comp fluid_cell_scan_main)
+hf_gen_msl(fluid_cell_emit.comp      fluid_cell_emit.comp.hlsl      comp fluid_cell_emit_main)
+hf_gen_msl(fluid_neighbor_count.comp fluid_neighbor_count.comp.hlsl comp fluid_neighbor_count_main)
+hf_gen_msl(fluid_neighbor_scan.comp  fluid_neighbor_scan.comp.hlsl  comp fluid_neighbor_scan_main)
+hf_gen_msl(fluid_neighbor_emit.comp  fluid_neighbor_emit.comp.hlsl  comp fluid_neighbor_emit_main)
 # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT GRAPH
 # BUILD (the FPX2 count->scan->emit on lattice particles). cloth_edge_count.comp (ONE thread per particle:
 # gEdgeCount[p]=#OWNED forward edges in bounds), cloth_edge_scan.comp (SINGLE-THREAD exclusive prefix-sum ->
