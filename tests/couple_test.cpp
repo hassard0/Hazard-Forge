@@ -861,6 +861,76 @@ int main() {
         check(diverged, "RunCoupleRollback: the mispredicted state DIFFERED from authority (a real divergence)");
     }
 
+    // ================= CP6 render helpers (CoupleToRenderInstances — the lit 3D render capstone) ============
+    // The render-only float helper: a known coupled state -> the COMBINED instance set (one LARGE sphere per
+    // FxBody via fpx::FxBodyTransform FIRST, then one SMALL sphere per fluid particle via the FL6 translate+
+    // scale), instance count B+N. CP1-CP5 stay bit-exact integer; ONLY this helper crosses to float. The
+    // render is golden-verified (not unit-tested) — here we PIN the count + the per-instance transform
+    // contracts (the FL6/GR6 twin: body via FxBodyTransform, droplets via pos/kOne + dropletRadius scale).
+    {
+        couple::CoupleWorld world;
+        // Two bodies (the barrels) at known positions, identity orient, integer radii.
+        fpx::FxBody b0 = BodyAt(3, 5, -2, 2);   // pos (3,5,-2), radius 2
+        b0.orient = fpx::FxQuat{0, 0, 0, kOne}; // identity quaternion (no rotation)
+        fpx::FxBody b1 = BodyAt(-4, 1, 6, 3);   // pos (-4,1,6), radius 3
+        b1.orient = fpx::FxQuat{0, 0, 0, kOne};
+        world.bodies = {b0, b1};
+        // Three fluid droplets at known positions.
+        world.particles = {ParticleAt(1, 2, 3), ParticleAt(-5, 0, 7), ParticleAt(8, -3, 0)};
+
+        const float kDropletRadius = 0.72f;
+        const std::vector<math::Mat4> insts = couple::CoupleToRenderInstances(world, kDropletRadius);
+
+        // Count = B + N (2 bodies + 3 particles = 5), bodies FIRST.
+        check(insts.size() == world.bodies.size() + world.particles.size() && insts.size() == 5u,
+              "CP6 CoupleToRenderInstances: count == B + N (bodies + particles), bodies first");
+
+        // The body instances (indices 0..B-1) == fpx::FxBodyTransform(body) byte-for-byte (the FPX6 bridge).
+        bool bodiesMatch = true;
+        for (size_t i = 0; i < world.bodies.size(); ++i) {
+            const math::Mat4 ref = fpx::FxBodyTransform(world.bodies[i]);
+            for (int k = 0; k < 16; ++k) if (insts[i].m[k] != ref.m[k]) bodiesMatch = false;
+        }
+        check(bodiesMatch, "CP6 CoupleToRenderInstances: each body instance == FxBodyTransform (the barrel)");
+
+        // The body translation is pos/(float)kOne (provenance — the bit-exact body pos) and scale is radius.
+        check(insts[0].m[12] == 3.0f && insts[0].m[13] == 5.0f && insts[0].m[14] == -2.0f,
+              "CP6 CoupleToRenderInstances: body 0 translate == pos/(float)kOne");
+        check(insts[0].m[0] == 2.0f && insts[0].m[5] == 2.0f && insts[0].m[10] == 2.0f,
+              "CP6 CoupleToRenderInstances: body 0 scale == body radius (2.0)");
+
+        // The droplet instances (indices B..B+N-1) == fluid::FluidToRenderInstances(particles, radius) — a
+        // small sphere at pos/(float)kOne scaled by the droplet radius (the FL6 bridge VERBATIM).
+        const std::vector<math::Mat4> dropRef =
+            fluid::FluidToRenderInstances(world.particles, kDropletRadius);
+        bool dropletsMatch = (dropRef.size() == world.particles.size());
+        for (size_t i = 0; dropletsMatch && i < world.particles.size(); ++i) {
+            const math::Mat4& m = insts[world.bodies.size() + i];
+            for (int k = 0; k < 16; ++k) if (m.m[k] != dropRef[i].m[k]) dropletsMatch = false;
+        }
+        check(dropletsMatch, "CP6 CoupleToRenderInstances: each droplet instance == FluidToRenderInstances");
+
+        // First droplet (world index 2 == body count 2): translate (1,2,3), scale dropletRadius, no rotation.
+        const math::Mat4& d0 = insts[world.bodies.size() + 0];
+        check(d0.m[12] == 1.0f && d0.m[13] == 2.0f && d0.m[14] == 3.0f,
+              "CP6 CoupleToRenderInstances: droplet 0 translate == pos/(float)kOne");
+        check(d0.m[0] == kDropletRadius && d0.m[5] == kDropletRadius && d0.m[10] == kDropletRadius,
+              "CP6 CoupleToRenderInstances: droplet 0 scale == droplet radius");
+
+        // Empty world (no bodies + no particles) -> empty instance array (the empty no-op: cleared base scene).
+        couple::CoupleWorld empty;
+        check(couple::CoupleToRenderInstances(empty, kDropletRadius).empty(),
+              "CP6 CoupleToRenderInstances: empty world -> empty (the empty no-op)");
+
+        // Bodies-only -> B instances; particles-only -> N instances (each set independently correct).
+        couple::CoupleWorld bodiesOnly;  bodiesOnly.bodies = {b0};
+        check(couple::CoupleToRenderInstances(bodiesOnly, kDropletRadius).size() == 1u,
+              "CP6 CoupleToRenderInstances: bodies-only -> B instances");
+        couple::CoupleWorld dropsOnly;   dropsOnly.particles = {ParticleAt(0, 0, 0)};
+        check(couple::CoupleToRenderInstances(dropsOnly, kDropletRadius).size() == 1u,
+              "CP6 CoupleToRenderInstances: particles-only -> N instances");
+    }
+
     if (g_fail == 0) std::printf("couple_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

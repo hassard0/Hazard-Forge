@@ -475,6 +475,7 @@ int main(int argc, char** argv) {
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* fluidLockstepShotPath = nullptr; // --fluid-lockstep-shot <out.bmp> (Slice FL5: Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #9 — PURE-CPU harness over the FL1-FL4 fluid (the FPX5/CL5 twin): a dam-break fluid block fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-fluid-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
+    const char* coupleRenderShotPath = nullptr;  // --couple-render-shot <out.bmp> (Slice CP6: Deterministic Rigid<->Fluid Coupling LIT 3D RENDER capstone, COMPLETES FLAGSHIP #11 — the CP1-CP5 coupled sim (a denser confined pool + a dynamic FxBody barrel, host-side StepCoupleSteps, the sim bit-exact) settled to the body floating at the waterline -> couple.h::CoupleToRenderInstances (one LARGE-sphere model matrix per body via fpx::FxBodyTransform + one SMALL-sphere per fluid particle via fluid::FluidToRenderInstances, render-only float) -> rendered as lit 3D INSTANCED SPHERES (the barrel among the droplets) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fluid-render-shot/--grain-render-shot/--fpx-render-shot; NO new shader/RHI). Renders only the DYNAMIC fluid + the body (static wall particles dropped — a containment detail). FLOAT visresolve bar (the FPX6/FL6/GR6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CP1-CP5 bit-exact integer coupled sim (provenance exact))
     const char* fluidRenderShotPath = nullptr;   // --fluid-render-shot <out.bmp> (Slice FL6: Deterministic GPU Fluid LIT 3D RENDER capstone, COMPLETES FLAGSHIP #9 — the FL4 dam-break sim (an 8x8x8 block poured over a static FxBody sphere, host-side StepFluid, the FL1-FL5 sim bit-exact) -> fluid.h::FluidToRenderInstances (one per-instance model matrix per particle, the ONE host float divide pos/(float)kOne + droplet-radius scale) -> rendered as lit 3D INSTANCED SPHERES (one per fluid particle) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fpx-render-shot; NO new shader/RHI). FLOAT visresolve bar (the FPX6/CL6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the FL1-FL5 bit-exact integer fluid (provenance exact))
     const char* grainRenderShotPath = nullptr;   // --grain-render-shot <out.bmp> (Slice GR6: Deterministic GPU Granular/Sand LIT 3D RENDER capstone, COMPLETES FLAGSHIP #10 — the GR4 friction sim (a staggered grain column dropped onto FLAT ground, host-side StepGrainFriction, the GR1-GR5 sim bit-exact) settled into an angle-of-repose CONE -> grain.h::GrainToRenderInstances (one per-instance model matrix per grain, the ONE host float divide pos/(float)kOne + grain-radius scale) -> rendered as lit 3D INSTANCED SPHERES (one per grain) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fluid-render-shot/--fpx-render-shot; NO new shader/RHI). FLOAT visresolve bar (the FPX6/FL6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the GR1-GR5 bit-exact integer granular sim (provenance exact))
     const char* clothRenderShotPath = nullptr;   // --cloth-render-shot <out.bmp> (Slice CL6: Deterministic GPU Cloth LIT 3D RENDER capstone, COMPLETES FLAGSHIP #8 — the CL4 draped-cloth sim (a 24x24 sheet draped over a static FxBody sphere, host-side StepClothCollide, the sim bit-exact) -> cloth.h::ClothToRenderMesh (W*H lattice -> a lit triangle mesh, the ONE host float divide pos/kOne + smooth per-vertex normals) -> rendered lit + shadowed from a fixed 3/4 camera through the EXISTING lit-mesh pipeline (lit.vert + lit.frag, scene::MeshVertexLayout, the FrameData UBO, sky + static-shadow + post — REUSED VERBATIM from --mc-render-shot; NO new shader/RHI). FLOAT visresolve bar (the MC6/FPX6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CL1-CL4 bit-exact integer cloth (provenance exact))
@@ -919,6 +920,19 @@ int main(int argc, char** argv) {
         // RHI. STANDALONE branch (the FPX3/4/5 MSVC nested-block / C1061 lesson).
         if (std::strcmp(argv[i], "--fluid-render-shot") == 0 && i + 1 < argc) {
             fluidRenderShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CP6: --couple-render-shot <out.bmp> — Deterministic Rigid<->Fluid Coupling LIT 3D RENDER (the
+        // money-shot capstone, COMPLETING FLAGSHIP #11 — the ELEVENTH flagship). Runs the bit-exact CP1-CP5
+        // coupled sim (a denser confined pool + a dynamic FxBody barrel, host-side StepCoupleSteps) to the body
+        // floating at the waterline, builds a COMBINED instance set (one LARGE sphere per body via FxBodyTransform
+        // + one SMALL sphere per fluid particle via FluidToRenderInstances — CoupleToRenderInstances, float,
+        // render-only), and renders the barrel-in-water as lit 3D instanced spheres through the EXISTING instanced
+        // lit pipeline (lit_instanced.vert + lit.frag) over the ground/sky. Renders only the DYNAMIC fluid + the
+        // body. FLOAT visresolve-bar (Metal-baked golden). NO new shader, NO new RHI. STANDALONE branch.
+        if (std::strcmp(argv[i], "--couple-render-shot") == 0 && i + 1 < argc) {
+            coupleRenderShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -24109,6 +24123,388 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fixed-point pile lit 3D render (%u bodies, %u settled)\n",
                                 fpxRenderShotPath, cw, ch2, kBodyCount, kSettled);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fpxRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Fluid Coupling LIT 3D RENDER CAPSTONE (--couple-render-shot <out.bmp>,
+        // Slice CP6, the money-shot COMPLETING FLAGSHIP #11 — the ELEVENTH flagship). Runs the bit-exact
+        // CP1-CP5 coupled sim (a denser confined pool + a dynamic FxBody barrel, host-side StepCoupleSteps —
+        // the sim stays pure integer) to the body floating at the waterline, builds a COMBINED instance set
+        // (one LARGE sphere per body via fpx::FxBodyTransform + one SMALL sphere per fluid particle via
+        // fluid::FluidToRenderInstances — couple.h::CoupleToRenderInstances, render-only float; the bit-exact
+        // sim is untouched), and renders the barrel-in-water as lit 3D INSTANCED spheres through the EXISTING
+        // instanced lit pipeline (lit_instanced.vert + lit.frag, the --fluid-render-shot / --grain-render-shot /
+        // --fpx-render-shot wiring) over the ground plane + sky + shadow. Renders only the DYNAMIC fluid + the
+        // body (static wall particles dropped — a sim containment detail, not the headline). The provenance:
+        // every instance transform derives from the bit-exact FxBody::pos/orient/radius + FluidParticle::pos.
+        // FLOAT visresolve-bar (Metal-baked golden tests/golden/metal/couple_render.png). NO new shader, NO new
+        // RHI. STANDALONE branch.
+        if (coupleRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace couple = hf::sim::couple;
+            namespace fluid  = hf::sim::fluid;
+            namespace fpx    = hf::sim::fpx;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // === The bit-exact CP1-CP5 coupled sim -> the BARREL half-submerged in a coherent water pool (the
+            // input; deterministic, shared with the Metal --couple-render by construction via the SAME couple.h
+            // scene). THE SCENE (a cleaner "barrel in water" money-shot — the FL6 dam-break recipe applied to the
+            // COUPLED sim): a WIDE, SHALLOW 12x2x12 = 288-particle pool poured around a dynamic FxBody barrel
+            // (radius 2.5, invMass=kOne/iters) sitting at the pool centre, run a FEW StepCouple steps. The PBF
+            // density solve is net-repulsive (it EXPANDS a dense block — the documented FL4/CP4 behavior; a
+            // settled confined pool blows past static walls into a thin sheet over hundreds of steps), so the
+            // COHESIVE money-shot is the EARLY drape: K=8 steps leave the fluid a tight coherent pool draping
+            // around the barrel. The pool is SHALLOW (2 layers) and the barrel (radius 2.5) sits with its TOP
+            // HEMISPHERE clearly EMERGING above the waterline (~5.6 top vs ~3.7 water surface) — a recognizable
+            // floating barrel, NOT a buried one. NO static walls (a few steps need no containment — they'd only
+            // clutter the render). The barrel reads as a LARGE sphere among the small droplets. NO RNG, fully
+            // deterministic. ===
+            const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne - 0.5);  // -9.8 host-snapped
+            const fluid::fx kDt = fluid::kOne / 60;
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+            const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);   // smoothing radius h = 2.0
+            const int kBins = fluid::kKernelBins;
+            const fluid::fx kEpsilon = fluid::kOne / 100;
+            const int kSteps = 8;     // a FEW steps -> the cohesive shallow pool draping the barrel's base
+            const int kIters = 4;     // the FL4 iteration count (the bit-exact density solve)
+
+            // The wide, shallow dam-break pool (the FL1 InitBlock recipe) poured around the barrel. NO walls.
+            couple::CoupleWorld world;
+            const int kPoolW = 12, kPoolD = 12;
+            {
+                fluid::FluidBlock block;
+                block.W = kPoolW; block.H = 2; block.D = kPoolD;   // 12x2x12 = 288 droplets (a wide shallow pool)
+                block.spacing = fluid::kOne;                       // unit spacing
+                block.origin = fluid::FxVec3{0, (fluid::fx)(1 * (int)fluid::kOne), 0};  // a low pool around the base
+                world.particles = fluid::InitBlock(block);
+                world.kernel  = fluid::BuildKernelTable(kH, fluid::kOne, kBins, kEpsilon);  // ρ0 re-snapped below
+                world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+                fpx::FxBody b;
+                // The barrel at the pool centre, half-submerged so its top hemisphere emerges above the water.
+                b.pos = fpx::FxVec3{(fpx::fx)((kPoolW / 2) * (int)fluid::kOne),
+                                    (fpx::fx)(3 * (int)fluid::kOne),
+                                    (fpx::fx)((kPoolD / 2) * (int)fluid::kOne)};
+                b.invMass = fluid::kOne / kIters;   // heavier body -> the K-fold buoyancy balances gravity
+                b.flags = fpx::kFlagDynamic;
+                b.radius = (fpx::fx)(25 * (int)(fluid::kOne / 10));   // radius 2.5 (a LARGE barrel sphere)
+                b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+                world.bodies = {b};
+            }
+            // ρ0 = the mean density of the packed initial lattice (the FL4 probe recipe); rebuild the kernel.
+            {
+                const fluid::FluidGrid pg = fluid::MakeGrid(world.particles, kH);
+                const fluid::FluidCellTable pt = fluid::BuildCellTable(world.particles, pg);
+                const fluid::FluidNeighborList pl = fluid::BuildNeighborList(world.particles, pg, pt, kH);
+                std::vector<fluid::fx> probeRho;
+                fluid::ComputeDensity(world.particles, pl, world.kernel, probeRho);
+                const fluid::fx rho0 = fluid::MeanDensity(probeRho);
+                world.kernel = fluid::BuildKernelTable(kH, rho0, kBins, kEpsilon);
+            }
+            const uint32_t kBodyCount = (uint32_t)world.bodies.size();
+
+            // Run the bit-exact CP1-CP5 coupled sim to the settled state (the integer sim output -> the render
+            // input; provenance: the transforms below derive from THIS bit-exact state).
+            couple::StepCoupleSteps(world, kDt, kIters, kSteps);
+
+            // === Build the RENDER world: only the DYNAMIC fluid + the body (drop the static wall particles —
+            // a sim containment detail, not the headline). The body comes through unchanged. ===
+            couple::CoupleWorld renderWorld;
+            renderWorld.bodies = world.bodies;
+            for (const fluid::FluidParticle& p : world.particles)
+                if (!(p.flags & fluid::kFlagStatic)) renderWorld.particles.push_back(p);
+            const uint32_t kRenderParticleCount = (uint32_t)renderWorld.particles.size();
+
+            // The combined instance set (one LARGE sphere per body via FxBodyTransform + one SMALL sphere per
+            // dynamic fluid particle via the FL6 translate+scale) — the ONLY float crossing, render-only. The
+            // droplet radius slightly overlaps the unit spacing so the droplets read as a coherent water pool.
+            const float kDropletRadius = 0.6f;
+            const std::vector<Mat4> mats = couple::CoupleToRenderInstances(renderWorld, kDropletRadius);
+            std::vector<scene::InstanceData> instances;
+            instances.reserve(mats.size());
+            for (const Mat4& m : mats) {
+                scene::InstanceData inst;
+                for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+                instances.push_back(inst);
+            }
+            const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+            // === Reuse the EXISTING instanced lit pipeline (the --fluid-render-shot / --grain-render-shot
+            // / --fpx-render-shot wiring). ===
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get();
+            instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = device->Swapchain().ColorFormat();
+            instDesc.depthTest = true;
+            instDesc.usesFrameUniforms = true;
+            instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto instShWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_instanced.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto instShVs = device->CreateShaderModule({std::span<const uint32_t>(instShWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc instShDesc;
+            instShDesc.vertex = instShVs.get();
+            instShDesc.fragment = shadowFs.get();
+            instShDesc.vertexLayout = scene::MeshVertexLayout();
+            instShDesc.instanceLayout = scene::InstanceTransformLayout();
+            instShDesc.depthTest = true;
+            instShDesc.depthOnly = true;
+            instShDesc.usesFrameUniforms = true;
+            instShDesc.pushConstantSize = 0;
+            auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get();
+            stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true;
+            stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // Instance buffer of the combined barrel + droplet transforms (kInstanceCount may be 0 -> no-op).
+            std::unique_ptr<rhi::IBuffer> instanceBuffer;
+            if (kInstanceCount > 0) {
+                rhi::BufferDesc instBufDesc;
+                instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+                instBufDesc.initialData = instances.data();
+                instBufDesc.usage = rhi::BufferUsage::Vertex;
+                instanceBuffer = device->CreateBuffer(instBufDesc);
+            }
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // Fixed 3/4 camera + directional light reading the barrel floating in the pool (deterministic). The
+            // shallow pool spans x,z in ~[-1,13] with the barrel at the centre (6, ~3, 6) emerging above the
+            // waterline; aim at the pool centre, elevated, close enough that the LARGE barrel + the small
+            // droplets both read.
+            const Vec3 eye{18.0f, 11.0f, 18.0f};
+            const Vec3 center{6.0f, 3.0f, 6.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{6.0f, 3.0f, 6.0f};
+                Vec3 lightEye = sc - lightDir * 22.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-16.0f, 16.0f, -16.0f, 16.0f, 1.0f, 52.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instShadowPipeline);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*instanceBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instPipeline);
+                        // a cool BLUE water material (the barrel + droplets share the pipeline; the body is
+                        // distinguished by being a LARGE sphere among small droplets — NO per-instance color).
+                        float material[4] = {0.20f, 0.45f, 0.85f, 0.0f};
+                        cmd.PushConstants(material, sizeof(material));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*instanceBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!device->GetCapturedPixels(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOFS ===
+            auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+                uint32_t n = 0;
+                for (size_t p = 0; p + 3 < img.size(); p += 4) {
+                    const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+                    if (b + g + r > 60) ++n;   // above the near-black sky clear
+                }
+                return n;
+            };
+            const uint32_t shaded = countShaded(px);
+
+            // (1) provenance: {bodies, particles, instances, shaded}. instances == bodies + dynamic particles.
+            std::printf("couple-render: {bodies:%u, particles:%u, instances:%u, shaded:%u} "
+                        "(fixed-point coupling -> lit 3D render)\n",
+                        kBodyCount, kRenderParticleCount, kInstanceCount, shaded);
+
+            // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+            if (!device->GetCapturedPixels(px2, cw2, ch3)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (2nd render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (px.size() != px2.size() || std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                std::fprintf(stderr, "FATAL: couple-render two renders DIFFER (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-render determinism: two renders BYTE-IDENTICAL\n");
+
+            // (3) coverage / coherence: shaded>0 and not uniform (a recognizable barrel-in-water).
+            if (shaded == 0) {
+                std::fprintf(stderr, "FATAL: couple-render coverage 0 (nothing shaded)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (shaded == (uint32_t)(px.size() / 4)) {
+                std::fprintf(stderr, "FATAL: couple-render uniform image (no coherent scene)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-render coverage: %u shaded (coherent lit barrel + fluid)\n", shaded);
+
+            // (4) empty no-op: zero bodies + zero particles -> zero instances -> the cleared base scene.
+            {
+                couple::CoupleWorld emptyWorld;
+                const std::vector<Mat4> emptyInst =
+                    couple::CoupleToRenderInstances(emptyWorld, kDropletRadius);
+                if (!emptyInst.empty()) {
+                    std::fprintf(stderr, "FATAL: couple-render empty world not empty\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("couple-render empty: base only (no-op)\n");
+
+            bool ok = WriteBMP(coupleRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — fixed-point coupling barrel-in-water lit 3D render "
+                                "(%u bodies, %u droplets)\n",
+                                coupleRenderShotPath, cw, ch2, kBodyCount, kRenderParticleCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

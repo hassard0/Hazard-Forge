@@ -698,5 +698,34 @@ inline CoupleWorld RunCoupleRollback(const CoupleWorld& init, const std::vector<
     return world;
 }
 
+// ===== Slice CP6 — LIT 3D RENDER CAPSTONE (the money-shot, COMPLETES FLAGSHIP #11; FLOAT, render-only) =====
+// The SIXTH and FINAL slice RENDERS the bit-exact coupled state as a lit 3D scene — the FxBody barrel floating
+// among the fluid droplets as lit 3D INSTANCED SPHERES. The CP1-CP5 sim above stays strict integer/bit-exact;
+// here — and ONLY here — we cross to float to build the per-instance render transforms for the rasterizer.
+// This is the documented FLOAT visresolve-bar (the FPX6/FL6/GR6 precedent): the SIM is bit-exact, the final
+// raster/shade is float (cross-vendor ~the engine baseline, NOT held to the integer zero-diff bar).
+//
+// CoupleToRenderInstances builds a COMBINED instance set DIRECTLY from the bit-exact CoupleWorld state — one
+// LARGE sphere per fpx::FxBody (the barrel, via fpx::FxBodyTransform: translate(pos/kOne) * rotate(orient) *
+// scale(radius), the FPX6 render bridge VERBATIM) followed by one SMALL sphere per fluid::FluidParticle (a
+// droplet, via fluid::FluidToRenderInstances: translate(pos/kOne) * scale(dropletRadius), the FL6 render
+// bridge VERBATIM). The bodies come FIRST so the caller can distinguish them (the body is a LARGE sphere
+// among small droplets — NO per-instance color, NO new shader). The instance count is bodies.size() +
+// particles.size(). Pure deterministic host float (no RNG, no clock). The provenance: every body transform
+// derives from FxBody::pos/orient/radius (the settled output of StepCouple) + every droplet from
+// FluidParticle::pos. Empty world (no bodies + no particles) -> empty output (the empty no-op: the cleared
+// base scene). Render-only, NO sim mutation — this is the ONLY float crossing of the whole flagship.
+inline std::vector<math::Mat4> CoupleToRenderInstances(const CoupleWorld& world, float dropletRadius) {
+    std::vector<math::Mat4> out;
+    out.reserve(world.bodies.size() + world.particles.size());
+    // The bodies FIRST (the LARGE barrel spheres, scaled by body radius via the FPX6 bridge).
+    for (const fpx::FxBody& b : world.bodies)
+        out.push_back(fpx::FxBodyTransform(b));
+    // Then the fluid droplets (the SMALL spheres, the FL6 bridge — translate(pos/kOne) * scale(dropletRadius)).
+    const std::vector<math::Mat4> droplets = fluid::FluidToRenderInstances(world.particles, dropletRadius);
+    out.insert(out.end(), droplets.begin(), droplets.end());
+    return out;
+}
+
 }  // namespace couple
 }  // namespace hf::sim
