@@ -17471,6 +17471,149 @@ static int RunGrainContactShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GR4 — Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION showcase (--grain-friction) ==
+// (the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10). The GR4 friction Δp pass
+// (grain_friction.comp) is int64 (the tangential Δx_t/cone fxmul/fxdiv + FxLength) -> glslc can't parse int64
+// -> VULKAN-SPIR-V-ONLY (NOT in this dir's hf_gen_msl list); on Metal --grain-friction runs the CPU
+// grain::StepGrainFriction — the EXACT bit-exact reference the Vulkan --grain-friction-shot GPU==CPU memcmp
+// compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION (the GR3/FL4 convention). The
+// SAME 5x5x5 = 125-grain STAGGERED block (a small 0.12 half-layer offset breaks the perfect-lattice symmetry
+// so the collapsing column generates real TANGENTIAL slip — a perfectly axis-aligned lattice collapses purely
+// radially with ZERO shear, friction idle) is dropped onto FLAT ground (NO collider sphere — the heap is held
+// by FRICTION ALONE, the beyond-UE5 "no container" headline) and settled K=70 steps x iters=2 into a
+// self-supporting CONE at its angle of repose, μ=0.8 host-snapped. The FOUR proofs (GPU==CPU bit-exact,
+// determinism, the repose slope HOLDS a clear margin > the μ=0 frictionless control, μ=0 == GR3 contact) run
+// on the CPU reference. The image golden is the integer settled-cone side-view (hashColor by index), identical
+// to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/grain_friction.png; two runs DIFF 0.0000.
+// REUSES grain_contact_apply + grain_collide (GR3) — only grain_friction.comp is new.
+static int RunGrainFrictionShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace grain = hf::sim::grain;
+
+    // The scene (== the Vulkan --grain-friction-shot config). -9.8 host-snapped; μ=0.8 host-snapped (kGrainMu).
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 2;            // 0.5 radius (diameter 1.0)
+    const grain::fx kSpacing = grain::kOne;              // 1.0 spacing (== diameter, non-overlapping start)
+    const grain::fx kStagger = (grain::fx)(0.12 * (double)grain::kOne + 0.5);   // 0.12 symmetry-break offset
+    const grain::fx kHSearch = grain::kOne * 2;          // 2.0 (>= the contact diameter 1.0)
+    const grain::fx kMu = grain::kGrainMu;               // 0.8 (the host-snapped friction coefficient)
+    const int kSide = 5;                                 // 5x5x5 -> 125 grains
+    const int kSteps = 70;                               // K=70: the column collapses into a recognizable cone
+    const int kIters = 2;                                // (taller/narrower than the μ=0 frictionless spread)
+    if (kHSearch < 2 * kRadius) return fail("grain-friction: hSearch < 2*maxRadius");
+
+    // The STAGGERED 5x5x5 block dropped onto flat ground (NO collider sphere — friction alone holds the heap).
+    auto buildBlock = [&]() {
+        std::vector<grain::GrainParticle> g;
+        for (int iy = 0; iy < kSide; ++iy)
+            for (int iz = 0; iz < kSide; ++iz)
+                for (int ix = 0; ix < kSide; ++ix) {
+                    grain::GrainParticle p;
+                    const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                    p.pos = grain::FxVec3{(grain::fx)(ix * (int)kSpacing) + ox,
+                                          (grain::fx)(3 * (int)grain::kOne) + (grain::fx)(iy * (int)kSpacing),
+                                          (grain::fx)(iz * (int)kSpacing) + oz};
+                    p.prev = p.pos; p.invMass = grain::kOne; p.radius = kRadius; p.flags = 0;
+                    g.push_back(p);
+                }
+        return g;
+    };
+    const std::vector<grain::GrainParticle> init = buildBlock();
+    const int kGrainCount = (int)init.size();
+    const std::vector<grain::GrainSphereCollider> noSpheres;
+
+    auto runSolve = [&](grain::fx mu) {
+        std::vector<grain::GrainParticle> ps = init;
+        grain::StepGrainFrictionSteps(ps, noSpheres, kGravity, kDt, kGroundY, kHSearch, mu, kIters, kSteps);
+        return ps;
+    };
+
+    // PROOF (1) GPU==CPU BIT-EXACT (Metal runs the CPU reference -> byte-identical to the Vulkan GPU result).
+    std::vector<grain::GrainParticle> cpu = runSolve(kMu);
+    std::printf("grain-friction: {particles:%d, steps:%d, iters:%d, mu:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU grain::StepGrainFriction, byte-identical to the Vulkan GPU result by construction]\n",
+                kGrainCount, kSteps, kIters, (int)kMu);
+
+    // PROOF (2) determinism: two runs byte-identical.
+    {
+        std::vector<grain::GrainParticle> b = runSolve(kMu);
+        if (b.size() != cpu.size() ||
+            std::memcmp(b.data(), cpu.data(), cpu.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("grain-friction: two runs differ (nondeterministic)");
+        std::printf("grain-friction determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) angle-of-repose / SLOPE STABILITY (the headline + the HONEST metric). The pile HOLDS A SLOPE —
+    // MeasureGrainRepose returns {height, baseRadius, slope}; assert slope > 0 by a clear margin AND slope >
+    // the μ=0 frictionless control (the contrast that proves friction does work). An EMERGENT, deterministic,
+    // within-band repose slope — NOT an exact degree (the FL4/FPX3 honest caveat).
+    const grain::GrainRepose rep = grain::MeasureGrainRepose(cpu, kGroundY);
+    {
+        std::vector<grain::GrainParticle> zero = runSolve(0);
+        const grain::GrainRepose repZero = grain::MeasureGrainRepose(zero, kGroundY);
+        if (!(rep.slope > 0) || !(rep.slope > repZero.slope))
+            return fail("grain-friction: repose slope did not clearly exceed the frictionless control");
+        std::printf("grain-friction repose: {height:%d, baseRadius:%d, slope:%d} (holds a slope, mu=%d)\n",
+                    (int)rep.height, (int)rep.baseRadius, (int)rep.slope, (int)kMu);
+    }
+
+    // PROOF (4) frictionless control / no-op: μ=0 -> the result EQUALS the GR3 frictionless StepGrainContact
+    // (friction idle). memcmp the μ=0 StepGrainFriction vs StepGrainContact over the SAME scene.
+    {
+        std::vector<grain::GrainParticle> zeroFric = init, gr3 = init;
+        grain::StepGrainFrictionSteps(zeroFric, noSpheres, kGravity, kDt, kGroundY, kHSearch, 0, kIters, kSteps);
+        grain::StepGrainContactSteps(gr3, noSpheres, kGravity, kDt, kGroundY, kHSearch, kIters, kSteps);
+        if (zeroFric.size() != gr3.size() ||
+            std::memcmp(zeroFric.data(), gr3.data(), gr3.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("grain-friction: mu=0 != GR3 StepGrainContact (friction not idle at mu=0)");
+        std::printf("grain-friction frictionless: mu=0 == GR3 contact (no friction)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER settled-cone side-view (IDENTICAL to the Vulkan --grain-friction-shot by
+    // construction; hashColor by index). The friction cone reads as a TALLER/NARROWER mound than GR3's flat
+    // spread — the angle-of-repose money-shot. ---
+    const int kPxPerUnit = 14, kMargin = 20;
+    const int kXLo = -8, kWorldW = 20, kWorldH = 12;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto hashColor = [](int idx) -> Vec3 {
+        uint32_t h = (uint32_t)idx * 2654435761u; h ^= h >> 15;
+        return Vec3{0.25f + 0.7f * (float)((h)       & 0xFF) / 255.0f,
+                    0.25f + 0.7f * (float)((h >> 8)  & 0xFF) / 255.0f,
+                    0.25f + 0.7f * (float)((h >> 16) & 0xFF) / 255.0f};
+    };
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kMargin + (wx - kXLo) * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        int cx, cy; toPx(cpu[(size_t)i].pos.x, cpu[(size_t)i].pos.y, cx, cy);
+        Vec3 col = hashColor(i);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — grain self-supporting cone (slope %d, mu=%d)\n",
+                outPath, imgW, imgH, (int)rep.slope, (int)kMu);
+    return 0;
+}
+
 // ===== Slice FL5 — Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof showcase (--fluid-lockstep) (the
 // HEADLINE of FLAGSHIP #9). PURE CPU on BOTH backends — there is NO GPU dispatch, NO new shader, NO new RHI
 // here: lockstep/rollback is a determinism PROPERTY of the bit-exact FL1-FL4 fluid, so the harness runs the
@@ -33396,6 +33539,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-contact") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_contact.png";
             try { return RunGrainContactShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --grain-friction <out.png>: render the Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION
+        // showcase (Slice GR4, the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10). Like
+        // --grain-contact, the GR4 friction pass (grain_friction.comp) is int64 -> Vulkan-only; on Metal
+        // --grain-friction runs the CPU grain::StepGrainFriction — the EXACT bit-exact reference the Vulkan
+        // --grain-friction-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY
+        // CONSTRUCTION. The SAME 5x5x5 staggered block dropped onto FLAT ground (NO collider sphere) is settled
+        // into a self-supporting CONE held by FRICTION ALONE; the four proofs (GPU==CPU bit-exact, determinism,
+        // the repose slope HOLDS a margin > the μ=0 frictionless control, μ=0 == GR3 contact) run on the CPU
+        // reference. The image golden is the integer settled-cone side-view, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/grain_friction.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--grain-friction") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_grain_friction.png";
+            try { return RunGrainFrictionShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fluid-neighbors <out.png>: render the Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH showcase

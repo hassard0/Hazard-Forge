@@ -649,5 +649,196 @@ inline GrainPenetration MeasureGrainPenetration(const std::vector<GrainParticle>
     return out;
 }
 
+// ===== Slice GR4 — the TANGENTIAL COULOMB FRICTION (the angle-of-repose; the SIGNATURE of FLAGSHIP #10) ===
+// The ONE physics the deterministic-sim trilogy (rigid->cloth->fluid) never modeled: dry tangential Coulomb
+// friction / shear. AFTER the GR3 normal (non-penetration) push, project out the inverse-mass-weighted
+// TANGENTIAL relative displacement of each overlapping pair, clamped to μ·pen (the Coulomb cone) — so a poured
+// pile HOLDS A SLOPE (a self-supporting cone at its angle of repose, with NO container), visibly ≠ GR3's
+// frictionless flat spread. The standard Unified-Particle / PBD friction, in Q16.16. Like the GR3 contact
+// solve, friction is per-grain INDEPENDENT in the JACOBI formulation (each grain accumulates its OWN
+// tangential Δp from the iteration-start positions into a SEPARATE dp[], then ALL apply) -> the GPU pass is
+// [numthreads(64,1,1)] MULTI-THREAD, NO single-thread/TDR (the FL4/GR3 win). int64 throughout ->
+// grain_friction.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --grain-friction showcase runs THIS
+// CPU StepGrainFriction (byte-identical by construction, the GR3/FL4 convention).
+//
+// THE FRICTION CONSTRAINT (the new math — standard Unified-Particle/PBD friction). For an overlapping pair
+// (i, j) with n = unit(p_i − p_j), pen = (r_i+r_j) − |p_i−p_j| > 0, compute the TANGENTIAL part of the
+// RELATIVE displacement this step (positions vs the step-start `prev`, snapshotted by IntegrateGrains):
+//   Δx_rel = (p_i − prev_i) − (p_j − prev_j)              // relative displacement this step
+//   Δx_t   = Δx_rel − (Δx_rel · n)·n                       // tangential component (subtract the normal part)
+//   t      = |Δx_t| ; fmax = fxmul(μ, pen)                 // the Coulomb cone (pen the normal-pen proxy)
+//   if t <= eps:        no friction
+//   else if t <= fmax:  corr = Δx_t                        // STATIC: cancel ALL tangential slip
+//   else:               corr = FxScale(Δx_t, fxdiv(fmax, t))   // KINETIC: clamp to the cone
+//   Δp_i += −share·corr  (share = fxdiv(w_i, w_i+w_j))     // inverse-mass-weighted, grain i's half
+// (grain j independently accumulates its symmetric half from the same pair — the Jacobi structure, no
+// double-apply.) STATIC grains (flags bit0 / invMass 0) -> Δp 0. The `Δx_rel·n` dot is formed componentwise
+// (fxmul + add — no FxDot in fpx.h). int64 throughout. The shader grain_friction.comp copies THIS VERBATIM.
+
+// kGrainFrictionEps: the slip dead-band (a few Q16.16 LSBs). Below it the tangential displacement is treated
+// as zero — fxdiv truncation noise, NOT real slip — so a settled grain accumulates no spurious friction Δp.
+inline constexpr fx kGrainFrictionEps = 16;   // ~16 Q16.16 LSBs (the kGrainCollideEps twin)
+
+// μ (the dry Coulomb friction coefficient) — a host-snapped Q16.16 constant. ~0.8 gives a recognizable
+// self-supporting cone (an emergent repose slope clearly > GR3's flat spread, within a μ-implied band). The
+// showcase uses THIS exact value so the CPU reference + the GPU + the golden share one constant.
+inline constexpr fx kGrainMu = (fx)(0.8 * (double)kOne + 0.5);   // 0.8 in Q16.16 (52429)
+
+// ----- SolveGrainFriction: the Jacobi per-grain TANGENTIAL Δp accumulate (the SolveGrainContact twin) ------
+// Given the grain array + the GR2 neighbor list + μ, compute the tangential-friction Δp_i for ALL grains into
+// a SEPARATE dp[] buffer (the Jacobi double-buffer — reads the iteration-start positions/prev, NOT the
+// in-progress dp). For each grain i (if NOT static): over its GR2 neighbours j with pen = (r_i+r_j) −
+// |p_i−p_j| > 0, compute the tangential relative displacement, clamp to fxmul(μ, pen) (static cancels all,
+// kinetic scales by fxdiv(fmax, t)), accumulate Δp_i += −share·corr (share = fxdiv(w_i, w_i+w_j)). int64
+// (FxLength/FxNormalize/fxmul/fxdiv). The shader grain_friction.comp copies THIS body VERBATIM. Deterministic
+// (the fixed GR2 neighbour order, fixed op order). dpOut is sized to the grain count (one Δp per grain).
+inline void SolveGrainFriction(const std::vector<GrainParticle>& grains, const GrainNeighborList& list, fx mu,
+                               std::vector<FxVec3>& dpOut) {
+    const uint32_t n = (uint32_t)grains.size();
+    dpOut.assign((size_t)n, FxVec3{0, 0, 0});
+    for (uint32_t i = 0; i < n; ++i) {
+        if (grains[(size_t)i].flags & kFlagStatic) continue;   // static -> Δp = 0 (the pinned case)
+        const fx wi = grains[(size_t)i].invMass;
+        FxVec3 accum{0, 0, 0};
+        const uint32_t s0 = list.neighborStart[i], s1 = list.neighborStart[i + 1u];
+        for (uint32_t s = s0; s < s1; ++s) {
+            const uint32_t j = list.neighbors[s];
+            const fx wj = grains[(size_t)j].invMass;
+            const fx wsum = wi + wj;
+            if (wsum == 0) continue;                           // both static -> no friction
+            // d = p_i − p_j ; pen = (r_i + r_j) − |d| ; only pen > 0 has a contact (the Coulomb cone needs it).
+            const FxVec3 d = FxSub(grains[(size_t)i].pos, grains[(size_t)j].pos);
+            const fx dist = FxLength(d);
+            const fx pen = (grains[(size_t)i].radius + grains[(size_t)j].radius) - dist;
+            if (pen <= 0) continue;                            // non-overlapping candidate -> no friction
+            const FxVec3 nrm = FxNormalize(d);                 // n = unit(p_i − p_j) (d==0 -> +Y fallback)
+            // Δx_rel = (p_i − prev_i) − (p_j − prev_j) — the relative displacement this step.
+            const FxVec3 dxi = FxSub(grains[(size_t)i].pos, grains[(size_t)i].prev);
+            const FxVec3 dxj = FxSub(grains[(size_t)j].pos, grains[(size_t)j].prev);
+            const FxVec3 dxRel = FxSub(dxi, dxj);
+            // Δx_t = Δx_rel − (Δx_rel · n)·n (subtract the normal component). Dot componentwise (no FxDot).
+            const fx dotN = fxmul(dxRel.x, nrm.x) + fxmul(dxRel.y, nrm.y) + fxmul(dxRel.z, nrm.z);
+            const FxVec3 dxT = FxSub(dxRel, FxScale(nrm, dotN));
+            const fx t = FxLength(dxT);
+            if (t <= kGrainFrictionEps) continue;              // no real slip (dead-band) -> no friction
+            const fx fmax = fxmul(mu, pen);                    // the Coulomb cone radius
+            FxVec3 corr;
+            if (t <= fmax) corr = dxT;                         // STATIC: cancel ALL tangential slip
+            else           corr = FxScale(dxT, fxdiv(fmax, t));// KINETIC: clamp the slip to the cone
+            const fx share = fxdiv(wi, wsum);
+            // Δp_i += −share·corr (grain i's inverse-mass-weighted half).
+            accum.x -= fxmul(share, corr.x);
+            accum.y -= fxmul(share, corr.y);
+            accum.z -= fxmul(share, corr.z);
+        }
+        dpOut[(size_t)i] = accum;
+    }
+}
+
+// ----- StepGrainFriction: one full JACOBI contact+friction step (the StepGrainContact driver + friction) ----
+// The GR3 StepGrainContact driver with a SECOND Jacobi sub-pass (friction) per iteration:
+//   (1) IntegrateGrains predict (GR1 — vel += g*dt; prev = pos; pos += vel*dt; radius-aware ground rest). The
+//       prev snapshot is the friction's step-start anchor.
+//   (2) MakeGrainGrid + BuildGrainCellTable + BuildGrainNeighborList from the PREDICTED positions (GR2; built
+//       ONCE per step — fixed across the `iters` iterations).
+//   (3) `iters` JACOBI iterations, EACH: SolveGrainContact->apply (the GR3 NORMAL push, UNCHANGED) THEN
+//       SolveGrainFriction->apply (the new TANGENTIAL friction, reading the POST-normal positions). TWO Jacobi
+//       sub-passes per iteration, each per-grain independent (reads sub-pass-start state) -> bit-exact +
+//       multi-thread, NO TDR.
+//   (4) derive velocity from the NET position change: vel = (pos − prev) / dt.
+//   (5) CollideGrainPlane + CollideGrainSpheres (project out of the ground + the static spheres). Returns the
+//       collider contact count. μ=0 -> SolveGrainFriction is a pure no-op -> byte-identical to StepGrainContact
+//       (the frictionless control). Pure integer, fixed op order -> two-run bit-identical AND bit-exact
+//       GPU==CPU. `hSearch` is the GR2 search radius (caller asserts >= the max contact diameter).
+inline int StepGrainFriction(std::vector<GrainParticle>& grains,
+                             const std::vector<GrainSphereCollider>& spheres, const FxVec3& gravity, fx dt,
+                             fx groundY, fx hSearch, fx mu, int iters) {
+    const size_t n = grains.size();
+    // (1) predict (GR1). prev = pos snapshotted INSIDE IntegrateGrains (the friction's step-start anchor).
+    IntegrateGrains(grains, gravity, dt, groundY);
+    // (2) neighbour list from the predicted positions (GR2; built once for this step).
+    const GrainGrid grid = MakeGrainGrid(grains, hSearch);
+    const GrainCellTable table = BuildGrainCellTable(grains, grid);
+    const GrainNeighborList list = BuildGrainNeighborList(grains, grid, table, hSearch);
+    // (3) `iters` JACOBI iterations: SolveGrainContact->apply (normal) THEN SolveGrainFriction->apply (tangent).
+    std::vector<FxVec3> dp;
+    for (int it = 0; it < iters; ++it) {
+        // (3a) the GR3 NORMAL push (UNCHANGED).
+        SolveGrainContact(grains, list, dp);
+        for (size_t i = 0; i < n; ++i) {
+            if (grains[i].flags & kFlagStatic) continue;
+            grains[i].pos = FxAdd(grains[i].pos, dp[i]);
+        }
+        // (3b) the GR4 TANGENTIAL friction (reads the POST-normal positions).
+        SolveGrainFriction(grains, list, mu, dp);
+        for (size_t i = 0; i < n; ++i) {
+            if (grains[i].flags & kFlagStatic) continue;
+            grains[i].pos = FxAdd(grains[i].pos, dp[i]);
+        }
+    }
+    // (4) derive velocity from the net position change: vel = (pos − prev) / dt.
+    if (dt != 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (grains[i].flags & kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(grains[i].pos, grains[i].prev);
+            grains[i].vel = FxVec3{fxdiv(dpos.x, dt), fxdiv(dpos.y, dt), fxdiv(dpos.z, dt)};
+        }
+    }
+    // (5) collision: clamp to the ground plane THEN project out of every static sphere (deterministic).
+    CollideGrainPlane(grains, groundY);
+    return CollideGrainSpheres(grains, spheres);
+}
+
+// ----- StepGrainFrictionSteps: run K full JACOBI contact+friction steps (the showcase / GPU K-step driver) --
+// K successive StepGrainFriction steps. The GPU runs THIS exact K-step loop as a HOST-driven sequence of
+// MULTI-THREAD dispatches (predict -> neighbours[GPU passes] -> {normal dp -> apply -> friction dp -> apply}
+// ×iters -> velocity -> collide per step, a ComputeToComputeBarrier between sub-passes). Returns the final
+// step's contact count.
+inline int StepGrainFrictionSteps(std::vector<GrainParticle>& grains,
+                                  const std::vector<GrainSphereCollider>& spheres, const FxVec3& gravity,
+                                  fx dt, fx groundY, fx hSearch, fx mu, int iters, int steps) {
+    int contacts = 0;
+    for (int s = 0; s < steps; ++s)
+        contacts = StepGrainFriction(grains, spheres, gravity, dt, groundY, hSearch, mu, iters);
+    return contacts;
+}
+
+// ----- MeasureGrainRepose: the deterministic angle-of-repose SLOPE metric (the HONEST headline metric) ------
+// A self-supporting heap's slope = height / baseRadius (a deterministic Q16.16 ratio). Over the settled grain
+// pool: height = (max pos.y) − groundY; baseRadius = the max horizontal distance from the pile's CENTROID
+// AXIS (the mean x,z of the grains) over all grains, in the x-z plane — the half-width of the footprint.
+// slope = fxdiv(height, baseRadius) (baseRadius 0 -> slope 0, the degenerate single-column case). Pure
+// integer (the centroid is an int64-accumulated mean; the horizontal distance is FxLength of the x-z offset);
+// DETERMINISTIC + bit-exact CPU<->GPU. The HONEST framing (the FL4/FPX3 caveat): the repose angle is EMERGENT
+// + iterative — this asserts slope > 0 by a clear margin (a real heap, NOT GR3's ~flat spread), deterministic
+// + two-run byte-identical, within a μ-implied BAND, NOT an exact degree.
+struct GrainRepose { fx height = 0; fx baseRadius = 0; fx slope = 0; };
+inline GrainRepose MeasureGrainRepose(const std::vector<GrainParticle>& grains, fx groundY) {
+    GrainRepose out;
+    const size_t n = grains.size();
+    if (n == 0) return out;
+    // Centroid axis: the mean (x, z) of the grains (int64 accumulate -> /n, the deterministic centroid).
+    int64_t sx = 0, sz = 0;
+    fx maxY = grains[0].pos.y;
+    for (size_t i = 0; i < n; ++i) {
+        sx += (int64_t)grains[i].pos.x;
+        sz += (int64_t)grains[i].pos.z;
+        if (grains[i].pos.y > maxY) maxY = grains[i].pos.y;
+    }
+    const fx cx = (fx)(sx / (int64_t)n);
+    const fx cz = (fx)(sz / (int64_t)n);
+    // height = (max pos.y) − groundY ; baseRadius = max horizontal distance from the centroid axis (x-z).
+    out.height = maxY - groundY;
+    fx maxR = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const FxVec3 horiz{grains[i].pos.x - cx, 0, grains[i].pos.z - cz};
+        const fx r = FxLength(horiz);
+        if (r > maxR) maxR = r;
+    }
+    out.baseRadius = maxR;
+    out.slope = (maxR != 0) ? fxdiv(out.height, out.baseRadius) : 0;
+    return out;
+}
+
 }  // namespace grain
 }  // namespace hf::sim

@@ -654,6 +654,205 @@ int main() {
               "GR3 no-op: a lone grain free-falls + rests at groundY + radius (contact solve idle)");
     }
 
+    // ============================ Slice GR4 — TANGENTIAL COULOMB FRICTION ============================
+
+    // ----- SolveGrainFriction: a hand-laid overlapping pair with a known tangential slip ------------------
+    {
+        // Two equal-mass grains, radius 0.5 each (diameter 1.0), centres 0.6 apart on x -> overlap pen = 0.4.
+        // The contact normal n = unit(p_i − p_j) is along ±x. Give grain 0 a PURELY TANGENTIAL (z) slip this
+        // step: prev0 = pos0 − (0,0,sz), prev1 = pos1 (so Δx_rel = (0,0,sz), entirely tangential to the x-normal).
+        const fx r = kOne / 2;                 // 0.5 radius
+        const fx hSearch = kOne + kOne / 2;    // 1.5 >= contact diameter 1.0
+        const fx mu = kOne;                    // μ = 1.0 (fmax = pen = 0.4)
+        const fx pen = kOne - (kOne * 6 / 10); // 26215 (0.4 in Q16.16, the exact integer penetration)
+
+        // Case A: SMALL slip (< fmax = μ·pen) -> STATIC: corr == Δx_t cancels the WHOLE slip. share = 0.5.
+        {
+            const fx slip = kOne / 10;         // 0.1 on z (< fmax 0.4)
+            std::vector<grain::GrainParticle> pair(2);
+            pair[0].pos = {0, 0, 0};               pair[0].invMass = kOne; pair[0].radius = r;
+            pair[0].prev = {0, 0, -slip};          // Δx0 = (0,0,+slip)
+            pair[1].pos = {kOne * 6 / 10, 0, 0};   pair[1].invMass = kOne; pair[1].radius = r;
+            pair[1].prev = pair[1].pos;            // Δx1 = 0  -> Δx_rel = (0,0,slip), tangential
+            grain::GrainGrid g = grain::MakeGrainGrid(pair, hSearch);
+            grain::GrainCellTable t = grain::BuildGrainCellTable(pair, g);
+            grain::GrainNeighborList nl = grain::BuildGrainNeighborList(pair, g, t, hSearch);
+            std::vector<grain::FxVec3> dp;
+            grain::SolveGrainFriction(pair, nl, mu, dp);
+            // grain 0: Δp = −share·corr = −0.5·(0,0,slip). share = fxdiv(kOne,2kOne) = 0.5; corr.z = +slip.
+            const fx half = grain::fxdiv(kOne, kOne + kOne);   // 0.5 in Q16.16
+            check(dp[0].x == 0 && dp[0].y == 0 && dp[0].z == -grain::fxmul(half, slip),
+                  "GR4 SolveGrainFriction: small slip (<μ·pen) -> STATIC, Δp cancels half the slip (−z)");
+            // grain 1: its Δx_rel = (p1−prev1) − (p0−prev0) = (0,0,−slip); share 0.5 -> Δp = −0.5·(0,0,−slip).
+            // (The >> floor-truncation makes the two halves off-by-one-LSB asymmetric, the documented fxmul bit.)
+            check(dp[1].x == 0 && dp[1].y == 0 && dp[1].z == -grain::fxmul(half, -slip),
+                  "GR4 SolveGrainFriction: symmetric half on grain 1 (+z, the fxmul-floor LSB)");
+        }
+
+        // Case B: LARGE slip (> fmax = μ·pen) -> KINETIC: corr = Δx_t · (fmax/t), clamped to the cone.
+        {
+            const fx slip = kOne;              // 1.0 on z (>> fmax 0.4)
+            std::vector<grain::GrainParticle> pair(2);
+            pair[0].pos = {0, 0, 0};               pair[0].invMass = kOne; pair[0].radius = r;
+            pair[0].prev = {0, 0, -slip};
+            pair[1].pos = {kOne * 6 / 10, 0, 0};   pair[1].invMass = kOne; pair[1].radius = r;
+            pair[1].prev = pair[1].pos;
+            grain::GrainGrid g = grain::MakeGrainGrid(pair, hSearch);
+            grain::GrainCellTable t = grain::BuildGrainCellTable(pair, g);
+            grain::GrainNeighborList nl = grain::BuildGrainNeighborList(pair, g, t, hSearch);
+            std::vector<grain::FxVec3> dp;
+            grain::SolveGrainFriction(pair, nl, mu, dp);
+            // t = slip = 1.0; corr = (0,0,slip)·(fmax/t) = (0,0, fxdiv(pen,slip)) = (0,0,pen). Δp = −0.5·pen.
+            const fx corrZ = grain::fxdiv(grain::fxmul(mu, pen), slip);   // == fmax/t == pen (μ=1)
+            const fx expectZ = -grain::fxmul(grain::fxdiv(kOne, kOne + kOne), corrZ);   // −share·corr
+            check(dp[0].z == expectZ && dp[0].x == 0 && dp[0].y == 0,
+                  "GR4 SolveGrainFriction: large slip (>μ·pen) -> KINETIC, Δp clamped to the cone");
+            check(corrZ < slip, "GR4 SolveGrainFriction: kinetic corr is clamped below the raw slip (cone)");
+        }
+
+        // Case C: μ = 0 -> fmax = 0 -> t > fmax always (kinetic with a zero cone) -> Δp 0 (friction idle).
+        {
+            const fx slip = kOne / 10;
+            std::vector<grain::GrainParticle> pair(2);
+            pair[0].pos = {0, 0, 0};               pair[0].invMass = kOne; pair[0].radius = r;
+            pair[0].prev = {0, 0, -slip};
+            pair[1].pos = {kOne * 6 / 10, 0, 0};   pair[1].invMass = kOne; pair[1].radius = r;
+            pair[1].prev = pair[1].pos;
+            grain::GrainGrid g = grain::MakeGrainGrid(pair, hSearch);
+            grain::GrainCellTable t = grain::BuildGrainCellTable(pair, g);
+            grain::GrainNeighborList nl = grain::BuildGrainNeighborList(pair, g, t, hSearch);
+            std::vector<grain::FxVec3> dp;
+            grain::SolveGrainFriction(pair, nl, 0, dp);
+            check(dp[0].x == 0 && dp[0].y == 0 && dp[0].z == 0 &&
+                  dp[1].x == 0 && dp[1].y == 0 && dp[1].z == 0,
+                  "GR4 SolveGrainFriction: μ=0 -> Δp 0 (friction idle, the frictionless control)");
+        }
+
+        // Case D: a STATIC + DYNAMIC pair -> only the dynamic moves; static partner Δp 0, share = w_d/(w_d+0) = 1.
+        {
+            const fx slip = kOne / 10;
+            std::vector<grain::GrainParticle> sd(2);
+            sd[0].pos = {0, 0, 0};                 sd[0].invMass = 0;     sd[0].radius = r;   // STATIC
+            sd[0].flags = grain::kFlagStatic;      sd[0].prev = {0, 0, -slip};
+            sd[1].pos = {kOne * 6 / 10, 0, 0};     sd[1].invMass = kOne;  sd[1].radius = r;   // DYNAMIC
+            sd[1].prev = sd[1].pos;
+            grain::GrainGrid g = grain::MakeGrainGrid(sd, hSearch);
+            grain::GrainCellTable t = grain::BuildGrainCellTable(sd, g);
+            grain::GrainNeighborList nl = grain::BuildGrainNeighborList(sd, g, t, hSearch);
+            std::vector<grain::FxVec3> dp;
+            grain::SolveGrainFriction(sd, nl, mu, dp);
+            check(dp[0].x == 0 && dp[0].y == 0 && dp[0].z == 0,
+                  "GR4 SolveGrainFriction: static grain Δp == 0 (pinned)");
+            // dynamic: Δx_rel = (p1−prev1) − (p0−prev0) = (0,0,0) − (0,0,slip) = (0,0,−slip); small (<fmax) ->
+            // STATIC; share = 1; Δp = −1·(0,0,−slip) = (0,0,+slip).
+            check(dp[1].z == slip && dp[1].x == 0 && dp[1].y == 0,
+                  "GR4 SolveGrainFriction: static+dynamic -> dynamic takes the FULL correction (share 1)");
+        }
+    }
+
+    // ----- StepGrainFriction: a sloped cluster HOLDS with slope > the μ=0 control, deterministic, Jacobi ----
+    {
+        const grain::FxVec3 grav{0, FromInt(-10), 0};
+        const fx dt = kOne / 60;
+        const fx groundY = 0;
+        const fx r = kOne / 2;                 // 0.5 radius (diameter 1.0)
+        const fx hSearch = FromInt(2);         // 2.0 >= diameter 1.0
+        const int iters = 2, steps = 70;       // == the --grain-friction showcase config
+        const fx mu = grain::kGrainMu;         // ~0.8
+        const std::vector<grain::GrainSphereCollider> noSpheres;
+
+        // A 5x5x5 STAGGERED block dropped onto FLAT ground (NO collider sphere). The half-offset on the odd
+        // y-layers breaks the perfect-lattice symmetry so the collapsing column generates real TANGENTIAL slip
+        // (a perfectly axis-aligned lattice collapses purely radially -> zero shear -> friction idle). spacing
+        // 1.0 (== the contact diameter, non-overlapping start) + a small 0.12 stagger -> a clean shear source.
+        // This is the EXACT --grain-friction showcase scene (the host-snapped angle-of-repose cone config).
+        const fx sp = kOne;                    // 1.0 spacing (== diameter)
+        const fx off = (fx)(0.12 * (double)kOne + 0.5);   // 0.12 stagger offset on odd y-layers
+        std::vector<grain::GrainParticle> init;
+        for (int iy = 0; iy < 5; ++iy)
+            for (int iz = 0; iz < 5; ++iz)
+                for (int ix = 0; ix < 5; ++ix) {
+                    grain::GrainParticle p;
+                    const fx ox = (iy & 1) ? off : 0, oz = (iy & 1) ? off : 0;
+                    p.pos = grain::FxVec3{(fx)(ix * (int)sp) + ox, FromInt(3) + (fx)(iy * (int)sp),
+                                          (fx)(iz * (int)sp) + oz};
+                    p.prev = p.pos; p.invMass = kOne; p.radius = r; p.flags = 0;
+                    init.push_back(p);
+                }
+
+        // WITH friction: the pile holds a slope.
+        std::vector<grain::GrainParticle> withMu = init;
+        grain::StepGrainFrictionSteps(withMu, noSpheres, grav, dt, groundY, hSearch, mu, iters, steps);
+        const grain::GrainRepose repWith = grain::MeasureGrainRepose(withMu, groundY);
+
+        // μ=0 control: frictionless -> equals the GR3 StepGrainContact (the pile spreads flatter).
+        std::vector<grain::GrainParticle> zeroMu = init;
+        grain::StepGrainFrictionSteps(zeroMu, noSpheres, grav, dt, groundY, hSearch, 0, iters, steps);
+        const grain::GrainRepose repZero = grain::MeasureGrainRepose(zeroMu, groundY);
+
+        // μ=0 StepGrainFriction MUST equal the GR3 StepGrainContact byte-for-byte (the frictionless control).
+        std::vector<grain::GrainParticle> gr3 = init;
+        grain::StepGrainContactSteps(gr3, noSpheres, grav, dt, groundY, hSearch, iters, steps);
+        check(zeroMu.size() == gr3.size() &&
+              std::memcmp(zeroMu.data(), gr3.data(), gr3.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR4 StepGrainFriction: μ=0 == GR3 StepGrainContact byte-for-byte (the frictionless control)");
+
+        check(repWith.slope > 0, "GR4 StepGrainFriction: the friction pile holds a slope (slope > 0)");
+        check(repWith.slope > repZero.slope,
+              "GR4 StepGrainFriction: friction slope > the μ=0 control slope (friction holds the heap)");
+
+        // Determinism: two full runs byte-identical.
+        std::vector<grain::GrainParticle> b = init;
+        grain::StepGrainFrictionSteps(b, noSpheres, grav, dt, groundY, hSearch, mu, iters, steps);
+        check(withMu.size() == b.size() &&
+              std::memcmp(withMu.data(), b.data(), withMu.size() * sizeof(grain::GrainParticle)) == 0,
+              "GR4 StepGrainFriction: two runs byte-identical (deterministic)");
+
+        // Jacobi order-independence: SolveGrainFriction reads iteration-start positions into a SEPARATE dp[],
+        // so the per-grain accumulate is order-free (recompute yields identical dp).
+        {
+            grain::GrainGrid g = grain::MakeGrainGrid(withMu, hSearch);
+            grain::GrainCellTable t = grain::BuildGrainCellTable(withMu, g);
+            grain::GrainNeighborList nl = grain::BuildGrainNeighborList(withMu, g, t, hSearch);
+            std::vector<grain::FxVec3> dp1, dp2;
+            grain::SolveGrainFriction(withMu, nl, mu, dp1);
+            grain::SolveGrainFriction(withMu, nl, mu, dp2);
+            bool same = dp1.size() == dp2.size();
+            for (size_t i = 0; i < dp1.size() && same; ++i)
+                if (std::memcmp(&dp1[i], &dp2[i], sizeof(grain::FxVec3)) != 0) same = false;
+            check(same, "GR4 SolveGrainFriction: Jacobi dp accumulate is order-free (recompute identical)");
+        }
+    }
+
+    // ----- MeasureGrainRepose: a known cone -> the expected height/baseRadius/slope -----------------------
+    {
+        // A simple cone: an apex grain at (0, 4, 0) + a ring of base grains at radius 2 on the ground (y=0).
+        // centroid (x,z) ≈ origin (the ring is symmetric + the apex at origin) -> height 4, baseRadius 2,
+        // slope = 4/2 = 2.0.
+        const fx groundY = 0;
+        std::vector<grain::GrainParticle> cone;
+        grain::GrainParticle apex; apex.pos = {0, FromInt(4), 0}; apex.invMass = kOne; apex.radius = kOne / 2;
+        cone.push_back(apex);
+        // 4 base grains at (+2,0,0),(−2,0,0),(0,0,+2),(0,0,−2): symmetric -> centroid at origin.
+        const int bx[4] = {2, -2, 0, 0};
+        const int bz[4] = {0, 0, 2, -2};
+        for (int k = 0; k < 4; ++k) {
+            grain::GrainParticle b; b.pos = {FromInt(bx[k]), 0, FromInt(bz[k])};
+            b.invMass = kOne; b.radius = kOne / 2;
+            cone.push_back(b);
+        }
+        const grain::GrainRepose rep = grain::MeasureGrainRepose(cone, groundY);
+        check(rep.height == FromInt(4), "GR4 MeasureGrainRepose: height == max pos.y − groundY == 4.0");
+        check(rep.baseRadius == FromInt(2), "GR4 MeasureGrainRepose: baseRadius == max horizontal dist == 2.0");
+        check(rep.slope == FromInt(2), "GR4 MeasureGrainRepose: slope == height/baseRadius == 2.0");
+        // A single-column degenerate (all grains stacked on the axis) -> baseRadius 0 -> slope 0.
+        std::vector<grain::GrainParticle> column(3);
+        for (int k = 0; k < 3; ++k) { column[k].pos = {0, FromInt(k), 0}; column[k].invMass = kOne; }
+        const grain::GrainRepose deg = grain::MeasureGrainRepose(column, groundY);
+        check(deg.baseRadius == 0 && deg.slope == 0,
+              "GR4 MeasureGrainRepose: single-column -> baseRadius 0, slope 0 (degenerate)");
+    }
+
     if (g_fail == 0) std::printf("grain_test: ALL PASS\n");
     else std::printf("grain_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

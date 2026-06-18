@@ -458,6 +458,7 @@ int main(int argc, char** argv) {
     const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
+    const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
     const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
     const char* fluidSolveShotPath = nullptr; // --fluid-solve-shot <out.bmp> (Slice FL4, the incompressibility solver of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY-CONSTRAINT SOLVE — a dam-break block (FL1) poured over the ground (+ a static FxBody sphere) is settled into an INCOMPRESSIBLE POOL by StepFluid K steps x iters JACOBI density iterations (predict -> neighbours -> {ComputeDensity -> ComputeLambda -> SolveDensityConstraint(Δp into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollidePlane+CollideSpheres). The K-step loop is HOST-driven over MULTI-THREAD per-particle passes (fluid_density/fluid_lambda reused per iteration + fluid_dp + fluid_apply + fluid_collide, ONE thread per particle, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepFluid. GPU==CPU particle array bit-exact vs fluid.h::StepFluid, a deterministic incompressibility residual (summed |ρ_i−ρ0|) small + below the unsolved free-fall, integer side-view of the settled pool. NO lockstep (FL5), NO float render (FL6))
@@ -665,6 +666,20 @@ int main(int argc, char** argv) {
         // --grain-contact runs the CPU StepGrainContact. NO new RHI. STANDALONE branch (C1061 avoidance).
         if (std::strcmp(argv[i], "--grain-contact-shot") == 0 && i + 1 < argc) {
             grainContactShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GR4: --grain-friction-shot <out.bmp> — the Deterministic GPU Granular/Sand TANGENTIAL COULOMB
+        // FRICTION (the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10). A staggered grain block
+        // dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a
+        // self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH with a NORMAL
+        // sub-pass (GR3 grain_contact_dp -> apply) THEN a TANGENTIAL friction sub-pass (grain_friction -> apply),
+        // -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU
+        // grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). int64 -> Vulkan-only; Metal
+        // --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO
+        // new RHI. STANDALONE branch (C1061 avoidance).
+        if (std::strcmp(argv[i], "--grain-friction-shot") == 0 && i + 1 < argc) {
+            grainFrictionShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16180,6 +16195,388 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — grain settled loose pile (%d grain px, penAfter %lld)\n",
                                 grainContactShotPath, imgW, imgH, grainPx, (long long)penAfter.summed);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainContactShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION (--grain-friction-shot <out.bmp>,
+        // Slice GR4, the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10). A 5x5x5 STAGGERED
+        // grain block dropped onto FLAT ground (NO collider sphere — friction ALONE holds the heap) is settled
+        // into a self-supporting CONE by StepGrainFriction K steps x iters JACOBI iterations. Each iteration is
+        // TWO Jacobi sub-passes: the GR3 NORMAL push (grain_contact_dp -> grain_contact_apply) THEN the GR4
+        // TANGENTIAL friction (grain_friction -> grain_contact_apply, reading the post-normal positions). The
+        // K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_integrate predict -> [host:
+        // rebuild the GR2 neighbour list] -> {grain_contact_dp -> apply -> grain_friction -> apply}×iters ->
+        // grain_collide, a ComputeToComputeBarrier between sub-passes). ReadBuffer reads gGrains; the CPU
+        // grain.h::StepGrainFrictionSteps over the SAME scene must match BIT-EXACT (memcmp, NO tol). int64 ->
+        // grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES
+        // grain_contact_apply + grain_collide (GR3) verbatim. NO new RHI. One BMP -> exit. (STANDALONE branch.)
+        if (grainFrictionShotPath) {
+            using math::Vec3;
+            namespace grain = hf::sim::grain;
+
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 2;          // 0.5 radius (diameter 1.0)
+            const grain::fx kSpacing = grain::kOne;            // 1.0 spacing (== diameter, non-overlapping)
+            const grain::fx kStagger = (grain::fx)(0.12 * (double)grain::kOne + 0.5);  // 0.12 symmetry-break
+            const grain::fx kHSearch = grain::kOne * 2;        // 2.0 (>= the contact diameter 1.0)
+            const grain::fx kMu = grain::kGrainMu;             // 0.8 (the host-snapped friction coefficient)
+            const int kSide = 5;                               // 5x5x5 -> 125 grains
+            const int kSteps = 70;   // K=70: the staggered column collapses into a recognizable self-supporting
+            const int kIters = 2;    // CONE (taller/narrower than the μ=0 frictionless flat spread — the GR3/GR4
+                                     // contrast; the angle of repose is EMERGENT + deterministic, NOT exact deg).
+            if (kHSearch < 2 * kRadius) {
+                std::fprintf(stderr, "FATAL: grain-friction hSearch (%d) < 2*maxRadius (%d)\n",
+                             kHSearch, 2 * kRadius);
+                device->WaitIdle(); return 1;
+            }
+
+            // The STAGGERED 5x5x5 block (a small 0.12 half-layer offset on the odd y-layers breaks the perfect-
+            // lattice symmetry so the collapsing column generates real TANGENTIAL slip — a perfectly axis-aligned
+            // lattice collapses purely radially with ZERO shear -> friction idle). NO collider sphere.
+            std::vector<grain::GrainParticle> init;
+            for (int iy = 0; iy < kSide; ++iy)
+                for (int iz = 0; iz < kSide; ++iz)
+                    for (int ix = 0; ix < kSide; ++ix) {
+                        grain::GrainParticle p;
+                        const grain::fx ox = (iy & 1) ? kStagger : 0, oz = (iy & 1) ? kStagger : 0;
+                        p.pos = grain::FxVec3{(grain::fx)(ix * (int)kSpacing) + ox,
+                                              (grain::fx)(3 * (int)grain::kOne) + (grain::fx)(iy * (int)kSpacing),
+                                              (grain::fx)(iz * (int)kSpacing) + oz};
+                        p.prev = p.pos; p.invMass = grain::kOne; p.radius = kRadius; p.flags = 0;
+                        init.push_back(p);
+                    }
+            const int kGrainCount = (int)init.size();
+            const std::vector<grain::GrainSphereCollider> noSpheres;
+            const int kSphereCount = 0;
+
+            // === CPU reference: StepGrainFrictionSteps K steps over the SAME scene (the GPU memcmp's this). ===
+            std::vector<grain::GrainParticle> cpu = init;
+            grain::StepGrainFrictionSteps(cpu, noSpheres, kGravity, kDt, kGroundY, kHSearch, kMu, kIters, kSteps);
+            const grain::GrainRepose rep = grain::MeasureGrainRepose(cpu, kGroundY);
+
+            // std430 mirrors (match the shaders).
+            struct GrainParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+            };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            static_assert(sizeof(grain::GrainParticle) == 48, "GrainParticle std430 layout");
+            struct FxVec3Gpu { int32_t x, y, z; };
+            static_assert(sizeof(FxVec3Gpu) == 12, "FxVec3Gpu std430 layout");
+            struct SphereGpu { int32_t cx, cy, cz, radius; };
+            static_assert(sizeof(SphereGpu) == 16, "SphereGpu std430 layout");
+            struct GrainParams       { int32_t grav[4]; int32_t cfg[4]; };         // grain_integrate
+            struct GrainGridParams   { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };  // GR2 passes
+            struct GrainContactParams{ int32_t cfg[4]; };                          // grain_contact_dp/apply
+            struct GrainFrictionParams{ int32_t cfg[4]; };                         // grain_friction (mu in cfg.z)
+            struct GrainSolveParams  { int32_t cfg0[4]; int32_t cfg1[4]; };        // grain_collide
+            static_assert(sizeof(GrainParams) == 32 && sizeof(GrainGridParams) == 48 &&
+                          sizeof(GrainContactParams) == 16 && sizeof(GrainFrictionParams) == 16 &&
+                          sizeof(GrainSolveParams) == 32, "GR4 params");
+
+            auto pack = [&](const std::vector<grain::GrainParticle>& ps) {
+                std::vector<GrainParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const grain::GrainParticle& p = ps[i];
+                    out[i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+                }
+                return out;
+            };
+            auto makeBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // A 1-entry placeholder sphere buffer (kSphereCount==0; grain_collide loops 0 spheres).
+            std::vector<SphereGpu> sphGpu(1, SphereGpu{0,0,0,0});
+            auto sphereBuf = makeBuf(sphGpu.data(), sphGpu.size() * sizeof(SphereGpu));
+
+            // Pipelines (GR1 integrate + the SIX GR2 passes + GR3 dp/apply/collide + the GR4 friction pass).
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                auto pipe = device->CreateComputePipeline(d);
+                return std::make_pair(std::move(cs), std::move(pipe));
+            };
+            auto integratePipe = mkPipe("grain_integrate.comp.hlsl.spv", 2, 64);
+            auto cellCountPipe  = mkPipe("grain_cell_count.comp.hlsl.spv", 3, 64);
+            auto cellScanPipe   = mkPipe("grain_cell_scan.comp.hlsl.spv", 3, 1);
+            auto cellEmitPipe   = mkPipe("grain_cell_emit.comp.hlsl.spv", 5, 1);
+            auto nbrCountPipe   = mkPipe("grain_neighbor_count.comp.hlsl.spv", 5, 64);
+            auto nbrScanPipe    = mkPipe("grain_neighbor_scan.comp.hlsl.spv", 3, 1);
+            auto nbrEmitPipe    = mkPipe("grain_neighbor_emit.comp.hlsl.spv", 6, 64);
+            auto dpPipe         = mkPipe("grain_contact_dp.comp.hlsl.spv", 5, 64);
+            auto applyPipe      = mkPipe("grain_contact_apply.comp.hlsl.spv", 3, 64);   // REUSED from GR3
+            auto frictionPipe   = mkPipe("grain_friction.comp.hlsl.spv", 5, 64);        // the ONE new GR4 pass
+            auto collidePipe    = mkPipe("grain_collide.comp.hlsl.spv", 3, 64);         // REUSED from GR3
+
+            const uint32_t kGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+
+            // runGpu: the full host-driven JACOBI contact+friction solve over the GPU. Returns the final array.
+            auto runGpu = [&](grain::fx mu, std::vector<GrainParticleGpu>& out) {
+                std::vector<GrainParticleGpu> grains = pack(init);
+                auto grainsBuf = makeBuf(grains.data(), grains.size() * sizeof(GrainParticleGpu));
+                std::vector<FxVec3Gpu> dpInit((size_t)kGrainCount, FxVec3Gpu{0,0,0});
+                auto dpBuf = makeBuf(dpInit.data(), dpInit.size() * sizeof(FxVec3Gpu));
+
+                for (int step = 0; step < kSteps; ++step) {
+                    // (1) predict: grain_integrate ONE step (GR1, on the GPU; steps=1, integrateEnabled=1).
+                    GrainParams ip{};
+                    ip.grav[0] = 0; ip.grav[1] = kGravY; ip.grav[2] = 0; ip.grav[3] = kDt;
+                    ip.cfg[0] = kGroundY; ip.cfg[1] = kGrainCount; ip.cfg[2] = 1; ip.cfg[3] = 1;
+                    auto ipBuf = makeBuf(&ip, sizeof(ip));
+                    {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gr_predict", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*integratePipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0);
+                            cmd.BindStorageBuffer(*ipBuf, 1);
+                            cmd.DispatchCompute(kGroups);
+                            cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+                    // (2) read back the predicted positions + build the GR2 grid params on the host.
+                    std::vector<GrainParticleGpu> pred((size_t)kGrainCount);
+                    device->ReadBuffer(*grainsBuf, pred.data(), pred.size() * sizeof(GrainParticleGpu), 0);
+                    std::vector<grain::GrainParticle> predH((size_t)kGrainCount);
+                    for (int i = 0; i < kGrainCount; ++i) {
+                        const GrainParticleGpu& q = pred[(size_t)i];
+                        predH[(size_t)i] = grain::GrainParticle{
+                            grain::FxVec3{q.px, q.py, q.pz}, grain::FxVec3{q.prx, q.pry, q.prz},
+                            grain::FxVec3{q.vx, q.vy, q.vz}, q.invMass, q.radius, q.flags};
+                    }
+                    const grain::GrainGrid grid = grain::MakeGrainGrid(predH, kHSearch);
+                    const uint32_t cellCount = grain::GrainCellCount(grid);
+                    const grain::GrainCellTable cpuTab = grain::BuildGrainCellTable(predH, grid);
+                    const grain::GrainNeighborList cpuList =
+                        grain::BuildGrainNeighborList(predH, grid, cpuTab, kHSearch);
+                    const uint32_t total = (uint32_t)cpuList.neighbors.size();
+                    const uint32_t alloc = total > 0u ? total : 1u;
+
+                    GrainGridParams gp{};
+                    gp.grid[0] = kHSearch; gp.grid[1] = grid.cellMin.x; gp.grid[2] = grid.cellMin.y;
+                    gp.grid[3] = grid.cellMin.z;
+                    gp.dim[0] = grid.gridDim.x; gp.dim[1] = grid.gridDim.y; gp.dim[2] = grid.gridDim.z;
+                    gp.dim[3] = kGrainCount;
+                    gp.cfg[0] = (int32_t)cellCount; gp.cfg[1] = 1; gp.cfg[2] = 0; gp.cfg[3] = 0;
+                    auto gpBuf = makeBuf(&gp, sizeof(gp));
+
+                    std::vector<uint32_t> cellCountInit((size_t)cellCount, 0u);
+                    std::vector<uint32_t> cellStartInit((size_t)cellCount + 1u, 0u);
+                    std::vector<uint32_t> cellCursorInit((size_t)cellCount, 0u);
+                    std::vector<uint32_t> cellGrainInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> perGrainInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> nbrStartInit((size_t)kGrainCount + 1u, 0u);
+                    std::vector<uint32_t> nbrInit((size_t)alloc, 0u);
+                    auto cellCountBuf = makeBuf(cellCountInit.data(), cellCountInit.size() * sizeof(uint32_t));
+                    auto cellStartBuf = makeBuf(cellStartInit.data(), cellStartInit.size() * sizeof(uint32_t));
+                    auto cellCursorBuf = makeBuf(cellCursorInit.data(), cellCursorInit.size() * sizeof(uint32_t));
+                    auto cellGrainBuf = makeBuf(cellGrainInit.data(), cellGrainInit.size() * sizeof(uint32_t));
+                    auto perGrainBuf = makeBuf(perGrainInit.data(), perGrainInit.size() * sizeof(uint32_t));
+                    auto nbrStartBuf = makeBuf(nbrStartInit.data(), nbrStartInit.size() * sizeof(uint32_t));
+                    auto nbrBuf = makeBuf(nbrInit.data(), nbrInit.size() * sizeof(uint32_t));
+
+                    // The GR2 neighbour passes (rebuilt each step from the predicted positions).
+                    {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gr_neighbors", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*cellCountPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellCountBuf, 1);
+                            cmd.BindStorageBuffer(*gpBuf, 2);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*cellScanPipe.second);
+                            cmd.BindStorageBuffer(*cellCountBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*gpBuf, 2);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*cellEmitPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*cellCursorBuf, 2); cmd.BindStorageBuffer(*cellGrainBuf, 3);
+                            cmd.BindStorageBuffer(*gpBuf, 4);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*nbrCountPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*cellGrainBuf, 2); cmd.BindStorageBuffer(*perGrainBuf, 3);
+                            cmd.BindStorageBuffer(*gpBuf, 4);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*nbrScanPipe.second);
+                            cmd.BindStorageBuffer(*perGrainBuf, 0); cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*gpBuf, 2);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*nbrEmitPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*cellGrainBuf, 2); cmd.BindStorageBuffer(*nbrStartBuf, 3);
+                            cmd.BindStorageBuffer(*nbrBuf, 4); cmd.BindStorageBuffer(*gpBuf, 5);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+
+                    // (3) `iters` JACOBI iterations: {NORMAL dp -> apply -> FRICTION dp -> apply}.
+                    GrainContactParams cp{};
+                    cp.cfg[0] = kGrainCount; cp.cfg[1] = (kIters > 0) ? 1 : 0;
+                    auto cpBuf = makeBuf(&cp, sizeof(cp));
+                    GrainFrictionParams fp{};
+                    fp.cfg[0] = kGrainCount; fp.cfg[1] = (mu != 0) ? 1 : 0; fp.cfg[2] = mu; fp.cfg[3] = 0;
+                    auto fpBuf = makeBuf(&fp, sizeof(fp));
+                    for (int it = 0; it < kIters; ++it) {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gr_iter", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            // (3a) the GR3 NORMAL push: grain_contact_dp -> grain_contact_apply.
+                            cmd.BindComputePipeline(*dpPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*nbrBuf, 2);     cmd.BindStorageBuffer(*dpBuf, 3);
+                            cmd.BindStorageBuffer(*cpBuf, 4);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*applyPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*dpBuf, 1);
+                            cmd.BindStorageBuffer(*cpBuf, 2);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToComputeBarrier();
+                            // (3b) the GR4 TANGENTIAL friction: grain_friction -> grain_contact_apply (REUSED).
+                            cmd.BindComputePipeline(*frictionPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*nbrBuf, 2);     cmd.BindStorageBuffer(*dpBuf, 3);
+                            cmd.BindStorageBuffer(*fpBuf, 4);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*applyPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*dpBuf, 1);
+                            cmd.BindStorageBuffer(*cpBuf, 2);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+
+                    // (4)+(5) velocity-from-dpos + CollideGrainPlane (no spheres).
+                    GrainSolveParams sp{};
+                    sp.cfg0[0] = kDt; sp.cfg0[1] = kGroundY; sp.cfg0[2] = kGrainCount; sp.cfg0[3] = kSphereCount;
+                    sp.cfg1[0] = 1;
+                    auto spBuf = makeBuf(&sp, sizeof(sp));
+                    {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gr_collide", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*collidePipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*sphereBuf, 1);
+                            cmd.BindStorageBuffer(*spBuf, 2);
+                            cmd.DispatchCompute(kGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+                }
+                out.assign((size_t)kGrainCount, GrainParticleGpu{});
+                device->ReadBuffer(*grainsBuf, out.data(), out.size() * sizeof(GrainParticleGpu), 0);
+            };
+
+            // === GPU solve (K steps x iters, μ>0) ===
+            std::vector<GrainParticleGpu> gpu;
+            runGpu(kMu, gpu);
+
+            // PROOF (1) GPU==CPU BIT-EXACT (integer memcmp, NO tol — the make-or-break).
+            std::vector<GrainParticleGpu> cpuGpu = pack(cpu);
+            bool exact = (gpu.size() == cpuGpu.size()) &&
+                std::memcmp(gpu.data(), cpuGpu.data(), cpuGpu.size() * sizeof(GrainParticleGpu)) == 0;
+            if (!exact) {
+                std::fprintf(stderr, "FATAL: grain-friction GPU != CPU StepGrainFriction (a float crept into "
+                             "the fixed-point friction solve?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-friction: {particles:%d, steps:%d, iters:%d, mu:%d} GPU==CPU BIT-EXACT\n",
+                        kGrainCount, kSteps, kIters, (int)kMu);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical.
+            {
+                std::vector<GrainParticleGpu> gpu2;
+                runGpu(kMu, gpu2);
+                if (gpu2.size() != gpu.size() ||
+                    std::memcmp(gpu2.data(), gpu.data(), gpu.size() * sizeof(GrainParticleGpu)) != 0) {
+                    std::fprintf(stderr, "FATAL: grain-friction two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("grain-friction determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) angle-of-repose / SLOPE STABILITY: the pile HOLDS A SLOPE (MeasureGrainRepose) clearly
+            // above the μ=0 frictionless control (the contrast proves friction does work). EMERGENT +
+            // deterministic + within-band — NOT an exact degree (the FL4/FPX3 honest caveat).
+            {
+                std::vector<grain::GrainParticle> zero = init;
+                grain::StepGrainFrictionSteps(zero, noSpheres, kGravity, kDt, kGroundY, kHSearch, 0, kIters, kSteps);
+                const grain::GrainRepose repZero = grain::MeasureGrainRepose(zero, kGroundY);
+                if (!(rep.slope > 0) || !(rep.slope > repZero.slope)) {
+                    std::fprintf(stderr, "FATAL: grain-friction repose slope (%d) did not clearly exceed the "
+                                 "frictionless control (%d)\n", (int)rep.slope, (int)repZero.slope);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("grain-friction repose: {height:%d, baseRadius:%d, slope:%d} (holds a slope, mu=%d)\n",
+                            (int)rep.height, (int)rep.baseRadius, (int)rep.slope, (int)kMu);
+            }
+
+            // PROOF (4) frictionless control / no-op: μ=0 -> the result EQUALS the GR3 frictionless
+            // StepGrainContact (friction idle — the pile spreads flat).
+            {
+                std::vector<grain::GrainParticle> zeroFric = init, gr3 = init;
+                grain::StepGrainFrictionSteps(zeroFric, noSpheres, kGravity, kDt, kGroundY, kHSearch, 0, kIters,
+                                              kSteps);
+                grain::StepGrainContactSteps(gr3, noSpheres, kGravity, kDt, kGroundY, kHSearch, kIters, kSteps);
+                if (zeroFric.size() != gr3.size() ||
+                    std::memcmp(zeroFric.data(), gr3.data(), gr3.size() * sizeof(grain::GrainParticle)) != 0) {
+                    std::fprintf(stderr, "FATAL: grain-friction mu=0 != GR3 StepGrainContact (friction not idle)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("grain-friction frictionless: mu=0 == GR3 contact (no friction)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER settled-cone side-view (the GR3 viz twin). The FRICTION cone reads as a
+            // TALLER/NARROWER mound than GR3's flat spread (the angle-of-repose money-shot). CPU-colored from
+            // the read-back integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 14, kMargin = 20;
+            const int kXLo = -8, kWorldW = 20, kWorldH = 12;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto hashColor = [](int idx) -> Vec3 {
+                uint32_t h = (uint32_t)idx * 2654435761u; h ^= h >> 15;
+                return Vec3{0.25f + 0.7f * (float)((h)       & 0xFF) / 255.0f,
+                            0.25f + 0.7f * (float)((h >> 8)  & 0xFF) / 255.0f,
+                            0.25f + 0.7f * (float)((h >> 16) & 0xFF) / 255.0f};
+            };
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+                cx = kMargin + (wx - kXLo) * kPxPerUnit;
+                cy = (int)imgH - kMargin - wy * kPxPerUnit;
+            };
+            int grainPx = 0;
+            for (int i = 0; i < kGrainCount; ++i) {
+                int cx, cy; toPx(cpu[(size_t)i].pos.x, cpu[(size_t)i].pos.y, cx, cy);
+                Vec3 col = hashColor(i);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                        ++grainPx;
+                    }
+            }
+            bool ok = WriteBMP(grainFrictionShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — grain self-supporting cone (%d grain px, slope %d, mu %d)\n",
+                                grainFrictionShotPath, imgW, imgH, grainPx, (int)rep.slope, (int)kMu);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainFrictionShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

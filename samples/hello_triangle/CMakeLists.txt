@@ -549,6 +549,25 @@ hf_compile_shaders(
     "shaders/grain_contact_dp.comp.hlsl:cs"
     "shaders/grain_contact_apply.comp.hlsl:cs"
     "shaders/grain_collide.comp.hlsl:cs"
+    # Deterministic GPU Granular/Sand Slice 4 (Slice GR4, the TANGENTIAL COULOMB FRICTION — the angle-of-repose
+    # SIGNATURE of FLAGSHIP #10, the grain_contact_dp twin with the friction clamp). ONE new int64 shader:
+    # grain_friction.comp — ONE thread per grain computes the JACOBI tangential-friction Δp_i = Σ_{j, pen>0}
+    # −share·corr where corr is the tangential relative displacement Δx_t = Δx_rel − (Δx_rel·n)·n clamped to the
+    # Coulomb cone fmax = fxmul(μ, pen) (STATIC t<=fmax cancels all slip, KINETIC t>fmax scales by fxdiv(fmax,t)),
+    # into a SEPARATE dp[] buffer (the Jacobi double-buffer). The K-step JACOBI loop is HOST-driven: each step =
+    # predict[GR1] -> GR2 neighbour passes -> {grain_contact_dp -> grain_contact_apply (NORMAL) -> grain_friction
+    # -> grain_contact_apply (TANGENTIAL)}×iters -> grain_collide, a ComputeToComputeBarrier between sub-passes.
+    # Per-grain INDEPENDENT (reads iteration-start state read-only, writes only its own dp) -> MULTI-THREAD
+    # [numthreads(64,1,1)], NO atomics, NO single-thread, NO TDR ceiling (the FL4/GR3 Jacobi win). REUSES
+    # grain_contact_apply.comp + grain_collide.comp VERBATIM (the apply + velocity/collide passes are shared with
+    # GR3 — NOT duplicated). SolveGrainFriction copied VERBATIM from engine/sim/grain.h. Because the friction
+    # Δx_t/cone fxmul/fxdiv + FxLength (FxISqrt) use int64, grain_friction.comp is VULKAN-SPIR-V-ONLY (DXC
+    # compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list, the Metal --grain-friction showcase
+    # running the CPU grain::StepGrainFriction (byte-identical by construction). ReadBuffer reads gGrains, PROVEN
+    # BIT-EXACT vs the CPU grain.h::StepGrainFrictionSteps (memcmp — the make-or-break). NO new RHI; GR1's
+    # grain_integrate + GR2's grain_cell/grain_neighbor + GR3's grain_contact_dp/grain_contact_apply/grain_collide
+    # shaders + their goldens untouched.
+    "shaders/grain_friction.comp.hlsl:cs"
     # Deterministic GPU Fluid Slice 2 (Slice FL2, the 2nd slice of FLAGSHIP #9): the GRID-HASH NEIGHBOR
     # SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FPX2 fpx_pair / CL2 cloth_edge twin).
     # The CELL TABLE: fluid_cell_count.comp (ONE thread per particle: InterlockedAdd into its cell's counter
