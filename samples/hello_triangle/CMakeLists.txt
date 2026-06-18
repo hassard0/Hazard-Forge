@@ -489,6 +489,20 @@ hf_compile_shaders(
     # construction, the cloth_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/fluid_integrate.comp.hlsl:cs"
+    # Deterministic GPU Granular/Sand Slice 1 (Slice GR1, the BEACHHEAD of FLAGSHIP #10: deterministic GPU
+    # granular/sand): grain_integrate.comp runs the Q16.16 semi-implicit-Euler GRAIN POOL INTEGRATOR — ONE
+    # thread per grain runs `steps` iterations of (vel += gravity*dt; prev = pos; pos += vel*dt; RADIUS-AWARE
+    # ground rest: pos.y < groundY + radius -> groundY + radius) on its OWN grain, the fxmul ((int64)a*b >> 16,
+    # the swraster/fpx int64 pattern) + integrate + prev-snap + radius-aware clamp copied VERBATIM from
+    # engine/sim/grain.h::IntegrateGrainParticle, and writes gGrains[i] back (each grain independent in GR1 ->
+    # race-free, NO atomics). The GrainParticle adds a first-class `radius` field vs FL1's FluidParticle ->
+    # 48-byte std430 packing. integrateEnabled=0 -> write the input back UNCHANGED. Like fluid_integrate.comp /
+    # cloth_integrate.comp / fpx_integrate.comp this is int64 (gravity*dt over Q16.16 overflows int32) ->
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal
+    # --grain-integrate showcase runs the CPU grain::IntegrateGrains (byte-identical by construction, the
+    # fluid_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU grain
+    # array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/grain_integrate.comp.hlsl:cs"
     # Deterministic GPU Fluid Slice 2 (Slice FL2, the 2nd slice of FLAGSHIP #9): the GRID-HASH NEIGHBOR
     # SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FPX2 fpx_pair / CL2 cloth_edge twin).
     # The CELL TABLE: fluid_cell_count.comp (ONE thread per particle: InterlockedAdd into its cell's counter

@@ -264,6 +264,21 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # cloth::IntegrateParticles (the SAME bit-exact reference the Vulkan GPU==CPU proof compares against) ->
 # the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side
 # carries the GPU==CPU bit-identity proof. So cloth_integrate.comp gets NO hf_gen_msl line.
+# Deterministic GPU Granular/Sand Slice 1 (Slice GR1, the BEACHHEAD of FLAGSHIP #10): grain_integrate.comp
+# runs the Q16.16 semi-implicit-Euler GRAIN POOL INTEGRATOR — ONE thread per grain runs `steps` iterations
+# of (vel += gravity*dt; prev = pos; pos += vel*dt; RADIUS-AWARE ground rest: pos.y < groundY + radius ->
+# groundY + radius) on its OWN grain, the fxmul ((int64)a*b >> 16) + integrate + prev-snap + radius-aware
+# clamp copied VERBATIM from engine/sim/grain.h::IntegrateGrainParticle, writing gGrains[i] back (each grain
+# independent in GR1 -> race-free, NO atomics). The GrainParticle adds a first-class `radius` field vs FL1's
+# FluidParticle -> 48-byte std430 packing. It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64
+# fxmul (GENUINELY required because gravity*dt over Q16.16 overflows int32, the SAME form as
+# fluid_integrate.comp / cloth_integrate.comp / fpx_integrate.comp) is compiled fine by DXC on the Vulkan
+# path, but glslc (glslang's HLSL frontend used for the Metal HLSL->SPIR-V->MSL chain) cannot parse int64_t
+# in HLSL, so it can't lower this shader. Same Vulkan-only convention as fluid_integrate.comp /
+# cloth_integrate.comp / fpx_integrate.comp: on Metal the --grain-integrate showcase runs the CPU
+# grain::IntegrateGrains (the SAME bit-exact reference the Vulkan GPU==CPU proof compares against) -> the
+# Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the
+# GPU==CPU bit-identity proof. So grain_integrate.comp gets NO hf_gen_msl line.
 # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
 # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp (ONE thread per body i:
 # perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) over j>i), fpx_pair_scan.comp (SINGLE-THREAD

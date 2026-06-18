@@ -90,6 +90,7 @@
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
+#include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -16844,6 +16845,159 @@ static int RunFluidIntegrateShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GR1 — Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR showcase (--grain-integrate)
+// (the BEACHHEAD of FLAGSHIP #10). Like FL1/CL1/FPX1 (and UNLIKE the int32 FPX2/FL2/NAV broadphase shaders),
+// the grain integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fluid_integrate.comp
+// / cloth_integrate.comp), so shaders/grain_integrate.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in
+// HLSL) and is NOT in this dir's hf_gen_msl list; on Metal the --grain-integrate showcase runs the CPU
+// grain::IntegrateGrains — the EXACT bit-exact reference the Vulkan --grain-integrate-shot GPU==CPU memcmp
+// already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION
+// (the fluid_integrate.comp convention), while the Vulkan side carries the GPU==CPU proof. So this builds the
+// SAME deterministic 10x10x10 = 1000-grain dropped block (in a corner above the ground, gravity -9.8
+// host-snapped to Q16.16, groundY=0, dt=kOne/60, a uniform grain radius 0.25), runs grain::IntegrateGrains
+// K=100 fixed steps over it with the RADIUS-AWARE ground rest (the grain's surface rests on the floor), and
+// CPU-colors the SAME integer side-view debug-viz (each grain's integer (pos.x>>kFrac,pos.y>>kFrac) -> a
+// pixel, hashColor dot) as the Vulkan --grain-integrate-shot -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/grain_integrate.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU
+// compute, NO neighbours/contact/friction (GR2+), NO new RHI.
+static int RunGrainIntegrateShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace grain = hf::sim::grain;
+    namespace vg = render::vg;
+
+    // The deterministic 10x10x10 dropped block (== the Vulkan --grain-integrate-shot config). -9.8 snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const grain::fx kDt = grain::kOne / 60;
+    const int kSide = 10;
+    const int kSteps = 100;   // mid-fall: bottom layers rest + upper layers a falling stack (== the Vulkan config)
+    const grain::fx kGroundY = 0;
+    const grain::fx kRadius = grain::kOne / 4;   // 0.25 grain radius (spacing 1.0 >= 2*radius)
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+
+    grain::GrainBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = grain::kOne;
+    block.radius = kRadius;
+    block.origin = grain::FxVec3{0, (grain::fx)(12 * (int)grain::kOne), 0};
+    const int kGrainCount = block.W * block.H * block.D;
+    std::vector<grain::GrainParticle> block0 = grain::InitGrainBlock(block);
+
+    // std430 GrainParticle mirror (== the Vulkan --grain-integrate-shot GrainParticleGpu): 12 x int32 (48).
+    struct GrainParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+    };
+    static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+    static_assert(sizeof(grain::GrainParticle) == 48, "GrainParticle std430 layout");
+    auto packGrains = [&](const std::vector<grain::GrainParticle>& ps) {
+        std::vector<GrainParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const grain::GrainParticle& p = ps[i];
+            out[i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                      p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+        }
+        return out;
+    };
+    const std::vector<GrainParticleGpu> grainsInit = packGrains(block0);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --grain-integrate-shot).
+    const int kPxPerUnit = 18, kMargin = 20;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kSide * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 12) * kPxPerUnit);
+
+    // CPU integrator (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    // integrateEnabled=false -> grains UNCHANGED (the no-op / static path).
+    auto runIntegrate = [&](bool integrateEnabled, std::vector<GrainParticleGpu>& outGrains) {
+        if (!integrateEnabled) { outGrains = grainsInit; return; }
+        std::vector<grain::GrainParticle> b = block0;
+        grain::IntegrateGrainSteps(b, kGravity, kDt, kGroundY, kSteps);
+        outGrains = packGrains(b);
+    };
+
+    // CPU integrate (enabled, K steps) — the Metal showcase grain array.
+    std::vector<GrainParticleGpu> gpuGrains;
+    runIntegrate(true, gpuGrains);
+
+    // GPU==CPU is N/A on the Metal CPU path: this grain array IS the CPU IntegrateGrains reference the
+    // Vulkan --grain-integrate-shot proved the GPU shader bit-identical against, so the Metal result is byte-
+    // identical to the Vulkan GPU result BY CONSTRUCTION. Print the same proof line for parity.
+    std::printf("grain-integrate: {particles:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU grain::IntegrateGrains, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kGrainCount, kSteps);
+
+    // two-run determinism.
+    std::vector<GrainParticleGpu> gpuGrains2;
+    runIntegrate(true, gpuGrains2);
+    if (gpuGrains.size() != gpuGrains2.size() ||
+        std::memcmp(gpuGrains.data(), gpuGrains2.data(),
+                    gpuGrains.size() * sizeof(GrainParticleGpu)) != 0)
+        return fail("grain-integrate: two integrations differ (nondeterministic)");
+    std::printf("grain-integrate determinism: two runs BYTE-IDENTICAL\n");
+
+    // coverage / coherence: the grains fell + piled at the ground (rest at groundY + radius).
+    int moved = 0, restingAtGround = 0;
+    const int32_t kRestY = kGroundY + kRadius;
+    for (int i = 0; i < kGrainCount; ++i) {
+        const GrainParticleGpu& g = gpuGrains[(size_t)i];
+        const GrainParticleGpu& init = grainsInit[(size_t)i];
+        if (g.py < init.py) ++moved;
+        if (g.py == kRestY) ++restingAtGround;
+    }
+    if (moved <= 0 || restingAtGround <= 0)
+        return fail("grain-integrate: coverage incoherent (moved/at-ground)");
+    std::printf("grain-integrate coverage: %d moved, %d resting at ground\n", moved, restingAtGround);
+
+    // static no-op: integrateEnabled=false -> grains UNCHANGED, AND an explicit static-grain pool (invMass 0
+    // / flags bit0) integrated K steps stays byte-identical (static grains are UNTOUCHED).
+    std::vector<GrainParticleGpu> disabledGrains;
+    runIntegrate(false, disabledGrains);
+    if (disabledGrains.size() != grainsInit.size() ||
+        std::memcmp(disabledGrains.data(), grainsInit.data(),
+                    grainsInit.size() * sizeof(GrainParticleGpu)) != 0)
+        return fail("grain-integrate: integrateEnabled=false changed the grains");
+    {
+        std::vector<grain::GrainParticle> staticBlock = block0;
+        for (auto& p : staticBlock) { p.invMass = 0; p.flags = grain::kFlagStatic; }
+        std::vector<grain::GrainParticle> staticAfter = staticBlock;
+        grain::IntegrateGrainSteps(staticAfter, kGravity, kDt, kGroundY, kSteps);
+        if (std::memcmp(staticAfter.data(), staticBlock.data(),
+                        staticBlock.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("grain-integrate: static grains moved (static no-op violated)");
+    }
+    std::printf("grain-integrate static: no-op (static grains unmoved)\n");
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --grain-integrate-shot by
+    // construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        const int wx = gpuGrains[(size_t)i].px >> grain::kFrac;
+        const int wy = gpuGrains[(size_t)i].py >> grain::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — grain pool side-view (%d moved, %d at ground)\n",
+                outPath, imgW, imgH, moved, restingAtGround);
+    return 0;
+}
+
 // ===== Slice FL3 — Deterministic GPU Fluid PBF DENSITY + λ showcase (--fluid-density) (the MAKE-OR-BREAK
 // of FLAGSHIP #9). Like FL1's --fluid-integrate / CL3's --cloth-solve (and UNLIKE the int32 FL2 neighbor
 // search), the density r² (dx² over Q16.16) + the λ fxdiv/FxISqrt are int64, so shaders/fluid_density.comp
@@ -32749,6 +32903,24 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fluid-integrate") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fluid_integrate.png";
             try { return RunFluidIntegrateShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --grain-integrate <out.png>: render the Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR
+        // showcase (Slice GR1, the BEACHHEAD of FLAGSHIP #10). Like --fluid-integrate / --cloth-integrate /
+        // --fpx (int64 integrator -> CPU on Metal), grain_integrate.comp is int64/Vulkan-only (glslc can't
+        // parse int64), so Metal runs the CPU grain::IntegrateGrains — byte-identical to the Vulkan GPU result
+        // by construction (the fluid_integrate.comp convention). A deterministic 10x10x10 = 1000-grain dropped
+        // block (in a corner above the ground, gravity (0,-9.8,0) host-snapped to Q16.16, groundY=0, dt=kOne/60,
+        // a uniform grain radius 0.25) is integrated K=100 fixed steps by grain::IntegrateGrains with the
+        // RADIUS-AWARE ground rest (the grain's surface rests on the floor) — the EXACT bit-exact reference the
+        // Vulkan --grain-integrate-shot GPU==CPU memcmp compares against; integrateEnabled=false -> grains
+        // unchanged; static grains unmoved; two runs byte-identical. The image golden is a PURE-INTEGER
+        // side-view debug-viz (each grain's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel, hashColor dot),
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/grain_integrate.png; two
+        // runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_grain_integrate.png";
+            try { return RunGrainIntegrateShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fluid-neighbors <out.png>: render the Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH showcase

@@ -70,6 +70,7 @@
 #include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
 #include "sim/cloth.h"          // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp
 #include "sim/fluid.h"          // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp
+#include "sim/grain.h"          // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -454,6 +455,7 @@ int main(int argc, char** argv) {
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* fluidIntegrateShotPath = nullptr; // --fluid-integrate-shot <out.bmp> (Slice FL1: Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #9 — a 10x10x10 = 1000-particle dam-break block in a corner integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/settling block)
+    const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
     const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
     const char* fluidSolveShotPath = nullptr; // --fluid-solve-shot <out.bmp> (Slice FL4, the incompressibility solver of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY-CONSTRAINT SOLVE — a dam-break block (FL1) poured over the ground (+ a static FxBody sphere) is settled into an INCOMPRESSIBLE POOL by StepFluid K steps x iters JACOBI density iterations (predict -> neighbours -> {ComputeDensity -> ComputeLambda -> SolveDensityConstraint(Δp into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollidePlane+CollideSpheres). The K-step loop is HOST-driven over MULTI-THREAD per-particle passes (fluid_density/fluid_lambda reused per iteration + fluid_dp + fluid_apply + fluid_collide, ONE thread per particle, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepFluid. GPU==CPU particle array bit-exact vs fluid.h::StepFluid, a deterministic incompressibility residual (summed |ρ_i−ρ0|) small + below the unsolved free-fall, integer side-view of the settled pool. NO lockstep (FL5), NO float render (FL6))
@@ -619,6 +621,22 @@ int main(int argc, char** argv) {
         // parse limit C1061, like the cloth/fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--fluid-integrate-shot") == 0 && i + 1 < argc) {
             fluidIntegrateShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GR1: --grain-integrate-shot <out.bmp> — the Deterministic GPU Granular/Sand Q16.16 GRAIN
+        // POOL INTEGRATOR (the BEACHHEAD of FLAGSHIP #10). A deterministic 10x10x10 = 1000-grain dropped
+        // block (in a corner above the ground, gravity (0,-9.8,0) host-snapped to Q16.16, dt=kOne/60, a
+        // uniform grain radius) is integrated K fixed steps by shaders/grain_integrate.comp (ONE thread per
+        // grain runs the K-step integrator: vel += gravity*dt; prev = pos; pos += vel*dt; RADIUS-AWARE
+        // ground rest — the grain's surface rests on the floor: pos.y < groundY + radius -> groundY + radius;
+        // copied VERBATIM from engine/sim/grain.h::IntegrateGrainParticle), GPU==CPU grain array bit-exact vs
+        // grain.h::IntegrateGrains. int64 fxmul (gravity*dt overflows int32, the FL1/CL1 form) ->
+        // grain_integrate.comp is Vulkan-only; Metal --grain-integrate runs the CPU IntegrateGrains. NO new
+        // RHI. Handled as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's nested-block
+        // parse limit C1061, like the fluid/cloth/fpx/mc/nav shots.
+        if (std::strcmp(argv[i], "--grain-integrate-shot") == 0 && i + 1 < argc) {
+            grainIntegrateShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15124,6 +15142,269 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fluid particle-pool side-view (%d moved, %d at ground)\n",
                                 fluidIntegrateShotPath, imgW, imgH, moved, restingAtGround);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidIntegrateShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR (--grain-integrate-shot <out.bmp>,
+        // Slice GR1, the BEACHHEAD of FLAGSHIP #10). A deterministic 10x10x10 = 1000-grain dropped block (in a
+        // corner above the ground, gravity (0,-9.8,0) host-snapped to Q16.16, dt=kOne/60, a uniform grain
+        // radius 0.25) is integrated K=100 fixed steps by a pure-integer compute (shaders/grain_integrate.comp):
+        // one thread per grain runs the K-step semi-implicit-Euler integrator (vel += gravity*dt; prev = pos;
+        // pos += vel*dt; RADIUS-AWARE ground rest: the grain's surface rests on the floor, pos.y < groundY +
+        // radius -> groundY + radius; the fxmul ((int64)a*b >> 16) + integrate + radius-aware clamp copied
+        // VERBATIM from engine/sim/grain.h::IntegrateGrainParticle) on its OWN grain — order-independent, NO
+        // atomics — and writes gGrains[i] back. ReadBuffer reads the integer Q16.16 grain array; the CPU
+        // grain.h::IntegrateGrains over the SAME block must match it BIT-EXACT (memcmp, NO tol).
+        // integrateEnabled=false -> grains UNCHANGED. The golden is a PURE-INTEGER side-view debug-viz (each
+        // grain's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer transform, a hashColor
+        // dot) -> identical both backends by construction. NO neighbours/contact/friction (GR2+), NO new RHI.
+        // K=100 (the FL1 60->120 step-count lesson, applied DOWNWARD): GR1 has NO inter-grain contact (that
+        // is GR3), so the block falls RIGIDLY and lands layer-by-layer. At K=140 every grain reaches the floor
+        // plane -> a single flat line (a poor golden). K=100 catches it MID-FALL: the bottom ~2 layers rest at
+        // groundY + radius while the upper layers are still a falling stack (8 distinct y-levels) -> a
+        // recognizable settling grain BLOCK with a built-up base, the coverage proof non-trivial on both axes.
+        if (grainIntegrateShotPath) {
+            using math::Vec3;
+            namespace grain = hf::sim::grain;
+            namespace vg = hf::render::vg;
+
+            // The deterministic 10x10x10 dropped block (== the Metal --grain-integrate config). -9.8 snapped.
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const grain::fx kDt = grain::kOne / 60;
+            const int kSide = 10;                      // 10x10x10 block -> 1000 grains
+            const int kSteps = 100;                    // mid-fall: the bottom layers rest, the upper layers
+                                                       // still a falling stack -> a recognizable settling block
+            const grain::fx kGroundY = 0;
+            const grain::fx kRadius = grain::kOne / 4; // 0.25 grain radius (spacing 1.0 >= 2*radius)
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+
+            grain::GrainBlock block;
+            block.W = kSide; block.H = kSide; block.D = kSide;
+            block.spacing = grain::kOne;               // 1.0 world unit spacing (>= 2*radius -> non-overlapping)
+            block.radius = kRadius;
+            block.origin = grain::FxVec3{0, (grain::fx)(12 * (int)grain::kOne), 0}; // corner above the ground
+            const int kGrainCount = block.W * block.H * block.D;
+            std::vector<grain::GrainParticle> block0 = grain::InitGrainBlock(block);
+
+            // std430 GrainParticle mirror (matches shaders/grain_integrate.comp GrainParticle): 12 x int32
+            // (48 bytes) = pos.xyz, prev.xyz, vel.xyz, invMass, radius, flags.
+            struct GrainParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+            };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            static_assert(sizeof(grain::GrainParticle) == 48, "GrainParticle std430 layout");
+            auto packGrains = [&](const std::vector<grain::GrainParticle>& ps) {
+                std::vector<GrainParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const grain::GrainParticle& p = ps[i];
+                    out[i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+                }
+                return out;
+            };
+            const std::vector<GrainParticleGpu> grainsInit = packGrains(block0);
+
+            auto makeGrainsBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = grainsInit.size() * sizeof(GrainParticleGpu);
+                d.initialData = grainsInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches grain_integrate.comp GrainParams std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, grainCount, steps, integrateEnabled}.
+            struct GrainParams { int32_t grav[4]; int32_t cfg[4]; };
+            static_assert(sizeof(GrainParams) == 32, "GrainParams std430 layout");
+            auto makeParams = [&](int32_t integrateEnabled) {
+                GrainParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kGrainCount; p.cfg[2] = kSteps; p.cfg[3] = integrateEnabled;
+                return p;
+            };
+
+            // Compute pipeline: 2 storage buffers (grains, params); 64 threads/group.
+            auto grainCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/grain_integrate.comp.hlsl.spv");
+            auto grainCs = device->CreateShaderModule({std::span<const uint32_t>(grainCsWords)});
+            rhi::ComputePipelineDesc grainCdesc;
+            grainCdesc.compute = grainCs.get();
+            grainCdesc.storageBufferCount = 2;
+            grainCdesc.pushConstantSize = 0;
+            grainCdesc.threadsPerGroupX = 64;
+            auto grainCompute = device->CreateComputePipeline(grainCdesc);
+
+            const uint32_t kGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+
+            // Run the integrate compute over a fresh grains buffer + params, read back gGrains.
+            auto runIntegrate = [&](int32_t integrateEnabled, std::vector<GrainParticleGpu>& outGrains) {
+                auto grainsBuf = makeGrainsBuf();
+                GrainParams params = makeParams(integrateEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(GrainParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("grain_integrate", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*grainCompute);
+                        cmd.BindStorageBuffer(*grainsBuf, 0);
+                        cmd.BindStorageBuffer(*paramsBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outGrains.assign((size_t)kGrainCount, GrainParticleGpu{});
+                device->ReadBuffer(*grainsBuf, outGrains.data(),
+                                   outGrains.size() * sizeof(GrainParticleGpu), 0);
+            };
+
+            // === GPU integrate (enabled, K steps) ===
+            std::vector<GrainParticleGpu> gpuGrains;
+            runIntegrate(1, gpuGrains);
+
+            // === CPU reference: IntegrateGrains K times over the SAME block ===
+            std::vector<grain::GrainParticle> cpuBlock = block0;
+            grain::IntegrateGrainSteps(cpuBlock, kGravity, kDt, kGroundY, kSteps);
+            std::vector<GrainParticleGpu> cpuGrains = packGrains(cpuBlock);
+
+            // PROOF (1) GPU==CPU grains BIT-EXACT after K steps (integer memcmp, NO tolerance).
+            if (gpuGrains.size() != cpuGrains.size() ||
+                std::memcmp(gpuGrains.data(), cpuGrains.data(),
+                            (size_t)kGrainCount * sizeof(GrainParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: grain GPU grain array != CPU IntegrateGrains "
+                             "(a float crept into the fixed-point grain integrator?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-integrate: {particles:%d, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kGrainCount, kSteps);
+
+            // PROOF (2) two-run determinism byte-identical.
+            std::vector<GrainParticleGpu> gpuGrains2;
+            runIntegrate(1, gpuGrains2);
+            if (gpuGrains.size() != gpuGrains2.size() ||
+                std::memcmp(gpuGrains.data(), gpuGrains2.data(),
+                            gpuGrains.size() * sizeof(GrainParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: grain two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-integrate determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) coverage / coherence: the grains fell (moved down) AND piled at the ground (some rest
+            // at groundY + radius) -> a coherent dropped-block fall + settle.
+            int moved = 0, restingAtGround = 0;
+            const int32_t kRestY = kGroundY + kRadius;
+            for (int i = 0; i < kGrainCount; ++i) {
+                const GrainParticleGpu& g = gpuGrains[(size_t)i];
+                const GrainParticleGpu& init = grainsInit[(size_t)i];
+                if (g.py < init.py) ++moved;
+                if (g.py == kRestY) ++restingAtGround;
+            }
+            if (moved <= 0 || restingAtGround <= 0) {
+                std::fprintf(stderr, "FATAL: grain coverage incoherent (moved=%d, atGround=%d)\n",
+                             moved, restingAtGround);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-integrate coverage: %d moved, %d resting at ground\n",
+                        moved, restingAtGround);
+
+            // PROOF (4) static no-op: a pool of STATIC grains (invMass 0 / flags bit0) -> UNCHANGED after K
+            // steps. We exercise it via the integrateEnabled=false disabled path (the byte-identical no-op) AND
+            // an explicit static-grain pool whose GPU read-back equals the upload (static grains never move).
+            std::vector<GrainParticleGpu> disabledGrains;
+            runIntegrate(0, disabledGrains);
+            if (disabledGrains.size() != grainsInit.size() ||
+                std::memcmp(disabledGrains.data(), grainsInit.data(),
+                            grainsInit.size() * sizeof(GrainParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: grain integrateEnabled=false changed the grains\n");
+                device->WaitIdle(); return 1;
+            }
+            // An explicit STATIC pool: same block but every grain flagged static (invMass 0) -> the enabled
+            // K-step integrate must leave it byte-identical (the static grains are UNTOUCHED by the shader).
+            std::vector<grain::GrainParticle> staticBlock = block0;
+            for (auto& p : staticBlock) { p.invMass = 0; p.flags = grain::kFlagStatic; }
+            const std::vector<GrainParticleGpu> staticInit = packGrains(staticBlock);
+            {
+                auto staticBuf = [&]() {
+                    rhi::BufferDesc d; d.size = staticInit.size() * sizeof(GrainParticleGpu);
+                    d.initialData = staticInit.data(); d.usage = rhi::BufferUsage::Storage;
+                    return device->CreateBuffer(d);
+                }();
+                GrainParams sp = makeParams(1);
+                rhi::BufferDesc pDesc; pDesc.size = sizeof(GrainParams); pDesc.initialData = &sp;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto spBuf = device->CreateBuffer(pDesc);
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("grain_integrate_static", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*grainCompute);
+                        cmd.BindStorageBuffer(*staticBuf, 0);
+                        cmd.BindStorageBuffer(*spBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                std::vector<GrainParticleGpu> staticOut((size_t)kGrainCount, GrainParticleGpu{});
+                device->ReadBuffer(*staticBuf, staticOut.data(),
+                                   staticOut.size() * sizeof(GrainParticleGpu), 0);
+                if (std::memcmp(staticOut.data(), staticInit.data(),
+                                staticInit.size() * sizeof(GrainParticleGpu)) != 0) {
+                    std::fprintf(stderr, "FATAL: grain static grains moved (static no-op violated)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("grain-integrate static: no-op (static grains unmoved)\n");
+
+            // --- Golden: a PURE-INTEGER side-view debug-viz. Project each grain's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) to a pixel via a FIXED integer transform (y up; z dropped — a side
+            // view of the 3D block), splat a small hashColor dot. CPU-colored from the read-back integers ->
+            // identical both backends by construction. ---
+            const int kPxPerUnit = 18;   // integer world-units -> pixels
+            const int kMargin = 20;
+            const int kWorldW = kSide;   // x spans 0..9
+            const int kWorldH = kSide + 12;  // y spans (the block falls from ~12+9 down to the ground)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Integer world->pixel transform (y up): px = margin + worldX*scale; py = imgH-margin - worldY*scale.
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            // Each grain as a small 2x2 dot at its integer (pos.x>>kFrac, pos.y>>kFrac).
+            for (int i = 0; i < kGrainCount; ++i) {
+                const int wx = gpuGrains[(size_t)i].px >> grain::kFrac;
+                const int wy = gpuGrains[(size_t)i].py >> grain::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(grainIntegrateShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — grain pool side-view (%d moved, %d at ground)\n",
+                                grainIntegrateShotPath, imgW, imgH, moved, restingAtGround);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainIntegrateShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
