@@ -527,6 +527,25 @@ hf_compile_shaders(
     # reference (memcmp — the make-or-break). NO new RHI; FL1+FL2 shaders + goldens untouched.
     "shaders/fluid_density.comp.hlsl:cs"
     "shaders/fluid_lambda.comp.hlsl:cs"
+    # Deterministic GPU Fluid Slice 4 (Slice FL4, the incompressibility solver of FLAGSHIP #9): the PBF
+    # DENSITY-CONSTRAINT SOLVE. The K-step JACOBI PBF loop is HOST-driven (predict[FL1] -> neighbours[host
+    # FL2] -> {fluid_density -> fluid_lambda -> fluid_dp -> fluid_apply}×iters -> fluid_collide per step, a
+    # ComputeToComputeBarrier between sub-passes), reusing the FL3 fluid_density/fluid_lambda passes per
+    # iteration. fluid_dp.comp: ONE thread per particle computes Δp_i = (1/ρ0) Σ_{j∈neighbors} (λ_i+λ_j)
+    # gradW[bin]·unit(p_j−p_i) into a SEPARATE dp[] buffer (the Jacobi double-buffer); fluid_apply.comp: ONE
+    # thread per particle applies p_i += dp_i; fluid_collide.comp: ONE thread per particle derives vel =
+    # (pos−prev)/dt then projects out of the ground + the static spheres. ALL per-particle INDEPENDENT (reads
+    # iteration-start state read-only, writes only its own particle) -> MULTI-THREAD, NO atomics, NO
+    # single-thread, NO TDR ceiling (the Jacobi design win over the cloth's order-dependent Gauss-Seidel).
+    # SolveDensityConstraint + the collide math copied VERBATIM from engine/sim/fluid.h. Because the λ-scale
+    # fxmul + the gradW fxdiv + FxISqrt + the velocity fxdiv use int64, these three are VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --fluid-solve showcase
+    # runs the CPU fluid::StepFluid (byte-identical by construction). ReadBuffer reads gParticles, PROVEN
+    # BIT-EXACT vs the CPU fluid.h::StepFluid (memcmp — the make-or-break). NO new RHI; FL1-FL3 shaders +
+    # goldens untouched.
+    "shaders/fluid_dp.comp.hlsl:cs"
+    "shaders/fluid_apply.comp.hlsl:cs"
+    "shaders/fluid_collide.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT
     # GRAPH BUILD (the FPX2/MC3 count->scan->emit on lattice particles). cloth_edge_count.comp: ONE thread
     # per particle counts its OWNED forward edges in bounds (right/down structural, the two cell diagonals

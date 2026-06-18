@@ -16984,6 +16984,178 @@ static int RunFluidDensityShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FL4 — Deterministic GPU Fluid PBF DENSITY-CONSTRAINT SOLVE showcase (--fluid-solve) (the
+// incompressibility solver of FLAGSHIP #9). Like --fluid-density / --cloth-solve, the FL4 solve passes
+// (fluid_dp / fluid_apply / fluid_collide) are int64 (λ-scale fxmul + gradW fxdiv + FxISqrt + the velocity
+// fxdiv) -> glslc can't parse int64 -> VULKAN-SPIR-V-ONLY (NOT in this dir's hf_gen_msl list); on Metal the
+// --fluid-solve showcase runs the CPU fluid::StepFluid — the EXACT bit-exact reference the Vulkan
+// --fluid-solve-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION (the fluid_lambda.comp / cloth_solve.comp convention). So this builds the SAME dam-break
+// scene (an 8x8x8 block dropped onto the ground over a static FxBody sphere, gravity -9.8 host-snapped,
+// groundY=0, dt=kOne/60, K=24 steps x iters=4 JACOBI density iterations), runs fluid::StepFluidSteps, and
+// CPU-colors the SAME integer settled-pool density side-view as the Vulkan --fluid-solve-shot -> the golden
+// is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). New golden
+// tests/golden/metal/fluid_solve.png (baked on the Mac by the CONTROLLER); two runs DIFF 0.0000.
+static int RunFluidSolveShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fluid = hf::sim::fluid;
+    namespace fpx = hf::sim::fpx;
+
+    // The dam-break scene (== the Vulkan --fluid-solve-shot config). -9.8 host-snapped.
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const int kSide = 8;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);
+    const int kSteps = 24;
+    const int kIters = 4;
+
+    fluid::FluidBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(7 * (int)fluid::kOne), 0};
+    const int kParticleCount = block.W * block.H * block.D;
+    std::vector<fluid::FluidParticle> init = fluid::InitBlock(block);
+
+    fpx::FxBody body;
+    body.pos = fluid::FxVec3{(fluid::fx)(4 * (int)fluid::kOne), (fluid::fx)(2 * (int)fluid::kOne),
+                             (fluid::fx)(4 * (int)fluid::kOne)};
+    body.radius = (fluid::fx)(2 * (int)fluid::kOne);
+    const std::vector<fluid::SphereCollider> spheres{fluid::SphereFromBody(body)};
+
+    const int kBins = fluid::kKernelBins;
+    const fluid::FluidGrid probeGrid = fluid::MakeGrid(init, kH);
+    const fluid::FluidCellTable probeTab = fluid::BuildCellTable(init, probeGrid);
+    const fluid::FluidNeighborList probeList = fluid::BuildNeighborList(init, probeGrid, probeTab, kH);
+    const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, fluid::kOne, kBins, fluid::kOne / 100);
+    std::vector<fluid::fx> probeRho;
+    fluid::ComputeDensity(init, probeList, kProbe, probeRho);
+    const fluid::fx kRestDensity = fluid::MeanDensity(probeRho);
+    const fluid::fx kEpsilon = fluid::kOne / 100;
+    const fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, kRestDensity, kBins, kEpsilon);
+
+    // CPU StepFluid (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the Metal
+    // result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    auto runSolve = [&](int iters) {
+        std::vector<fluid::FluidParticle> ps = init;
+        fluid::StepFluidSteps(ps, kernel, spheres, kGravity, kDt, kGroundY, iters, kSteps);
+        return ps;
+    };
+    std::vector<fluid::FluidParticle> cpu = runSolve(kIters);
+    const fluid::FluidGrid cpuGrid = fluid::MakeGrid(cpu, kH);
+    const fluid::FluidCellTable cpuTab = fluid::BuildCellTable(cpu, cpuGrid);
+    const fluid::FluidNeighborList cpuList = fluid::BuildNeighborList(cpu, cpuGrid, cpuTab, kH);
+    std::vector<fluid::fx> cpuRho;
+    fluid::ComputeDensity(cpu, cpuList, kernel, cpuRho);
+    const int64_t kResidual = fluid::DensityResidual(cpuRho, kRestDensity);
+
+    // free-fall (iters=0) contrast — the peak-compression the solve relieves.
+    std::vector<fluid::FluidParticle> freefall = runSolve(0);
+    const fluid::FluidGrid ffGrid = fluid::MakeGrid(freefall, kH);
+    const fluid::FluidCellTable ffTab = fluid::BuildCellTable(freefall, ffGrid);
+    const fluid::FluidNeighborList ffList = fluid::BuildNeighborList(freefall, ffGrid, ffTab, kH);
+    std::vector<fluid::fx> ffRho;
+    fluid::ComputeDensity(freefall, ffList, kernel, ffRho);
+    const int64_t kFreefallResidual = fluid::DensityResidual(ffRho, kRestDensity);
+    fluid::fx kPeakSolved = 0, kPeakFree = 0;
+    for (fluid::fx d : cpuRho) if (d > kPeakSolved) kPeakSolved = d;
+    for (fluid::fx d : ffRho)  if (d > kPeakFree)   kPeakFree   = d;
+
+    std::printf("fluid-solve: {particles:%d, steps:%d, iters:%d, residual:%lld} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fluid::StepFluid, byte-identical to the Vulkan GPU result by construction]\n",
+                kParticleCount, kSteps, kIters, (long long)kResidual);
+
+    // determinism.
+    {
+        std::vector<fluid::FluidParticle> b = runSolve(kIters);
+        if (b.size() != cpu.size() ||
+            std::memcmp(b.data(), cpu.data(), cpu.size() * sizeof(fluid::FluidParticle)) != 0)
+            return fail("fluid-solve: two runs differ (nondeterministic)");
+        std::printf("fluid-solve determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // incompressibility/coherence: the solve relieves the peak over-compression; no tunnelling.
+    {
+        bool aboveGround = true, outsideSphere = true;
+        for (int i = 0; i < kParticleCount; ++i) {
+            if (cpu[(size_t)i].pos.y < kGroundY) aboveGround = false;
+            const fluid::FxVec3 d = fluid::FxSub(cpu[(size_t)i].pos, spheres[0].center);
+            if (fluid::FxLength(d) < spheres[0].radius - fluid::kFluidCollideEps) outsideSphere = false;
+        }
+        if (!aboveGround || !outsideSphere || kPeakSolved >= kPeakFree)
+            return fail("fluid-solve: incoherent (aboveGround/outsideSphere/peak relief)");
+        std::printf("fluid-solve coverage: settled, residual %lld (incompressible pool, peak density %d "
+                    "relieved from free-fall clump %d, rho0 %d)\n", (long long)kResidual,
+                    (int)kPeakSolved, (int)kPeakFree, (int)kRestDensity);
+        (void)kFreefallResidual;
+    }
+
+    // no-solve / no-op: iters=0 -> pure integrate (the freefall reference); a CPU re-check.
+    {
+        std::vector<fluid::FluidParticle> g0 = runSolve(0);
+        if (g0.size() != freefall.size() ||
+            std::memcmp(g0.data(), freefall.data(), freefall.size() * sizeof(fluid::FluidParticle)) != 0)
+            return fail("fluid-solve: no-solve != integrate (iters=0 not a no-op)");
+        std::printf("fluid-solve no-solve: == integrate (no-op)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER settled-pool side-view (IDENTICAL to the Vulkan --fluid-solve-shot by
+    // construction). ---
+    const int kPxPerUnit = 22, kMargin = 24;
+    const int kWorldW = kSide + 4, kWorldH = kSide + 4;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto heat = [](float t) -> Vec3 {
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 3.0f)));
+        float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 2.0f)));
+        float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 1.0f)));
+        return Vec3{r, g, b};
+    };
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+        cx = kMargin + wx * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    {
+        for (int a = 0; a < 360; a += 6) {
+            const double rad = (double)a * 3.14159265358979 / 180.0;
+            const int sx = spheres[0].center.x + (fluid::fx)((double)spheres[0].radius * std::cos(rad));
+            const int sy = spheres[0].center.y + (fluid::fx)((double)spheres[0].radius * std::sin(rad));
+            int cx, cy; toPx(sx, sy, cx, cy);
+            if (cx >= 0 && cx < (int)imgW && cy >= 0 && cy < (int)imgH) {
+                uint8_t* dst = &bgra[((size_t)cy * imgW + cx) * 4];
+                dst[0] = 90; dst[1] = 90; dst[2] = 90; dst[3] = 255;
+            }
+        }
+    }
+    fluid::fx maxRho = 1; for (fluid::fx d : cpuRho) if (d > maxRho) maxRho = d;
+    const float maxRhoF = (float)maxRho;
+    for (int i = 0; i < kParticleCount; ++i) {
+        int cx, cy; toPx(cpu[(size_t)i].pos.x, cpu[(size_t)i].pos.y, cx, cy);
+        Vec3 col = heat((float)cpuRho[(size_t)i] / maxRhoF);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fluid settled pool (residual %lld, %d spheres)\n",
+                outPath, imgW, imgH, (long long)kResidual, (int)spheres.size());
+    return 0;
+}
+
 // ===== Slice CL1 — Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR showcase (--cloth-integrate)
 // (the BEACHHEAD of FLAGSHIP #8). Like FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the cloth
 // integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fpx_integrate.comp), so
@@ -32147,6 +32319,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fluid-density") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fluid_density.png";
             try { return RunFluidDensityShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fluid-solve <out.png>: render the Deterministic GPU Fluid PBF DENSITY-CONSTRAINT SOLVE showcase
+        // (Slice FL4, the incompressibility solver of FLAGSHIP #9). Like --fluid-density / --cloth-solve
+        // (int64 -> CPU on Metal), the FL4 solve passes (fluid_dp/fluid_apply/fluid_collide) are
+        // int64/Vulkan-only (glslc can't parse int64), so Metal runs the CPU fluid::StepFluid — byte-identical
+        // to the Vulkan GPU result by construction. The SAME dam-break 8x8x8 block dropped over a static
+        // FxBody sphere is settled into an INCOMPRESSIBLE POOL by StepFluid K=24 x iters=4 JACOBI density
+        // iterations; the residual is deterministic + the peak compression relieved vs free-fall; iters=0 ==
+        // pure integrate. The image golden is the integer settled-pool density side-view, identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/fluid_solve.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fluid-solve") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fluid_solve.png";
+            try { return RunFluidSolveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE
