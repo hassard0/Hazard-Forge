@@ -477,6 +477,18 @@ hf_compile_shaders(
     # construction, the fpx_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/cloth_integrate.comp.hlsl:cs"
+    # Deterministic GPU Fluid Slice 1 (Slice FL1, the BEACHHEAD of FLAGSHIP #9: deterministic GPU fluid):
+    # fluid_integrate.comp runs the Q16.16 semi-implicit-Euler PARTICLE POOL INTEGRATOR — ONE thread per
+    # particle runs `steps` iterations of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp)
+    # on its OWN particle, the fxmul ((int64)a*b >> 16, the swraster/fpx int64 pattern) + integrate + prev-
+    # snap + clamp copied VERBATIM from engine/sim/fluid.h::IntegrateFluidParticle, and writes gParticles[i]
+    # back (each particle independent in FL1 -> race-free, NO atomics). integrateEnabled=0 -> write the input
+    # back UNCHANGED. Like cloth_integrate.comp / fpx_integrate.comp this is int64 (gravity*dt over Q16.16
+    # overflows int32) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl
+    # list; the Metal --fluid-integrate showcase runs the CPU fluid::IntegrateFluid (byte-identical by
+    # construction, the cloth_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
+    # GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/fluid_integrate.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT
     # GRAPH BUILD (the FPX2/MC3 count->scan->emit on lattice particles). cloth_edge_count.comp: ONE thread
     # per particle counts its OWNED forward edges in bounds (right/down structural, the two cell diagonals

@@ -69,6 +69,7 @@
 #include "render/mc.h"          // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp
 #include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
 #include "sim/cloth.h"          // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp
+#include "sim/fluid.h"          // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -452,7 +453,8 @@ int main(int argc, char** argv) {
     const char* mcRenderShotPath = nullptr; // --mc-render-shot <out.bmp> (Slice MC5: GPU Isosurface Meshing RENDER — MarchCellsInterp's bit-exact fixed-point mesh -> BuildRenderMesh (position=vert/kSub + flat per-face normals) -> the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO) -> a lit 3D extracted-sphere render. The MC arc's FIRST FLOAT slice: the golden is the visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof), NOT the integer zero-diff bar. NO new RHI / shader)
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
-    const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~60 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
+    const char* fluidIntegrateShotPath = nullptr; // --fluid-integrate-shot <out.bmp> (Slice FL1: Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #9 — a 10x10x10 = 1000-particle dam-break block in a corner integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/settling block)
+    const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
     const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
@@ -597,6 +599,21 @@ int main(int argc, char** argv) {
         // to avoid MSVC's nested-block parse limit C1061, like the fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--cloth-integrate-shot") == 0 && i + 1 < argc) {
             clothIntegrateShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice FL1: --fluid-integrate-shot <out.bmp> — the Deterministic GPU Fluid Q16.16 PARTICLE POOL
+        // INTEGRATOR (the BEACHHEAD of FLAGSHIP #9). A deterministic 10x10x10 = 1000-particle dam-break
+        // block (in a corner above the ground, gravity (0,-9.8,0) host-snapped to Q16.16, dt=kOne/60) is
+        // integrated K=120 fixed steps by shaders/fluid_integrate.comp (ONE thread per particle runs the
+        // K-step integrator: vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp, copied
+        // VERBATIM from engine/sim/fluid.h::IntegrateFluidParticle), GPU==CPU particle array bit-exact vs
+        // fluid.h::IntegrateFluid. int64 fxmul (gravity*dt overflows int32, the CL1/FPX1 form) ->
+        // fluid_integrate.comp is Vulkan-only; Metal --fluid-integrate runs the CPU IntegrateFluid. NO new
+        // RHI. Handled as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's nested-block
+        // parse limit C1061, like the cloth/fpx/mc/nav shots.
+        if (std::strcmp(argv[i], "--fluid-integrate-shot") == 0 && i + 1 < argc) {
+            fluidIntegrateShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -14827,10 +14844,227 @@ int main(int argc, char** argv) {
             return ok ? 0 : 1;
         }
 
+        // --- Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR (--fluid-integrate-shot <out.bmp>,
+        // Slice FL1, the BEACHHEAD of FLAGSHIP #9). A deterministic 10x10x10 = 1000-particle dam-break
+        // block (in a corner above the ground, gravity (0,-9.8,0) host-snapped to Q16.16, dt=kOne/60) is
+        // integrated K=120 fixed steps by a pure-integer compute (shaders/fluid_integrate.comp): one thread
+        // per particle runs the K-step semi-implicit-Euler integrator (vel += gravity*dt; prev = pos;
+        // pos += vel*dt; ground floor-clamp; the fxmul ((int64)a*b >> 16) + integrate + clamp copied
+        // VERBATIM from engine/sim/fluid.h::IntegrateFluidParticle) on its OWN particle — order-independent,
+        // NO atomics — and writes gParticles[i] back. ReadBuffer reads the integer Q16.16 particle array;
+        // the CPU fluid.h::IntegrateFluid over the SAME block must match it BIT-EXACT (memcmp, NO tol).
+        // integrateEnabled=false -> particles UNCHANGED. The golden is a PURE-INTEGER side-view debug-viz
+        // (each particle's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a fixed integer transform,
+        // a hashColor dot) -> identical both backends by construction. NO neighbours/density/constraints
+        // (FL2+), NO new RHI.
+        if (fluidIntegrateShotPath) {
+            using math::Vec3;
+            namespace fluid = hf::sim::fluid;
+            namespace vg = hf::render::vg;
+
+            // The deterministic 10x10x10 dam-break block (== the Metal --fluid-integrate config). -9.8 snapped.
+            const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const fluid::fx kDt = fluid::kOne / 60;
+            const int kSide = 10;                      // 10x10x10 block -> 1000 particles
+            const int kSteps = 120;                    // ~2s of fall — enough for the block to reach the floor
+            // groundY = 0; the block starts above it (origin.y = 12) so it falls + piles at the ground
+            // (120 steps at dt=1/60 fall ~19.6 units > 12 -> the bottom rows ground, restingAtGround > 0).
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+
+            fluid::FluidBlock block;
+            block.W = kSide; block.H = kSide; block.D = kSide;
+            block.spacing = fluid::kOne;               // 1.0 world unit spacing
+            block.origin = fluid::FxVec3{0, (fluid::fx)(12 * (int)fluid::kOne), 0}; // corner above the ground
+            const int kParticleCount = block.W * block.H * block.D;
+            std::vector<fluid::FluidParticle> block0 = fluid::InitBlock(block);
+
+            // std430 FluidParticle mirror (matches shaders/fluid_integrate.comp FluidParticle): 11 x int32
+            // (44 bytes) = pos.xyz, prev.xyz, vel.xyz, invMass, flags.
+            struct FluidParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            static_assert(sizeof(fluid::FluidParticle) == 44, "FluidParticle std430 layout");
+            auto packParticles = [&](const std::vector<fluid::FluidParticle>& ps) {
+                std::vector<FluidParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const fluid::FluidParticle& p = ps[i];
+                    out[i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+                }
+                return out;
+            };
+            const std::vector<FluidParticleGpu> particlesInit = packParticles(block0);
+
+            auto makeParticlesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = particlesInit.size() * sizeof(FluidParticleGpu);
+                d.initialData = particlesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches fluid_integrate.comp FluidParams std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, particleCount, steps, integrateEnabled}.
+            struct FluidParams { int32_t grav[4]; int32_t cfg[4]; };
+            static_assert(sizeof(FluidParams) == 32, "FluidParams std430 layout");
+            auto makeParams = [&](int32_t integrateEnabled) {
+                FluidParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kParticleCount; p.cfg[2] = kSteps; p.cfg[3] = integrateEnabled;
+                return p;
+            };
+
+            // Compute pipeline: 2 storage buffers (particles, params); 64 threads/group.
+            auto fluidCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fluid_integrate.comp.hlsl.spv");
+            auto fluidCs = device->CreateShaderModule({std::span<const uint32_t>(fluidCsWords)});
+            rhi::ComputePipelineDesc fluidCdesc;
+            fluidCdesc.compute = fluidCs.get();
+            fluidCdesc.storageBufferCount = 2;
+            fluidCdesc.pushConstantSize = 0;
+            fluidCdesc.threadsPerGroupX = 64;
+            auto fluidCompute = device->CreateComputePipeline(fluidCdesc);
+
+            const uint32_t kGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+
+            // Run the integrate compute over a fresh particles buffer + params, read back gParticles.
+            auto runIntegrate = [&](int32_t integrateEnabled, std::vector<FluidParticleGpu>& outParticles) {
+                auto particlesBuf = makeParticlesBuf();
+                FluidParams params = makeParams(integrateEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(FluidParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fluid_integrate", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*fluidCompute);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*paramsBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outParticles.assign((size_t)kParticleCount, FluidParticleGpu{});
+                device->ReadBuffer(*particlesBuf, outParticles.data(),
+                                   outParticles.size() * sizeof(FluidParticleGpu), 0);
+            };
+
+            // === GPU integrate (enabled, K steps) ===
+            std::vector<FluidParticleGpu> gpuParticles;
+            runIntegrate(1, gpuParticles);
+
+            // === CPU reference: IntegrateFluid K times over the SAME block ===
+            std::vector<fluid::FluidParticle> cpuBlock = block0;
+            fluid::IntegrateFluidSteps(cpuBlock, kGravity, kDt, kGroundY, kSteps);
+            std::vector<FluidParticleGpu> cpuParticles = packParticles(cpuBlock);
+
+            // PROOF (1) GPU==CPU particles BIT-EXACT after K steps (integer memcmp, NO tolerance).
+            if (gpuParticles.size() != cpuParticles.size() ||
+                std::memcmp(gpuParticles.data(), cpuParticles.data(),
+                            (size_t)kParticleCount * sizeof(FluidParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fluid GPU particle array != CPU IntegrateFluid "
+                             "(a float crept into the fixed-point fluid integrator?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-integrate: {particles:%d, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kParticleCount, kSteps);
+
+            // PROOF (2) two-run determinism byte-identical.
+            std::vector<FluidParticleGpu> gpuParticles2;
+            runIntegrate(1, gpuParticles2);
+            if (gpuParticles.size() != gpuParticles2.size() ||
+                std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                            gpuParticles.size() * sizeof(FluidParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fluid two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-integrate determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) coverage / coherence: the particles fell (moved down) AND piled at the ground
+            // (some rest at groundY) -> a coherent dam-break fall.
+            int moved = 0, restingAtGround = 0;
+            for (int i = 0; i < kParticleCount; ++i) {
+                const FluidParticleGpu& g = gpuParticles[(size_t)i];
+                const FluidParticleGpu& init = particlesInit[(size_t)i];
+                if (g.py < init.py) ++moved;
+                if (g.py == kGroundY) ++restingAtGround;
+            }
+            if (moved <= 0 || restingAtGround <= 0) {
+                std::fprintf(stderr, "FATAL: fluid coverage incoherent (moved=%d, atGround=%d)\n",
+                             moved, restingAtGround);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-integrate coverage: %d moved, %d at ground (coherent dam-break fall)\n",
+                        moved, restingAtGround);
+
+            // PROOF (4) empty / no-op: integrateEnabled=false -> particles UNCHANGED (byte-identical to
+            // the upload). The disabled path is the "no gravity (no-op)" static case (nothing integrates).
+            std::vector<FluidParticleGpu> disabledParticles;
+            runIntegrate(0, disabledParticles);
+            if (disabledParticles.size() != particlesInit.size() ||
+                std::memcmp(disabledParticles.data(), particlesInit.data(),
+                            particlesInit.size() * sizeof(FluidParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fluid integrateEnabled=false changed the particles\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-integrate static: no gravity (no-op)\n");
+
+            // --- Golden: a PURE-INTEGER side-view debug-viz. Project each particle's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) to a pixel via a FIXED integer transform (y up; z dropped — a
+            // side view of the 3D block), splat a small hashColor dot. CPU-colored from the read-back
+            // integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 18;   // integer world-units -> pixels
+            const int kMargin = 20;
+            const int kWorldW = kSide;   // x spans 0..9
+            const int kWorldH = kSide + 12;  // y spans (the block falls from ~12+9 down to the ground)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Integer world->pixel transform (y up): px = margin + worldX*scale; py = imgH-margin - worldY*scale.
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            // Each particle as a small 2x2 dot at its integer (pos.x>>kFrac, pos.y>>kFrac).
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = gpuParticles[(size_t)i].px >> fluid::kFrac;
+                const int wy = gpuParticles[(size_t)i].py >> fluid::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(fluidIntegrateShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fluid particle-pool side-view (%d moved, %d at ground)\n",
+                                fluidIntegrateShotPath, imgW, imgH, moved, restingAtGround);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidIntegrateShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         // --- Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR (--cloth-integrate-shot
         // <out.bmp>, Slice CL1, the BEACHHEAD of FLAGSHIP #8). A deterministic 24x24 flat sheet (the two
         // top corners PINNED, gravity (0,-9.8,0) host-snapped to Q16.16, groundY below the sheet,
-        // dt=kOne/60) is integrated K=60 fixed steps by a pure-integer compute (shaders/cloth_integrate.comp):
+        // dt=kOne/60) is integrated K=120 fixed steps by a pure-integer compute (shaders/cloth_integrate.comp):
         // one thread per particle runs the K-step semi-implicit-Euler integrator (vel += gravity*dt;
         // prev = pos; pos += vel*dt; ground floor-clamp; the fxmul ((int64)a*b >> 16) + integrate + clamp
         // copied VERBATIM from engine/sim/cloth.h::IntegrateParticle) on its OWN particle — order-

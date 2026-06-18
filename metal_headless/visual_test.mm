@@ -89,6 +89,7 @@
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
+#include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -16703,6 +16704,146 @@ static int RunFpxShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FL1 — Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR showcase (--fluid-integrate)
+// (the BEACHHEAD of FLAGSHIP #9). Like CL1/FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the
+// fluid integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as cloth_integrate.comp
+// / fpx_integrate.comp), so shaders/fluid_integrate.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in
+// HLSL) and is NOT in this dir's hf_gen_msl list; on Metal the --fluid-integrate showcase runs the CPU
+// fluid::IntegrateFluid — the EXACT bit-exact reference the Vulkan --fluid-integrate-shot GPU==CPU memcmp
+// already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION
+// (the cloth_integrate.comp / fpx_integrate.comp convention), while the Vulkan side carries the GPU==CPU
+// proof. So this builds the SAME deterministic 10x10x10 = 1000-particle dam-break block (in a corner above
+// the ground, gravity -9.8 host-snapped to Q16.16, groundY=0, dt=kOne/60), runs fluid::IntegrateFluid K=120
+// fixed steps over it, and CPU-colors the SAME integer side-view debug-viz (each particle's integer
+// (pos.x>>kFrac,pos.y>>kFrac) -> a pixel, hashColor dot) as the Vulkan --fluid-integrate-shot -> the golden
+// is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match
+// the Vulkan side EXACTLY. New golden tests/golden/metal/fluid_integrate.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000. NO GPU compute, NO neighbours/density/constraints (FL2+), NO new RHI.
+static int RunFluidIntegrateShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fluid = hf::sim::fluid;
+    namespace vg = render::vg;
+
+    // The deterministic 10x10x10 dam-break block (== the Vulkan --fluid-integrate-shot config). -9.8 snapped.
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const fluid::fx kDt = fluid::kOne / 60;
+    const int kSide = 10;
+    const int kSteps = 120;   // ~2s of fall — enough for the block to reach the floor (== the Vulkan config)
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+
+    fluid::FluidBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(12 * (int)fluid::kOne), 0};
+    const int kParticleCount = block.W * block.H * block.D;
+    std::vector<fluid::FluidParticle> block0 = fluid::InitBlock(block);
+
+    // std430 FluidParticle mirror (== the Vulkan --fluid-integrate-shot FluidParticleGpu): 11 x int32 (44).
+    struct FluidParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+    };
+    static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+    static_assert(sizeof(fluid::FluidParticle) == 44, "FluidParticle std430 layout");
+    auto packParticles = [&](const std::vector<fluid::FluidParticle>& ps) {
+        std::vector<FluidParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const fluid::FluidParticle& p = ps[i];
+            out[i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                      p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+        }
+        return out;
+    };
+    const std::vector<FluidParticleGpu> particlesInit = packParticles(block0);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --fluid-integrate-shot).
+    const int kPxPerUnit = 18, kMargin = 20;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kSide * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 12) * kPxPerUnit);
+
+    // CPU integrator (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    // integrateEnabled=false -> particles UNCHANGED (the no-op / no-gravity static path).
+    auto runIntegrate = [&](bool integrateEnabled, std::vector<FluidParticleGpu>& outParticles) {
+        if (!integrateEnabled) { outParticles = particlesInit; return; }
+        std::vector<fluid::FluidParticle> b = block0;
+        fluid::IntegrateFluidSteps(b, kGravity, kDt, kGroundY, kSteps);
+        outParticles = packParticles(b);
+    };
+
+    // CPU integrate (enabled, K steps) — the Metal showcase particle array.
+    std::vector<FluidParticleGpu> gpuParticles;
+    runIntegrate(true, gpuParticles);
+
+    // GPU==CPU is N/A on the Metal CPU path: this particle array IS the CPU IntegrateFluid reference the
+    // Vulkan --fluid-integrate-shot proved the GPU shader bit-identical against, so the Metal result is byte-
+    // identical to the Vulkan GPU result BY CONSTRUCTION. Print the same proof line for parity.
+    std::printf("fluid-integrate: {particles:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fluid::IntegrateFluid, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kParticleCount, kSteps);
+
+    // two-run determinism.
+    std::vector<FluidParticleGpu> gpuParticles2;
+    runIntegrate(true, gpuParticles2);
+    if (gpuParticles.size() != gpuParticles2.size() ||
+        std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                    gpuParticles.size() * sizeof(FluidParticleGpu)) != 0)
+        return fail("fluid-integrate: two integrations differ (nondeterministic)");
+    std::printf("fluid-integrate determinism: two runs BYTE-IDENTICAL\n");
+
+    // coverage / coherence: the particles fell + piled at the ground.
+    int moved = 0, restingAtGround = 0;
+    for (int i = 0; i < kParticleCount; ++i) {
+        const FluidParticleGpu& g = gpuParticles[(size_t)i];
+        const FluidParticleGpu& init = particlesInit[(size_t)i];
+        if (g.py < init.py) ++moved;
+        if (g.py == kGroundY) ++restingAtGround;
+    }
+    if (moved <= 0 || restingAtGround <= 0)
+        return fail("fluid-integrate: coverage incoherent (moved/at-ground)");
+    std::printf("fluid-integrate coverage: %d moved, %d at ground (coherent dam-break fall)\n",
+                moved, restingAtGround);
+
+    // empty / no-op: integrateEnabled=false -> particles UNCHANGED (the no-gravity static case).
+    std::vector<FluidParticleGpu> disabledParticles;
+    runIntegrate(false, disabledParticles);
+    if (disabledParticles.size() != particlesInit.size() ||
+        std::memcmp(disabledParticles.data(), particlesInit.data(),
+                    particlesInit.size() * sizeof(FluidParticleGpu)) != 0)
+        return fail("fluid-integrate: integrateEnabled=false changed the particles");
+    std::printf("fluid-integrate static: no gravity (no-op)\n");
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --fluid-integrate-shot by
+    // construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = gpuParticles[(size_t)i].px >> fluid::kFrac;
+        const int wy = gpuParticles[(size_t)i].py >> fluid::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fluid particle-pool side-view (%d moved, %d at ground)\n",
+                outPath, imgW, imgH, moved, restingAtGround);
+    return 0;
+}
+
 // ===== Slice CL1 — Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR showcase (--cloth-integrate)
 // (the BEACHHEAD of FLAGSHIP #8). Like FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the cloth
 // integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fpx_integrate.comp), so
@@ -31525,6 +31666,23 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cloth-integrate") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cloth_integrate.png";
             try { return RunClothIntegrateShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fluid-integrate <out.png>: render the Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR
+        // showcase (Slice FL1, the BEACHHEAD of FLAGSHIP #9). Like --cloth-integrate / --fpx (int64
+        // integrator -> CPU on Metal), fluid_integrate.comp is int64/Vulkan-only (glslc can't parse int64),
+        // so Metal runs the CPU fluid::IntegrateFluid — byte-identical to the Vulkan GPU result by
+        // construction (the cloth_integrate.comp convention). A deterministic 10x10x10 = 1000-particle
+        // dam-break block (in a corner above the ground, gravity (0,-9.8,0) host-snapped to Q16.16,
+        // groundY=0, dt=kOne/60) is integrated K=120 fixed steps by fluid::IntegrateFluid — the EXACT
+        // bit-exact reference the Vulkan --fluid-integrate-shot GPU==CPU memcmp compares against;
+        // integrateEnabled=false -> particles unchanged; two runs byte-identical. The image golden is a
+        // PURE-INTEGER side-view debug-viz (each particle's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel,
+        // hashColor dot), identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/fluid_integrate.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fluid-integrate") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fluid_integrate.png";
+            try { return RunFluidIntegrateShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE
