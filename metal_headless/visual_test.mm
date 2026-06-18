@@ -19476,6 +19476,155 @@ static int RunCgrainSupportShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CG3 — Deterministic Rigid<->Grain Coupling GRAIN REACTION / DISPLACEMENT showcase (--cgrain-displace)
+// (the Newton's-3rd-law HALF of CG2, the 3rd slice of FLAGSHIP #12, the CP3 fluid-displacement twin). Like
+// --cgrain-support / --couple-displace, the CG3 projection math is int64 (FxLength/FxNormalize via FxISqrt + the
+// drag-reaction fxmul) -> glslc can't parse int64 -> cgrain_displace.comp is VULKAN-SPIR-V-ONLY (NOT in this
+// dir's hf_gen_msl list); on Metal the --cgrain-displace showcase runs the CPU cgrain::ApplyBodyToGrains — the
+// EXACT bit-exact reference the Vulkan --cgrain-displace-shot GPU==CPU memcmp compares against -> byte-identical
+// to the Vulkan GPU result BY CONSTRUCTION (the couple_displace.comp convention). The CG1 query passes stay int32
+// MSL-native. So this builds the SAME scene (a settled DENSE 16x8x16 grain bed packed at 0.5 spacing + an FxBody
+// sphere radius 2 BURIED in it, MOVING), runs cgrain::ApplyBodyToGrains, and CPU-colors the SAME integer
+// side-view cavity golden as the Vulkan --cgrain-displace-shot -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). New golden tests/golden/metal/cgrain_displace.png (baked on
+// the Mac by the CONTROLLER); two runs DIFF 0.0000. NO new RHI.
+static int RunCgrainDisplaceShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgrain = hf::sim::cgrain;
+    namespace grain  = hf::sim::grain;
+    namespace fpx    = hf::sim::fpx;
+
+    // The scene (== the Vulkan --cgrain-displace-shot config). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+    const grain::fx kHSearch = grain::kOne + grain::kOne / 2;  // 1.5
+
+    // A DENSE PACKED bed (spacing == 2*radius so grains touch): 16x8x16 = 2048 grains, 0.25-radius, settled.
+    grain::GrainBlock block;
+    block.W = 16; block.H = 8; block.D = 16;
+    block.spacing = grain::kOne / 2;
+    block.radius = kRadius;
+    block.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+    std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(block);
+    grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kHSearch, grain::kGrainMu, 2, 60);
+
+    auto makeWorld = [&]() {
+        cgrain::CGrainWorld w;
+        w.grains  = bed;
+        w.hSearch = kHSearch;
+        w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(4 * (int)grain::kOne), (fpx::fx)(2 * (int)grain::kOne),
+                            (fpx::fx)(4 * (int)grain::kOne)};
+        b.vel = fpx::FxVec3{(fpx::fx)(2 * (int)grain::kOne), (fpx::fx)(1 * (int)grain::kOne), 0};  // moving
+        b.invMass = grain::kOne; b.flags = fpx::kFlagDynamic;
+        b.radius  = (fpx::fx)(2 * (int)grain::kOne);
+        w.bodies = {b};
+        return w;
+    };
+    cgrain::CGrainWorld world = makeWorld();
+    const int kBodyCount = (int)world.bodies.size();
+    const int kGrainCount = (int)world.grains.size();
+
+    // CPU ApplyBodyToGrains (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the Metal
+    // result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    const uint32_t kDisplaced = cgrain::CountDisplacedGrains(world);
+    cgrain::CGrainWorld cpuWorld = world;
+    cgrain::ApplyBodyToGrains(cpuWorld, kDt);
+
+    std::printf("cgrain-displace: {bodies:%d, grains:%d, displaced:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cgrain::ApplyBodyToGrains, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kGrainCount, kDisplaced);
+
+    // determinism: two runs byte-identical.
+    {
+        cgrain::CGrainWorld b = world;
+        cgrain::ApplyBodyToGrains(b, kDt);
+        if (b.grains.size() != cpuWorld.grains.size() ||
+            std::memcmp(b.grains.data(), cpuWorld.grains.data(),
+                        b.grains.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("cgrain-displace: two runs differ (nondeterministic)");
+        std::printf("cgrain-displace determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // no-penetration (the HONEST FL4/GR3/CP3 metric): penAfter < penBefore + displaced > 0 (the sand parted).
+    {
+        const cgrain::GrainBodyPenetration before = cgrain::MeasureGrainBodyPenetration(world);
+        const cgrain::GrainBodyPenetration after  = cgrain::MeasureGrainBodyPenetration(cpuWorld);
+        if (!(kDisplaced > 0u) || !(after.summed < before.summed))
+            return fail("cgrain-displace: did NOT part the sand (penAfter >= penBefore or 0 displaced)");
+        std::printf("cgrain-displace no-penetration: {penBefore:%lld, penAfter:%lld} (sand parted)\n",
+                    (long long)before.summed, (long long)after.summed);
+    }
+
+    // no-op: a body clear of the bed (zero bodies) -> the sand is unchanged.
+    {
+        cgrain::CGrainWorld clearWorld = world;
+        clearWorld.bodies.clear();
+        std::vector<grain::GrainParticle> beforeGrains = clearWorld.grains;
+        cgrain::ApplyBodyToGrains(clearWorld, kDt);
+        if (std::memcmp(beforeGrains.data(), clearWorld.grains.data(),
+                        beforeGrains.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("cgrain-displace: clear (zero bodies) changed the sand");
+        std::printf("cgrain-displace clear: sand unchanged (no-op)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the displaced bed + the buried body (IDENTICAL to the
+    // Vulkan --cgrain-displace-shot by construction; dim sand with the cavity where the body parted the sand +
+    // a warm body disk + an integer radius ring). ---
+    const int kPxPerUnit = 26, kImgMargin = 24;
+    const int kWorldW = 9, kWorldH = 9;
+    const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kImgMargin + wx * kPxPerUnit;
+        cy = (int)imgH - kImgMargin - wy * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.55f, 0.42f, 0.22f}, 0);
+    }
+    {
+        const fpx::FxBody& fb = world.bodies[0];
+        int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+        const int rPx = (fb.radius >> grain::kFrac) * kPxPerUnit;
+        for (int a = 0; a < 360; a += 3) {
+            const double rad = (double)a * 3.14159265358979 / 180.0;
+            const int rx = bcx + (int)((double)rPx * std::cos(rad));
+            const int ry = bcy - (int)((double)rPx * std::sin(rad));
+            if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+            }
+        }
+        plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgrain displacement cavity (displaced %u grains)\n",
+                outPath, imgW, imgH, kDisplaced);
+    return 0;
+}
+
 // ===== Slice CP2 — Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG showcase (--couple-buoyancy) =======
 // (the CRUX of FLAGSHIP #11, the FIRST momentum exchange). Like --grain-contact / --fluid-solve, the CP2
 // buoyancy/drag math is int64 (the buoyancy/drag fxmul/fxdiv + the vFluidAvg int64 sum + FxNormalize via
@@ -35846,6 +35995,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cgrain-support") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cgrain_support.png";
             try { return RunCgrainSupportShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgrain-displace <out.png>: render the Deterministic Rigid<->Grain Coupling GRAIN REACTION /
+        // DISPLACEMENT body->grain showcase (Slice CG3, the Newton's-3rd-law HALF of CG2). Like --couple-displace,
+        // the CG3 projection math is int64 -> cgrain_displace.comp is Vulkan-only; on Metal --cgrain-displace runs
+        // the CPU cgrain::ApplyBodyToGrains — the EXACT bit-exact reference the Vulkan --cgrain-displace-shot
+        // GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. The SAME
+        // dense grain bed + an FxBody sphere BURIED in it parts the sand (a cavity); the four proofs (GPU==CPU
+        // bit-exact, determinism, penAfter<penBefore + displaced>0, the clear no-op) + the integer cavity golden
+        // are identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/cgrain_displace.png; two
+        // runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgrain-displace") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgrain_displace.png";
+            try { return RunCgrainDisplaceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-buoyancy <out.png>: render the Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG

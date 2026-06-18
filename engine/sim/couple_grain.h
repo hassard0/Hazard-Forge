@@ -344,5 +344,110 @@ inline fx MeasureRestLine(const CGrainWorld& world) {
     return n == 0u ? 0 : (fx)(sum / (int64_t)n);
 }
 
+// ===== Slice CG3 — GRAIN REACTION / DISPLACEMENT (body->grain, Newton's 3rd law to CG2) ==============
+// THE SECOND HALF of FLAGSHIP #12's two-way exchange: the body now pushes BACK on the sand. Each grain
+// INSIDE a body is projected out to the body surface (the body PARTS the sand — a cavity) AND receives the
+// equal-opposite DRAG-REACTION impulse (the body imparts its momentum to the surrounding grains). Completes
+// the two-way exchange (CG2 grain->body, CG3 body->grain). The CP3 ApplyBodyToFluid twin, with
+// grain::GrainParticle, and the positional push is LITERALLY grain.h::CollideGrainSphere(g,
+// GrainSphereFromBody(b)) — the grain-out-of-FxBody bridge already exists.
+//
+// THE MIRROR OF CG2 (per-GRAIN over the body set): CG2's body-force reduction was per-BODY (over its
+// gathered grains). CG3's grain displacement is the mirror — ONE thread per GRAIN, each grain iterates the
+// tiny body list (fixed order), and for each body that CONTAINS it accumulates the surface-snap push into a
+// SEPARATE dp[] (JACOBI) + applies the drag-reaction velocity impulse. Each grain writes ONLY its own
+// dp/vel -> per-grain-disjoint, race-free, NO atomics, [numthreads(64,1,1)] MULTI-THREAD, NO TDR (the
+// GR3/CP3 win; the EXACT shape of grain.h::CollideGrainSpheres, body as the sphere). int64
+// (FxLength/FxNormalize/fxmul) -> cgrain_displace.comp is VULKAN-SPIR-V-ONLY + the Metal --cgrain-displace
+// showcase runs THIS CPU ApplyBodyToGrains (byte-identical by construction, the CG2/GR3/CP3 split). The CG1
+// query passes stay int32 MSL-native.
+
+// kDragReaction: the body->grain drag-reaction coefficient (the CG2 kDrag partner — the equal-opposite of
+// the body's CG2 drag, now imparting the body's momentum to the grains). Host-snapped Q16.16 (~1.5, the CP3
+// kDragReaction value). The showcase + the CPU reference + the GPU shader share THIS exact constant.
+inline constexpr fx kDragReaction = (fx)(1.5 * (double)kOne + 0.5);   // 98304 (Q16.16, ~1.5 reaction drag)
+
+// ApplyBodyToGrains(world, dt): the per-grain projection-out-of-body + drag reaction (the GR3
+// CollideGrainSphere mold over the body set + a Jacobi dp[]). For each grain g (skip STATIC), over each
+// DYNAMIC body b (fixed order), with d = g.pos − b.pos, dist = FxLength(d), surf = b.radius + g.radius: if
+// dist < surf (the grain is INSIDE the body) accumulate the surface-snap push into a SEPARATE dp[] buffer
+//   dp_g += FxAdd(b.pos, FxScale(FxNormalize(d), surf)) − g.pos    // snap to the body surface (sphereR+grainR)
+// (dist==0 -> the FxNormalize +Y fallback — EXACTLY grain.h::CollideGrainSphere(g, GrainSphereFromBody(b)))
+// AND apply the drag-reaction velocity impulse per axis
+//   g.vel += fxmul(kDragReaction, (b.vel − g.vel)) · dt           // toward the body velocity
+// then apply g.pos += dp_g for ALL grains after (JACOBI — each grain reads the iteration-start body state,
+// NOT the in-progress positions). STATIC grains (kFlagStatic / boundary) -> dp 0, vel untouched. Non-dynamic
+// bodies are SKIPPED (they hold; CG3 is the dynamic-body reaction). int64 (FxLength/FxNormalize/fxmul).
+// cgrain_displace.comp copies THIS body VERBATIM (one thread per grain). Deterministic (the fixed body
+// order, fixed op order) -> bit-identical to the GPU memcmp + two-run byte-identical.
+inline void ApplyBodyToGrains(CGrainWorld& world, fx dt) {
+    const size_t n = world.grains.size();
+    const size_t bodyCount = world.bodies.size();
+    std::vector<FxVec3> dp((size_t)n, FxVec3{0, 0, 0});   // the Jacobi double-buffer (per-grain Δp)
+    for (size_t i = 0; i < n; ++i) {
+        grain::GrainParticle& g = world.grains[i];
+        if (g.flags & grain::kFlagStatic) continue;       // boundary grain -> dp 0, vel untouched
+        FxVec3 accum{0, 0, 0};
+        for (size_t bi = 0; bi < bodyCount; ++bi) {
+            const fpx::FxBody& b = world.bodies[bi];
+            if (!(b.flags & fpx::kFlagDynamic)) continue; // non-dynamic body -> holds (the pinned case)
+            const FxVec3 d = FxSub(g.pos, b.pos);         // grain relative to the body centre (outward)
+            const fx dist = FxLength(d);
+            const fx surf = b.radius + g.radius;          // the surfaces-touch distance (sphereR + grainR)
+            if (dist >= surf) continue;                   // outside the (expanded) body sphere -> no push
+            // (1) POSITIONAL DISPLACEMENT: snap the grain centre to the body surface (the body parts the sand).
+            const FxVec3 nrm = FxNormalize(d);            // outward normal (dist==0 -> {0,kOne,0} fallback)
+            const FxVec3 surfPt = FxAdd(b.pos, FxScale(nrm, surf));   // the surface point along the normal
+            accum = FxAdd(accum, FxSub(surfPt, g.pos));   // into the Jacobi dp[] (the CollideGrainSphere push)
+            // (2) DRAG REACTION: the body imparts momentum to the grain (the equal-opposite of CG2's drag).
+            const FxVec3 dv = FxSub(b.vel, g.vel);        // toward the body velocity
+            g.vel.x += fpx::fxmul(fpx::fxmul(kDragReaction, dv.x), dt);
+            g.vel.y += fpx::fxmul(fpx::fxmul(kDragReaction, dv.y), dt);
+            g.vel.z += fpx::fxmul(fpx::fxmul(kDragReaction, dv.z), dt);
+        }
+        dp[i] = accum;
+    }
+    // Apply pos += dp for all grains (Jacobi — disjoint per-grain writes, race-free).
+    for (size_t i = 0; i < n; ++i) {
+        if (world.grains[i].flags & grain::kFlagStatic) continue;
+        world.grains[i].pos = FxAdd(world.grains[i].pos, dp[i]);
+    }
+}
+
+// MeasureGrainBodyPenetration(world): the honest no-penetration metric (the FL4/GR3/CP3 caveat) — over every
+// grain / dynamic body pair, sum/max the grain-into-body penetration pen = (b.radius + g.radius) −
+// |g.pos − b.pos| > 0. Returns {peak, summed} in Q16.16 (int64 accumulator). DETERMINISTIC + bit-exact. The
+// showcase's "sand parted" proof compares this BEFORE vs AFTER ApplyBodyToGrains (penAfter < penBefore — the
+// FL4/GR3 honesty: relieved, NOT zero; Jacobi single-projection so a grain inside MULTIPLE bodies leaves a
+// deterministic-but-nonzero residual). Static grains are counted (they CAN sit inside a body; CG3 does not
+// move them, so their penetration is part of the honest residual). Non-dynamic bodies skipped.
+struct GrainBodyPenetration { int64_t peak = 0; int64_t summed = 0; };
+inline GrainBodyPenetration MeasureGrainBodyPenetration(const CGrainWorld& world) {
+    GrainBodyPenetration out;
+    for (const grain::GrainParticle& g : world.grains)
+        for (const fpx::FxBody& b : world.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            const fx pen = (b.radius + g.radius) - FxLength(FxSub(g.pos, b.pos));
+            if (pen > 0) { out.summed += (int64_t)pen; if ((int64_t)pen > out.peak) out.peak = (int64_t)pen; }
+        }
+    return out;
+}
+
+// CountDisplacedGrains(world): the deterministic count of grains INSIDE at least one dynamic body (dist <
+// b.radius + g.radius) — the "displaced > 0" coverage stat for the showcase proof. Static grains ARE counted
+// (they sit inside the body too). Pure int64 compare -> bit-exact CPU<->GPU.
+inline uint32_t CountDisplacedGrains(const CGrainWorld& world) {
+    uint32_t c = 0;
+    for (const grain::GrainParticle& g : world.grains) {
+        bool inside = false;
+        for (const fpx::FxBody& b : world.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            if (FxLength(FxSub(g.pos, b.pos)) < (b.radius + g.radius)) { inside = true; break; }
+        }
+        if (inside) ++c;
+    }
+    return c;
+}
+
 }  // namespace cgrain
 }  // namespace hf::sim

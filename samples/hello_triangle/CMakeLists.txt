@@ -583,6 +583,21 @@ hf_compile_shaders(
     # couple_grain.h::StepCGrainSupportSteps (memcmp — the make-or-break). NO new RHI; CG1's cgrain_body_
     # {count,scan,emit} shaders + their goldens UNCHANGED (CG2 is additive; the CG1 query passes stay int32 MSL-native).
     "shaders/cgrain_support.comp.hlsl:cs"
+    # Deterministic Rigid<->Grain Coupling Slice 3 (Slice CG3, the GRAIN REACTION / DISPLACEMENT body->grain pass
+    # — the Newton's-3rd-law HALF of CG2, the 3rd slice of FLAGSHIP #12). ONE new int64 shader:
+    # cgrain_displace.comp — ONE THREAD PER GRAIN (multi-thread OVER grains, each thread serially iterates the
+    # tiny body list, fixed order). For each DYNAMIC body that CONTAINS the grain (dist < b.radius + g.radius),
+    # it (1) accumulates the surface-snap push (snap the grain centre to b.radius+g.radius along the outward
+    # normal — LITERALLY grain.h::CollideGrainSphere(g, GrainSphereFromBody(b))) into a per-thread Jacobi dp +
+    # (2) applies the equal-opposite drag-reaction velocity impulse (toward the body velocity), then writes
+    # pos += dp + the updated vel; ApplyBodyToGrains copied VERBATIM from engine/sim/couple_grain.h. Per-grain
+    # DISJOINT -> NO race, NO atomics, [numthreads(64,1,1)] MULTI-THREAD, NO TDR (the GR3/CP3 win). Because the
+    # FxLength/FxNormalize (FxISqrt) + the drag-reaction fxmul use int64, cgrain_displace.comp is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal
+    # --cgrain-displace showcase runs the CPU cgrain::ApplyBodyToGrains (byte-identical by construction). The
+    # GPU grain array is PROVEN BIT-EXACT vs the CPU reference (memcmp — the make-or-break). NO new RHI; CG1/CG2
+    # cgrain code + shaders + their goldens UNCHANGED (CG3 is additive; the CG1 query passes stay int32 MSL-native).
+    "shaders/cgrain_displace.comp.hlsl:cs"
     # Deterministic Rigid<->Fluid Coupling Slice 2 (Slice CP2, the BUOYANCY + DRAG fluid->body pass — the CRUX
     # of FLAGSHIP #11, the FIRST momentum exchange). ONE new int64 shader: couple_buoyancy.comp — ONE THREAD
     # PER BODY (multi-thread OVER bodies, NOT per particle), each thread SERIALLY sums its body's CP1 gathered

@@ -472,6 +472,184 @@ int main() {
               "body-order independence: B's settled state is identical in [A,B] vs [B,A]");
     }
 
+    // ============================================================================================
+    // ===== Slice CG3 — GRAIN REACTION / DISPLACEMENT (body->grain, Newton's 3rd law to CG2) ======
+    // ============================================================================================
+    // ApplyBodyToGrains: a grain INSIDE a body -> snapped to the body surface (|g-b.pos| == b.radius +
+    // g.radius within an LSB) + a drag-reaction velocity toward the body; a grain OUTSIDE -> untouched; a
+    // STATIC grain -> untouched (dp 0, vel 0); two bodies fixed-order; MeasureGrainBodyPenetration on a known
+    // overlap; CountDisplacedGrains; determinism.
+
+    // ---- ApplyBodyToGrains: ONE grain inside the body -> snapped to the surface + drag toward body vel ----
+    // Body at (0,0,0) r=4 (dynamic), one grain at (0,1,0) r=1. d = g.pos - b.pos = (0, kOne, 0); dist=kOne;
+    // surf = 4+1 = 5. dist(1) < surf(5) -> inside. n = (0,kOne,0); surfPt = b.pos + n*surf = (0, 5, 0). dp =
+    // surfPt - g.pos = (0, 4, 0). The grain has vel 0; body vel = (kOne, 0, 0) -> drag reaction toward +X.
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 1, 0, 1);     // r=1, dynamic, vel 0
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 0, 0, 4);               // dynamic, r=4
+        b.vel = fpx::FxVec3{kOne, 0, 0};                  // body moving +X
+        world.bodies = {b};
+
+        cgrain::ApplyBodyToGrains(world, dt);
+
+        // Snapped to the surface: |g.pos - b.pos| == surf (4+1==5) within an LSB epsilon (FxNormalize+FxScale
+        // truncate toward zero, so the snapped length lands a few LSBs short — the kGrainCollideEps band).
+        const fx surf = FromInt(5);
+        const fx dist = fpx::FxLength(fpx::FxSub(world.grains[0].pos, world.bodies[0].pos));
+        check(dist <= surf && dist >= surf - 64, "displace: grain snapped to the body surface (|g-b| == r+gr within an LSB band)");
+        // The snap is along +Y (the grain was directly above the body): pos.x/z stay 0, pos.y rises to ~5.
+        check(world.grains[0].pos.x == 0 && world.grains[0].pos.z == 0, "displace: pure-+Y grain stays on the Y axis");
+        check(world.grains[0].pos.y == FromInt(5), "displace: grain snapped to y = b.pos.y + surf (= 5)");
+        // Drag reaction toward the body's +X velocity: vel.x > 0, exact replay.
+        const fx expVelX = fpx::fxmul(fpx::fxmul(cgrain::kDragReaction, kOne /*b.vel.x - 0*/), dt);
+        check(world.grains[0].vel.x == expVelX, "displace: drag reaction vel.x == fxmul(fxmul(kDragReaction, b.vel.x), dt)");
+        check(world.grains[0].vel.x > 0, "displace: drag pulls the grain toward the body's +X velocity");
+        check(world.grains[0].vel.y == 0 && world.grains[0].vel.z == 0, "displace: drag only along the body's velocity axis");
+    }
+
+    // ---- ApplyBodyToGrains: a grain OUTSIDE the body -> untouched ----
+    // Body at (0,0,0) r=2, grain at (0,10,0) r=1: dist=10 >= surf=3 -> NO displacement, vel unchanged.
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 10, 0, 1);
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 0, 0, 2);
+        b.vel = fpx::FxVec3{kOne, 0, 0};
+        world.bodies = {b};
+
+        cgrain::ApplyBodyToGrains(world, dt);
+        check(std::memcmp(&world.grains[0], &g, sizeof(grain::GrainParticle)) == 0,
+              "displace: a grain clear of the body is byte-untouched (no push, no drag)");
+    }
+
+    // ---- ApplyBodyToGrains: a STATIC grain inside the body -> untouched (dp 0, vel untouched) ----
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 1, 0, 1);
+        g.flags = grain::kFlagStatic; g.invMass = 0;
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 0, 0, 4);
+        b.vel = fpx::FxVec3{kOne, 0, 0};
+        world.bodies = {b};
+
+        cgrain::ApplyBodyToGrains(world, dt);
+        check(std::memcmp(&world.grains[0], &g, sizeof(grain::GrainParticle)) == 0,
+              "displace: a STATIC grain inside the body is byte-untouched (the pinned case)");
+    }
+
+    // ---- ApplyBodyToGrains: a NON-DYNAMIC body does not displace grains ----
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(0, 1, 0, 1);
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 0, 0, 4);
+        b.flags = 0;                                      // NOT dynamic -> holds
+        b.vel = fpx::FxVec3{kOne, 0, 0};
+        world.bodies = {b};
+
+        cgrain::ApplyBodyToGrains(world, dt);
+        check(std::memcmp(&world.grains[0], &g, sizeof(grain::GrainParticle)) == 0,
+              "displace: a non-dynamic body does not displace grains (skipped)");
+    }
+
+    // ---- ApplyBodyToGrains == grain.h CollideGrainSphere(g, GrainSphereFromBody(b)) (the bridge) ----
+    // The positional snap MUST equal grain.h's projection (the spec's reuse claim). Run both on the same
+    // grain/body and assert the resulting position is identical (the drag is the CG3 addition; the push is
+    // literally CollideGrainSphere with a zero-velocity body so no drag).
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        grain::GrainParticle g = GrainAt(1, 2, 0, 1);     // offset so the normal is non-axis-aligned
+        world.grains = {g};
+        fpx::FxBody b = BodyAt(0, 0, 0, 3);
+        b.vel = fpx::FxVec3{0, 0, 0};                      // zero body vel -> no drag, pure positional snap
+        world.bodies = {b};
+        cgrain::ApplyBodyToGrains(world, dt);
+
+        // grain.h reference: project the SAME grain out of the SAME body via the bridge.
+        grain::GrainParticle gRef = GrainAt(1, 2, 0, 1);
+        grain::CollideGrainSphere(gRef, grain::GrainSphereFromBody(b));
+        check(world.grains[0].pos.x == gRef.pos.x && world.grains[0].pos.y == gRef.pos.y &&
+              world.grains[0].pos.z == gRef.pos.z,
+              "displace: the positional push == grain.h CollideGrainSphere(g, GrainSphereFromBody(b)) (the bridge)");
+    }
+
+    // ---- ApplyBodyToGrains: two bodies, fixed order, a grain inside BOTH gets the summed (Jacobi) push ----
+    // Two ASYMMETRIC bodies (different radii / centres) both containing a grain at (0,1,0). Each contributes a
+    // snap push into dp[]; the Jacobi sum is deterministic (fixed body order) and net non-zero (asymmetric).
+    // We assert determinism + that the grain MOVED (a multi-body residual is the honest FL4/GR3/CP3 caveat,
+    // not exact non-penetration).
+    {
+        const fx dt = kOne / 60;
+        auto makeWorld = [&]() {
+            cgrain::CGrainWorld w;
+            w.hSearch = h; w.dt = dt; w.groundY = 0;
+            w.grains = {GrainAt(0, 1, 0, 1)};
+            fpx::FxBody b0 = BodyAt(0, 0, 0, 4); b0.vel = fpx::FxVec3{0, 0, 0};
+            fpx::FxBody b1 = BodyAt(2, 1, 0, 5); b1.vel = fpx::FxVec3{0, 0, 0};   // offset in X, larger radius
+            w.bodies = {b0, b1};
+            return w;
+        };
+        cgrain::CGrainWorld w1 = makeWorld();
+        cgrain::CGrainWorld w2 = makeWorld();
+        cgrain::ApplyBodyToGrains(w1, dt);
+        cgrain::ApplyBodyToGrains(w2, dt);
+        check(std::memcmp(&w1.grains[0], &w2.grains[0], sizeof(grain::GrainParticle)) == 0,
+              "displace: two-body fixed-order projection is deterministic (two runs byte-identical)");
+        grain::GrainParticle orig = GrainAt(0, 1, 0, 1);
+        check(std::memcmp(&w1.grains[0].pos, &orig.pos, sizeof(fpx::FxVec3)) != 0,
+              "displace: a grain inside two bodies is displaced (the Jacobi sum moved it)");
+    }
+
+    // ---- MeasureGrainBodyPenetration on a known overlap + the BEFORE>AFTER relief ----
+    // Body at (0,0,0) r=4, a grain at (0,1,0) r=1: pen = (4+1) - 1 = 4 (kOne*4). MeasureGrainBodyPenetration
+    // reports it; after ApplyBodyToGrains the grain is snapped out -> penAfter < penBefore.
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        world.grains = {GrainAt(0, 1, 0, 1)};
+        fpx::FxBody b = BodyAt(0, 0, 0, 4); b.vel = fpx::FxVec3{0, 0, 0};
+        world.bodies = {b};
+
+        cgrain::GrainBodyPenetration before = cgrain::MeasureGrainBodyPenetration(world);
+        check(before.peak == FromInt(4), "penetration: peak == (b.radius+g.radius) - dist == 4");
+        check(before.summed == FromInt(4), "penetration: summed == 4 (one overlapping pair)");
+        check(cgrain::CountDisplacedGrains(world) == 1u, "displaced: 1 grain inside the body");
+
+        cgrain::ApplyBodyToGrains(world, dt);
+        cgrain::GrainBodyPenetration after = cgrain::MeasureGrainBodyPenetration(world);
+        check(after.summed < before.summed, "penetration: penAfter < penBefore (the sand parted, relieved)");
+    }
+
+    // ---- ApplyBodyToGrains: zero bodies / clear body -> the grains are byte-unchanged (the no-op) ----
+    {
+        const fx dt = kOne / 60;
+        cgrain::CGrainWorld world;
+        world.hSearch = h; world.dt = dt; world.groundY = 0;
+        std::vector<grain::GrainParticle> grains;
+        for (int x = 0; x <= 4; ++x) grains.push_back(GrainAt(x, 0, 0, 1));
+        world.grains = grains;
+        world.bodies = {};                                // NO bodies
+        cgrain::ApplyBodyToGrains(world, dt);
+        bool unchanged = true;
+        for (size_t i = 0; i < grains.size(); ++i)
+            if (std::memcmp(&world.grains[i], &grains[i], sizeof(grain::GrainParticle)) != 0) unchanged = false;
+        check(unchanged, "displace: zero bodies -> the grains are byte-unchanged (no-op)");
+        check(cgrain::CountDisplacedGrains(world) == 0u, "displaced: zero bodies -> 0 displaced grains");
+    }
+
     if (g_fail == 0) std::printf("cgrain_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
