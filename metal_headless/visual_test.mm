@@ -19684,6 +19684,152 @@ static int RunCgfQueryShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GF2 — Deterministic Grain<->Fluid Coupling BUOYANCY + DRAG showcase (--cgf-buoyancy) ============
+// (the CRUX of FLAGSHIP #13, the FIRST momentum exchange, the CG2 contact-support twin with a COUNT-based
+// buoyancy, per-PARTICLE). Like --cgrain-support / --couple-buoyancy, the GF2 buoyancy/drag math is int64
+// (FxNormalize via FxISqrt + the buoyancy/drag fxmul/fxdiv + the vFluidAvg int64 sum) -> glslc can't parse
+// int64 -> cgf_buoyancy.comp is VULKAN-SPIR-V-ONLY (NOT in this dir's hf_gen_msl list); on Metal the
+// --cgf-buoyancy showcase runs the CPU cgf::StepCGFBuoyancy — the EXACT bit-exact reference the Vulkan
+// --cgf-buoyancy-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION (the cgrain_support.comp convention). The GF1 cross-query passes (re-run each step inside
+// StepCGFBuoyancy) stay int32 MSL-native. So this builds the SAME scene (a settled packed 12x4x6 grain bed +
+// a 4x6x6 fluid block over its LEFT half, gravity -9.8 host-snapped, groundY=0, dt=kOne/60, K=200 steps), runs
+// cgf::StepCGFBuoyancySteps, and CPU-colors the SAME integer side-view wet/dry golden as the Vulkan
+// --cgf-buoyancy-shot -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-
+// pixel bar). New golden tests/golden/metal/cgf_buoyancy.png (baked on the Mac by the CONTROLLER); two runs
+// DIFF 0.0000. NO new RHI.
+static int RunCgfBuoyancyShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgf   = hf::sim::cgf;
+    namespace grain = hf::sim::grain;
+    namespace fluid = hf::sim::fluid;
+
+    // The scene (== the Vulkan --cgf-buoyancy-shot config). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+    const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (coupling radius)
+    const int kSteps = 200;
+
+    // A packed grain bed: 12x4x6 = 288 grains, 0.5 spacing, settled by GR4 friction.
+    grain::GrainBlock gblock;
+    gblock.W = 12; gblock.H = 4; gblock.D = 6;
+    gblock.spacing = grain::kOne / 2;
+    gblock.radius = kRadius;
+    gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+    std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+    grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+    // A fluid block over the LEFT half: 4x6x6 = 144 fluid particles, 0.5 spacing.
+    fluid::FluidBlock fblock;
+    fblock.W = 4; fblock.H = 6; fblock.D = 6;
+    fblock.spacing = grain::kOne / 2;
+    fblock.origin = grain::FxVec3{0, (grain::fx)(0), 0};
+    std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+    auto makeWorld = [&]() {
+        cgf::CGFWorld w;
+        w.grains  = bed;
+        w.fluid   = fluidP;
+        w.h       = kH;
+        w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+        return w;
+    };
+    cgf::CGFWorld world = makeWorld();
+    const int kGrainCount = (int)world.grains.size();
+    const int kFluidCount = (int)world.fluid.size();
+
+    // CPU StepCGFBuoyancy (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the Metal
+    // result is byte-identical to the Vulkan GPU result BY CONSTRUCTION). buoyEnabled=0 -> the buoy=0 control.
+    auto runSolve = [&](int buoyEnabled) {
+        cgf::CGFWorld w = world;
+        if (buoyEnabled) cgf::StepCGFBuoyancySteps(w, kDt, kSteps);
+        else             cgf::StepCGFBuoyancyControlSteps(w, kDt, 0, kSteps);
+        return w;
+    };
+    cgf::CGFWorld cpuWorld = runSolve(1);
+    const cgf::WetDry kWD = cgf::MeasureWetDry(cpuWorld);
+
+    std::printf("cgf-buoyancy: {grains:%d, fluid:%d, steps:%d, wetY:%d, dryY:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cgf::StepCGFBuoyancy, byte-identical to the Vulkan GPU result by construction]\n",
+                kGrainCount, kFluidCount, kSteps, (int)kWD.wetY, (int)kWD.dryY);
+
+    // determinism.
+    {
+        cgf::CGFWorld b = runSolve(1);
+        bool same = (b.grains.size() == cpuWorld.grains.size());
+        for (size_t i = 0; same && i < b.grains.size(); ++i)
+            if (std::memcmp(&b.grains[i], &cpuWorld.grains[i], sizeof(grain::GrainParticle)) != 0) same = false;
+        if (!same) return fail("cgf-buoyancy: two runs differ (nondeterministic)");
+        std::printf("cgf-buoyancy determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // WET LIGHTENS (the headline + the HONEST metric): wetY > dryY by a margin.
+    {
+        const grain::fx kMargin = grain::kOne / 8;
+        if (!(kWD.wet > 0u) || !(kWD.dry > 0u) || !(kWD.wetY > kWD.dryY + kMargin))
+            return fail("cgf-buoyancy: wet did NOT lighten");
+        std::printf("cgf-buoyancy lightens: wetY %d > dryY %d (submerged grains buoyed)\n",
+                    (int)kWD.wetY, (int)kWD.dryY);
+    }
+
+    // buoy=0 control packs dry: wetY ≈ dryY within a band (buoyancy does the work).
+    {
+        cgf::CGFWorld ctrl = runSolve(0);
+        const cgf::WetDry kCtrlWD = cgf::MeasureWetDry(ctrl);
+        grain::fx ctrlDiff = kCtrlWD.wetY - kCtrlWD.dryY; if (ctrlDiff < 0) ctrlDiff = -ctrlDiff;
+        const grain::fx kBand = grain::kOne / 4;
+        if (!(ctrlDiff < kBand) || !(kWD.wetY > kCtrlWD.wetY))
+            return fail("cgf-buoyancy: control buoy=0 did NOT pack dry");
+        std::printf("cgf-buoyancy control: buoy=0 packs dry (buoyancy does work)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the wet (warm/loose) vs dry (dim/packed) grains + the
+    // static fluid block (IDENTICAL to the Vulkan --cgf-buoyancy-shot by construction). ---
+    const cgf::CGFNeighbors goldenNbr = cgf::BuildCGFNeighbors(cpuWorld);   // classify wet/dry at rest
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldW = 8, kWorldH = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kMargin + wx * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kFluidCount; ++i) {
+        int cx, cy; toPx(cpuWorld.fluid[(size_t)i].pos.x, cpuWorld.fluid[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.10f, 0.30f, 0.55f}, 1);
+    }
+    for (int i = 0; i < kGrainCount; ++i) {
+        const uint32_t cnt = goldenNbr.gfStart[(size_t)i + 1] - goldenNbr.gfStart[(size_t)i];
+        int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+        const Vec3 col = (cnt > 0u) ? Vec3{0.95f, 0.70f, 0.30f} : Vec3{0.40f, 0.28f, 0.16f};
+        plot(cx, cy, col, 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgf buoyancy wet/dry (wetY %d > dryY %d)\n",
+                outPath, imgW, imgH, (int)kWD.wetY, (int)kWD.dryY);
+    return 0;
+}
+
 // ===== Slice CG2 — Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG showcase (--cgrain-support) ====
 // (the CRUX of FLAGSHIP #12, the FIRST momentum exchange, the CP2 buoyancy twin with contact-support physics).
 // Like --couple-buoyancy / --grain-contact, the CG2 support/drag math is int64 (FxLength/FxNormalize via FxISqrt
@@ -37086,6 +37232,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cgf-query") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cgf_query.png";
             try { return RunCgfQueryShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgf-buoyancy <out.png>: render the Deterministic Grain<->Fluid Coupling BUOYANCY + DRAG fluid->grain
+        // showcase (Slice GF2, the CRUX of FLAGSHIP #13, the FIRST momentum exchange). Like --cgrain-support, the
+        // GF2 buoyancy/drag math is int64 -> cgf_buoyancy.comp is Vulkan-only; on Metal --cgf-buoyancy runs the
+        // CPU cgf::StepCGFBuoyancy — the EXACT bit-exact reference the Vulkan --cgf-buoyancy-shot GPU==CPU memcmp
+        // compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. The SAME packed grain bed
+        // + a fluid block over its left half lightens the submerged grains; the four proofs (GPU==CPU bit-exact,
+        // determinism, wet lightens above dry within a band, the buoy=0 control packs dry) print. New golden
+        // tests/golden/metal/cgf_buoyancy.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgf-buoyancy") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgf_buoyancy.png";
+            try { return RunCgfBuoyancyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cgrain-support <out.png>: render the Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG

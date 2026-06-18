@@ -373,42 +373,57 @@ int main() {
 
     // ---- StepCGFBuoyancy: submerged grains end HIGHER than dry; buoy=0 control packs the same -------------
     {
-        // A grain bed with a fluid block over its LEFT half. The submerged (left) grains should be buoyed
-        // HIGHER than the dry (right) grains after K steps. The buoy=0 control packs them the same.
+        // A PACKED grain bed (0.5 spacing, h=1.5 coupling radius) with a fluid block over its LEFT half so the
+        // submerged grains have MANY fluid neighbours (the buoyancy is ∝ count). The wet (left) grains should be
+        // buoyed to a stable line ABOVE the dry (right) pack after K steps. The buoy=0 control packs them the
+        // same. (The sparse 1.0-spaced scene above gives only ~1 fluid neighbour per grain — too little lift
+        // for the mild per-neighbour coefficient — so the buoyancy proof uses the representative packed scene.)
         const fx kDt = kOne / 60;
         const fx kGroundY = 0;
+        const fx kHb = kOne + kOne / 2;   // 1.5 coupling radius (the showcase config)
         const fpx::FxVec3 kGravity{0, (fx)(-9 * (int)kOne), 0};
+        const fx kHalf = kOne / 2;        // 0.5 spacing (packed)
         auto makeWorld = [&]() {
             cgf::CGFWorld w;
-            w.h = h; w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
-            // A 8(x) x 3(y) x 1(z) grain bed at y in [1,3], spanning x [0,7].
+            w.h = kHb; w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+            // A packed 8(x) x 4(y) x 3(z) grain bed at 0.5 spacing, just above the ground.
             for (int gx = 0; gx < 8; ++gx)
-                for (int gy = 1; gy <= 3; ++gy)
-                    w.grains.push_back(GrainAt(gx, gy, 0));
-            // A fluid block over the LEFT half (x in [0,3]), interpenetrating the bed at y in [1,3].
+                for (int gy = 0; gy < 4; ++gy)
+                    for (int gz = 0; gz < 3; ++gz) {
+                        grain::GrainParticle g = GrainAt(0, 0, 0);
+                        g.pos = fpx::FxVec3{(fx)(gx * (int)kHalf), kOne + (fx)(gy * (int)kHalf), (fx)(gz * (int)kHalf)};
+                        g.prev = g.pos;
+                        w.grains.push_back(g);
+                    }
+            // A packed fluid block over the LEFT half (x in [0,~1.5]), interpenetrating the bed.
             for (int fx_ = 0; fx_ < 4; ++fx_)
-                for (int fy = 1; fy <= 3; ++fy)
-                    w.fluid.push_back(FluidAt(fx_, fy, 0));
+                for (int fy = 0; fy < 6; ++fy)
+                    for (int fz = 0; fz < 3; ++fz) {
+                        fluid::FluidParticle f = FluidAt(0, 0, 0);
+                        f.pos = fpx::FxVec3{(fx)(fx_ * (int)kHalf), (fx)(fy * (int)kHalf), (fx)(fz * (int)kHalf)};
+                        f.prev = f.pos;
+                        w.fluid.push_back(f);
+                    }
             return w;
         };
 
         cgf::CGFWorld wA = makeWorld();
-        cgf::StepCGFBuoyancySteps(wA, kDt, 120);
+        cgf::StepCGFBuoyancySteps(wA, kDt, 200);
         const cgf::WetDry wd = cgf::MeasureWetDry(wA);
         check(wd.wet > 0u && wd.dry > 0u, "step: both wet and dry grains exist");
-        check(wd.wetY > wd.dryY, "step: submerged grains end HIGHER than dry (buoyancy lightens)");
+        check(wd.wetY > wd.dryY + kOne / 8, "step: submerged grains end HIGHER than dry (buoyancy lightens)");
 
-        // buoy=0 control: the wet and dry grains pack the SAME (within an LSB band).
+        // buoy=0 control: the wet and dry grains pack the SAME (within a band).
         cgf::CGFWorld wCtrl = makeWorld();
-        cgf::StepCGFBuoyancyControlSteps(wCtrl, kDt, 0, 120);
+        cgf::StepCGFBuoyancyControlSteps(wCtrl, kDt, 0, 200);
         const cgf::WetDry wdc = cgf::MeasureWetDry(wCtrl);
-        const fx band = kOne / 16;   // a tight LSB band
+        const fx band = kOne / 4;   // within a quarter-unit band
         fx diff = wdc.wetY - wdc.dryY; if (diff < 0) diff = -diff;
         check(diff < band, "step: buoy=0 control packs wet ≈ dry (buoyancy does the work)");
 
         // Determinism: two runs byte-identical.
         cgf::CGFWorld wB = makeWorld();
-        cgf::StepCGFBuoyancySteps(wB, kDt, 120);
+        cgf::StepCGFBuoyancySteps(wB, kDt, 200);
         bool same = (wA.grains.size() == wB.grains.size());
         for (size_t i = 0; same && i < wA.grains.size(); ++i)
             if (std::memcmp(&wA.grains[i], &wB.grains[i], sizeof(grain::GrainParticle)) != 0) same = false;

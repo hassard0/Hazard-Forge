@@ -463,6 +463,7 @@ int main(int argc, char** argv) {
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
     const char* cgrainQueryShotPath = nullptr; // --cgrain-query-shot <out.bmp> (Slice CG1: Deterministic Rigid<->Grain Coupling UNIFIED bodies+grains WORLD + BODY->GRAIN grid-hash QUERY, the BEACHHEAD of FLAGSHIP #12 — a poured grain bed (GR1 InitGrainBlock, settled with GR4 friction steps) + a few FxBody spheres placed partly buried. Build the GR2 grain grid + cell table (reused grain_cell_{count,scan,emit}) then the per-body grain QUERY via THREE pure-INT32 count->scan->emit passes (cgrain_body_{count,scan,emit}.comp, MSL-native): each body gathers the grains inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - g.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CG2/CG3). GPU=={cellStart,cellGrains,bodyStart,bodyGrains}==CPU couple_grain.h::GatherBodyGrains bit-exact (memcmp), per-body gathered-grain heat viz (buried bodies populated, clear bodies empty). NO momentum exchange (CG2 support/drag, CG3 displacement, CG4 step, CG5 lockstep, CG6 render), NO new RHI; couple_grain.h #includes fpx.h + grain.h read-only)
     const char* cgfQueryShotPath = nullptr; // --cgf-query-shot <out.bmp> (Slice GF1: Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL WORLD + SHARED-GRID CROSS QUERY, the BEACHHEAD of FLAGSHIP #13 — a settled grain bed (GR1 InitGrainBlock + GR4 friction) + an overlapping fluid block (FL1 InitBlock). Build ONE shared grid over BOTH pools' union AABB, bucket each pool into its own cell table (reused grain_cell_* + fluid_cell_* sized to the shared grid), then the two CROSS lists via SIX pure-INT32 count->scan->emit passes (cgf_gf_{count,scan,emit} grain->fluid + cgf_fg_{count,scan,emit} fluid->grain, MSL-native): each grain gathers the FLUID in its 27-cell stencil + each fluid the GRAINS in its 27-cell stencil, accepted iff the per-axis |query.axis - target.axis| < h box reject passes (the exact radial cull deferred to GF2/GF3). GPU=={grainCellTable,fluidCellTable,gfStart,gfNeighbors,fgStart,fgNeighbors}==CPU couple_gf.h::BuildCGFNeighbors bit-exact (memcmp), cross-pool neighbour heat viz (overlap populated, separated empty), the symmetry X==Y. NO momentum exchange (GF2-GF6), NO new RHI; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only)
+    const char* cgfBuoyancyShotPath = nullptr; // --cgf-buoyancy-shot <out.bmp> (Slice GF2, the BUOYANCY + DRAG fluid->grain pass, the CRUX of FLAGSHIP #13 — the FIRST momentum exchange. A settled grain bed with a fluid block over PART of it: each step re-runs the GF1 cross-query (cgf_gf/cgf_fg_{count,scan,emit}, int32 MSL-native) from the grains' CURRENT positions, then cgf_buoyancy.comp (ONE thread per GRAIN, int64 -> Vulkan-only) sums over its OWN gfNeighbors fluid list a buoyant impulse (∝ the fluid count, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the grain's vel, then the host integrates (IntegrateGrains). Over K steps the SUBMERGED grains LIGHTEN/rise while DRY grains pack. AccumGrainBuoyancy copied VERBATIM from engine/sim/couple_gf.h. GPU grain state PROVEN BIT-EXACT vs the CPU couple_gf.h::StepCGFBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) WET LIGHTENS — wetY > dryY by a margin (the honest emergent wet/dry contrast, NOT an exact buoyancy depth — the CP2/GR4 caveat); (4) buoy=0 control packs dry (wetY ≈ dryY), proving buoyancy does work. Metal --cgf-buoyancy runs the CPU StepCGFBuoyancy. PER-GRAIN Jacobi (multi-thread, NO TDR). NO grain->fluid reaction (GF3), NO coupled step (GF4), NO lockstep (GF5), NO lit render (GF6), NO grain torque, NO new RHI; GF1's cross-query passes + their goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h/couple_grain.h + engine/physics/ UNTOUCHED)
     const char* coupleDisplaceShotPath = nullptr; // --couple-displace-shot <out.bmp> (Slice CP3, the FLUID REACTION / DISPLACEMENT body->fluid pass, the Newton's-3rd-law half of CP2; the 3rd slice of FLAGSHIP #11. A body submerged in a fluid pool pushes BACK on the fluid: each fluid particle inside the body is projected out to the body surface (the body DISPLACES the fluid — a cavity/wake) + receives the equal-opposite drag impulse. couple_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) runs ApplyBodyToFluid VERBATIM from couple.h; the GPU fluid array PROVEN BIT-EXACT vs the CPU couple.h::ApplyBodyToFluid (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) no-penetration penAfter<penBefore + displaced>0 (the fluid parted, the Jacobi single-projection caveat — relieved NOT zero); (4) a body clear of the fluid -> unchanged (no-op). Metal --couple-displace runs the CPU ApplyBodyToFluid. NO new RHI; CP1/CP2 couple code+shaders + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleStepShotPath = nullptr; // --couple-step-shot <out.bmp> (Slice CP4, THE COUPLED STEP — the bobbing barrel, the INTEGRATED two-way solver of FLAGSHIP #11. ONE deterministic tick composes the FL4 fluid sub-passes + CP2 fluid->body + CP3 body->fluid + the rigid integrate in the LOCKED (1)-(5) order -> a barrel BOBS under emergent buoyancy in an incompressible fluid, NO script. CP4 ORCHESTRATES the existing FL4 fluid_* + CP2 couple_buoyancy + CP3 couple_displace shaders (NO new shader, NO new RHI): the Vulkan GPU driver is the host-driven multi-pass mold of --fluid-solve-shot, re-running per step the FL2 query + FL4 density + CP3 displace + CP2 buoyancy passes with ComputeToComputeBarrier between, ReadBuffer reads the fluid + body arrays PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleSteps. A static basin holds a dynamic pool + a body dropped above it (radius 2, invMass=kOne/iters; h=2.0, iters=3, K=400). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) coupled — the body floats above the bed by a margin AND bobbed peak-to-trough>threshold AND the fluid stayed coherent (density residual bounded); (4) buoy=0 control sinks while the fluid settles. The HONEST emergent float line + bob (the GR4/FL4 caveat). int64 -> the FL4/CP2/CP3 shaders are Vulkan-only; Metal --couple-step runs the CPU StepCoupleSteps. CP1-CP3 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleBuoyancyShotPath = nullptr; // --couple-buoyancy-shot <out.bmp> (Slice CP2, the BUOYANCY + DRAG fluid->body pass, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange. A settled fluid pool (FL1 InitBlock) + an FxBody sphere dropped ABOVE it: each step re-runs the CP1 body->fluid query (couple_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then couple_buoyancy.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a buoyant impulse (∝ the gathered count = the displaced volume, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, enters the pool, buoyancy builds as it submerges, and it settles to an emergent float line. AccumBodyForces copied VERBATIM from engine/sim/couple.h. GPU body state PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) FLOATS — floatY > groundY+radius by a margin, bounded above (the honest emergent float line, NOT an exact Archimedes depth — the GR4/FL4 caveat); (4) buoy=0 control SINKS to the bed (floatY == groundY+radius), proving buoyancy does work. Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO fluid reaction (CP3), NO coupled step (CP4), NO lockstep (CP5), NO float render (CP6), NO buoyancy torque, NO new RHI; CP1's query passes + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -709,6 +710,19 @@ int main(int argc, char** argv) {
         // momentum exchange (GF2-GF6), NO new RHI. STANDALONE branch (C1061 avoidance, like the cgrain-query shot).
         if (std::strcmp(argv[i], "--cgf-query-shot") == 0 && i + 1 < argc) {
             cgfQueryShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GF2: --cgf-buoyancy-shot <out.bmp> — the Deterministic Grain<->Fluid Coupling BUOYANCY + DRAG
+        // fluid->grain pass (the CRUX of FLAGSHIP #13, the FIRST momentum exchange). A settled grain bed with a
+        // fluid block over PART of it: each step re-runs the GF1 cross-query (int32 MSL-native) from the grains'
+        // CURRENT positions -> cgf_buoyancy.comp (ONE thread per GRAIN, int64 -> Vulkan-only) -> the host
+        // integrate (IntegrateGrains). The submerged grains LIGHTEN/rise; dry grains pack. GPU grain state
+        // bit-exact vs couple_gf.h::StepCGFBuoyancySteps (memcmp). int64 -> Vulkan-only; Metal --cgf-buoyancy
+        // runs the CPU StepCGFBuoyancy. PER-GRAIN Jacobi (NO TDR). NO new RHI. STANDALONE branch (C1061
+        // avoidance), like the cgf-query/cgrain-support shots.
+        if (std::strcmp(argv[i], "--cgf-buoyancy-shot") == 0 && i + 1 < argc) {
+            cgfBuoyancyShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16838,6 +16852,398 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cgf cross-pool neighbour heat (gf %u, fg %u)\n",
                                 cgfQueryShotPath, imgW, imgH, kGF, kFG);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgfQueryShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Grain<->Fluid Coupling BUOYANCY + DRAG fluid->grain pass (--cgf-buoyancy-shot
+        // <out.bmp>, Slice GF2, the CRUX of FLAGSHIP #13 — the FIRST momentum exchange). A settled grain bed with
+        // a fluid block over its LEFT half. Each step is HOST-driven over GPU passes: (a) re-run the GF1
+        // cross-query (the SIX reused cell passes + the SIX cgf_gf/cgf_fg passes, int32 MSL-native) from the
+        // grains' CURRENT positions -> gfStart + gfNeighbors; (b) cgf_buoyancy.comp (ONE thread per GRAIN, int64
+        // -> Vulkan-only) sums over each grain's OWN fluid list the buoyancy (∝ fluid count, up) + drag (toward
+        // the static fluid mean vel) impulse into the grain's vel; (c) read back the buoyancy-updated grain vel +
+        // host IntegrateGrains (the GR1 integrate VERBATIM, the SAME ops the CPU reference runs) + re-upload. The
+        // fluid is held STATIC (the reaction is GF3). Over K steps the SUBMERGED grains LIGHTEN/rise while the DRY
+        // grains pack. The GPU grain array is PROVEN BIT-EXACT vs the CPU couple_gf.h::StepCGFBuoyancySteps
+        // (memcmp, NO tol — the make-or-break). int64 -> Vulkan-only; Metal --cgf-buoyancy runs the CPU
+        // StepCGFBuoyancy. NO new RHI. STANDALONE branch (C1061).
+        if (cgfBuoyancyShotPath) {
+            using math::Vec3;
+            namespace cgf   = hf::sim::cgf;
+            namespace grain = hf::sim::grain;
+            namespace fluid = hf::sim::fluid;
+
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+            const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (host-snapped Q16.16, coupling radius)
+            const int kSteps = 200;
+
+            // A packed grain bed: 12x4x6 = 288 grains, 0.5 spacing (packed), settled by GR4 friction into a bed.
+            grain::GrainBlock gblock;
+            gblock.W = 12; gblock.H = 4; gblock.D = 6;                 // 288 grains
+            gblock.spacing = grain::kOne / 2;                         // 0.5 spacing == 2*radius (packed)
+            gblock.radius = kRadius;
+            gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+            std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+            grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+            // A fluid block over the LEFT half of the bed (x in [0, ~3]) at the bed's settled y so the fluid
+            // SUBMERGES the left grains. 4x6x6 = 144 fluid particles, 0.5 spacing, sitting over the left bed.
+            fluid::FluidBlock fblock;
+            fblock.W = 4; fblock.H = 6; fblock.D = 6;                  // 144 fluid particles
+            fblock.spacing = grain::kOne / 2;
+            fblock.origin = grain::FxVec3{0, (grain::fx)(0), 0};       // ground up the left half, over the bed
+            std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+            auto makeWorld = [&]() {
+                cgf::CGFWorld w;
+                w.grains  = bed;
+                w.fluid   = fluidP;
+                w.h       = kH;
+                w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+                return w;
+            };
+            cgf::CGFWorld world = makeWorld();
+            const int kGrainCount = (int)world.grains.size();
+            const int kFluidCount = (int)world.fluid.size();
+
+            // === CPU reference: StepCGFBuoyancySteps K steps (the GPU memcmp's against this). ===
+            cgf::CGFWorld cpuWorld = world;
+            cgf::StepCGFBuoyancySteps(cpuWorld, kDt, kSteps);
+
+            // std430 mirrors (match the shaders).
+            struct GrainParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+            };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            struct FluidParticleGpu { int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags; };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            struct CGFParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };   // GF1 query params
+            static_assert(sizeof(CGFParams) == 48, "CGFParams std430 layout");
+            struct CGFBuoyancyParams { int32_t cfg[4]; int32_t grav[4]; int32_t coef[4]; };  // GF2 buoyancy
+            static_assert(sizeof(CGFBuoyancyParams) == 48, "CGFBuoyancyParams std430 layout");
+
+            auto makeBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // The fluid pool is STATIC -> one shared read-only fluid buffer (pos read by the query, vel read by
+            // cgf_buoyancy). Built ONCE from the static fluid.
+            std::vector<FluidParticleGpu> fluidGpu((size_t)kFluidCount);
+            for (int i = 0; i < kFluidCount; ++i) {
+                const fluid::FluidParticle& p = world.fluid[(size_t)i];
+                fluidGpu[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                    p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+            }
+            auto fluidBuf = makeBuf(fluidGpu.data(), fluidGpu.size() * sizeof(FluidParticleGpu));
+
+            // Pipelines: the GF1 cross-query (reused GR2/FL2 cell + cgf_gf/cgf_fg) + the GF2 buoyancy.
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                return std::make_pair(std::move(cs), device->CreateComputePipeline(d));
+            };
+            auto gCellCountPipe = mkPipe("grain_cell_count.comp.hlsl.spv", 3, 64);
+            auto gCellScanPipe  = mkPipe("grain_cell_scan.comp.hlsl.spv", 3, 1);
+            auto gCellEmitPipe  = mkPipe("grain_cell_emit.comp.hlsl.spv", 5, 1);
+            auto fCellCountPipe = mkPipe("fluid_cell_count.comp.hlsl.spv", 3, 64);
+            auto fCellScanPipe  = mkPipe("fluid_cell_scan.comp.hlsl.spv", 3, 1);
+            auto fCellEmitPipe  = mkPipe("fluid_cell_emit.comp.hlsl.spv", 5, 1);
+            auto gfCountPipe = mkPipe("cgf_gf_count.comp.hlsl.spv", 6, 64);
+            auto gfScanPipe  = mkPipe("cgf_gf_scan.comp.hlsl.spv", 3, 1);
+            auto gfEmitPipe  = mkPipe("cgf_gf_emit.comp.hlsl.spv", 7, 64);
+            auto fgCountPipe = mkPipe("cgf_fg_count.comp.hlsl.spv", 6, 64);
+            auto fgScanPipe  = mkPipe("cgf_fg_scan.comp.hlsl.spv", 3, 1);
+            auto fgEmitPipe  = mkPipe("cgf_fg_emit.comp.hlsl.spv", 7, 64);
+            auto buoyPipe    = mkPipe("cgf_buoyancy.comp.hlsl.spv", 5, 64);
+
+            const uint32_t kGrainGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+            const uint32_t kFluidGroups = ((uint32_t)kFluidCount + 63u) / 64u;
+
+            // runGpu: the full host-driven coupled buoyancy sim. buoyEnabled=0 -> the buoy=0 control (the grains
+            // free-fall/pack: kBuoyPerFluid=0 -> no buoyancy, drag toward static fluid only). The fluid is static.
+            auto runGpu = [&](int buoyEnabled, cgf::CGFWorld& outWorld) {
+                cgf::CGFWorld w = world;   // a fresh copy of the init scene
+
+                for (int step = 0; step < kSteps; ++step) {
+                    // The grain pack, re-created each step from the host w.grains state (carries the prior step's
+                    // integrated result). cgf_buoyancy writes the buoyancy-updated vel into it; read it back +
+                    // host-integrate.
+                    std::vector<GrainParticleGpu> grainGpu((size_t)kGrainCount);
+                    for (int i = 0; i < kGrainCount; ++i) {
+                        const grain::GrainParticle& p = w.grains[(size_t)i];
+                        grainGpu[(size_t)i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+                            p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+                    }
+                    auto grainsBuf = makeBuf(grainGpu.data(), grainGpu.size() * sizeof(GrainParticleGpu));
+
+                    // The GF1 shared grid from the grains' CURRENT positions + the static fluid. Size the cross
+                    // buffers from the CPU query (the GPU recomputes it bit-exact).
+                    const cgf::CGFGrid grid = cgf::MakeCGFGrid(w);
+                    const uint32_t kCellCount = cgf::CGFCellCount(grid);
+                    const cgf::CGFNeighbors cpuNbr = cgf::BuildCGFNeighbors(w);
+                    const uint32_t kGF = cgf::CountGF(cpuNbr);
+                    const uint32_t kFG = cgf::CountFG(cpuNbr);
+                    const uint32_t kGFAlloc = kGF > 0u ? kGF : 1u;
+                    const uint32_t kFGAlloc = kFG > 0u ? kFG : 1u;
+
+                    auto makeParams = [&](int32_t countW) {
+                        CGFParams p{};
+                        p.grid[0] = kH; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+                        p.grid[3] = grid.cellMin.z;
+                        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+                        p.dim[3] = countW;
+                        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = 1; return p;
+                    };
+                    CGFParams grainParams = makeParams(kGrainCount);
+                    CGFParams fluidParams = makeParams(kFluidCount);
+                    auto grainParamsBuf = makeBuf(&grainParams, sizeof(grainParams));
+                    auto fluidParamsBuf = makeBuf(&fluidParams, sizeof(fluidParams));
+
+                    std::vector<uint32_t> gCellCountInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> gCellStartInit((size_t)kCellCount + 1u, 0u);
+                    std::vector<uint32_t> gCellCursorInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> gCellGrainInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> fCellCountInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> fCellStartInit((size_t)kCellCount + 1u, 0u);
+                    std::vector<uint32_t> fCellCursorInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> fCellPartInit((size_t)kFluidCount, 0u);
+                    std::vector<uint32_t> gfCountInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> gfStartInit((size_t)kGrainCount + 1u, 0u);
+                    std::vector<uint32_t> gfNbrInit((size_t)kGFAlloc, 0u);
+                    std::vector<uint32_t> fgCountInit((size_t)kFluidCount, 0u);
+                    std::vector<uint32_t> fgStartInit((size_t)kFluidCount + 1u, 0u);
+                    std::vector<uint32_t> fgNbrInit((size_t)kFGAlloc, 0u);
+                    auto gCellCountBuf = makeBuf(gCellCountInit.data(), gCellCountInit.size() * sizeof(uint32_t));
+                    auto gCellStartBuf = makeBuf(gCellStartInit.data(), gCellStartInit.size() * sizeof(uint32_t));
+                    auto gCellCursorBuf = makeBuf(gCellCursorInit.data(), gCellCursorInit.size() * sizeof(uint32_t));
+                    auto gCellGrainBuf = makeBuf(gCellGrainInit.data(), gCellGrainInit.size() * sizeof(uint32_t));
+                    auto fCellCountBuf = makeBuf(fCellCountInit.data(), fCellCountInit.size() * sizeof(uint32_t));
+                    auto fCellStartBuf = makeBuf(fCellStartInit.data(), fCellStartInit.size() * sizeof(uint32_t));
+                    auto fCellCursorBuf = makeBuf(fCellCursorInit.data(), fCellCursorInit.size() * sizeof(uint32_t));
+                    auto fCellPartBuf = makeBuf(fCellPartInit.data(), fCellPartInit.size() * sizeof(uint32_t));
+                    auto gfCountBuf = makeBuf(gfCountInit.data(), gfCountInit.size() * sizeof(uint32_t));
+                    auto gfStartBuf = makeBuf(gfStartInit.data(), gfStartInit.size() * sizeof(uint32_t));
+                    auto gfNbrBuf = makeBuf(gfNbrInit.data(), gfNbrInit.size() * sizeof(uint32_t));
+                    auto fgCountBuf = makeBuf(fgCountInit.data(), fgCountInit.size() * sizeof(uint32_t));
+                    auto fgStartBuf = makeBuf(fgStartInit.data(), fgStartInit.size() * sizeof(uint32_t));
+                    auto fgNbrBuf = makeBuf(fgNbrInit.data(), fgNbrInit.size() * sizeof(uint32_t));
+
+                    // The GF2 buoyancy params.
+                    CGFBuoyancyParams bp{};
+                    bp.cfg[0] = kGrainCount; bp.cfg[1] = 1;
+                    bp.grav[0] = 0; bp.grav[1] = kGravY; bp.grav[2] = 0; bp.grav[3] = kDt;
+                    bp.coef[0] = buoyEnabled ? cgf::kBuoyPerFluid : 0;   // buoy=0 control disables the lift
+                    bp.coef[1] = cgf::kDrag;
+                    auto bpBuf = makeBuf(&bp, sizeof(bp));
+
+                    render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                    g.AddPass("cgf_buoyancy", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // GF1: GRAIN cell table (reused GR2).
+                        cmd.BindComputePipeline(*gCellCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellCountBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                        cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gCellScanPipe.second);
+                        cmd.BindStorageBuffer(*gCellCountBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gCellEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*gCellCursorBuf, 2); cmd.BindStorageBuffer(*gCellGrainBuf, 3);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 4);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        // GF1: FLUID cell table (reused FL2).
+                        cmd.BindComputePipeline(*fCellCountPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellCountBuf, 1);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 2);
+                        cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fCellScanPipe.second);
+                        cmd.BindStorageBuffer(*fCellCountBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fCellEmitPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fCellCursorBuf, 2); cmd.BindStorageBuffer(*fCellPartBuf, 3);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 4);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        // GF1: gf cross list (grain -> fluid).
+                        cmd.BindComputePipeline(*gfCountPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fCellPartBuf, 2); cmd.BindStorageBuffer(*grainsBuf, 3);
+                        cmd.BindStorageBuffer(*gfCountBuf, 4); cmd.BindStorageBuffer(*grainParamsBuf, 5);
+                        cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gfScanPipe.second);
+                        cmd.BindStorageBuffer(*gfCountBuf, 0); cmd.BindStorageBuffer(*gfStartBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gfEmitPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fCellPartBuf, 2); cmd.BindStorageBuffer(*grainsBuf, 3);
+                        cmd.BindStorageBuffer(*gfStartBuf, 4); cmd.BindStorageBuffer(*gfNbrBuf, 5);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 6);
+                        cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                        // GF1: fg cross list (fluid -> grain). (Built for parity with the GF1 query; GF2 sums gf.)
+                        cmd.BindComputePipeline(*fgCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*gCellGrainBuf, 2); cmd.BindStorageBuffer(*fluidBuf, 3);
+                        cmd.BindStorageBuffer(*fgCountBuf, 4); cmd.BindStorageBuffer(*fluidParamsBuf, 5);
+                        cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fgScanPipe.second);
+                        cmd.BindStorageBuffer(*fgCountBuf, 0); cmd.BindStorageBuffer(*fgStartBuf, 1);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fgEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*gCellGrainBuf, 2); cmd.BindStorageBuffer(*fluidBuf, 3);
+                        cmd.BindStorageBuffer(*fgStartBuf, 4); cmd.BindStorageBuffer(*fgNbrBuf, 5);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 6);
+                        cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                        // GF2: buoyancy + drag (ONE thread per GRAIN, int64) — sums over each grain's gfNeighbors.
+                        cmd.BindComputePipeline(*buoyPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gfStartBuf, 1);
+                        cmd.BindStorageBuffer(*gfNbrBuf, 2); cmd.BindStorageBuffer(*fluidBuf, 3);
+                        cmd.BindStorageBuffer(*bpBuf, 4);
+                        cmd.DispatchCompute(kGrainGroups); cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                    });
+                    g.Execute(*device); device->WaitIdle();
+
+                    // (c) read back the buoyancy-updated grain vel + host IntegrateGrains (the GR1 integrate
+                    // VERBATIM, the SAME op the CPU reference runs -> bit-exact), re-upload (carried in w.grains).
+                    std::vector<GrainParticleGpu> rb((size_t)kGrainCount);
+                    device->ReadBuffer(*grainsBuf, rb.data(), rb.size() * sizeof(GrainParticleGpu), 0);
+                    for (int i = 0; i < kGrainCount; ++i)
+                        w.grains[(size_t)i].vel = grain::FxVec3{rb[(size_t)i].vx, rb[(size_t)i].vy, rb[(size_t)i].vz};
+                    grain::IntegrateGrains(w.grains, w.gravity, kDt, w.groundY);
+                }
+                outWorld = w;
+            };
+
+            // === GPU coupled buoyancy (K steps, buoyancy ON) ===
+            cgf::CGFWorld gpuWorld;
+            runGpu(1, gpuWorld);
+            const cgf::WetDry kGpuWD = cgf::MeasureWetDry(gpuWorld);
+
+            // PROOF (1) GPU==CPU BIT-EXACT (integer memcmp, NO tol — the make-or-break).
+            bool exact = (gpuWorld.grains.size() == cpuWorld.grains.size());
+            for (size_t i = 0; exact && i < gpuWorld.grains.size(); ++i)
+                if (std::memcmp(&gpuWorld.grains[i], &cpuWorld.grains[i], sizeof(grain::GrainParticle)) != 0)
+                    exact = false;
+            if (!exact) {
+                std::fprintf(stderr, "FATAL: cgf-buoyancy GPU != CPU StepCGFBuoyancy (a float crept into the "
+                             "fixed-point buoyancy/drag reduction?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgf-buoyancy: {grains:%d, fluid:%d, steps:%d, wetY:%d, dryY:%d} GPU==CPU BIT-EXACT\n",
+                        kGrainCount, kFluidCount, kSteps, (int)kGpuWD.wetY, (int)kGpuWD.dryY);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical.
+            {
+                cgf::CGFWorld gpu2;
+                runGpu(1, gpu2);
+                bool same = (gpu2.grains.size() == gpuWorld.grains.size());
+                for (size_t i = 0; same && i < gpu2.grains.size(); ++i)
+                    if (std::memcmp(&gpu2.grains[i], &gpuWorld.grains[i], sizeof(grain::GrainParticle)) != 0)
+                        same = false;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: cgf-buoyancy two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-buoyancy determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) WET LIGHTENS (the headline + the HONEST metric): the submerged grains end HIGHER / less
+            // packed than the dry grains — wetY > dryY by a clear margin, deterministic + two-run byte-identical.
+            // (The HONEST framing, the CP2/GR4 caveat: the wet/dry contrast is EMERGENT + within-band, NOT an
+            // exact buoyancy depth.)
+            {
+                const grain::fx kMargin = grain::kOne / 8;   // a clear margin (wet meaningfully above dry)
+                if (!(kGpuWD.wet > 0u) || !(kGpuWD.dry > 0u) || !(kGpuWD.wetY > kGpuWD.dryY + kMargin)) {
+                    std::fprintf(stderr, "FATAL: cgf-buoyancy wet did NOT lighten (wetY=%d dryY=%d wet=%u dry=%u)\n",
+                                 (int)kGpuWD.wetY, (int)kGpuWD.dryY, kGpuWD.wet, kGpuWD.dry);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-buoyancy lightens: wetY %d > dryY %d (submerged grains buoyed)\n",
+                            (int)kGpuWD.wetY, (int)kGpuWD.dryY);
+            }
+
+            // PROOF (4) buoy=0 control packs dry: kBuoyPerFluid=0 -> the wet and dry grains pack the SAME
+            // (wetY ≈ dryY within a band) — proving the buoyancy does the work. The GPU path with buoy=0 is
+            // byte-identical to the CPU buoy=0 control by construction.
+            {
+                cgf::CGFWorld ctrlWorld;
+                runGpu(0, ctrlWorld);
+                const cgf::WetDry kCtrlWD = cgf::MeasureWetDry(ctrlWorld);
+                grain::fx ctrlDiff = kCtrlWD.wetY - kCtrlWD.dryY; if (ctrlDiff < 0) ctrlDiff = -ctrlDiff;
+                const grain::fx kBand = grain::kOne / 4;   // within an LSB/quarter-unit band
+                if (!(ctrlDiff < kBand)) {
+                    std::fprintf(stderr, "FATAL: cgf-buoyancy control buoy=0 did NOT pack dry (wetY=%d dryY=%d "
+                                 "diff=%d band=%d)\n", (int)kCtrlWD.wetY, (int)kCtrlWD.dryY, (int)ctrlDiff,
+                                 (int)kBand);
+                    device->WaitIdle(); return 1;
+                }
+                if (!(kGpuWD.wetY > kCtrlWD.wetY)) {
+                    std::fprintf(stderr, "FATAL: cgf-buoyancy buoyed wet not above the buoy=0 control wet\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-buoyancy control: buoy=0 packs dry (buoyancy does work)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER side-view (x,y). Project each grain's integer (pos.x>>kFrac,
+            // pos.y>>kFrac) to a pixel; the WET grains (cnt>0 fluid neighbours) warm/loose, the DRY grains dim/
+            // packed, the static fluid block a cool overlay. CPU-colored from the bit-exact CPU reference state ->
+            // identical both backends by construction (PURE INTEGER, the strict zero-differing-pixel bar; the GPU
+            // grains == the CPU grains, proven above). ---
+            const cgf::CGFNeighbors goldenNbr = cgf::BuildCGFNeighbors(cpuWorld);   // classify wet/dry at rest
+            const int kPxPerUnit = 40, kMargin = 24;
+            const int kWorldW = 8, kWorldH = 6;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+                cx = kMargin + wx * kPxPerUnit;
+                cy = (int)imgH - kMargin - wy * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // The static fluid block (cool faint overlay — the submerging fluid).
+            for (int i = 0; i < kFluidCount; ++i) {
+                int cx, cy; toPx(cpuWorld.fluid[(size_t)i].pos.x, cpuWorld.fluid[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.10f, 0.30f, 0.55f}, 1);
+            }
+            // The grains: WET (cnt>0) warm/bright (buoyed, loose); DRY (cnt==0) dim brown (packed).
+            for (int i = 0; i < kGrainCount; ++i) {
+                const uint32_t cnt = goldenNbr.gfStart[(size_t)i + 1] - goldenNbr.gfStart[(size_t)i];
+                int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+                const Vec3 col = (cnt > 0u) ? Vec3{0.95f, 0.70f, 0.30f} : Vec3{0.40f, 0.28f, 0.16f};
+                plot(cx, cy, col, 1);
+            }
+            bool ok = WriteBMP(cgfBuoyancyShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cgf buoyancy wet/dry (wetY %d > dryY %d)\n",
+                                cgfBuoyancyShotPath, imgW, imgH, (int)kGpuWD.wetY, (int)kGpuWD.dryY);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgfBuoyancyShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

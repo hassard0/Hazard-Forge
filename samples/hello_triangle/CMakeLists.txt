@@ -582,6 +582,24 @@ hf_compile_shaders(
     "shaders/cgf_fg_count.comp.hlsl:cs"
     "shaders/cgf_fg_scan.comp.hlsl:cs"
     "shaders/cgf_fg_emit.comp.hlsl:cs"
+    # Deterministic Grain<->Fluid Coupling Slice 2 (Slice GF2, the BUOYANCY + DRAG fluid->grain pass — the CRUX of
+    # FLAGSHIP #13, the FIRST momentum exchange). ONE new int64 shader: cgf_buoyancy.comp — ONE THREAD PER GRAIN
+    # (multi-thread OVER grains, each thread sums its OWN GF1 gfNeighbors fluid list, the FIXED ascending GF1 emit
+    # order, into a buoyancy (∝ the fluid count, opposing gravity up=-FxNormalize(gravity)) + drag (toward the
+    # static fluid's mean velocity) impulse, then writes the grain's new vel; AccumGrainBuoyancy copied VERBATIM
+    # from engine/sim/couple_gf.h (linear only — grains are points, no torque; the host driver runs IntegrateGrains
+    # AFTER). PER-GRAIN DISJOINT -> NO race, NO atomics, [numthreads(64,1,1)] MULTI-THREAD, NO single-thread TDR
+    # (the FL4/GR3 Jacobi pattern, cleaner than CG2's per-body reduction). The K-step loop is HOST-driven: each
+    # step re-runs the GF1 cross-query passes (cgf_gf/cgf_fg_{count,scan,emit}, int32 MSL-native) from the grains'
+    # CURRENT positions -> cgf_buoyancy -> the host integrate (IntegrateGrains), a ComputeToComputeBarrier between
+    # sub-passes; the fluid is held STATIC (the reaction is GF3). Because the buoyancy/drag fxmul/fxdiv + the
+    # vFluidAvg int64 sum + FxNormalize (FxISqrt) use int64, cgf_buoyancy.comp is VULKAN-SPIR-V-ONLY (DXC compiles
+    # int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --cgf-buoyancy showcase runs the CPU
+    # cgf::StepCGFBuoyancy (byte-identical by construction, the cgrain_support.comp convention) — the Vulkan side
+    # carries the GPU==CPU proof. ReadBuffer reads the grain array, PROVEN BIT-EXACT vs the CPU
+    # couple_gf.h::StepCGFBuoyancySteps (memcmp — the make-or-break). NO new RHI; GF1's cgf_gf/cgf_fg
+    # {count,scan,emit} shaders + their goldens UNCHANGED (GF2 is additive; the GF1 cross-query passes stay int32 MSL-native).
+    "shaders/cgf_buoyancy.comp.hlsl:cs"
     # Deterministic Rigid<->Grain Coupling Slice 2 (Slice CG2, the CONTACT SUPPORT + DRAG grain->body pass — the
     # CRUX of FLAGSHIP #12, the FIRST momentum exchange). ONE new int64 shader: cgrain_support.comp — ONE THREAD
     # PER BODY (multi-thread OVER bodies, NOT per grain), each thread SERIALLY sums its body's CG1 gathered grain

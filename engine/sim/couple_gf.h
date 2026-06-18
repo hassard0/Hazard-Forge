@@ -357,14 +357,17 @@ using fpx::fxmul;          // read-only: the int64-intermediate Q16.16 multiply
 // WET/DRY contrast, NOT an exact buoyancy depth (the CP2/GR4 within-band caveat). BUOYANCY: F_buoy ∝ the
 // submerging fluid count, opposing gravity (more surrounding fluid -> more lift). DRAG: a linear damping toward
 // the (static) fluid's mean velocity, so the grain settles instead of ringing.
-//   kBuoyPerFluid = 3.0 (Q16.16): the per-fluid-neighbour lift. With a packed bed under a fluid block a
-//     submerged grain has many fluid neighbours; cnt·kBuoyPerFluid builds the upward force that overcomes
-//     |g|=9.8 enough to LIGHTEN / loosen the wet grains vs the dry pack (host-snapped, tuned for a clear
-//     wet>dry margin without flying the wet grains out of the basin).
-//   kDrag = 2.0 (Q16.16): a firm linear damping toward the static fluid (vFluidAvg≈0) so the wet grains settle
-//     loose instead of ringing.
-inline constexpr fx kBuoyPerFluid = (fx)(3.0 * (double)kOne + 0.5);   // 196608 (Q16.16, ~3.0 per-fluid lift)
-inline constexpr fx kDrag         = (fx)(2.0 * (double)kOne + 0.5);   // 131072 (Q16.16, ~2.0 damping)
+//   kBuoyPerFluid = 0.3 (Q16.16): the per-fluid-neighbour lift. A submerged grain has MANY fluid neighbours
+//     (a packed bed under a fluid block gathers ~tens-120), so a SMALL per-neighbour lift is the right scale:
+//     a grain near the fluid surface (fewer neighbours) feels just enough lift to LIGHTEN/rise, but as it
+//     rises it LOSES neighbours -> the lift drops -> it stabilises at a buoyed line where buoyancy ≈ gravity
+//     (a SELF-LIMITING suspension), NOT a runaway launch. Host-snapped, tuned (with kDrag) for a clear stable
+//     wet>dry margin (~2 units) with the wet grains bounded a few units up, never flying out.
+//   kDrag = 4.0 (Q16.16): a firm linear damping toward the static fluid (vFluidAvg≈0) so the rising wet grains
+//     hit a low terminal velocity and settle loose at the buoyed line instead of overshooting/ringing — the
+//     stabiliser that keeps the self-limiting suspension from oscillating.
+inline constexpr fx kBuoyPerFluid = (fx)(0.3 * (double)kOne + 0.5);   // 19661 (Q16.16, ~0.3 per-fluid lift)
+inline constexpr fx kDrag         = (fx)(4.0 * (double)kOne + 0.5);   // 262144 (Q16.16, ~4.0 damping)
 
 // AccumGrainBuoyancy(world, neighbors, buoyPerFluid): the per-grain buoyancy+drag impulse accumulate (the
 // per-PARTICLE Jacobi reduction). For each grain i (static skipped), over its GF1 fluid-neighbour list
