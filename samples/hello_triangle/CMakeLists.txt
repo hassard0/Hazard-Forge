@@ -504,6 +504,17 @@ hf_compile_shaders(
     # cross-backend, proven memcmp. NO new RHI; NAV1 shaders + goldens untouched.
     "shaders/nav_filter.comp.hlsl:cs"
     "shaders/nav_distance.comp.hlsl:cs"
+    # Deterministic GPU Navmesh Slice 3 (Slice NAV3, the 3rd slice + MAKE-OR-BREAK of FLAGSHIP #7): the
+    # INTEGER WATERSHED REGION GENERATION over the NAV2 distance field. nav_region.comp: SINGLE-THREAD
+    # ([numthreads(1,1,1)], the nav_distance/nav_raster_scan/mc_scan serial mirror) runs the WHOLE
+    # level-descending fixed-order watershed (for level=maxDist..1: GROW existing regions into this
+    # level's cells by lowest-region-id among connected neighbours, in ascending cellId until stable;
+    # then SEED any still-unassigned walkable cell at this level in ascending cellId + grow it) ->
+    # gRegion[] (0=none, ids dense from 1). The watershed is copied VERBATIM from
+    # engine/nav/navmesh.h::BuildRegions — PURE INT32 (NO int64), so it MSL-generates NATIVELY on Metal.
+    # Pure integer SSBO compute + a compute->compute barrier + ReadBuffer -> bit-exact GPU==CPU region[]
+    # + cross-backend, proven memcmp. NO new RHI; NAV1+NAV2 shaders + goldens untouched.
+    "shaders/nav_region.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6):
     # fpx_solve.comp is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)],
     # the mc_scan/vt_alloc allocator pattern) runs `steps` of StepWorld = IntegrateStep then SolveContacts

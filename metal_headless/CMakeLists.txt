@@ -295,6 +295,17 @@ hf_gen_msl(nav_raster_emit.comp  nav_raster_emit.comp.hlsl  comp nav_raster_emit
 # shaders + goldens untouched.
 hf_gen_msl(nav_filter.comp   nav_filter.comp.hlsl   comp nav_filter_main)
 hf_gen_msl(nav_distance.comp nav_distance.comp.hlsl comp nav_distance_main)
+# Deterministic GPU Navmesh Slice 3 (Slice NAV3, the 3rd slice + MAKE-OR-BREAK of FLAGSHIP #7):
+# nav_region.comp — the INTEGER WATERSHED REGION GENERATION over the NAV2 distance field. SINGLE-THREAD
+# ([numthreads(1,1,1)], the nav_distance/nav_raster_scan serial mirror) runs the WHOLE level-descending
+# fixed-order watershed (for level=maxDist..1: GROW existing regions into this level by lowest-region-id
+# among connected neighbours in ascending cellId until stable; then SEED + grow any still-unassigned
+# cell). The watershed is copied VERBATIM from engine/nav/navmesh.h::BuildRegions. Like the NAV1/NAV2
+# shaders + UNLIKE fpx_*.comp, it is PURE INT32 (NO int64), so glslc CAN lower it and it MSL-generates
+# NATIVELY (the default MSL gen suffices). The Metal --nav-region showcase dispatches the GPU shader
+# directly -> the GPU==CPU region[] proof runs on Metal too; bit-exact cross-backend by construction.
+# Behind --nav-region only; NAV1+NAV2 + existing shaders + goldens untouched.
+hf_gen_msl(nav_region.comp   nav_region.comp.hlsl   comp nav_region_main)
 # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6): fpx_solve.comp
 # is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)]) runs `steps` of
 # StepWorld = IntegrateStep then SolveContacts (K=solveIters Gauss-Seidel sweeps: ground then sphere-sphere

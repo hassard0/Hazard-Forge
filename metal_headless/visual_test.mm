@@ -17482,6 +17482,310 @@ static int RunNavDistanceShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic GPU Navmesh INTEGER WATERSHED REGION GENERATION showcase (Slice NAV3, the 3rd slice +
+// MAKE-OR-BREAK of FLAGSHIP #7). Like --nav-distance (and UNLIKE --fpx-solve's int64 -> CPU on Metal), the
+// watershed is PURE INT32 (region ids/levels small ints, IsConnected integer abs+compare, NO int64), so
+// nav_region.comp MSL-gens natively and Metal DISPATCHES THE GPU passes: the SAME NAV1 showcase heightfield
+// is rasterized + per-column MERGED on the HOST, then nav_filter.comp (one thread per column ->
+// walkable[]+surfaceY[]) -> (barrier) -> nav_distance.comp (single-thread chamfer -> dist[]) -> (barrier) ->
+// nav_region.comp ([numthreads(1,1,1)] single-thread level-descending watershed -> region[]) -> ReadBuffer
+// region[], PROVEN BIT-EXACT vs the CPU nav::BuildRegions reference (memcmp — the same proofs the Vulkan
+// --nav-region-shot runs); enabled=false -> region 0; two runs byte-identical. The image golden is the
+// hash-colored region partition, identical to the Vulkan path BY CONSTRUCTION. New golden
+// tests/golden/metal/nav_regions.png; two runs DIFF 0.0000. NO new RHI.
+static int RunNavRegionShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace nav = hf::nav;
+    namespace vg = render::vg;
+
+    // The deterministic heightfield (== the Vulkan --nav-region-shot config). A 32x32 column grid.
+    const int kW = 32, kH = 32;
+    nav::Heightfield hf;
+    hf.w = kW; hf.h = kH;
+    hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+    hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+    hf.cs = 1; hf.ch = 1;
+    const int kColumnCount = hf.columnCount();   // 1024
+    nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+
+    std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+
+    // Host: rasterize -> per-column merged spans -> a flat merged-span buffer + offset/count.
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+    std::vector<nav::Span> flatMerged;
+    std::vector<uint32_t> mOffset((size_t)kColumnCount, 0u), mCount((size_t)kColumnCount, 0u);
+    for (int c = 0; c < kColumnCount; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+        mOffset[(size_t)c] = (uint32_t)flatMerged.size();
+        mCount[(size_t)c] = (uint32_t)mergedPerCol[(size_t)c].size();
+        for (const auto& s : mergedPerCol[(size_t)c]) flatMerged.push_back(s);
+    }
+    const uint32_t kMergedTotal = (uint32_t)flatMerged.size();
+    const uint32_t kMergedAlloc = kMergedTotal > 0u ? kMergedTotal : 1u;
+
+    // CPU reference: filter + distance + REGIONS (the make-or-break memcmp target).
+    std::vector<std::vector<nav::Span>> cpuMerged = mergedPerCol;
+    std::vector<uint32_t> cpuWalkable; std::vector<int32_t> cpuSurfaceY;
+    nav::FilterWalkableSpans(hf, cfg, cpuMerged, cpuWalkable, cpuSurfaceY);
+    std::vector<uint32_t> cpuDist;
+    nav::BuildDistanceField(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist);
+    const uint32_t cpuMaxDist = nav::MaxDistOf(cpuDist);
+    std::vector<uint32_t> cpuRegion;
+    nav::BuildRegions(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist, cpuMaxDist, cpuRegion);
+
+    const int kCell = 16;                 // 16px/cell -> 512x512
+    const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    struct SpanGpu { uint32_t ymin, ymax, area; };
+    static_assert(sizeof(SpanGpu) == 12, "SpanGpu std430 layout");
+    std::vector<SpanGpu> mergedInit((size_t)kMergedAlloc, SpanGpu{0u, 0u, 0u});
+    for (uint32_t i = 0; i < kMergedTotal; ++i)
+        mergedInit[i] = SpanGpu{flatMerged[i].ymin, flatMerged[i].ymax, flatMerged[i].area};
+
+    auto makeBufU32 = [&](const std::vector<uint32_t>& v) {
+        rhi::BufferDesc d; d.size = v.size() * sizeof(uint32_t);
+        d.initialData = v.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto offsetBuf = makeBufU32(mOffset);
+    auto countBuf  = makeBufU32(mCount);
+
+    std::vector<int32_t> surfaceInit((size_t)kColumnCount, 0);
+    std::vector<uint32_t> walkableInit((size_t)kColumnCount, 0u);
+    std::vector<uint32_t> distInit((size_t)kColumnCount, 0u);
+    std::vector<uint32_t> regionInit((size_t)kColumnCount, 0u);
+    auto makeSpansBuf = [&]() {
+        rhi::BufferDesc d; d.size = mergedInit.size() * sizeof(SpanGpu);
+        d.initialData = mergedInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeWalkBuf = [&]() {
+        rhi::BufferDesc d; d.size = walkableInit.size() * sizeof(uint32_t);
+        d.initialData = walkableInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeSurfBuf = [&]() {
+        rhi::BufferDesc d; d.size = surfaceInit.size() * sizeof(int32_t);
+        d.initialData = surfaceInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeDistBuf = [&]() {
+        rhi::BufferDesc d; d.size = distInit.size() * sizeof(uint32_t);
+        d.initialData = distInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeRegionBuf = [&]() {
+        rhi::BufferDesc d; d.size = regionInit.size() * sizeof(uint32_t);
+        d.initialData = regionInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct NavFilterParams { int32_t cfg[4]; int32_t ext[4]; };
+    static_assert(sizeof(NavFilterParams) == 32, "NavFilterParams std430 layout");
+    auto makeFilterParams = [&](int32_t enabled) {
+        NavFilterParams p{};
+        p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableHeight; p.cfg[3] = enabled;
+        p.ext[0] = hf.bmaxY - 1;
+        return p;
+    };
+    struct NavDistParams { int32_t cfg[4]; };
+    static_assert(sizeof(NavDistParams) == 16, "NavDistParams std430 layout");
+    auto makeDistParams = [&](int32_t enabled) {
+        NavDistParams p{}; p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled;
+        return p;
+    };
+    struct NavRegionParams { int32_t cfg[4]; int32_t ext[4]; };
+    static_assert(sizeof(NavRegionParams) == 32, "NavRegionParams std430 layout");
+    auto makeRegionParams = [&](int32_t enabled, int32_t maxDist) {
+        NavRegionParams p{};
+        p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled;
+        p.ext[0] = maxDist;
+        return p;
+    };
+
+    auto filterCs = loadMSL("nav_filter.comp.gen.metal", "nav_filter_main");
+    rhi::ComputePipelineDesc filterCd;
+    filterCd.compute = filterCs.get(); filterCd.storageBufferCount = 6; filterCd.threadsPerGroupX = 64;
+    auto filterCompute = device->CreateComputePipeline(filterCd);
+
+    auto distCs = loadMSL("nav_distance.comp.gen.metal", "nav_distance_main");
+    rhi::ComputePipelineDesc distCd;
+    distCd.compute = distCs.get(); distCd.storageBufferCount = 4; distCd.threadsPerGroupX = 1;
+    auto distCompute = device->CreateComputePipeline(distCd);
+
+    auto regionCs = loadMSL("nav_region.comp.gen.metal", "nav_region_main");
+    rhi::ComputePipelineDesc regionCd;
+    regionCd.compute = regionCs.get(); regionCd.storageBufferCount = 5; regionCd.threadsPerGroupX = 1;
+    auto regionCompute = device->CreateComputePipeline(regionCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)kColumnCount + 63u) / 64u;
+
+    auto runRegions = [&](int32_t enabled, std::vector<uint32_t>& outRegion) {
+        auto spansBuf  = makeSpansBuf();
+        auto walkBuf   = makeWalkBuf();
+        auto surfBuf   = makeSurfBuf();
+        auto distBuf   = makeDistBuf();
+        auto regionBuf = makeRegionBuf();
+        NavFilterParams fp = makeFilterParams(enabled);
+        rhi::BufferDesc fpDesc; fpDesc.size = sizeof(NavFilterParams);
+        fpDesc.initialData = &fp; fpDesc.usage = rhi::BufferUsage::Storage;
+        auto fpBuf = device->CreateBuffer(fpDesc);
+        NavDistParams dp = makeDistParams(enabled);
+        rhi::BufferDesc dpDesc; dpDesc.size = sizeof(NavDistParams);
+        dpDesc.initialData = &dp; dpDesc.usage = rhi::BufferUsage::Storage;
+        auto dpBuf = device->CreateBuffer(dpDesc);
+        NavRegionParams rp = makeRegionParams(enabled, (int32_t)cpuMaxDist);
+        rhi::BufferDesc rpDesc; rpDesc.size = sizeof(NavRegionParams);
+        rpDesc.initialData = &rp; rpDesc.usage = rhi::BufferUsage::Storage;
+        auto rpBuf = device->CreateBuffer(rpDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("nav_region", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*filterCompute);
+                cmd.BindStorageBuffer(*spansBuf, 0);
+                cmd.BindStorageBuffer(*offsetBuf, 1);
+                cmd.BindStorageBuffer(*countBuf, 2);
+                cmd.BindStorageBuffer(*walkBuf, 3);
+                cmd.BindStorageBuffer(*surfBuf, 4);
+                cmd.BindStorageBuffer(*fpBuf, 5);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*distCompute);
+                cmd.BindStorageBuffer(*walkBuf, 0);
+                cmd.BindStorageBuffer(*surfBuf, 1);
+                cmd.BindStorageBuffer(*distBuf, 2);
+                cmd.BindStorageBuffer(*dpBuf, 3);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*regionCompute);
+                cmd.BindStorageBuffer(*walkBuf, 0);
+                cmd.BindStorageBuffer(*surfBuf, 1);
+                cmd.BindStorageBuffer(*distBuf, 2);
+                cmd.BindStorageBuffer(*regionBuf, 3);
+                cmd.BindStorageBuffer(*rpBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outRegion.assign((size_t)kColumnCount, 0u);
+        device->ReadBuffer(*regionBuf, outRegion.data(), outRegion.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU regions (enabled).
+    std::vector<uint32_t> gpuRegion;
+    runRegions(1, gpuRegion);
+
+    // PROOF (1) GPU==CPU region[] BIT-EXACT.
+    bool regionOk = (gpuRegion.size() == cpuRegion.size()) &&
+        std::memcmp(gpuRegion.data(), cpuRegion.data(), cpuRegion.size() * sizeof(uint32_t)) == 0;
+    if (!regionOk) return fail("nav-region: GPU != CPU BuildRegions");
+    uint32_t walkCount = 0u; for (uint32_t wv : cpuWalkable) if (wv != 0u) ++walkCount;
+    uint32_t regionCount = 0u; for (uint32_t r : gpuRegion) if (r > regionCount) regionCount = r;
+    std::printf("nav-region: {columns:%d, walkable:%u, regions:%u} GPU==CPU BIT-EXACT\n",
+                kColumnCount, walkCount, regionCount);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint32_t> r2;
+        runRegions(1, r2);
+        if (r2.size() != gpuRegion.size() ||
+            std::memcmp(r2.data(), gpuRegion.data(), r2.size() * sizeof(uint32_t)) != 0)
+            return fail("nav-region: two runs differ (nondeterministic)");
+        std::printf("nav-region determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage / coherence: >=2 regions, every assigned cell walkable, each region a single
+    // 4-connected component.
+    {
+        bool everyAssignedWalkable = true;
+        for (size_t c = 0; c < gpuRegion.size(); ++c)
+            if (gpuRegion[c] != 0u && cpuWalkable[c] == 0u) everyAssignedWalkable = false;
+        bool eachConnected = true;
+        for (uint32_t id = 1u; id <= regionCount && eachConnected; ++id) {
+            int sx = -1, sz = -1;
+            for (int z = 0; z < kH && sx < 0; ++z)
+                for (int x = 0; x < kW; ++x)
+                    if (gpuRegion[(size_t)hf.columnId(x, z)] == id) { sx = x; sz = z; break; }
+            if (sx < 0) continue;
+            std::vector<uint8_t> seen((size_t)kColumnCount, 0u);
+            std::vector<int> stack; stack.push_back(hf.columnId(sx, sz));
+            seen[(size_t)hf.columnId(sx, sz)] = 1u;
+            uint32_t reached = 0u;
+            while (!stack.empty()) {
+                const int cc = stack.back(); stack.pop_back(); ++reached;
+                const int cx = cc % kW, cz = cc / kW;
+                const int nb[4][2] = {{cx, cz - 1}, {cx, cz + 1}, {cx - 1, cz}, {cx + 1, cz}};
+                for (auto& n : nb) {
+                    if (n[0] < 0 || n[1] < 0 || n[0] >= kW || n[1] >= kH) continue;
+                    const int nc = hf.columnId(n[0], n[1]);
+                    if (seen[(size_t)nc] || gpuRegion[(size_t)nc] != id) continue;
+                    seen[(size_t)nc] = 1u; stack.push_back(nc);
+                }
+            }
+            uint32_t total = 0u; for (uint32_t v : gpuRegion) if (v == id) ++total;
+            if (reached != total) eachConnected = false;
+        }
+        if (regionCount < 2u || !everyAssignedWalkable || !eachConnected)
+            return fail("nav-region: coverage incoherent");
+        std::printf("nav-region coverage: %u regions partition %u walkable cells (each connected)\n",
+                    regionCount, walkCount);
+    }
+
+    // PROOF (4) empty no-op.
+    {
+        std::vector<uint32_t> dRegion;
+        runRegions(0, dRegion);
+        bool zero = true;
+        for (uint32_t r : dRegion) if (r != 0u) { zero = false; break; }
+        if (!zero) return fail("nav-region: disabled path produced regions");
+        std::printf("nav-region empty: 0 regions (no-op)\n");
+    }
+
+    // --- Golden: the top-down hash-colored region partition (IDENTICAL to the Vulkan --nav-region-shot
+    // by construction; CPU-colored from the read-back integer region[]). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto fillCell = [&](int row, int col, uint8_t r, uint8_t g2, uint8_t b2) {
+        for (int dy = 0; dy < kCell; ++dy)
+            for (int dx = 0; dx < kCell; ++dx) {
+                const int ix = col * kCell + dx, iy = row * kCell + dy;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+            }
+    };
+    for (int cz = 0; cz < kH; ++cz)
+        for (int cx = 0; cx < kW; ++cx) {
+            const size_t c = (size_t)hf.columnId(cx, cz);
+            if (gpuRegion[c] == 0u) continue;
+            Vec3 col = vg::hashColor(gpuRegion[c]);
+            fillCell(cz, cx, (uint8_t)(col.x * 255.0f + 0.5f),
+                     (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.z * 255.0f + 0.5f));
+        }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — hash-colored watershed region partition (%u regions)\n",
+                outPath, imgW, imgH, regionCount);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver showcase (Slice FPX3, the
 // MAKE-OR-BREAK of FLAGSHIP #6). On Metal this runs the CPU SOLVER, NOT a GPU compute dispatch.
 // fpx_solve.comp is int64/Vulkan-only (glslc can't parse int64 — fxdiv/FxISqrt for the sphere-sphere
@@ -28804,6 +29108,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--nav-distance") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_nav_distfield.png";
             try { return RunNavDistanceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --nav-region <out.png>: render the Deterministic GPU Navmesh INTEGER WATERSHED REGION GENERATION
+        // showcase (Slice NAV3, the 3rd slice + MAKE-OR-BREAK of FLAGSHIP #7). Like --nav-distance (and
+        // UNLIKE --fpx-solve's int64 -> CPU on Metal), the watershed is PURE INT32, so nav_region.comp
+        // MSL-gens natively and Metal DISPATCHES THE GPU passes: the SAME NAV1 showcase heightfield is
+        // rasterized + per-column MERGED on the host, then nav_filter.comp -> (barrier) -> nav_distance.comp
+        // -> (barrier) -> nav_region.comp ([numthreads(1,1,1)] single-thread level-descending watershed ->
+        // region[]) -> ReadBuffer region[], PROVEN BIT-EXACT vs the CPU nav::BuildRegions reference (memcmp
+        // — the same proofs the Vulkan --nav-region-shot runs); enabled=false -> region 0; two runs
+        // byte-identical. The image golden is the hash-colored region partition, identical to the Vulkan
+        // path BY CONSTRUCTION. New golden tests/golden/metal/nav_regions.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--nav-region") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_nav_regions.png";
+            try { return RunNavRegionShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-solve <out.png>: render the Deterministic Fixed-Point Physics PBD POSITIONAL
