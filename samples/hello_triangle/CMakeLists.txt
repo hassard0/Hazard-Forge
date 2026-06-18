@@ -512,6 +512,21 @@ hf_compile_shaders(
     "shaders/fluid_neighbor_count.comp.hlsl:cs"
     "shaders/fluid_neighbor_scan.comp.hlsl:cs"
     "shaders/fluid_neighbor_emit.comp.hlsl:cs"
+    # Deterministic GPU Fluid Slice 3 (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9): the PBF DENSITY + λ.
+    # fluid_density.comp: ONE thread per particle gathers ρ_i = W[0] + Σ_{j∈neighbors} W[bin(r_ij²)] over the
+    # FL2 neighbour list via a HOST-SNAPPED Q16.16 kernel LUT (W), the RadiusSq (int64 dx²) + BinOf
+    # ((r²*bins)/h² int64 divide) + gather copied VERBATIM from engine/sim/fluid.h::ComputeDensity.
+    # fluid_lambda.comp: ONE thread per particle computes C_i = ρ_i/ρ0 − 1 then λ_i = −C_i/(Σ|∇C_i|²+ε)
+    # (the unilateral clamp C_i<0 -> λ_i=0), the fxdiv/fxmul/FxNormalize (via the int64 FxISqrt, NO float
+    # sqrt) + gradW gather copied VERBATIM from engine/sim/fluid.h::ComputeLambda. Per-particle INDEPENDENT
+    # (a gather over the fixed FL2 list) -> multi-thread, NO atomics, NO single-thread/TDR (the FL1 pattern).
+    # Because r² (dx² over Q16.16) + the λ fxdiv/FxISqrt use int64, these two are VULKAN-SPIR-V-ONLY (DXC
+    # compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --fluid-density showcase
+    # runs the CPU fluid::ComputeDensity + ComputeLambda (byte-identical by construction, the
+    # fluid_integrate.comp/cloth_solve.comp convention). ReadBuffer reads ρ + λ, PROVEN BIT-EXACT vs the CPU
+    # reference (memcmp — the make-or-break). NO new RHI; FL1+FL2 shaders + goldens untouched.
+    "shaders/fluid_density.comp.hlsl:cs"
+    "shaders/fluid_lambda.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT
     # GRAPH BUILD (the FPX2/MC3 count->scan->emit on lattice particles). cloth_edge_count.comp: ONE thread
     # per particle counts its OWNED forward edges in bounds (right/down structural, the two cell diagonals

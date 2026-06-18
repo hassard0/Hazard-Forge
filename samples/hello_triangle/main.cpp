@@ -455,6 +455,7 @@ int main(int argc, char** argv) {
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* fluidIntegrateShotPath = nullptr; // --fluid-integrate-shot <out.bmp> (Slice FL1: Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #9 — a 10x10x10 = 1000-particle dam-break block in a corner integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/settling block)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
+    const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
     const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
     const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
@@ -629,6 +630,19 @@ int main(int argc, char** argv) {
         // parse limit C1061, like the fl1/cloth/fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--fluid-neighbors-shot") == 0 && i + 1 < argc) {
             fluidNeighborsShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice FL3: --fluid-density-shot <out.bmp> — the Deterministic GPU Fluid PBF DENSITY + λ (the
+        // MAKE-OR-BREAK of FLAGSHIP #9). The FL1 dam-break block (settled) -> BuildNeighborList (FL2) ->
+        // BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity -> ComputeLambda via two
+        // int64 compute passes (fluid_density.comp + fluid_lambda.comp, ONE thread per particle, NO atomics),
+        // GPU==CPU ρ+λ bit-exact vs fluid.h::ComputeDensity/ComputeLambda. int64 (r² + the λ fxdiv) ->
+        // Vulkan-only; Metal --fluid-density runs the CPU reference. NO new RHI. Handled as a STANDALONE
+        // branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse limit C1061, like the
+        // fl1/fl2/cloth/fpx/mc/nav shots.
+        if (std::strcmp(argv[i], "--fluid-density-shot") == 0 && i + 1 < argc) {
+            fluidDensityShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15405,6 +15419,291 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — fluid neighbor-count heat (%u neighbors, maxPer %u)\n",
                                 fluidNeighborsShotPath, imgW, imgH, kTotalNeighbors, maxPer);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidNeighborsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Fluid PBF DENSITY + λ (--fluid-density-shot <out.bmp>, Slice FL3, the
+        // MAKE-OR-BREAK of FLAGSHIP #9). The FL1 dam-break block (settled to a mid-fall pile so the density
+        // is non-trivial) -> BuildNeighborList (FL2, on the host) -> BuildKernelTable (a HOST-SNAPPED Q16.16
+        // poly6 W + spiky |∇W| LUT over B=64 r² bins; the ONLY sqrt, at build) -> TWO int64 compute passes:
+        // fluid_density.comp (ONE thread per particle: ρ_i = W[0] + Σ_{j∈neighbors} W[bin(r_ij²)], the int64
+        // RadiusSq + BinOf + gather copied VERBATIM from fluid.h::ComputeDensity) -> (barrier) ->
+        // fluid_lambda.comp (ONE thread per particle: C_i = ρ_i/ρ0−1, then λ_i = −C_i/(Σ|∇C_i|²+ε) with the
+        // unilateral clamp C_i<0 -> λ_i=0, the fxdiv/fxmul/FxNormalize copied VERBATIM from
+        // fluid.h::ComputeLambda). Per-particle INDEPENDENT -> multi-thread, NO atomics. ReadBuffer reads ρ +
+        // λ; the CPU fluid.h::ComputeDensity + ComputeLambda over the SAME block must match BIT-EXACT (memcmp,
+        // NO tol — the make-or-break). The golden is a per-particle DENSITY HEAT viz (ρ_i -> color: dense
+        // interior hot, sparse surface cold). int64 -> Vulkan-only (NOT in hf_gen_msl); Metal --fluid-density
+        // runs the CPU reference. NO PBF position solve (FL4), NO new RHI. One BMP -> exit.
+        if (fluidDensityShotPath) {
+            using math::Vec3;
+            namespace fluid = hf::sim::fluid;
+
+            // The FL1 dam-break block, settled to a mid-fall pile (== the FL2 + Metal --fluid-density config).
+            const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fluid::fx kDt = fluid::kOne / 60;
+            const int kSide = 10;                          // 10x10x10 -> 1000 particles
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+            const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);   // smoothing radius h = 2.0
+
+            fluid::FluidBlock block;
+            block.W = kSide; block.H = kSide; block.D = kSide;
+            block.spacing = fluid::kOne;
+            block.origin = fluid::FxVec3{0, (fluid::fx)(12 * (int)fluid::kOne), 0};
+            const int kParticleCount = block.W * block.H * block.D;
+            std::vector<fluid::FluidParticle> particles = fluid::InitBlock(block);
+            fluid::IntegrateFluidSteps(particles, kGravity, kDt, kGroundY, 90);   // settle (== FL2)
+
+            // The CPU reference grid + cell table + neighbor list (FL2, on the host) + the kernel LUT.
+            const fluid::FluidGrid grid = fluid::MakeGrid(particles, kH);
+            const fluid::FluidCellTable cpuTable = fluid::BuildCellTable(particles, grid);
+            const fluid::FluidNeighborList cpuList = fluid::BuildNeighborList(particles, grid, cpuTable, kH);
+            const uint32_t kTotalNeighbors = (uint32_t)cpuList.neighbors.size();
+            const uint32_t kNeighAlloc = kTotalNeighbors > 0u ? kTotalNeighbors : 1u;
+            // Rest density ρ0: chosen so a settled-block interior is near ρ0 (a deterministic, golden-stable
+            // pick; this is the deterministic-band target, NOT a physically-tuned constant). ε = CFM relax.
+            const int kBins = fluid::kKernelBins;
+            // Probe the interior density to set ρ0 ≈ the interior value (the "settled ρ̄ ≈ ρ0" band).
+            const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, fluid::kOne, kBins, fluid::kOne / 100);
+            std::vector<fluid::fx> probeRho;
+            fluid::ComputeDensity(particles, cpuList, kProbe, probeRho);
+            const fluid::fx kRestDensity = fluid::MeanDensity(probeRho);  // ρ0 = the block's mean density
+            const fluid::fx kEpsilon = fluid::kOne / 100;
+            const fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, kRestDensity, kBins, kEpsilon);
+
+            // CPU reference ρ + λ (the GPU memcmp's against these).
+            std::vector<fluid::fx> cpuRho, cpuLam;
+            fluid::ComputeDensity(particles, cpuList, kernel, cpuRho);
+            fluid::ComputeLambda(particles, cpuList, kernel, cpuRho, cpuLam);
+            const fluid::fx kMeanDensity = fluid::MeanDensity(cpuRho);
+
+            // std430 FluidParticle mirror (matches the shaders' FluidParticle): 11 x int32 (44 bytes).
+            struct FluidParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            std::vector<FluidParticleGpu> particlesInit((size_t)kParticleCount);
+            for (int i = 0; i < kParticleCount; ++i) {
+                const fluid::FluidParticle& p = particles[(size_t)i];
+                particlesInit[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+                    p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+            }
+            rhi::BufferDesc partDesc;
+            partDesc.size = particlesInit.size() * sizeof(FluidParticleGpu);
+            partDesc.initialData = particlesInit.data();
+            partDesc.usage = rhi::BufferUsage::Storage;
+            auto particlesBuf = device->CreateBuffer(partDesc);
+
+            // Upload the FL2 neighbor list (built on the host) + the host-snapped kernel LUT as read buffers.
+            auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+                rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+                d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeIntBuf = [&](const std::vector<int32_t>& init) {
+                rhi::BufferDesc d; d.size = init.size() * sizeof(int32_t);
+                d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            std::vector<uint32_t> nbrStartUp(cpuList.neighborStart.begin(), cpuList.neighborStart.end());
+            std::vector<uint32_t> nbrUp(kNeighAlloc, 0u);
+            for (uint32_t s = 0; s < kTotalNeighbors; ++s) nbrUp[s] = cpuList.neighbors[s];
+            std::vector<int32_t> kernelWUp(kernel.W.begin(), kernel.W.end());
+            std::vector<int32_t> kernelGradWUp(kernel.gradW.begin(), kernel.gradW.end());
+            auto nbrStartBuf = makeUintBuf(nbrStartUp);
+            auto nbrBuf      = makeUintBuf(nbrUp);
+            auto kernelWBuf  = makeIntBuf(kernelWUp);
+            auto kernelGWBuf = makeIntBuf(kernelGradWUp);
+
+            // std430 FluidKernelParams (matches the shaders): int4 ker {h, restDensity, epsilon, bins} +
+            // int4 cfg {particleCount, enabled, _, _}.
+            struct FluidKernelParams { int32_t ker[4]; int32_t cfg[4]; };
+            static_assert(sizeof(FluidKernelParams) == 32, "FluidKernelParams std430 layout");
+            auto makeKernelParams = [&](int32_t enabled) {
+                FluidKernelParams p{};
+                p.ker[0] = kH; p.ker[1] = kRestDensity; p.ker[2] = kEpsilon; p.ker[3] = kBins;
+                p.cfg[0] = kParticleCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Pipelines: fluid_density (6 SSBO, 64t), fluid_lambda (7 SSBO, 64t).
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                auto pipe = device->CreateComputePipeline(d);
+                return std::make_pair(std::move(cs), std::move(pipe));
+            };
+            auto densityPipe = mkPipe("fluid_density.comp.hlsl.spv", 6, 64);
+            auto lambdaPipe  = mkPipe("fluid_lambda.comp.hlsl.spv", 7, 64);
+
+            const uint32_t kPartGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+
+            // Run density then λ over fresh output buffers; read back ρ + λ.
+            auto runDensity = [&](int32_t enabled, std::vector<int32_t>& outRho, std::vector<int32_t>& outLam) {
+                std::vector<int32_t> rhoInit((size_t)kParticleCount, 0);
+                std::vector<int32_t> lamInit((size_t)kParticleCount, 0);
+                auto densityBuf = makeIntBuf(rhoInit);
+                auto lambdaBuf  = makeIntBuf(lamInit);
+                FluidKernelParams params = makeKernelParams(enabled);
+                rhi::BufferDesc pd; pd.size = sizeof(FluidKernelParams); pd.initialData = &params;
+                pd.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pd);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fluid_density", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-particle density gather.
+                        cmd.BindComputePipeline(*densityPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                        cmd.BindStorageBuffer(*nbrBuf, 2);
+                        cmd.BindStorageBuffer(*kernelWBuf, 3);
+                        cmd.BindStorageBuffer(*densityBuf, 4);
+                        cmd.BindStorageBuffer(*paramsBuf, 5);
+                        cmd.DispatchCompute(kPartGroups);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 2: per-particle λ (reads the density from pass 1).
+                        cmd.BindComputePipeline(*lambdaPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                        cmd.BindStorageBuffer(*nbrBuf, 2);
+                        cmd.BindStorageBuffer(*kernelGWBuf, 3);
+                        cmd.BindStorageBuffer(*densityBuf, 4);
+                        cmd.BindStorageBuffer(*lambdaBuf, 5);
+                        cmd.BindStorageBuffer(*paramsBuf, 6);
+                        cmd.DispatchCompute(kPartGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outRho.assign((size_t)kParticleCount, 0);
+                device->ReadBuffer(*densityBuf, outRho.data(), outRho.size() * sizeof(int32_t), 0);
+                outLam.assign((size_t)kParticleCount, 0);
+                device->ReadBuffer(*lambdaBuf, outLam.data(), outLam.size() * sizeof(int32_t), 0);
+            };
+
+            // === GPU density + λ (enabled) ===
+            std::vector<int32_t> gRho, gLam;
+            runDensity(1, gRho, gLam);
+
+            // PROOF (1) GPU==CPU ρ + λ BIT-EXACT (integer memcmp, NO tol — the make-or-break).
+            bool rhoOk = (gRho.size() == cpuRho.size()) &&
+                std::memcmp(gRho.data(), cpuRho.data(), cpuRho.size() * sizeof(int32_t)) == 0;
+            bool lamOk = (gLam.size() == cpuLam.size()) &&
+                std::memcmp(gLam.data(), cpuLam.data(), cpuLam.size() * sizeof(int32_t)) == 0;
+            if (!rhoOk || !lamOk) {
+                std::fprintf(stderr, "FATAL: fluid-density GPU != CPU ComputeDensity/ComputeLambda "
+                             "(rho=%d lambda=%d) — a float crept into the fixed-point kernel?\n",
+                             (int)rhoOk, (int)lamOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fluid-density: {particles:%d, restDensity:%d, meanDensity:%d} GPU==CPU BIT-EXACT\n",
+                        kParticleCount, (int)kRestDensity, (int)kMeanDensity);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<int32_t> r2, l2;
+                runDensity(1, r2, l2);
+                if (r2 != gRho || l2 != gLam) {
+                    std::fprintf(stderr, "FATAL: fluid-density two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fluid-density determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coherence: all ρ_i > 0; interior denser than surface; ρ̄ ≈ ρ0 (a settled block).
+            {
+                int dense = 0; bool allPos = true;
+                for (int i = 0; i < kParticleCount; ++i) {
+                    if (gRho[(size_t)i] <= 0) allPos = false;
+                    if (gRho[(size_t)i] >= kRestDensity) ++dense;
+                }
+                // interior (5,5,5) denser than a corner (0,0,0).
+                const fluid::fx rhoInterior = gRho[(size_t)fluid::ParticleIndex(block, 5, 5, 5)];
+                const fluid::fx rhoCorner   = gRho[(size_t)fluid::ParticleIndex(block, 0, 0, 0)];
+                // ρ̄ ≈ ρ0 within a deterministic band (ρ0 IS the mean by construction, so this is exact-ish;
+                // require |ρ̄ − ρ0| within 1% of ρ0 — the settled-band check).
+                const fluid::fx band = kRestDensity / 100;
+                const fluid::fx dmean = (kMeanDensity > kRestDensity) ? (kMeanDensity - kRestDensity)
+                                                                      : (kRestDensity - kMeanDensity);
+                if (!allPos || rhoInterior <= rhoCorner || dmean > band) {
+                    std::fprintf(stderr, "FATAL: fluid-density coherence incoherent (allPos=%d, "
+                                 "interior=%d corner=%d, |mean-rho0|=%d band=%d)\n",
+                                 (int)allPos, (int)rhoInterior, (int)rhoCorner, (int)dmean, (int)band);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fluid-density coverage: %d dense particles, mean rho %d (coherent density field)\n",
+                            dense, (int)kMeanDensity);
+            }
+
+            // PROOF (4) sparse / no-op: a single isolated particle -> ρ = W[0] (self only), λ = 0 (the
+            // unilateral clamp, since W[0] < ρ0 -> C < 0). The integer reference is the make-or-break the GPU
+            // already matched above; this re-runs the CPU path on a 1-particle pool.
+            {
+                std::vector<fluid::FluidParticle> one(1);
+                one[0].pos = {fluid::kOne * 3, fluid::kOne * 5, 0}; one[0].invMass = fluid::kOne;
+                fluid::FluidGrid g1 = fluid::MakeGrid(one, kH);
+                fluid::FluidCellTable t1 = fluid::BuildCellTable(one, g1);
+                fluid::FluidNeighborList l1 = fluid::BuildNeighborList(one, g1, t1, kH);
+                std::vector<fluid::fx> r1, lm1;
+                fluid::ComputeDensity(one, l1, kernel, r1);
+                fluid::ComputeLambda(one, l1, kernel, r1, lm1);
+                if (r1.size() != 1 || r1[0] != kernel.W[0] || lm1[0] != 0) {
+                    std::fprintf(stderr, "FATAL: fluid-density sparse: isolated particle != {W[0], 0}\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("fluid-density sparse: self-density only (no-op)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER per-particle DENSITY HEAT side-view (the FL2 viz twin). Project each
+            // particle's integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel, colored by ρ_i mapped to a
+            // blue->cyan->green->yellow->red ramp (dense interior hot, sparse surface cold). CPU-colored from
+            // the read-back integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 18, kMargin = 20;
+            const int kWorldW = kSide, kWorldH = kSide + 12;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto heat = [](float t) -> Vec3 {
+                if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+                float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 3.0f)));
+                float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 2.0f)));
+                float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 1.0f)));
+                return Vec3{r, g, b};
+            };
+            int32_t maxRho = 1; for (int32_t d : gRho) if (d > maxRho) maxRho = d;
+            const float maxRhoF = (float)maxRho;
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = particlesInit[(size_t)i].px >> fluid::kFrac;
+                const int wy = particlesInit[(size_t)i].py >> fluid::kFrac;
+                int cx = kMargin + wx * kPxPerUnit;
+                int cy = (int)imgH - kMargin - wy * kPxPerUnit;
+                Vec3 col = heat((float)gRho[(size_t)i] / maxRhoF);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(fluidDensityShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fluid density heat (mean rho %d, %u neighbors)\n",
+                                fluidDensityShotPath, imgW, imgH, (int)kMeanDensity, kTotalNeighbors);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fluidDensityShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

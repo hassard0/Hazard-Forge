@@ -16844,6 +16844,146 @@ static int RunFluidIntegrateShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FL3 — Deterministic GPU Fluid PBF DENSITY + λ showcase (--fluid-density) (the MAKE-OR-BREAK
+// of FLAGSHIP #9). Like FL1's --fluid-integrate / CL3's --cloth-solve (and UNLIKE the int32 FL2 neighbor
+// search), the density r² (dx² over Q16.16) + the λ fxdiv/FxISqrt are int64, so shaders/fluid_density.comp
+// + fluid_lambda.comp are VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) and are NOT in this dir's
+// hf_gen_msl list; on Metal the --fluid-density showcase runs the CPU fluid::ComputeDensity +
+// fluid::ComputeLambda — the EXACT bit-exact reference the Vulkan --fluid-density-shot GPU==CPU memcmp
+// already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION
+// (the fluid_integrate.comp / cloth_solve.comp convention), while the Vulkan side carries the GPU==CPU
+// proof. So this builds the SAME settled 10x10x10 = 1000-particle dam-break block, builds the FL2 neighbor
+// list + the host-snapped Q16.16 kernel LUT (BuildKernelTable), runs ComputeDensity + ComputeLambda, and
+// CPU-colors the SAME integer density-heat side-view as the Vulkan --fluid-density-shot -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/fluid_density.png (baked on the Mac by the controller);
+// two runs DIFF 0.0000. NO GPU compute (int64 -> Vulkan-only), NO PBF position solve (FL4), NO new RHI.
+static int RunFluidDensityShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fluid = hf::sim::fluid;
+
+    // The settled 10x10x10 dam-break block (== the Vulkan --fluid-density-shot config).
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const int kSide = 10;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = (fluid::fx)(2 * (int)fluid::kOne);
+
+    fluid::FluidBlock block;
+    block.W = kSide; block.H = kSide; block.D = kSide;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(12 * (int)fluid::kOne), 0};
+    const int kParticleCount = block.W * block.H * block.D;
+    std::vector<fluid::FluidParticle> particles = fluid::InitBlock(block);
+    fluid::IntegrateFluidSteps(particles, kGravity, kDt, kGroundY, 90);
+
+    const fluid::FluidGrid grid = fluid::MakeGrid(particles, kH);
+    const fluid::FluidCellTable cpuTable = fluid::BuildCellTable(particles, grid);
+    const fluid::FluidNeighborList cpuList = fluid::BuildNeighborList(particles, grid, cpuTable, kH);
+    const uint32_t kTotalNeighbors = (uint32_t)cpuList.neighbors.size();
+    const int kBins = fluid::kKernelBins;
+    const fluid::FluidKernel kProbe = fluid::BuildKernelTable(kH, fluid::kOne, kBins, fluid::kOne / 100);
+    std::vector<fluid::fx> probeRho;
+    fluid::ComputeDensity(particles, cpuList, kProbe, probeRho);
+    const fluid::fx kRestDensity = fluid::MeanDensity(probeRho);
+    const fluid::fx kEpsilon = fluid::kOne / 100;
+    const fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, kRestDensity, kBins, kEpsilon);
+
+    // CPU ComputeDensity + ComputeLambda (== the bit-exact reference the Vulkan GPU==CPU memcmp compares
+    // against). This IS the result the Vulkan --fluid-density-shot proved the GPU shaders bit-identical to,
+    // so the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION.
+    auto runDensity = [&](std::vector<fluid::fx>& rho, std::vector<fluid::fx>& lam) {
+        fluid::ComputeDensity(particles, cpuList, kernel, rho);
+        fluid::ComputeLambda(particles, cpuList, kernel, rho, lam);
+    };
+    std::vector<fluid::fx> gRho, gLam;
+    runDensity(gRho, gLam);
+    const fluid::fx kMeanDensity = fluid::MeanDensity(gRho);
+
+    std::printf("fluid-density: {particles:%d, restDensity:%d, meanDensity:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fluid::ComputeDensity/ComputeLambda, byte-identical to the Vulkan GPU result "
+                "by construction]\n", kParticleCount, (int)kRestDensity, (int)kMeanDensity);
+
+    // determinism.
+    std::vector<fluid::fx> r2, l2;
+    runDensity(r2, l2);
+    if (r2 != gRho || l2 != gLam)
+        return fail("fluid-density: two runs differ (nondeterministic)");
+    std::printf("fluid-density determinism: two runs BYTE-IDENTICAL\n");
+
+    // coherence: all ρ_i > 0; interior denser than surface; ρ̄ ≈ ρ0.
+    int dense = 0; bool allPos = true;
+    for (int i = 0; i < kParticleCount; ++i) {
+        if (gRho[(size_t)i] <= 0) allPos = false;
+        if (gRho[(size_t)i] >= kRestDensity) ++dense;
+    }
+    const fluid::fx rhoInterior = gRho[(size_t)fluid::ParticleIndex(block, 5, 5, 5)];
+    const fluid::fx rhoCorner   = gRho[(size_t)fluid::ParticleIndex(block, 0, 0, 0)];
+    const fluid::fx band = kRestDensity / 100;
+    const fluid::fx dmean = (kMeanDensity > kRestDensity) ? (kMeanDensity - kRestDensity)
+                                                          : (kRestDensity - kMeanDensity);
+    if (!allPos || rhoInterior <= rhoCorner || dmean > band)
+        return fail("fluid-density: coherence incoherent (allPos/interior/mean band)");
+    std::printf("fluid-density coverage: %d dense particles, mean rho %d (coherent density field)\n",
+                dense, (int)kMeanDensity);
+
+    // sparse / no-op: an isolated particle -> ρ = W[0] (self only), λ = 0.
+    {
+        std::vector<fluid::FluidParticle> one(1);
+        one[0].pos = {fluid::kOne * 3, fluid::kOne * 5, 0}; one[0].invMass = fluid::kOne;
+        fluid::FluidGrid g1 = fluid::MakeGrid(one, kH);
+        fluid::FluidCellTable t1 = fluid::BuildCellTable(one, g1);
+        fluid::FluidNeighborList l1 = fluid::BuildNeighborList(one, g1, t1, kH);
+        std::vector<fluid::fx> rr, ll;
+        fluid::ComputeDensity(one, l1, kernel, rr);
+        fluid::ComputeLambda(one, l1, kernel, rr, ll);
+        if (rr.size() != 1 || rr[0] != kernel.W[0] || ll[0] != 0)
+            return fail("fluid-density: isolated particle != {W[0], 0}");
+        std::printf("fluid-density sparse: self-density only (no-op)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER density-heat side-view (IDENTICAL to the Vulkan --fluid-density-shot by
+    // construction). ---
+    const int kPxPerUnit = 18, kMargin = 20;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kSide * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 12) * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto heat = [](float t) -> Vec3 {
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 3.0f)));
+        float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 2.0f)));
+        float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 1.0f)));
+        return Vec3{r, g, b};
+    };
+    fluid::fx maxRho = 1; for (fluid::fx d : gRho) if (d > maxRho) maxRho = d;
+    const float maxRhoF = (float)maxRho;
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = particles[(size_t)i].pos.x >> fluid::kFrac;
+        const int wy = particles[(size_t)i].pos.y >> fluid::kFrac;
+        int cx = kMargin + wx * kPxPerUnit;
+        int cy = (int)imgH - kMargin - wy * kPxPerUnit;
+        Vec3 col = heat((float)gRho[(size_t)i] / maxRhoF);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — fluid density heat (mean rho %d, %u neighbors)\n",
+                outPath, imgW, imgH, (int)kMeanDensity, kTotalNeighbors);
+    return 0;
+}
+
 // ===== Slice CL1 — Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR showcase (--cloth-integrate)
 // (the BEACHHEAD of FLAGSHIP #8). Like FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the cloth
 // integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fpx_integrate.comp), so
@@ -31991,6 +32131,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fluid-neighbors") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fluid_neighbors.png";
             try { return RunFluidNeighborsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fluid-density <out.png>: render the Deterministic GPU Fluid PBF DENSITY + λ showcase (Slice FL3,
+        // the MAKE-OR-BREAK of FLAGSHIP #9). Like --fluid-integrate / --cloth-solve (int64 -> CPU on Metal),
+        // fluid_density.comp + fluid_lambda.comp are int64/Vulkan-only (glslc can't parse int64), so Metal
+        // runs the CPU fluid::ComputeDensity + ComputeLambda — byte-identical to the Vulkan GPU result by
+        // construction (the fluid_integrate.comp/cloth_solve.comp convention). The SAME settled 10x10x10 =
+        // 1000-particle dam-break block -> FL2 neighbor list -> the host-snapped Q16.16 kernel LUT
+        // (BuildKernelTable) -> ComputeDensity (ρ_i) + ComputeLambda (λ_i) — the EXACT bit-exact reference
+        // the Vulkan --fluid-density-shot GPU==CPU memcmp compares against; two runs byte-identical; the
+        // density field coherent (ρ̄ ≈ ρ0, interior denser); an isolated particle -> ρ = W[0], λ = 0. The
+        // image golden is the integer per-particle density-heat side-view, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/fluid_density.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fluid-density") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fluid_density.png";
+            try { return RunFluidDensityShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE
