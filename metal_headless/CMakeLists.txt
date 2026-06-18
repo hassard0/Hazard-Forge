@@ -371,6 +371,25 @@ hf_gen_msl(couple_body_emit.comp  couple_body_emit.comp.hlsl  comp couple_body_e
 hf_gen_msl(cgrain_body_count.comp cgrain_body_count.comp.hlsl comp cgrain_body_count_main)
 hf_gen_msl(cgrain_body_scan.comp  cgrain_body_scan.comp.hlsl  comp cgrain_body_scan_main)
 hf_gen_msl(cgrain_body_emit.comp  cgrain_body_emit.comp.hlsl  comp cgrain_body_emit_main)
+# Deterministic Grain<->Fluid Coupling Slice 1 (Slice GF1, the BEACHHEAD of FLAGSHIP #13): the UNIFIED TWO-POOL
+# WORLD + the SHARED-GRID CROSS QUERY (the GR2/FL2 27-cell-stencil neighbour search applied CROSS-POOL over ONE
+# shared grid) OVER the reused GR2 grain cell table + FL2 fluid cell table (grain_cell_* + fluid_cell_* above
+# build the two cellStart/cellGrains|cellParticles the cross query iterates, sized to the SHARED grid — no new
+# cell-table passes). cgf_gf_{count,scan,emit}.comp (ONE thread per grain: count/emit the FLUID particles in the
+# grain's 27-cell stencil over the FLUID cell table passing the per-axis |grain.axis - fluid.axis| < h reject —
+# CrossAccept VERBATIM, NO j==i self-skip since the pools are distinct) + cgf_fg_{count,scan,emit}.comp (the
+# MIRROR: ONE thread per fluid over the GRAIN cell table). ALL PURE INT32 (FloorDiv integer divide + per-axis
+# abs-compare, NO int64/fxmul/sqrt, NO radial cull — deferred to GF2/GF3), so glslc CAN lower them and they
+# MSL-generate NATIVELY (the default MSL gen suffices, the cgrain_body/grain_neighbor lesson). The Metal
+# --cgf-query showcase dispatches the GPU shaders directly (NOT a CPU fallback) -> the GPU==CPU cell-table+cross
+# proof runs on Metal too. Bit-exact GPU==CPU + cross-backend by construction. Behind --cgf-query only; the
+# GR2/FL2 pipelines + their goldens untouched; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only (additive).
+hf_gen_msl(cgf_gf_count.comp cgf_gf_count.comp.hlsl comp cgf_gf_count_main)
+hf_gen_msl(cgf_gf_scan.comp  cgf_gf_scan.comp.hlsl  comp cgf_gf_scan_main)
+hf_gen_msl(cgf_gf_emit.comp  cgf_gf_emit.comp.hlsl  comp cgf_gf_emit_main)
+hf_gen_msl(cgf_fg_count.comp cgf_fg_count.comp.hlsl comp cgf_fg_count_main)
+hf_gen_msl(cgf_fg_scan.comp  cgf_fg_scan.comp.hlsl  comp cgf_fg_scan_main)
+hf_gen_msl(cgf_fg_emit.comp  cgf_fg_emit.comp.hlsl  comp cgf_fg_emit_main)
 # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT GRAPH
 # BUILD (the FPX2 count->scan->emit on lattice particles). cloth_edge_count.comp (ONE thread per particle:
 # gEdgeCount[p]=#OWNED forward edges in bounds), cloth_edge_scan.comp (SINGLE-THREAD exclusive prefix-sum ->

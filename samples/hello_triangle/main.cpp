@@ -73,6 +73,7 @@
 #include "sim/grain.h"          // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp
 #include "sim/couple.h"         // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp
 #include "sim/couple_grain.h"   // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
+#include "sim/couple_gf.h"      // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -461,6 +462,7 @@ int main(int argc, char** argv) {
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
     const char* cgrainQueryShotPath = nullptr; // --cgrain-query-shot <out.bmp> (Slice CG1: Deterministic Rigid<->Grain Coupling UNIFIED bodies+grains WORLD + BODY->GRAIN grid-hash QUERY, the BEACHHEAD of FLAGSHIP #12 — a poured grain bed (GR1 InitGrainBlock, settled with GR4 friction steps) + a few FxBody spheres placed partly buried. Build the GR2 grain grid + cell table (reused grain_cell_{count,scan,emit}) then the per-body grain QUERY via THREE pure-INT32 count->scan->emit passes (cgrain_body_{count,scan,emit}.comp, MSL-native): each body gathers the grains inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - g.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CG2/CG3). GPU=={cellStart,cellGrains,bodyStart,bodyGrains}==CPU couple_grain.h::GatherBodyGrains bit-exact (memcmp), per-body gathered-grain heat viz (buried bodies populated, clear bodies empty). NO momentum exchange (CG2 support/drag, CG3 displacement, CG4 step, CG5 lockstep, CG6 render), NO new RHI; couple_grain.h #includes fpx.h + grain.h read-only)
+    const char* cgfQueryShotPath = nullptr; // --cgf-query-shot <out.bmp> (Slice GF1: Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL WORLD + SHARED-GRID CROSS QUERY, the BEACHHEAD of FLAGSHIP #13 — a settled grain bed (GR1 InitGrainBlock + GR4 friction) + an overlapping fluid block (FL1 InitBlock). Build ONE shared grid over BOTH pools' union AABB, bucket each pool into its own cell table (reused grain_cell_* + fluid_cell_* sized to the shared grid), then the two CROSS lists via SIX pure-INT32 count->scan->emit passes (cgf_gf_{count,scan,emit} grain->fluid + cgf_fg_{count,scan,emit} fluid->grain, MSL-native): each grain gathers the FLUID in its 27-cell stencil + each fluid the GRAINS in its 27-cell stencil, accepted iff the per-axis |query.axis - target.axis| < h box reject passes (the exact radial cull deferred to GF2/GF3). GPU=={grainCellTable,fluidCellTable,gfStart,gfNeighbors,fgStart,fgNeighbors}==CPU couple_gf.h::BuildCGFNeighbors bit-exact (memcmp), cross-pool neighbour heat viz (overlap populated, separated empty), the symmetry X==Y. NO momentum exchange (GF2-GF6), NO new RHI; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only)
     const char* coupleDisplaceShotPath = nullptr; // --couple-displace-shot <out.bmp> (Slice CP3, the FLUID REACTION / DISPLACEMENT body->fluid pass, the Newton's-3rd-law half of CP2; the 3rd slice of FLAGSHIP #11. A body submerged in a fluid pool pushes BACK on the fluid: each fluid particle inside the body is projected out to the body surface (the body DISPLACES the fluid — a cavity/wake) + receives the equal-opposite drag impulse. couple_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) runs ApplyBodyToFluid VERBATIM from couple.h; the GPU fluid array PROVEN BIT-EXACT vs the CPU couple.h::ApplyBodyToFluid (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) no-penetration penAfter<penBefore + displaced>0 (the fluid parted, the Jacobi single-projection caveat — relieved NOT zero); (4) a body clear of the fluid -> unchanged (no-op). Metal --couple-displace runs the CPU ApplyBodyToFluid. NO new RHI; CP1/CP2 couple code+shaders + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleStepShotPath = nullptr; // --couple-step-shot <out.bmp> (Slice CP4, THE COUPLED STEP — the bobbing barrel, the INTEGRATED two-way solver of FLAGSHIP #11. ONE deterministic tick composes the FL4 fluid sub-passes + CP2 fluid->body + CP3 body->fluid + the rigid integrate in the LOCKED (1)-(5) order -> a barrel BOBS under emergent buoyancy in an incompressible fluid, NO script. CP4 ORCHESTRATES the existing FL4 fluid_* + CP2 couple_buoyancy + CP3 couple_displace shaders (NO new shader, NO new RHI): the Vulkan GPU driver is the host-driven multi-pass mold of --fluid-solve-shot, re-running per step the FL2 query + FL4 density + CP3 displace + CP2 buoyancy passes with ComputeToComputeBarrier between, ReadBuffer reads the fluid + body arrays PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleSteps. A static basin holds a dynamic pool + a body dropped above it (radius 2, invMass=kOne/iters; h=2.0, iters=3, K=400). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) coupled — the body floats above the bed by a margin AND bobbed peak-to-trough>threshold AND the fluid stayed coherent (density residual bounded); (4) buoy=0 control sinks while the fluid settles. The HONEST emergent float line + bob (the GR4/FL4 caveat). int64 -> the FL4/CP2/CP3 shaders are Vulkan-only; Metal --couple-step runs the CPU StepCoupleSteps. CP1-CP3 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleBuoyancyShotPath = nullptr; // --couple-buoyancy-shot <out.bmp> (Slice CP2, the BUOYANCY + DRAG fluid->body pass, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange. A settled fluid pool (FL1 InitBlock) + an FxBody sphere dropped ABOVE it: each step re-runs the CP1 body->fluid query (couple_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then couple_buoyancy.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a buoyant impulse (∝ the gathered count = the displaced volume, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, enters the pool, buoyancy builds as it submerges, and it settles to an emergent float line. AccumBodyForces copied VERBATIM from engine/sim/couple.h. GPU body state PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) FLOATS — floatY > groundY+radius by a margin, bounded above (the honest emergent float line, NOT an exact Archimedes depth — the GR4/FL4 caveat); (4) buoy=0 control SINKS to the bed (floatY == groundY+radius), proving buoyancy does work. Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO fluid reaction (CP3), NO coupled step (CP4), NO lockstep (CP5), NO float render (CP6), NO buoyancy torque, NO new RHI; CP1's query passes + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -695,6 +697,18 @@ int main(int argc, char** argv) {
         // STANDALONE branch (C1061 avoidance, like the couple-query/grain-neighbors shots).
         if (std::strcmp(argv[i], "--cgrain-query-shot") == 0 && i + 1 < argc) {
             cgrainQueryShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GF1: --cgf-query-shot <out.bmp> — the Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL
+        // WORLD + SHARED-GRID CROSS QUERY (the BEACHHEAD of FLAGSHIP #13). A settled grain bed (GR1 InitGrainBlock
+        // + GR4 friction) overlapping a fluid block (FL1 InitBlock) -> ONE shared grid over BOTH pools, two cell
+        // tables (reused grain_cell_* + fluid_cell_*), then the two cross lists via SIX pure-INT32
+        // cgf_gf/cgf_fg_{count,scan,emit} passes, GPU==CPU {grainCellTable, fluidCellTable, gf*, fg*} bit-exact vs
+        // couple_gf.h::BuildCGFNeighbors, cross-pool neighbour heat viz. PURE int32 -> MSL-native on Metal. NO
+        // momentum exchange (GF2-GF6), NO new RHI. STANDALONE branch (C1061 avoidance, like the cgrain-query shot).
+        if (std::strcmp(argv[i], "--cgf-query-shot") == 0 && i + 1 < argc) {
+            cgfQueryShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16405,6 +16419,425 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cgrain body-grain gather heat (%u gathered, maxPerBody %u)\n",
                                 cgrainQueryShotPath, imgW, imgH, kTotalGathered, maxPer);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgrainQueryShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL WORLD + SHARED-GRID CROSS QUERY
+        // (--cgf-query-shot <out.bmp>, Slice GF1, the BEACHHEAD of FLAGSHIP #13 — the FIRST particle<->particle
+        // coupling). A settled grain bed (GR1 InitGrainBlock + a few GR4 friction steps) + a fluid block (FL1
+        // InitBlock) overlapping its left half. Build ONE shared grid over the UNION of both pools' AABBs, bucket
+        // EACH pool into its own cell table over that grid by the SIX reused passes (grain_cell_{count,scan,emit}
+        // + fluid_cell_{count,scan,emit}, sized to the shared grid). Then the two CROSS lists by the SIX new
+        // pure-INT32 passes: cgf_gf_count/scan/emit (per grain, the FLUID 27-cell stencil) + cgf_fg_count/scan/emit
+        // (per fluid, the GRAIN 27-cell stencil). CrossAccept (per-axis |dx|<h) copied VERBATIM (PURE INT32, NO
+        // int64/sqrt, NO radial cull -> MSL-native on Metal). ReadBuffer reads both cell tables + gfStart/gfNeighbors
+        // + fgStart/fgNeighbors; the CPU couple_gf.h::BuildCGFNeighbors over the SAME world must match BIT-EXACT
+        // (memcmp, NO tol). The golden is a cross-pool neighbour HEAT viz (overlap region populated, separated
+        // regions empty). NO momentum exchange (GF2-GF6), NO new RHI. One BMP -> exit. (STANDALONE branch, C1061.)
+        if (cgfQueryShotPath) {
+            using math::Vec3;
+            namespace cgf   = hf::sim::cgf;
+            namespace grain = hf::sim::grain;
+            namespace fluid = hf::sim::fluid;
+
+            // Shared world config. h = 1.5 (the coupling radius / shared cell size, host-snapped Q16.16).
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+            const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (host-snapped Q16.16, the coupling radius)
+
+            // The grain bed: a GR1 dropped block settled (GR4 friction) into a low pile at the ground. 12x4x12 =
+            // 576 grains, spacing 1.0, spanning x,z in [0,11], y near the ground after settling.
+            grain::GrainBlock gblock;
+            gblock.W = 12; gblock.H = 4; gblock.D = 12;                // 576 grains
+            gblock.spacing = grain::kOne;
+            gblock.radius = kRadius;
+            gblock.origin = grain::FxVec3{0, (grain::fx)(3 * (int)grain::kOne), 0};
+            std::vector<grain::GrainParticle> grains = grain::InitGrainBlock(gblock);
+            grain::StepGrainFrictionSteps(grains, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 40);
+
+            // The fluid block: a FL1 InitBlock overlapping the LEFT half of the bed (x in [0,5]) at low y so the
+            // two pools INTERPENETRATE -> non-trivial cross neighbours. 6x3x12 = 216 fluid particles, spacing 1.0.
+            fluid::FluidBlock fblock;
+            fblock.W = 6; fblock.H = 3; fblock.D = 12;                 // 216 fluid particles
+            fblock.spacing = grain::kOne;
+            fblock.origin = grain::FxVec3{0, (grain::fx)(0), 0};       // sit at the ground, overlapping the bed
+            std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+            cgf::CGFWorld world;
+            world.grains  = grains;
+            world.fluid   = fluidP;
+            world.h       = kH;
+            world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+            const int kGrainCount = (int)world.grains.size();
+            const int kFluidCount = (int)world.fluid.size();
+
+            // The CPU reference shared grid + both cell tables + both cross lists (the GPU memcmp's against this).
+            const cgf::CGFGrid grid = cgf::MakeCGFGrid(world);
+            const uint32_t kCellCount = cgf::CGFCellCount(grid);
+            const grain::GrainGrid gGrid = cgf::GrainGridFromCGF(grid);
+            const fluid::FluidGrid fGrid = cgf::FluidGridFromCGF(grid);
+            const grain::GrainCellTable cpuGTable = grain::BuildGrainCellTable(world.grains, gGrid);
+            const fluid::FluidCellTable cpuFTable = fluid::BuildCellTable(world.fluid, fGrid);
+            const cgf::CGFNeighbors cpuNbr = cgf::BuildCGFNeighbors(world);
+            const uint32_t kGF = cgf::CountGF(cpuNbr);
+            const uint32_t kFG = cgf::CountFG(cpuNbr);
+            const uint32_t kGFAlloc = kGF > 0u ? kGF : 1u;
+            const uint32_t kFGAlloc = kFG > 0u ? kFG : 1u;
+
+            // std430 GrainParticle mirror (== the cgf shaders): 12 x int32 (48 bytes).
+            struct GrainParticleGpu { int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags; };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            std::vector<GrainParticleGpu> grainsInit((size_t)kGrainCount);
+            for (int i = 0; i < kGrainCount; ++i) {
+                const grain::GrainParticle& p = world.grains[(size_t)i];
+                grainsInit[(size_t)i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+                    p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+            }
+            rhi::BufferDesc grainDesc;
+            grainDesc.size = grainsInit.size() * sizeof(GrainParticleGpu);
+            grainDesc.initialData = grainsInit.data();
+            grainDesc.usage = rhi::BufferUsage::Storage;
+            auto grainsBuf = device->CreateBuffer(grainDesc);
+
+            // std430 FluidParticle mirror (== the cgf shaders): 11 x int32 (44 bytes).
+            struct FluidParticleGpu { int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags; };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            std::vector<FluidParticleGpu> fluidInit((size_t)kFluidCount);
+            for (int i = 0; i < kFluidCount; ++i) {
+                const fluid::FluidParticle& p = world.fluid[(size_t)i];
+                fluidInit[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+                    p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+            }
+            rhi::BufferDesc fluidDesc;
+            fluidDesc.size = fluidInit.size() * sizeof(FluidParticleGpu);
+            fluidDesc.initialData = fluidInit.data();
+            fluidDesc.usage = rhi::BufferUsage::Storage;
+            auto fluidBuf = device->CreateBuffer(fluidDesc);
+
+            // std430 params (== the GrainGridParams/FluidGridParams/CGFGridParams layout): int4 grid {h,
+            // cellMin.xyz} + int4 dim {gridDim.xyz, queryCount} + int4 cfg {cellCount, enabled, _, _}. The grain
+            // cell pass reads dim.w = grainCount; the fluid cell pass dim.w = fluidCount; gf dim.w = grainCount;
+            // fg dim.w = fluidCount. Both pools share cellMin/gridDim/cellCount (the shared grid).
+            struct CGFParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+            static_assert(sizeof(CGFParams) == 48, "CGFParams std430 layout");
+            auto makeParams = [&](int32_t countW, int32_t enabled) {
+                CGFParams p{};
+                p.grid[0] = kH; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y; p.grid[3] = grid.cellMin.z;
+                p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z; p.dim[3] = countW;
+                p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Fresh-cleared per-run output buffers (the two cell tables + the two cross lists).
+            std::vector<uint32_t> gCellCountInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> gCellStartInit((size_t)kCellCount + 1u, 0u);
+            std::vector<uint32_t> gCellCursorInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> gCellGrainInit((size_t)kGrainCount, 0u);
+            std::vector<uint32_t> fCellCountInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> fCellStartInit((size_t)kCellCount + 1u, 0u);
+            std::vector<uint32_t> fCellCursorInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> fCellPartInit((size_t)kFluidCount, 0u);
+            std::vector<uint32_t> gfCountInit((size_t)kGrainCount, 0u);
+            std::vector<uint32_t> gfStartInit((size_t)kGrainCount + 1u, 0u);
+            std::vector<uint32_t> gfNbrInit((size_t)kGFAlloc, 0u);
+            std::vector<uint32_t> fgCountInit((size_t)kFluidCount, 0u);
+            std::vector<uint32_t> fgStartInit((size_t)kFluidCount + 1u, 0u);
+            std::vector<uint32_t> fgNbrInit((size_t)kFGAlloc, 0u);
+            auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+                rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+                d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                auto pipe = device->CreateComputePipeline(d);
+                return std::make_pair(std::move(cs), std::move(pipe));
+            };
+            auto gCellCountPipe = mkPipe("grain_cell_count.comp.hlsl.spv", 3, 64);
+            auto gCellScanPipe  = mkPipe("grain_cell_scan.comp.hlsl.spv", 3, 1);
+            auto gCellEmitPipe  = mkPipe("grain_cell_emit.comp.hlsl.spv", 5, 1);
+            auto fCellCountPipe = mkPipe("fluid_cell_count.comp.hlsl.spv", 3, 64);
+            auto fCellScanPipe  = mkPipe("fluid_cell_scan.comp.hlsl.spv", 3, 1);
+            auto fCellEmitPipe  = mkPipe("fluid_cell_emit.comp.hlsl.spv", 5, 1);
+            auto gfCountPipe = mkPipe("cgf_gf_count.comp.hlsl.spv", 6, 64);
+            auto gfScanPipe  = mkPipe("cgf_gf_scan.comp.hlsl.spv", 3, 1);
+            auto gfEmitPipe  = mkPipe("cgf_gf_emit.comp.hlsl.spv", 7, 64);
+            auto fgCountPipe = mkPipe("cgf_fg_count.comp.hlsl.spv", 6, 64);
+            auto fgScanPipe  = mkPipe("cgf_fg_scan.comp.hlsl.spv", 3, 1);
+            auto fgEmitPipe  = mkPipe("cgf_fg_emit.comp.hlsl.spv", 7, 64);
+
+            const uint32_t kGrainGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+            const uint32_t kFluidGroups = ((uint32_t)kFluidCount + 63u) / 64u;
+
+            auto runQuery = [&](int32_t enabled, std::vector<uint32_t>& outGCellStart,
+                                std::vector<uint32_t>& outGCellGrains, std::vector<uint32_t>& outFCellStart,
+                                std::vector<uint32_t>& outFCellPart, std::vector<uint32_t>& outGfStart,
+                                std::vector<uint32_t>& outGfNbr, std::vector<uint32_t>& outFgStart,
+                                std::vector<uint32_t>& outFgNbr) {
+                auto gCellCountBuf = makeUintBuf(gCellCountInit);
+                auto gCellStartBuf = makeUintBuf(gCellStartInit);
+                auto gCellCursorBuf = makeUintBuf(gCellCursorInit);
+                auto gCellGrainBuf = makeUintBuf(gCellGrainInit);
+                auto fCellCountBuf = makeUintBuf(fCellCountInit);
+                auto fCellStartBuf = makeUintBuf(fCellStartInit);
+                auto fCellCursorBuf = makeUintBuf(fCellCursorInit);
+                auto fCellPartBuf = makeUintBuf(fCellPartInit);
+                auto gfCountBuf = makeUintBuf(gfCountInit);
+                auto gfStartBuf = makeUintBuf(gfStartInit);
+                auto gfNbrBuf = makeUintBuf(gfNbrInit);
+                auto fgCountBuf = makeUintBuf(fgCountInit);
+                auto fgStartBuf = makeUintBuf(fgStartInit);
+                auto fgNbrBuf = makeUintBuf(fgNbrInit);
+                CGFParams grainParams = makeParams(kGrainCount, enabled);
+                CGFParams fluidParams = makeParams(kFluidCount, enabled);
+                rhi::BufferDesc gpd; gpd.size = sizeof(CGFParams); gpd.initialData = &grainParams;
+                gpd.usage = rhi::BufferUsage::Storage;
+                auto grainParamsBuf = device->CreateBuffer(gpd);
+                rhi::BufferDesc fpd; fpd.size = sizeof(CGFParams); fpd.initialData = &fluidParams;
+                fpd.usage = rhi::BufferUsage::Storage;
+                auto fluidParamsBuf = device->CreateBuffer(fpd);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("cgf_query", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // (1-3) GRAIN cell table (reused GR2): count -> scan -> emit.
+                        cmd.BindComputePipeline(*gCellCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellCountBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2); cmd.DispatchCompute(kGrainGroups);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gCellScanPipe.second);
+                        cmd.BindStorageBuffer(*gCellCountBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2); cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gCellEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*gCellCursorBuf, 2); cmd.BindStorageBuffer(*gCellGrainBuf, 3);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 4); cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // (4-6) FLUID cell table (reused FL2): count -> scan -> emit.
+                        cmd.BindComputePipeline(*fCellCountPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellCountBuf, 1);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 2); cmd.DispatchCompute(kFluidGroups);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fCellScanPipe.second);
+                        cmd.BindStorageBuffer(*fCellCountBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 2); cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fCellEmitPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fCellCursorBuf, 2); cmd.BindStorageBuffer(*fCellPartBuf, 3);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 4); cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // (7-9) gf cross list (grain -> fluid): count -> scan -> emit (over the FLUID cell table).
+                        cmd.BindComputePipeline(*gfCountPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fCellPartBuf, 2); cmd.BindStorageBuffer(*grainsBuf, 3);
+                        cmd.BindStorageBuffer(*gfCountBuf, 4); cmd.BindStorageBuffer(*grainParamsBuf, 5);
+                        cmd.DispatchCompute(kGrainGroups);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gfScanPipe.second);
+                        cmd.BindStorageBuffer(*gfCountBuf, 0); cmd.BindStorageBuffer(*gfStartBuf, 1);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 2); cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*gfEmitPipe.second);
+                        cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*fCellPartBuf, 2); cmd.BindStorageBuffer(*grainsBuf, 3);
+                        cmd.BindStorageBuffer(*gfStartBuf, 4); cmd.BindStorageBuffer(*gfNbrBuf, 5);
+                        cmd.BindStorageBuffer(*grainParamsBuf, 6); cmd.DispatchCompute(kGrainGroups);
+                        cmd.ComputeToComputeBarrier();
+                        // (10-12) fg cross list (fluid -> grain): count -> scan -> emit (over the GRAIN cell table).
+                        cmd.BindComputePipeline(*fgCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*gCellGrainBuf, 2); cmd.BindStorageBuffer(*fluidBuf, 3);
+                        cmd.BindStorageBuffer(*fgCountBuf, 4); cmd.BindStorageBuffer(*fluidParamsBuf, 5);
+                        cmd.DispatchCompute(kFluidGroups);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fgScanPipe.second);
+                        cmd.BindStorageBuffer(*fgCountBuf, 0); cmd.BindStorageBuffer(*fgStartBuf, 1);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 2); cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*fgEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gCellStartBuf, 1);
+                        cmd.BindStorageBuffer(*gCellGrainBuf, 2); cmd.BindStorageBuffer(*fluidBuf, 3);
+                        cmd.BindStorageBuffer(*fgStartBuf, 4); cmd.BindStorageBuffer(*fgNbrBuf, 5);
+                        cmd.BindStorageBuffer(*fluidParamsBuf, 6); cmd.DispatchCompute(kFluidGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outGCellStart.assign((size_t)kCellCount + 1u, 0u);
+                device->ReadBuffer(*gCellStartBuf, outGCellStart.data(), outGCellStart.size() * sizeof(uint32_t), 0);
+                outGCellGrains.assign((size_t)kGrainCount, 0u);
+                device->ReadBuffer(*gCellGrainBuf, outGCellGrains.data(), outGCellGrains.size() * sizeof(uint32_t), 0);
+                outFCellStart.assign((size_t)kCellCount + 1u, 0u);
+                device->ReadBuffer(*fCellStartBuf, outFCellStart.data(), outFCellStart.size() * sizeof(uint32_t), 0);
+                outFCellPart.assign((size_t)kFluidCount, 0u);
+                device->ReadBuffer(*fCellPartBuf, outFCellPart.data(), outFCellPart.size() * sizeof(uint32_t), 0);
+                outGfStart.assign((size_t)kGrainCount + 1u, 0u);
+                device->ReadBuffer(*gfStartBuf, outGfStart.data(), outGfStart.size() * sizeof(uint32_t), 0);
+                outGfNbr.assign((size_t)kGFAlloc, 0u);
+                device->ReadBuffer(*gfNbrBuf, outGfNbr.data(), outGfNbr.size() * sizeof(uint32_t), 0);
+                outFgStart.assign((size_t)kFluidCount + 1u, 0u);
+                device->ReadBuffer(*fgStartBuf, outFgStart.data(), outFgStart.size() * sizeof(uint32_t), 0);
+                outFgNbr.assign((size_t)kFGAlloc, 0u);
+                device->ReadBuffer(*fgNbrBuf, outFgNbr.data(), outFgNbr.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU query (enabled) ===
+            std::vector<uint32_t> gGCellStart, gGCellGrains, gFCellStart, gFCellPart, gGfStart, gGfNbr,
+                gFgStart, gFgNbr;
+            runQuery(1, gGCellStart, gGCellGrains, gFCellStart, gFCellPart, gGfStart, gGfNbr, gFgStart, gFgNbr);
+
+            // PROOF (1) GPU==CPU both cell tables + both cross lists BIT-EXACT (integer memcmp, NO tol).
+            bool gCellStartOk = (gGCellStart.size() == cpuGTable.cellStart.size()) &&
+                std::memcmp(gGCellStart.data(), cpuGTable.cellStart.data(),
+                            cpuGTable.cellStart.size() * sizeof(uint32_t)) == 0;
+            bool gCellGrainsOk = (gGCellGrains.size() == cpuGTable.cellGrains.size()) &&
+                std::memcmp(gGCellGrains.data(), cpuGTable.cellGrains.data(),
+                            cpuGTable.cellGrains.size() * sizeof(uint32_t)) == 0;
+            bool fCellStartOk = (gFCellStart.size() == cpuFTable.cellStart.size()) &&
+                std::memcmp(gFCellStart.data(), cpuFTable.cellStart.data(),
+                            cpuFTable.cellStart.size() * sizeof(uint32_t)) == 0;
+            bool fCellPartOk = (gFCellPart.size() == cpuFTable.cellParticles.size()) &&
+                std::memcmp(gFCellPart.data(), cpuFTable.cellParticles.data(),
+                            cpuFTable.cellParticles.size() * sizeof(uint32_t)) == 0;
+            bool gfStartOk = (gGfStart.size() == cpuNbr.gfStart.size()) &&
+                std::memcmp(gGfStart.data(), cpuNbr.gfStart.data(),
+                            cpuNbr.gfStart.size() * sizeof(uint32_t)) == 0;
+            bool gfNbrOk = (kGF == (uint32_t)cpuNbr.gfNeighbors.size()) &&
+                std::memcmp(gGfNbr.data(), cpuNbr.gfNeighbors.data(), (size_t)kGF * sizeof(uint32_t)) == 0;
+            bool fgStartOk = (gFgStart.size() == cpuNbr.fgStart.size()) &&
+                std::memcmp(gFgStart.data(), cpuNbr.fgStart.data(),
+                            cpuNbr.fgStart.size() * sizeof(uint32_t)) == 0;
+            bool fgNbrOk = (kFG == (uint32_t)cpuNbr.fgNeighbors.size()) &&
+                std::memcmp(gFgNbr.data(), cpuNbr.fgNeighbors.data(), (size_t)kFG * sizeof(uint32_t)) == 0;
+            if (!gCellStartOk || !gCellGrainsOk || !fCellStartOk || !fCellPartOk || !gfStartOk || !gfNbrOk ||
+                !fgStartOk || !fgNbrOk) {
+                std::fprintf(stderr, "FATAL: cgf-query GPU != CPU BuildCGFNeighbors (gCell=%d/%d fCell=%d/%d "
+                             "gf=%d/%d fg=%d/%d)\n", (int)gCellStartOk, (int)gCellGrainsOk, (int)fCellStartOk,
+                             (int)fCellPartOk, (int)gfStartOk, (int)gfNbrOk, (int)fgStartOk, (int)fgNbrOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgf-query: {grains:%d, fluid:%d, gf:%u, fg:%u} GPU==CPU BIT-EXACT\n",
+                        kGrainCount, kFluidCount, kGF, kFG);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<uint32_t> a, b, c, d, e, f, g2, h2;
+                runQuery(1, a, b, c, d, e, f, g2, h2);
+                if (a != gGCellStart || b != gGCellGrains || c != gFCellStart || d != gFCellPart ||
+                    e != gGfStart || f != gGfNbr || g2 != gFgStart || h2 != gFgNbr) {
+                    std::fprintf(stderr, "FATAL: cgf-query two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-query determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage / coherence + the symmetry sanity X==Y. Every emitted gf/fg pair must pass the
+            // box reject; the overlap region is populated; the symmetric pair count X==Y (same h).
+            {
+                auto crossAccept = [&](const cgf::FxVec3& a, const cgf::FxVec3& b) {
+                    cgf::fx ax = a.x - b.x; if (ax < 0) ax = -ax;
+                    cgf::fx ay = a.y - b.y; if (ay < 0) ay = -ay;
+                    cgf::fx az = a.z - b.z; if (az < 0) az = -az;
+                    return ax < kH && ay < kH && az < kH;
+                };
+                bool coherent = true;
+                for (uint32_t i = 0; i < (uint32_t)kGrainCount && coherent; ++i)
+                    for (uint32_t s = gGfStart[i]; s < gGfStart[i + 1u]; ++s)
+                        if (!crossAccept(world.grains[i].pos, world.fluid[gGfNbr[s]].pos)) coherent = false;
+                for (uint32_t i = 0; i < (uint32_t)kFluidCount && coherent; ++i)
+                    for (uint32_t s = gFgStart[i]; s < gFgStart[i + 1u]; ++s)
+                        if (!crossAccept(world.fluid[i].pos, world.grains[gFgNbr[s]].pos)) coherent = false;
+                if (!coherent || kGF == 0u || kGF != kFG) {
+                    std::fprintf(stderr, "FATAL: cgf-query coverage incoherent (coherent=%d gf=%u fg=%u X==Y=%d)\n",
+                                 (int)coherent, kGF, kFG, (int)(kGF == kFG));
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-query coverage: {gf:%u, fg:%u} cross-pool pairs (overlap populated, "
+                            "separated empty)\n", kGF, kFG);
+            }
+
+            // PROOF (4) empty / separated no-op: two pools fully separated (no overlap) -> 0 cross neighbours.
+            {
+                cgf::CGFWorld sep;
+                sep.h = kH;
+                sep.grains = world.grains;
+                // A fluid block far to the +x side, clear of the bed (x in [50,55]).
+                fluid::FluidBlock farB; farB.W = 6; farB.H = 3; farB.D = 12; farB.spacing = grain::kOne;
+                farB.origin = grain::FxVec3{(grain::fx)(50 * (int)grain::kOne), 0, 0};
+                sep.fluid = fluid::InitBlock(farB);
+                cgf::CGFNeighbors sepNbr = cgf::BuildCGFNeighbors(sep);
+                if (cgf::CountGF(sepNbr) != 0u || cgf::CountFG(sepNbr) != 0u) {
+                    std::fprintf(stderr, "FATAL: cgf-query separated produced cross neighbours\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-query separated: 0 cross-pool neighbours (no-op)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER cross-pool neighbour HEAT TOP-DOWN (x,z) view. The bed is 12(x)x12(z);
+            // the fluid overlaps x in [0,5]. Project each particle's integer (pos.x>>kFrac, pos.z>>kFrac) to a
+            // pixel; color grains by their FLUID-neighbour count (gf) and fluid by their GRAIN-neighbour count
+            // (fg) — warm = has cross neighbours, dim = none. The overlap region (left half) lights up; the
+            // separated right half of the bed stays dim. CPU-colored from the read-back integers -> identical
+            // both backends by construction (PURE INTEGER, the strict zero-differing-pixel bar). ---
+            const int kPxPerUnit = 20;
+            const int kMargin = 20;
+            const int kWorldW = 12, kWorldH = 12;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Heat color: 0 cross neighbours -> dim grey; >0 -> a warm/cool ramp by count.
+            auto heatColor = [](uint32_t cnt, bool grain) -> Vec3 {
+                if (cnt == 0u) return Vec3{0.16f, 0.16f, 0.18f};
+                float t = (float)cnt / 8.0f; if (t > 1.0f) t = 1.0f;
+                // grains = warm (orange->yellow), fluid = cool (blue->cyan) so the two pools are distinguishable.
+                if (grain) return Vec3{0.6f + 0.4f * t, 0.3f + 0.5f * t, 0.1f};
+                else       return Vec3{0.1f, 0.4f + 0.5f * t, 0.7f + 0.3f * t};
+            };
+            auto plotAt = [&](int px, int pz, const Vec3& col) {
+                int cx = kMargin + px * kPxPerUnit;
+                int cy = (int)imgH - kMargin - pz * kPxPerUnit;
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // Draw grains (warm heat by gf count) then fluid (cool heat by fg count) on top.
+            for (int i = 0; i < kGrainCount; ++i) {
+                const uint32_t cnt = gGfStart[(size_t)i + 1] - gGfStart[(size_t)i];
+                plotAt(grainsInit[(size_t)i].px >> grain::kFrac, grainsInit[(size_t)i].pz >> grain::kFrac,
+                       heatColor(cnt, true));
+            }
+            for (int i = 0; i < kFluidCount; ++i) {
+                const uint32_t cnt = gFgStart[(size_t)i + 1] - gFgStart[(size_t)i];
+                plotAt(fluidInit[(size_t)i].px >> grain::kFrac, fluidInit[(size_t)i].pz >> grain::kFrac,
+                       heatColor(cnt, false));
+            }
+            bool ok = WriteBMP(cgfQueryShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cgf cross-pool neighbour heat (gf %u, fg %u)\n",
+                                cgfQueryShotPath, imgW, imgH, kGF, kFG);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgfQueryShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

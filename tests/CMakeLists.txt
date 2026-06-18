@@ -673,6 +673,21 @@ hf_add_pure_test(couple_test)
 # C++ (hf_core), ASan-eligible. couple_grain.h #includes fpx.h + grain.h read-only.
 hf_add_pure_test(cgrain_test)
 
+# Deterministic Grain<->Fluid Coupling Slice 1 (Slice GF1, the BEACHHEAD of FLAGSHIP #13): the UNIFIED TWO-POOL
+# WORLD + the SHARED-GRID CROSS QUERY core (engine/sim/couple_gf.h) the GPU
+# shaders/cgf_gf_{count,scan,emit}.comp.hlsl + cgf_fg_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
+# bit-identical. The GR2/FL2 27-cell-stencil neighbour search applied CROSS-POOL over ONE shared grid: per grain
+# the FLUID particles in its 27-cell stencil (gfNeighbors), per fluid the GRAINS in its 27-cell stencil
+# (fgNeighbors), each accepted iff the per-axis box reject |query.axis - target.axis| < h passes (PURE INT32, the
+# exact radial cull deferred to GF2/GF3). Pins MakeCGFGrid (the union bounds over BOTH pools' cell ranges — every
+# grain AND fluid cell in [0,gridDim); empty/one-empty degenerate cases), BuildCGFNeighbors (a hand-laid
+# overlapping set -> the EXACT gf/fg cross lists vs a naive O(G*F) oracle, CSR offsets correct, ascending
+# within-query order, NO self-pairs), the SYMMETRY CountGF==CountFG, separated pools -> 0 (the no-op), determinism
+# (two builds byte-identical). GF1 claims ONLY the unified two-pool world + the two cross-pool neighbour lists (NO
+# momentum exchange — GF2 buoyancy/seepage, GF3 contact, GF4 step, GF5 lockstep, GF6 render). Pure C++ (hf_core),
+# ASan-eligible. couple_gf.h #includes fpx.h + grain.h + fluid.h read-only.
+hf_add_pure_test(cgf_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE

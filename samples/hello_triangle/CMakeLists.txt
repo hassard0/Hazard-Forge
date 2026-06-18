@@ -561,6 +561,27 @@ hf_compile_shaders(
     "shaders/cgrain_body_count.comp.hlsl:cs"
     "shaders/cgrain_body_scan.comp.hlsl:cs"
     "shaders/cgrain_body_emit.comp.hlsl:cs"
+    # Deterministic Grain<->Fluid Coupling Slice 1 (Slice GF1, the BEACHHEAD of FLAGSHIP #13): the UNIFIED
+    # TWO-POOL WORLD + the SHARED-GRID CROSS QUERY meshed by SIX pure-INT32 count->scan->emit passes (the GR2/FL2
+    # 27-cell-stencil neighbour search applied CROSS-POOL over ONE shared grid). The two cell tables are the
+    # REUSED GR2 grain_cell_{count,scan,emit} + FL2 fluid_cell_{count,scan,emit} passes sized to the SHARED grid
+    # (no new cell-table passes). The two CROSS lists: cgf_gf_{count,scan,emit}.comp (ONE thread per grain: count
+    # the FLUID particles in the grain's 27-cell stencil over the FLUID cell table passing the per-axis
+    # |grain.axis - fluid.axis| < h reject — CrossAccept VERBATIM, NO j==i self-skip since the pools are distinct;
+    # SINGLE-THREAD exclusive prefix-sum -> gfStart CSR + sentinel; ONE thread per grain emits its FLUID indices
+    # into its DISJOINT gfNeighbors[] slice, NO atomics) + cgf_fg_{count,scan,emit}.comp (the MIRROR: ONE thread
+    # per fluid over the GRAIN cell table -> fgStart/fgNeighbors). ALL PURE INT32 (FloorDiv integer divide +
+    # per-axis abs-compare, NO int64/fxmul/sqrt, NO radial cull — deferred to GF2/GF3), so these MSL-GENERATE
+    # NATIVELY (they ARE in the Metal hf_gen_msl list) and Metal dispatches the GPU passes (a true GPU pass on
+    # both backends, the CG1/CP1/GR2/FL2 precedent). ReadBuffer reads grainCellTable + fluidCellTable + gfStart +
+    # gfNeighbors + fgStart + fgNeighbors, PROVEN BIT-EXACT vs the CPU couple_gf.h::BuildCGFNeighbors (memcmp). NO
+    # momentum exchange (GF2-GF6), NO new RHI; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only (additive).
+    "shaders/cgf_gf_count.comp.hlsl:cs"
+    "shaders/cgf_gf_scan.comp.hlsl:cs"
+    "shaders/cgf_gf_emit.comp.hlsl:cs"
+    "shaders/cgf_fg_count.comp.hlsl:cs"
+    "shaders/cgf_fg_scan.comp.hlsl:cs"
+    "shaders/cgf_fg_emit.comp.hlsl:cs"
     # Deterministic Rigid<->Grain Coupling Slice 2 (Slice CG2, the CONTACT SUPPORT + DRAG grain->body pass — the
     # CRUX of FLAGSHIP #12, the FIRST momentum exchange). ONE new int64 shader: cgrain_support.comp — ONE THREAD
     # PER BODY (multi-thread OVER bodies, NOT per grain), each thread SERIALLY sums its body's CG1 gathered grain
