@@ -544,6 +544,26 @@ hf_compile_shaders(
     "shaders/couple_body_count.comp.hlsl:cs"
     "shaders/couple_body_scan.comp.hlsl:cs"
     "shaders/couple_body_emit.comp.hlsl:cs"
+    # Deterministic Rigid<->Fluid Coupling Slice 2 (Slice CP2, the BUOYANCY + DRAG fluid->body pass — the CRUX
+    # of FLAGSHIP #11, the FIRST momentum exchange). ONE new int64 shader: couple_buoyancy.comp — ONE THREAD
+    # PER BODY (multi-thread OVER bodies, NOT per particle), each thread SERIALLY sums its body's CP1 gathered
+    # list (bodyParticles[bodyStart[i]..bodyStart[i+1]), the FIXED ascending CP1 emit order) into a buoyant
+    # (∝ the gathered count = the displaced volume, along up = -normalize(gravity)) + drag (toward the static
+    # fluid's mean velocity) impulse, then writes the body's new vel; AccumBodyForces copied VERBATIM from
+    # engine/sim/couple.h (linear only — a sphere body has no buoyancy torque; the host driver runs IntegrateBody
+    # + ResolveGround AFTER). The body count is TINY so each body's short inner loop is far below the ~2s
+    # watchdog -> NO single-thread [numthreads(1,1,1)] / TDR ceiling (the CL3/FPX3 limit does not apply). The
+    # K-step loop is HOST-driven: each step re-runs the CP1 query passes (couple_body_{count,scan,emit}, int32
+    # MSL-native) from the bodies' CURRENT positions -> couple_buoyancy -> the host integrate (IntegrateBody +
+    # ResolveGround), a ComputeToComputeBarrier between sub-passes; the fluid is held STATIC (the reaction is
+    # CP3). Because the buoyancy/drag fxmul/fxdiv + the vFluidAvg int64 sum + FxNormalize (FxISqrt) use int64,
+    # couple_buoyancy.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal
+    # hf_gen_msl list; the Metal --couple-buoyancy showcase runs the CPU couple::StepCoupleBuoyancy (byte-
+    # identical by construction, the grain_contact_dp.comp/fluid_dp.comp convention) — the Vulkan side carries
+    # the GPU==CPU proof. ReadBuffer reads the body array, PROVEN BIT-EXACT vs the CPU couple.h::
+    # StepCoupleBuoyancySteps (memcmp — the make-or-break). NO new RHI; CP1's couple_body_{count,scan,emit}
+    # shaders + their goldens UNCHANGED (CP2 is additive; the CP1 query passes stay int32 MSL-native).
+    "shaders/couple_buoyancy.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 3 (Slice GR3, the FRICTIONLESS CONTACT PROJECTION of FLAGSHIP
     # #10, the FL4 fluid_dp/fluid_apply/fluid_collide twin): the JACOBI contact solve. The K-step JACOBI loop
     # is HOST-driven (predict[GR1] -> GR2 neighbour passes[host-rebuilt from the predicted positions] ->

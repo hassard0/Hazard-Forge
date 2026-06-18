@@ -649,9 +649,13 @@ hf_add_pure_test(grain_test)
 # sphere cull deferred to CP2). Pins BodyParticleAccept (the per-axis abs-compare), GatherBodyParticles (one
 # body over a hand-laid pool -> the EXACT 3x3 gathered box, CSR offsets correct, ascending within-body order;
 # a body clear of the pool -> empty; two bodies -> disjoint ascending per-body lists; the empty world / no
-# particles no-op; determinism: two builds byte-identical). CP1 claims ONLY the unified world + the per-body
-# query (NO momentum exchange — CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render).
-# Pure C++ (hf_core), ASan-eligible. couple.h #includes fpx.h + fluid.h read-only (the additive sibling).
+# particles no-op; determinism: two builds byte-identical). PLUS Slice CP2 (the BUOYANCY + DRAG fluid->body
+# pass, the CRUX of FLAGSHIP #11): AccumBodyForces (a body over a hand-laid gathered list -> the EXACT Q16.16
+# vel delta; buoyancy up EXACTLY proportional to the gathered count; drag damps toward the fluid avg; a static
+# / 0-gather body untouched), StepCoupleBuoyancy (a body dropped above a pool settles to a FLOAT LINE above
+# the bed, the buoy=0 control sinks to the bed, deterministic + body-order-independent). CP2 claims a
+# deterministic fluid->body buoyancy+drag (NO fluid reaction — CP3; NO coupled step — CP4; NO lockstep — CP5;
+# NO render — CP6). Pure C++ (hf_core), ASan-eligible. couple.h #includes fpx.h + fluid.h read-only.
 hf_add_pure_test(couple_test)
 
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD

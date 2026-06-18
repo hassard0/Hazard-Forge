@@ -459,6 +459,7 @@ int main(int argc, char** argv) {
     const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
+    const char* coupleBuoyancyShotPath = nullptr; // --couple-buoyancy-shot <out.bmp> (Slice CP2, the BUOYANCY + DRAG fluid->body pass, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange. A settled fluid pool (FL1 InitBlock) + an FxBody sphere dropped ABOVE it: each step re-runs the CP1 body->fluid query (couple_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then couple_buoyancy.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a buoyant impulse (∝ the gathered count = the displaced volume, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, enters the pool, buoyancy builds as it submerges, and it settles to an emergent float line. AccumBodyForces copied VERBATIM from engine/sim/couple.h. GPU body state PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) FLOATS — floatY > groundY+radius by a margin, bounded above (the honest emergent float line, NOT an exact Archimedes depth — the GR4/FL4 caveat); (4) buoy=0 control SINKS to the bed (floatY == groundY+radius), proving buoyancy does work. Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO fluid reaction (CP3), NO coupled step (CP4), NO lockstep (CP5), NO float render (CP6), NO buoyancy torque, NO new RHI; CP1's query passes + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
     const char* grainLockstepShotPath = nullptr; // --grain-lockstep-shot <out.bmp> (Slice GR5: Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #10 — PURE-CPU harness over the GR1-GR4 granular sim WITH friction (the FL5/CL5/FPX5 twin): a 5x5x5 staggered grain block (the GR4 friction scene, μ=0.8) fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-grain-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
@@ -670,6 +671,19 @@ int main(int argc, char** argv) {
         // MSL-native on Metal. NO momentum exchange (CP2-CP4), NO new RHI. STANDALONE branch (C1061 avoidance).
         if (std::strcmp(argv[i], "--couple-query-shot") == 0 && i + 1 < argc) {
             coupleQueryShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CP2: --couple-buoyancy-shot <out.bmp> — the Deterministic Rigid<->Fluid Coupling BUOYANCY +
+        // DRAG fluid->body pass (the CRUX of FLAGSHIP #11, the FIRST momentum exchange). A settled fluid pool +
+        // an FxBody dropped above it settles to an emergent FLOAT LINE by StepCoupleBuoyancySteps K steps: each
+        // step re-runs the CP1 query (int32 MSL-native) from the body's CURRENT position -> couple_buoyancy.comp
+        // (ONE thread per body, int64 -> Vulkan-only) -> the host integrate (IntegrateBody + ResolveGround). The
+        // K-step loop is HOST-driven; GPU body state bit-exact vs couple.h::StepCoupleBuoyancySteps (memcmp).
+        // int64 -> Vulkan-only; Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO new RHI. STANDALONE
+        // branch (C1061 avoidance), like the couple-query/grain-contact shots.
+        if (std::strcmp(argv[i], "--couple-buoyancy-shot") == 0 && i + 1 < argc) {
+            coupleBuoyancyShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15865,6 +15879,368 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — couple body-particle gather heat (%u gathered, maxPerBody %u)\n",
                                 coupleQueryShotPath, imgW, imgH, kTotalGathered, maxPer);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleQueryShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG fluid->body pass (--couple-buoyancy-shot
+        // <out.bmp>, Slice CP2, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange). A settled fluid pool
+        // (FL1 InitBlock + a few IntegrateFluid steps so it piles into a deep pool) + an FxBody sphere dropped
+        // ABOVE it. Each step is HOST-driven over GPU passes: (a) re-run the CP1 body->fluid QUERY (the THREE
+        // reused FL2 cell passes + the THREE couple_body_{count,scan,emit} passes, int32 MSL-native) from the
+        // body's CURRENT position -> bodyStart + bodyParticles; (b) couple_buoyancy.comp (ONE thread per body,
+        // int64 -> Vulkan-only) sums over the gathered list the buoyant (∝ count, up) + drag (toward the static
+        // fluid's mean vel) impulse into the body's vel; (c) read back + host IntegrateBody + ResolveGround
+        // (the fpx.h integrate VERBATIM, the SAME ops the CPU reference runs) + re-upload. The fluid is held
+        // STATIC (the reaction is CP3). Over K steps the body falls, enters, buoyancy builds as it submerges,
+        // and it settles to an emergent FLOAT LINE damped by drag. The GPU body array is PROVEN BIT-EXACT vs
+        // the CPU couple.h::StepCoupleBuoyancySteps (memcmp, NO tol — the make-or-break). int64 -> Vulkan-only;
+        // Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO new RHI. STANDALONE branch (C1061).
+        if (coupleBuoyancyShotPath) {
+            using math::Vec3;
+            namespace couple = hf::sim::couple;
+            namespace fluid  = hf::sim::fluid;
+            namespace fpx    = hf::sim::fpx;
+
+            // The fluid pool: a DEEP DENSE STILL pool — a 9x9x9 unit lattice slab resting at the ground (y in
+            // [0,8]). A dense, deep, STATIC pool (the fluid is held static in CP2) so the dropped body has room
+            // to settle at a PARTIAL-submersion float line WELL ABOVE the bed (groundY + radius = 2.0). h = 1.0.
+            // (A unit lattice — NOT InitBlock+settle — gives a uniformly dense column so the gathered count
+            // grows with submersion depth, the Archimedes proxy that produces a clean emergent float line.)
+            const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fluid::fx kDt = fluid::kOne / 60;
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+            const fluid::fx kH = fluid::kOne;
+            const int kSteps = 240;
+
+            std::vector<fluid::FluidParticle> particles;
+            for (int py = 0; py <= 8; ++py)
+                for (int pz = 0; pz <= 8; ++pz)
+                    for (int px = 0; px <= 8; ++px) {
+                        fluid::FluidParticle p;
+                        p.pos = fluid::FxVec3{(fluid::fx)(px * (int)fluid::kOne), (fluid::fx)(py * (int)fluid::kOne),
+                                              (fluid::fx)(pz * (int)fluid::kOne)};
+                        p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0}; p.invMass = fluid::kOne; p.flags = 0;
+                        particles.push_back(p);
+                    }
+
+            // Build the world. ONE body dropped above the pool centre, radius 2 (the float-line headline).
+            auto makeWorld = [&](int bodyX, int bodyY, int bodyZ) {
+                couple::CoupleWorld w;
+                w.particles = particles;
+                w.kernel.h  = kH;
+                w.gravity   = kGravity; w.dt = kDt; w.groundY = kGroundY;
+                fpx::FxBody b;
+                b.pos = fpx::FxVec3{(fpx::fx)(bodyX * (int)fluid::kOne), (fpx::fx)(bodyY * (int)fluid::kOne),
+                                    (fpx::fx)(bodyZ * (int)fluid::kOne)};
+                b.invMass = fluid::kOne; b.flags = fpx::kFlagDynamic;
+                b.radius  = (fpx::fx)(2 * (int)fluid::kOne);
+                w.bodies = {b};
+                return w;
+            };
+            couple::CoupleWorld world = makeWorld(4, 14, 4);   // dropped well above the pool
+            const int kBodyCount = (int)world.bodies.size();
+            const int kParticleCount = (int)world.particles.size();
+            const fluid::fx kBedLine = kGroundY + world.bodies[0].radius;   // groundY + radius (the bed rest)
+
+            // === CPU reference: StepCoupleBuoyancySteps K steps (the GPU memcmp's against this). ===
+            couple::CoupleWorld cpuWorld = world;
+            couple::StepCoupleBuoyancySteps(cpuWorld, kDt, kSteps);
+
+            // std430 mirrors (match the shaders).
+            struct FluidParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            struct CoupleBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+            static_assert(sizeof(CoupleBodyGpu) == 36, "CoupleBodyGpu std430 layout");
+            struct CoupleBodyQGpu { int32_t bx, by, bz, radius; };   // the CP1 query body pack (pos+radius)
+            static_assert(sizeof(CoupleBodyQGpu) == 16, "CoupleBodyQGpu std430 layout");
+            struct CoupleParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };   // CP1 query params
+            static_assert(sizeof(CoupleParams) == 48, "CoupleParams std430 layout");
+            struct CoupleBuoyParams { int32_t cfg[4]; int32_t grav[4]; int32_t coef[4]; };  // CP2 buoyancy
+            static_assert(sizeof(CoupleBuoyParams) == 48, "CoupleBuoyParams std430 layout");
+
+            auto makeBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // The fluid pool is STATIC -> one shared read-only particle buffer (vel read by couple_buoyancy).
+            std::vector<FluidParticleGpu> partGpu((size_t)kParticleCount);
+            for (int i = 0; i < kParticleCount; ++i) {
+                const fluid::FluidParticle& p = world.particles[(size_t)i];
+                partGpu[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                    p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+            }
+            auto particlesBuf = makeBuf(partGpu.data(), partGpu.size() * sizeof(FluidParticleGpu));
+
+            // Pipelines: the CP1 query (reused FL2 cell + new couple_body) + the CP2 buoyancy.
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                return std::make_pair(std::move(cs), device->CreateComputePipeline(d));
+            };
+            auto cellCountPipe = mkPipe("fluid_cell_count.comp.hlsl.spv", 3, 64);
+            auto cellScanPipe  = mkPipe("fluid_cell_scan.comp.hlsl.spv", 3, 1);
+            auto cellEmitPipe  = mkPipe("fluid_cell_emit.comp.hlsl.spv", 5, 1);
+            auto bodyCountPipe = mkPipe("couple_body_count.comp.hlsl.spv", 6, 64);
+            auto bodyScanPipe  = mkPipe("couple_body_scan.comp.hlsl.spv", 3, 1);
+            auto bodyEmitPipe  = mkPipe("couple_body_emit.comp.hlsl.spv", 7, 64);
+            auto buoyPipe      = mkPipe("couple_buoyancy.comp.hlsl.spv", 5, 64);
+
+            const uint32_t kPartGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+            const uint32_t kBodyGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+            // runGpu: the full host-driven coupled buoyancy sim. buoyEnabled=0 -> the buoy=0 control (the body
+            // free-falls: no buoyancy/drag delta, only IntegrateBody + ResolveGround -> sinks to the bed).
+            auto runGpu = [&](int buoyEnabled, couple::CoupleWorld& outWorld) {
+                couple::CoupleWorld w = world;   // a fresh copy of the init scene
+
+                for (int step = 0; step < kSteps; ++step) {
+                    // The body pack, re-created each step from the host w.bodies state (which carries the prior
+                    // step's integrated result). couple_buoyancy writes the buoyancy-updated vel into it; we
+                    // read it back + host-integrate. (No persistent buffer / mid-loop WriteBuffer — the
+                    // fresh-buffer-per-step grain-contact pattern.)
+                    std::vector<CoupleBodyGpu> bodyGpu((size_t)kBodyCount);
+                    for (int i = 0; i < kBodyCount; ++i) {
+                        const fpx::FxBody& b = w.bodies[(size_t)i];
+                        bodyGpu[(size_t)i] = CoupleBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                                           b.invMass, b.flags, b.radius};
+                    }
+                    auto bodyBuf = makeBuf(bodyGpu.data(), bodyGpu.size() * sizeof(CoupleBodyGpu));
+                    // --- (a) the CP1 query from the body's CURRENT position. Build the fluid grid/cell table
+                    // host-side (the fluid is static -> the SAME grid each step, but we follow the CP1 contract
+                    // of querying from the current body pos). The query body pack carries pos + radius. ---
+                    const fluid::FluidGrid grid = fluid::MakeGrid(w.particles, kH);
+                    const uint32_t kCellCount = fluid::CellCount(grid);
+                    // Size the gather buffer from the CPU query (the GPU recomputes it bit-exact).
+                    const couple::CoupleQuery cpuQ = couple::GatherBodyParticles(w);
+                    const uint32_t total = couple::CountGathered(cpuQ);
+                    const uint32_t alloc = total > 0u ? total : 1u;
+
+                    std::vector<CoupleBodyQGpu> qbodies((size_t)kBodyCount);
+                    for (int i = 0; i < kBodyCount; ++i) {
+                        const fpx::FxBody& b = w.bodies[(size_t)i];
+                        qbodies[(size_t)i] = CoupleBodyQGpu{b.pos.x, b.pos.y, b.pos.z, b.radius};
+                    }
+                    auto qBodyBuf = makeBuf(qbodies.data(), qbodies.size() * sizeof(CoupleBodyQGpu));
+
+                    auto makeParams = [&](int32_t countW, int32_t enabled) {
+                        CoupleParams p{};
+                        p.grid[0] = kH; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+                        p.grid[3] = grid.cellMin.z;
+                        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+                        p.dim[3] = countW;
+                        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; return p;
+                    };
+                    CoupleParams partParams = makeParams(kParticleCount, 1);
+                    CoupleParams bodyParams = makeParams(kBodyCount, 1);
+                    auto partParamsBuf = makeBuf(&partParams, sizeof(partParams));
+                    auto bodyParamsBuf = makeBuf(&bodyParams, sizeof(bodyParams));
+
+                    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+                    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> cellPartInit((size_t)kParticleCount, 0u);
+                    std::vector<uint32_t> perBodyInit((size_t)kBodyCount, 0u);
+                    std::vector<uint32_t> bodyStartInit((size_t)kBodyCount + 1u, 0u);
+                    std::vector<uint32_t> bodyPartInit((size_t)alloc, 0u);
+                    auto cellCountBuf = makeBuf(cellCountInit.data(), cellCountInit.size() * sizeof(uint32_t));
+                    auto cellStartBuf = makeBuf(cellStartInit.data(), cellStartInit.size() * sizeof(uint32_t));
+                    auto cellCursorBuf = makeBuf(cellCursorInit.data(), cellCursorInit.size() * sizeof(uint32_t));
+                    auto cellPartBuf = makeBuf(cellPartInit.data(), cellPartInit.size() * sizeof(uint32_t));
+                    auto perBodyBuf = makeBuf(perBodyInit.data(), perBodyInit.size() * sizeof(uint32_t));
+                    auto bodyStartBuf = makeBuf(bodyStartInit.data(), bodyStartInit.size() * sizeof(uint32_t));
+                    auto bodyPartBuf = makeBuf(bodyPartInit.data(), bodyPartInit.size() * sizeof(uint32_t));
+
+                    // The CP2 buoyancy params.
+                    CoupleBuoyParams bp{};
+                    bp.cfg[0] = kBodyCount; bp.cfg[1] = buoyEnabled;
+                    bp.grav[0] = 0; bp.grav[1] = kGravY; bp.grav[2] = 0; bp.grav[3] = kDt;
+                    bp.coef[0] = couple::kBuoyPerParticle; bp.coef[1] = couple::kDrag;
+                    auto bpBuf = makeBuf(&bp, sizeof(bp));
+
+                    render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                    g.AddPass("cp_buoy", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // CP1 query: fluid cell table (3 reused FL2 passes).
+                        cmd.BindComputePipeline(*cellCountPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0); cmd.BindStorageBuffer(*cellCountBuf, 1);
+                        cmd.BindStorageBuffer(*partParamsBuf, 2);
+                        cmd.DispatchCompute(kPartGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*cellScanPipe.second);
+                        cmd.BindStorageBuffer(*cellCountBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*partParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*cellEmitPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellCursorBuf, 2); cmd.BindStorageBuffer(*cellPartBuf, 3);
+                        cmd.BindStorageBuffer(*partParamsBuf, 4);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        // CP1 query: per-body gather (3 new couple_body passes).
+                        cmd.BindComputePipeline(*bodyCountPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellPartBuf, 2); cmd.BindStorageBuffer(*qBodyBuf, 3);
+                        cmd.BindStorageBuffer(*perBodyBuf, 4); cmd.BindStorageBuffer(*bodyParamsBuf, 5);
+                        cmd.DispatchCompute(kBodyGroups); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*bodyScanPipe.second);
+                        cmd.BindStorageBuffer(*perBodyBuf, 0); cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 2);
+                        cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*bodyEmitPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0); cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellPartBuf, 2); cmd.BindStorageBuffer(*qBodyBuf, 3);
+                        cmd.BindStorageBuffer(*bodyStartBuf, 4); cmd.BindStorageBuffer(*bodyPartBuf, 5);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 6);
+                        cmd.DispatchCompute(kBodyGroups); cmd.ComputeToComputeBarrier();
+                        // CP2 buoyancy + drag (ONE thread per body, int64).
+                        cmd.BindComputePipeline(*buoyPipe.second);
+                        cmd.BindStorageBuffer(*bodyBuf, 0); cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                        cmd.BindStorageBuffer(*bodyPartBuf, 2); cmd.BindStorageBuffer(*particlesBuf, 3);
+                        cmd.BindStorageBuffer(*bpBuf, 4);
+                        cmd.DispatchCompute(kBodyGroups); cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                    });
+                    g.Execute(*device); device->WaitIdle();
+
+                    // (c) read back the buoyancy-updated body vel + host IntegrateBody + ResolveGround (the
+                    // fpx.h integrate VERBATIM, the SAME ops the CPU reference runs -> bit-exact), re-upload.
+                    std::vector<CoupleBodyGpu> rb((size_t)kBodyCount);
+                    device->ReadBuffer(*bodyBuf, rb.data(), rb.size() * sizeof(CoupleBodyGpu), 0);
+                    for (int i = 0; i < kBodyCount; ++i) {
+                        fpx::FxBody& b = w.bodies[(size_t)i];
+                        b.vel = fpx::FxVec3{rb[(size_t)i].vx, rb[(size_t)i].vy, rb[(size_t)i].vz};
+                        fpx::IntegrateBody(b, w.gravity, w.groundY, kDt);
+                        fpx::ResolveGround(b, w.groundY);
+                    }
+                }
+                outWorld = w;
+            };
+
+            // === GPU coupled buoyancy (K steps, buoyancy ON) ===
+            couple::CoupleWorld gpuWorld;
+            runGpu(1, gpuWorld);
+            const fpx::fx kGpuFloatY = couple::MeasureFloatLine(gpuWorld);
+
+            // PROOF (1) GPU==CPU BIT-EXACT (integer memcmp, NO tol — the make-or-break).
+            bool exact = (gpuWorld.bodies.size() == cpuWorld.bodies.size());
+            for (size_t i = 0; exact && i < gpuWorld.bodies.size(); ++i)
+                if (std::memcmp(&gpuWorld.bodies[i], &cpuWorld.bodies[i], sizeof(fpx::FxBody)) != 0) exact = false;
+            if (!exact) {
+                std::fprintf(stderr, "FATAL: couple-buoyancy GPU != CPU StepCoupleBuoyancy (a float crept into "
+                             "the fixed-point buoyancy/drag reduction?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-buoyancy: {bodies:%d, particles:%d, steps:%d, floatY:%d} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kParticleCount, kSteps, (int)kGpuFloatY);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical.
+            {
+                couple::CoupleWorld gpu2;
+                runGpu(1, gpu2);
+                bool same = (gpu2.bodies.size() == gpuWorld.bodies.size());
+                for (size_t i = 0; same && i < gpu2.bodies.size(); ++i)
+                    if (std::memcmp(&gpu2.bodies[i], &gpuWorld.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: couple-buoyancy two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-buoyancy determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) FLOATS (the headline + the HONEST metric): the body settles at a float line INSIDE the
+            // pool — floatY > groundY + radius by a clear margin (it did NOT sink to the bed) AND floatY is
+            // bounded above (it did NOT fly out), deterministic + two-run byte-identical. (The HONEST framing,
+            // the GR4/FL4 caveat: the float line is EMERGENT + iterative — NOT an exact Archimedes depth.)
+            {
+                const fpx::fx kMargin = fluid::kOne / 4;        // a clear margin above the bed
+                const fpx::fx kCeiling = (fpx::fx)(20 * (int)fluid::kOne);   // a generous upper bound (no fly-out)
+                if (!(kGpuFloatY > kBedLine + kMargin) || !(kGpuFloatY < kCeiling)) {
+                    std::fprintf(stderr, "FATAL: couple-buoyancy did NOT float (floatY=%d bed+r=%d ceiling=%d)\n",
+                                 (int)kGpuFloatY, (int)kBedLine, (int)kCeiling);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-buoyancy floats: floatY %d (above bed groundY+r=%d, settled in pool)\n",
+                            (int)kGpuFloatY, (int)kBedLine);
+            }
+
+            // PROOF (4) zero-buoyancy control SINKS: buoyEnabled=0 -> the body free-falls to the bed
+            // (floatY == groundY + radius) — proving buoyancy does the work. CPU reference (the GPU path with
+            // buoyEnabled=0 is byte-identical by construction; we assert the deterministic bed-rest here).
+            {
+                couple::CoupleWorld ctrlWorld;
+                runGpu(0, ctrlWorld);
+                const fpx::fx kCtrlY = couple::MeasureFloatLine(ctrlWorld);
+                if (kCtrlY != kBedLine) {
+                    std::fprintf(stderr, "FATAL: couple-buoyancy control buoy=0 did NOT sink to bed "
+                                 "(ctrlY=%d bed+r=%d)\n", (int)kCtrlY, (int)kBedLine);
+                    device->WaitIdle(); return 1;
+                }
+                if (!(kGpuFloatY > kCtrlY)) {
+                    std::fprintf(stderr, "FATAL: couple-buoyancy floated body not above the buoy=0 control\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-buoyancy control: buoy=0 sinks to bed (buoyancy does work)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER side-view (x,y) of the settled pool + the floating body. Project each
+            // fluid particle's integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel (dim blue), then the body as a
+            // warm filled disk at its settled (x,y) float line + an integer ring of its radius. CPU-colored
+            // from the bit-exact CPU reference state -> identical both backends by construction (PURE INTEGER,
+            // the strict zero-differing-pixel bar; the GPU body == the CPU body, proven above). ---
+            const int kPxPerUnit = 26, kMargin = 24;
+            const int kWorldW = 9, kWorldH = 18;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+                cx = kMargin + wx * kPxPerUnit;
+                cy = (int)imgH - kMargin - wy * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // The static pool (dim blue water).
+            for (int i = 0; i < kParticleCount; ++i) {
+                int cx, cy; toPx(cpuWorld.particles[(size_t)i].pos.x, cpuWorld.particles[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.20f, 0.35f, 0.6f}, 0);
+            }
+            // The floating body: a warm filled disk + an integer radius ring (from the bit-exact CPU state).
+            {
+                const fpx::FxBody& fb = cpuWorld.bodies[0];
+                int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+                const int rPx = (fb.radius >> fluid::kFrac) * kPxPerUnit;
+                for (int a = 0; a < 360; a += 4) {
+                    const double rad = (double)a * 3.14159265358979 / 180.0;
+                    const int rx = bcx + (int)((double)rPx * std::cos(rad));
+                    const int ry = bcy - (int)((double)rPx * std::sin(rad));
+                    if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                        uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                        dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+                    }
+                }
+                plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);   // the body centre, a warm disk at the float line
+            }
+            bool ok = WriteBMP(coupleBuoyancyShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — couple buoyancy float line (floatY %d, bed %d)\n",
+                                coupleBuoyancyShotPath, imgW, imgH, (int)kGpuFloatY, (int)kBedLine);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleBuoyancyShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

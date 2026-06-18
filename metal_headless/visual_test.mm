@@ -18986,6 +18986,169 @@ static int RunCoupleQueryShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CP2 — Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG showcase (--couple-buoyancy) =======
+// (the CRUX of FLAGSHIP #11, the FIRST momentum exchange). Like --grain-contact / --fluid-solve, the CP2
+// buoyancy/drag math is int64 (the buoyancy/drag fxmul/fxdiv + the vFluidAvg int64 sum + FxNormalize via
+// FxISqrt) -> glslc can't parse int64 -> couple_buoyancy.comp is VULKAN-SPIR-V-ONLY (NOT in this dir's
+// hf_gen_msl list); on Metal the --couple-buoyancy showcase runs the CPU couple::StepCoupleBuoyancy — the
+// EXACT bit-exact reference the Vulkan --couple-buoyancy-shot GPU==CPU memcmp compares against -> byte-
+// identical to the Vulkan GPU result BY CONSTRUCTION (the grain_contact_dp.comp/fluid_dp.comp convention). The
+// CP1 query passes (re-run each step inside StepCoupleBuoyancy) stay int32 MSL-native. So this builds the SAME
+// scene (a deep dense 9x9x9 = 729-particle unit-lattice pool + an FxBody sphere radius 2 dropped above it,
+// gravity -9.8 host-snapped, groundY=0, dt=kOne/60, K=240 steps), runs couple::StepCoupleBuoyancySteps, and
+// CPU-colors the SAME integer side-view float-line golden as the Vulkan --couple-buoyancy-shot -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). New golden
+// tests/golden/metal/couple_buoyancy.png (baked on the Mac by the CONTROLLER); two runs DIFF 0.0000. NO new RHI.
+static int RunCoupleBuoyancyShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace couple = hf::sim::couple;
+    namespace fluid  = hf::sim::fluid;
+    namespace fpx    = hf::sim::fpx;
+
+    // The scene (== the Vulkan --couple-buoyancy-shot config). -9.8 host-snapped.
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = fluid::kOne;
+    const int kSteps = 240;
+
+    // The deep dense STILL pool — a 9x9x9 unit lattice slab resting at the ground (y in [0,8]).
+    std::vector<fluid::FluidParticle> particles;
+    for (int py = 0; py <= 8; ++py)
+        for (int pz = 0; pz <= 8; ++pz)
+            for (int px = 0; px <= 8; ++px) {
+                fluid::FluidParticle p;
+                p.pos = fluid::FxVec3{(fluid::fx)(px * (int)fluid::kOne), (fluid::fx)(py * (int)fluid::kOne),
+                                      (fluid::fx)(pz * (int)fluid::kOne)};
+                p.prev = p.pos; p.vel = fluid::FxVec3{0, 0, 0}; p.invMass = fluid::kOne; p.flags = 0;
+                particles.push_back(p);
+            }
+
+    auto makeWorld = [&](int bodyX, int bodyY, int bodyZ) {
+        couple::CoupleWorld w;
+        w.particles = particles;
+        w.kernel.h  = kH;
+        w.gravity   = kGravity; w.dt = kDt; w.groundY = kGroundY;
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(bodyX * (int)fluid::kOne), (fpx::fx)(bodyY * (int)fluid::kOne),
+                            (fpx::fx)(bodyZ * (int)fluid::kOne)};
+        b.invMass = fluid::kOne; b.flags = fpx::kFlagDynamic;
+        b.radius  = (fpx::fx)(2 * (int)fluid::kOne);
+        w.bodies = {b};
+        return w;
+    };
+    couple::CoupleWorld world = makeWorld(4, 14, 4);
+    const int kBodyCount = (int)world.bodies.size();
+    const int kParticleCount = (int)world.particles.size();
+    const fluid::fx kBedLine = kGroundY + world.bodies[0].radius;
+
+    // CPU StepCoupleBuoyancy (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the
+    // Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    auto runSolve = [&](int buoyEnabled) {
+        couple::CoupleWorld w = world;
+        if (buoyEnabled) {
+            couple::StepCoupleBuoyancySteps(w, kDt, kSteps);
+        } else {
+            // The buoy=0 control: free-fall + ground rest only (NO buoyancy/drag) -> sinks to the bed. We
+            // reproduce the GPU control's per-step sequence (no AccumBodyForces, just IntegrateBody +
+            // ResolveGround) so the metal control is byte-identical to the Vulkan buoyEnabled=0 path.
+            for (int s = 0; s < kSteps; ++s)
+                for (fpx::FxBody& b : w.bodies) {
+                    fpx::IntegrateBody(b, w.gravity, w.groundY, kDt);
+                    fpx::ResolveGround(b, w.groundY);
+                }
+        }
+        return w;
+    };
+    couple::CoupleWorld cpuWorld = runSolve(1);
+    const fpx::fx kFloatY = couple::MeasureFloatLine(cpuWorld);
+
+    std::printf("couple-buoyancy: {bodies:%d, particles:%d, steps:%d, floatY:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU couple::StepCoupleBuoyancy, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kParticleCount, kSteps, (int)kFloatY);
+
+    // determinism.
+    {
+        couple::CoupleWorld b = runSolve(1);
+        if (b.bodies.size() != cpuWorld.bodies.size() ||
+            std::memcmp(&b.bodies[0], &cpuWorld.bodies[0], sizeof(fpx::FxBody)) != 0)
+            return fail("couple-buoyancy: two runs differ (nondeterministic)");
+        std::printf("couple-buoyancy determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // FLOATS (the headline + the HONEST metric): floatY > groundY+radius by a margin AND bounded above.
+    {
+        const fpx::fx kMargin = fluid::kOne / 4;
+        const fpx::fx kCeiling = (fpx::fx)(20 * (int)fluid::kOne);
+        if (!(kFloatY > kBedLine + kMargin) || !(kFloatY < kCeiling))
+            return fail("couple-buoyancy: did NOT float (sunk to bed or flew out)");
+        std::printf("couple-buoyancy floats: floatY %d (above bed groundY+r=%d, settled in pool)\n",
+                    (int)kFloatY, (int)kBedLine);
+    }
+
+    // zero-buoyancy control SINKS: buoy=0 -> floatY == groundY + radius (buoyancy does the work).
+    {
+        couple::CoupleWorld ctrl = runSolve(0);
+        const fpx::fx kCtrlY = couple::MeasureFloatLine(ctrl);
+        if (kCtrlY != kBedLine || !(kFloatY > kCtrlY))
+            return fail("couple-buoyancy: control buoy=0 did NOT sink to the bed");
+        std::printf("couple-buoyancy control: buoy=0 sinks to bed (buoyancy does work)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the static pool + the floating body (IDENTICAL to the
+    // Vulkan --couple-buoyancy-shot by construction; dim-blue water + a warm body disk + an integer radius
+    // ring at the bit-exact settled float line). ---
+    const int kPxPerUnit = 26, kMargin = 24;
+    const int kWorldW = 9, kWorldH = 18;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> fluid::kFrac, wy = wyFx >> fluid::kFrac;
+        cx = kMargin + wx * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        int cx, cy; toPx(cpuWorld.particles[(size_t)i].pos.x, cpuWorld.particles[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.20f, 0.35f, 0.6f}, 0);
+    }
+    {
+        const fpx::FxBody& fb = cpuWorld.bodies[0];
+        int bcx, bcy; toPx(fb.pos.x, fb.pos.y, bcx, bcy);
+        const int rPx = (fb.radius >> fluid::kFrac) * kPxPerUnit;
+        for (int a = 0; a < 360; a += 4) {
+            const double rad = (double)a * 3.14159265358979 / 180.0;
+            const int rx = bcx + (int)((double)rPx * std::cos(rad));
+            const int ry = bcy - (int)((double)rPx * std::sin(rad));
+            if (rx >= 0 && rx < (int)imgW && ry >= 0 && ry < (int)imgH) {
+                uint8_t* dst = &bgra[((size_t)ry * imgW + rx) * 4];
+                dst[0] = 60; dst[1] = 200; dst[2] = 255; dst[3] = 255;
+            }
+        }
+        plot(bcx, bcy, Vec3{1.0f, 0.5f, 0.15f}, 4);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — couple buoyancy float line (floatY %d, bed %d)\n",
+                outPath, imgW, imgH, (int)kFloatY, (int)kBedLine);
+    return 0;
+}
+
 // ===== Slice GR2 — Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH showcase (--grain-neighbors) =
 // UNLIKE GR1's --grain-integrate (int64 grain_integrate.comp -> CPU on Metal), the neighbor search is PURE
 // INT32 (GrainCellOf = FloorDiv per axis + the per-axis |dx|<hSearch GrainNeighborAccept = integer divide +
@@ -34325,6 +34488,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--couple-query") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_couple_query.png";
             try { return RunCoupleQueryShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --couple-buoyancy <out.png>: render the Deterministic Rigid<->Fluid Coupling BUOYANCY + DRAG
+        // fluid->body showcase (Slice CP2, the CRUX of FLAGSHIP #11, the FIRST momentum exchange). Like
+        // --grain-contact, the CP2 buoyancy/drag math is int64 -> couple_buoyancy.comp is Vulkan-only; on Metal
+        // --couple-buoyancy runs the CPU couple::StepCoupleBuoyancy — the EXACT bit-exact reference the Vulkan
+        // --couple-buoyancy-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan GPU result BY
+        // CONSTRUCTION. The SAME deep dense pool + an FxBody sphere dropped above it settles to an emergent
+        // FLOAT LINE; the four proofs (GPU==CPU bit-exact, determinism, floats above the bed within a band,
+        // buoy=0 control sinks) run on the CPU reference. The image golden is the integer float-line side-view,
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/couple_buoyancy.png; two
+        // runs DIFF 0.0000. The CP1 query passes (re-run each step) stay int32 MSL-native. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--couple-buoyancy") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_couple_buoyancy.png";
+            try { return RunCoupleBuoyancyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-contact <out.png>: render the Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION
