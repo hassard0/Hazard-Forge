@@ -456,6 +456,7 @@ int main(int argc, char** argv) {
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* fluidIntegrateShotPath = nullptr; // --fluid-integrate-shot <out.bmp> (Slice FL1: Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #9 — a 10x10x10 = 1000-particle dam-break block in a corner integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/settling block)
     const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
+    const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* fluidNeighborsShotPath = nullptr; // --fluid-neighbors-shot <out.bmp> (Slice FL2: Deterministic GPU Fluid GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #9 — the FL1 1000-particle dam-break block bucketed into a uniform spatial-hash grid (BuildCellTable) + a per-particle 27-cell-stencil candidate NEIGHBOR LIST (BuildNeighborList) via PURE-INT32 count->scan->emit (fluid_cell_{count,scan,emit} + fluid_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-particle neighbor-count heat viz; NO density/kernel (FL3), NO radial r<h cull)
     const char* fluidDensityShotPath = nullptr; // --fluid-density-shot <out.bmp> (Slice FL3, the MAKE-OR-BREAK of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY + λ — the FL1 dam-break block (settled) -> BuildNeighborList (FL2) -> BuildKernelTable (host-snapped Q16.16 poly6/spiky LUT) -> ComputeDensity (ρ_i = W[0] + Σ W[bin(r²)] over neighbours, int64 r²) -> ComputeLambda (λ_i = −C_i/(Σ|∇C_i|²+ε), C_i = ρ_i/ρ0−1, unilateral clamp) by fluid_density.comp + fluid_lambda.comp (ONE thread per particle, int64 -> Vulkan-only; Metal runs the CPU reference). GPU==CPU ρ+λ bit-exact, per-particle density heat viz; the only genuinely fluid-specific slice. NO PBF position solve (FL4))
     const char* fluidSolveShotPath = nullptr; // --fluid-solve-shot <out.bmp> (Slice FL4, the incompressibility solver of FLAGSHIP #9: Deterministic GPU Fluid PBF DENSITY-CONSTRAINT SOLVE — a dam-break block (FL1) poured over the ground (+ a static FxBody sphere) is settled into an INCOMPRESSIBLE POOL by StepFluid K steps x iters JACOBI density iterations (predict -> neighbours -> {ComputeDensity -> ComputeLambda -> SolveDensityConstraint(Δp into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollidePlane+CollideSpheres). The K-step loop is HOST-driven over MULTI-THREAD per-particle passes (fluid_density/fluid_lambda reused per iteration + fluid_dp + fluid_apply + fluid_collide, ONE thread per particle, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepFluid. GPU==CPU particle array bit-exact vs fluid.h::StepFluid, a deterministic incompressibility residual (summed |ρ_i−ρ0|) small + below the unsolved free-fall, integer side-view of the settled pool. NO lockstep (FL5), NO float render (FL6))
@@ -637,6 +638,20 @@ int main(int argc, char** argv) {
         // parse limit C1061, like the fluid/cloth/fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--grain-integrate-shot") == 0 && i + 1 < argc) {
             grainIntegrateShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GR2: --grain-neighbors-shot <out.bmp> — the Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR
+        // SEARCH (the 2nd slice of FLAGSHIP #10). The GR1 1000-grain dropped block (settled to a mid-fall pile)
+        // -> BuildGrainCellTable (bucket grains into a uniform spatial-hash grid at cell-size hSearch) ->
+        // BuildGrainNeighborList (per-grain 27-cell-stencil candidate neighbors, per-axis |dx|<hSearch reject)
+        // via SIX pure-INT32 compute passes (grain_cell_count/scan/emit + grain_neighbor_count/scan/emit),
+        // GPU==CPU cell-table + neighbor-list bit-exact vs grain.h::BuildGrainCellTable/BuildGrainNeighborList,
+        // integer per-grain neighbor-count heat viz. PURE int32 (NO int64/sqrt, NO radial overlap cull — GR3's
+        // contact solve) -> MSL-native on Metal. NO new RHI. Handled as a STANDALONE branch (not in the --shot
+        // else-if chain) to avoid MSVC's nested-block parse limit C1061, like the gr1/fl2/cloth/fpx/mc/nav shots.
+        if (std::strcmp(argv[i], "--grain-neighbors-shot") == 0 && i + 1 < argc) {
+            grainNeighborsShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15405,6 +15420,337 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — grain pool side-view (%d moved, %d at ground)\n",
                                 grainIntegrateShotPath, imgW, imgH, moved, restingAtGround);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainIntegrateShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH (--grain-neighbors-shot <out.bmp>,
+        // Slice GR2, the 2nd slice of FLAGSHIP #10). The GR1 10x10x10 = 1000-grain dropped block (settled to a
+        // mid-fall pile by a few GR1 IntegrateGrains steps so the neighbor density is non-trivial) is bucketed
+        // into a uniform spatial-hash grid (cell-size hSearch = the contact search radius) by SIX pure-INT32
+        // compute passes: grain_cell_count (per-grain InterlockedAdd into the cell's counter) -> (barrier)
+        // grain_cell_scan (single-thread exclusive prefix-sum -> cellStart CSR) -> (barrier) grain_cell_emit
+        // (single-thread ascending-grain scatter into cellGrains, the within-cell-order crux) -> (barrier)
+        // grain_neighbor_count (one thread per grain: count candidates in its 27-cell stencil passing the
+        // per-axis |dx|<hSearch reject) -> (barrier) grain_neighbor_scan (single-thread exclusive prefix-sum
+        // -> neighborStart) -> (barrier) grain_neighbor_emit (one thread per grain emits its candidates into
+        // its DISJOINT neighbors[] slice, NO atomics). GrainCellOf/FloorDiv/GrainNeighborAccept copied VERBATIM
+        // from grain.h (PURE INT32: integer divide + per-axis abs-compare, NO int64/sqrt -> MSL-native on
+        // Metal). ReadBuffer reads cellStart + cellGrains + neighborStart + neighbors + perGrainCount; the CPU
+        // grain.h::BuildGrainCellTable + BuildGrainNeighborList over the SAME block must match BIT-EXACT
+        // (memcmp, NO tol). enabled=false -> cleared (no-op). The golden is a per-grain neighbor-count HEAT viz.
+        // NO contact solve (GR3), NO radial overlap cull, NO new RHI. One BMP -> exit.
+        //
+        // hSearch = 1.5 (== 1.5 * the GR1 block spacing 1.0, a host-snapped Q16.16 constant). This is >= the
+        // contact diameter 2*radius = 0.5 (the HARD requirement, asserted below) AND makes the non-overlapping
+        // GR1 block a NON-DEGENERATE neighbor graph: each interior grain sees its 26 lattice neighbours (the
+        // "interior dense / surface sparse" heat structure). The exact radial overlap cull is DEFERRED to GR3.
+        if (grainNeighborsShotPath) {
+            using math::Vec3;
+            namespace grain = hf::sim::grain;
+
+            // The GR1 dropped block, settled to a mid-fall pile (== the Metal --grain-neighbors config).
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const int kSide = 10;                          // 10x10x10 -> 1000 grains
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 4;     // 0.25 grain radius (spacing 1.0 >= 2*radius)
+            // The contact search radius hSearch = 1.5 (host-snapped Q16.16). HARD requirement: hSearch >=
+            // 2*maxRadius (the contact diameter) so GR3's contact solve sees every real contact candidate.
+            const grain::fx kHSearch = grain::kOne + grain::kOne / 2;   // 1.5
+            if (kHSearch < 2 * kRadius) {
+                std::fprintf(stderr, "FATAL: grain-neighbors hSearch (%d) < 2*maxRadius (%d) — would miss "
+                             "real GR3 contacts\n", kHSearch, 2 * kRadius);
+                device->WaitIdle(); return 1;
+            }
+
+            grain::GrainBlock block;
+            block.W = kSide; block.H = kSide; block.D = kSide;
+            block.spacing = grain::kOne;                   // 1.0 world unit spacing (>= 2*radius)
+            block.radius = kRadius;
+            block.origin = grain::FxVec3{0, (grain::fx)(12 * (int)grain::kOne), 0};
+            const int kGrainCount = block.W * block.H * block.D;
+            std::vector<grain::GrainParticle> grains = grain::InitGrainBlock(block);
+            // Settle a handful of steps so the block compresses a bit at the ground (denser neighborhoods).
+            grain::IntegrateGrainSteps(grains, kGravity, kDt, kGroundY, 90);
+
+            // The CPU reference grid + cell table + neighbor list (the GPU memcmp's against this).
+            const grain::GrainGrid grid = grain::MakeGrainGrid(grains, kHSearch);
+            const uint32_t kCellCount = grain::GrainCellCount(grid);
+            const grain::GrainCellTable cpuTable = grain::BuildGrainCellTable(grains, grid);
+            const grain::GrainNeighborList cpuList =
+                grain::BuildGrainNeighborList(grains, grid, cpuTable, kHSearch);
+            const uint32_t kTotalNeighbors = (uint32_t)cpuList.neighbors.size();
+            const uint32_t kNeighAlloc = kTotalNeighbors > 0u ? kTotalNeighbors : 1u;
+
+            // std430 GrainParticle mirror (matches the GR2 shaders' GrainParticle): 12 x int32 (48 bytes).
+            struct GrainParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+            };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            std::vector<GrainParticleGpu> grainsInit((size_t)kGrainCount);
+            for (int i = 0; i < kGrainCount; ++i) {
+                const grain::GrainParticle& p = grains[(size_t)i];
+                grainsInit[(size_t)i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+                    p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+            }
+            rhi::BufferDesc grainDesc;
+            grainDesc.size = grainsInit.size() * sizeof(GrainParticleGpu);
+            grainDesc.initialData = grainsInit.data();
+            grainDesc.usage = rhi::BufferUsage::Storage;
+            auto grainsBuf = device->CreateBuffer(grainDesc);   // read-only on the GPU (shared)
+
+            // std430 GrainGridParams (matches the GR2 shaders): int4 grid {hSearch, cellMinX, cellMinY,
+            // cellMinZ} + int4 dim {gridDimX, gridDimY, gridDimZ, grainCount} + int4 cfg {cellCount, enabled,_,_}.
+            struct GrainGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+            static_assert(sizeof(GrainGridParams) == 48, "GrainGridParams std430 layout");
+            auto makeGridParams = [&](int32_t enabled) {
+                GrainGridParams p{};
+                p.grid[0] = kHSearch; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+                p.grid[3] = grid.cellMin.z;
+                p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+                p.dim[3] = kGrainCount;
+                p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Fresh-cleared per-run output buffers. cellCount (cellCount uints), cellStart (cellCount+1),
+            // cellCursor (cellCount), cellGrains (grainCount), perGrainCount (grainCount), neighborStart
+            // (grainCount+1), neighbors (totalNeighbors).
+            std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+            std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> cellGrainInit((size_t)kGrainCount, 0u);
+            std::vector<uint32_t> perGrainInit((size_t)kGrainCount, 0u);
+            std::vector<uint32_t> nbrStartInit((size_t)kGrainCount + 1u, 0u);
+            std::vector<uint32_t> nbrInit((size_t)kNeighAlloc, 0u);
+            auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+                rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+                d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Pipelines: cell_count(3 SSBO,64t), cell_scan(3,1t), cell_emit(5,1t), neighbor_count(5,64t),
+            // neighbor_scan(3,1t), neighbor_emit(6,64t).
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                auto pipe = device->CreateComputePipeline(d);
+                return std::make_pair(std::move(cs), std::move(pipe));
+            };
+            auto cellCountPipe = mkPipe("grain_cell_count.comp.hlsl.spv", 3, 64);
+            auto cellScanPipe  = mkPipe("grain_cell_scan.comp.hlsl.spv", 3, 1);
+            auto cellEmitPipe  = mkPipe("grain_cell_emit.comp.hlsl.spv", 5, 1);
+            auto nbrCountPipe  = mkPipe("grain_neighbor_count.comp.hlsl.spv", 5, 64);
+            auto nbrScanPipe   = mkPipe("grain_neighbor_scan.comp.hlsl.spv", 3, 1);
+            auto nbrEmitPipe   = mkPipe("grain_neighbor_emit.comp.hlsl.spv", 6, 64);
+
+            const uint32_t kGrainGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+
+            // Run the full 6-pass pipeline over fresh output buffers; read all read-back buffers.
+            auto runNeighbors = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                                    std::vector<uint32_t>& outCellGrains, std::vector<uint32_t>& outNbrStart,
+                                    std::vector<uint32_t>& outNbr, std::vector<uint32_t>& outPerGrain) {
+                auto cellCountBuf = makeUintBuf(cellCountInit);
+                auto cellStartBuf = makeUintBuf(cellStartInit);
+                auto cellCursorBuf = makeUintBuf(cellCursorInit);
+                auto cellGrainBuf = makeUintBuf(cellGrainInit);
+                auto perGrainBuf = makeUintBuf(perGrainInit);
+                auto nbrStartBuf = makeUintBuf(nbrStartInit);
+                auto nbrBuf = makeUintBuf(nbrInit);
+                GrainGridParams params = makeGridParams(enabled);
+                rhi::BufferDesc pd; pd.size = sizeof(GrainGridParams); pd.initialData = &params;
+                pd.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pd);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("grain_neighbors", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-grain cell count (atomic add).
+                        cmd.BindComputePipeline(*cellCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0);
+                        cmd.BindStorageBuffer(*cellCountBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(kGrainGroups);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 2: single-thread exclusive prefix-sum -> cellStart.
+                        cmd.BindComputePipeline(*cellScanPipe.second);
+                        cmd.BindStorageBuffer(*cellCountBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 3: single-thread ascending-grain scatter -> cellGrains.
+                        cmd.BindComputePipeline(*cellEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                        cmd.BindStorageBuffer(*cellGrainBuf, 3);
+                        cmd.BindStorageBuffer(*paramsBuf, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 4: per-grain neighbor count over the 27-cell stencil.
+                        cmd.BindComputePipeline(*nbrCountPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellGrainBuf, 2);
+                        cmd.BindStorageBuffer(*perGrainBuf, 3);
+                        cmd.BindStorageBuffer(*paramsBuf, 4);
+                        cmd.DispatchCompute(kGrainGroups);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 5: single-thread exclusive prefix-sum -> neighborStart.
+                        cmd.BindComputePipeline(*nbrScanPipe.second);
+                        cmd.BindStorageBuffer(*perGrainBuf, 0);
+                        cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 6: per-grain emit into the disjoint neighbors[] slice.
+                        cmd.BindComputePipeline(*nbrEmitPipe.second);
+                        cmd.BindStorageBuffer(*grainsBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellGrainBuf, 2);
+                        cmd.BindStorageBuffer(*nbrStartBuf, 3);
+                        cmd.BindStorageBuffer(*nbrBuf, 4);
+                        cmd.BindStorageBuffer(*paramsBuf, 5);
+                        cmd.DispatchCompute(kGrainGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outCellStart.assign((size_t)kCellCount + 1u, 0u);
+                device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+                outCellGrains.assign((size_t)kGrainCount, 0u);
+                device->ReadBuffer(*cellGrainBuf, outCellGrains.data(), outCellGrains.size() * sizeof(uint32_t), 0);
+                outNbrStart.assign((size_t)kGrainCount + 1u, 0u);
+                device->ReadBuffer(*nbrStartBuf, outNbrStart.data(), outNbrStart.size() * sizeof(uint32_t), 0);
+                outNbr.assign((size_t)kNeighAlloc, 0u);
+                device->ReadBuffer(*nbrBuf, outNbr.data(), outNbr.size() * sizeof(uint32_t), 0);
+                outPerGrain.assign((size_t)kGrainCount, 0u);
+                device->ReadBuffer(*perGrainBuf, outPerGrain.data(), outPerGrain.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU neighbors (enabled) ===
+            std::vector<uint32_t> gCellStart, gCellGrains, gNbrStart, gNbr, gPerGrain;
+            runNeighbors(1, gCellStart, gCellGrains, gNbrStart, gNbr, gPerGrain);
+
+            // PROOF (1) GPU==CPU cell table + neighbor list BIT-EXACT (integer memcmp, NO tol).
+            uint32_t maxPer = 0; for (uint32_t c : gPerGrain) if (c > maxPer) maxPer = c;
+            bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+                std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                            cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+            bool cellGrainsOk = (gCellGrains.size() == cpuTable.cellGrains.size()) &&
+                std::memcmp(gCellGrains.data(), cpuTable.cellGrains.data(),
+                            cpuTable.cellGrains.size() * sizeof(uint32_t)) == 0;
+            bool nbrStartOk = (gNbrStart.size() == cpuList.neighborStart.size()) &&
+                std::memcmp(gNbrStart.data(), cpuList.neighborStart.data(),
+                            cpuList.neighborStart.size() * sizeof(uint32_t)) == 0;
+            bool nbrOk = (kTotalNeighbors == (uint32_t)cpuList.neighbors.size()) &&
+                std::memcmp(gNbr.data(), cpuList.neighbors.data(),
+                            (size_t)kTotalNeighbors * sizeof(uint32_t)) == 0;
+            if (!cellStartOk || !cellGrainsOk || !nbrStartOk || !nbrOk) {
+                std::fprintf(stderr, "FATAL: grain-neighbors GPU != CPU BuildGrainCellTable/"
+                             "BuildGrainNeighborList (cellStart=%d cellGrains=%d nbrStart=%d nbr=%d)\n",
+                             (int)cellStartOk, (int)cellGrainsOk, (int)nbrStartOk, (int)nbrOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("grain-neighbors: {particles:%d, cells:%u, neighbors:%u, maxPer:%u} GPU==CPU BIT-EXACT\n",
+                        kGrainCount, kCellCount, kTotalNeighbors, maxPer);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<uint32_t> c2, cg2, ns2, n2, pg2;
+                runNeighbors(1, c2, cg2, ns2, n2, pg2);
+                if (c2 != gCellStart || cg2 != gCellGrains || ns2 != gNbrStart || n2 != gNbr ||
+                    pg2 != gPerGrain) {
+                    std::fprintf(stderr, "FATAL: grain-neighbors two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("grain-neighbors determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage / coherence: every emitted neighbor j of i is within hSearch per-axis of i
+            // (and i!=j); interior grains have more neighbors than surface ones (a coherent density).
+            {
+                bool coherent = true;
+                for (uint32_t i = 0; i < (uint32_t)kGrainCount && coherent; ++i)
+                    for (uint32_t s = gNbrStart[i]; s < gNbrStart[i + 1u]; ++s) {
+                        uint32_t j = gNbr[s];
+                        if (j == i) coherent = false;
+                        if (!grain::GrainNeighborAccept(grains[i].pos, grains[j].pos, kHSearch)) coherent = false;
+                    }
+                if (!coherent) {
+                    std::fprintf(stderr, "FATAL: grain-neighbors coverage incoherent (a neighbor outside hSearch)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("grain-neighbors coverage: %u candidate pairs (interior dense, surface sparse)\n",
+                            kTotalNeighbors);
+            }
+
+            // PROOF (4) sparse / disabled no-op: a single grain -> ZERO neighbours.
+            {
+                std::vector<grain::GrainParticle> one(1);
+                one[0].pos = {grain::kOne * 3, grain::kOne * 5, 0}; one[0].invMass = grain::kOne;
+                one[0].radius = kRadius;
+                grain::GrainGrid g1 = grain::MakeGrainGrid(one, kHSearch);
+                grain::GrainCellTable t1 = grain::BuildGrainCellTable(one, g1);
+                grain::GrainNeighborList l1 = grain::BuildGrainNeighborList(one, g1, t1, kHSearch);
+                if (!l1.neighbors.empty() || l1.neighborStart[1] != 0u) {
+                    std::fprintf(stderr, "FATAL: grain-neighbors single grain produced neighbours\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("grain-neighbors sparse: 0 neighbours (no-op)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER per-grain neighbor-count HEAT side-view. Project each grain's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) to a pixel (the GR1 transform), colored by its neighbor count
+            // (gPerGrain[i]) mapped to a blue->cyan->green->yellow->red ramp -> a coherent density heat map.
+            // CPU-colored from the read-back integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 18;
+            const int kMargin = 20;
+            const int kWorldW = kSide;
+            const int kWorldH = kSide + 12;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto heat = [](float t) -> Vec3 {
+                if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+                float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 3.0f)));
+                float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 2.0f)));
+                float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 1.0f)));
+                return Vec3{r, g, b};
+            };
+            const float maxPerF = maxPer > 0 ? (float)maxPer : 1.0f;
+            for (int i = 0; i < kGrainCount; ++i) {
+                const int wx = grainsInit[(size_t)i].px >> grain::kFrac;
+                const int wy = grainsInit[(size_t)i].py >> grain::kFrac;
+                int cx = kMargin + wx * kPxPerUnit;
+                int cy = (int)imgH - kMargin - wy * kPxPerUnit;
+                Vec3 col = heat((float)gPerGrain[(size_t)i] / maxPerF);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(grainNeighborsShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — grain neighbor-count heat (%u neighbors, maxPer %u)\n",
+                                grainNeighborsShotPath, imgW, imgH, kTotalNeighbors, maxPer);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainNeighborsShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

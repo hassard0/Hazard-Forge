@@ -269,6 +269,213 @@ int main() {
               "InitGrainBlock 10x10x10: far corner (9,9,9) at origin + (9,9,9)");
     }
 
+    // ============================ Slice GR2 — GRID-HASH NEIGHBOR SEARCH =============================
+
+    // ----- MakeGrainGrid: correct cellMin / gridDim over a known pool (FloorDiv per axis at hSearch) ------
+    {
+        const fx hSearch = kOne;   // 1.0 cell size
+        // GrainCellOf: positive + negative coords floor toward -inf (monotone across 0).
+        check(grain::GrainCellOf(grain::FxVec3{FromInt(0), FromInt(0), FromInt(0)}, hSearch).x == 0,
+              "GrainCellOf: 0 -> cell 0");
+        check(grain::GrainCellOf(grain::FxVec3{FromInt(2), FromInt(3), FromInt(5)}, hSearch).y == 3,
+              "GrainCellOf: (2,3,5) -> cell 3 on y");
+        check(grain::GrainCellOf(grain::FxVec3{kOne + kOne / 2, 0, 0}, hSearch).x == 1,
+              "GrainCellOf: 1.5 -> cell 1");
+        check(grain::GrainCellOf(grain::FxVec3{-(kOne / 2), 0, 0}, hSearch).x == -1,
+              "GrainCellOf: -0.5 -> cell -1 (floor, not truncate)");
+        check(grain::GrainCellOf(grain::FxVec3{-(kOne + kOne / 2), 0, 0}, hSearch).x == -2,
+              "GrainCellOf: -1.5 -> cell -2");
+
+        // A pool spanning a known AABB -> exact cellMin/gridDim. Grains at x={0,2,4}, y={-1,1}, z={0}.
+        std::vector<grain::GrainParticle> pool;
+        for (int gx : {0, 2, 4}) for (int gy : {-1, 1}) {
+            grain::GrainParticle p; p.pos = {FromInt(gx), FromInt(gy), 0}; p.invMass = kOne; pool.push_back(p);
+        }
+        grain::GrainGrid grid = grain::MakeGrainGrid(pool, hSearch);
+        check(grid.cellMin.x == 0 && grid.cellMin.y == -1 && grid.cellMin.z == 0,
+              "MakeGrainGrid: cellMin == the min cell coord per axis");
+        check(grid.gridDim.x == 5 && grid.gridDim.y == 3 && grid.gridDim.z == 1,
+              "MakeGrainGrid: gridDim == (max-min+1) per axis (x:0..4, y:-1..1, z:0)");
+        check(grain::GrainCellCount(grid) == 15u, "MakeGrainGrid: cellCount == 5*3*1 == 15");
+
+        // Empty pool -> 1x1x1 grid at origin (deterministic degenerate).
+        std::vector<grain::GrainParticle> empty;
+        grain::GrainGrid eg = grain::MakeGrainGrid(empty, hSearch);
+        check(eg.gridDim.x == 1 && eg.gridDim.y == 1 && eg.gridDim.z == 1 &&
+              grain::GrainCellCount(eg) == 1u, "MakeGrainGrid: empty pool -> 1x1x1 grid");
+    }
+
+    // ----- GrainNeighborAccept: the per-axis |dx| < hSearch box reject (hand-checked) --------------------
+    {
+        const fx hSearch = kOne;   // 1.0
+        const grain::FxVec3 a{0, 0, 0};
+        check(grain::GrainNeighborAccept(a, grain::FxVec3{kOne / 2, 0, 0}, hSearch),
+              "GrainNeighborAccept: dx=0.5 < hSearch -> accept");
+        check(!grain::GrainNeighborAccept(a, grain::FxVec3{kOne, 0, 0}, hSearch),
+              "GrainNeighborAccept: dx=1.0 == hSearch -> reject (strict <)");
+        check(!grain::GrainNeighborAccept(a, grain::FxVec3{0, 0, kOne + 1}, hSearch),
+              "GrainNeighborAccept: dz just > hSearch -> reject");
+        check(grain::GrainNeighborAccept(grain::FxVec3{kOne / 2, 0, 0}, a, hSearch),
+              "GrainNeighborAccept: symmetric (b,a) accept");
+        check(grain::GrainNeighborAccept(a, grain::FxVec3{-(kOne / 2), 0, 0}, hSearch),
+              "GrainNeighborAccept: dx=-0.5 within hSearch -> accept (abs)");
+    }
+
+    // ----- 2 grains within hSearch -> MUTUAL neighbors; > hSearch apart -> NONE; no self-neighbor --------
+    {
+        const fx hSearch = kOne;
+        std::vector<grain::GrainParticle> within(2);
+        within[0].pos = {0, 0, 0};            within[0].invMass = kOne;
+        within[1].pos = {kOne / 2, 0, 0};     within[1].invMass = kOne;
+        grain::GrainGrid g = grain::MakeGrainGrid(within, hSearch);
+        grain::GrainCellTable t = grain::BuildGrainCellTable(within, g);
+        grain::GrainNeighborList nl = grain::BuildGrainNeighborList(within, g, t, hSearch);
+        check(nl.neighborStart.size() == 3, "neighbor: neighborStart has grainCount+1 entries");
+        check(nl.neighborStart[2] == nl.neighbors.size() && nl.neighbors.size() == 2,
+              "neighbor: 2 mutual neighbor entries within hSearch");
+        auto slice = [&](uint32_t i, std::vector<uint32_t>& out) {
+            out.assign(nl.neighbors.begin() + nl.neighborStart[i],
+                       nl.neighbors.begin() + nl.neighborStart[i + 1]);
+        };
+        std::vector<uint32_t> n0, n1;
+        slice(0, n0); slice(1, n1);
+        check(n0.size() == 1 && n0[0] == 1u, "neighbor: g0 -> {1}");
+        check(n1.size() == 1 && n1[0] == 0u, "neighbor: g1 -> {0}");
+        bool noSelf = true;
+        for (uint32_t i = 0; i < 2; ++i) { std::vector<uint32_t> s; slice(i, s);
+            for (uint32_t j : s) if (j == i) noSelf = false; }
+        check(noSelf, "neighbor: no grain is its own neighbor");
+
+        // > hSearch apart (3.0 on x) -> NO neighbors.
+        std::vector<grain::GrainParticle> apart(2);
+        apart[0].pos = {0, 0, 0};            apart[0].invMass = kOne;
+        apart[1].pos = {FromInt(3), 0, 0};   apart[1].invMass = kOne;
+        grain::GrainGrid g2 = grain::MakeGrainGrid(apart, hSearch);
+        grain::GrainCellTable t2 = grain::BuildGrainCellTable(apart, g2);
+        grain::GrainNeighborList nl2 = grain::BuildGrainNeighborList(apart, g2, t2, hSearch);
+        check(nl2.neighbors.empty() && nl2.neighborStart[2] == 0u,
+              "neighbor: grains > hSearch apart -> 0 neighbors");
+    }
+
+    // ----- a small block: BuildGrainCellTable CSR offsets + ascending within-cell order + exact counts ----
+    {
+        // A 3x3x3 block spaced 1.0, hSearch = 1.5 (one grain per cell, the stencil reaches the 1-away
+        // lattice neighbors). hSearch 1.5 >= 2*radius (0.5) -> a valid contact search radius.
+        const fx hSearch = kOne + kOne / 2;   // 1.5
+        grain::GrainBlock block;
+        block.W = 3; block.H = 3; block.D = 3; block.spacing = kOne; block.radius = kOne / 4;
+        block.origin = grain::FxVec3{0, 0, 0};
+        std::vector<grain::GrainParticle> ps = grain::InitGrainBlock(block);   // 27 grains
+        grain::GrainGrid g = grain::MakeGrainGrid(ps, hSearch);
+        grain::GrainCellTable tab = grain::BuildGrainCellTable(ps, g);
+        grain::GrainNeighborList nl = grain::BuildGrainNeighborList(ps, g, tab, hSearch);
+
+        // Cell-table CSR invariants: cellStart has cellCount+1 entries, monotone, last == n.
+        const uint32_t cells = grain::GrainCellCount(g);
+        check(tab.cellStart.size() == (size_t)cells + 1, "cell-table: cellStart has cellCount+1 entries");
+        bool monotone = true;
+        for (size_t c = 0; c + 1 < tab.cellStart.size(); ++c)
+            if (tab.cellStart[c] > tab.cellStart[c + 1]) monotone = false;
+        check(monotone, "cell-table: cellStart monotone non-decreasing");
+        check(tab.cellStart[cells] == ps.size() && tab.cellGrains.size() == ps.size(),
+              "cell-table: sentinel == grain count, every grain bucketed");
+        // Every grain index appears exactly once in cellGrains (a permutation).
+        std::vector<int> seen(ps.size(), 0);
+        for (uint32_t idx : tab.cellGrains) if (idx < ps.size()) ++seen[idx];
+        bool perm = true; for (int s : seen) if (s != 1) perm = false;
+        check(perm, "cell-table: cellGrains is a permutation of [0,n)");
+        // Ascending within-cell order: each cell's slice is ascending grain index (the DET-CRUX).
+        bool ascendingInCell = true;
+        for (uint32_t c = 0; c < cells; ++c)
+            for (uint32_t s = tab.cellStart[c] + 1; s < tab.cellStart[c + 1]; ++s)
+                if (tab.cellGrains[s] <= tab.cellGrains[s - 1]) ascendingInCell = false;
+        check(ascendingInCell, "cell-table: within-cell order is ascending grain index (deterministic)");
+
+        // Expected neighbor count per grain = #lattice neighbors with |d|<hSearch=1.5 per axis (the 3x3x3
+        // box minus self, clamped to the block bounds).
+        auto inRange = [&](int v, int lo, int hi) { return v >= lo && v <= hi; };
+        bool countsOk = true;
+        for (int iz = 0; iz < 3; ++iz)
+        for (int iy = 0; iy < 3; ++iy)
+        for (int ix = 0; ix < 3; ++ix) {
+            int idx = grain::GrainIndex(block, ix, iy, iz);
+            uint32_t expected = 0;
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                if (inRange(ix + dx, 0, 2) && inRange(iy + dy, 0, 2) && inRange(iz + dz, 0, 2)) ++expected;
+            }
+            uint32_t got = nl.neighborStart[idx + 1] - nl.neighborStart[idx];
+            if (got != expected) countsOk = false;
+        }
+        check(countsOk, "neighbor: 3x3x3 block counts == lattice |d|<hSearch reference (corner 7, center 26)");
+        int cornerIdx = grain::GrainIndex(block, 0, 0, 0);
+        int centerIdx = grain::GrainIndex(block, 1, 1, 1);
+        check(nl.neighborStart[cornerIdx + 1] - nl.neighborStart[cornerIdx] == 7,
+              "neighbor: corner grain has 7 neighbors (the 2x2x2 minus self)");
+        check(nl.neighborStart[centerIdx + 1] - nl.neighborStart[centerIdx] == 26,
+              "neighbor: center grain has 26 neighbors (all others within hSearch)");
+
+        // Coherence: every emitted neighbor j of i passes GrainNeighborAccept (within hSearch per axis); i!=j.
+        bool coherent = true;
+        for (uint32_t i = 0; i < ps.size(); ++i)
+            for (uint32_t s = nl.neighborStart[i]; s < nl.neighborStart[i + 1]; ++s) {
+                uint32_t j = nl.neighbors[s];
+                if (j == i) coherent = false;
+                if (!grain::GrainNeighborAccept(ps[i].pos, ps[j].pos, hSearch)) coherent = false;
+            }
+        check(coherent, "neighbor: every emitted neighbor within hSearch per axis, no self");
+
+        // The FIXED stencil emit order: with one grain per cell, each grain's neighbor list is the accepted j
+        // visited in ascending stencil-cell (dz,dy,dx -1..+1) order. Hand-check the corner (0,0,0): its
+        // neighbors are the 7 lattice points in the +x/+y/+z half, emitted in (dz,dy,dx) order. The grain
+        // index is GrainIndex(ix,iy,iz) = (iz*3+iy)*3+ix. The first accepted (dz=0,dy=0,dx=+1) is grain 1.
+        {
+            std::vector<uint32_t> ref;
+            int ix0 = 0, iy0 = 0, iz0 = 0;
+            for (int dz = -1; dz <= 1; ++dz)
+            for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0 && dz == 0) continue;
+                int nx = ix0 + dx, ny = iy0 + dy, nz = iz0 + dz;
+                if (nx < 0 || nx > 2 || ny < 0 || ny > 2 || nz < 0 || nz > 2) continue;
+                ref.push_back((uint32_t)grain::GrainIndex(block, nx, ny, nz));
+            }
+            std::vector<uint32_t> got(nl.neighbors.begin() + nl.neighborStart[cornerIdx],
+                                      nl.neighbors.begin() + nl.neighborStart[cornerIdx + 1]);
+            check(got == ref, "neighbor: corner list is the fixed (dz,dy,dx) stencil order");
+        }
+
+        // Determinism: rebuild from scratch -> byte-identical cell table + neighbor list.
+        grain::GrainGrid g2 = grain::MakeGrainGrid(ps, hSearch);
+        grain::GrainCellTable tab2 = grain::BuildGrainCellTable(ps, g2);
+        grain::GrainNeighborList nl2 = grain::BuildGrainNeighborList(ps, g2, tab2, hSearch);
+        check(nl.neighborStart == nl2.neighborStart && nl.neighbors == nl2.neighbors &&
+              tab.cellStart == tab2.cellStart && tab.cellGrains == tab2.cellGrains,
+              "neighbor: two builds byte-identical (deterministic)");
+    }
+
+    // ----- a SINGLE grain (and grains spread > hSearch apart) -> 0 neighbors (the sparse no-op) -----------
+    {
+        const fx hSearch = kOne;
+        std::vector<grain::GrainParticle> one(1);
+        one[0].pos = {FromInt(5), FromInt(2), FromInt(-3)}; one[0].invMass = kOne;
+        grain::GrainGrid g = grain::MakeGrainGrid(one, hSearch);
+        grain::GrainCellTable t = grain::BuildGrainCellTable(one, g);
+        grain::GrainNeighborList nl = grain::BuildGrainNeighborList(one, g, t, hSearch);
+        check(nl.neighbors.empty() && nl.neighborStart.size() == 2 && nl.neighborStart[1] == 0u,
+              "neighbor: single grain -> 0 neighbors (sparse no-op)");
+
+        std::vector<grain::GrainParticle> sparse(3);
+        sparse[0].pos = {0, 0, 0}; sparse[1].pos = {FromInt(5), 0, 0}; sparse[2].pos = {FromInt(10), 0, 0};
+        for (auto& p : sparse) p.invMass = kOne;
+        grain::GrainGrid gs = grain::MakeGrainGrid(sparse, hSearch);
+        grain::GrainCellTable ts = grain::BuildGrainCellTable(sparse, gs);
+        grain::GrainNeighborList nls = grain::BuildGrainNeighborList(sparse, gs, ts, hSearch);
+        check(nls.neighbors.empty(), "neighbor: grains spread > hSearch apart -> 0 neighbors");
+    }
+
     if (g_fail == 0) std::printf("grain_test: ALL PASS\n");
     else std::printf("grain_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;

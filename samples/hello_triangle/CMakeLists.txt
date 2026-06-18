@@ -503,6 +503,29 @@ hf_compile_shaders(
     # fluid_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU grain
     # array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/grain_integrate.comp.hlsl:cs"
+    # Deterministic GPU Granular/Sand Slice 2 (Slice GR2, the 2nd slice of FLAGSHIP #10): the GRID-HASH
+    # NEIGHBOR SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FL2 fluid_cell/fluid_neighbor
+    # twin, applied to grains). The CELL TABLE: grain_cell_count.comp (ONE thread per grain: InterlockedAdd
+    # into its cell's counter — the cell id is GrainCellOf = FloorDiv per axis at cell-size hSearch, the
+    # bounded-dense-grid linearization, VERBATIM engine/sim/grain.h), grain_cell_scan.comp (SINGLE-THREAD
+    # [numthreads(1,1,1)] exclusive prefix-sum -> cellStart CSR + sentinel), grain_cell_emit.comp
+    # (SINGLE-THREAD ascending-grain scatter into cellGrains — single-thread because the within-cell order
+    # must be ascending grain index, NOT GPU-scheduling order). The NEIGHBOR LIST: grain_neighbor_count.comp
+    # (ONE thread per grain: count candidates in its 27-cell stencil passing the per-axis |dx|<hSearch reject
+    # — GrainNeighborAccept VERBATIM), grain_neighbor_scan.comp (SINGLE-THREAD exclusive prefix-sum ->
+    # neighborStart), grain_neighbor_emit.comp (ONE thread per grain emits its candidates into its DISJOINT
+    # neighbors[] slice, NO atomics — the per-grain-disjoint pattern). ALL PURE INT32 (FloorDiv integer divide
+    # + per-axis abs-compare, NO int64/fxmul/sqrt, NO radial overlap cull — deferred to GR3's contact solve),
+    # so UNLIKE grain_integrate.comp these MSL-GENERATE NATIVELY (they ARE in the Metal hf_gen_msl list) and
+    # Metal dispatches the GPU passes. ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs
+    # the CPU grain.h::BuildGrainCellTable + BuildGrainNeighborList (memcmp). NO new RHI; GR1's
+    # grain_integrate + goldens untouched.
+    "shaders/grain_cell_count.comp.hlsl:cs"
+    "shaders/grain_cell_scan.comp.hlsl:cs"
+    "shaders/grain_cell_emit.comp.hlsl:cs"
+    "shaders/grain_neighbor_count.comp.hlsl:cs"
+    "shaders/grain_neighbor_scan.comp.hlsl:cs"
+    "shaders/grain_neighbor_emit.comp.hlsl:cs"
     # Deterministic GPU Fluid Slice 2 (Slice FL2, the 2nd slice of FLAGSHIP #9): the GRID-HASH NEIGHBOR
     # SEARCH meshed by SIX pure-INT32 count->scan->emit passes (the FPX2 fpx_pair / CL2 cloth_edge twin).
     # The CELL TABLE: fluid_cell_count.comp (ONE thread per particle: InterlockedAdd into its cell's counter

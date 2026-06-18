@@ -197,5 +197,235 @@ inline int CountAtGround(const std::vector<GrainParticle>& grains, fx groundY) {
     return n;
 }
 
+// ===== Slice GR2 — the GRID-HASH NEIGHBOR SEARCH (the candidate contact-pair list GR3's solve iterates) ==
+// Builds the per-grain CANDIDATE NEIGHBOR LIST over the GR1 grain pool via a uniform spatial-hash grid, with
+// the proven count->scan->emit compaction (the FL2 fluid_cell_*/fluid_neighbor_* / FPX2 / CL2 twin). PURE
+// INT32 -> the GR2 shaders MSL-generate NATIVELY (a true GPU pass on BOTH backends, unlike GR1's int64
+// integrate): the whole neighbor search is integer INDEX arithmetic. Cell ids are FloorDiv per axis (the cell
+// size is hSearch); the cell bucketing is count->scan->emit of grain indices; the candidate reject is a
+// per-axis |pos_i.axis - pos_j.axis| < hSearch compare (fx is int32 -> a PURE INT32 compare, NO squaring, NO
+// products, NO int64, NO sqrt). The exact radial overlap cull (centre distance < r_i + r_j) is DEFERRED to
+// GR3's contact solve (the contact projection is a no-op for non-overlapping candidate pairs, exactly FL2's
+// "over-inclusive box candidate, exact cull deferred to FL3" discipline). NO float, NO sqrt, NO int64.
+//
+// THE CONTACT SEARCH RADIUS `hSearch` (the one parameter delta vs FL2): the range within which two grains are
+// CANDIDATE contact pairs. For uniform radius r, two grains contact when centre distance < 2*r (the
+// diameter), so the search radius MUST be >= the contact diameter (a smaller radius would MISS real contacts
+// in GR3) -> the caller asserts hSearch >= 2*maxRadius. The GR1 showcase block has spacing 1.0 + radius 0.25
+// (diameter 0.5); the showcase picks hSearch = 1.5 (== 1.5 * spacing, a host-snapped Q16.16 constant), which
+// is >= the diameter AND makes the non-overlapping block a NON-DEGENERATE neighbor graph (each interior grain
+// sees its 26 lattice neighbours -> a rich "interior dense / surface sparse" heat viz).
+//
+// REUSE: fpx::FloorDiv (the deterministic floor-division for negative coords, fpx.h:177), fpx::FxCell
+// (fpx.h:183), fpx::CellId (fpx.h:196). The whole search is engine/sim/fluid.h::MakeGrid/BuildCellTable/
+// NeighborAccept/BuildNeighborList with Grain types + hSearch for the radius + GrainParticle.pos as position.
+
+using fpx::FloorDiv;     // read-only: the deterministic floor-division (correct for negative coords)
+using fpx::FxCell;       // read-only: the int3 cell coordinate
+using fpx::CellId;       // read-only: the flat cell linearization
+
+// ----- The bounded dense grid over the grain AABB (the FL2 cell-linearization scheme verbatim) -----------
+// CHOSEN SCHEME: a BOUNDED DENSE GRID (== fluid.h::FluidGrid). Cell-size = hSearch (the contact search
+// radius). A grain's cell coord is FloorDiv(pos.axis, hSearch) per axis (monotone across 0 for negatives).
+// The grid covers [cellMin, cellMin+gridDim) cells; a cell's flat id is fpx::CellId of (coord - cellMin) into
+// gridDim. The caller sizes the grid to the grain AABB (every grain's cell in [0,gridDim)), so the
+// linearization is total + collision-free + deterministic. The origin offset cellMin lets the grid sit at any
+// world location (incl. negative coords) deterministically.
+struct GrainGrid {
+    fx     hSearch = 0;    // Q16.16 cell size (== the contact search radius)
+    FxCell cellMin;        // the integer cell coord of the grid's (0,0,0) corner (the AABB lower cell)
+    FxCell gridDim;        // the grid extent in cells per axis (cellCount = x*y*z)
+};
+
+// GrainCellOf(pos, hSearch): the integer grid cell a grain's position falls in, FloorDiv per axis. Pure int32.
+inline FxCell GrainCellOf(const FxVec3& pos, fx hSearch) {
+    return FxCell{FloorDiv(pos.x, hSearch), FloorDiv(pos.y, hSearch), FloorDiv(pos.z, hSearch)};
+}
+
+// FlatGrainCellId(cell, grid): the flat id of an absolute cell coord into the bounded dense grid (offset by
+// cellMin into [0,gridDim), then fpx::CellId). The caller guarantees the cell is in range (the grid was sized
+// to the grain AABB); returns the linear cell index in [0, gridDim.x*y*z).
+inline uint32_t FlatGrainCellId(const FxCell& cell, const GrainGrid& grid) {
+    const FxCell local{cell.x - grid.cellMin.x, cell.y - grid.cellMin.y, cell.z - grid.cellMin.z};
+    return CellId(local, grid.gridDim);
+}
+
+// GrainCellCount(grid): the total number of cells in the dense grid (gridDim.x * y * z).
+inline uint32_t GrainCellCount(const GrainGrid& grid) {
+    return (uint32_t)(grid.gridDim.x * grid.gridDim.y * grid.gridDim.z);
+}
+
+// MakeGrainGrid(grains, hSearch): build the bounded dense grid that tightly covers the grain pool at cell-size
+// hSearch. cellMin = the min cell coord over all grains; gridDim = (maxCell - minCell + 1) per axis. Empty
+// pool -> a 1x1x1 grid at origin (deterministic degenerate). Pure int32 (== fluid.h::MakeGrid).
+inline GrainGrid MakeGrainGrid(const std::vector<GrainParticle>& grains, fx hSearch) {
+    GrainGrid grid;
+    grid.hSearch = hSearch;
+    if (grains.empty()) {
+        grid.cellMin = FxCell{0, 0, 0};
+        grid.gridDim = FxCell{1, 1, 1};
+        return grid;
+    }
+    FxCell lo = GrainCellOf(grains[0].pos, hSearch);
+    FxCell hi = lo;
+    for (const GrainParticle& p : grains) {
+        const FxCell c = GrainCellOf(p.pos, hSearch);
+        if (c.x < lo.x) lo.x = c.x; if (c.x > hi.x) hi.x = c.x;
+        if (c.y < lo.y) lo.y = c.y; if (c.y > hi.y) hi.y = c.y;
+        if (c.z < lo.z) lo.z = c.z; if (c.z > hi.z) hi.z = c.z;
+    }
+    grid.cellMin = lo;
+    grid.gridDim = FxCell{hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1};
+    return grid;
+}
+
+// ----- BuildGrainCellTable: bucket grain indices into cells (the count->scan->emit on grains) -------------
+// The CSR-style cell table: cellStart[c..] is the exclusive prefix-sum of per-cell counts (cellStart has
+// cellCount+1 entries; cellStart[c]..cellStart[c+1] is cell c's slice), and cellGrains[] holds the grain
+// indices grouped by cell, ASCENDING grain index within each cell (deterministic). This is count->scan->emit:
+// (1) count grains per cell; (2) exclusive prefix-sum -> cellStart; (3) scatter each grain index into its
+// cell's slice (the emit, ascending-index order by construction since the grain loop is ascending). Pure
+// int32 -> the GPU grain_cell_{count,scan,emit} mirror this byte-for-byte. (DET-CRUX, the FL2 lesson: the
+// EMIT is the single-thread ascending-grain scatter — a parallel atomic cursor would make the within-cell
+// order GPU-scheduling-dependent -> non-deterministic. The cell COUNT + the neighbor passes are
+// per-grain-disjoint and race-free; only the cell-emit scatter is the ordered pass.)
+struct GrainCellTable {
+    std::vector<uint32_t> cellStart;    // cellCount+1 exclusive prefix-sum offsets (CSR row pointers)
+    std::vector<uint32_t> cellGrains;   // grain indices grouped by cell (size == grain count)
+};
+
+inline GrainCellTable BuildGrainCellTable(const std::vector<GrainParticle>& grains, const GrainGrid& grid) {
+    const uint32_t n = (uint32_t)grains.size();
+    const uint32_t cells = GrainCellCount(grid);
+    GrainCellTable table;
+    // (1) COUNT: per-cell grain count.
+    std::vector<uint32_t> counts((size_t)cells, 0u);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t c = FlatGrainCellId(GrainCellOf(grains[i].pos, grid.hSearch), grid);
+        ++counts[c];
+    }
+    // (2) SCAN: exclusive prefix-sum -> cellStart (cellCount+1 entries; the last == n).
+    table.cellStart.assign((size_t)cells + 1u, 0u);
+    uint32_t running = 0;
+    for (uint32_t c = 0; c < cells; ++c) {
+        table.cellStart[c] = running;
+        running += counts[c];
+    }
+    table.cellStart[cells] = running;   // == n (the total)
+    // (3) EMIT: scatter each grain index into its cell's slice (ascending index by the ascending loop).
+    table.cellGrains.assign((size_t)n, 0u);
+    std::vector<uint32_t> cursor((size_t)cells, 0u);   // per-cell write cursor (local offset)
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t c = FlatGrainCellId(GrainCellOf(grains[i].pos, grid.hSearch), grid);
+        table.cellGrains[table.cellStart[c] + cursor[c]] = i;
+        ++cursor[c];
+    }
+    return table;
+}
+
+// ----- The neighbor reject (the PURE INT32 per-axis |dx| < hSearch candidate test) -----------------------
+// GrainNeighborAccept(a, b, hSearch): accept b as a candidate neighbor of a iff |a.axis - b.axis| < hSearch on
+// EVERY axis (a box, NOT a sphere — the over-inclusive candidate set GR3's contact solve culls). PURE INT32:
+// an integer subtract + abs + compare per axis, NO products, NO int64, NO sqrt. The shader copies THIS
+// verbatim. (== fluid.h::NeighborAccept with hSearch for h.)
+inline bool GrainNeighborAccept(const FxVec3& a, const FxVec3& b, fx hSearch) {
+    fx dx = a.x - b.x; if (dx < 0) dx = -dx;
+    fx dy = a.y - b.y; if (dy < 0) dy = -dy;
+    fx dz = a.z - b.z; if (dz < 0) dz = -dz;
+    return dx < hSearch && dy < hSearch && dz < hSearch;
+}
+
+// ----- BuildGrainNeighborList: per-grain candidates over the 27-cell stencil (count->scan->emit) ----------
+// For each grain i, scan the 27 cells of its 3x3x3 stencil (the cell + its 26 neighbors); for each grain
+// j != i in those cells, accept iff GrainNeighborAccept(pos_i, pos_j, hSearch). Emit the accepted j into
+// neighbors[] at i's offset, in a FIXED order: ascending stencil-cell (dz,dy,dx -1..+1), then within a cell
+// ascending j (cellGrains is already ascending-index per cell) -> fully deterministic. The variable-length
+// per-grain lists are laid out by count->scan->emit (neighborStart = exclusive prefix-sum; neighbors[]
+// grouped by i). Stencil cells outside the grid are skipped (clamped). Pure int32 (== fluid.h::
+// BuildNeighborList).
+struct GrainNeighborList {
+    std::vector<uint32_t> neighborStart;   // grainCount+1 exclusive prefix-sum offsets (CSR)
+    std::vector<uint32_t> neighbors;       // candidate neighbor j indices grouped by i (in stencil order)
+};
+
+// CountGrainNeighbors(grains, grid, table, hSearch, perGrainOut): the count pass. perGrainOut[i] = #candidate
+// neighbors of i (j!=i in the 27-cell stencil passing GrainNeighborAccept); returns the total. The GPU
+// grain_neighbor_count mirrors THIS per-thread (one thread per grain i).
+inline uint32_t CountGrainNeighbors(const std::vector<GrainParticle>& grains, const GrainGrid& grid,
+                                    const GrainCellTable& table, fx hSearch,
+                                    std::vector<uint32_t>& perGrainOut) {
+    const uint32_t n = (uint32_t)grains.size();
+    perGrainOut.assign((size_t)n, 0u);
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const FxCell ci = GrainCellOf(grains[i].pos, grid.hSearch);
+        uint32_t c = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            // Skip stencil cells outside the bounded grid (clamp).
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = FlatGrainCellId(nc, grid);
+            for (uint32_t s = table.cellStart[cell]; s < table.cellStart[cell + 1u]; ++s) {
+                const uint32_t j = table.cellGrains[s];
+                if (j == i) continue;                                      // NO self-neighbor
+                if (GrainNeighborAccept(grains[i].pos, grains[j].pos, hSearch)) ++c;
+            }
+        }
+        perGrainOut[i] = c;
+        total += c;
+    }
+    return total;
+}
+
+// BuildGrainNeighborList(grains, grid, table, hSearch): the full mesher (count->scan->emit). (1)
+// CountGrainNeighbors -> per-grain counts; (2) exclusive prefix-sum -> neighborStart; (3) emit each accepted j
+// into i's disjoint slice in the FIXED stencil order. The list is grouped by i (ascending), then stencil-cell
+// (dz,dy,dx ascending), then j (ascending within a cell) -> fully deterministic. The GPU does the SAME three
+// passes (count/scan/emit) -> the GPU neighbors[]+neighborStart memcmp's against this byte-for-byte.
+inline GrainNeighborList BuildGrainNeighborList(const std::vector<GrainParticle>& grains,
+                                                const GrainGrid& grid, const GrainCellTable& table,
+                                                fx hSearch) {
+    const uint32_t n = (uint32_t)grains.size();
+    GrainNeighborList list;
+    std::vector<uint32_t> counts;
+    const uint32_t total = CountGrainNeighbors(grains, grid, table, hSearch, counts);
+    // (2) SCAN: exclusive prefix-sum -> neighborStart (grainCount+1 entries; the last == total).
+    list.neighborStart.assign((size_t)n + 1u, 0u);
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        list.neighborStart[i] = running;
+        running += counts[i];
+    }
+    list.neighborStart[n] = running;   // == total
+    // (3) EMIT: each grain writes its candidates into its disjoint [neighborStart[i], ..) slice.
+    list.neighbors.assign((size_t)total, 0u);
+    for (uint32_t i = 0; i < n; ++i) {
+        const FxCell ci = GrainCellOf(grains[i].pos, grid.hSearch);
+        uint32_t local = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = FlatGrainCellId(nc, grid);
+            for (uint32_t s = table.cellStart[cell]; s < table.cellStart[cell + 1u]; ++s) {
+                const uint32_t j = table.cellGrains[s];
+                if (j == i) continue;
+                if (GrainNeighborAccept(grains[i].pos, grains[j].pos, hSearch)) {
+                    list.neighbors[list.neighborStart[i] + local] = j;
+                    ++local;
+                }
+            }
+        }
+    }
+    return list;
+}
+
 }  // namespace grain
 }  // namespace hf::sim

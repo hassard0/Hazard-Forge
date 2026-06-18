@@ -315,6 +315,28 @@ hf_gen_msl(fluid_cell_emit.comp      fluid_cell_emit.comp.hlsl      comp fluid_c
 hf_gen_msl(fluid_neighbor_count.comp fluid_neighbor_count.comp.hlsl comp fluid_neighbor_count_main)
 hf_gen_msl(fluid_neighbor_scan.comp  fluid_neighbor_scan.comp.hlsl  comp fluid_neighbor_scan_main)
 hf_gen_msl(fluid_neighbor_emit.comp  fluid_neighbor_emit.comp.hlsl  comp fluid_neighbor_emit_main)
+# Deterministic GPU Granular/Sand Slice 2 (Slice GR2, the 2nd slice of FLAGSHIP #10): the GRID-HASH NEIGHBOR
+# SEARCH (the FL2 fluid_cell/fluid_neighbor twin, applied to grains). The CELL TABLE: grain_cell_count.comp
+# (ONE thread per grain: InterlockedAdd into its cell's counter — GrainCellOf = FloorDiv per axis at cell-size
+# hSearch, the bounded-dense-grid linearization, VERBATIM engine/sim/grain.h), grain_cell_scan.comp
+# (SINGLE-THREAD exclusive prefix-sum -> cellStart CSR), grain_cell_emit.comp (SINGLE-THREAD ascending-grain
+# scatter -> cellGrains, single-thread because the within-cell order must be ascending grain index). The
+# NEIGHBOR LIST: grain_neighbor_count.comp (ONE thread per grain: count 27-cell-stencil candidates passing the
+# per-axis |dx|<hSearch reject — GrainNeighborAccept VERBATIM), grain_neighbor_scan.comp (SINGLE-THREAD
+# exclusive prefix-sum -> neighborStart), grain_neighbor_emit.comp (ONE thread per grain emits its candidates
+# into its DISJOINT neighbors[] slice, NO atomics). UNLIKE GR1's int64 grain_integrate.comp (Vulkan-only ->
+# CPU on Metal), these are PURE INT32 (FloorDiv integer divide + per-axis abs-compare, NO
+# products/int64/fxmul/sqrt, NO radial overlap cull — deferred to GR3's contact solve), so glslc CAN lower
+# them and they MSL-generate NATIVELY (the default MSL gen suffices, the fluid_cell/fluid_neighbor lesson).
+# The Metal --grain-neighbors showcase dispatches the GPU shaders directly (NOT a CPU fallback) -> the
+# GPU==CPU cell-table+neighbor-list proof runs on Metal too. Bit-exact GPU==CPU + cross-backend by
+# construction. Behind --grain-neighbors only; GR1's grain_integrate + existing goldens untouched.
+hf_gen_msl(grain_cell_count.comp     grain_cell_count.comp.hlsl     comp grain_cell_count_main)
+hf_gen_msl(grain_cell_scan.comp      grain_cell_scan.comp.hlsl      comp grain_cell_scan_main)
+hf_gen_msl(grain_cell_emit.comp      grain_cell_emit.comp.hlsl      comp grain_cell_emit_main)
+hf_gen_msl(grain_neighbor_count.comp grain_neighbor_count.comp.hlsl comp grain_neighbor_count_main)
+hf_gen_msl(grain_neighbor_scan.comp  grain_neighbor_scan.comp.hlsl  comp grain_neighbor_scan_main)
+hf_gen_msl(grain_neighbor_emit.comp  grain_neighbor_emit.comp.hlsl  comp grain_neighbor_emit_main)
 # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT GRAPH
 # BUILD (the FPX2 count->scan->emit on lattice particles). cloth_edge_count.comp (ONE thread per particle:
 # gEdgeCount[p]=#OWNED forward edges in bounds), cloth_edge_scan.comp (SINGLE-THREAD exclusive prefix-sum ->
