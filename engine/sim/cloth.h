@@ -176,5 +176,111 @@ inline int CountPinned(const std::vector<ClothParticle>& particles) {
     return n;
 }
 
+// ===== Slice CL2 — Deterministic GPU Cloth: the DISTANCE-CONSTRAINT GRAPH BUILD ======================
+// Enumerate the cloth's distance constraints over the W x H lattice — the graph the CL3 PBD solver will
+// project. Three kinds of edge (the standard mass-spring cloth topology): STRUCTURAL (each particle to
+// its RIGHT + DOWN neighbour — the woven warp/weft), SHEAR (the two DIAGONALS of each cell — resist
+// in-plane shear), BEND (each particle to its 2-away RIGHT + DOWN neighbour — resist out-of-plane
+// folding, modelled here as a plain distance constraint, the documented simplification vs a dihedral
+// model). Each unordered edge is OWNED by its LOWER linear index so it is enumerated EXACTLY ONCE.
+//
+// THE int32-NATIVE DECISION (the FPX2 twin, documented): the count->scan->emit compaction is pure int32
+// index/compare arithmetic over the lattice (per-particle owned-edge COUNT -> single-thread exclusive
+// prefix-SUM -> per-particle EMIT at offset) — so the cloth_edge_{count,scan,emit} shaders MSL-generate
+// NATIVELY on Metal and run as TRUE GPU passes on both backends (unlike CL1's int64 cloth_integrate).
+// The ONLY length is restLen = FxLength(pos[j]-pos[i]); FxLength internally is int64 (fpx.h::FxISqrt over
+// the int64 sum-of-squares), but the lattice is HOST-SNAPPED and FLAT at build, so restLen is a build-
+// time CONSTANT PER KIND (structural = spacing; shear = FxLength(spacing,spacing,0); bend = 2*spacing).
+// We compute these three int32 restLens host-side once (the only int64 use, on the CPU) and the SHADER
+// reads them from params per edge kind — so the edge buffer + the three shaders are PURE int32 (NO int64,
+// NO sqrt in-shader), exactly the NAV1 TriYSpan / FPX2 rest-data precedent.
+
+inline constexpr uint32_t kConstraintStructural = 0u;  // right/down neighbour (warp/weft)
+inline constexpr uint32_t kConstraintShear      = 1u;  // cell diagonal (in-plane shear)
+inline constexpr uint32_t kConstraintBend       = 2u;  // 2-away right/down (out-of-plane bend)
+
+// A single distance constraint (i<j canonical). std430-packable as 4 x int32 (16 bytes): i, j, restLen,
+// kind — NO padding holes (memcmp-able; the GPU Constraint mirror). restLen is the Q16.16 rest distance.
+struct Constraint {
+    uint32_t i = 0, j = 0;   // the two endpoint particle indices (i<j by construction)
+    fx       restLen = 0;    // Q16.16 rest length = FxLength(pos[j]-pos[i]) at build (host-snapped int32)
+    uint32_t kind = 0;       // kConstraintStructural / kConstraintShear / kConstraintBend
+};
+
+// CountOwnedEdges(grid, r, c): the number of edges OWNED by particle (r,c) — i.e. edges whose LOWER
+// linear index is r*W+c. Owner = the neighbour with the LARGER index in each pair, so each particle owns
+// exactly the FORWARD edges that stay in-bounds, in the FIXED per-particle order [right, down, diag1
+// (down-right), diag2 (down-left), bend-right, bend-down]. diag2 (down-left) is owned by (r,c) because
+// (r,c) = r*W+c < (r+1)*W+(c-1) for c>=1 — its lower index. Pure int32 (the count shader copies this).
+inline int CountOwnedEdges(const ClothGrid& grid, int r, int c) {
+    const int W = grid.W, H = grid.H;
+    int n = 0;
+    if (c + 1 < W) ++n;                       // STRUCTURAL right  (r,c)-(r,c+1)
+    if (r + 1 < H) ++n;                       // STRUCTURAL down   (r,c)-(r+1,c)
+    if (r + 1 < H && c + 1 < W) ++n;          // SHEAR diag1 down-right (r,c)-(r+1,c+1)
+    if (r + 1 < H && c - 1 >= 0) ++n;         // SHEAR diag2 down-left  (r,c)-(r+1,c-1)
+    if (c + 2 < W) ++n;                       // BEND right (r,c)-(r,c+2)
+    if (r + 2 < H) ++n;                       // BEND down  (r,c)-(r+2,c)
+    return n;
+}
+
+// BuildConstraints(grid, particles): the CPU reference constraint graph (the make-or-break the GPU
+// memcmp's against). Mirrors the count->scan->emit the GPU runs: (1) per-particle owned-edge count;
+// (2) exclusive prefix-sum -> per-particle write offset; (3) per-particle emit at its DISJOINT offset
+// in the FIXED order [right, down, diag1, diag2, bend-right, bend-down]. restLen = FxLength(pos[j]-pos[i])
+// at build (host-snapped). The result is grouped by OWNER index (ascending) then the fixed per-particle
+// order -> fully deterministic, the exact ascending-owner list the GPU emit produces byte-for-byte.
+inline std::vector<Constraint> BuildConstraints(const ClothGrid& grid,
+                                                const std::vector<ClothParticle>& particles) {
+    const int W = grid.W, H = grid.H;
+    const int n = W * H;
+
+    // (1) per-particle owned-edge count.
+    std::vector<int> counts((size_t)n, 0);
+    for (int r = 0; r < H; ++r)
+        for (int c = 0; c < W; ++c)
+            counts[(size_t)(r * W + c)] = CountOwnedEdges(grid, r, c);
+
+    // (2) exclusive prefix-sum -> per-particle write offset (the single-thread serial scan).
+    std::vector<int> offset((size_t)n, 0);
+    int running = 0;
+    for (int p = 0; p < n; ++p) { offset[(size_t)p] = running; running += counts[(size_t)p]; }
+    const int total = running;
+
+    // (3) per-particle emit each owned edge at offset[p] + local++, in the FIXED order. restLen is
+    // FxLength of the host-snapped endpoint delta at build.
+    std::vector<Constraint> out((size_t)total);
+    auto emit = [&](int& base, int& local, int i, int j, uint32_t kind) {
+        const FxVec3 d = fpx::FxSub(particles[(size_t)j].pos, particles[(size_t)i].pos);
+        out[(size_t)(base + local)] =
+            Constraint{(uint32_t)i, (uint32_t)j, fpx::FxLength(d), kind};
+        ++local;
+    };
+    for (int r = 0; r < H; ++r)
+        for (int c = 0; c < W; ++c) {
+            const int p = r * W + c;
+            int base = offset[(size_t)p], local = 0;
+            if (c + 1 < W)              emit(base, local, p, r * W + (c + 1),       kConstraintStructural);
+            if (r + 1 < H)              emit(base, local, p, (r + 1) * W + c,       kConstraintStructural);
+            if (r + 1 < H && c + 1 < W) emit(base, local, p, (r + 1) * W + (c + 1), kConstraintShear);
+            if (r + 1 < H && c - 1 >= 0)emit(base, local, p, (r + 1) * W + (c - 1), kConstraintShear);
+            if (c + 2 < W)              emit(base, local, p, r * W + (c + 2),       kConstraintBend);
+            if (r + 2 < H)              emit(base, local, p, (r + 2) * W + c,       kConstraintBend);
+        }
+    return out;
+}
+
+// CountConstraintsByKind(constraints, outStruct, outShear, outBend): the deterministic per-kind tally
+// (a reporting/stat helper for the showcase proof line). Pure integer.
+inline void CountConstraintsByKind(const std::vector<Constraint>& constraints,
+                                   int& outStruct, int& outShear, int& outBend) {
+    outStruct = outShear = outBend = 0;
+    for (const Constraint& e : constraints) {
+        if (e.kind == kConstraintStructural) ++outStruct;
+        else if (e.kind == kConstraintShear) ++outShear;
+        else if (e.kind == kConstraintBend)  ++outBend;
+    }
+}
+
 }  // namespace cloth
 }  // namespace hf::sim

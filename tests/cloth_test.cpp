@@ -208,6 +208,108 @@ int main() {
               "all-pinned grid UNCHANGED after K steps (static no-op)");
     }
 
+    // ================= CL2: BuildConstraints — a 2x2 grid hand-enumerated =================
+    // A 2x2 grid (indices 0=(0,0) 1=(0,1) 2=(1,0) 3=(1,1)): STRUCTURAL = (0,1) right + (2,3) right +
+    // (0,2) down + (1,3) down = 4; SHEAR = the cell's two diagonals (0,3) down-right + (1,2) down-left = 2;
+    // BEND = none (no 2-away neighbour exists in a 2-wide/2-tall grid) = 0. Total = 6.
+    {
+        cloth::ClothGrid grid;
+        grid.W = 2; grid.H = 2; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(4), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+
+        int s, h, b;
+        cloth::CountConstraintsByKind(es, s, h, b);
+        check(es.size() == 6, "CL2 2x2: 6 edges total");
+        check(s == 4, "CL2 2x2: 4 structural");
+        check(h == 2, "CL2 2x2: 2 shear");
+        check(b == 0, "CL2 2x2: 0 bend");
+
+        // Hand-enumerated edge set (i<j, by kind). Build a lookup over the produced edges.
+        auto has = [&](uint32_t i, uint32_t j, uint32_t kind) {
+            for (const cloth::Constraint& e : es)
+                if (e.i == i && e.j == j && e.kind == kind) return true;
+            return false;
+        };
+        check(has(0, 1, cloth::kConstraintStructural), "CL2 2x2: (0,1) structural");
+        check(has(2, 3, cloth::kConstraintStructural), "CL2 2x2: (2,3) structural");
+        check(has(0, 2, cloth::kConstraintStructural), "CL2 2x2: (0,2) structural");
+        check(has(1, 3, cloth::kConstraintStructural), "CL2 2x2: (1,3) structural");
+        check(has(0, 3, cloth::kConstraintShear),      "CL2 2x2: (0,3) shear (down-right)");
+        check(has(1, 2, cloth::kConstraintShear),      "CL2 2x2: (1,2) shear (down-left)");
+
+        // restLens on a FLAT unit sheet: structural == spacing (1.0); shear == FxLength(1,1,0) == sqrt(2).
+        const fx structRest = cloth::kOne;
+        const fx shearRest  = hf::sim::fpx::FxLength(cloth::FxVec3{kOne, kOne, 0});
+        for (const cloth::Constraint& e : es) {
+            if (e.kind == cloth::kConstraintStructural)
+                check(e.restLen == structRest, "CL2 2x2: structural restLen == spacing");
+            else if (e.kind == cloth::kConstraintShear)
+                check(e.restLen == shearRest, "CL2 2x2: shear restLen == FxLength(spacing,spacing,0)");
+        }
+        // sqrt(2)*65536 ~= 92682; sanity-band the shear length (within ~1 LSB of the integer sqrt).
+        check(shearRest >= 92680 && shearRest <= 92684, "CL2 2x2: shear restLen ~= sqrt(2) in Q16.16");
+    }
+
+    // ================= CL2: the W x H edge-count formula + invariants =================
+    {
+        cloth::ClothGrid grid;
+        grid.W = 6; grid.H = 5; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(20), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+
+        const int W = grid.W, H = grid.H;
+        // Closed-form counts: STRUCTURAL = W*(H-1) + H*(W-1); SHEAR = 2*(W-1)*(H-1) (two diagonals/cell);
+        // BEND = H*(W-2) + W*(H-2) (right 2-away + down 2-away).
+        const int expectStruct = W * (H - 1) + H * (W - 1);
+        const int expectShear  = 2 * (W - 1) * (H - 1);
+        const int expectBend   = H * (W - 2) + W * (H - 2);
+        int s, h, b;
+        cloth::CountConstraintsByKind(es, s, h, b);
+        check(s == expectStruct, "CL2 formula: structural == W(H-1)+H(W-1)");
+        check(h == expectShear,  "CL2 formula: shear == 2(W-1)(H-1)");
+        check(b == expectBend,   "CL2 formula: bend == H(W-2)+W(H-2)");
+        check((int)es.size() == expectStruct + expectShear + expectBend, "CL2 formula: total == sum");
+
+        // Every edge: i<j, both in-bounds, restLen>0; no duplicate (i,j) pair.
+        const int n = W * H;
+        bool ok = true;
+        for (const cloth::Constraint& e : es) {
+            if (!(e.i < e.j)) ok = false;
+            if ((int)e.j >= n) ok = false;
+            if (e.restLen <= 0) ok = false;
+        }
+        check(ok, "CL2: every edge i<j, in-bounds, restLen>0");
+
+        // No duplicate undirected edge.
+        std::vector<uint64_t> keys;
+        keys.reserve(es.size());
+        for (const cloth::Constraint& e : es) keys.push_back(((uint64_t)e.i << 32) | (uint64_t)e.j);
+        bool dup = false;
+        for (size_t a = 0; a < keys.size() && !dup; ++a)
+            for (size_t c = a + 1; c < keys.size(); ++c)
+                if (keys[a] == keys[c]) { dup = true; break; }
+        check(!dup, "CL2: no duplicate edges");
+
+        // Determinism: a second build is byte-identical.
+        std::vector<cloth::Constraint> es2 = cloth::BuildConstraints(grid, ps);
+        check(es.size() == es2.size() &&
+              std::memcmp(es.data(), es2.data(), es.size() * sizeof(cloth::Constraint)) == 0,
+              "CL2: two builds byte-identical (deterministic)");
+    }
+
+    // ================= CL2: a 1x1 grid -> 0 edges (degenerate / empty) =================
+    {
+        cloth::ClothGrid grid;
+        grid.W = 1; grid.H = 1; grid.spacing = kOne;
+        grid.origin = cloth::FxVec3{0, FromInt(3), 0};
+        std::vector<cloth::ClothParticle> ps = cloth::InitGrid(grid);
+        std::vector<cloth::Constraint> es = cloth::BuildConstraints(grid, ps);
+        check(es.empty(), "CL2 1x1: 0 edges (degenerate empty)");
+    }
+
     if (g_fail == 0) std::printf("cloth_test: ALL PASS\n");
     else std::printf("cloth_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
