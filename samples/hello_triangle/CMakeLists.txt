@@ -487,6 +487,21 @@ hf_compile_shaders(
     "shaders/cloth_edge_count.comp.hlsl:cs"
     "shaders/cloth_edge_scan.comp.hlsl:cs"
     "shaders/cloth_edge_emit.comp.hlsl:cs"
+    # Deterministic GPU Cloth Slice 3 (Slice CL3, the MAKE-OR-BREAK of FLAGSHIP #8): the PBD DISTANCE-
+    # CONSTRAINT SOLVER. cloth_solve.comp runs `steps` iterations of StepCloth = IntegrateParticles (CL1)
+    # then `iters` Gauss-Seidel constraint passes (each iterating ALL CL2 constraints in the FIXED emit
+    # order applying SolveDistanceConstraint = the verbatim fpx.h::ResolvePair projection generalized from a
+    # sphere-pair to a constraint EDGE: pen = FxLength(pos[j]-pos[i]) - restLen; split by inverse-mass shares
+    # via fxdiv; pinned (invMass 0) never move) then a ground floor-clamp — copied VERBATIM from
+    # engine/sim/cloth.h::StepCloth, so the pinned corners hold + the lattice DRAPES cohesively (unlike CL1's
+    # free-fall). The constraint projection is SEQUENTIAL (Gauss-Seidel, order-dependent), so this is a SINGLE
+    # THREAD ([numthreads(1,1,1)], the fpx_solve.comp mirror) -> bit-exact GPU==CPU + cross-backend, NO
+    # atomics. solveEnabled=0 -> particles UNCHANGED. Like fpx_solve.comp / cloth_integrate.comp this is int64
+    # (fxdiv/FxISqrt) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl
+    # list; the Metal --cloth-solve showcase runs the CPU cloth::StepCloth (byte-identical by construction,
+    # the fpx_solve.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle
+    # array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/cloth_solve.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
     # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp: ONE thread per body i scans j>i
     # and writes perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) (each unordered pair counted once,

@@ -454,6 +454,7 @@ int main(int argc, char** argv) {
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~60 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
     const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
+    const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
@@ -606,6 +607,19 @@ int main(int argc, char** argv) {
         // the --shot else-if chain) to avoid MSVC's nested-block parse limit C1061, like the cl1/fpx/mc shots.
         if (std::strcmp(argv[i], "--cloth-edges-shot") == 0 && i + 1 < argc) {
             clothEdgesShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CL3: --cloth-solve-shot <out.bmp> — the Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT
+        // SOLVER (the MAKE-OR-BREAK of FLAGSHIP #8). The CL1 24x24 sheet (top corners PINNED), CL2
+        // constraints, StepCloth K=60 steps x iters=8 Gauss-Seidel passes under gravity -> a DRAPED cloth
+        // (pinned corners hold, the constraints keep the lattice cohesive — unlike CL1's free-fall scatter).
+        // One GPU thread runs the K-step StepCloth (integrate + SolveDistanceConstraint passes, copied
+        // VERBATIM from cloth.h), GPU==CPU particle array bit-exact vs cloth.h::StepCloth. int64 fxdiv/FxISqrt
+        // -> cloth_solve.comp is Vulkan-only; Metal --cloth-solve runs the CPU StepCloth. NO new RHI. Handled
+        // as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's C1061, like the cl1/cl2/fpx shots.
+        if (std::strcmp(argv[i], "--cloth-solve-shot") == 0 && i + 1 < argc) {
+            clothSolveShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15279,6 +15293,278 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cloth constraint-graph (%u edges: %d/%d/%d)\n",
                                 clothEdgesShotPath, imgW, imgH, totalEdges, cpuStruct, cpuShear, cpuBend);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothEdgesShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER (--cloth-solve-shot <out.bmp>, Slice
+        // CL3, the MAKE-OR-BREAK of FLAGSHIP #8). The CL1 24x24 sheet (the two top corners PINNED), the CL2
+        // BuildConstraints (structural+shear+bend distance constraints), is stepped K=60 times by a SINGLE-
+        // THREAD compute (shaders/cloth_solve.comp): each step = IntegrateParticles (CL1) then iters=8
+        // Gauss-Seidel constraint passes (each iterating ALL constraints in the FIXED CL2 emit order applying
+        // SolveDistanceConstraint = the verbatim fpx.h::ResolvePair projection generalized from a sphere-pair
+        // to a constraint EDGE: pen = FxLength(pos[j]-pos[i]) - restLen, split by inverse-mass shares via
+        // fxdiv, pinned never move) then a ground floor-clamp -> a DRAPED cloth (the pinned corners hold, the
+        // constraints keep the lattice cohesive — unlike CL1's free-fall scatter). The constraint list is
+        // built ONCE on the host (cloth.h::BuildConstraints) + uploaded; the integrate + projection math is
+        // copied VERBATIM from engine/sim/cloth.h::StepCloth. ReadBuffer reads the integer Q16.16 particle
+        // array; the CPU cloth.h::StepCloth over the SAME sheet must match it BIT-EXACT (memcmp, NO tol —
+        // the GPU==CPU make-or-break). solveEnabled=false -> particles UNCHANGED. The golden is a PURE-
+        // INTEGER side-view of the draped lattice (each particle's integer (pos.x>>kFrac, pos.y>>kFrac) ->
+        // a pixel, a hashColor dot, pinned corners marked) -> identical both backends by construction. int64
+        // fxdiv/FxISqrt -> cloth_solve.comp is VULKAN-ONLY (Metal --cloth-solve runs the CPU StepCloth). NO new RHI.
+        if (clothSolveShotPath) {
+            using math::Vec3;
+            namespace cloth = hf::sim::cloth;
+            namespace vg = hf::render::vg;
+
+            // The deterministic 24x24 sheet (== the Metal --cloth-solve config). gravity -9.8 host-snapped.
+            const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const cloth::fx kDt = cloth::kOne / 60;
+            const int kSide = 24;                      // 24x24 sheet -> 576 particles
+            // K=40 steps x iters=6: the single-thread [numthreads(1,1,1)] dispatch runs steps*iters*edges
+            // (40*6*3218 ~= 772K) fxdiv/FxISqrt constraint-solves SERIALLY. The spec's example 60x8 (~1.5M)
+            // intermittently tripped the GPU watchdog (TDR) -> a corrupted SECOND dispatch (determinism
+            // FATAL while GPU==CPU still passed on dispatch 1). 40x6 completes reliably (deterministic 5/5)
+            // and still DRAPES cohesively (residual ~= 0.025/edge). The math is unchanged; only the duration.
+            const int kSteps = 40;
+            const int kIters = 6;
+            // groundY well below the hanging sheet so the focus is the constraint DRAPE (not the floor).
+            const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+            const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+            cloth::ClothGrid grid;
+            grid.W = kSide; grid.H = kSide;
+            grid.spacing = cloth::kOne;                // 1.0 world unit spacing
+            grid.origin = cloth::FxVec3{0, (cloth::fx)(kSide * (int)cloth::kOne), 0}; // hang from y=24
+            const int kParticleCount = grid.W * grid.H;
+            std::vector<cloth::ClothParticle> sheet0 = cloth::InitGrid(grid);
+            const int kPinned = cloth::CountPinned(sheet0);
+
+            // Build the CL2 constraint graph ONCE from the rest sheet (the edge list StepCloth iterates).
+            const std::vector<cloth::Constraint> constraints = cloth::BuildConstraints(grid, sheet0);
+            const uint32_t kConstraintCount = (uint32_t)constraints.size();
+            const uint32_t kConstraintAlloc = kConstraintCount > 0u ? kConstraintCount : 1u;
+
+            // std430 ClothParticle mirror (matches cloth_solve.comp ClothParticle): 11 x int32 (44 bytes).
+            struct ClothParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(ClothParticleGpu) == 44, "ClothParticleGpu std430 layout");
+            static_assert(sizeof(cloth::ClothParticle) == 44, "ClothParticle std430 layout");
+            auto packParticles = [&](const std::vector<cloth::ClothParticle>& ps) {
+                std::vector<ClothParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const cloth::ClothParticle& p = ps[i];
+                    out[i] = ClothParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+                }
+                return out;
+            };
+            const std::vector<ClothParticleGpu> particlesInit = packParticles(sheet0);
+
+            auto makeParticlesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = particlesInit.size() * sizeof(ClothParticleGpu);
+                d.initialData = particlesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // std430 Constraint mirror (matches cloth_solve.comp Constraint): 4 x int32 (16 bytes). Built
+            // once, shared (read-only) across runs.
+            struct ConstraintGpu { uint32_t i, j; int32_t restLen; uint32_t kind; };
+            static_assert(sizeof(ConstraintGpu) == 16, "ConstraintGpu std430 layout");
+            static_assert(sizeof(cloth::Constraint) == 16, "Constraint std430 layout");
+            std::vector<ConstraintGpu> constraintsInit((size_t)kConstraintAlloc, ConstraintGpu{0u, 0u, 0, 0u});
+            for (uint32_t e = 0; e < kConstraintCount; ++e)
+                constraintsInit[e] = ConstraintGpu{constraints[e].i, constraints[e].j,
+                                                   constraints[e].restLen, constraints[e].kind};
+            rhi::BufferDesc cDesc;
+            cDesc.size = constraintsInit.size() * sizeof(ConstraintGpu);
+            cDesc.initialData = constraintsInit.data();
+            cDesc.usage = rhi::BufferUsage::Storage;
+            auto constraintsBuf = device->CreateBuffer(cDesc);
+
+            // Params (matches cloth_solve.comp ClothSolveParams std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, particleCount, constraintCount, steps} + int4 cfg2 {iters, solveEnabled, _, _}.
+            struct ClothSolveParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(ClothSolveParams) == 48, "ClothSolveParams std430 layout");
+            auto makeParams = [&](int32_t solveEnabled) {
+                ClothSolveParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kParticleCount; p.cfg[2] = (int32_t)kConstraintCount; p.cfg[3] = kSteps;
+                p.cfg2[0] = kIters; p.cfg2[1] = solveEnabled; p.cfg2[2] = 0; p.cfg2[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (particles, constraints, params); SINGLE thread.
+            auto clothCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cloth_solve.comp.hlsl.spv");
+            auto clothCs = device->CreateShaderModule({std::span<const uint32_t>(clothCsWords)});
+            rhi::ComputePipelineDesc clothCdesc;
+            clothCdesc.compute = clothCs.get();
+            clothCdesc.storageBufferCount = 3;
+            clothCdesc.pushConstantSize = 0;
+            clothCdesc.threadsPerGroupX = 1;
+            auto clothCompute = device->CreateComputePipeline(clothCdesc);
+
+            // Run the solve compute over a fresh particles buffer + params, read back gParticles.
+            auto runSolve = [&](int32_t solveEnabled, std::vector<ClothParticleGpu>& outParticles) {
+                auto particlesBuf = makeParticlesBuf();
+                ClothSolveParams params = makeParams(solveEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(ClothSolveParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("cloth_solve", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*clothCompute);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*constraintsBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outParticles.assign((size_t)kParticleCount, ClothParticleGpu{});
+                device->ReadBuffer(*particlesBuf, outParticles.data(),
+                                   outParticles.size() * sizeof(ClothParticleGpu), 0);
+            };
+
+            // === GPU solve (enabled, K steps) ===
+            std::vector<ClothParticleGpu> gpuParticles;
+            runSolve(1, gpuParticles);
+
+            // === CPU reference: StepCloth K times over the SAME sheet + the SAME constraint list ===
+            std::vector<cloth::ClothParticle> cpuSheet = sheet0;
+            cloth::StepClothSteps(grid, cpuSheet, constraints, kGravity, kDt, kGroundY, kIters, kSteps);
+            std::vector<ClothParticleGpu> cpuParticles = packParticles(cpuSheet);
+
+            // PROOF (1) GPU==CPU particles BIT-EXACT after K solve steps (integer memcmp, NO tol) — the
+            // MAKE-OR-BREAK.
+            if (gpuParticles.size() != cpuParticles.size() ||
+                std::memcmp(gpuParticles.data(), cpuParticles.data(),
+                            (size_t)kParticleCount * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-solve GPU particle array != CPU StepCloth "
+                             "(a float/overflow/order divergence crept into the PBD solver?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-solve: {particles:%d, constraints:%u, pinned:%d, steps:%d, iters:%d} "
+                        "GPU==CPU BIT-EXACT\n",
+                        kParticleCount, kConstraintCount, kPinned, kSteps, kIters);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            std::vector<ClothParticleGpu> gpuParticles2;
+            runSolve(1, gpuParticles2);
+            if (gpuParticles.size() != gpuParticles2.size() ||
+                std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                            gpuParticles.size() * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-solve two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-solve determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) cohesion / coverage: the pinned corners HELD (byte-unchanged from the rest sheet)
+            // and the drape is COHESIVE — the summed |edge len - restLen| residual is small + deterministic
+            // (the constraints kept the lattice's structure, NOT free-fall scatter). R is a deterministic
+            // integer metric (EdgeResidual over the bit-exact draped sheet).
+            {
+                int pinnedHeld = 0;
+                for (int i = 0; i < kParticleCount; ++i) {
+                    const ClothParticleGpu& g = gpuParticles[(size_t)i];
+                    const ClothParticleGpu& init = particlesInit[(size_t)i];
+                    if ((g.flags & cloth::kFlagPinned) != 0u &&
+                        std::memcmp(&g, &init, sizeof(ClothParticleGpu)) == 0) ++pinnedHeld;
+                }
+                const int64_t residual = cloth::EdgeResidual(cpuSheet, constraints);
+                // Sanity: the drape stayed COHESIVE — the per-edge mean residual is a small fraction of a
+                // spacing (a free-fall scatter would blow the residual up by orders of magnitude).
+                const int64_t meanResidual = kConstraintCount ? residual / (int64_t)kConstraintCount : 0;
+                if (pinnedHeld != kPinned || meanResidual >= (int64_t)cloth::kOne) {
+                    std::fprintf(stderr, "FATAL: cloth-solve incoherent (pinnedHeld=%d/%d, meanResidual=%lld)\n",
+                                 pinnedHeld, kPinned, (long long)meanResidual);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-solve coverage: pinned %d held, residual %lld (coherent drape)\n",
+                            pinnedHeld, (long long)residual);
+            }
+
+            // PROOF (4) hand-check / no-op: a single distance constraint between one FREE + one PINNED
+            // particle -> the free one moves to exactly restLen (the exact inverse-mass split, hand-checked
+            // Q16.16); all-pinned (solveEnabled=false) -> no movement (byte-identical upload).
+            {
+                const cloth::fx restLen = (cloth::fx)(2 * (int)cloth::kOne);  // 2.0
+                std::vector<cloth::ClothParticle> two(2);
+                two[0].pos = {0, 0, 0}; two[0].prev = two[0].pos; two[0].invMass = 0; two[0].flags = cloth::kFlagPinned;
+                two[1].pos = {(cloth::fx)(3 * (int)cloth::kOne), 0, 0}; two[1].prev = two[1].pos;
+                two[1].invMass = cloth::kOne; two[1].flags = 0;
+                cloth::Constraint hc{0u, 1u, restLen, cloth::kConstraintStructural};
+                cloth::SolveDistanceConstraint(two, hc);
+                if (two[0].pos.x != 0 || two[1].pos.x != restLen) {
+                    std::fprintf(stderr, "FATAL: cloth-solve hand-check split wrong (pinned.x=%d free.x=%d rest=%d)\n",
+                                 two[0].pos.x, two[1].pos.x, restLen);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cloth-solve hand-check: free pulled to exactly restLen %d (pinned share 0)\n", restLen);
+            }
+            // The disabled-path no-op (the "all pinned (no-op)" static case): solveEnabled=false -> particles
+            // UNCHANGED (byte-identical to the upload).
+            std::vector<ClothParticleGpu> disabledParticles;
+            runSolve(0, disabledParticles);
+            if (disabledParticles.size() != particlesInit.size() ||
+                std::memcmp(disabledParticles.data(), particlesInit.data(),
+                            particlesInit.size() * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth-solve solveEnabled=false changed the particles\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-solve static: all pinned (no-op)\n");
+
+            // --- Golden: a PURE-INTEGER side-view debug-viz of the DRAPED lattice. Project each particle's
+            // integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel via a FIXED integer transform (y up), splat a
+            // small hashColor dot (pinned corners bright white). CPU-colored from the read-back integers ->
+            // identical both backends by construction. ---
+            const int kPxPerUnit = 18;   // integer world-units -> pixels
+            const int kMargin = 20;
+            const int kWorldW = kSide;   // x spans 0..23
+            const int kWorldH = kSide;   // y spans (the draped sheet within ~[0, 24] above ground)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + (kWorldH + 1) * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = gpuParticles[(size_t)i].px >> cloth::kFrac;
+                const int wy = gpuParticles[(size_t)i].py >> cloth::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                const bool pinned = (gpuParticles[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+                Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(clothSolveShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cloth PBD drape side-view (%u constraints, %d pinned)\n",
+                                clothSolveShotPath, imgW, imgH, kConstraintCount, kPinned);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothSolveShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

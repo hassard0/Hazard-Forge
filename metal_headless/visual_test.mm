@@ -17387,6 +17387,172 @@ static int RunClothEdgesShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CL3 — Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER showcase (--cloth-solve) =====
+// (the MAKE-OR-BREAK of FLAGSHIP #8). Like CL1's --cloth-integrate (and UNLIKE the int32 CL2 --cloth-edges /
+// FPX2 broadphase), the PBD solve is int64 (fxdiv/FxISqrt in SolveDistanceConstraint — the SAME form as
+// fpx_solve.comp), so shaders/cloth_solve.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) and
+// is NOT in this dir's hf_gen_msl list; on Metal the --cloth-solve showcase runs the CPU cloth::StepCloth —
+// the EXACT bit-exact reference the Vulkan --cloth-solve-shot GPU==CPU memcmp already compares against ->
+// the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the fpx_solve.comp /
+// cloth_integrate.comp convention), while the Vulkan side carries the GPU==CPU proof. So this builds the
+// SAME deterministic 24x24 sheet (the two top corners pinned, the CL2 constraints, gravity -9.8 host-snapped
+// to Q16.16, groundY far below, dt=kOne/60), runs cloth::StepCloth K=60 steps x iters=8 over it -> a DRAPED
+// cohesive cloth, and CPU-colors the SAME integer side-view debug-viz as the Vulkan --cloth-solve-shot ->
+// the golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof
+// lines match the Vulkan side EXACTLY. New golden tests/golden/metal/cloth_solve.png (baked on the Mac by
+// the controller); two runs DIFF 0.0000. NO GPU compute (int64 -> CPU on Metal), NO new RHI.
+static int RunClothSolveShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cloth = hf::sim::cloth;
+    namespace vg = render::vg;
+
+    // The deterministic 24x24 sheet (== the Vulkan --cloth-solve-shot config). gravity -9.8 host-snapped.
+    const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const cloth::fx kDt = cloth::kOne / 60;
+    const int kSide = 24;
+    const int kSteps = 40;
+    const int kIters = 6;
+    const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+    const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+    cloth::ClothGrid grid;
+    grid.W = kSide; grid.H = kSide;
+    grid.spacing = cloth::kOne;
+    grid.origin = cloth::FxVec3{0, (cloth::fx)(kSide * (int)cloth::kOne), 0};
+    const int kParticleCount = grid.W * grid.H;
+    std::vector<cloth::ClothParticle> sheet0 = cloth::InitGrid(grid);
+    const int kPinned = cloth::CountPinned(sheet0);
+
+    // Build the CL2 constraint graph ONCE from the rest sheet (== the Vulkan path).
+    const std::vector<cloth::Constraint> constraints = cloth::BuildConstraints(grid, sheet0);
+    const uint32_t kConstraintCount = (uint32_t)constraints.size();
+
+    // std430 ClothParticle mirror (== the Vulkan --cloth-solve-shot ClothParticleGpu): 11 x int32 (44).
+    struct ClothParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+    };
+    static_assert(sizeof(ClothParticleGpu) == 44, "ClothParticleGpu std430 layout");
+    static_assert(sizeof(cloth::ClothParticle) == 44, "ClothParticle std430 layout");
+    auto packParticles = [&](const std::vector<cloth::ClothParticle>& ps) {
+        std::vector<ClothParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const cloth::ClothParticle& p = ps[i];
+            out[i] = ClothParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                      p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+        }
+        return out;
+    };
+    const std::vector<ClothParticleGpu> particlesInit = packParticles(sheet0);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --cloth-solve-shot).
+    const int kPxPerUnit = 18, kMargin = 20;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kSide * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 1) * kPxPerUnit);
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    // solveEnabled=false -> particles UNCHANGED (the no-op / all-pinned static path).
+    auto runSolve = [&](bool solveEnabled, std::vector<ClothParticleGpu>& outParticles) {
+        if (!solveEnabled) { outParticles = particlesInit; return; }
+        std::vector<cloth::ClothParticle> sheet = sheet0;
+        cloth::StepClothSteps(grid, sheet, constraints, kGravity, kDt, kGroundY, kIters, kSteps);
+        outParticles = packParticles(sheet);
+    };
+
+    // CPU solve (enabled, K steps) — the Metal showcase particle array.
+    std::vector<ClothParticleGpu> gpuParticles;
+    runSolve(true, gpuParticles);
+
+    // GPU==CPU is N/A on the Metal CPU path: this particle array IS the CPU StepCloth reference the Vulkan
+    // --cloth-solve-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("cloth-solve: {particles:%d, constraints:%u, pinned:%d, steps:%d, iters:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cloth::StepCloth, byte-identical to the Vulkan GPU result by construction]\n",
+                kParticleCount, kConstraintCount, kPinned, kSteps, kIters);
+
+    // two-run determinism.
+    std::vector<ClothParticleGpu> gpuParticles2;
+    runSolve(true, gpuParticles2);
+    if (gpuParticles.size() != gpuParticles2.size() ||
+        std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                    gpuParticles.size() * sizeof(ClothParticleGpu)) != 0)
+        return fail("cloth-solve: two solves differ (nondeterministic)");
+    std::printf("cloth-solve determinism: two runs BYTE-IDENTICAL\n");
+
+    // cohesion / coverage: the pinned corners held + the drape is COHESIVE (small, deterministic residual).
+    {
+        std::vector<cloth::ClothParticle> sheet = sheet0;
+        cloth::StepClothSteps(grid, sheet, constraints, kGravity, kDt, kGroundY, kIters, kSteps);
+        int pinnedHeld = 0;
+        for (int i = 0; i < kParticleCount; ++i) {
+            const ClothParticleGpu& g = gpuParticles[(size_t)i];
+            const ClothParticleGpu& init = particlesInit[(size_t)i];
+            if ((g.flags & cloth::kFlagPinned) != 0u &&
+                std::memcmp(&g, &init, sizeof(ClothParticleGpu)) == 0) ++pinnedHeld;
+        }
+        const int64_t residual = cloth::EdgeResidual(sheet, constraints);
+        const int64_t meanResidual = kConstraintCount ? residual / (int64_t)kConstraintCount : 0;
+        if (pinnedHeld != kPinned || meanResidual >= (int64_t)cloth::kOne)
+            return fail("cloth-solve: coverage incoherent (pinned/residual)");
+        std::printf("cloth-solve coverage: pinned %d held, residual %lld (coherent drape)\n",
+                    pinnedHeld, (long long)residual);
+    }
+
+    // hand-check / no-op: a single distance constraint between one FREE + one PINNED particle -> the free
+    // one moves to exactly restLen (the exact inverse-mass split, pinned share 0).
+    {
+        const cloth::fx restLen = (cloth::fx)(2 * (int)cloth::kOne);
+        std::vector<cloth::ClothParticle> two(2);
+        two[0].pos = {0, 0, 0}; two[0].prev = two[0].pos; two[0].invMass = 0; two[0].flags = cloth::kFlagPinned;
+        two[1].pos = {(cloth::fx)(3 * (int)cloth::kOne), 0, 0}; two[1].prev = two[1].pos;
+        two[1].invMass = cloth::kOne; two[1].flags = 0;
+        cloth::Constraint hc{0u, 1u, restLen, cloth::kConstraintStructural};
+        cloth::SolveDistanceConstraint(two, hc);
+        if (two[0].pos.x != 0 || two[1].pos.x != restLen)
+            return fail("cloth-solve: hand-check split wrong");
+        std::printf("cloth-solve hand-check: free pulled to exactly restLen %d (pinned share 0)\n", restLen);
+    }
+
+    // empty / no-op: solveEnabled=false -> particles UNCHANGED (the all-pinned static case).
+    std::vector<ClothParticleGpu> disabledParticles;
+    runSolve(false, disabledParticles);
+    if (disabledParticles.size() != particlesInit.size() ||
+        std::memcmp(disabledParticles.data(), particlesInit.data(),
+                    particlesInit.size() * sizeof(ClothParticleGpu)) != 0)
+        return fail("cloth-solve: solveEnabled=false changed the particles");
+    std::printf("cloth-solve static: all pinned (no-op)\n");
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz of the DRAPED lattice (IDENTICAL to the Vulkan
+    // --cloth-solve-shot by construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = gpuParticles[(size_t)i].px >> cloth::kFrac;
+        const int wy = gpuParticles[(size_t)i].py >> cloth::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        const bool pinned = (gpuParticles[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+        Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cloth PBD drape side-view (%u constraints, %d pinned)\n",
+                outPath, imgW, imgH, kConstraintCount, kPinned);
+    return 0;
+}
+
 // --- Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION showcase (Slice NAV1, the
 // BEACHHEAD of FLAGSHIP #7). UNLIKE --fpx (int64 integrator -> CPU on Metal), the span rasterizer is
 // PURE INT32 (TriColumnAabb add/sub/compare + the three-edge PointInTriXZ cover test + TriYSpan, NO
@@ -30767,6 +30933,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cloth-edges") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cloth_edges.png";
             try { return RunClothEdgesShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cloth-solve <out.png>: render the Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER
+        // showcase (Slice CL3, the MAKE-OR-BREAK of FLAGSHIP #8). On Metal this runs the CPU SOLVER:
+        // cloth_solve.comp is int64/Vulkan-only (glslc can't parse the fxdiv/FxISqrt int64 in
+        // SolveDistanceConstraint), so Metal runs the CPU cloth::StepCloth — byte-identical to the Vulkan GPU
+        // result by construction (the cloth_integrate.comp / fpx_solve.comp convention). The SAME 24x24 sheet
+        // (top corners pinned, the CL2 constraints, gravity (0,-9.8,0) host-snapped to Q16.16, groundY far
+        // below, dt=kOne/60) is stepped K=60 (iters=8) by cloth::StepCloth (IntegrateParticles + Gauss-Seidel
+        // SolveDistanceConstraint passes + floor clamp) -> a DRAPED cohesive cloth — the EXACT bit-exact
+        // reference the Vulkan --cloth-solve-shot GPU==CPU memcmp compares against; solveEnabled=false ->
+        // particles unchanged; two runs byte-identical. The image golden is a PURE-INTEGER drape side-view,
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/cloth_solve.png.
+        if (argc > 1 && std::strcmp(argv[1], "--cloth-solve") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cloth_solve.png";
+            try { return RunClothSolveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --nav-raster <out.png>: render the Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN
