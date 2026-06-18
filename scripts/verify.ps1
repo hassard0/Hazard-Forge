@@ -479,7 +479,13 @@ function Invoke-MacVerify {
     try {
         # bsdtar: exclude build artifacts + .git + known stray PNGs. The golden under
         # tests/golden/ is intentionally NOT matched by these patterns.
-        & tar `
+        # PIN the Windows bsdtar (System32\tar.exe) by full path: if a GNU tar (e.g. Git/MSYS
+        # usr/bin) is first on PATH — which happens when verify.ps1 is launched from a bash
+        # context — GNU tar treats the 'C:\...\hf-verify.tar.gz' output path as a remote
+        # rsh 'host:path' ("Cannot connect to C: resolve failed" / "Broken pipe") and the
+        # Mac stage fails before the bake. bsdtar handles drive-letter paths natively.
+        $bsdtar = Join-Path $env:SystemRoot 'System32\tar.exe'
+        & $bsdtar `
             --exclude='./build' `
             --exclude='./build-metal' `
             --exclude='./.git' `
@@ -494,7 +500,7 @@ function Invoke-MacVerify {
     } finally { Pop-Location }
 
     # Sanity: EVERY golden MUST be in the archive or its compare on the Mac can't run.
-    $archiveList = (& tar -tzf $tarPath)
+    $archiveList = (& $bsdtar -tzf $tarPath)
     foreach ($g in $Goldens) {
         $needle = "golden/metal/$($g.Name).png"
         if (-not ($archiveList | Select-String -SimpleMatch $needle)) {
