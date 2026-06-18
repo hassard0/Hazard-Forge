@@ -306,6 +306,19 @@ hf_gen_msl(nav_distance.comp nav_distance.comp.hlsl comp nav_distance_main)
 # directly -> the GPU==CPU region[] proof runs on Metal too; bit-exact cross-backend by construction.
 # Behind --nav-region only; NAV1+NAV2 + existing shaders + goldens untouched.
 hf_gen_msl(nav_region.comp   nav_region.comp.hlsl   comp nav_region_main)
+# nav_contour.comp + nav_polygonize.comp — Slice NAV4 CONTOUR TRACE + INTEGER POLYGONIZATION over the
+# NAV3 region partition. nav_contour: SINGLE-THREAD ([numthreads(1,1,1)], the nav_region serial mirror)
+# traces each region boundary into an integer corner loop (lowest-cellId start + fixed wall-follow turn
+# order) then Douglas-Peucker simplifies (perpendicular-distance SQUARED vs maxError^2, no sqrt) ->
+# gContourVerts + per-region offsets/counts. nav_polygonize: SINGLE-THREAD ear-clip triangulation (clip
+# the LOWEST-index valid ear) + per-edge cross-poly adjacency -> gPolys + per-region offsets/counts.
+# Both copied VERBATIM from engine/nav/navmesh.h::TraceContours/SimplifyContour/BuildPolyMesh. Like the
+# NAV1-NAV3 shaders + UNLIKE fpx_*.comp, they are PURE INT32 (NO int64; corner coords <=32 for the 32x32
+# showcase, the documented overflow bound), so glslc CAN lower them and they MSL-generate NATIVELY. The
+# Metal --nav-polymesh showcase dispatches the GPU shaders directly -> the GPU==CPU proof runs on Metal
+# too; bit-exact cross-backend by construction. Behind --nav-polymesh only; NAV1-NAV3 + goldens untouched.
+hf_gen_msl(nav_contour.comp     nav_contour.comp.hlsl     comp nav_contour_main)
+hf_gen_msl(nav_polygonize.comp  nav_polygonize.comp.hlsl  comp nav_polygonize_main)
 # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6): fpx_solve.comp
 # is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)]) runs `steps` of
 # StepWorld = IntegrateStep then SolveContacts (K=solveIters Gauss-Seidel sweeps: ground then sphere-sphere
