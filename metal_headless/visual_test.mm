@@ -18188,6 +18188,440 @@ static int RunNavPolymeshShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic GPU Navmesh INTEGER A* PATHFINDING showcase (Slice NAV5, the 5th slice + HEADLINE of
+// FLAGSHIP #7). Like --nav-polymesh (PURE INT32, NO int64 -> nav_astar.comp MSL-gens natively), Metal
+// DISPATCHES the GPU passes: the NAV1-NAV4 pipeline builds the poly mesh + adjacency, then nav_astar.comp
+// ([numthreads(1,1,1)] connected-components -> deterministic start/goal -> integer Manhattan A* -> a
+// CORRIDOR). ReadBuffer reads the corridor + meta (len, cost, start, goal); the CPU
+// nav::ConnectedComponents/SelectStartGoal/FindPath reference over the SAME polys + centroids must match
+// BIT-EXACT (memcmp — the same proofs the Vulkan --nav-path-shot runs). enabled=false -> empty corridor;
+// two runs identical. The golden is the navmesh (faint) + the bright corridor polyline (through poly
+// centroids, start/goal marked), identical to the Vulkan path BY CONSTRUCTION. New golden
+// tests/golden/metal/nav_path.png; two runs DIFF 0.0000.
+static int RunNavPathShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace nav = hf::nav;
+    namespace vg = render::vg;
+
+    const int kW = 32, kH = 32;
+    nav::Heightfield hf;
+    hf.w = kW; hf.h = kH;
+    hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+    hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+    hf.cs = 1; hf.ch = 1;
+    const int kColumnCount = hf.columnCount();   // 1024
+    nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+    const int32_t kMaxError = 0;
+
+    std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+    std::vector<nav::Span> flatMerged;
+    std::vector<uint32_t> mOffset((size_t)kColumnCount, 0u), mCount((size_t)kColumnCount, 0u);
+    for (int c = 0; c < kColumnCount; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+        mOffset[(size_t)c] = (uint32_t)flatMerged.size();
+        mCount[(size_t)c] = (uint32_t)mergedPerCol[(size_t)c].size();
+        for (const auto& s : mergedPerCol[(size_t)c]) flatMerged.push_back(s);
+    }
+    const uint32_t kMergedTotal = (uint32_t)flatMerged.size();
+    const uint32_t kMergedAlloc = kMergedTotal > 0u ? kMergedTotal : 1u;
+
+    // CPU reference (full pipeline -> polymesh).
+    std::vector<std::vector<nav::Span>> cpuMerged = mergedPerCol;
+    std::vector<uint32_t> cpuWalkable; std::vector<int32_t> cpuSurfaceY;
+    nav::FilterWalkableSpans(hf, cfg, cpuMerged, cpuWalkable, cpuSurfaceY);
+    std::vector<uint32_t> cpuDist;
+    nav::BuildDistanceField(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist);
+    const uint32_t cpuMaxDist = nav::MaxDistOf(cpuDist);
+    std::vector<uint32_t> cpuRegion;
+    const uint32_t cpuRegionCount =
+        nav::BuildRegions(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist, cpuMaxDist, cpuRegion);
+    std::vector<nav::Contour> cpuContours;
+    nav::TraceContours(hf, cpuRegion, cpuRegionCount, cpuContours);
+    for (auto& cc : cpuContours) {
+        std::vector<nav::ContourVertex> s;
+        nav::SimplifyContour(cc.verts, kMaxError, s);
+        cc.verts = s;
+    }
+    std::vector<nav::Poly> cpuPolys;
+    nav::BuildPolyMesh(cpuContours, cpuPolys);
+
+    std::vector<int32_t> cpuFlatVerts;
+    std::vector<uint32_t> cpuVOff((size_t)cpuRegionCount, 0u), cpuVCnt((size_t)cpuRegionCount, 0u);
+    {
+        std::vector<int> contourOfRegion((size_t)cpuRegionCount + 1u, -1);
+        for (size_t ci = 0; ci < cpuContours.size(); ++ci)
+            contourOfRegion[(size_t)cpuContours[ci].region] = (int)ci;
+        uint32_t base = 0u;
+        for (uint32_t R = 1u; R <= cpuRegionCount; ++R) {
+            cpuVOff[(size_t)(R - 1u)] = base;
+            const int ci = contourOfRegion[(size_t)R];
+            if (ci < 0) { cpuVCnt[(size_t)(R - 1u)] = 0u; continue; }
+            const auto& vv = cpuContours[(size_t)ci].verts;
+            for (const auto& v : vv) { cpuFlatVerts.push_back(v.x); cpuFlatVerts.push_back(v.z); }
+            cpuVCnt[(size_t)(R - 1u)] = (uint32_t)vv.size();
+            base += (uint32_t)vv.size();
+        }
+    }
+    const uint32_t cpuTotalPolys = (uint32_t)cpuPolys.size();
+
+    const uint32_t kVertCap = 4096u;
+    const uint32_t kPolyCap = 4096u;
+    const uint32_t kRegAlloc = cpuRegionCount > 0u ? cpuRegionCount : 1u;
+    const uint32_t kCorridorCap = kPolyCap;
+
+    const int kCell = 16;
+    const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    struct SpanGpu { uint32_t ymin, ymax, area; };
+    static_assert(sizeof(SpanGpu) == 12, "SpanGpu std430 layout");
+    std::vector<SpanGpu> mergedInit((size_t)kMergedAlloc, SpanGpu{0u, 0u, 0u});
+    for (uint32_t i = 0; i < kMergedTotal; ++i)
+        mergedInit[i] = SpanGpu{flatMerged[i].ymin, flatMerged[i].ymax, flatMerged[i].area};
+
+    auto makeStorage = [&](const void* data, size_t bytes) {
+        rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto makeBufU32 = [&](const std::vector<uint32_t>& v) {
+        return makeStorage(v.data(), v.size() * sizeof(uint32_t));
+    };
+    auto offsetBuf = makeBufU32(mOffset);
+    auto countBuf  = makeBufU32(mCount);
+
+    std::vector<int32_t> surfaceInit((size_t)kColumnCount, 0);
+    std::vector<uint32_t> walkableInit((size_t)kColumnCount, 0u);
+    std::vector<uint32_t> distInit((size_t)kColumnCount, 0u);
+    std::vector<uint32_t> regionInit((size_t)kColumnCount, 0u);
+    std::vector<int32_t> cVertInit((size_t)kVertCap * 2u, 0);
+    std::vector<uint32_t> rVOffInit((size_t)kRegAlloc, 0u), rVCntInit((size_t)kRegAlloc, 0u);
+    std::vector<uint32_t> polyInit((size_t)kPolyCap * 8u, 0u);
+    std::vector<uint32_t> rPOffInit((size_t)kRegAlloc, 0u), rPCntInit((size_t)kRegAlloc, 0u);
+
+    struct NavFilterParams { int32_t cfg[4]; int32_t ext[4]; };
+    auto makeFilterParams = [&](int32_t enabled) {
+        NavFilterParams p{};
+        p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableHeight; p.cfg[3] = enabled;
+        p.ext[0] = hf.bmaxY - 1; return p;
+    };
+    struct NavDistParams { int32_t cfg[4]; };
+    auto makeDistParams = [&](int32_t enabled) {
+        NavDistParams p{}; p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled; return p;
+    };
+    struct NavRegionParams { int32_t cfg[4]; int32_t ext[4]; };
+    auto makeRegionParams = [&](int32_t enabled, int32_t maxDist) {
+        NavRegionParams p{};
+        p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled; p.ext[0] = maxDist; return p;
+    };
+    struct NavContourParams { int32_t cfg[4]; int32_t ext[4]; };
+    auto makeContourParams = [&](int32_t enabled) {
+        NavContourParams p{};
+        p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = kMaxError; p.cfg[3] = enabled;
+        p.ext[0] = (int32_t)cpuRegionCount; p.ext[1] = (int32_t)kVertCap; return p;
+    };
+    struct NavPolyParams { int32_t cfg[4]; };
+    auto makePolyParams = [&](int32_t enabled) {
+        NavPolyParams p{};
+        p.cfg[0] = (int32_t)cpuRegionCount; p.cfg[1] = (int32_t)kPolyCap; p.cfg[2] = enabled; return p;
+    };
+    struct NavAstarParams { int32_t cfg[4]; };
+
+    auto filterCs = loadMSL("nav_filter.comp.gen.metal", "nav_filter_main");
+    rhi::ComputePipelineDesc filterCd;
+    filterCd.compute = filterCs.get(); filterCd.storageBufferCount = 6; filterCd.threadsPerGroupX = 64;
+    auto filterCompute = device->CreateComputePipeline(filterCd);
+    auto distCs = loadMSL("nav_distance.comp.gen.metal", "nav_distance_main");
+    rhi::ComputePipelineDesc distCd;
+    distCd.compute = distCs.get(); distCd.storageBufferCount = 4; distCd.threadsPerGroupX = 1;
+    auto distCompute = device->CreateComputePipeline(distCd);
+    auto regionCs = loadMSL("nav_region.comp.gen.metal", "nav_region_main");
+    rhi::ComputePipelineDesc regionCd;
+    regionCd.compute = regionCs.get(); regionCd.storageBufferCount = 5; regionCd.threadsPerGroupX = 1;
+    auto regionCompute = device->CreateComputePipeline(regionCd);
+    auto contourCs = loadMSL("nav_contour.comp.gen.metal", "nav_contour_main");
+    rhi::ComputePipelineDesc contourCd;
+    contourCd.compute = contourCs.get(); contourCd.storageBufferCount = 5; contourCd.threadsPerGroupX = 1;
+    auto contourCompute = device->CreateComputePipeline(contourCd);
+    auto polyCs = loadMSL("nav_polygonize.comp.gen.metal", "nav_polygonize_main");
+    rhi::ComputePipelineDesc polyCd;
+    polyCd.compute = polyCs.get(); polyCd.storageBufferCount = 7; polyCd.threadsPerGroupX = 1;
+    auto polyCompute = device->CreateComputePipeline(polyCd);
+    auto astarCs = loadMSL("nav_astar.comp.gen.metal", "nav_astar_main");
+    rhi::ComputePipelineDesc astarCd;
+    astarCd.compute = astarCs.get(); astarCd.storageBufferCount = 6; astarCd.threadsPerGroupX = 1;
+    auto astarCompute = device->CreateComputePipeline(astarCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)kColumnCount + 63u) / 64u;
+
+    auto buildCentroids = [&](const std::vector<uint32_t>& polys, const std::vector<int32_t>& verts,
+                              const std::vector<uint32_t>& vOff, const std::vector<uint32_t>& pOff,
+                              const std::vector<uint32_t>& pCnt, uint32_t regionCount,
+                              uint32_t totalPolys, std::vector<int32_t>& cx, std::vector<int32_t>& cz) {
+        cx.assign((size_t)totalPolys, 0); cz.assign((size_t)totalPolys, 0);
+        for (uint32_t r = 0; r < regionCount; ++r) {
+            const uint32_t vBase = vOff[r], pBase = pOff[r], pc = pCnt[r];
+            for (uint32_t pi = pBase; pi < pBase + pc && pi < totalPolys; ++pi) {
+                int32_t sx = 0, sz = 0;
+                for (int k = 0; k < 3; ++k) {
+                    const uint32_t vi = vBase + polys[pi * 8u + (uint32_t)k];
+                    sx += verts[(size_t)vi * 2u]; sz += verts[(size_t)vi * 2u + 1u];
+                }
+                cx[pi] = sx / 3; cz[pi] = sz / 3;
+            }
+        }
+    };
+
+    auto runPath = [&](int32_t enabled, std::vector<int32_t>& outVerts, std::vector<uint32_t>& outVOff,
+                       std::vector<uint32_t>& outVCnt, std::vector<uint32_t>& outPolys,
+                       std::vector<uint32_t>& outPOff, std::vector<uint32_t>& outPCnt,
+                       std::vector<uint32_t>& outCorridor, std::vector<uint32_t>& outMeta,
+                       const std::vector<int32_t>& cxUp, const std::vector<int32_t>& czUp) {
+        auto spansBuf  = makeStorage(mergedInit.data(), mergedInit.size() * sizeof(SpanGpu));
+        auto walkBuf   = makeStorage(walkableInit.data(), walkableInit.size() * sizeof(uint32_t));
+        auto surfBuf   = makeStorage(surfaceInit.data(), surfaceInit.size() * sizeof(int32_t));
+        auto distBuf   = makeStorage(distInit.data(), distInit.size() * sizeof(uint32_t));
+        auto regionBuf = makeStorage(regionInit.data(), regionInit.size() * sizeof(uint32_t));
+        auto cVertBuf  = makeStorage(cVertInit.data(), cVertInit.size() * sizeof(int32_t));
+        auto rVOffBuf  = makeStorage(rVOffInit.data(), rVOffInit.size() * sizeof(uint32_t));
+        auto rVCntBuf  = makeStorage(rVCntInit.data(), rVCntInit.size() * sizeof(uint32_t));
+        auto polyBuf   = makeStorage(polyInit.data(), polyInit.size() * sizeof(uint32_t));
+        auto rPOffBuf  = makeStorage(rPOffInit.data(), rPOffInit.size() * sizeof(uint32_t));
+        auto rPCntBuf  = makeStorage(rPCntInit.data(), rPCntInit.size() * sizeof(uint32_t));
+
+        std::vector<int32_t> cxInit((size_t)kPolyCap, 0), czInit((size_t)kPolyCap, 0);
+        for (size_t i = 0; i < cxUp.size() && i < kPolyCap; ++i) { cxInit[i] = cxUp[i]; czInit[i] = czUp[i]; }
+        auto cxBuf = makeStorage(cxInit.data(), cxInit.size() * sizeof(int32_t));
+        auto czBuf = makeStorage(czInit.data(), czInit.size() * sizeof(int32_t));
+        std::vector<uint32_t> corridorInit((size_t)kCorridorCap, 0u);
+        auto corridorBuf = makeStorage(corridorInit.data(), corridorInit.size() * sizeof(uint32_t));
+        std::vector<uint32_t> metaInit(4u, 0u);
+        auto metaBuf = makeStorage(metaInit.data(), metaInit.size() * sizeof(uint32_t));
+
+        NavFilterParams fp = makeFilterParams(enabled);   auto fpBuf = makeStorage(&fp, sizeof(fp));
+        NavDistParams dp = makeDistParams(enabled);       auto dpBuf = makeStorage(&dp, sizeof(dp));
+        NavRegionParams rp = makeRegionParams(enabled, (int32_t)cpuMaxDist); auto rpBuf = makeStorage(&rp, sizeof(rp));
+        NavContourParams cp = makeContourParams(enabled); auto cpBuf = makeStorage(&cp, sizeof(cp));
+        NavPolyParams pp = makePolyParams(enabled);       auto ppBuf = makeStorage(&pp, sizeof(pp));
+        NavAstarParams ap{}; ap.cfg[0] = (int32_t)cpuTotalPolys; ap.cfg[1] = (int32_t)kPolyCap; ap.cfg[2] = enabled;
+        auto apBuf = makeStorage(&ap, sizeof(ap));
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("nav_path", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*filterCompute);
+                cmd.BindStorageBuffer(*spansBuf, 0); cmd.BindStorageBuffer(*offsetBuf, 1);
+                cmd.BindStorageBuffer(*countBuf, 2); cmd.BindStorageBuffer(*walkBuf, 3);
+                cmd.BindStorageBuffer(*surfBuf, 4); cmd.BindStorageBuffer(*fpBuf, 5);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*distCompute);
+                cmd.BindStorageBuffer(*walkBuf, 0); cmd.BindStorageBuffer(*surfBuf, 1);
+                cmd.BindStorageBuffer(*distBuf, 2); cmd.BindStorageBuffer(*dpBuf, 3);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*regionCompute);
+                cmd.BindStorageBuffer(*walkBuf, 0); cmd.BindStorageBuffer(*surfBuf, 1);
+                cmd.BindStorageBuffer(*distBuf, 2); cmd.BindStorageBuffer(*regionBuf, 3);
+                cmd.BindStorageBuffer(*rpBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*contourCompute);
+                cmd.BindStorageBuffer(*regionBuf, 0); cmd.BindStorageBuffer(*cVertBuf, 1);
+                cmd.BindStorageBuffer(*rVOffBuf, 2); cmd.BindStorageBuffer(*rVCntBuf, 3);
+                cmd.BindStorageBuffer(*cpBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*polyCompute);
+                cmd.BindStorageBuffer(*cVertBuf, 0); cmd.BindStorageBuffer(*rVOffBuf, 1);
+                cmd.BindStorageBuffer(*rVCntBuf, 2); cmd.BindStorageBuffer(*polyBuf, 3);
+                cmd.BindStorageBuffer(*rPOffBuf, 4); cmd.BindStorageBuffer(*rPCntBuf, 5);
+                cmd.BindStorageBuffer(*ppBuf, 6);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();   // polygonize -> A*
+                cmd.BindComputePipeline(*astarCompute);
+                cmd.BindStorageBuffer(*polyBuf, 0); cmd.BindStorageBuffer(*cxBuf, 1);
+                cmd.BindStorageBuffer(*czBuf, 2); cmd.BindStorageBuffer(*corridorBuf, 3);
+                cmd.BindStorageBuffer(*metaBuf, 4); cmd.BindStorageBuffer(*apBuf, 5);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outVerts.assign((size_t)kVertCap * 2u, 0);
+        device->ReadBuffer(*cVertBuf, outVerts.data(), outVerts.size() * sizeof(int32_t), 0);
+        outVOff.assign((size_t)kRegAlloc, 0u);
+        device->ReadBuffer(*rVOffBuf, outVOff.data(), outVOff.size() * sizeof(uint32_t), 0);
+        outVCnt.assign((size_t)kRegAlloc, 0u);
+        device->ReadBuffer(*rVCntBuf, outVCnt.data(), outVCnt.size() * sizeof(uint32_t), 0);
+        outPolys.assign((size_t)kPolyCap * 8u, 0u);
+        device->ReadBuffer(*polyBuf, outPolys.data(), outPolys.size() * sizeof(uint32_t), 0);
+        outPOff.assign((size_t)kRegAlloc, 0u);
+        device->ReadBuffer(*rPOffBuf, outPOff.data(), outPOff.size() * sizeof(uint32_t), 0);
+        outPCnt.assign((size_t)kRegAlloc, 0u);
+        device->ReadBuffer(*rPCntBuf, outPCnt.data(), outPCnt.size() * sizeof(uint32_t), 0);
+        outCorridor.assign((size_t)kCorridorCap, 0u);
+        device->ReadBuffer(*corridorBuf, outCorridor.data(), outCorridor.size() * sizeof(uint32_t), 0);
+        outMeta.assign(4u, 0u);
+        device->ReadBuffer(*metaBuf, outMeta.data(), outMeta.size() * sizeof(uint32_t), 0);
+    };
+
+    std::vector<int32_t> gpuVerts; std::vector<uint32_t> gpuVOff, gpuVCnt;
+    std::vector<uint32_t> gpuPolys, gpuPOff, gpuPCnt, gpuCorridor, gpuMeta;
+    std::vector<int32_t> emptyCx, emptyCz;
+    runPath(1, gpuVerts, gpuVOff, gpuVCnt, gpuPolys, gpuPOff, gpuPCnt, gpuCorridor, gpuMeta, emptyCx, emptyCz);
+    uint32_t gpuTotalPolys = 0u; for (uint32_t v : gpuPCnt) gpuTotalPolys += v;
+
+    std::vector<int32_t> gpuCx, gpuCz;
+    buildCentroids(gpuPolys, gpuVerts, gpuVOff, gpuPOff, gpuPCnt, cpuRegionCount, gpuTotalPolys, gpuCx, gpuCz);
+
+    runPath(1, gpuVerts, gpuVOff, gpuVCnt, gpuPolys, gpuPOff, gpuPCnt, gpuCorridor, gpuMeta, gpuCx, gpuCz);
+    const uint32_t gpuCorridorLen = gpuMeta[0];
+    const uint32_t gpuCost = gpuMeta[1];
+    const uint32_t gpuStart = gpuMeta[2];
+    const uint32_t gpuGoal = gpuMeta[3];
+
+    // CPU reference.
+    std::vector<uint32_t> cpuPolyVertBase((size_t)cpuTotalPolys, 0u);
+    for (uint32_t pi = 0; pi < cpuTotalPolys; ++pi) {
+        const uint32_t R = cpuPolys[pi].region;
+        cpuPolyVertBase[pi] = (R >= 1u && R <= cpuRegionCount) ? cpuVOff[R - 1u] : 0u;
+    }
+    std::vector<int32_t> cpuCx, cpuCz;
+    nav::ComputePolyCentroids(cpuPolys, cpuFlatVerts, cpuPolyVertBase, cpuCx, cpuCz);
+    uint32_t cpuStart = 0u, cpuGoal = 0u;
+    nav::SelectStartGoal(cpuPolys, cpuCx, cpuCz, cpuStart, cpuGoal);
+    std::vector<uint32_t> cpuCorridor;
+    const int32_t cpuCost = nav::FindPath(cpuPolys, cpuCx, cpuCz, cpuStart, cpuGoal, cpuCorridor);
+
+    // PROOF (1) GPU==CPU BIT-EXACT.
+    bool startGoalOk = (gpuStart == cpuStart) && (gpuGoal == cpuGoal);
+    bool lenOk = (gpuCorridorLen == (uint32_t)cpuCorridor.size());
+    bool costOk = (gpuCost == (uint32_t)cpuCost);
+    bool seqOk = lenOk;
+    for (uint32_t i = 0; i < cpuCorridor.size() && seqOk; ++i)
+        if (gpuCorridor[i] != cpuCorridor[i]) seqOk = false;
+    if (!startGoalOk || !lenOk || !costOk || !seqOk) return fail("nav-path: GPU != CPU reference");
+    std::printf("nav-path: {polys:%u, corridor:%u, cost:%u} GPU==CPU BIT-EXACT\n",
+                gpuTotalPolys, gpuCorridorLen, gpuCost);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<int32_t> v2; std::vector<uint32_t> vo2, vc2, p2, po2, pc2, cor2, m2;
+        runPath(1, v2, vo2, vc2, p2, po2, pc2, cor2, m2, gpuCx, gpuCz);
+        bool same = (cor2.size() == gpuCorridor.size()) &&
+            std::memcmp(cor2.data(), gpuCorridor.data(), cor2.size() * sizeof(uint32_t)) == 0 &&
+            std::memcmp(m2.data(), gpuMeta.data(), m2.size() * sizeof(uint32_t)) == 0;
+        if (!same) return fail("nav-path: two runs differ (nondeterministic)");
+        std::printf("nav-path determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) validity / coherence.
+    {
+        bool valid = (gpuCorridorLen >= 2u) && (gpuCorridor[0] == gpuStart) &&
+                     (gpuCorridor[gpuCorridorLen - 1u] == gpuGoal);
+        for (uint32_t i = 0; i + 1 < gpuCorridorLen && valid; ++i) {
+            const uint32_t a = gpuCorridor[i], b = gpuCorridor[i + 1];
+            bool adj = false;
+            for (int e = 0; e < 3; ++e) if (gpuPolys[a * 8u + 3u + (uint32_t)e] == b) adj = true;
+            if (!adj) valid = false;
+        }
+        if (!valid) return fail("nav-path: corridor invalid");
+        std::printf("nav-path coverage: corridor of %u polys start->goal (each step adjacent)\n",
+                    gpuCorridorLen);
+    }
+
+    // PROOF (4) empty no-op.
+    {
+        std::vector<int32_t> v2; std::vector<uint32_t> vo2, vc2, p2, po2, pc2, cor2, m2;
+        runPath(0, v2, vo2, vc2, p2, po2, pc2, cor2, m2, gpuCx, gpuCz);
+        if (m2[0] != 0u) return fail("nav-path: disabled path produced a corridor");
+        std::printf("nav-path empty: no corridor (no-op)\n");
+    }
+
+    // --- Golden: the navmesh (faint) + the corridor polyline (bright), IDENTICAL to the Vulkan
+    // --nav-path-shot by construction (CPU-colored from the read-back integer buffers). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, uint8_t r, uint8_t g2, uint8_t b2) {
+        if (x < 0 || y < 0 || x >= (int)imgW || y >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)y * imgW + x) * 4];
+        dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+    };
+    for (int cz = 0; cz < kH; ++cz)
+        for (int cx = 0; cx < kW; ++cx) {
+            const size_t c = (size_t)hf.columnId(cx, cz);
+            if (cpuRegion[c] == 0u) continue;
+            Vec3 col = vg::hashColor(cpuRegion[c]);
+            const uint8_t r = (uint8_t)(col.x * 45.0f + 0.5f);
+            const uint8_t g = (uint8_t)(col.y * 45.0f + 0.5f);
+            const uint8_t b = (uint8_t)(col.z * 45.0f + 0.5f);
+            for (int dy = 0; dy < kCell; ++dy)
+                for (int dx = 0; dx < kCell; ++dx)
+                    putPx(cx * kCell + dx, cz * kCell + dy, r, g, b);
+        }
+    auto drawLine = [&](int x0, int z0, int x1, int z1, uint8_t r, uint8_t g2, uint8_t b2) {
+        const int px0 = x0 * kCell, py0 = z0 * kCell, px1 = x1 * kCell, py1 = z1 * kCell;
+        int dx = px1 - px0, dy = py1 - py0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int steps = adx > ady ? adx : ady;
+        if (steps == 0) { putPx(px0, py0, r, g2, b2); return; }
+        for (int s = 0; s <= steps; ++s) {
+            int px = px0 + (dx * s + (dx < 0 ? -steps / 2 : steps / 2)) / steps;
+            int py = py0 + (dy * s + (dy < 0 ? -steps / 2 : steps / 2)) / steps;
+            putPx(px, py, r, g2, b2);
+        }
+    };
+    for (uint32_t r = 0; r < cpuRegionCount; ++r) {
+        const uint32_t vBase = gpuVOff[r];
+        const uint32_t pBase = gpuPOff[r], pCnt = gpuPCnt[r];
+        for (uint32_t pi = pBase; pi < pBase + pCnt; ++pi) {
+            const uint32_t i0 = gpuPolys[pi * 8u + 0u], i1 = gpuPolys[pi * 8u + 1u], i2 = gpuPolys[pi * 8u + 2u];
+            const int ax = gpuVerts[(vBase + i0) * 2u], az = gpuVerts[(vBase + i0) * 2u + 1u];
+            const int bx = gpuVerts[(vBase + i1) * 2u], bz = gpuVerts[(vBase + i1) * 2u + 1u];
+            const int cx2 = gpuVerts[(vBase + i2) * 2u], cz2 = gpuVerts[(vBase + i2) * 2u + 1u];
+            drawLine(ax, az, bx, bz, 60, 60, 70);
+            drawLine(bx, bz, cx2, cz2, 60, 60, 70);
+            drawLine(cx2, cz2, ax, az, 60, 60, 70);
+        }
+    }
+    auto markDot = [&](int cxp, int czp, uint8_t r, uint8_t g2, uint8_t b2) {
+        const int px = cxp * kCell, py = czp * kCell;
+        for (int dy = -3; dy <= 3; ++dy)
+            for (int dx = -3; dx <= 3; ++dx)
+                if (dx * dx + dy * dy <= 9) putPx(px + dx, py + dy, r, g2, b2);
+    };
+    for (uint32_t i = 0; i + 1 < gpuCorridorLen; ++i) {
+        const uint32_t a = gpuCorridor[i], b = gpuCorridor[i + 1];
+        drawLine(gpuCx[a], gpuCz[a], gpuCx[b], gpuCz[b], 250, 230, 40);
+    }
+    if (gpuCorridorLen >= 1u) {
+        markDot(gpuCx[gpuStart], gpuCz[gpuStart], 40, 230, 60);
+        markDot(gpuCx[gpuGoal], gpuCz[gpuGoal], 235, 40, 40);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — A* corridor (%u polys, cost %u) over %u-poly navmesh\n",
+                outPath, imgW, imgH, gpuCorridorLen, gpuCost, gpuTotalPolys);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver showcase (Slice FPX3, the
 // MAKE-OR-BREAK of FLAGSHIP #6). On Metal this runs the CPU SOLVER, NOT a GPU compute dispatch.
 // fpx_solve.comp is int64/Vulkan-only (glslc can't parse int64 — fxdiv/FxISqrt for the sphere-sphere
@@ -29539,6 +29973,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--nav-polymesh") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_nav_polymesh.png";
             try { return RunNavPolymeshShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --nav-path <out.png>: render the Deterministic GPU Navmesh INTEGER A* PATHFINDING showcase
+        // (Slice NAV5, the 5th slice + HEADLINE of FLAGSHIP #7). Like --nav-polymesh (PURE INT32, NO int64
+        // -> nav_astar.comp MSL-gens natively), Metal DISPATCHES the GPU passes: the NAV1-NAV4 pipeline +
+        // nav_astar.comp (connected-components -> deterministic start/goal -> integer Manhattan A* -> a
+        // CORRIDOR) -> ReadBuffer corridor + meta, PROVEN BIT-EXACT vs the CPU nav::FindPath reference (the
+        // same proofs the Vulkan --nav-path-shot runs); enabled=false -> empty corridor; two runs identical.
+        // The golden is the navmesh (faint) + the corridor polyline (bright), identical to the Vulkan path
+        // BY CONSTRUCTION. New golden tests/golden/metal/nav_path.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--nav-path") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_nav_path.png";
+            try { return RunNavPathShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-solve <out.png>: render the Deterministic Fixed-Point Physics PBD POSITIONAL

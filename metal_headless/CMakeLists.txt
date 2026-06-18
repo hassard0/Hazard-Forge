@@ -319,6 +319,18 @@ hf_gen_msl(nav_region.comp   nav_region.comp.hlsl   comp nav_region_main)
 # too; bit-exact cross-backend by construction. Behind --nav-polymesh only; NAV1-NAV3 + goldens untouched.
 hf_gen_msl(nav_contour.comp     nav_contour.comp.hlsl     comp nav_contour_main)
 hf_gen_msl(nav_polygonize.comp  nav_polygonize.comp.hlsl  comp nav_polygonize_main)
+# nav_astar.comp — Slice NAV5 INTEGER A* PATHFINDING over the NAV4 poly adjacency graph (the FLAGSHIP
+# HEADLINE). SINGLE-THREAD ([numthreads(1,1,1)], the nav_region/nav_polygonize serial mirror) runs the
+# WHOLE A*: connected-components flood -> deterministic start/goal (largest component, lowest-id ties) ->
+# integer A* (linear min-scan frontier popping lowest f=g+h tie-break lowest poly id, came_from reconstruct)
+# -> a CORRIDOR + total cost. Edge cost + heuristic = the MANHATTAN distance between integer poly centroids
+# (admissible+consistent -> optimal A*). Copied VERBATIM from engine/nav/navmesh.h::ConnectedComponents/
+# SelectStartGoal/FindPath. Like the NAV1-NAV4 shaders + UNLIKE fpx_*.comp, it is PURE INT32 (NO int64;
+# centroids <=32, a single edge cost <=64, the documented overflow bound), so glslc CAN lower it and it
+# MSL-generates NATIVELY. The Metal --nav-path showcase dispatches the GPU shader directly -> the GPU==CPU
+# corridor proof runs on Metal too; bit-exact cross-backend by construction. Behind --nav-path only;
+# NAV1-NAV4 + goldens untouched.
+hf_gen_msl(nav_astar.comp        nav_astar.comp.hlsl        comp nav_astar_main)
 # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6): fpx_solve.comp
 # is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)]) runs `steps` of
 # StepWorld = IntegrateStep then SolveContacts (K=solveIters Gauss-Seidel sweeps: ground then sphere-sphere

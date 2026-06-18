@@ -460,6 +460,7 @@ int main(int argc, char** argv) {
     const char* navRasterShotPath = nullptr; // --nav-raster-shot <out.bmp> (Slice NAV1: Deterministic GPU Navmesh INTEGER HEIGHTFIELD SPAN RASTERIZATION, the BEACHHEAD of FLAGSHIP #7 — host-snapped voxel triangles (ground plane + box-step + ramp) rasterized into per-column SOLID SPANS by INT32 count->scan->emit (nav_raster_count/scan/emit.comp), GPU==CPU span list bit-exact, top-down per-column span-count viz)
     const char* navRegionShotPath = nullptr; // --nav-region-shot <out.bmp> (Slice NAV3: Deterministic GPU Navmesh INTEGER WATERSHED REGION GENERATION, the 3rd slice + MAKE-OR-BREAK of FLAGSHIP #7 — partition the NAV2 walkable distance field into REGIONS via a single-thread level-descending fixed-order integer watershed (nav_region.comp); GPU==CPU region[] bit-exact, hash-colored region partition viz)
     const char* navPolymeshShotPath = nullptr; // --nav-polymesh-shot <out.bmp> (Slice NAV4: Deterministic GPU Navmesh CONTOUR TRACE + INTEGER POLYGONIZATION, the 4th slice of FLAGSHIP #7 — trace each NAV3 region's boundary into an integer contour (nav_contour.comp: trace+Douglas-Peucker), triangulate it (nav_polygonize.comp: ear-clip + adjacency); GPU==CPU contour verts + poly indices + adjacency bit-exact; region fill + contour edges + poly edges viz)
+    const char* navPathShotPath = nullptr; // --nav-path-shot <out.bmp> (Slice NAV5: Deterministic GPU Navmesh INTEGER A* PATHFINDING, the 5th slice + HEADLINE of FLAGSHIP #7 — run integer A* (Manhattan cost+heuristic over poly centroids, lowest-id tie-break) over the NAV4 poly adjacency graph (nav_astar.comp, [numthreads(1,1,1)] single-thread) -> a deterministic CORRIDOR; GPU==CPU corridor+cost+start/goal bit-exact, navmesh faint + corridor polyline bright viz)
     const char* clusteredLightsShotPath = nullptr; // --clustered-lights-shot <out.bmp> (Slice CL)
     const char* commandsPath = nullptr;
     // Slice AA (interactive runtime): scripted-pose headless capture + live fly viewport.
@@ -548,6 +549,18 @@ int main(int argc, char** argv) {
         // avoid MSVC's nested-block parse limit C1061).
         if (std::strcmp(argv[i], "--nav-polymesh-shot") == 0 && i + 1 < argc) {
             navPolymeshShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice NAV5: --nav-path-shot <out.bmp> — the Deterministic GPU Navmesh INTEGER A* PATHFINDING
+        // (the 5th slice + HEADLINE of FLAGSHIP #7). Build the NAV1-NAV4 poly mesh + adjacency exactly as
+        // --nav-polymesh-shot, then nav_astar.comp ([numthreads(1,1,1)] single-thread integer A*: connected
+        // components -> deterministic start/goal -> Manhattan-cost A* over the poly graph -> a CORRIDOR).
+        // GPU==CPU corridor + cost + start/goal bit-exact vs navmesh.h::FindPath. PURE INT32 (Manhattan,
+        // centroids <=32) -> the shader MSL-gens natively on Metal. NO new RHI. STANDALONE branch (the
+        // fpx/mc/nav lesson: avoid MSVC's nested-block parse limit C1061).
+        if (std::strcmp(argv[i], "--nav-path-shot") == 0 && i + 1 < argc) {
+            navPathShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -16633,6 +16646,467 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — contour + triangulated poly mesh (%u polys, %u regions)\n",
                                 navPolymeshShotPath, imgW, imgH, gpuTotalPolys, cpuRegionCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", navPolymeshShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Navmesh INTEGER A* PATHFINDING (--nav-path-shot <out.bmp>, Slice NAV5,
+        // the 5th slice + HEADLINE of FLAGSHIP #7). The NAV1-NAV4 pipeline (rasterize + merge + filter +
+        // distance + regions + contour + polygonize) runs on the HOST + GPU exactly as --nav-polymesh-shot,
+        // producing the poly mesh + per-edge adjacency. Then a NEW pure-INT32 single-thread pass runs A*
+        // over that graph: nav_astar.comp ([numthreads(1,1,1)] connected-components flood -> deterministic
+        // start/goal -> integer A* with Manhattan cost+heuristic over poly centroids, lowest-id tie-break ->
+        // a CORRIDOR + total cost). The A* is copied VERBATIM from engine/nav/navmesh.h::ConnectedComponents/
+        // SelectStartGoal/FindPath (PURE INT32, NO int64 -> MSL-gens natively on Metal). ReadBuffer reads the
+        // corridor + meta (len, cost, start, goal); the CPU reference over the SAME polys + centroids must
+        // match BIT-EXACT (memcmp — the make-or-break). enabled=false -> empty corridor. The golden draws the
+        // navmesh (faint) + the corridor polyline (bright, through poly centroids, start/goal marked). NO new RHI.
+        if (navPathShotPath) {
+            using math::Vec3;
+            namespace nav = hf::nav;
+            namespace vg = hf::render::vg;
+
+            // The deterministic heightfield (== the --nav-polymesh config). 32x32, the NAV4 showcase.
+            const int kW = 32, kH = 32;
+            nav::Heightfield hf;
+            hf.w = kW; hf.h = kH;
+            hf.bminX = 0; hf.bminY = 0; hf.bminZ = 0;
+            hf.bmaxX = kW; hf.bmaxY = 64; hf.bmaxZ = kH;
+            hf.cs = 1; hf.ch = 1;
+            const int kColumnCount = hf.columnCount();   // 1024
+            nav::WalkableConfig cfg; cfg.walkableHeight = 2; cfg.walkableClimb = 1;
+            const int32_t kMaxError = 0;
+
+            std::vector<nav::NavTri> tris = nav::MakeShowcaseTriangles(hf);
+
+            // Host: rasterize -> per-column merged spans -> a flat merged-span buffer + offset/count.
+            std::vector<uint32_t> rColCount, rColOffset;
+            std::vector<nav::Span> rSpans;
+            nav::RasterizeTriangleSpans(hf, std::span<const nav::NavTri>(tris), rColCount, rColOffset, rSpans);
+            std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kColumnCount);
+            std::vector<nav::Span> flatMerged;
+            std::vector<uint32_t> mOffset((size_t)kColumnCount, 0u), mCount((size_t)kColumnCount, 0u);
+            for (int c = 0; c < kColumnCount; ++c) {
+                std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                          rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+                mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+                mOffset[(size_t)c] = (uint32_t)flatMerged.size();
+                mCount[(size_t)c] = (uint32_t)mergedPerCol[(size_t)c].size();
+                for (const auto& s : mergedPerCol[(size_t)c]) flatMerged.push_back(s);
+            }
+            const uint32_t kMergedTotal = (uint32_t)flatMerged.size();
+            const uint32_t kMergedAlloc = kMergedTotal > 0u ? kMergedTotal : 1u;
+
+            // CPU reference: filter + distance + regions -> contours -> simplify -> polymesh.
+            std::vector<std::vector<nav::Span>> cpuMerged = mergedPerCol;
+            std::vector<uint32_t> cpuWalkable; std::vector<int32_t> cpuSurfaceY;
+            nav::FilterWalkableSpans(hf, cfg, cpuMerged, cpuWalkable, cpuSurfaceY);
+            std::vector<uint32_t> cpuDist;
+            nav::BuildDistanceField(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist);
+            const uint32_t cpuMaxDist = nav::MaxDistOf(cpuDist);
+            std::vector<uint32_t> cpuRegion;
+            const uint32_t cpuRegionCount =
+                nav::BuildRegions(hf, cfg, cpuWalkable, cpuSurfaceY, cpuDist, cpuMaxDist, cpuRegion);
+            std::vector<nav::Contour> cpuContours;
+            nav::TraceContours(hf, cpuRegion, cpuRegionCount, cpuContours);
+            for (auto& cc : cpuContours) {
+                std::vector<nav::ContourVertex> s;
+                nav::SimplifyContour(cc.verts, kMaxError, s);
+                cc.verts = s;
+            }
+            std::vector<nav::Poly> cpuPolys;
+            nav::BuildPolyMesh(cpuContours, cpuPolys);
+
+            // Flatten CPU contour verts region-by-region (the GPU layout) + record per-region vertex base.
+            std::vector<int32_t> cpuFlatVerts;
+            std::vector<uint32_t> cpuVOff((size_t)cpuRegionCount, 0u), cpuVCnt((size_t)cpuRegionCount, 0u);
+            {
+                std::vector<int> contourOfRegion((size_t)cpuRegionCount + 1u, -1);
+                for (size_t ci = 0; ci < cpuContours.size(); ++ci)
+                    contourOfRegion[(size_t)cpuContours[ci].region] = (int)ci;
+                uint32_t base = 0u;
+                for (uint32_t R = 1u; R <= cpuRegionCount; ++R) {
+                    cpuVOff[(size_t)(R - 1u)] = base;
+                    const int ci = contourOfRegion[(size_t)R];
+                    if (ci < 0) { cpuVCnt[(size_t)(R - 1u)] = 0u; continue; }
+                    const auto& vv = cpuContours[(size_t)ci].verts;
+                    for (const auto& v : vv) { cpuFlatVerts.push_back(v.x); cpuFlatVerts.push_back(v.z); }
+                    cpuVCnt[(size_t)(R - 1u)] = (uint32_t)vv.size();
+                    base += (uint32_t)vv.size();
+                }
+            }
+            const uint32_t cpuTotalPolys = (uint32_t)cpuPolys.size();
+
+            // GPU buffer capacities (== the NAV4 showcase bounds; nav_astar's HF_NAV_MAX_POLYS matches).
+            const uint32_t kVertCap = 4096u;
+            const uint32_t kPolyCap = 4096u;
+            const uint32_t kRegAlloc = cpuRegionCount > 0u ? cpuRegionCount : 1u;
+
+            struct SpanGpu { uint32_t ymin, ymax, area; };
+            static_assert(sizeof(SpanGpu) == 12, "SpanGpu std430 layout");
+            std::vector<SpanGpu> mergedInit((size_t)kMergedAlloc, SpanGpu{0u, 0u, 0u});
+            for (uint32_t i = 0; i < kMergedTotal; ++i)
+                mergedInit[i] = SpanGpu{flatMerged[i].ymin, flatMerged[i].ymax, flatMerged[i].area};
+
+            auto makeStorage = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeBufU32 = [&](const std::vector<uint32_t>& v) {
+                return makeStorage(v.data(), v.size() * sizeof(uint32_t));
+            };
+            auto offsetBuf = makeBufU32(mOffset);
+            auto countBuf  = makeBufU32(mCount);
+
+            std::vector<int32_t> surfaceInit((size_t)kColumnCount, 0);
+            std::vector<uint32_t> walkableInit((size_t)kColumnCount, 0u);
+            std::vector<uint32_t> distInit((size_t)kColumnCount, 0u);
+            std::vector<uint32_t> regionInit((size_t)kColumnCount, 0u);
+            std::vector<int32_t> cVertInit((size_t)kVertCap * 2u, 0);
+            std::vector<uint32_t> rVOffInit((size_t)kRegAlloc, 0u), rVCntInit((size_t)kRegAlloc, 0u);
+            std::vector<uint32_t> polyInit((size_t)kPolyCap * 8u, 0u);
+            std::vector<uint32_t> rPOffInit((size_t)kRegAlloc, 0u), rPCntInit((size_t)kRegAlloc, 0u);
+
+            struct NavFilterParams { int32_t cfg[4]; int32_t ext[4]; };
+            auto makeFilterParams = [&](int32_t enabled) {
+                NavFilterParams p{};
+                p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableHeight; p.cfg[3] = enabled;
+                p.ext[0] = hf.bmaxY - 1; return p;
+            };
+            struct NavDistParams { int32_t cfg[4]; };
+            auto makeDistParams = [&](int32_t enabled) {
+                NavDistParams p{}; p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled; return p;
+            };
+            struct NavRegionParams { int32_t cfg[4]; int32_t ext[4]; };
+            auto makeRegionParams = [&](int32_t enabled, int32_t maxDist) {
+                NavRegionParams p{};
+                p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = cfg.walkableClimb; p.cfg[3] = enabled; p.ext[0] = maxDist; return p;
+            };
+            struct NavContourParams { int32_t cfg[4]; int32_t ext[4]; };
+            auto makeContourParams = [&](int32_t enabled) {
+                NavContourParams p{};
+                p.cfg[0] = kW; p.cfg[1] = kH; p.cfg[2] = kMaxError; p.cfg[3] = enabled;
+                p.ext[0] = (int32_t)cpuRegionCount; p.ext[1] = (int32_t)kVertCap; return p;
+            };
+            struct NavPolyParams { int32_t cfg[4]; };
+            auto makePolyParams = [&](int32_t enabled) {
+                NavPolyParams p{};
+                p.cfg[0] = (int32_t)cpuRegionCount; p.cfg[1] = (int32_t)kPolyCap; p.cfg[2] = enabled; return p;
+            };
+            // nav_astar Params: int4 cfg {polyCount, polyCap, enabled, _}.
+            struct NavAstarParams { int32_t cfg[4]; };
+            static_assert(sizeof(NavAstarParams) == 16, "NavAstarParams std430 layout");
+
+            auto loadCs = [&](const char* name, int storageCount, uint32_t tpg) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + name);
+                auto mod = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc cd;
+                cd.compute = mod.get(); cd.storageBufferCount = storageCount; cd.threadsPerGroupX = tpg;
+                return std::make_pair(std::move(mod), device->CreateComputePipeline(cd));
+            };
+            auto [filterMod, filterCompute] = loadCs("nav_filter.comp.hlsl.spv", 6, 64);
+            auto [distMod, distCompute]     = loadCs("nav_distance.comp.hlsl.spv", 4, 1);
+            auto [regionMod, regionCompute] = loadCs("nav_region.comp.hlsl.spv", 5, 1);
+            auto [contourMod, contourCompute] = loadCs("nav_contour.comp.hlsl.spv", 5, 1);
+            auto [polyMod, polyCompute]     = loadCs("nav_polygonize.comp.hlsl.spv", 7, 1);
+            auto [astarMod, astarCompute]   = loadCs("nav_astar.comp.hlsl.spv", 6, 1);
+
+            const uint32_t kGroups = ((uint32_t)kColumnCount + 63u) / 64u;
+            const uint32_t kCorridorCap = kPolyCap;   // a corridor can't exceed the poly count.
+
+            // Per-poly centroid arrays the A* runs over: built host-side from the read-back polys + the
+            // per-region vertex base (the GPU layout). The shader receives these integer centroids (the
+            // verbatim ComputePolyCentroids output -> byte-exact to upload). polyVertBase[p] = the vertex
+            // base of poly p's owning region (each region's polys share that region's gVOff[] base).
+            auto buildCentroids = [&](const std::vector<uint32_t>& polys, const std::vector<int32_t>& verts,
+                                      const std::vector<uint32_t>& vOff, const std::vector<uint32_t>& pOff,
+                                      const std::vector<uint32_t>& pCnt, uint32_t regionCount,
+                                      uint32_t totalPolys, std::vector<int32_t>& cx, std::vector<int32_t>& cz) {
+                cx.assign((size_t)totalPolys, 0); cz.assign((size_t)totalPolys, 0);
+                for (uint32_t r = 0; r < regionCount; ++r) {
+                    const uint32_t vBase = vOff[r], pBase = pOff[r], pc = pCnt[r];
+                    for (uint32_t pi = pBase; pi < pBase + pc && pi < totalPolys; ++pi) {
+                        int32_t sx = 0, sz = 0;
+                        for (int k = 0; k < 3; ++k) {
+                            const uint32_t vi = vBase + polys[pi * 8u + (uint32_t)k];
+                            sx += verts[(size_t)vi * 2u]; sz += verts[(size_t)vi * 2u + 1u];
+                        }
+                        cx[pi] = sx / 3; cz[pi] = sz / 3;
+                    }
+                }
+            };
+
+            // Runs the full NAV1-NAV4 pipeline THEN nav_astar; returns polys/verts/offsets + corridor/meta.
+            auto runPath = [&](int32_t enabled, std::vector<int32_t>& outVerts, std::vector<uint32_t>& outVOff,
+                               std::vector<uint32_t>& outVCnt, std::vector<uint32_t>& outPolys,
+                               std::vector<uint32_t>& outPOff, std::vector<uint32_t>& outPCnt,
+                               std::vector<uint32_t>& outCorridor, std::vector<uint32_t>& outMeta,
+                               const std::vector<int32_t>& cxUp, const std::vector<int32_t>& czUp) {
+                auto spansBuf  = makeStorage(mergedInit.data(), mergedInit.size() * sizeof(SpanGpu));
+                auto walkBuf   = makeStorage(walkableInit.data(), walkableInit.size() * sizeof(uint32_t));
+                auto surfBuf   = makeStorage(surfaceInit.data(), surfaceInit.size() * sizeof(int32_t));
+                auto distBuf   = makeStorage(distInit.data(), distInit.size() * sizeof(uint32_t));
+                auto regionBuf = makeStorage(regionInit.data(), regionInit.size() * sizeof(uint32_t));
+                auto cVertBuf  = makeStorage(cVertInit.data(), cVertInit.size() * sizeof(int32_t));
+                auto rVOffBuf  = makeStorage(rVOffInit.data(), rVOffInit.size() * sizeof(uint32_t));
+                auto rVCntBuf  = makeStorage(rVCntInit.data(), rVCntInit.size() * sizeof(uint32_t));
+                auto polyBuf   = makeStorage(polyInit.data(), polyInit.size() * sizeof(uint32_t));
+                auto rPOffBuf  = makeStorage(rPOffInit.data(), rPOffInit.size() * sizeof(uint32_t));
+                auto rPCntBuf  = makeStorage(rPCntInit.data(), rPCntInit.size() * sizeof(uint32_t));
+
+                std::vector<int32_t> cxInit((size_t)kPolyCap, 0), czInit((size_t)kPolyCap, 0);
+                for (size_t i = 0; i < cxUp.size() && i < kPolyCap; ++i) { cxInit[i] = cxUp[i]; czInit[i] = czUp[i]; }
+                auto cxBuf = makeStorage(cxInit.data(), cxInit.size() * sizeof(int32_t));
+                auto czBuf = makeStorage(czInit.data(), czInit.size() * sizeof(int32_t));
+                std::vector<uint32_t> corridorInit((size_t)kCorridorCap, 0u);
+                auto corridorBuf = makeStorage(corridorInit.data(), corridorInit.size() * sizeof(uint32_t));
+                std::vector<uint32_t> metaInit(4u, 0u);
+                auto metaBuf = makeStorage(metaInit.data(), metaInit.size() * sizeof(uint32_t));
+
+                NavFilterParams fp = makeFilterParams(enabled);   auto fpBuf = makeStorage(&fp, sizeof(fp));
+                NavDistParams dp = makeDistParams(enabled);       auto dpBuf = makeStorage(&dp, sizeof(dp));
+                NavRegionParams rp = makeRegionParams(enabled, (int32_t)cpuMaxDist); auto rpBuf = makeStorage(&rp, sizeof(rp));
+                NavContourParams cp = makeContourParams(enabled); auto cpBuf = makeStorage(&cp, sizeof(cp));
+                NavPolyParams pp = makePolyParams(enabled);       auto ppBuf = makeStorage(&pp, sizeof(pp));
+                NavAstarParams ap{}; ap.cfg[0] = (int32_t)cpuTotalPolys; ap.cfg[1] = (int32_t)kPolyCap; ap.cfg[2] = enabled;
+                auto apBuf = makeStorage(&ap, sizeof(ap));
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("nav_path", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*filterCompute);
+                        cmd.BindStorageBuffer(*spansBuf, 0); cmd.BindStorageBuffer(*offsetBuf, 1);
+                        cmd.BindStorageBuffer(*countBuf, 2); cmd.BindStorageBuffer(*walkBuf, 3);
+                        cmd.BindStorageBuffer(*surfBuf, 4); cmd.BindStorageBuffer(*fpBuf, 5);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*distCompute);
+                        cmd.BindStorageBuffer(*walkBuf, 0); cmd.BindStorageBuffer(*surfBuf, 1);
+                        cmd.BindStorageBuffer(*distBuf, 2); cmd.BindStorageBuffer(*dpBuf, 3);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*regionCompute);
+                        cmd.BindStorageBuffer(*walkBuf, 0); cmd.BindStorageBuffer(*surfBuf, 1);
+                        cmd.BindStorageBuffer(*distBuf, 2); cmd.BindStorageBuffer(*regionBuf, 3);
+                        cmd.BindStorageBuffer(*rpBuf, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*contourCompute);
+                        cmd.BindStorageBuffer(*regionBuf, 0); cmd.BindStorageBuffer(*cVertBuf, 1);
+                        cmd.BindStorageBuffer(*rVOffBuf, 2); cmd.BindStorageBuffer(*rVCntBuf, 3);
+                        cmd.BindStorageBuffer(*cpBuf, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        cmd.BindComputePipeline(*polyCompute);
+                        cmd.BindStorageBuffer(*cVertBuf, 0); cmd.BindStorageBuffer(*rVOffBuf, 1);
+                        cmd.BindStorageBuffer(*rVCntBuf, 2); cmd.BindStorageBuffer(*polyBuf, 3);
+                        cmd.BindStorageBuffer(*rPOffBuf, 4); cmd.BindStorageBuffer(*rPCntBuf, 5);
+                        cmd.BindStorageBuffer(*ppBuf, 6);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();   // polygonize -> A*
+                        cmd.BindComputePipeline(*astarCompute);
+                        cmd.BindStorageBuffer(*polyBuf, 0); cmd.BindStorageBuffer(*cxBuf, 1);
+                        cmd.BindStorageBuffer(*czBuf, 2); cmd.BindStorageBuffer(*corridorBuf, 3);
+                        cmd.BindStorageBuffer(*metaBuf, 4); cmd.BindStorageBuffer(*apBuf, 5);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outVerts.assign((size_t)kVertCap * 2u, 0);
+                device->ReadBuffer(*cVertBuf, outVerts.data(), outVerts.size() * sizeof(int32_t), 0);
+                outVOff.assign((size_t)kRegAlloc, 0u);
+                device->ReadBuffer(*rVOffBuf, outVOff.data(), outVOff.size() * sizeof(uint32_t), 0);
+                outVCnt.assign((size_t)kRegAlloc, 0u);
+                device->ReadBuffer(*rVCntBuf, outVCnt.data(), outVCnt.size() * sizeof(uint32_t), 0);
+                outPolys.assign((size_t)kPolyCap * 8u, 0u);
+                device->ReadBuffer(*polyBuf, outPolys.data(), outPolys.size() * sizeof(uint32_t), 0);
+                outPOff.assign((size_t)kRegAlloc, 0u);
+                device->ReadBuffer(*rPOffBuf, outPOff.data(), outPOff.size() * sizeof(uint32_t), 0);
+                outPCnt.assign((size_t)kRegAlloc, 0u);
+                device->ReadBuffer(*rPCntBuf, outPCnt.data(), outPCnt.size() * sizeof(uint32_t), 0);
+                outCorridor.assign((size_t)kCorridorCap, 0u);
+                device->ReadBuffer(*corridorBuf, outCorridor.data(), outCorridor.size() * sizeof(uint32_t), 0);
+                outMeta.assign(4u, 0u);
+                device->ReadBuffer(*metaBuf, outMeta.data(), outMeta.size() * sizeof(uint32_t), 0);
+            };
+
+            // First run the polymesh-only pipeline (A* disabled feed of centroids) to GET the GPU polys, so
+            // we can compute the centroids the A* needs. Then run again WITH centroids uploaded + A* enabled.
+            std::vector<int32_t> gpuVerts; std::vector<uint32_t> gpuVOff, gpuVCnt;
+            std::vector<uint32_t> gpuPolys, gpuPOff, gpuPCnt, gpuCorridor, gpuMeta;
+            std::vector<int32_t> emptyCx, emptyCz;
+            runPath(1, gpuVerts, gpuVOff, gpuVCnt, gpuPolys, gpuPOff, gpuPCnt, gpuCorridor, gpuMeta, emptyCx, emptyCz);
+            uint32_t gpuTotalPolys = 0u; for (uint32_t v : gpuPCnt) gpuTotalPolys += v;
+
+            // Build the centroids from the GPU polys (== the CPU ComputePolyCentroids by construction).
+            std::vector<int32_t> gpuCx, gpuCz;
+            buildCentroids(gpuPolys, gpuVerts, gpuVOff, gpuPOff, gpuPCnt, cpuRegionCount, gpuTotalPolys, gpuCx, gpuCz);
+
+            // Now the REAL run: centroids uploaded -> nav_astar produces the corridor + meta.
+            runPath(1, gpuVerts, gpuVOff, gpuVCnt, gpuPolys, gpuPOff, gpuPCnt, gpuCorridor, gpuMeta, gpuCx, gpuCz);
+            const uint32_t gpuCorridorLen = gpuMeta[0];
+            const uint32_t gpuCost = gpuMeta[1];
+            const uint32_t gpuStart = gpuMeta[2];
+            const uint32_t gpuGoal = gpuMeta[3];
+
+            // CPU reference: build the SAME per-poly vertex-base -> centroids -> SelectStartGoal -> FindPath.
+            std::vector<uint32_t> cpuPolyVertBase((size_t)cpuTotalPolys, 0u);
+            {
+                // Per-region poly offsets (count->scan on cpuPolys' contour-by-contour layout). cpuPolys are
+                // emitted region-by-region (BuildPolyMesh order == TraceContours region-ascending order), so
+                // poly pi's region maps to its region's vertex base cpuVOff[region-1].
+                for (uint32_t pi = 0; pi < cpuTotalPolys; ++pi) {
+                    const uint32_t R = cpuPolys[pi].region;   // 1-based region id.
+                    cpuPolyVertBase[pi] = (R >= 1u && R <= cpuRegionCount) ? cpuVOff[R - 1u] : 0u;
+                }
+            }
+            std::vector<int32_t> cpuCx, cpuCz;
+            nav::ComputePolyCentroids(cpuPolys, cpuFlatVerts, cpuPolyVertBase, cpuCx, cpuCz);
+            uint32_t cpuStart = 0u, cpuGoal = 0u;
+            nav::SelectStartGoal(cpuPolys, cpuCx, cpuCz, cpuStart, cpuGoal);
+            std::vector<uint32_t> cpuCorridor;
+            const int32_t cpuCost = nav::FindPath(cpuPolys, cpuCx, cpuCz, cpuStart, cpuGoal, cpuCorridor);
+
+            // PROOF (1) GPU==CPU corridor + cost + start/goal BIT-EXACT (the make-or-break).
+            bool startGoalOk = (gpuStart == cpuStart) && (gpuGoal == cpuGoal);
+            bool lenOk = (gpuCorridorLen == (uint32_t)cpuCorridor.size());
+            bool costOk = (gpuCost == (uint32_t)cpuCost);
+            bool seqOk = lenOk;
+            for (uint32_t i = 0; i < cpuCorridor.size() && seqOk; ++i)
+                if (gpuCorridor[i] != cpuCorridor[i]) seqOk = false;
+            if (!startGoalOk || !lenOk || !costOk || !seqOk) {
+                std::fprintf(stderr, "FATAL: nav-path GPU != CPU (sg=%d len=%d cost=%d seq=%d; "
+                             "gpuLen=%u cpuLen=%zu gpuCost=%u cpuCost=%d gpuS=%u cpuS=%u gpuG=%u cpuG=%u)\n",
+                             (int)startGoalOk, (int)lenOk, (int)costOk, (int)seqOk,
+                             gpuCorridorLen, cpuCorridor.size(), gpuCost, cpuCost,
+                             gpuStart, cpuStart, gpuGoal, cpuGoal);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("nav-path: {polys:%u, corridor:%u, cost:%u} GPU==CPU BIT-EXACT\n",
+                        gpuTotalPolys, gpuCorridorLen, gpuCost);
+
+            // PROOF (2) determinism: a second full run -> byte-identical corridor + meta.
+            {
+                std::vector<int32_t> v2; std::vector<uint32_t> vo2, vc2, p2, po2, pc2, cor2, m2;
+                runPath(1, v2, vo2, vc2, p2, po2, pc2, cor2, m2, gpuCx, gpuCz);
+                bool same = (cor2.size() == gpuCorridor.size()) &&
+                    std::memcmp(cor2.data(), gpuCorridor.data(), cor2.size() * sizeof(uint32_t)) == 0 &&
+                    std::memcmp(m2.data(), gpuMeta.data(), m2.size() * sizeof(uint32_t)) == 0;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: nav-path two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-path determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) validity / coherence: corridor adjacency-connected, start->goal, length >= 2.
+            {
+                bool valid = (gpuCorridorLen >= 2u) &&
+                             (gpuCorridor[0] == gpuStart) &&
+                             (gpuCorridor[gpuCorridorLen - 1u] == gpuGoal);
+                for (uint32_t i = 0; i + 1 < gpuCorridorLen && valid; ++i) {
+                    const uint32_t a = gpuCorridor[i], b = gpuCorridor[i + 1];
+                    bool adj = false;
+                    for (int e = 0; e < 3; ++e) if (gpuPolys[a * 8u + 3u + (uint32_t)e] == b) adj = true;
+                    if (!adj) valid = false;
+                }
+                if (!valid) {
+                    std::fprintf(stderr, "FATAL: nav-path corridor invalid (len=%u start=%u goal=%u)\n",
+                                 gpuCorridorLen, gpuStart, gpuGoal);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-path coverage: corridor of %u polys start->goal (each step adjacent)\n",
+                            gpuCorridorLen);
+            }
+
+            // PROOF (4) no-path / empty: enabled=false -> empty corridor (no-op).
+            {
+                std::vector<int32_t> v2; std::vector<uint32_t> vo2, vc2, p2, po2, pc2, cor2, m2;
+                runPath(0, v2, vo2, vc2, p2, po2, pc2, cor2, m2, gpuCx, gpuCz);
+                if (m2[0] != 0u) {
+                    std::fprintf(stderr, "FATAL: nav-path disabled path produced a corridor (len=%u)\n", m2[0]);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("nav-path empty: no corridor (no-op)\n");
+            }
+
+            // --- Golden: the navmesh (FAINT poly edges) + the corridor polyline (BRIGHT, through poly
+            // centroids, start/goal marked) CPU-colored from the read-back integer buffers -> identical both
+            // backends by construction. 16px/cell -> 512x512 (the NAV4 showcase frame). ---
+            const int kCell = 16;
+            const uint32_t imgW = (uint32_t)(kW * kCell), imgH = (uint32_t)(kH * kCell);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, uint8_t r, uint8_t g2, uint8_t b2) {
+                if (x < 0 || y < 0 || x >= (int)imgW || y >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)y * imgW + x) * 4];
+                dst[0] = b2; dst[1] = g2; dst[2] = r; dst[3] = 255;
+            };
+            // Region fill (very faint) for context.
+            for (int cz = 0; cz < kH; ++cz)
+                for (int cx = 0; cx < kW; ++cx) {
+                    const size_t c = (size_t)hf.columnId(cx, cz);
+                    if (cpuRegion[c] == 0u) continue;
+                    Vec3 col = vg::hashColor(cpuRegion[c]);
+                    const uint8_t r = (uint8_t)(col.x * 45.0f + 0.5f);
+                    const uint8_t g = (uint8_t)(col.y * 45.0f + 0.5f);
+                    const uint8_t b = (uint8_t)(col.z * 45.0f + 0.5f);
+                    for (int dy = 0; dy < kCell; ++dy)
+                        for (int dx = 0; dx < kCell; ++dx)
+                            putPx(cx * kCell + dx, cz * kCell + dy, r, g, b);
+                }
+            // Bresenham line in corner-coord space (corner (x,z) -> pixel (x*kCell, z*kCell)).
+            auto drawLine = [&](int x0, int z0, int x1, int z1, uint8_t r, uint8_t g2, uint8_t b2) {
+                const int px0 = x0 * kCell, py0 = z0 * kCell, px1 = x1 * kCell, py1 = z1 * kCell;
+                int dx = px1 - px0, dy = py1 - py0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int steps = adx > ady ? adx : ady;
+                if (steps == 0) { putPx(px0, py0, r, g2, b2); return; }
+                for (int s = 0; s <= steps; ++s) {
+                    int px = px0 + (dx * s + (dx < 0 ? -steps / 2 : steps / 2)) / steps;
+                    int py = py0 + (dy * s + (dy < 0 ? -steps / 2 : steps / 2)) / steps;
+                    putPx(px, py, r, g2, b2);
+                }
+            };
+            // Navmesh poly edges (FAINT) for context.
+            for (uint32_t r = 0; r < cpuRegionCount; ++r) {
+                const uint32_t vBase = gpuVOff[r];
+                const uint32_t pBase = gpuPOff[r], pCnt = gpuPCnt[r];
+                for (uint32_t pi = pBase; pi < pBase + pCnt; ++pi) {
+                    const uint32_t i0 = gpuPolys[pi * 8u + 0u], i1 = gpuPolys[pi * 8u + 1u], i2 = gpuPolys[pi * 8u + 2u];
+                    const int ax = gpuVerts[(vBase + i0) * 2u], az = gpuVerts[(vBase + i0) * 2u + 1u];
+                    const int bx = gpuVerts[(vBase + i1) * 2u], bz = gpuVerts[(vBase + i1) * 2u + 1u];
+                    const int cx2 = gpuVerts[(vBase + i2) * 2u], cz2 = gpuVerts[(vBase + i2) * 2u + 1u];
+                    drawLine(ax, az, bx, bz, 60, 60, 70);
+                    drawLine(bx, bz, cx2, cz2, 60, 60, 70);
+                    drawLine(cx2, cz2, ax, az, 60, 60, 70);
+                }
+            }
+            // The corridor polyline (BRIGHT yellow) through poly centroids; start GREEN, goal RED dots.
+            auto markDot = [&](int cxp, int czp, uint8_t r, uint8_t g2, uint8_t b2) {
+                const int px = cxp * kCell, py = czp * kCell;
+                for (int dy = -3; dy <= 3; ++dy)
+                    for (int dx = -3; dx <= 3; ++dx)
+                        if (dx * dx + dy * dy <= 9) putPx(px + dx, py + dy, r, g2, b2);
+            };
+            for (uint32_t i = 0; i + 1 < gpuCorridorLen; ++i) {
+                const uint32_t a = gpuCorridor[i], b = gpuCorridor[i + 1];
+                drawLine(gpuCx[a], gpuCz[a], gpuCx[b], gpuCz[b], 250, 230, 40);
+            }
+            if (gpuCorridorLen >= 1u) {
+                markDot(gpuCx[gpuStart], gpuCz[gpuStart], 40, 230, 60);    // start = green
+                markDot(gpuCx[gpuGoal], gpuCz[gpuGoal], 235, 40, 40);      // goal  = red
+            }
+            bool ok = WriteBMP(navPathShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — A* corridor (%u polys, cost %u) over %u-poly navmesh\n",
+                                navPathShotPath, imgW, imgH, gpuCorridorLen, gpuCost, gpuTotalPolys);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", navPathShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

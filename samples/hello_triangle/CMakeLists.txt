@@ -530,6 +530,19 @@ hf_compile_shaders(
     # shaders + goldens untouched.
     "shaders/nav_contour.comp.hlsl:cs"
     "shaders/nav_polygonize.comp.hlsl:cs"
+    # Deterministic GPU Navmesh Slice 5 (Slice NAV5, the 5th slice + HEADLINE of FLAGSHIP #7): INTEGER
+    # A* PATHFINDING over the NAV4 poly adjacency graph. nav_astar.comp: SINGLE-THREAD ([numthreads(1,1,1)],
+    # the nav_region/nav_polygonize serial mirror) runs the WHOLE A* — connected-components flood ->
+    # deterministic start/goal (largest component, lowest-id ties; start=lowest id, goal=farthest by
+    # Manhattan centroid distance) -> integer A* (g/f arrays, linear min-scan frontier popping lowest f=g+h
+    # tie-break lowest poly id, came_from reconstruct) -> a CORRIDOR (poly-id sequence) + total cost. Edge
+    # cost + heuristic = the MANHATTAN distance between integer poly CENTROIDS (admissible+consistent metric
+    # -> optimal A*). Copied VERBATIM from engine/nav/navmesh.h::ConnectedComponents/SelectStartGoal/FindPath
+    # — PURE INT32 (NO int64; centroids <=32, a single edge cost <=64, the documented overflow bound), so it
+    # MSL-generates NATIVELY on Metal. Pure integer SSBO compute + a compute->compute barrier + ReadBuffer ->
+    # bit-exact GPU==CPU corridor + cost + start/goal + cross-backend, proven memcmp. NO new RHI; NAV1-NAV4
+    # shaders + goldens untouched.
+    "shaders/nav_astar.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 3 (Slice FPX3, the MAKE-OR-BREAK of FLAGSHIP #6):
     # fpx_solve.comp is the PBD POSITIONAL collision-response solver — a SINGLE THREAD ([numthreads(1,1,1)],
     # the mc_scan/vt_alloc allocator pattern) runs `steps` of StepWorld = IntegrateStep then SolveContacts
