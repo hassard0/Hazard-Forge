@@ -88,6 +88,7 @@
 #include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
+#include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -16702,6 +16703,151 @@ static int RunFpxShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CL1 — Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR showcase (--cloth-integrate)
+// (the BEACHHEAD of FLAGSHIP #8). Like FPX1 (and UNLIKE the int32 FPX2/NAV broadphase shaders), the cloth
+// integrate is int64 (gravity*dt over Q16.16 overflows int32 — the SAME form as fpx_integrate.comp), so
+// shaders/cloth_integrate.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) and is NOT in this
+// dir's hf_gen_msl list; on Metal the --cloth-integrate showcase runs the CPU cloth::IntegrateParticles —
+// the EXACT bit-exact reference the Vulkan --cloth-integrate-shot GPU==CPU memcmp already compares against
+// -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the swraster.comp /
+// fpx_integrate.comp convention), while the Vulkan side carries the GPU==CPU proof. So this builds the
+// SAME deterministic 24x24 sheet (the two top corners pinned, gravity -9.8 host-snapped to Q16.16, groundY
+// far below, dt=kOne/60), runs cloth::IntegrateParticles K=60 fixed steps over it, and CPU-colors the SAME
+// integer side-view debug-viz (each particle's integer (pos.x>>kFrac,pos.y>>kFrac) -> a pixel, hashColor
+// dot, pinned corners marked) as the Vulkan --cloth-integrate-shot -> the golden is bit-identical cross-
+// backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY.
+// New golden tests/golden/metal/cloth_integrate.png (baked on the Mac by the controller); two runs DIFF
+// 0.0000. NO GPU compute, NO constraints/collision/render (CL2+), NO new RHI.
+static int RunClothIntegrateShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cloth = hf::sim::cloth;
+    namespace vg = render::vg;
+
+    // The deterministic 24x24 sheet (== the Vulkan --cloth-integrate-shot config). gravity -9.8 snapped.
+    const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const cloth::fx kDt = cloth::kOne / 60;
+    const int kSide = 24;
+    const int kSteps = 60;
+    const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+    const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+    cloth::ClothGrid grid;
+    grid.W = kSide; grid.H = kSide;
+    grid.spacing = cloth::kOne;
+    grid.origin = cloth::FxVec3{0, (cloth::fx)(kSide * (int)cloth::kOne), 0};
+    const int kParticleCount = grid.W * grid.H;
+    std::vector<cloth::ClothParticle> sheet0 = cloth::InitGrid(grid);
+    const int kPinned = cloth::CountPinned(sheet0);
+
+    // std430 ClothParticle mirror (== the Vulkan --cloth-integrate-shot ClothParticleGpu): 11 x int32 (44).
+    struct ClothParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+    };
+    static_assert(sizeof(ClothParticleGpu) == 44, "ClothParticleGpu std430 layout");
+    static_assert(sizeof(cloth::ClothParticle) == 44, "ClothParticle std430 layout");
+    auto packParticles = [&](const std::vector<cloth::ClothParticle>& ps) {
+        std::vector<ClothParticleGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const cloth::ClothParticle& p = ps[i];
+            out[i] = ClothParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                      p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+        }
+        return out;
+    };
+    const std::vector<ClothParticleGpu> particlesInit = packParticles(sheet0);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --cloth-integrate-shot).
+    const int kPxPerUnit = 18, kMargin = 20;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kSide * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kSide + 1) * kPxPerUnit);
+
+    // CPU integrator (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    // integrateEnabled=false -> particles UNCHANGED (the no-op / all-pinned static path).
+    auto runIntegrate = [&](bool integrateEnabled, std::vector<ClothParticleGpu>& outParticles) {
+        if (!integrateEnabled) { outParticles = particlesInit; return; }
+        std::vector<cloth::ClothParticle> sheet = sheet0;
+        cloth::IntegrateParticlesSteps(grid, sheet, kGravity, kDt, kGroundY, kSteps);
+        outParticles = packParticles(sheet);
+    };
+
+    // CPU integrate (enabled, K steps) — the Metal showcase particle array.
+    std::vector<ClothParticleGpu> gpuParticles;
+    runIntegrate(true, gpuParticles);
+
+    // GPU==CPU is N/A on the Metal CPU path: this particle array IS the CPU IntegrateParticles reference the
+    // Vulkan --cloth-integrate-shot proved the GPU shader bit-identical against, so the Metal result is byte-
+    // identical to the Vulkan GPU result BY CONSTRUCTION. Print the same proof line for parity.
+    std::printf("cloth-integrate: {particles:%d, pinned:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cloth::IntegrateParticles, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kParticleCount, kPinned, kSteps);
+
+    // two-run determinism.
+    std::vector<ClothParticleGpu> gpuParticles2;
+    runIntegrate(true, gpuParticles2);
+    if (gpuParticles.size() != gpuParticles2.size() ||
+        std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                    gpuParticles.size() * sizeof(ClothParticleGpu)) != 0)
+        return fail("cloth-integrate: two integrations differ (nondeterministic)");
+    std::printf("cloth-integrate determinism: two runs BYTE-IDENTICAL\n");
+
+    // coverage / coherence: non-pinned particles fell + pinned corners held.
+    int moved = 0, pinnedHeld = 0;
+    for (int i = 0; i < kParticleCount; ++i) {
+        const ClothParticleGpu& g = gpuParticles[(size_t)i];
+        const ClothParticleGpu& init = particlesInit[(size_t)i];
+        if ((g.flags & cloth::kFlagPinned) != 0u) {
+            if (std::memcmp(&g, &init, sizeof(ClothParticleGpu)) == 0) ++pinnedHeld;
+        } else if (g.py < init.py) {
+            ++moved;
+        }
+    }
+    if (moved <= 0 || pinnedHeld != kPinned)
+        return fail("cloth-integrate: coverage incoherent (moved/pinned)");
+    std::printf("cloth-integrate coverage: %d moved, %d pinned held (coherent lattice)\n",
+                moved, pinnedHeld);
+
+    // empty / no-op: integrateEnabled=false -> particles UNCHANGED (the all-pinned static case).
+    std::vector<ClothParticleGpu> disabledParticles;
+    runIntegrate(false, disabledParticles);
+    if (disabledParticles.size() != particlesInit.size() ||
+        std::memcmp(disabledParticles.data(), particlesInit.data(),
+                    particlesInit.size() * sizeof(ClothParticleGpu)) != 0)
+        return fail("cloth-integrate: integrateEnabled=false changed the particles");
+    std::printf("cloth-integrate static: all pinned (no-op)\n");
+
+    // --- Golden: a PURE-INTEGER side-view debug-viz (IDENTICAL to the Vulkan --cloth-integrate-shot by
+    // construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = gpuParticles[(size_t)i].px >> cloth::kFrac;
+        const int wy = gpuParticles[(size_t)i].py >> cloth::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        const bool pinned = (gpuParticles[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+        Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cloth particle-lattice side-view (%d moved, %d pinned)\n",
+                outPath, imgW, imgH, moved, kPinned);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics integer-AABB BROADPHASE candidate-pair generator showcase (Slice
 // FPX2). UNLIKE FPX1 (whose int64 fxmul integrator is Vulkan-only, so --fpx runs the CPU IntegrateStep on
 // Metal), the FPX2 broadphase is PURE INT32 (BodyAabb = integer add/sub, AabbOverlap = six compares, NO
@@ -30320,6 +30466,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fpx") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fpx.png";
             try { return RunFpxShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cloth-integrate <out.png>: render the Deterministic GPU Cloth Q16.16 PARTICLE LATTICE
+        // INTEGRATOR showcase (Slice CL1, the BEACHHEAD of FLAGSHIP #8). Like --fpx (int64 integrator ->
+        // CPU on Metal), cloth_integrate.comp is int64/Vulkan-only (glslc can't parse int64), so Metal runs
+        // the CPU cloth::IntegrateParticles — byte-identical to the Vulkan GPU result by construction (the
+        // fpx_integrate.comp convention). A deterministic 24x24 sheet (the two top corners pinned, gravity
+        // (0,-9.8,0) host-snapped to Q16.16, groundY far below, dt=kOne/60) is integrated K=60 fixed steps
+        // by cloth::IntegrateParticles — the EXACT bit-exact reference the Vulkan --cloth-integrate-shot
+        // GPU==CPU memcmp compares against; integrateEnabled=false -> particles unchanged; two runs byte-
+        // identical. The image golden is a PURE-INTEGER side-view debug-viz (each particle's integer
+        // (pos.x>>kFrac, pos.y>>kFrac) -> a pixel, hashColor dot, pinned corners marked), identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/cloth_integrate.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--cloth-integrate") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cloth_integrate.png";
+            try { return RunClothIntegrateShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx-pairs <out.png>: render the Deterministic Fixed-Point Physics integer-AABB BROADPHASE

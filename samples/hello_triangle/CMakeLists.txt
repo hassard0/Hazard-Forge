@@ -460,6 +460,18 @@ hf_compile_shaders(
     # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing
     # shaders + goldens untouched.
     "shaders/fpx_integrate.comp.hlsl:cs"
+    # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8: deterministic GPU cloth):
+    # cloth_integrate.comp runs the Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per
+    # particle runs `steps` iterations of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp)
+    # on its OWN particle, the fxmul ((int64)a*b >> 16, the swraster/fpx int64 pattern) + integrate + prev-
+    # snap + clamp copied VERBATIM from engine/sim/cloth.h::IntegrateParticle, and writes gParticles[i] back
+    # (each particle independent in CL1 -> race-free, NO atomics; PINNED particles untouched). integrateEnabled
+    # =0 -> write the input back UNCHANGED. Like fpx_integrate.comp this is int64 (gravity*dt over Q16.16
+    # overflows int32) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl
+    # list; the Metal --cloth-integrate showcase runs the CPU cloth::IntegrateParticles (byte-identical by
+    # construction, the fpx_integrate.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
+    # GPU==CPU particle array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/cloth_integrate.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
     # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp: ONE thread per body i scans j>i
     # and writes perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) (each unordered pair counted once,

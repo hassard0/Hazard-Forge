@@ -68,6 +68,7 @@
 #include "render/vt.h"          // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp
 #include "render/mc.h"          // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp
 #include "sim/fpx.h"            // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp
+#include "sim/cloth.h"          // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -451,6 +452,7 @@ int main(int argc, char** argv) {
     const char* mcRenderShotPath = nullptr; // --mc-render-shot <out.bmp> (Slice MC5: GPU Isosurface Meshing RENDER — MarchCellsInterp's bit-exact fixed-point mesh -> BuildRenderMesh (position=vert/kSub + flat per-face normals) -> the EXISTING lit mesh pipeline (lit.vert+lit.frag, scene::MeshVertexLayout, FrameData UBO) -> a lit 3D extracted-sphere render. The MC arc's FIRST FLOAT slice: the golden is the visresolve float bar (per-backend Metal golden + determinism + interior/provenance proof), NOT the integer zero-diff bar. NO new RHI / shader)
     const char* mcNormalsShotPath = nullptr; // --mc-normals-shot <out.bmp> (Slice MC6: GPU Isosurface Meshing SMOOTH FIELD-GRADIENT NORMALS — MarchCellsInterp's bit-exact fixed-point mesh -> BuildSmoothRenderMesh (position=vert/kSub IDENTICAL to MC5 + per-vertex OUTWARD field-gradient normal -∇f via central differences instead of MC5's flat per-face normal) -> the EXISTING lit mesh pipeline -> a SMOOTH-shaded 3D extracted-sphere render. The 6th and FINAL MC slice; same FLOAT visresolve bar as MC5 (per-backend Metal golden + determinism + provenance). NO new RHI / shader)
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
+    const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~60 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
     const char* fpxSolveShotPath = nullptr; // --fpx-solve-shot <out.bmp> (Slice FPX3: Deterministic Fixed-Point Physics PBD POSITIONAL collision-response solver, the MAKE-OR-BREAK of FLAGSHIP #6 — a cluster falls + collides into a settled PILE over the FPX2 pairs, GPU==CPU body array bit-exact, single-thread serial Gauss-Seidel)
     const char* fpxOrientShotPath = nullptr; // --fpx-orient-shot <out.bmp> (Slice FPX4: Deterministic Fixed-Point Physics integer QUATERNION ORIENTATION integrator — a 6x6 grid of free-spinning bodies integrated K=120 fixed Q16.16 quaternion steps by one GPU thread per body, GPU==CPU body array bit-exact, orientation-gizmo grid viz)
     const char* fpxRenderShotPath = nullptr; // --fpx-render-shot <out.bmp> (Slice FPX6: Deterministic Fixed-Point Physics LIT 3D RENDER — the bit-exact fpx sim run to a settled PILE, each FxBody -> a float FxBodyTransform, rendered as lit 3D instanced spheres through the EXISTING instanced lit pipeline; FLOAT visresolve-bar, Metal-baked golden; completes flagship #6)
@@ -575,6 +577,21 @@ int main(int argc, char** argv) {
         // STANDALONE branch (the fpx/mc/nav lesson: avoid MSVC's nested-block parse limit C1061).
         if (std::strcmp(argv[i], "--nav-render-shot") == 0 && i + 1 < argc) {
             navRenderShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CL1: --cloth-integrate-shot <out.bmp> — the Deterministic GPU Cloth Q16.16 PARTICLE
+        // LATTICE INTEGRATOR (the BEACHHEAD of FLAGSHIP #8). A deterministic 24x24 flat sheet (the two top
+        // corners PINNED, gravity (0,-9.8,0) host-snapped to Q16.16, groundY far below, dt=kOne/60) is
+        // integrated K=60 fixed steps by shaders/cloth_integrate.comp (ONE thread per particle runs the
+        // K-step integrator: vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp, copied
+        // VERBATIM from engine/sim/cloth.h::IntegrateParticle; PINNED corners untouched), GPU==CPU particle
+        // array bit-exact vs cloth.h::IntegrateParticles. int64 fxmul (gravity*dt overflows int32, the FPX1
+        // form) -> cloth_integrate.comp is Vulkan-only; Metal --cloth-integrate runs the CPU
+        // IntegrateParticles. NO new RHI. Handled as a STANDALONE branch (not in the --shot else-if chain)
+        // to avoid MSVC's nested-block parse limit C1061, like the fpx/mc/nav shots.
+        if (std::strcmp(argv[i], "--cloth-integrate-shot") == 0 && i + 1 < argc) {
+            clothIntegrateShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -14741,6 +14758,228 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — MC case-index Z-slice viz (%d surface cells)\n",
                                 mcClassifyShotPath, imgW, imgH, surfaceCells);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", mcClassifyShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR (--cloth-integrate-shot
+        // <out.bmp>, Slice CL1, the BEACHHEAD of FLAGSHIP #8). A deterministic 24x24 flat sheet (the two
+        // top corners PINNED, gravity (0,-9.8,0) host-snapped to Q16.16, groundY below the sheet,
+        // dt=kOne/60) is integrated K=60 fixed steps by a pure-integer compute (shaders/cloth_integrate.comp):
+        // one thread per particle runs the K-step semi-implicit-Euler integrator (vel += gravity*dt;
+        // prev = pos; pos += vel*dt; ground floor-clamp; the fxmul ((int64)a*b >> 16) + integrate + clamp
+        // copied VERBATIM from engine/sim/cloth.h::IntegrateParticle) on its OWN particle — order-
+        // independent, NO atomics; PINNED corners untouched — and writes gParticles[i] back. ReadBuffer
+        // reads the integer Q16.16 particle array; the CPU cloth.h::IntegrateParticles over the SAME
+        // sheet must match it BIT-EXACT (memcmp, NO tol). integrateEnabled=false -> particles UNCHANGED.
+        // The golden is a PURE-INTEGER side-view debug-viz (each particle's integer (pos.x>>kFrac,
+        // pos.y>>kFrac) -> a pixel via a fixed integer transform, a hashColor dot, pinned corners marked)
+        // -> identical both backends by construction. NO constraints/collision/render (CL2+), NO new RHI.
+        if (clothIntegrateShotPath) {
+            using math::Vec3;
+            namespace cloth = hf::sim::cloth;
+            namespace vg = hf::render::vg;
+
+            // The deterministic 24x24 sheet (== the Metal --cloth-integrate config). gravity -9.8 snapped.
+            const cloth::fx kGravY = (cloth::fx)(-9.8 * (double)cloth::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const cloth::fx kDt = cloth::kOne / 60;
+            const int kSide = 24;                      // 24x24 sheet -> 576 particles
+            const int kSteps = 60;
+            // groundY a few units below the sheet's bottom row so the sheet falls/hangs WITHOUT clamping
+            // (the integrator + pin is the focus; the floor-clamp branch is unit-tested in cloth_test).
+            const cloth::fx kGroundY = (cloth::fx)(-100 * (int)cloth::kOne);
+            const cloth::FxVec3 kGravity{0, kGravY, 0};
+
+            cloth::ClothGrid grid;
+            grid.W = kSide; grid.H = kSide;
+            grid.spacing = cloth::kOne;                // 1.0 world unit spacing
+            grid.origin = cloth::FxVec3{0, (cloth::fx)(kSide * (int)cloth::kOne), 0}; // hang from y=24
+            const int kParticleCount = grid.W * grid.H;
+            std::vector<cloth::ClothParticle> sheet0 = cloth::InitGrid(grid);
+            const int kPinned = cloth::CountPinned(sheet0);
+
+            // std430 ClothParticle mirror (matches shaders/cloth_integrate.comp ClothParticle): 11 x int32
+            // (44 bytes) = pos.xyz, prev.xyz, vel.xyz, invMass, flags.
+            struct ClothParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(ClothParticleGpu) == 44, "ClothParticleGpu std430 layout");
+            static_assert(sizeof(cloth::ClothParticle) == 44, "ClothParticle std430 layout");
+            auto packParticles = [&](const std::vector<cloth::ClothParticle>& ps) {
+                std::vector<ClothParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const cloth::ClothParticle& p = ps[i];
+                    out[i] = ClothParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+                }
+                return out;
+            };
+            const std::vector<ClothParticleGpu> particlesInit = packParticles(sheet0);
+
+            auto makeParticlesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = particlesInit.size() * sizeof(ClothParticleGpu);
+                d.initialData = particlesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches cloth_integrate.comp ClothParams std430): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, particleCount, steps, integrateEnabled}.
+            struct ClothParams { int32_t grav[4]; int32_t cfg[4]; };
+            static_assert(sizeof(ClothParams) == 32, "ClothParams std430 layout");
+            auto makeParams = [&](int32_t integrateEnabled) {
+                ClothParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kParticleCount; p.cfg[2] = kSteps; p.cfg[3] = integrateEnabled;
+                return p;
+            };
+
+            // Compute pipeline: 2 storage buffers (particles, params); 64 threads/group.
+            auto clothCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/cloth_integrate.comp.hlsl.spv");
+            auto clothCs = device->CreateShaderModule({std::span<const uint32_t>(clothCsWords)});
+            rhi::ComputePipelineDesc clothCdesc;
+            clothCdesc.compute = clothCs.get();
+            clothCdesc.storageBufferCount = 2;
+            clothCdesc.pushConstantSize = 0;
+            clothCdesc.threadsPerGroupX = 64;
+            auto clothCompute = device->CreateComputePipeline(clothCdesc);
+
+            const uint32_t kGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+
+            // Run the integrate compute over a fresh particles buffer + params, read back gParticles.
+            auto runIntegrate = [&](int32_t integrateEnabled, std::vector<ClothParticleGpu>& outParticles) {
+                auto particlesBuf = makeParticlesBuf();
+                ClothParams params = makeParams(integrateEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(ClothParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("cloth_integrate", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*clothCompute);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*paramsBuf, 1);
+                        cmd.DispatchCompute(kGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outParticles.assign((size_t)kParticleCount, ClothParticleGpu{});
+                device->ReadBuffer(*particlesBuf, outParticles.data(),
+                                   outParticles.size() * sizeof(ClothParticleGpu), 0);
+            };
+
+            // === GPU integrate (enabled, K steps) ===
+            std::vector<ClothParticleGpu> gpuParticles;
+            runIntegrate(1, gpuParticles);
+
+            // === CPU reference: IntegrateParticles K times over the SAME sheet ===
+            std::vector<cloth::ClothParticle> cpuSheet = sheet0;
+            cloth::IntegrateParticlesSteps(grid, cpuSheet, kGravity, kDt, kGroundY, kSteps);
+            std::vector<ClothParticleGpu> cpuParticles = packParticles(cpuSheet);
+
+            // PROOF (1) GPU==CPU particles BIT-EXACT after K steps (integer memcmp, NO tolerance).
+            if (gpuParticles.size() != cpuParticles.size() ||
+                std::memcmp(gpuParticles.data(), cpuParticles.data(),
+                            (size_t)kParticleCount * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth GPU particle array != CPU IntegrateParticles "
+                             "(a float crept into the fixed-point cloth integrator?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-integrate: {particles:%d, pinned:%d, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kParticleCount, kPinned, kSteps);
+
+            // PROOF (2) two-run determinism byte-identical.
+            std::vector<ClothParticleGpu> gpuParticles2;
+            runIntegrate(1, gpuParticles2);
+            if (gpuParticles.size() != gpuParticles2.size() ||
+                std::memcmp(gpuParticles.data(), gpuParticles2.data(),
+                            gpuParticles.size() * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-integrate determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) coverage / coherence: the non-pinned particles fell (moved down) + the pinned
+            // corners held (untouched) -> a coherent hanging/falling lattice.
+            int moved = 0, pinnedHeld = 0;
+            for (int i = 0; i < kParticleCount; ++i) {
+                const ClothParticleGpu& g = gpuParticles[(size_t)i];
+                const ClothParticleGpu& init = particlesInit[(size_t)i];
+                if ((g.flags & cloth::kFlagPinned) != 0u) {
+                    if (std::memcmp(&g, &init, sizeof(ClothParticleGpu)) == 0) ++pinnedHeld;
+                } else if (g.py < init.py) {
+                    ++moved;
+                }
+            }
+            if (moved <= 0 || pinnedHeld != kPinned) {
+                std::fprintf(stderr, "FATAL: cloth coverage incoherent (moved=%d, pinnedHeld=%d/%d)\n",
+                             moved, pinnedHeld, kPinned);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-integrate coverage: %d moved, %d pinned held (coherent lattice)\n",
+                        moved, pinnedHeld);
+
+            // PROOF (4) empty / no-op: integrateEnabled=false -> particles UNCHANGED (byte-identical to
+            // the upload). The disabled path is the "all pinned (no-op)" static case (nothing integrates).
+            std::vector<ClothParticleGpu> disabledParticles;
+            runIntegrate(0, disabledParticles);
+            if (disabledParticles.size() != particlesInit.size() ||
+                std::memcmp(disabledParticles.data(), particlesInit.data(),
+                            particlesInit.size() * sizeof(ClothParticleGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: cloth integrateEnabled=false changed the particles\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cloth-integrate static: all pinned (no-op)\n");
+
+            // --- Golden: a PURE-INTEGER side-view debug-viz. Project each particle's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) to a pixel via a FIXED integer transform (y up), splat a small
+            // hashColor dot (pinned corners drawn bright white). CPU-colored from the read-back integers
+            // -> identical both backends by construction. ---
+            const int kPxPerUnit = 18;   // integer world-units -> pixels
+            const int kMargin = 20;
+            const int kWorldW = kSide;   // x spans 0..23
+            const int kWorldH = kSide;   // y spans (the sheet falls within ~[0, 24] above ground)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + (kWorldH + 1) * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Integer world->pixel transform (y up): px = margin + worldX*scale; py = imgH-margin - worldY*scale.
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            // Each particle as a small 2x2 dot at its integer (pos.x>>kFrac, pos.y>>kFrac).
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = gpuParticles[(size_t)i].px >> cloth::kFrac;
+                const int wy = gpuParticles[(size_t)i].py >> cloth::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                const bool pinned = (gpuParticles[(size_t)i].flags & cloth::kFlagPinned) != 0u;
+                Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i);
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(clothIntegrateShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cloth particle-lattice side-view (%d moved, %d pinned)\n",
+                                clothIntegrateShotPath, imgW, imgH, moved, kPinned);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothIntegrateShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

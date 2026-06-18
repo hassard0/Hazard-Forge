@@ -251,6 +251,19 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # showcase runs the CPU fpx::IntegrateStep (the SAME bit-exact reference the Vulkan GPU==CPU proof compares
 # against) -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan
 # side carries the GPU==CPU bit-identity proof. So fpx_integrate.comp gets NO hf_gen_msl line.
+# Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
+# Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
+# of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul
+# ((int64)a*b >> 16) + integrate + clamp copied VERBATIM from engine/sim/cloth.h::IntegrateParticle,
+# writing gParticles[i] back (each particle independent in CL1 -> race-free, NO atomics; PINNED untouched).
+# It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: its int64 fxmul (GENUINELY required because
+# gravity*dt over Q16.16 overflows int32, the SAME form as fpx_integrate.comp) is compiled fine by DXC on
+# the Vulkan path, but glslc (glslang's HLSL frontend used for the Metal HLSL->SPIR-V->MSL chain) cannot
+# parse int64_t in HLSL, so it can't lower this shader. Same Vulkan-only convention as fpx_integrate.comp /
+# fpx_solve.comp / swraster.comp: on Metal the --cloth-integrate showcase runs the CPU
+# cloth::IntegrateParticles (the SAME bit-exact reference the Vulkan GPU==CPU proof compares against) ->
+# the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side
+# carries the GPU==CPU bit-identity proof. So cloth_integrate.comp gets NO hf_gen_msl line.
 # Deterministic Fixed-Point Physics Slice 2 (Slice FPX2): the integer-AABB BROADPHASE candidate-pair
 # generator (the MC3 count->scan->emit on bodies). fpx_pair_count.comp (ONE thread per body i:
 # perBodyCount[i]=Σ AabbOverlap(BodyAabb(i),BodyAabb(j)) over j>i), fpx_pair_scan.comp (SINGLE-THREAD
