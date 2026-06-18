@@ -264,6 +264,181 @@ int main() {
               "determinism: two builds byte-identical");
     }
 
+    // ===== Slice GF2 — BUOYANCY / SEEPAGE (fluid->grain) ==================================================
+
+    // Helper: a grain at exact integer pos with a given velocity (dynamic, unit mass).
+    auto GrainVel = [&](int x, int y, int z, fx vx, fx vy, fx vz) {
+        grain::GrainParticle g = GrainAt(x, y, z);
+        g.vel = fpx::FxVec3{vx, vy, vz};
+        return g;
+    };
+    auto FluidVel = [&](int x, int y, int z, fx vx, fx vy, fx vz) {
+        fluid::FluidParticle f = FluidAt(x, y, z);
+        f.vel = fpx::FxVec3{vx, vy, vz};
+        return f;
+    };
+
+    // ---- AccumGrainBuoyancy: a grain over a hand-laid fluid list -> the EXACT Q16.16 vel delta ------------
+    {
+        // One DYNAMIC grain at the origin, at rest. Two STATIC fluid particles inside its box (cnt==2). Gravity
+        // straight down so up = +Y. The grain should gain +Y velocity (buoyancy) and the drag toward the
+        // static fluid (vel 0) damps. We compute the EXACT expected delta and compare bit-for-bit.
+        cgf::CGFWorld w;
+        w.h = h;
+        w.gravity = fpx::FxVec3{0, -9 * (int)kOne, 0};   // straight down -> up = +Y
+        w.dt = kOne;                                     // dt = 1.0 (clean math)
+        w.grains = {GrainVel(0, 0, 0, 0, 0, 0)};         // dynamic, invMass = kOne, vel 0
+        w.fluid  = {FluidVel(0, 0, 0, 0, 0, 0), FluidVel(0, 0, 0, 0, 0, 0)};  // 2 coincident static fluid
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        check(nbr.gfStart[1] - nbr.gfStart[0] == 2u, "buoy: grain has 2 fluid neighbours (submerged)");
+
+        // Expected: up = -normalize((0,-9,0)) = (0,+1,0). buoyMag = fxmul(kBuoyPerFluid, 2<<kFrac).
+        const fpx::FxVec3 up{0, kOne, 0};
+        const fx buoyMag = fpx::fxmul(cgf::kBuoyPerFluid, (fx)(2u << fpx::kFrac));
+        const fpx::FxVec3 fBuoy{fpx::fxmul(up.x, buoyMag), fpx::fxmul(up.y, buoyMag), fpx::fxmul(up.z, buoyMag)};
+        // vFluidAvg = 0 (static fluid). F_drag = kDrag*(0 - vel=0) = 0.
+        const fpx::FxVec3 fTotal = fBuoy;
+        // dvel = fTotal * invMass(kOne) * dt(kOne) = fTotal.
+        const fpx::FxVec3 expectedVel = fTotal;
+
+        cgf::CGFWorld w2 = w;
+        cgf::AccumGrainBuoyancy(w2, nbr, cgf::kBuoyPerFluid);
+        check(w2.grains[0].vel.x == expectedVel.x && w2.grains[0].vel.y == expectedVel.y &&
+              w2.grains[0].vel.z == expectedVel.z, "buoy: exact Q16.16 vel delta (buoyancy up, no drag)");
+        check(w2.grains[0].vel.y > 0, "buoy: submerged grain gains UP velocity (lift)");
+    }
+
+    // ---- Buoyancy ∝ count: 4 fluid neighbours lift TWICE as hard as 2 -------------------------------------
+    {
+        auto liftFor = [&](int nFluid) -> fx {
+            cgf::CGFWorld w; w.h = h;
+            w.gravity = fpx::FxVec3{0, -9 * (int)kOne, 0};
+            w.dt = kOne;
+            w.grains = {GrainVel(0, 0, 0, 0, 0, 0)};
+            for (int k = 0; k < nFluid; ++k) w.fluid.push_back(FluidVel(0, 0, 0, 0, 0, 0));
+            const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+            cgf::AccumGrainBuoyancy(w, nbr, cgf::kBuoyPerFluid);
+            return w.grains[0].vel.y;
+        };
+        const fx lift2 = liftFor(2);
+        const fx lift4 = liftFor(4);
+        check(lift4 == 2 * lift2, "buoy: lift ∝ fluid count (4 lifts exactly 2x of 2)");
+    }
+
+    // ---- Drag damps toward the fluid velocity (a moving fluid pulls the grain along) ---------------------
+    {
+        // A grain at rest with ONE fluid neighbour moving in +X. Gravity down (up = +Y). The drag should add a
+        // +X velocity component toward the fluid; buoyancy adds +Y.
+        cgf::CGFWorld w; w.h = h;
+        w.gravity = fpx::FxVec3{0, -9 * (int)kOne, 0};
+        w.dt = kOne;
+        w.grains = {GrainVel(0, 0, 0, 0, 0, 0)};
+        w.fluid  = {FluidVel(0, 0, 0, 3 * (int)kOne, 0, 0)};   // fluid moving +3 in x
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        // Expected drag x = fxmul(kDrag, (3.0 - 0)) = kDrag*3.0.
+        const fx expectDragX = fpx::fxmul(cgf::kDrag, 3 * (int)kOne);
+        cgf::AccumGrainBuoyancy(w, nbr, cgf::kBuoyPerFluid);
+        check(w.grains[0].vel.x == expectDragX, "buoy: drag pulls grain toward the moving fluid (+X)");
+        check(w.grains[0].vel.y > 0, "buoy: buoyancy still lifts +Y with a moving fluid");
+    }
+
+    // ---- A STATIC grain is untouched ---------------------------------------------------------------------
+    {
+        cgf::CGFWorld w; w.h = h;
+        w.gravity = fpx::FxVec3{0, -9 * (int)kOne, 0};
+        w.dt = kOne;
+        grain::GrainParticle sg = GrainVel(0, 0, 0, 0, 0, 0);
+        sg.flags = grain::kFlagStatic;                 // boundary grain -> never moves
+        w.grains = {sg};
+        w.fluid  = {FluidVel(0, 0, 0, 0, 0, 0), FluidVel(0, 0, 0, 0, 0, 0)};
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        cgf::AccumGrainBuoyancy(w, nbr, cgf::kBuoyPerFluid);
+        check(w.grains[0].vel.x == 0 && w.grains[0].vel.y == 0 && w.grains[0].vel.z == 0,
+              "buoy: static grain vel untouched");
+    }
+
+    // ---- A DRY grain (no fluid neighbours) -> no buoyancy/drag (free GR sim) ------------------------------
+    {
+        cgf::CGFWorld w; w.h = h;
+        w.gravity = fpx::FxVec3{0, -9 * (int)kOne, 0};
+        w.dt = kOne;
+        w.grains = {GrainVel(0, 0, 0, kOne, 0, 0)};    // grain has some +X velocity already
+        w.fluid  = {FluidVel(20, 0, 0, 0, 0, 0)};      // fluid far away -> no cross neighbour
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        check(nbr.gfStart[1] - nbr.gfStart[0] == 0u, "buoy: dry grain has 0 fluid neighbours");
+        cgf::AccumGrainBuoyancy(w, nbr, cgf::kBuoyPerFluid);
+        check(w.grains[0].vel.x == kOne && w.grains[0].vel.y == 0 && w.grains[0].vel.z == 0,
+              "buoy: dry grain vel unchanged by the accumulate (free-fall handled by IntegrateGrains)");
+    }
+
+    // ---- StepCGFBuoyancy: submerged grains end HIGHER than dry; buoy=0 control packs the same -------------
+    {
+        // A grain bed with a fluid block over its LEFT half. The submerged (left) grains should be buoyed
+        // HIGHER than the dry (right) grains after K steps. The buoy=0 control packs them the same.
+        const fx kDt = kOne / 60;
+        const fx kGroundY = 0;
+        const fpx::FxVec3 kGravity{0, (fx)(-9 * (int)kOne), 0};
+        auto makeWorld = [&]() {
+            cgf::CGFWorld w;
+            w.h = h; w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+            // A 8(x) x 3(y) x 1(z) grain bed at y in [1,3], spanning x [0,7].
+            for (int gx = 0; gx < 8; ++gx)
+                for (int gy = 1; gy <= 3; ++gy)
+                    w.grains.push_back(GrainAt(gx, gy, 0));
+            // A fluid block over the LEFT half (x in [0,3]), interpenetrating the bed at y in [1,3].
+            for (int fx_ = 0; fx_ < 4; ++fx_)
+                for (int fy = 1; fy <= 3; ++fy)
+                    w.fluid.push_back(FluidAt(fx_, fy, 0));
+            return w;
+        };
+
+        cgf::CGFWorld wA = makeWorld();
+        cgf::StepCGFBuoyancySteps(wA, kDt, 120);
+        const cgf::WetDry wd = cgf::MeasureWetDry(wA);
+        check(wd.wet > 0u && wd.dry > 0u, "step: both wet and dry grains exist");
+        check(wd.wetY > wd.dryY, "step: submerged grains end HIGHER than dry (buoyancy lightens)");
+
+        // buoy=0 control: the wet and dry grains pack the SAME (within an LSB band).
+        cgf::CGFWorld wCtrl = makeWorld();
+        cgf::StepCGFBuoyancyControlSteps(wCtrl, kDt, 0, 120);
+        const cgf::WetDry wdc = cgf::MeasureWetDry(wCtrl);
+        const fx band = kOne / 16;   // a tight LSB band
+        fx diff = wdc.wetY - wdc.dryY; if (diff < 0) diff = -diff;
+        check(diff < band, "step: buoy=0 control packs wet ≈ dry (buoyancy does the work)");
+
+        // Determinism: two runs byte-identical.
+        cgf::CGFWorld wB = makeWorld();
+        cgf::StepCGFBuoyancySteps(wB, kDt, 120);
+        bool same = (wA.grains.size() == wB.grains.size());
+        for (size_t i = 0; same && i < wA.grains.size(); ++i)
+            if (std::memcmp(&wA.grains[i], &wB.grains[i], sizeof(grain::GrainParticle)) != 0) same = false;
+        check(same, "step: two runs byte-identical (deterministic)");
+    }
+
+    // ---- Grain-order independence: shuffling the grain array gives the SAME per-grain result -------------
+    {
+        const fx kDt = kOne / 60;
+        const fpx::FxVec3 kGravity{0, (fx)(-9 * (int)kOne), 0};
+        cgf::CGFWorld w; w.h = h; w.gravity = kGravity; w.dt = kDt; w.groundY = 0;
+        // 4 grains, a fluid neighbour each (or not), at distinct positions.
+        w.grains = {GrainAt(0, 1, 0), GrainAt(1, 1, 0), GrainAt(10, 1, 0), GrainAt(11, 1, 0)};
+        w.fluid  = {FluidAt(0, 1, 0), FluidAt(1, 1, 0)};   // submerge grains 0,1; grains 2,3 dry
+        // Reverse the grain array; the per-grain physics must be identical (the accumulate is per-grain).
+        cgf::CGFWorld wRev = w;
+        std::reverse(wRev.grains.begin(), wRev.grains.end());
+
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        const cgf::CGFNeighbors nbrRev = cgf::BuildCGFNeighbors(wRev);
+        cgf::AccumGrainBuoyancy(w, nbr, cgf::kBuoyPerFluid);
+        cgf::AccumGrainBuoyancy(wRev, nbrRev, cgf::kBuoyPerFluid);
+        // grain 0 of w == grain 3 of wRev (reversed), etc.
+        bool match = true;
+        for (size_t i = 0; i < w.grains.size(); ++i)
+            if (std::memcmp(&w.grains[i].vel, &wRev.grains[w.grains.size() - 1 - i].vel,
+                            sizeof(fpx::FxVec3)) != 0) match = false;
+        check(match, "buoy: per-grain result is grain-order-independent");
+    }
+
     if (g_fail == 0) std::printf("cgf_test: ALL PASS\n");
     else             std::printf("cgf_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

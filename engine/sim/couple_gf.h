@@ -326,5 +326,152 @@ inline uint32_t MaxFGPerFluid(const CGFNeighbors& nbr) {
     return m;
 }
 
+// ===== Slice GF2 — BUOYANCY / SEEPAGE (fluid->grain, the CRUX; the 2nd slice of FLAGSHIP #13) =========
+// THE FIRST MOMENTUM EXCHANGE of FLAGSHIP #13: each grain sums, over its GF1 fluid-neighbour list (in the
+// FIXED GF1 gfNeighbors emit order, ascending), a BUOYANT impulse (∝ the surrounding fluid count, opposing
+// gravity — the submerging fluid lifts it) + a DRAG impulse (toward the local fluid velocity, which GF2 damps
+// since the fluid is held STATIC), so SUBMERGED grains LIGHTEN / FLUIDIZE (a wet/dry contrast) — the sand
+// under the fluid loosens toward slurry, while DRY grains pack normally. ONE-WAY for now (fluid -> grain; the
+// grain->fluid reaction is GF3). LINEAR only — grains are points, no torque. The CG2 contact-support reduction
+// twin, with a COUNT-based buoyancy (the fluid-submersion proxy) instead of a penetration-based support, and
+// per-PARTICLE (one thread per grain over its OWN short fluid list) instead of per-body.
+//
+// THE int64 DECISION (the CG2/GR3/FL4 split): the buoyancy/drag math is int64 (FxNormalize/FxScale/fxmul/
+// fxdiv) -> shaders/cgf_buoyancy.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) + the Metal
+// --cgf-buoyancy showcase runs the CPU StepCGFBuoyancy (byte-identical by construction). The GF1 cross-query
+// (re-run each step) stays int32 MSL-native.
+//
+// THE CRUX — but EASIER than CG2 (per-GRAIN, not per-BODY): each grain sums over its OWN short gfNeighbors
+// fluid list (the GF1 over-inclusive box list), writing ONLY its own velocity -> per-grain-disjoint, race-free,
+// NO atomics, [numthreads(64,1,1)] MULTI-THREAD over grains, NO single-thread TDR (the FL4/GR3 Jacobi pattern).
+// The fixed gfNeighbors ascending order keeps the int64 sum bit-identical CPU<->shader.
+
+using fpx::FxAdd;          // read-only: the fpx.h vector toolbox (reused verbatim, no new primitives)
+using fpx::FxSub;
+using fpx::FxScale;
+using fpx::FxNormalize;    // read-only: the int64 normalize (+Y fallback on length 0)
+using fpx::fxmul;          // read-only: the int64-intermediate Q16.16 multiply
+
+// The host-snapped Q16.16 coupling coefficients. Tuned so SUBMERGED grains (cnt>0 fluid neighbours) LIGHTEN /
+// rise / loosen (the sand fluidizes under the fluid) while DRY grains (cnt==0) pack normally — an emergent
+// WET/DRY contrast, NOT an exact buoyancy depth (the CP2/GR4 within-band caveat). BUOYANCY: F_buoy ∝ the
+// submerging fluid count, opposing gravity (more surrounding fluid -> more lift). DRAG: a linear damping toward
+// the (static) fluid's mean velocity, so the grain settles instead of ringing.
+//   kBuoyPerFluid = 3.0 (Q16.16): the per-fluid-neighbour lift. With a packed bed under a fluid block a
+//     submerged grain has many fluid neighbours; cnt·kBuoyPerFluid builds the upward force that overcomes
+//     |g|=9.8 enough to LIGHTEN / loosen the wet grains vs the dry pack (host-snapped, tuned for a clear
+//     wet>dry margin without flying the wet grains out of the basin).
+//   kDrag = 2.0 (Q16.16): a firm linear damping toward the static fluid (vFluidAvg≈0) so the wet grains settle
+//     loose instead of ringing.
+inline constexpr fx kBuoyPerFluid = (fx)(3.0 * (double)kOne + 0.5);   // 196608 (Q16.16, ~3.0 per-fluid lift)
+inline constexpr fx kDrag         = (fx)(2.0 * (double)kOne + 0.5);   // 131072 (Q16.16, ~2.0 damping)
+
+// AccumGrainBuoyancy(world, neighbors, buoyPerFluid): the per-grain buoyancy+drag impulse accumulate (the
+// per-PARTICLE Jacobi reduction). For each grain i (static skipped), over its GF1 fluid-neighbour list
+// gfNeighbors[gfStart[i]..gfStart[i+1]) in ASCENDING order: cnt = the count; cnt==0 -> dry, skip (free GR
+// sim). BUOYANCY F_buoy = FxScale(up, fxmul(buoyPerFluid, cnt<<kFrac)) with up = -FxNormalize(gravity). DRAG
+// vFluidAvg = (Σ_j fluid[j].vel)/cnt (the fixed-order int64 sum / the integer count); F_drag =
+// fxmul(kDrag, vFluidAvg - grain.vel) per axis. Apply grain.vel += FxScale(F_buoy + F_drag, grain.invMass)·dt
+// (linear). int64. cgf_buoyancy.comp copies THIS body VERBATIM (one thread per grain i). Deterministic (the
+// fixed gfNeighbors order, fixed op order) -> bit-identical to the GPU memcmp + two-run byte-identical. The
+// buoyPerFluid coefficient is a parameter so the showcase's buoy=0 control reuses this exact body.
+inline void AccumGrainBuoyancy(CGFWorld& world, const CGFNeighbors& neighbors, fx buoyPerFluid) {
+    const uint32_t grainCount = (uint32_t)world.grains.size();
+    const fx dt = world.dt;
+    // up = -normalize(gravity) (the buoyant direction, opposing gravity). Computed ONCE (shared by all grains).
+    const FxVec3 g = world.gravity;
+    const FxVec3 gn = FxNormalize(g);
+    const FxVec3 up{-gn.x, -gn.y, -gn.z};
+    for (uint32_t i = 0; i < grainCount; ++i) {
+        grain::GrainParticle& gi = world.grains[(size_t)i];
+        if (gi.flags & grain::kFlagStatic) continue;   // static boundary grain -> untouched (the pinned case)
+        const uint32_t s0 = neighbors.gfStart[(size_t)i];
+        const uint32_t s1 = neighbors.gfStart[(size_t)i + 1u];
+        const uint32_t cnt = s1 - s0;
+        if (cnt == 0u) continue;                        // dry grain (no fluid neighbours) -> free GR sim
+
+        // BUOYANCY: F_buoy = up * (buoyPerFluid * (cnt in Q16.16)) — ∝ the submerging fluid count, opposing
+        // gravity. The count<<kFrac Q16.16 promotion is the CG2 precedent.
+        const fx buoyMag = fpx::fxmul(buoyPerFluid, (fx)(cnt << kFrac));
+        const FxVec3 fBuoy = FxScale(up, buoyMag);
+        // DRAG: vFluidAvg = (Σ_j fluid[j].vel) / cnt, the fixed-order int64 sum / the integer count.
+        int64_t sumX = 0, sumY = 0, sumZ = 0;
+        for (uint32_t s = s0; s < s1; ++s) {
+            const fluid::FluidParticle& f = world.fluid[(size_t)neighbors.gfNeighbors[(size_t)s]];
+            sumX += (int64_t)f.vel.x;
+            sumY += (int64_t)f.vel.y;
+            sumZ += (int64_t)f.vel.z;
+        }
+        const FxVec3 vFluidAvg{
+            (fx)(sumX / (int64_t)cnt), (fx)(sumY / (int64_t)cnt), (fx)(sumZ / (int64_t)cnt)};
+        // F_drag = kDrag * (vFluidAvg - grain.vel) per axis.
+        const FxVec3 dv = FxSub(vFluidAvg, gi.vel);
+        const FxVec3 fDrag{fpx::fxmul(kDrag, dv.x), fpx::fxmul(kDrag, dv.y), fpx::fxmul(kDrag, dv.z)};
+
+        // Apply the impulse as a velocity delta: vel += (F_buoy + F_drag) * invMass * dt (linear only).
+        const FxVec3 fTotal = FxAdd(fBuoy, fDrag);
+        const FxVec3 dvel = FxScale(FxScale(fTotal, gi.invMass), dt);
+        gi.vel = FxAdd(gi.vel, dvel);
+    }
+}
+
+// StepCGFBuoyancy(world, dt): ONE coupled step (the driver — the fluid is held STATIC). (1) re-query the
+// grain->fluid neighbour lists from the grains' CURRENT positions (GF1 BuildCGFNeighbors) -> (2) accumulate
+// the buoyancy+drag velocity delta (AccumGrainBuoyancy with the default kBuoyPerFluid) -> (3) IntegrateGrains
+// (the grain integrate + radius-aware ground rest, the GR1 step VERBATIM — gravity + the buoyancy-adjusted
+// vel). The fluid is NOT moved (the reaction is GF3). Over K steps the SUBMERGED grains lighten/rise while
+// the DRY grains pack. IntegrateGrains is copied VERBATIM by cgf_buoyancy.comp's host driver (the GPU runs
+// the SAME per-step sequence).
+inline void StepCGFBuoyancy(CGFWorld& world, fx dt) {
+    const CGFNeighbors nbr = BuildCGFNeighbors(world);    // GF1 re-query (fluid static -> the block unchanged)
+    AccumGrainBuoyancy(world, nbr, kBuoyPerFluid);        // GF2 buoyancy + drag velocity delta
+    grain::IntegrateGrains(world.grains, world.gravity, dt, world.groundY);   // GR1 integrate, VERBATIM
+}
+
+// StepCGFBuoyancyControl(world, dt, buoyPerFluid): the parameterized step (the buoy=0 control reuses the
+// SAME driver with buoyPerFluid=0 -> the wet and dry grains pack the same, proving buoyancy does the work).
+inline void StepCGFBuoyancyControl(CGFWorld& world, fx dt, fx buoyPerFluid) {
+    const CGFNeighbors nbr = BuildCGFNeighbors(world);
+    AccumGrainBuoyancy(world, nbr, buoyPerFluid);
+    grain::IntegrateGrains(world.grains, world.gravity, dt, world.groundY);
+}
+
+// StepCGFBuoyancySteps(world, dt, steps): run K StepCGFBuoyancy steps. The CPU reference the GPU grain state
+// memcmp's against byte-for-byte. Pure integer -> two runs byte-identical, cross-backend identical.
+inline void StepCGFBuoyancySteps(CGFWorld& world, fx dt, int steps) {
+    for (int s = 0; s < steps; ++s) StepCGFBuoyancy(world, dt);
+}
+
+// StepCGFBuoyancyControlSteps(world, dt, buoyPerFluid, steps): K parameterized steps (the buoy=0 control).
+inline void StepCGFBuoyancyControlSteps(CGFWorld& world, fx dt, fx buoyPerFluid, int steps) {
+    for (int s = 0; s < steps; ++s) StepCGFBuoyancyControl(world, dt, buoyPerFluid);
+}
+
+// MeasureWetDry(world): the honest WET/DRY metric — the mean pos.y of SUBMERGED grains (cnt>0 fluid
+// neighbours) vs DRY grains (cnt==0), a deterministic Q16.16 stat for the wet/dry-contrast proof. Re-queries
+// GF1 from the current positions to classify each grain. 0 wet (or 0 dry) -> that mean is 0. The wet/dry
+// contrast is EMERGENT/within-band (the CP2/GR4 caveat): the proof asserts wetY > dryY by a margin +
+// deterministic, NOT an exact buoyancy depth.
+struct WetDry {
+    fx       wetY = 0;     // the mean pos.y of submerged grains (cnt>0)
+    fx       dryY = 0;     // the mean pos.y of dry grains (cnt==0)
+    uint32_t wet  = 0;     // the submerged-grain count
+    uint32_t dry  = 0;     // the dry-grain count
+};
+inline WetDry MeasureWetDry(const CGFWorld& world) {
+    WetDry out;
+    const CGFNeighbors nbr = BuildCGFNeighbors(world);
+    const uint32_t grainCount = (uint32_t)world.grains.size();
+    int64_t wetSum = 0, drySum = 0;
+    for (uint32_t i = 0; i < grainCount; ++i) {
+        const uint32_t cnt = nbr.gfStart[(size_t)i + 1u] - nbr.gfStart[(size_t)i];
+        if (cnt > 0u) { wetSum += (int64_t)world.grains[(size_t)i].pos.y; ++out.wet; }
+        else          { drySum += (int64_t)world.grains[(size_t)i].pos.y; ++out.dry; }
+    }
+    out.wetY = out.wet == 0u ? 0 : (fx)(wetSum / (int64_t)out.wet);
+    out.dryY = out.dry == 0u ? 0 : (fx)(drySum / (int64_t)out.dry);
+    return out;
+}
+
 }  // namespace cgf
 }  // namespace hf::sim
