@@ -650,6 +650,128 @@ int main() {
         check(cgrain::CountDisplacedGrains(world) == 0u, "displaced: zero bodies -> 0 displaced grains");
     }
 
+    // ============================================================================================
+    // ===== Slice CG4 — THE COUPLED STEP (the body sinking into a dynamic sand bed) ===============
+    // ============================================================================================
+    // StepCGrain: a body dropped above a small DYNAMIC grain bed sinks to a rest line above the bed floor AND
+    // the bed stays bounded (the sand piles, does NOT explode); the support=0 control (no grains) sinks through
+    // to the bed floor; deterministic (two runs byte-identical); the composed (1)-(5) order is fixed.
+
+    // ---- StepCGrain: a body sinks into a DYNAMIC bed and settles supported; the bed stays coherent ----
+    // The scene mirrors CP4's STATIC BASIN: a bowl of STATIC grains (floor + 4 walls) confines a DYNAMIC sand
+    // bed, so the dynamic grains cannot be fully evacuated by the body's CG3 displacement — they get trapped
+    // under the body and SUPPORT it (the grain twin of CP4's incompressible-fluid-in-a-basin). Without the
+    // basin a heavy body excavates straight to the floor (the honest physics of a free granular column). The
+    // body settles HALF-BURIED at an emergent rest line above the static floor; the bed stays coherent.
+    {
+        const fx dt = kOne / 60;
+        const fx hSearch = kOne + kOne / 2;              // 1.5
+        const int iters = 3;
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fx gr = kOne / 4;                          // 0.25 grain radius, 0.5 spacing (packed)
+        const int span = 10;                             // interior 0..5 world units (11 cells at 0.5)
+        const int fillH = 10;                            // dynamic fill ~5 units deep
+        const int r = 2;                                 // body radius
+        const int cx = span / 4;                         // basin centre in integer world units (0.5*span/2)
+
+        // Build a static-grain basin (floor + 4 walls) + a dynamic fill, settle it (GR4 friction).
+        auto grainAt = [&](double x, double y, double z, bool stat) {
+            grain::GrainParticle g;
+            g.pos  = fpx::FxVec3{(fx)(x * (double)kOne), (fx)(y * (double)kOne), (fx)(z * (double)kOne)};
+            g.prev = g.pos; g.vel = fpx::FxVec3{0, 0, 0};
+            g.invMass = stat ? 0 : kOne; g.radius = gr; g.flags = stat ? grain::kFlagStatic : 0u;
+            return g;
+        };
+        auto buildBed = [&]() {
+            std::vector<grain::GrainParticle> bed;
+            const double s = 0.5;
+            // A static floor (full footprint, frictional textured bed) + 2-cell-thick static walls around the
+            // interior [0, span*s] (the thicker walls seal the corners so the dynamic grains stay contained).
+            const double wlo = -2 * s, whi = span * s + 2 * s;
+            for (double x = wlo; x <= whi + 1e-9; x += s)
+                for (double z = wlo; z <= whi + 1e-9; z += s) bed.push_back(grainAt(x, 0, z, true));  // floor
+            for (double y = s; y <= fillH * s + 1e-9; y += s)
+                for (double x = wlo; x <= whi + 1e-9; x += s)
+                    for (double z = wlo; z <= whi + 1e-9; z += s) {
+                        const bool wall = (x < -1e-9 || x > span * s + 1e-9 || z < -1e-9 || z > span * s + 1e-9);
+                        if (wall) bed.push_back(grainAt(x, y, z, true));                               // walls
+                    }
+            for (double y = s; y <= fillH * s + 1e-9; y += s)                                          // dynamic fill
+                for (double x = 0; x <= span * s + 1e-9; x += s)
+                    for (double z = 0; z <= span * s + 1e-9; z += s) bed.push_back(grainAt(x, y, z, false));
+            grain::StepGrainFrictionSteps(bed, {}, fpx::FxVec3{0, kGravY, 0}, dt, 0, hSearch, grain::kGrainMu, 2, 60);
+            return bed;
+        };
+        const std::vector<grain::GrainParticle> bed = buildBed();
+        fx bedTopFx = -(fx)(1 << 28);
+        for (const grain::GrainParticle& g : bed)
+            if (!(g.flags & grain::kFlagStatic) && g.pos.y > bedTopFx) bedTopFx = g.pos.y;
+        const int bodyY = (bedTopFx >> fpx::kFrac) + r;  // body bottom just touches the settled bed top
+
+        auto makeWorld = [&](bool withBed) {
+            cgrain::CGrainWorld w;
+            w.grains  = withBed ? bed : std::vector<grain::GrainParticle>{};
+            w.hSearch = hSearch;
+            w.gravity = fpx::FxVec3{0, kGravY, 0}; w.dt = dt; w.groundY = 0;
+            fpx::FxBody b = BodyAt(cx, bodyY, cx, r);
+            b.invMass = kOne / iters;                    // the CP4 compensation (CG2 runs each of the K iters)
+            w.bodies = {b};
+            return w;
+        };
+        const fx kStartY = FromInt(bodyY);
+        const fx kBedFloor = 0 + FromInt(r);             // groundY + radius (the static-floor rest line)
+        const int kSteps = 300;
+
+        cgrain::CGrainWorld world = makeWorld(true);
+        cgrain::StepCGrainSteps(world, dt, iters, kSteps);
+        const cgrain::CGrainState st = cgrain::MeasureCGrainState(world, kStartY);
+
+        // The body settled SUPPORTED in the bed: restY above the static floor by a margin, bounded above (it
+        // did NOT crash through, did NOT fly out). The margin is EMERGENT (the GR4/CP2 honesty) — a body half-
+        // buried, its surface resting above the floor on the trapped grains.
+        check(st.restY > kBedFloor + kOne / 8, "step: body settled SUPPORTED above the static floor (not crashed through)");
+        check(st.restY < FromInt(bodyY), "step: body restY bounded above (did not fly out)");
+        // It SANK from its start (a non-trivial drop into the bed).
+        check(st.sink > kOne, "step: the body SANK from its start (non-trivial drop)");
+        // The bed stayed COHERENT (the honest "no explosion" metric — the GR4 instability signature is a
+        // VERTICAL blow-up): NO dynamic grain rockets up (every dynamic grain.y stays bounded well below a
+        // generous ceiling) AND the BULK stays horizontally contained (>=90% within a box around the basin).
+        // A few grains creeping out the basin corners along the floor over K steps is a containment
+        // imperfection, NOT incoherence — the meaningful claim is "the bed did not explode".
+        bool noExplosion = true;
+        uint32_t dynTotal = 0, dynContained = 0;
+        for (const grain::GrainParticle& g : world.grains) {
+            if (g.flags & grain::kFlagStatic) continue;
+            ++dynTotal;
+            if (g.pos.y < -FromInt(2) || g.pos.y > FromInt(30)) noExplosion = false;   // no vertical blow-up
+            if (g.pos.x >= -FromInt(15) && g.pos.x <= FromInt(15) &&
+                g.pos.z >= -FromInt(15) && g.pos.z <= FromInt(15)) ++dynContained;
+        }
+        check(noExplosion, "step: the bed did NOT explode (every dynamic grain.y bounded — no vertical blow-up)");
+        check(dynTotal > 0 && (uint64_t)dynContained * 100u >= (uint64_t)dynTotal * 90u,
+              "step: the bed stayed COHERENT (>=90% of dynamic grains contained around the basin)");
+        check(st.repose >= 0, "step: the grain repose slope is a valid non-negative stat");
+
+        // Determinism: two runs byte-identical (both the body AND the grains).
+        cgrain::CGrainWorld world2 = makeWorld(true);
+        cgrain::StepCGrainSteps(world2, dt, iters, kSteps);
+        check(std::memcmp(&world.bodies[0], &world2.bodies[0], sizeof(fpx::FxBody)) == 0,
+              "step: two runs byte-identical (the body is deterministic)");
+        bool grainsSame = (world.grains.size() == world2.grains.size());
+        for (size_t i = 0; grainsSame && i < world.grains.size(); ++i)
+            if (std::memcmp(&world.grains[i], &world2.grains[i], sizeof(grain::GrainParticle)) != 0)
+                grainsSame = false;
+        check(grainsSame, "step: two runs byte-identical (the grains are deterministic)");
+
+        // ---- support=0 control: NO grains -> the body free-falls + only ResolveGround clamps -> restY == the
+        // floor (it sinks straight through; proving the coupling does the work). ----
+        cgrain::CGrainWorld ctrl = makeWorld(false);
+        cgrain::StepCGrainSteps(ctrl, dt, iters, kSteps);
+        const cgrain::CGrainState ctrlSt = cgrain::MeasureCGrainState(ctrl, kStartY);
+        check(ctrlSt.restY == kBedFloor, "step control: support=0 (no grains) sinks through to the floor");
+        check(st.restY > ctrlSt.restY, "step: the supported body rests ABOVE the support=0 control (coupling works)");
+    }
+
     if (g_fail == 0) std::printf("cgrain_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

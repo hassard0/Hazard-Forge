@@ -449,5 +449,140 @@ inline uint32_t CountDisplacedGrains(const CGrainWorld& world) {
     return c;
 }
 
+// ===== Slice CG4 — THE COUPLED STEP (the body sinking into sand, the INTEGRATED two-way solver) ==========
+// The FOURTH slice of FLAGSHIP #12: ONE deterministic tick that runs the grain's own frictional pile dynamics
+// (GR3 non-penetration + GR4 Coulomb friction) AND both exchange directions (CG2 grain->body support, CG3
+// body->grain displacement) AND the rigid integrate — a dynamic sand bed AND a dynamic body in one
+// bidirectional loop. The result: a body SINKS into a dynamic, self-piling sand bed under gravity, the sand
+// piles around it (holding its angle of repose) and SUPPORTS it, and it settles half-buried — no script. The
+// CP4 twin with the GRAIN sim. CG4 ORCHESTRATES the existing bit-exact pieces — it composes the GR3/GR4
+// SUB-passes (NOT StepGrainFriction wholesale, which would re-predict + re-build the neighbour list and skip
+// the coupling) interleaved with CG2 AccumBodyGrainForces + CG3 ApplyBodyToGrains + the rigid IntegrateBody/
+// ResolveGround, in the LOCKED order below. NO new shader, NO new RHI: the GPU showcase is a host-driven
+// multi-pass driver over the EXISTING GR3 grain_contact_* + GR4 grain_friction + CG2 cgrain_support + CG3
+// cgrain_displace shaders.
+//
+// THE COUPLED TICK (StepCGrain, the locked make-or-break order):
+//   (1) PREDICT:  grains IntegrateGrains(grains) [GR1: prev=pos, predict pos; radius-aware ground rest]; each
+//                 DYNAMIC body vel += gravity·dt  (velocity ONLY — the position integrates at (5)).
+//   (2) BUILD:    grid = MakeGrainGrid; table = BuildGrainCellTable; nbr = BuildGrainNeighborList (GR2) — once
+//                 per step, FIXED across the K iters (the standard PBF choice); query = GatherBodyGrains (CG1),
+//                 also built ONCE per step (from the predicted grains + the current body pos).
+//   (3) ITERATE (K JACOBI iters), EACH:
+//         (3a) GR3 normal:   SolveGrainContact -> apply pos+=Δp   (grain-grain non-penetration).
+//         (3b) GR4 friction: SolveGrainFriction -> apply pos+=Δp  (the angle-of-repose tangential clamp).
+//         (3c) CG3 body->grain: ApplyBodyToGrains (grains pushed out of the bodies + the drag reaction).
+//         (3d) CG2 grain->body: AccumBodyGrainForces (support + drag -> body.vel delta, over the CG1 query).
+//   (4) GRAIN VELOCITY: vel = (pos − prev)/dt   (the GR-step grain velocity update).
+//   (5) BODY INTEGRATE: each DYNAMIC body pos += vel·dt; ResolveGround(body, groundY)   (the bed/floor clamp).
+//                 grains: CollideGrainPlane(grains, groundY)   (the grains rest on the ground floor).
+// The body accumulates gravity (1) + support/drag over the K iters (3d), THEN its position integrates (5); the
+// sand self-piles (3a/3b) and parts around the body (3c). Over many steps the body sinks in, the sand supports
+// it, and it settles half-buried — emergent, no script. The neighbour list + the CG1 query are built ONCE per
+// step (the PBF choice). Pure integer, fixed op order -> two runs bit-identical AND bit-exact GPU==CPU. Bodies
+// do not collide with each other (single body / non-overlapping; body-body contacts are out of scope).
+//
+// THE CP4 COMPENSATION (the invMass = kOne/iters trick): CG2 AccumBodyGrainForces runs in EACH of the K iters
+// (3d), so its impulse is applied K× per step; balance it against once-per-step gravity with the body
+// invMass = kOne/iters (mathematically exact: K·F·(1/K) = F) — the same clean compensation CP4 used. The
+// CALLER sets the body invMass (the showcase / test sets it to kOne/iters); StepCGrain itself does NOT touch
+// invMass — it simply applies CG2's force scaled by the body's own invMass each iter (the AccumBodyGrainForces
+// contract), so a body built with invMass=kOne/iters gets the exactly-balanced K-fold accumulation.
+//
+// The friction coefficient μ is grain::kGrainMu (the GR4 default — the angle-of-repose constant); the grains
+// hold their repose around the sinking body exactly as the GR4 showcase pile does.
+
+inline void StepCGrain(CGrainWorld& world, fx dt, int iters) {
+    const size_t n = world.grains.size();
+    // (1) PREDICT: the grain integrate (GR1 — vel += g·dt; prev = pos; pos += vel·dt; radius-aware ground rest)
+    // AND each dynamic body's gravity velocity integrate (velocity ONLY; the position integrates at (5)).
+    grain::IntegrateGrains(world.grains, world.gravity, dt, world.groundY);
+    for (fpx::FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        b.vel.x += fpx::fxmul(world.gravity.x, dt);
+        b.vel.y += fpx::fxmul(world.gravity.y, dt);
+        b.vel.z += fpx::fxmul(world.gravity.z, dt);
+    }
+    // (2) BUILD: the GR2 neighbour list from the PREDICTED positions (built ONCE, fixed across the K iters) +
+    // the CG1 body->grain query (built ONCE per step, from the predicted grains + the current body pos).
+    const grain::GrainGrid grid = grain::MakeGrainGrid(world.grains, world.hSearch);
+    const grain::GrainCellTable table = grain::BuildGrainCellTable(world.grains, grid);
+    const grain::GrainNeighborList list =
+        grain::BuildGrainNeighborList(world.grains, grid, table, world.hSearch);
+    const CGrainQuery query = GatherBodyGrains(world);
+    // (3) K JACOBI iterations: GR3 normal -> GR4 friction -> CG3 body->grain -> CG2 grain->body, each iteration.
+    std::vector<FxVec3> dp;
+    for (int it = 0; it < iters; ++it) {
+        // (3a) GR3 NORMAL push (the grain-grain non-penetration; Δp_i into a SEPARATE dp buffer -> apply).
+        grain::SolveGrainContact(world.grains, list, dp);
+        for (size_t i = 0; i < n; ++i) {
+            if (world.grains[i].flags & grain::kFlagStatic) continue;
+            world.grains[i].pos = FxAdd(world.grains[i].pos, dp[i]);
+        }
+        // (3b) GR4 TANGENTIAL friction (reads the POST-normal positions; the angle-of-repose clamp).
+        grain::SolveGrainFriction(world.grains, list, grain::kGrainMu, dp);
+        for (size_t i = 0; i < n; ++i) {
+            if (world.grains[i].flags & grain::kFlagStatic) continue;
+            world.grains[i].pos = FxAdd(world.grains[i].pos, dp[i]);
+        }
+        // (3c) CG3 body->grain: displace the grains out of the bodies (+ the drag reaction).
+        ApplyBodyToGrains(world, dt);
+        // (3d) CG2 grain->body: accumulate support + drag into the body velocities (over the CG1 query).
+        AccumBodyGrainForces(world, query, dt);
+    }
+    // (4) GRAIN VELOCITY: vel = (pos − prev)/dt (the GR-step PBF grain velocity update).
+    if (dt != 0) {
+        for (size_t i = 0; i < n; ++i) {
+            if (world.grains[i].flags & grain::kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(world.grains[i].pos, world.grains[i].prev);
+            world.grains[i].vel =
+                FxVec3{fpx::fxdiv(dpos.x, dt), fpx::fxdiv(dpos.y, dt), fpx::fxdiv(dpos.z, dt)};
+        }
+    }
+    // (5) BODY INTEGRATE: pos += vel·dt for each dynamic body THEN ResolveGround (the radius-aware bed clamp);
+    // the grains rest on the ground floor (CollideGrainPlane — pos.y >= groundY + radius).
+    for (fpx::FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        b.pos.x += fpx::fxmul(b.vel.x, dt);
+        b.pos.y += fpx::fxmul(b.vel.y, dt);
+        b.pos.z += fpx::fxmul(b.vel.z, dt);
+        fpx::ResolveGround(b, world.groundY);
+    }
+    grain::CollideGrainPlane(world.grains, world.groundY);
+}
+
+// StepCGrainSteps(world, dt, iters, steps): run K coupled ticks. The CPU reference the GPU multi-pass driver
+// memcmp's against byte-for-byte (the grain + body state). Pure integer -> two runs byte-identical,
+// cross-backend identical (the GPU runs the GR3/GR4/CG2/CG3 int64 passes Vulkan-only; Metal runs THIS).
+inline void StepCGrainSteps(CGrainWorld& world, fx dt, int iters, int steps) {
+    for (int s = 0; s < steps; ++s) StepCGrain(world, dt, iters);
+}
+
+// MeasureCGrainState(world): the honest emergent metrics helper (the CP4 MeasureCoupleState twin with the
+// grain sim). Returns the mean DYNAMIC-body rest line (pos.y), the GR4 grain repose slope (the bed-coherence
+// stat — the pile still holds an angle of repose around the body), the body's sink (the drop from its start),
+// and the dynamic body count. Deterministic Q16.16 stats for the proofs (the GR4/CP2 caveat shape — the rest
+// line + sink are EMERGENT/within-band, NOT exact depths). The repose is computed from the CURRENT grains via
+// grain::MeasureGrainRepose, bit-exact CPU<->GPU. `startY` is the body's initial pos.y (the caller passes the
+// scene's drop height) so sink = startY − restY is the body's net descent.
+struct CGrainState {
+    fx       restY = 0;          // the mean settled DYNAMIC-body pos.y (the emergent rest line)
+    fx       repose = 0;         // the GR4 grain repose slope (the bed-coherence stat)
+    fx       sink = 0;           // the body's drop from its start (startY − restY)
+    uint32_t dynamicBodies = 0;  // the count of dynamic bodies (restY is their mean)
+};
+inline CGrainState MeasureCGrainState(const CGrainWorld& world, fx startY) {
+    CGrainState s;
+    int64_t sum = 0;
+    for (const fpx::FxBody& b : world.bodies)
+        if (b.flags & fpx::kFlagDynamic) { sum += (int64_t)b.pos.y; ++s.dynamicBodies; }
+    s.restY = s.dynamicBodies == 0u ? 0 : (fx)(sum / (int64_t)s.dynamicBodies);
+    s.sink  = startY - s.restY;
+    // The grain repose slope over the current bed (the GR4 coherence metric). Empty pool -> 0.
+    if (!world.grains.empty())
+        s.repose = grain::MeasureGrainRepose(world.grains, world.groundY).slope;
+    return s;
+}
+
 }  // namespace cgrain
 }  // namespace hf::sim
