@@ -43,6 +43,10 @@
 // NOT modified (fluid is the additive sibling; fpx.h #included read-only + stays byte-unchanged).
 
 #include <cstdint>
+#include <cmath>     // FL3 ONLY: host-side BuildKernelTable poly6/spiky float math, snapped to Q16.16 ONCE
+                     // at build (the cloth.h restLen / mc.h kTriTable host-snap precedent). The per-step
+                     // bit-exact sim path (FL1 integrate, FL2 neighbors, FL3 ComputeDensity/ComputeLambda)
+                     // uses NO <cmath>/float — only the integer LUT BuildKernelTable produces.
 #include <vector>
 
 #include "sim/fpx.h"   // read-only: fx / fxmul / FxVec3 / FxAdd / FxSub / FxScale / kOne / kFrac
@@ -202,6 +206,10 @@ inline int CountAtGround(const std::vector<FluidParticle>& particles, fx groundY
 using fpx::FloorDiv;     // read-only: the deterministic floor-division (correct for negative coords)
 using fpx::FxCell;       // read-only: the int3 cell coordinate
 using fpx::CellId;       // read-only: the flat cell linearization
+using fpx::fxdiv;        // read-only (FL3): the int64 Q16.16 truncating divide (C_i, λ_i)
+using fpx::FxISqrt;      // read-only (FL3): the BUILD-TIME-ONLY integer sqrt (BuildKernelTable's |∇W| r)
+using fpx::FxLength;     // read-only (FL3): the int64 Q16.16 vector length (the λ gradient direction)
+using fpx::FxNormalize;  // read-only (FL3): the int64 Q16.16 unit vector (the λ gradient direction)
 
 // ----- The bounded dense grid over a fixed AABB (the deterministic cell-linearization scheme) ---------
 // CHOSEN SCHEME: a BOUNDED DENSE GRID. Cell-size = `h` (the PBF smoothing radius). A particle's cell coord
@@ -400,6 +408,193 @@ inline FluidNeighborList BuildNeighborList(const std::vector<FluidParticle>& par
         }
     }
     return list;
+}
+
+// ===== Slice FL3 — the PBF DENSITY + λ (host-snapped kernel LUT, the MAKE-OR-BREAK) ==================
+// The only genuinely fluid-specific computation: per particle gather the SPH DENSITY ρ_i over the FL2
+// neighbours via a HOST-SNAPPED Q16.16 kernel LUT, then the PBF scaling factor λ_i = −C_i/(Σ|∇C_i|²+ε)
+// with the unilateral density constraint C_i = ρ_i/ρ0 − 1. Per-particle INDEPENDENT (a gather over the
+// fixed FL2 neighbor list) -> multi-thread, NO atomics, NO single-thread/TDR. int64 (the squared
+// distance r² + the λ divide) -> fluid_density.comp/fluid_lambda.comp are Vulkan-only + Metal runs the
+// CPU reference (the FL1/CL3 convention). Strict zero-diff cross-backend (the integer bar).
+//
+// THE HOST-SNAPPED KERNEL LUT (the make-or-break move, the mc.h kTriTable / cloth.h restLen precedent):
+// raw SPH would evaluate poly6 W(r,h)=(315/64πh⁹)(h²−r²)³ and spiky ∇W symbolically — divide-heavy +
+// hard to keep monotone/non-negative in Q16.16. PBF + a TABULATED kernel dodges this: precompute W and
+// |∇W| as HOST-snapped Q16.16 values over B bins of r² ∈ [0, h²), computed ONCE at build (host float ->
+// host-snapped int, the ONLY FxISqrt/sqrt use, in BuildKernelTable). Shared C++ run on both backends ->
+// identical. r ≥ h (bin ≥ B) -> W = 0 (the FL2 over-inclusive box-candidate list is culled here). The
+// kernel is monotone-non-increasing + non-negative BY CONSTRUCTION (the table); there is NO in-shader
+// divide in the density (the ONE divide is λ's fxdiv). HONEST: the BINNED LUT is a FIDELITY
+// SIMPLIFICATION (a deterministic step-function approximation of the analytic continuous kernel — the
+// FPX3/CL3 caveat shape); the claim is DETERMINISM + cross-platform bit-identity, NOT "more physically
+// correct than Niagara".
+
+// FluidKernel: the host-snapped Q16.16 kernel LUT. W[bin] = poly6 density-kernel value (>= 0,
+// monotone-non-increasing in bin); gradW[bin] = the spiky-gradient MAGNITUDE |∇W| (>= 0). Both are
+// indexed by BinOf(r²) in [0, B); a neighbour with bin >= B (r >= h) contributes ZERO. h/restDensity/
+// epsilon are carried so ComputeDensity/ComputeLambda read them from the same struct.
+struct FluidKernel {
+    fx                h = 0;           // Q16.16 smoothing radius (== the FL2 cell-size / neighbour radius)
+    fx                restDensity = 0; // Q16.16 ρ0 (the target rest density; C_i = ρ_i/ρ0 − 1)
+    fx                epsilon = 0;     // Q16.16 CFM relaxation ε (the λ denominator regularizer)
+    int               bins = 0;        // B (the number of r² bins over [0, h²))
+    std::vector<fx>   W;               // [B] poly6 density-kernel, Q16.16, host-snapped, monotone-non-incr
+    std::vector<fx>   gradW;           // [B] spiky |∇W| magnitude, Q16.16, host-snapped
+};
+
+// kKernelBins: the LUT resolution. B = 64 r² bins over [0, h²). A step-function approximation of the
+// analytic kernel (the documented fidelity simplification); 64 bins is a deterministic, golden-stable
+// choice (NOT tuned for physical accuracy — that is out of scope for the deterministic flagship).
+inline constexpr int kKernelBins = 64;
+
+// H2Of(h): the squared Q16.16 magnitude h*h as an int64 (Q32.32-scaled — the FxLength sum-of-squares
+// convention). r² and h² are compared/binned in this SAME int64 squared-magnitude space, NO shift, so
+// the binning is a pure int64 integer op identical CPU<->shader.
+inline int64_t H2Of(fx h) { return (int64_t)h * (int64_t)h; }
+
+// RadiusSq(a, b): the squared Q16.16 distance |a − b|² as an int64 (each axis (a.axis−b.axis)² is an
+// int64 product — bounded positions STILL overflow int32 for dx², so int64 is REQUIRED; the FxLength
+// sum-of-squares discipline). The make-or-break int64 op the density gather + λ run. Identical
+// CPU<->shader (the shader copies THIS body VERBATIM).
+inline int64_t RadiusSq(const FxVec3& a, const FxVec3& b) {
+    const int64_t dx = (int64_t)a.x - (int64_t)b.x;
+    const int64_t dy = (int64_t)a.y - (int64_t)b.y;
+    const int64_t dz = (int64_t)a.z - (int64_t)b.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// BinOf(r2, h2, bins): the LUT bin for a squared distance r2 (int64) given h2 (int64) over `bins` bins.
+// r2 >= h2 -> `bins` (OUT OF RANGE: r >= h -> W = 0, the radial cull the FL2 box-candidate list deferred).
+// else floor((r2 * bins) / h2) in [0, bins). Pure int64 integer arithmetic (a multiply + a truncating
+// divide) -> identical CPU<->shader. h2 > 0 is guaranteed (h > 0).
+inline int BinOf(int64_t r2, int64_t h2, int bins) {
+    if (r2 >= h2) return bins;                 // r >= h -> out of range -> zero contribution
+    return (int)((r2 * (int64_t)bins) / h2);   // floor; in [0, bins)
+}
+
+// BuildKernelTable(h, restDensity, bins, epsilon): the HOST-SNAPPED Q16.16 kernel LUT (the make-or-break,
+// the ONLY place float / FxISqrt is used). Over `bins` bins of r² ∈ [0, h²), evaluate the analytic kernels
+// at each bin's LOWER r² edge (r²_bin = bin * h² / bins; r = sqrt(r²_bin)):
+//   * W[bin]   = poly6  (315/(64 π h⁹)) (h² − r²)³                (the density kernel; (h²−r²)³ is
+//                monotone-non-increasing in r² so W[bin] is monotone-non-increasing in bin, BY CONSTRUCTION).
+//   * gradW[bin] = spiky  (45/(π h⁶)) (h − r)²                   (the |∇W| MAGNITUDE the constraint
+//                gradient uses; (h−r)² monotone-non-increasing in r).
+// All in HOST DOUBLE, then ROUND-TO-NEAREST snapped to Q16.16 (the cloth.h restLen snap). Computed ONCE,
+// shared C++ -> identical both backends. NO per-step float (the integer ComputeDensity/ComputeLambda just
+// index this table). Document: B = bins (default kKernelBins = 64); h/ρ0/ε in Q16.16 world units.
+inline FluidKernel BuildKernelTable(fx h, fx restDensity, int bins, fx epsilon) {
+    FluidKernel k;
+    k.h = h;
+    k.restDensity = restDensity;
+    k.epsilon = epsilon;
+    k.bins = bins;
+    k.W.assign((size_t)bins, 0);
+    k.gradW.assign((size_t)bins, 0);
+    if (bins <= 0 || h <= 0) return k;
+
+    const double kPi = 3.14159265358979323846;
+    const double hf  = (double)h / (double)kOne;           // h in world units (float, build-time only)
+    const double h2f = hf * hf;                            // h² in world units
+    // The analytic 3D normalizations (poly6 + spiky-gradient magnitude). Standard SPH constants.
+    const double poly6Norm = 315.0 / (64.0 * kPi * std::pow(hf, 9.0));   // W(r,h) = poly6Norm (h²−r²)³
+    const double spikyNorm = 45.0  / (kPi * std::pow(hf, 6.0));          // |∇W(r,h)| = spikyNorm (h−r)²
+    auto snap = [](double v) -> fx {
+        // round-to-nearest, ties away from zero (the cloth.h / fpx.h BuildPileWorld snap).
+        const double s = v * (double)kOne;
+        return (fx)(s + (s < 0 ? -0.5 : 0.5));
+    };
+    for (int b = 0; b < bins; ++b) {
+        // The bin's LOWER r² edge in world units: r²_bin = (b / bins) * h² (the conservative, monotone
+        // representative — bin 0 is r=0 -> the peak self-density W[0]).
+        const double r2 = ((double)b / (double)bins) * h2f;
+        const double r  = std::sqrt(r2);                  // build-time sqrt (host float; the ONLY sqrt)
+        const double w  = poly6Norm * std::pow(h2f - r2, 3.0);     // >= 0 for r2 <= h2
+        const double gw = spikyNorm * (hf - r) * (hf - r);         // |∇W| magnitude, >= 0
+        k.W[(size_t)b]     = snap(w > 0.0 ? w : 0.0);
+        k.gradW[(size_t)b] = snap(gw > 0.0 ? gw : 0.0);
+    }
+    return k;
+}
+
+// ----- ComputeDensity: per particle ρ_i = W[0] (self) + Σ_{j∈neighbors(i)} W[bin(r_ij²)] -------------
+// The bit-exact core. For each particle i: start from the self-contribution W[0] (the r=0 peak), then for
+// each FL2 neighbour j gather W[BinOf(|p_i−p_j|², h², bins)] (a neighbour with bin >= bins, i.e. r >= h,
+// adds nothing — the deferred FL2 radial cull lands HERE). r_ij² is the int64 RadiusSq (bounded positions
+// STILL overflow int32 for dx², so int64 is REQUIRED). Deterministic (the fixed FL2 neighbour order). The
+// shader fluid_density.comp copies THIS body VERBATIM -> the host GPU==CPU memcmp catches any divergence.
+inline void ComputeDensity(const std::vector<FluidParticle>& particles, const FluidNeighborList& list,
+                           const FluidKernel& k, std::vector<fx>& densityOut) {
+    const uint32_t n = (uint32_t)particles.size();
+    const int64_t h2 = H2Of(k.h);
+    const fx wSelf = (k.bins > 0) ? k.W[0] : 0;
+    densityOut.assign((size_t)n, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        fx rho = wSelf;                                   // the self-density term (r = 0 -> W[0])
+        const uint32_t s0 = list.neighborStart[i], s1 = list.neighborStart[i + 1u];
+        for (uint32_t s = s0; s < s1; ++s) {
+            const uint32_t j = list.neighbors[s];
+            const int bin = BinOf(RadiusSq(particles[i].pos, particles[j].pos), h2, k.bins);
+            if (bin < k.bins) rho += k.W[(size_t)bin];    // r >= h -> bin == k.bins -> no contribution
+        }
+        densityOut[(size_t)i] = rho;
+    }
+}
+
+// ----- ComputeLambda: per particle λ_i = −C_i / (Σ_k |∇_k C_i|² + ε), unilateral C_i<0 -> λ_i=0 --------
+// The PBF scaling factor. For each particle i:
+//   C_i      = fxdiv(ρ_i, ρ0) − kOne                                    (the density constraint, Q16.16)
+//   ∇_j C_i  = (gradW[bin] / ρ0) * dir(p_i − p_j)   for each neighbour j (the per-neighbour gradient)
+//   ∇_i C_i  = −Σ_j ∇_j C_i  (the self gradient; |∇_i C_i|² included in the sum)
+//   Σgrad²   = Σ_j |∇_j C_i|²  +  |∇_i C_i|²                            (the sum of squared gradients)
+//   λ_i      = fxdiv(−C_i, Σgrad² + ε)
+// The UNILATERAL clamp: C_i < 0 (under-dense surface — fluid doesn't PULL together) -> λ_i = 0 (a fixed
+// integer compare). int64 throughout (fxdiv + the grad² fxmul accumulate + FxNormalize). The gradient
+// magnitude per axis is fxmul(gradWScaled, dir.axis) where gradWScaled = fxdiv(gradW[bin], ρ0) and dir =
+// FxNormalize(p_i − p_j) (the int64 FxLength/FxISqrt direction). The shader fluid_lambda.comp copies THIS
+// body VERBATIM. Deterministic (fixed FL2 neighbour order). densityOut from ComputeDensity is the input.
+inline void ComputeLambda(const std::vector<FluidParticle>& particles, const FluidNeighborList& list,
+                          const FluidKernel& k, const std::vector<fx>& density, std::vector<fx>& lambdaOut) {
+    const uint32_t n = (uint32_t)particles.size();
+    const int64_t h2 = H2Of(k.h);
+    lambdaOut.assign((size_t)n, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        // C_i = ρ_i / ρ0 − 1 (Q16.16). fxdiv handles ρ0 != 0 (BuildKernelTable's restDensity > 0).
+        const fx Ci = fxdiv(density[(size_t)i], k.restDensity) - kOne;
+        // Unilateral: an UNDER-dense particle (C_i < 0) gets λ = 0 (no pulling-together correction).
+        if (Ci < 0) { lambdaOut[(size_t)i] = 0; continue; }
+
+        FxVec3 gradSelf{0, 0, 0};   // ∇_i C_i = −Σ_j ∇_j C_i (accumulated; its |·|² joins the sum)
+        fx sumGrad2 = 0;            // Σ_j |∇_j C_i|² (the neighbour terms; the self term added after)
+        const uint32_t s0 = list.neighborStart[i], s1 = list.neighborStart[i + 1u];
+        for (uint32_t s = s0; s < s1; ++s) {
+            const uint32_t j = list.neighbors[s];
+            const int bin = BinOf(RadiusSq(particles[i].pos, particles[j].pos), h2, k.bins);
+            if (bin >= k.bins) continue;                      // r >= h -> zero gradient
+            // gradWScaled = |∇W| / ρ0; dir = unit(p_i − p_j); ∇_j C_i = gradWScaled * dir (per axis fxmul).
+            const fx gradWScaled = fxdiv(k.gradW[(size_t)bin], k.restDensity);
+            const FxVec3 dir = FxNormalize(FxSub(particles[i].pos, particles[j].pos));
+            const FxVec3 g{fxmul(gradWScaled, dir.x), fxmul(gradWScaled, dir.y), fxmul(gradWScaled, dir.z)};
+            // |∇_j C_i|² = g·g (each fxmul is Q16.16; the sum is Q16.16).
+            sumGrad2 += fxmul(g.x, g.x) + fxmul(g.y, g.y) + fxmul(g.z, g.z);
+            // accumulate the self gradient ∇_i C_i = −Σ_j ∇_j C_i.
+            gradSelf.x -= g.x; gradSelf.y -= g.y; gradSelf.z -= g.z;
+        }
+        // |∇_i C_i|² joins the sum (the standard PBF Σ_k includes k = i).
+        sumGrad2 += fxmul(gradSelf.x, gradSelf.x) + fxmul(gradSelf.y, gradSelf.y) +
+                    fxmul(gradSelf.z, gradSelf.z);
+        // λ_i = −C_i / (Σgrad² + ε). The CFM ε regularizes the denominator (PBF's stability term).
+        lambdaOut[(size_t)i] = fxdiv(-Ci, sumGrad2 + k.epsilon);
+    }
+}
+
+// MeanDensity(density): the deterministic integer mean ρ̄ of the density array (a reporting/coherence
+// stat — Σρ / N, pure integer). Empty -> 0. Bit-exact CPU<->GPU (the GPU read-back feeds the same sum).
+inline fx MeanDensity(const std::vector<fx>& density) {
+    if (density.empty()) return 0;
+    int64_t sum = 0;
+    for (fx d : density) sum += (int64_t)d;
+    return (fx)(sum / (int64_t)density.size());
 }
 
 }  // namespace fluid

@@ -405,6 +405,162 @@ int main() {
         check(nls.neighbors.empty(), "neighbor: particles spread > h apart -> 0 neighbors");
     }
 
+    // ================= FL3: BuildKernelTable — monotone non-increasing W, W[>=B] = 0 ==================
+    {
+        const fx h = (fx)(2 * (int)kOne);            // h = 2.0
+        const fx rho0 = (fx)(8 * (int)kOne);         // a target rest density
+        const fx eps = kOne / 100;                   // CFM ε
+        const int B = fluid::kKernelBins;
+        fluid::FluidKernel k = fluid::BuildKernelTable(h, rho0, B, eps);
+        check((int)k.W.size() == B && (int)k.gradW.size() == B, "kernel: W/gradW sized to B");
+        check(k.bins == B && k.h == h && k.restDensity == rho0 && k.epsilon == eps,
+              "kernel: params carried");
+        check(k.W[0] > 0, "kernel: W[0] (self peak) > 0");
+        // poly6 (h²−r²)³ is monotone-non-increasing in r² -> W[bin] monotone-non-increasing in bin, all >=0.
+        bool mono = true, nonneg = true;
+        for (int b = 0; b < B; ++b) {
+            if (k.W[(size_t)b] < 0) nonneg = false;
+            if (b > 0 && k.W[(size_t)b] > k.W[(size_t)b - 1]) mono = false;
+        }
+        check(mono, "kernel: W monotone non-increasing");
+        check(nonneg, "kernel: W non-negative");
+        // gradW (h−r)² monotone-non-increasing, non-negative.
+        bool gmono = true, gnonneg = true;
+        for (int b = 0; b < B; ++b) {
+            if (k.gradW[(size_t)b] < 0) gnonneg = false;
+            if (b > 0 && k.gradW[(size_t)b] > k.gradW[(size_t)b - 1]) gmono = false;
+        }
+        check(gmono && gnonneg, "kernel: gradW monotone non-increasing + non-negative");
+        // BinOf: r²>=h² -> B (out of range -> W=0); r=0 -> bin 0.
+        const int64_t h2 = fluid::H2Of(h);
+        check(fluid::BinOf(0, h2, B) == 0, "BinOf: r²=0 -> bin 0");
+        check(fluid::BinOf(h2, h2, B) == B, "BinOf: r²==h² -> B (out of range)");
+        check(fluid::BinOf(h2 + 1, h2, B) == B, "BinOf: r²>h² -> B (out of range)");
+        check(fluid::BinOf(h2 / 2, h2, B) == B / 2, "BinOf: r²=h²/2 -> bin B/2");
+    }
+
+    // ================= FL3: isolated particle -> ρ = W[0] (self only); λ = 0 (sparse no-op) ===========
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        const fx rho0 = (fx)(8 * (int)kOne);
+        const fx eps = kOne / 100;
+        const int B = fluid::kKernelBins;
+        fluid::FluidKernel k = fluid::BuildKernelTable(h, rho0, B, eps);
+
+        std::vector<fluid::FluidParticle> one(1);
+        one[0].pos = {FromInt(5), FromInt(2), FromInt(-3)}; one[0].invMass = kOne;
+        fluid::FluidGrid g = fluid::MakeGrid(one, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(one, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(one, g, t, h);
+        std::vector<fx> rho, lam;
+        fluid::ComputeDensity(one, nl, k, rho);
+        fluid::ComputeLambda(one, nl, k, rho, lam);
+        check(rho.size() == 1 && rho[0] == k.W[0], "density: isolated particle -> ρ = W[0] (self only)");
+        // ρ (W[0]) < ρ0 -> C_i < 0 -> unilateral clamp -> λ = 0 (the sparse no-op).
+        check(lam.size() == 1 && lam[0] == 0, "lambda: isolated particle -> λ = 0 (unilateral clamp)");
+    }
+
+    // ================= FL3: two particles at a known r -> ρ = W[0] + W[bin(r²)] (hand-checked) ========
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        const fx rho0 = (fx)(8 * (int)kOne);
+        const fx eps = kOne / 100;
+        const int B = fluid::kKernelBins;
+        fluid::FluidKernel k = fluid::BuildKernelTable(h, rho0, B, eps);
+
+        // Two particles 1.0 apart on x (r = 1.0 < h = 2.0 -> within the kernel). r² = 1.0 in world units.
+        std::vector<fluid::FluidParticle> two(2);
+        two[0].pos = {0, 0, 0};
+        two[1].pos = {FromInt(1), 0, 0};
+        for (auto& p : two) p.invMass = kOne;
+        fluid::FluidGrid g = fluid::MakeGrid(two, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(two, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(two, g, t, h);
+        std::vector<fx> rho;
+        fluid::ComputeDensity(two, nl, k, rho);
+
+        // Hand-check: r² = (1.0)² in the int64 squared-Q16.16 space; bin = BinOf(r², h², B). Each particle
+        // sees the OTHER as its one neighbour -> ρ = W[0] + W[bin].
+        const int64_t r2 = fluid::RadiusSq(two[0].pos, two[1].pos);
+        const int64_t h2 = fluid::H2Of(h);
+        const int bin = fluid::BinOf(r2, h2, B);
+        check(bin > 0 && bin < B, "density(2): r=1.0 -> bin in (0, B)");
+        const fx expected = k.W[0] + k.W[(size_t)bin];
+        check(rho.size() == 2 && rho[0] == expected && rho[1] == expected,
+              "density(2): ρ = W[0] + W[bin(r²)] (hand-checked, symmetric)");
+        check(rho[0] > k.W[0], "density(2): a neighbour raises ρ above the self peak");
+    }
+
+    // ================= FL3: a known dense pair -> C_i > 0 -> λ_i computed (not clamped) ================
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        const int B = fluid::kKernelBins;
+        const fx eps = kOne / 100;
+        // Build a tiny tight cluster: a 3x3x3 block at spacing 0.5 so each particle has many neighbours
+        // within h -> ρ is large. Pick ρ0 BELOW the interior density so the interior C_i > 0 (over-dense).
+        fluid::FluidBlock blk;
+        blk.W = 3; blk.H = 3; blk.D = 3;
+        blk.spacing = kOne / 2;                          // 0.5 spacing -> dense
+        blk.origin = fluid::FxVec3{0, 0, 0};
+        std::vector<fluid::FluidParticle> ps = fluid::InitBlock(blk);
+        fluid::FluidGrid g = fluid::MakeGrid(ps, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(ps, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(ps, g, t, h);
+        // First measure the center particle's density, then choose ρ0 below it.
+        std::vector<fx> probe;
+        fluid::FluidKernel kp = fluid::BuildKernelTable(h, kOne, B, eps);
+        fluid::ComputeDensity(ps, nl, kp, probe);
+        const int center = fluid::ParticleIndex(blk, 1, 1, 1);
+        const fx rhoCenter = probe[(size_t)center];
+        check(rhoCenter > kp.W[0], "lambda-pre: center denser than the self peak");
+        // ρ0 = half the center density -> C_center = rho/rho0 - 1 ~ +1 > 0 -> NOT clamped, λ computed.
+        const fx rho0 = rhoCenter / 2;
+        fluid::FluidKernel k = fluid::BuildKernelTable(h, rho0, B, eps);
+        std::vector<fx> rho, lam;
+        fluid::ComputeDensity(ps, nl, k, rho);
+        fluid::ComputeLambda(ps, nl, k, rho, lam);
+        const fx Cc = fluid::fxdiv(rho[(size_t)center], rho0) - kOne;
+        check(Cc > 0, "lambda: over-dense center -> C_i > 0");
+        // λ = −C / (Σgrad² + ε); C>0 -> λ < 0 (the standard PBF sign for an over-dense particle).
+        check(lam[(size_t)center] != 0, "lambda: over-dense center -> λ != 0 (not clamped)");
+        check(lam[(size_t)center] < 0, "lambda: over-dense (C>0) -> λ < 0");
+        // determinism: two runs byte-identical.
+        std::vector<fx> rho2, lam2;
+        fluid::ComputeDensity(ps, nl, k, rho2);
+        fluid::ComputeLambda(ps, nl, k, rho2, lam2);
+        check(rho == rho2 && lam == lam2, "density/lambda: two runs byte-identical (deterministic)");
+    }
+
+    // ================= FL3: a dense block -> ρ̄ coherent (all ρ_i > 0, interior denser) ================
+    {
+        const fx h = (fx)(2 * (int)kOne);
+        const fx rho0 = (fx)(8 * (int)kOne);
+        const fx eps = kOne / 100;
+        const int B = fluid::kKernelBins;
+        fluid::FluidKernel k = fluid::BuildKernelTable(h, rho0, B, eps);
+
+        fluid::FluidBlock blk;
+        blk.W = 6; blk.H = 6; blk.D = 6;
+        blk.spacing = kOne;                              // spacing 1.0 < h -> coherent overlap
+        blk.origin = fluid::FxVec3{0, 0, 0};
+        std::vector<fluid::FluidParticle> ps = fluid::InitBlock(blk);
+        fluid::FluidGrid g = fluid::MakeGrid(ps, h);
+        fluid::FluidCellTable t = fluid::BuildCellTable(ps, g);
+        fluid::FluidNeighborList nl = fluid::BuildNeighborList(ps, g, t, h);
+        std::vector<fx> rho;
+        fluid::ComputeDensity(ps, nl, k, rho);
+        bool allPos = true;
+        for (fx d : rho) if (d <= 0) allPos = false;
+        check(allPos, "density(block): all ρ_i > 0 (every particle at least self-dense)");
+        // interior (3,3,3) denser than a corner (0,0,0) — more neighbours within h.
+        const fx rhoInterior = rho[(size_t)fluid::ParticleIndex(blk, 3, 3, 3)];
+        const fx rhoCorner   = rho[(size_t)fluid::ParticleIndex(blk, 0, 0, 0)];
+        check(rhoInterior > rhoCorner, "density(block): interior denser than corner (coherent field)");
+        const fx mean = fluid::MeanDensity(rho);
+        check(mean > 0, "density(block): mean ρ̄ > 0");
+        check(mean >= rhoCorner && mean <= rhoInterior, "density(block): ρ̄ between corner and interior");
+    }
+
     if (g_fail == 0) std::printf("fluid_test: ALL PASS\n");
     else std::printf("fluid_test: %d FAILURES\n", g_fail);
     return g_fail == 0 ? 0 : 1;
