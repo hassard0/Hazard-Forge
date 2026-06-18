@@ -337,6 +337,23 @@ hf_gen_msl(grain_cell_emit.comp      grain_cell_emit.comp.hlsl      comp grain_c
 hf_gen_msl(grain_neighbor_count.comp grain_neighbor_count.comp.hlsl comp grain_neighbor_count_main)
 hf_gen_msl(grain_neighbor_scan.comp  grain_neighbor_scan.comp.hlsl  comp grain_neighbor_scan_main)
 hf_gen_msl(grain_neighbor_emit.comp  grain_neighbor_emit.comp.hlsl  comp grain_neighbor_emit_main)
+# Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
+# grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
+# table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new
+# cell-table passes). couple_body_count.comp (ONE thread per body: count the fluid particles in the body's
+# BodyAabb cell RANGE [CellOf(pos-radius) .. CellOf(pos+radius)] passing the per-axis |body.pos.axis -
+# p.pos.axis| < body.radius reject — BodyParticleAccept VERBATIM; a body spans MANY cells, NOT a fixed 27-cell
+# stencil), couple_body_scan.comp (SINGLE-THREAD exclusive prefix-sum -> bodyStart CSR + sentinel),
+# couple_body_emit.comp (ONE thread per body emits its gathered particle indices into its DISJOINT
+# bodyParticles[] slice, NO atomics). ALL PURE INT32 (FloorDiv integer divide + per-axis abs-compare, NO
+# products/int64/fxmul/sqrt, NO radial sphere cull — deferred to CP2's force), so glslc CAN lower them and they
+# MSL-generate NATIVELY (the default MSL gen suffices, the grain_neighbor lesson). The Metal --couple-query
+# showcase dispatches the GPU shaders directly (NOT a CPU fallback) -> the GPU==CPU cell-table+query proof runs
+# on Metal too. Bit-exact GPU==CPU + cross-backend by construction. Behind --couple-query only; the FL2/GR2
+# pipelines + their goldens untouched; couple.h #includes fpx.h + fluid.h read-only (the additive sibling).
+hf_gen_msl(couple_body_count.comp couple_body_count.comp.hlsl comp couple_body_count_main)
+hf_gen_msl(couple_body_scan.comp  couple_body_scan.comp.hlsl  comp couple_body_scan_main)
+hf_gen_msl(couple_body_emit.comp  couple_body_emit.comp.hlsl  comp couple_body_emit_main)
 # Deterministic GPU Cloth Slice 2 (Slice CL2, the 2nd slice of FLAGSHIP #8): the DISTANCE-CONSTRAINT GRAPH
 # BUILD (the FPX2 count->scan->emit on lattice particles). cloth_edge_count.comp (ONE thread per particle:
 # gEdgeCount[p]=#OWNED forward edges in bounds), cloth_edge_scan.comp (SINGLE-THREAD exclusive prefix-sum ->

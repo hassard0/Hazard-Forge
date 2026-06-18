@@ -526,6 +526,24 @@ hf_compile_shaders(
     "shaders/grain_neighbor_count.comp.hlsl:cs"
     "shaders/grain_neighbor_scan.comp.hlsl:cs"
     "shaders/grain_neighbor_emit.comp.hlsl:cs"
+    # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
+    # grid-hash QUERY meshed by THREE pure-INT32 count->scan->emit passes (the GR2 grain_neighbor twin, per
+    # BODY instead of per grain) OVER the reused FL2 fluid cell table (fluid_cell_{count,scan,emit} build the
+    # cellStart/cellParticles the query iterates — no new cell-table passes). couple_body_count.comp (ONE
+    # thread per body: count the fluid particles in the body's BodyAabb cell RANGE [CellOf(pos-radius) ..
+    # CellOf(pos+radius)] passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject —
+    # BodyParticleAccept VERBATIM; a body spans MANY cells, NOT a fixed 27-cell stencil), couple_body_scan.comp
+    # (SINGLE-THREAD [numthreads(1,1,1)] exclusive prefix-sum -> bodyStart CSR + sentinel), couple_body_emit.comp
+    # (ONE thread per body emits its gathered particle indices into its DISJOINT bodyParticles[] slice, NO
+    # atomics — the per-body-disjoint pattern). ALL PURE INT32 (FloorDiv integer divide + per-axis abs-compare,
+    # NO int64/fxmul/sqrt, NO radial sphere cull — deferred to CP2's force), so these MSL-GENERATE NATIVELY
+    # (they ARE in the Metal hf_gen_msl list) and Metal dispatches the GPU passes (a true GPU pass on both
+    # backends, the GR2 precedent). ReadBuffer reads cellStart + cellParticles + bodyStart + bodyParticles,
+    # PROVEN BIT-EXACT vs the CPU couple.h::BuildCellTable + GatherBodyParticles (memcmp). NO momentum exchange
+    # (CP2-CP4), NO new RHI; couple.h #includes fpx.h + fluid.h read-only (the additive sibling).
+    "shaders/couple_body_count.comp.hlsl:cs"
+    "shaders/couple_body_scan.comp.hlsl:cs"
+    "shaders/couple_body_emit.comp.hlsl:cs"
     # Deterministic GPU Granular/Sand Slice 3 (Slice GR3, the FRICTIONLESS CONTACT PROJECTION of FLAGSHIP
     # #10, the FL4 fluid_dp/fluid_apply/fluid_collide twin): the JACOBI contact solve. The K-step JACOBI loop
     # is HOST-driven (predict[GR1] -> GR2 neighbour passes[host-rebuilt from the predicted positions] ->

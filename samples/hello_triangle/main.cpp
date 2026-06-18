@@ -71,6 +71,7 @@
 #include "sim/cloth.h"          // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp
 #include "sim/fluid.h"          // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp
 #include "sim/grain.h"          // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp
+#include "sim/couple.h"         // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -457,6 +458,7 @@ int main(int argc, char** argv) {
     const char* fluidIntegrateShotPath = nullptr; // --fluid-integrate-shot <out.bmp> (Slice FL1: Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #9 — a 10x10x10 = 1000-particle dam-break block in a corner integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/settling block)
     const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
+    const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
     const char* grainContactShotPath = nullptr; // --grain-contact-shot <out.bmp> (Slice GR3: Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION, the 3rd slice of FLAGSHIP #10, the FL4 Jacobi-solve twin — a dropped grain block over the ground + a static FxBody sphere is settled into a LOOSE frictionless HEAP by StepGrainContactSteps K steps x iters JACOBI contact iterations (predict[GR1] -> GR2 neighbours[rebuilt from the predicted positions] -> {SolveGrainContact(Δp_i = Σ (w_i/(w_i+w_j))·pen·unit(p_i−p_j) over the overlapping neighbours, into a SEPARATE dp buffer) -> apply p+=dp}×iters -> vel=(pos-prev)/dt -> CollideGrainPlane(pos.y>=groundY+radius)+CollideGrainSpheres(centre->sphereR+grainR)). The K-step loop is HOST-driven over MULTI-THREAD per-grain passes (grain_contact_dp + grain_contact_apply + grain_collide, ONE thread per grain, ComputeToComputeBarrier between — Jacobi -> NO atomics, NO single-thread, NO TDR), int64 -> Vulkan-only; Metal runs the CPU StepGrainContact. GPU==CPU grain array bit-exact vs grain.h::StepGrainContactSteps, a deterministic penetration metric RELIEVED (penAfter < penBefore, the FL4 honesty — not zero), integer side-view of the settled loose pile. NO friction (GR4 — the pile spreads flat), NO lockstep (GR5), NO float render (GR6))
     const char* grainFrictionShotPath = nullptr; // --grain-friction-shot <out.bmp> (Slice GR4: Deterministic GPU Granular/Sand TANGENTIAL COULOMB FRICTION — the angle-of-repose money-shot, the SIGNATURE slice of FLAGSHIP #10. A 5x5x5 staggered grain block dropped onto FLAT ground (NO collider sphere — friction alone holds the heap) is settled into a self-supporting CONE by StepGrainFrictionSteps K steps x iters JACOBI iterations, EACH adding a TANGENTIAL friction sub-pass (grain_friction Δp_i = Σ −share·corr where corr is the tangential relative displacement Δx_t clamped to the Coulomb cone fxmul(μ,pen)) after the GR3 NORMAL push (grain_contact_dp -> apply): {grain_contact_dp -> apply -> grain_friction -> apply}×iters -> vel -> grain_collide. The K-step loop is HOST-driven over MULTI-THREAD per-grain passes; GPU==CPU grain array bit-exact vs grain.h::StepGrainFrictionSteps (memcmp). The HONEST slope-stability metric (MeasureGrainRepose {height,baseRadius,slope}): the repose angle is EMERGENT + deterministic + two-run byte-identical, slope clearly > the μ=0 frictionless control, within a μ-implied band — NOT an exact degree. int64 -> grain_friction Vulkan-only; Metal --grain-friction runs the CPU StepGrainFriction. REUSES grain_contact_apply + grain_collide (GR3). NO lockstep (GR5), NO float render (GR6), NO new RHI)
     const char* grainLockstepShotPath = nullptr; // --grain-lockstep-shot <out.bmp> (Slice GR5: Deterministic GPU Granular/Sand LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #10 — PURE-CPU harness over the GR1-GR4 granular sim WITH friction (the FL5/CL5/FPX5 twin): a 5x5x5 staggered grain block (the GR4 friction scene, μ=0.8) fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-grain-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
@@ -656,6 +658,18 @@ int main(int argc, char** argv) {
         // else-if chain) to avoid MSVC's nested-block parse limit C1061, like the gr1/fl2/cloth/fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--grain-neighbors-shot") == 0 && i + 1 < argc) {
             grainNeighborsShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice CP1: --couple-query-shot <out.bmp> — the Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED
+        // WORLD + BODY->FLUID grid-hash QUERY (the BEACHHEAD of FLAGSHIP #11). A settled fluid pool + a few
+        // FxBody spheres placed partly submerged -> build the FL2 fluid grid + cell table (reused fluid_cell_*)
+        // then the per-body fluid-particle query via THREE pure-INT32 couple_body_{count,scan,emit} passes,
+        // GPU==CPU {cellTable, perBodyList} bit-exact vs couple.h::GatherBodyParticles, per-body
+        // gathered-particle heat viz. PURE int32 (NO int64/sqrt, NO radial sphere cull — CP2's force) ->
+        // MSL-native on Metal. NO momentum exchange (CP2-CP4), NO new RHI. STANDALONE branch (C1061 avoidance).
+        if (std::strcmp(argv[i], "--couple-query-shot") == 0 && i + 1 < argc) {
+            coupleQueryShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -15474,6 +15488,374 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — grain pool side-view (%d moved, %d at ground)\n",
                                 grainIntegrateShotPath, imgW, imgH, moved, restingAtGround);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", grainIntegrateShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY
+        // (--couple-query-shot <out.bmp>, Slice CP1, the BEACHHEAD of FLAGSHIP #11). A settled fluid pool (the
+        // FL1 InitBlock, a few IntegrateFluid steps so it piles at the ground) + a few FxBody spheres placed
+        // partly submerged (and one floating CLEAR of the pool). The fluid pool is bucketed into the FL2
+        // uniform spatial-hash grid (cell-size h) by the THREE reused FL2 passes: fluid_cell_count (per-particle
+        // InterlockedAdd into the cell's counter) -> (barrier) fluid_cell_scan (single-thread exclusive
+        // prefix-sum -> cellStart CSR) -> (barrier) fluid_cell_emit (single-thread ascending-particle scatter
+        // -> cellParticles). Then the per-body QUERY by the THREE NEW pure-INT32 passes: couple_body_count (one
+        // thread per body: count the fluid particles in the body's BodyAabb cell RANGE passing the per-axis
+        // |body.pos.axis - p.pos.axis| < body.radius reject) -> (barrier) couple_body_scan (single-thread
+        // exclusive prefix-sum -> bodyStart) -> (barrier) couple_body_emit (one thread per body emits its
+        // gathered particle indices into its DISJOINT bodyParticles[] slice, NO atomics). FloorDiv/
+        // BodyParticleAccept copied VERBATIM from couple.h (PURE INT32: integer divide + per-axis abs-compare,
+        // NO int64/sqrt -> MSL-native on Metal). ReadBuffer reads cellStart + cellParticles + bodyStart +
+        // bodyParticles + perBodyCount; the CPU couple.h::BuildCellTable + GatherBodyParticles over the SAME
+        // world must match BIT-EXACT (memcmp, NO tol). enabled=false -> cleared (no-op). The golden is a
+        // per-body gathered-particle HEAT viz (submerged bodies populated, clear bodies empty). NO momentum
+        // exchange (CP2-CP4), NO radial sphere cull, NO new RHI. One BMP -> exit. (STANDALONE branch, C1061.)
+        if (coupleQueryShotPath) {
+            using math::Vec3;
+            namespace couple = hf::sim::couple;
+            namespace fluid  = hf::sim::fluid;
+            namespace fpx    = hf::sim::fpx;
+
+            // The fluid pool: an FL1 dam-break block settled to a shallow pool at the ground. Modest count so
+            // the showcase is fast (10x4x10 = 400 particles). Cell size h = 1.0 (== the spacing -> a
+            // non-degenerate grid). The pool spans x,z in [0,9], y near the ground.
+            const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fluid::fx kDt = fluid::kOne / 60;
+            const fluid::fx kGroundY = 0;
+            const fluid::FxVec3 kGravity{0, kGravY, 0};
+            const fluid::fx kH = fluid::kOne;                  // 1.0 cell size (== the block spacing)
+
+            fluid::FluidBlock block;
+            block.W = 10; block.H = 4; block.D = 10;           // 400 particles
+            block.spacing = fluid::kOne;                       // 1.0 world unit spacing
+            block.origin = fluid::FxVec3{0, (fluid::fx)(3 * (int)fluid::kOne), 0};
+            std::vector<fluid::FluidParticle> particles = fluid::InitBlock(block);
+            // Settle a handful of steps so the block piles at the ground (a shallow pool, y in [0,~3]).
+            fluid::IntegrateFluidSteps(particles, kGravity, kDt, kGroundY, 40);
+
+            // The bodies: two spheres SUBMERGED in the pool (radius 2 -> each gathers the box of particles in
+            // its sphere), one body floating CLEAR above the pool (gathers 0 -> the coverage/empty proof).
+            auto makeBody = [&](int wx, int wy, int wz, int rUnits) {
+                fpx::FxBody b;
+                b.pos = fpx::FxVec3{(fpx::fx)(wx * (int)fluid::kOne), (fpx::fx)(wy * (int)fluid::kOne),
+                                    (fpx::fx)(wz * (int)fluid::kOne)};
+                b.invMass = fluid::kOne; b.flags = fpx::kFlagDynamic;
+                b.radius = (fpx::fx)(rUnits * (int)fluid::kOne);
+                return b;
+            };
+            couple::CoupleWorld world;
+            world.particles = particles;
+            world.kernel.h = kH;
+            world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+            world.bodies = {
+                makeBody(3, 1, 4, 2),    // submerged in the pool
+                makeBody(7, 1, 5, 2),    // submerged in the pool (disjoint from body 0)
+                makeBody(5, 20, 5, 2),   // floating CLEAR above the pool -> gathers 0
+            };
+            const int kBodyCount = (int)world.bodies.size();
+            const int kParticleCount = (int)world.particles.size();
+
+            // The CPU reference grid + cell table + per-body query (the GPU memcmp's against this).
+            const fluid::FluidGrid grid = fluid::MakeGrid(world.particles, kH);
+            const uint32_t kCellCount = fluid::CellCount(grid);
+            const fluid::FluidCellTable cpuTable = fluid::BuildCellTable(world.particles, grid);
+            const couple::CoupleQuery cpuQuery = couple::GatherBodyParticles(world);
+            const uint32_t kTotalGathered = couple::CountGathered(cpuQuery);
+            const uint32_t kGatherAlloc = kTotalGathered > 0u ? kTotalGathered : 1u;
+
+            // std430 FluidParticle mirror (matches the fluid_cell/couple shaders): 11 x int32 (44 bytes).
+            struct FluidParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+            };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            std::vector<FluidParticleGpu> particlesInit((size_t)kParticleCount);
+            for (int i = 0; i < kParticleCount; ++i) {
+                const fluid::FluidParticle& p = world.particles[(size_t)i];
+                particlesInit[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+                    p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+            }
+            rhi::BufferDesc partDesc;
+            partDesc.size = particlesInit.size() * sizeof(FluidParticleGpu);
+            partDesc.initialData = particlesInit.data();
+            partDesc.usage = rhi::BufferUsage::Storage;
+            auto particlesBuf = device->CreateBuffer(partDesc);   // read-only on the GPU (shared)
+
+            // std430 CoupleBody mirror (matches the couple shaders): pos.xyz + radius = 4 x int32 (16 bytes).
+            struct CoupleBodyGpu { int32_t bx, by, bz, radius; };
+            static_assert(sizeof(CoupleBodyGpu) == 16, "CoupleBodyGpu std430 layout");
+            std::vector<CoupleBodyGpu> bodiesInit((size_t)kBodyCount);
+            for (int i = 0; i < kBodyCount; ++i) {
+                const fpx::FxBody& b = world.bodies[(size_t)i];
+                bodiesInit[(size_t)i] = CoupleBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.radius};
+            }
+            rhi::BufferDesc bodyDesc;
+            bodyDesc.size = bodiesInit.size() * sizeof(CoupleBodyGpu);
+            bodyDesc.initialData = bodiesInit.data();
+            bodyDesc.usage = rhi::BufferUsage::Storage;
+            auto bodiesBuf = device->CreateBuffer(bodyDesc);
+
+            // std430 params: int4 grid {h, cellMinX, cellMinY, cellMinZ} + int4 dim {gridDimX, gridDimY,
+            // gridDimZ, particleOrBodyCount} + int4 cfg {cellCount, enabled, _, _}. The FL2 cell passes read
+            // dim.w = particleCount; the couple passes read dim.w = bodyCount -> TWO param buffers.
+            struct CoupleParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+            static_assert(sizeof(CoupleParams) == 48, "CoupleParams std430 layout");
+            auto makeParams = [&](int32_t countW, int32_t enabled) {
+                CoupleParams p{};
+                p.grid[0] = kH; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y; p.grid[3] = grid.cellMin.z;
+                p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z; p.dim[3] = countW;
+                p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+                return p;
+            };
+
+            // Fresh-cleared per-run output buffers.
+            std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+            std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+            std::vector<uint32_t> cellPartInit((size_t)kParticleCount, 0u);
+            std::vector<uint32_t> perBodyInit((size_t)kBodyCount, 0u);
+            std::vector<uint32_t> bodyStartInit((size_t)kBodyCount + 1u, 0u);
+            std::vector<uint32_t> bodyPartInit((size_t)kGatherAlloc, 0u);
+            auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+                rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+                d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Pipelines: fluid_cell_count(3 SSBO,64t), fluid_cell_scan(3,1t), fluid_cell_emit(5,1t),
+            // couple_body_count(6,64t), couple_body_scan(3,1t), couple_body_emit(7,64t).
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                auto pipe = device->CreateComputePipeline(d);
+                return std::make_pair(std::move(cs), std::move(pipe));
+            };
+            auto cellCountPipe = mkPipe("fluid_cell_count.comp.hlsl.spv", 3, 64);
+            auto cellScanPipe  = mkPipe("fluid_cell_scan.comp.hlsl.spv", 3, 1);
+            auto cellEmitPipe  = mkPipe("fluid_cell_emit.comp.hlsl.spv", 5, 1);
+            auto bodyCountPipe = mkPipe("couple_body_count.comp.hlsl.spv", 6, 64);
+            auto bodyScanPipe  = mkPipe("couple_body_scan.comp.hlsl.spv", 3, 1);
+            auto bodyEmitPipe  = mkPipe("couple_body_emit.comp.hlsl.spv", 7, 64);
+
+            const uint32_t kPartGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+            const uint32_t kBodyGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+            // Run the full 6-pass pipeline over fresh output buffers; read all read-back buffers.
+            auto runQuery = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                                std::vector<uint32_t>& outCellPart, std::vector<uint32_t>& outBodyStart,
+                                std::vector<uint32_t>& outBodyPart, std::vector<uint32_t>& outPerBody) {
+                auto cellCountBuf = makeUintBuf(cellCountInit);
+                auto cellStartBuf = makeUintBuf(cellStartInit);
+                auto cellCursorBuf = makeUintBuf(cellCursorInit);
+                auto cellPartBuf = makeUintBuf(cellPartInit);
+                auto perBodyBuf = makeUintBuf(perBodyInit);
+                auto bodyStartBuf = makeUintBuf(bodyStartInit);
+                auto bodyPartBuf = makeUintBuf(bodyPartInit);
+                CoupleParams partParams = makeParams(kParticleCount, enabled);
+                CoupleParams bodyParams = makeParams(kBodyCount, enabled);
+                rhi::BufferDesc ppd; ppd.size = sizeof(CoupleParams); ppd.initialData = &partParams;
+                ppd.usage = rhi::BufferUsage::Storage;
+                auto partParamsBuf = device->CreateBuffer(ppd);
+                rhi::BufferDesc bpd; bpd.size = sizeof(CoupleParams); bpd.initialData = &bodyParams;
+                bpd.usage = rhi::BufferUsage::Storage;
+                auto bodyParamsBuf = device->CreateBuffer(bpd);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("couple_query", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        // Pass 1: per-particle cell count (atomic add) — reused FL2.
+                        cmd.BindComputePipeline(*cellCountPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*cellCountBuf, 1);
+                        cmd.BindStorageBuffer(*partParamsBuf, 2);
+                        cmd.DispatchCompute(kPartGroups);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 2: single-thread exclusive prefix-sum -> cellStart — reused FL2.
+                        cmd.BindComputePipeline(*cellScanPipe.second);
+                        cmd.BindStorageBuffer(*cellCountBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*partParamsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 3: single-thread ascending-particle scatter -> cellParticles — reused FL2.
+                        cmd.BindComputePipeline(*cellEmitPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                        cmd.BindStorageBuffer(*cellPartBuf, 3);
+                        cmd.BindStorageBuffer(*partParamsBuf, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 4: per-body gather count over the body's AABB cell range — NEW CP1.
+                        cmd.BindComputePipeline(*bodyCountPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellPartBuf, 2);
+                        cmd.BindStorageBuffer(*bodiesBuf, 3);
+                        cmd.BindStorageBuffer(*perBodyBuf, 4);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 5);
+                        cmd.DispatchCompute(kBodyGroups);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 5: single-thread exclusive prefix-sum -> bodyStart — NEW CP1.
+                        cmd.BindComputePipeline(*bodyScanPipe.second);
+                        cmd.BindStorageBuffer(*perBodyBuf, 0);
+                        cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToComputeBarrier();
+                        // Pass 6: per-body emit into the disjoint bodyParticles[] slice — NEW CP1.
+                        cmd.BindComputePipeline(*bodyEmitPipe.second);
+                        cmd.BindStorageBuffer(*particlesBuf, 0);
+                        cmd.BindStorageBuffer(*cellStartBuf, 1);
+                        cmd.BindStorageBuffer(*cellPartBuf, 2);
+                        cmd.BindStorageBuffer(*bodiesBuf, 3);
+                        cmd.BindStorageBuffer(*bodyStartBuf, 4);
+                        cmd.BindStorageBuffer(*bodyPartBuf, 5);
+                        cmd.BindStorageBuffer(*bodyParamsBuf, 6);
+                        cmd.DispatchCompute(kBodyGroups);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outCellStart.assign((size_t)kCellCount + 1u, 0u);
+                device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+                outCellPart.assign((size_t)kParticleCount, 0u);
+                device->ReadBuffer(*cellPartBuf, outCellPart.data(), outCellPart.size() * sizeof(uint32_t), 0);
+                outBodyStart.assign((size_t)kBodyCount + 1u, 0u);
+                device->ReadBuffer(*bodyStartBuf, outBodyStart.data(), outBodyStart.size() * sizeof(uint32_t), 0);
+                outBodyPart.assign((size_t)kGatherAlloc, 0u);
+                device->ReadBuffer(*bodyPartBuf, outBodyPart.data(), outBodyPart.size() * sizeof(uint32_t), 0);
+                outPerBody.assign((size_t)kBodyCount, 0u);
+                device->ReadBuffer(*perBodyBuf, outPerBody.data(), outPerBody.size() * sizeof(uint32_t), 0);
+            };
+
+            // === GPU query (enabled) ===
+            std::vector<uint32_t> gCellStart, gCellPart, gBodyStart, gBodyPart, gPerBody;
+            runQuery(1, gCellStart, gCellPart, gBodyStart, gBodyPart, gPerBody);
+
+            // PROOF (1) GPU==CPU cell table + per-body query BIT-EXACT (integer memcmp, NO tol).
+            uint32_t maxPer = 0; for (uint32_t c : gPerBody) if (c > maxPer) maxPer = c;
+            bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+                std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                            cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+            bool cellPartOk = (gCellPart.size() == cpuTable.cellParticles.size()) &&
+                std::memcmp(gCellPart.data(), cpuTable.cellParticles.data(),
+                            cpuTable.cellParticles.size() * sizeof(uint32_t)) == 0;
+            bool bodyStartOk = (gBodyStart.size() == cpuQuery.bodyStart.size()) &&
+                std::memcmp(gBodyStart.data(), cpuQuery.bodyStart.data(),
+                            cpuQuery.bodyStart.size() * sizeof(uint32_t)) == 0;
+            bool bodyPartOk = (kTotalGathered == (uint32_t)cpuQuery.bodyParticles.size()) &&
+                std::memcmp(gBodyPart.data(), cpuQuery.bodyParticles.data(),
+                            (size_t)kTotalGathered * sizeof(uint32_t)) == 0;
+            if (!cellStartOk || !cellPartOk || !bodyStartOk || !bodyPartOk) {
+                std::fprintf(stderr, "FATAL: couple-query GPU != CPU BuildCellTable/GatherBodyParticles "
+                             "(cellStart=%d cellPart=%d bodyStart=%d bodyPart=%d)\n",
+                             (int)cellStartOk, (int)cellPartOk, (int)bodyStartOk, (int)bodyPartOk);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("couple-query: {bodies:%d, particles:%d, gathered:%u, maxPerBody:%u} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kParticleCount, kTotalGathered, maxPer);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            {
+                std::vector<uint32_t> c2, cp2, bs2, bp2, pb2;
+                runQuery(1, c2, cp2, bs2, bp2, pb2);
+                if (c2 != gCellStart || cp2 != gCellPart || bs2 != gBodyStart || bp2 != gBodyPart ||
+                    pb2 != gPerBody) {
+                    std::fprintf(stderr, "FATAL: couple-query two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-query determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) coverage / coherence: every gathered particle j of body i passes BodyParticleAccept
+            // (and the SUBMERGED bodies gathered > 0 while the CLEAR body gathered 0).
+            {
+                bool coherent = true;
+                for (uint32_t i = 0; i < (uint32_t)kBodyCount && coherent; ++i)
+                    for (uint32_t s = gBodyStart[i]; s < gBodyStart[i + 1u]; ++s) {
+                        uint32_t j = gBodyPart[s];
+                        if (!couple::BodyParticleAccept(world.bodies[i], world.particles[j])) coherent = false;
+                    }
+                const uint32_t clearGathered = gBodyStart[(uint32_t)kBodyCount] - gBodyStart[(uint32_t)kBodyCount - 1];
+                const bool submergedPopulated = (gBodyStart[1] - gBodyStart[0]) > 0u &&
+                                                (gBodyStart[2] - gBodyStart[1]) > 0u;
+                if (!coherent || clearGathered != 0u || !submergedPopulated) {
+                    std::fprintf(stderr, "FATAL: couple-query coverage incoherent (coherent=%d clear=%u "
+                                 "submergedPopulated=%d)\n", (int)coherent, clearGathered, (int)submergedPopulated);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-query coverage: %u body-particle pairs (submerged bodies populated, "
+                            "clear bodies empty)\n", kTotalGathered);
+            }
+
+            // PROOF (4) empty no-op: a world with all bodies clear of the fluid -> 0 gathered (CPU reference,
+            // the disabled-path twin: enabled=0 also yields 0).
+            {
+                couple::CoupleWorld empty;
+                empty.particles = world.particles;
+                empty.kernel.h = kH;
+                empty.bodies = {makeBody(5, 50, 5, 2), makeBody(2, 60, 2, 2)};   // far above the pool
+                couple::CoupleQuery eq = couple::GatherBodyParticles(empty);
+                if (couple::CountGathered(eq) != 0u || !eq.bodyParticles.empty()) {
+                    std::fprintf(stderr, "FATAL: couple-query empty produced gathered particles\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("couple-query empty: 0 gathered (no-op)\n");
+            }
+
+            // --- Golden: a PURE-INTEGER per-body gathered-particle HEAT side-view. Project each fluid
+            // particle's integer (pos.x>>kFrac, pos.y>>kFrac) to a pixel (the FL1 transform); color each
+            // particle by which body gathered it (body 0 = warm, body 1 = cool, un-gathered = dim grey) ->
+            // a coherent per-body heat map. CPU-colored from the read-back integers -> identical both backends
+            // by construction (PURE INTEGER, the strict zero-differing-pixel bar). ---
+            const int kPxPerUnit = 22;
+            const int kMargin = 20;
+            const int kWorldW = 10;
+            const int kWorldH = 10;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Per-particle owning-body (the first body whose slice contains the particle index, from the
+            // read-back CSR). -1 == un-gathered.
+            std::vector<int> ownerOf((size_t)kParticleCount, -1);
+            for (uint32_t i = 0; i < (uint32_t)kBodyCount; ++i)
+                for (uint32_t s = gBodyStart[i]; s < gBodyStart[i + 1u]; ++s)
+                    ownerOf[(size_t)gBodyPart[s]] = (int)i;
+            // A per-body distinct color (warm/cool/green for bodies 0/1/2; cycle for more).
+            auto bodyColor = [](int b) -> Vec3 {
+                static const Vec3 palette[3] = {Vec3{1.0f, 0.45f, 0.15f}, Vec3{0.2f, 0.6f, 1.0f},
+                                                Vec3{0.4f, 1.0f, 0.4f}};
+                return palette[b % 3];
+            };
+            for (int i = 0; i < kParticleCount; ++i) {
+                const int wx = particlesInit[(size_t)i].px >> fluid::kFrac;
+                const int wy = particlesInit[(size_t)i].py >> fluid::kFrac;
+                int cx = kMargin + wx * kPxPerUnit;
+                int cy = (int)imgH - kMargin - wy * kPxPerUnit;
+                Vec3 col = ownerOf[(size_t)i] >= 0 ? bodyColor(ownerOf[(size_t)i]) : Vec3{0.18f, 0.18f, 0.2f};
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            }
+            bool ok = WriteBMP(coupleQueryShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — couple body-particle gather heat (%u gathered, maxPerBody %u)\n",
+                                coupleQueryShotPath, imgW, imgH, kTotalGathered, maxPer);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleQueryShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

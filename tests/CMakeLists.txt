@@ -640,6 +640,20 @@ hf_add_pure_test(fluid_test)
 # later GR slices). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(grain_test)
 
+# Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the UNIFIED
+# COUPLED WORLD + the BODY->FLUID grid-hash QUERY core (engine/sim/couple.h) the GPU
+# shaders/couple_body_{count,scan,emit}.comp.hlsl copy VERBATIM + prove bit-identical. The GR2 grain-neighbor
+# twin, per BODY (not per grain): over the FL2 fluid grid + cell table it gathers the fluid particles inside
+# each body's sphere, iterating the body's BodyAabb cell RANGE (not a fixed 27-cell stencil), accepting iff
+# the per-axis box reject |body.pos.axis - p.pos.axis| < body.radius passes (PURE INT32, the exact radial
+# sphere cull deferred to CP2). Pins BodyParticleAccept (the per-axis abs-compare), GatherBodyParticles (one
+# body over a hand-laid pool -> the EXACT 3x3 gathered box, CSR offsets correct, ascending within-body order;
+# a body clear of the pool -> empty; two bodies -> disjoint ascending per-body lists; the empty world / no
+# particles no-op; determinism: two builds byte-identical). CP1 claims ONLY the unified world + the per-body
+# query (NO momentum exchange — CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render).
+# Pure C++ (hf_core), ASan-eligible. couple.h #includes fpx.h + fluid.h read-only (the additive sibling).
+hf_add_pure_test(couple_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE

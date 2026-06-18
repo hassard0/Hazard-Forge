@@ -91,6 +91,7 @@
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
+#include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -18659,6 +18660,328 @@ static int RunFluidNeighborsShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CP1 — Deterministic Rigid<->Fluid Coupling BODY->FLUID grid-hash QUERY showcase (--couple-query) =
+// The query is PURE INT32 (FloorDiv + the per-axis |body.pos.axis - p.pos.axis| < body.radius
+// BodyParticleAccept = integer divide + abs-compare, NO int64/fxmul/sqrt, NO radial sphere cull), so the
+// reused FL2 fluid_cell_{count,scan,emit} + the NEW couple_body_{count,scan,emit} shaders MSL-gen natively and
+// Metal DISPATCHES THE GPU passes directly: the SAME settled fluid pool (FL1 InitBlock 10x4x10=400 particles,
+// 40 IntegrateFluid steps) + the SAME 3 FxBody spheres (two submerged, one clear) feed the SAME six passes ->
+// ReadBuffer reads the cell table + per-body query, PROVEN BIT-EXACT vs the CPU couple.h::BuildCellTable +
+// GatherBodyParticles reference (memcmp — the same proofs the Vulkan --couple-query-shot runs); all bodies
+// clear -> 0 gathered; two runs byte-identical. The image golden is the integer per-body gathered-particle
+// heat viz, IDENTICAL to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/couple_query.png;
+// two runs DIFF 0.0000. NO new RHI.
+static int RunCoupleQueryShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace couple = hf::sim::couple;
+    namespace fluid  = hf::sim::fluid;
+    namespace fpx    = hf::sim::fpx;
+
+    // The fluid pool + bodies (== the Vulkan --couple-query-shot config, verbatim).
+    const fluid::fx kGravY = (fluid::fx)(-9.8 * (double)fluid::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fluid::fx kDt = fluid::kOne / 60;
+    const fluid::fx kGroundY = 0;
+    const fluid::FxVec3 kGravity{0, kGravY, 0};
+    const fluid::fx kH = fluid::kOne;
+
+    fluid::FluidBlock block;
+    block.W = 10; block.H = 4; block.D = 10;
+    block.spacing = fluid::kOne;
+    block.origin = fluid::FxVec3{0, (fluid::fx)(3 * (int)fluid::kOne), 0};
+    std::vector<fluid::FluidParticle> particles = fluid::InitBlock(block);
+    fluid::IntegrateFluidSteps(particles, kGravity, kDt, kGroundY, 40);
+
+    auto makeBody = [&](int wx, int wy, int wz, int rUnits) {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(wx * (int)fluid::kOne), (fpx::fx)(wy * (int)fluid::kOne),
+                            (fpx::fx)(wz * (int)fluid::kOne)};
+        b.invMass = fluid::kOne; b.flags = fpx::kFlagDynamic;
+        b.radius = (fpx::fx)(rUnits * (int)fluid::kOne);
+        return b;
+    };
+    couple::CoupleWorld world;
+    world.particles = particles;
+    world.kernel.h = kH;
+    world.gravity = kGravity; world.dt = kDt; world.groundY = kGroundY;
+    world.bodies = {makeBody(3, 1, 4, 2), makeBody(7, 1, 5, 2), makeBody(5, 20, 5, 2)};
+    const int kBodyCount = (int)world.bodies.size();
+    const int kParticleCount = (int)world.particles.size();
+
+    // The CPU reference grid + cell table + per-body query (the GPU memcmp's against this).
+    const fluid::FluidGrid grid = fluid::MakeGrid(world.particles, kH);
+    const uint32_t kCellCount = fluid::CellCount(grid);
+    const fluid::FluidCellTable cpuTable = fluid::BuildCellTable(world.particles, grid);
+    const couple::CoupleQuery cpuQuery = couple::GatherBodyParticles(world);
+    const uint32_t kTotalGathered = couple::CountGathered(cpuQuery);
+    const uint32_t kGatherAlloc = kTotalGathered > 0u ? kTotalGathered : 1u;
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --couple-query-shot).
+    const int kPxPerUnit = 22, kMargin = 20, kWorldW = 10, kWorldH = 10;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 FluidParticle mirror (== the Vulkan --couple-query-shot FluidParticleGpu): 11 x int32 (44).
+    struct FluidParticleGpu {
+        int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags;
+    };
+    static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+    std::vector<FluidParticleGpu> particlesInit((size_t)kParticleCount);
+    for (int i = 0; i < kParticleCount; ++i) {
+        const fluid::FluidParticle& p = world.particles[(size_t)i];
+        particlesInit[(size_t)i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y,
+            p.prev.z, p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+    }
+    rhi::BufferDesc partDesc;
+    partDesc.size = particlesInit.size() * sizeof(FluidParticleGpu);
+    partDesc.initialData = particlesInit.data();
+    partDesc.usage = rhi::BufferUsage::Storage;
+    auto particlesBuf = device->CreateBuffer(partDesc);
+
+    struct CoupleBodyGpu { int32_t bx, by, bz, radius; };
+    static_assert(sizeof(CoupleBodyGpu) == 16, "CoupleBodyGpu std430 layout");
+    std::vector<CoupleBodyGpu> bodiesInit((size_t)kBodyCount);
+    for (int i = 0; i < kBodyCount; ++i) {
+        const fpx::FxBody& b = world.bodies[(size_t)i];
+        bodiesInit[(size_t)i] = CoupleBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.radius};
+    }
+    rhi::BufferDesc bodyDesc;
+    bodyDesc.size = bodiesInit.size() * sizeof(CoupleBodyGpu);
+    bodyDesc.initialData = bodiesInit.data();
+    bodyDesc.usage = rhi::BufferUsage::Storage;
+    auto bodiesBuf = device->CreateBuffer(bodyDesc);
+
+    struct CoupleParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(CoupleParams) == 48, "CoupleParams std430 layout");
+    auto makeParams = [&](int32_t countW, int32_t enabled) {
+        CoupleParams p{};
+        p.grid[0] = kH; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y; p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z; p.dim[3] = countW;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellPartInit((size_t)kParticleCount, 0u);
+    std::vector<uint32_t> perBodyInit((size_t)kBodyCount, 0u);
+    std::vector<uint32_t> bodyStartInit((size_t)kBodyCount + 1u, 0u);
+    std::vector<uint32_t> bodyPartInit((size_t)kGatherAlloc, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    auto cellCountPipe = mkPipe("fluid_cell_count.comp.gen.metal", "fluid_cell_count_main", 3, 64);
+    auto cellScanPipe  = mkPipe("fluid_cell_scan.comp.gen.metal", "fluid_cell_scan_main", 3, 1);
+    auto cellEmitPipe  = mkPipe("fluid_cell_emit.comp.gen.metal", "fluid_cell_emit_main", 5, 1);
+    auto bodyCountPipe = mkPipe("couple_body_count.comp.gen.metal", "couple_body_count_main", 6, 64);
+    auto bodyScanPipe  = mkPipe("couple_body_scan.comp.gen.metal", "couple_body_scan_main", 3, 1);
+    auto bodyEmitPipe  = mkPipe("couple_body_emit.comp.gen.metal", "couple_body_emit_main", 7, 64);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kPartGroups = ((uint32_t)kParticleCount + 63u) / 64u;
+    const uint32_t kBodyGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+    auto runQuery = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                        std::vector<uint32_t>& outCellPart, std::vector<uint32_t>& outBodyStart,
+                        std::vector<uint32_t>& outBodyPart, std::vector<uint32_t>& outPerBody) {
+        auto cellCountBuf = makeUintBuf(cellCountInit);
+        auto cellStartBuf = makeUintBuf(cellStartInit);
+        auto cellCursorBuf = makeUintBuf(cellCursorInit);
+        auto cellPartBuf = makeUintBuf(cellPartInit);
+        auto perBodyBuf = makeUintBuf(perBodyInit);
+        auto bodyStartBuf = makeUintBuf(bodyStartInit);
+        auto bodyPartBuf = makeUintBuf(bodyPartInit);
+        CoupleParams partParams = makeParams(kParticleCount, enabled);
+        CoupleParams bodyParams = makeParams(kBodyCount, enabled);
+        rhi::BufferDesc ppd; ppd.size = sizeof(CoupleParams); ppd.initialData = &partParams;
+        ppd.usage = rhi::BufferUsage::Storage;
+        auto partParamsBuf = device->CreateBuffer(ppd);
+        rhi::BufferDesc bpd; bpd.size = sizeof(CoupleParams); bpd.initialData = &bodyParams;
+        bpd.usage = rhi::BufferUsage::Storage;
+        auto bodyParamsBuf = device->CreateBuffer(bpd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("couple_query", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*cellCountPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellCountBuf, 1);
+                cmd.BindStorageBuffer(*partParamsBuf, 2);
+                cmd.DispatchCompute(kPartGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellScanPipe.second);
+                cmd.BindStorageBuffer(*cellCountBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*partParamsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellEmitPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                cmd.BindStorageBuffer(*cellPartBuf, 3);
+                cmd.BindStorageBuffer(*partParamsBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*bodyCountPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellPartBuf, 2);
+                cmd.BindStorageBuffer(*bodiesBuf, 3);
+                cmd.BindStorageBuffer(*perBodyBuf, 4);
+                cmd.BindStorageBuffer(*bodyParamsBuf, 5);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*bodyScanPipe.second);
+                cmd.BindStorageBuffer(*perBodyBuf, 0);
+                cmd.BindStorageBuffer(*bodyStartBuf, 1);
+                cmd.BindStorageBuffer(*bodyParamsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*bodyEmitPipe.second);
+                cmd.BindStorageBuffer(*particlesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellPartBuf, 2);
+                cmd.BindStorageBuffer(*bodiesBuf, 3);
+                cmd.BindStorageBuffer(*bodyStartBuf, 4);
+                cmd.BindStorageBuffer(*bodyPartBuf, 5);
+                cmd.BindStorageBuffer(*bodyParamsBuf, 6);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCellStart.assign((size_t)kCellCount + 1u, 0u);
+        device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+        outCellPart.assign((size_t)kParticleCount, 0u);
+        device->ReadBuffer(*cellPartBuf, outCellPart.data(), outCellPart.size() * sizeof(uint32_t), 0);
+        outBodyStart.assign((size_t)kBodyCount + 1u, 0u);
+        device->ReadBuffer(*bodyStartBuf, outBodyStart.data(), outBodyStart.size() * sizeof(uint32_t), 0);
+        outBodyPart.assign((size_t)kGatherAlloc, 0u);
+        device->ReadBuffer(*bodyPartBuf, outBodyPart.data(), outBodyPart.size() * sizeof(uint32_t), 0);
+        outPerBody.assign((size_t)kBodyCount, 0u);
+        device->ReadBuffer(*perBodyBuf, outPerBody.data(), outPerBody.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU query (enabled).
+    std::vector<uint32_t> gCellStart, gCellPart, gBodyStart, gBodyPart, gPerBody;
+    runQuery(1, gCellStart, gCellPart, gBodyStart, gBodyPart, gPerBody);
+
+    // PROOF (1) GPU==CPU cell table + per-body query BIT-EXACT.
+    uint32_t maxPer = 0; for (uint32_t c : gPerBody) if (c > maxPer) maxPer = c;
+    bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+        std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                    cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+    bool cellPartOk = (gCellPart.size() == cpuTable.cellParticles.size()) &&
+        std::memcmp(gCellPart.data(), cpuTable.cellParticles.data(),
+                    cpuTable.cellParticles.size() * sizeof(uint32_t)) == 0;
+    bool bodyStartOk = (gBodyStart.size() == cpuQuery.bodyStart.size()) &&
+        std::memcmp(gBodyStart.data(), cpuQuery.bodyStart.data(),
+                    cpuQuery.bodyStart.size() * sizeof(uint32_t)) == 0;
+    bool bodyPartOk = (kTotalGathered == (uint32_t)cpuQuery.bodyParticles.size()) &&
+        std::memcmp(gBodyPart.data(), cpuQuery.bodyParticles.data(),
+                    (size_t)kTotalGathered * sizeof(uint32_t)) == 0;
+    if (!cellStartOk || !cellPartOk || !bodyStartOk || !bodyPartOk)
+        return fail("couple-query: GPU != CPU BuildCellTable/GatherBodyParticles");
+    std::printf("couple-query: {bodies:%d, particles:%d, gathered:%u, maxPerBody:%u} GPU==CPU BIT-EXACT\n",
+                kBodyCount, kParticleCount, kTotalGathered, maxPer);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint32_t> c2, cp2, bs2, bp2, pb2;
+        runQuery(1, c2, cp2, bs2, bp2, pb2);
+        if (c2 != gCellStart || cp2 != gCellPart || bs2 != gBodyStart || bp2 != gBodyPart || pb2 != gPerBody)
+            return fail("couple-query: two runs differ (nondeterministic)");
+        std::printf("couple-query determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) coverage / coherence: every gathered particle passes BodyParticleAccept; submerged populated,
+    // clear empty.
+    {
+        bool coherent = true;
+        for (uint32_t i = 0; i < (uint32_t)kBodyCount && coherent; ++i)
+            for (uint32_t s = gBodyStart[i]; s < gBodyStart[i + 1u]; ++s) {
+                uint32_t j = gBodyPart[s];
+                if (!couple::BodyParticleAccept(world.bodies[i], world.particles[j])) coherent = false;
+            }
+        const uint32_t clearGathered = gBodyStart[(uint32_t)kBodyCount] - gBodyStart[(uint32_t)kBodyCount - 1];
+        const bool submergedPopulated = (gBodyStart[1] - gBodyStart[0]) > 0u &&
+                                        (gBodyStart[2] - gBodyStart[1]) > 0u;
+        if (!coherent || clearGathered != 0u || !submergedPopulated)
+            return fail("couple-query: coverage incoherent");
+        std::printf("couple-query coverage: %u body-particle pairs (submerged bodies populated, "
+                    "clear bodies empty)\n", kTotalGathered);
+    }
+
+    // PROOF (4) empty no-op: all bodies clear of the fluid -> 0 gathered.
+    {
+        couple::CoupleWorld empty;
+        empty.particles = world.particles;
+        empty.kernel.h = kH;
+        empty.bodies = {makeBody(5, 50, 5, 2), makeBody(2, 60, 2, 2)};
+        couple::CoupleQuery eq = couple::GatherBodyParticles(empty);
+        if (couple::CountGathered(eq) != 0u || !eq.bodyParticles.empty())
+            return fail("couple-query: empty produced gathered particles");
+        std::printf("couple-query empty: 0 gathered (no-op)\n");
+    }
+
+    // --- Golden: the integer per-body gathered-particle HEAT side-view (IDENTICAL to the Vulkan
+    // --couple-query-shot by construction; CPU-colored from the read-back integer CSR). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    std::vector<int> ownerOf((size_t)kParticleCount, -1);
+    for (uint32_t i = 0; i < (uint32_t)kBodyCount; ++i)
+        for (uint32_t s = gBodyStart[i]; s < gBodyStart[i + 1u]; ++s)
+            ownerOf[(size_t)gBodyPart[s]] = (int)i;
+    auto bodyColor = [](int b) -> Vec3 {
+        static const Vec3 palette[3] = {Vec3{1.0f, 0.45f, 0.15f}, Vec3{0.2f, 0.6f, 1.0f},
+                                        Vec3{0.4f, 1.0f, 0.4f}};
+        return palette[b % 3];
+    };
+    for (int i = 0; i < kParticleCount; ++i) {
+        const int wx = particlesInit[(size_t)i].px >> fluid::kFrac;
+        const int wy = particlesInit[(size_t)i].py >> fluid::kFrac;
+        int cx = kMargin + wx * kPxPerUnit;
+        int cy = (int)imgH - kMargin - wy * kPxPerUnit;
+        Vec3 col = ownerOf[(size_t)i] >= 0 ? bodyColor(ownerOf[(size_t)i]) : Vec3{0.18f, 0.18f, 0.2f};
+        for (int dy = 0; dy <= 1; ++dy)
+            for (int dx = 0; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — couple body-particle gather heat (%u gathered, maxPerBody %u)\n",
+                outPath, imgW, imgH, kTotalGathered, maxPer);
+    return 0;
+}
+
 // ===== Slice GR2 — Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH showcase (--grain-neighbors) =
 // UNLIKE GR1's --grain-integrate (int64 grain_integrate.comp -> CPU on Metal), the neighbor search is PURE
 // INT32 (GrainCellOf = FloorDiv per axis + the per-axis |dx|<hSearch GrainNeighborAccept = integer divide +
@@ -33983,6 +34306,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-neighbors") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_neighbors.png";
             try { return RunGrainNeighborsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --couple-query <out.png>: render the Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD +
+        // BODY->FLUID grid-hash QUERY showcase (Slice CP1, the BEACHHEAD of FLAGSHIP #11). Like
+        // --grain-neighbors, the query is PURE INT32 (FloorDiv + the per-axis |body.pos.axis - p.pos.axis| <
+        // body.radius BodyParticleAccept = integer divide + abs-compare, NO int64/sqrt), so the reused FL2
+        // fluid_cell_{count,scan,emit} + the NEW couple_body_{count,scan,emit} shaders MSL-gen natively and
+        // Metal DISPATCHES THE GPU passes directly: the SAME settled fluid pool + the SAME 3 FxBody spheres
+        // feed the SAME six passes -> ReadBuffer reads the cell table + per-body query PROVEN BIT-EXACT vs the
+        // CPU couple.h::BuildCellTable + GatherBodyParticles (the same proofs the Vulkan --couple-query-shot
+        // runs). The image golden is the integer per-body gathered-particle heat viz, identical to the Vulkan
+        // path BY CONSTRUCTION. New golden tests/golden/metal/couple_query.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--couple-query") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_couple_query.png";
+            try { return RunCoupleQueryShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --grain-contact <out.png>: render the Deterministic GPU Granular/Sand FRICTIONLESS CONTACT PROJECTION
