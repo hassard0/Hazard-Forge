@@ -601,6 +601,18 @@ hf_add_pure_test(mc_test)
 # (correct floor, not truncate-toward-zero). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(fpx_test)
 
+# Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
+# cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
+# shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
+# toolbox (fx/fxmul/FxVec3/FxAdd/FxSub/FxScale) read-only. Pins InitGrid (a flat W x H sheet, row-major,
+# spacing/origin host-snapped, the two TOP corners PINNED, prev==pos, interior dynamic), IntegrateParticle
+# one-step + K-step semi-implicit-Euler closed form (a free particle falls the EXACT Q16.16 distance —
+# hand-checked integer recurrence — prev=pos each step) + the ground floor clamp (pos.y==groundY, vel.y
+# zeroed on contact, stays settled) + a PINNED particle never moves + two runs byte-identical + an
+# ALL-PINNED grid unchanged after K steps (the static no-op). CL1 is ONLY the integrator + grid + pin +
+# ground (NO constraints/collision/render — later CL slices). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(cloth_test)
+
 # Deterministic GPU Navmesh Slice 1 (Slice NAV1, the BEACHHEAD of FLAGSHIP #7): the integer HEIGHTFIELD
 # SPAN RASTERIZATION core (engine/nav/navmesh.h) the GPU shaders/nav_raster_count/scan/emit.comp.hlsl
 # copy VERBATIM + prove bit-identical. Pins QuantizeCoord (world->voxel column via FloorDiv incl NEGATIVE
