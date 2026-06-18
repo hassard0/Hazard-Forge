@@ -300,6 +300,8 @@ int main() {
             bool sawNavPathFeature = false;
             // Slice NAV6: the deterministic-navmesh-render capability is advertised.
             bool sawNavRenderFeature = false;
+            // Slice CL1: the deterministic-cloth-integrate capability is advertised.
+            bool sawClothIntegrateFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -410,6 +412,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-navmesh-polymesh") sawNavPolymeshFeature = true;
                     if (AsString(el->value) == "deterministic-navmesh-pathfinding") sawNavPathFeature = true;
                     if (AsString(el->value) == "deterministic-navmesh-render") sawNavRenderFeature = true;
+                    if (AsString(el->value) == "deterministic-cloth-integrate") sawClothIntegrateFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -504,6 +507,7 @@ int main() {
             check(sawNavPolymeshFeature, "engine.features includes deterministic-navmesh-polymesh");
             check(sawNavPathFeature, "engine.features includes deterministic-navmesh-pathfinding");
             check(sawNavRenderFeature, "engine.features includes deterministic-navmesh-render");
+            check(sawClothIntegrateFeature, "engine.features includes deterministic-cloth-integrate");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -666,6 +670,8 @@ int main() {
         bool sawMcNormalsShot = false;
         // Slice FPX1: the --fpx-shot showcase flag is listed in the showcase manifest.
         bool sawFpxShot = false;
+        // Slice CL1: the --cloth-integrate-shot showcase flag is listed in the showcase manifest.
+        bool sawClothIntegrateShot = false;
         // Slice FPX2: the --fpx-pairs-shot showcase flag is listed in the showcase manifest.
         bool sawFpxPairsShot = false;
         // Slice FPX3: the --fpx-solve-shot showcase flag is listed in the showcase manifest.
@@ -791,6 +797,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-render-shot") sawMcRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mc-normals-shot") sawMcNormalsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-shot") sawFpxShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--cloth-integrate-shot") sawClothIntegrateShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-pairs-shot") sawFpxPairsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-solve-shot") sawFpxSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fpx-orient-shot") sawFpxOrientShot = true;
@@ -888,6 +895,7 @@ int main() {
         check(sawMcRenderShot, "showcases manifest includes --mc-render-shot");
         check(sawMcNormalsShot, "showcases manifest includes --mc-normals-shot");
         check(sawFpxShot, "showcases manifest includes --fpx-shot");
+        check(sawClothIntegrateShot, "showcases manifest includes --cloth-integrate-shot");
         check(sawFpxPairsShot, "showcases manifest includes --fpx-pairs-shot");
         check(sawFpxSolveShot, "showcases manifest includes --fpx-solve-shot");
         check(sawFpxOrientShot, "showcases manifest includes --fpx-orient-shot");
