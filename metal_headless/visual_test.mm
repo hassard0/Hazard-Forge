@@ -23618,6 +23618,184 @@ static int RunVehicleSpringShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VH2 — Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE showcase (--vehicle-rig) =
+// (the 2nd slice of FLAGSHIP #16). VH2's StepVehicleRig is the JT3 two-phase-block tick driven on Vulkan by
+// the EXISTING vehicle_spring_solve.comp (Phase A) + joint_angular_solve.comp (Phase B) + the host wheel
+// clamp (Phase C); both shaders are int64 -> Vulkan-only (glslc can't parse int64 in HLSL), NOT in this
+// dir's hf_gen_msl list. On Metal the --vehicle-rig showcase runs the CPU vehicle::StepVehicleRig — the
+// EXACT bit-exact reference the Vulkan --vehicle-rig-shot GPU==CPU memcmp compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the joint_step / vehicle_spring
+// convention), while the Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic
+// vehicle (VehicleFromConfig, IDENTICAL config to the Vulkan --vehicle-rig-shot), settles it K=400 steps x
+// iters=16 -> the chassis floats at ride height + the 4 wheels rest on the ground, the suspension
+// compressed, and CPU-colors the SAME integer side-view as the Vulkan --vehicle-rig-shot -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/vehicle_rig.png (Mac-baked by the controller); two
+// runs DIFF 0.0000. NO GPU compute (int64 -> CPU on Metal), NO new shader, NO new RHI. CAVEAT: NO inter-body
+// contacts (VH3); the suspension residual is deterministic-but-nonzero (the cloth/JT/VH1 within-band caveat).
+static int RunVehicleRigShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vehicle = hf::sim::vehicle;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic vehicle scene (== the Vulkan --vehicle-rig-shot config + the vehicle_test VH2 case).
+    const vehicle::fx kDt = vehicle::kOne / 60;
+    const int kSteps = 400;
+    const int kIters = 16;
+    vehicle::VehicleConfig cfg;                       // the documented defaults
+    const vehicle::Vehicle vehInit = vehicle::VehicleFromConfig(cfg);
+    const int kBodyCount = (int)vehInit.world.bodies.size();   // 5
+    const uint32_t kSpringCount = (uint32_t)vehInit.springs.size();   // 4
+    const uint32_t kHingeCount = (uint32_t)vehInit.hinges.size();     // 4
+    const vehicle::fx kGroundY = cfg.groundY;
+
+    // std430 FxBody mirror (== the Vulkan --vehicle-rig-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). Returns the
+    // settled vehicle + its packed bodies.
+    auto runSolve = [&](vehicle::Vehicle& outVeh, std::vector<FxBodyGpu>& outBodies) {
+        outVeh = vehInit;
+        vehicle::StepVehicleRigSteps(outVeh, kDt, kIters, kSteps);
+        outBodies = packBodies(outVeh.world.bodies);
+    };
+
+    // CPU solve (K steps) — the Metal showcase body array.
+    vehicle::Vehicle cpuVeh;
+    std::vector<FxBodyGpu> gpuBodies;
+    runSolve(cpuVeh, gpuBodies);
+
+    // GPU==CPU is N/A on the Metal CPU path: this body array IS the CPU StepVehicleRig reference the Vulkan
+    // --vehicle-rig-shot proved the GPU shaders bit-identical against -> byte-identical by construction.
+    std::printf("vehicle-rig: {bodies:%d, springs:%u, hinges:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU vehicle::StepVehicleRig, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kSpringCount, kHingeCount, kSteps);
+
+    // two-run determinism.
+    vehicle::Vehicle cpuVeh2; std::vector<FxBodyGpu> gpuBodies2;
+    runSolve(cpuVeh2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("vehicle-rig: two solves differ (nondeterministic)");
+    std::printf("vehicle-rig determinism: two runs BYTE-IDENTICAL\n");
+
+    // the car SETTLED on its suspension: the 4 wheels on the ground + the chassis at ride height + springs
+    // compressed.
+    const vehicle::VehicleRigState st = vehicle::MeasureVehicleRig(cpuVeh, cfg);
+    {
+        const vehicle::fx chassisY = st.chassisY;
+        const bool chassisInBand = chassisY > kGroundY && chassisY < kGroundY + 4 * (int)vehicle::kOne;
+        const bool springCompressed = st.meanSpringLen < cfg.suspensionLen;
+        if (!(st.wheelsOnGround && chassisInBand && springCompressed))
+            return fail("vehicle-rig: did not settle (wheelsOnGround/chassisY/springCompressed out of band)");
+        std::printf("vehicle-rig settled: {chassisY:%d, wheelsOnGround:true, springCompressed:true}\n",
+                    chassisY);
+    }
+
+    // the hinges hold the wheels IN-PLANE: every wheel's off-axis swing is within the hinge band.
+    {
+        const vehicle::fx kHingeBand = vehicle::kOne / 4;
+        if (st.maxHingeOffAxis >= kHingeBand)
+            return fail("vehicle-rig: hinges let a wheel flop off-axis (maxHingeOffAxis out of band)");
+        std::printf("vehicle-rig hinges: all 4 wheels in-plane\n");
+    }
+
+    // --- Golden: a PURE-INTEGER 2D SIDE-VIEW (IDENTICAL to the Vulkan --vehicle-rig-shot by construction).
+    // The chassis box, 2 visible (+Z) wheels as discs at their bit-exact pos>>kFrac, the suspension springs
+    // as segments, the ground line. ---
+    const int kPxPerUnit = 56;
+    const int kMargin = 40;
+    const int kWorldW = 8;
+    const int kWorldH = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, const Vec3& col) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        d[3] = 255;
+    };
+    auto worldToPx = [&](vehicle::fx wx, vehicle::fx wy, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)(wx + (vehicle::fx)((kWorldW / 2) * (int)vehicle::kOne)) * kPxPerUnit) >> vehicle::kFrac;
+        const int64_t sy = ((int64_t)wy * kPxPerUnit) >> vehicle::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s)
+            putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+    };
+    // The ground line (y == groundY).
+    { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+      for (int x = 0; x < (int)imgW; ++x) {
+          if (gy0 < 0 || gy0 >= (int)imgH) break;
+          uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+          d[0] = 70; d[1] = 70; d[2] = 70; d[3] = 255;
+      } }
+    // The chassis box (its half-extents about the chassis centre).
+    {
+        const FxBodyGpu& c = gpuBodies[(size_t)cpuVeh.chassisIndex];
+        int x0, y0, x1, y1;
+        worldToPx(c.px - cfg.chassisHalfX, c.py + cfg.chassisHalfY, x0, y0);
+        worldToPx(c.px + cfg.chassisHalfX, c.py - cfg.chassisHalfY, x1, y1);
+        const Vec3 chassisCol{0.85f, 0.7f, 0.3f};
+        for (int yy = (y0 < y1 ? y0 : y1); yy <= (y0 < y1 ? y1 : y0); ++yy)
+            for (int xx = (x0 < x1 ? x0 : x1); xx <= (x0 < x1 ? x1 : x0); ++xx)
+                putPx(xx, yy, chassisCol);
+    }
+    // The suspension springs (segments chassis-corner -> wheel centre) for the 2 visible (+Z) corners.
+    const int visibleCorner[2] = {0, 2};
+    for (int vi = 0; vi < 2; ++vi) {
+        const vehicle::FxSpringJoint& j = cpuVeh.springs[(size_t)visibleCorner[vi]];
+        const fpx::FxBody& ba = cpuVeh.world.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuVeh.world.bodies[(size_t)j.bodyB];
+        const vehicle::FxVec3 pa = vehicle::WorldAnchor(ba, j.anchorA);
+        const vehicle::FxVec3 pb = vehicle::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.6f, 0.85f, 0.95f});
+    }
+    // The 2 visible wheels as filled discs of wheelRadius, hashColor'd.
+    const int radPx = (int)(((int64_t)cfg.wheelRadius * kPxPerUnit) >> vehicle::kFrac);
+    for (int vi = 0; vi < 2; ++vi) {
+        const FxBodyGpu& w = gpuBodies[(size_t)cpuVeh.wheelIndex[visibleCorner[vi]]];
+        int cx, cy; worldToPx(w.px, w.py, cx, cy);
+        const Vec3 col = vg::hashColor((uint32_t)(visibleCorner[vi] + 2));
+        for (int yy = -radPx; yy <= radPx; ++yy)
+            for (int xx = -radPx; xx <= radPx; ++xx)
+                if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vehicle rig side-view (%d bodies, %u springs, %u hinges, settled)\n",
+                outPath, imgW, imgH, kBodyCount, kSpringCount, kHingeCount);
+    return 0;
+}
+
 // ===== Slice JT2 — Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase (--joint-hinge) ======
 // THE NEW-PHYSICS BEAT of FLAGSHIP #15. The angular solve (SolveAngularLimit's swing-twist + cone clamp +
 // nlerp) is int64 (the quaternion fxmul/fxdiv/FxISqrt), so shaders/joint_angular_solve.comp is VULKAN-ONLY
@@ -41376,6 +41554,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vehicle-spring") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vehicle_spring.png";
             try { return RunVehicleSpringShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vehicle-rig <out.png>: render the Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE
+        // showcase (Slice VH2, the 2nd slice of FLAGSHIP #16). On Metal this runs the CPU solver: the rig step
+        // drives the vehicle_spring_solve.comp + joint_angular_solve.comp shaders which are int64/Vulkan-only
+        // (glslc can't parse int64 in HLSL), so Metal runs the CPU vehicle::StepVehicleRig over an assembled
+        // car (1 chassis + 4 wheels tied by 4 VH1 springs + 4 JT2 hinges) dropped + settled -> the chassis
+        // floats at ride height + the 4 wheels rest on the ground, the suspension compressed — the EXACT
+        // bit-exact reference the Vulkan --vehicle-rig-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical. The image golden is a PURE-INTEGER vehicle side-view, identical to the Vulkan path
+        // BY CONSTRUCTION. New golden tests/golden/metal/vehicle_rig.png.
+        if (argc > 1 && std::strcmp(argv[1], "--vehicle-rig") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vehicle_rig.png";
+            try { return RunVehicleRigShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --joint-hinge <out.png>: render the Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase

@@ -188,5 +188,291 @@ inline void StepSpringWorldSteps(FxWorld& world, const std::vector<FxSpringJoint
         StepSpringWorld(world, springs, dt, iters);
 }
 
+// ====================================================================================================
+// Slice VH2 — THE VEHICLE RIG + WHEEL HINGE (the 2nd slice of FLAGSHIP #16: DETERMINISTIC VEHICLE
+// PHYSICS, hf::sim::vehicle). VH1 built the suspension SPRING joint in isolation (a body bobbing on a
+// spring); VH2 ASSEMBLES the car — 1 chassis fpx::FxBody + 4 wheel FxBodies tied by 4 VH1 FxSpringJoints
+// (the suspension) + 4 joint::FxAngularLimit hinges (kAngularHinge — the wheels SPIN about their axle but
+// the hinge clamps the off-axis swing so a wheel stays in its rolling plane, no flopping) — and SETTLES
+// it on its springs so the chassis rests at ride height and the four wheels rest on the ground. The
+// joint::RagdollFromSkeleton twin (a host-built body+constraint rig) over the vehicle. ADDITIVE — VH1's
+// FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld + vehicle_spring_solve.comp stay
+// BYTE-FROZEN. INTEGER-bit-exact. **NO new shader** — StepVehicleRig is structured as the JT3
+// host-driven multi-pass mold so the GPU showcase drives the EXISTING VH1 vehicle_spring_solve.comp +
+// JT2 joint_angular_solve.comp in the locked order, memcmp vs this CPU reference.
+//
+// THE STEP STRUCTURE (StepVehicleRig — the JT3 two-PHASE-block tick that the existing whole-step shaders
+// reproduce byte-for-byte, NOT a per-iteration {spring | angular} interleave; the JT3 hard lesson is that
+// dt=0 integrate-suppression is NOT bit-idempotent for orientation, so a per-iteration GPU interleave
+// over a whole-step shader would diverge):
+//   PHASE A (the spring phase — the EXISTING vehicle_spring_solve.comp, SENTINEL groundY so its floor
+//            clamp is a DEAD no-op): IntegrateBodyFull(all) [the FPX4 6-DOF integrate, real dt] -> K
+//            Gauss-Seidel passes EACH applying all SolveSpringJoint. Touches pos/vel.
+//   PHASE B (the hinge phase — the EXISTING joint_angular_solve.comp, dt=0 + jointCount=0 + SENTINEL
+//            groundY): IntegrateBodyFull(all) with dt=0 [the dt=0 translation integrate is a no-op; the
+//            orientation integrate runs its FxQuatNormalize, exactly the shader's behaviour] -> K
+//            Gauss-Seidel passes EACH applying all SolveAngularLimit (the JT2 swing-twist + hinge clamp).
+//            With jointCount=0 the shader's ball pass is a no-op. Touches orient.
+//   PHASE C (the ground clamp — HOST, NOT the shaders' generic pos.y<groundY clamp): each DYNAMIC body's
+//            pos.y is lifted to >= groundY + radius (the wheels rest ON the floor at their radius; the
+//            chassis is held up by the springs). Both shader phases use the SENTINEL groundY so their
+//            internal clamp never fires; the WHEEL-radius clamp lives here.
+// The CPU StepVehicleRig below calls exactly these ops in this order, so the GPU driver (Phase A via the
+// spring shader, Phase B via the angular shader with dt=0, Phase C on the host) memcmps BIT-EXACT.
+//
+// HONEST CAVEATS (cloth/JT/VH1-identical): the suspension residual is deterministic-but-nonzero (the
+// Gauss-Seidel spring residual + the nlerp angular residual; stiffness/limit ∝ iterations — within-band,
+// not analytic). NO inter-body broadphase/contacts (that is VH3 — the wheels rest via the ground clamp,
+// the chassis floats on the springs; ramps/obstacles + drive/traction are later VH slices). The hinge is
+// the JT2 cone-limit-0 proxy. The headline is DETERMINISM + cross-platform bit-identity, NOT analytic
+// vehicle mechanics.
+
+// Re-export the JT2 angular-limit toolbox VERBATIM (read-only — REUSED, not re-implemented).
+using joint::FxAngularLimit;     // the hinge/cone angular limit record (8 x int32, 32 bytes)
+using joint::SolveAngularLimit;  // the swing-twist + host-cos cone clamp + nlerp inverse-mass apply
+using joint::SwingAngleCos;      // the swing .w (== cos half off-axis angle) metric — the in-plane proof
+using joint::QConj;              // the unit-quaternion conjugate (for the body-local frame transform)
+using joint::kAngularHinge;      // cone limit 0 -> swing forced to identity (the wheel spin-axis hinge)
+
+// ----- VehicleConfig: the host recipe for the car (all Q16.16; the documented integer scene constants) -
+// rideHeight     : the chassis centre height above groundY at rest (Q16.16 world units).
+// suspensionLen  : the spring rest length (chassis-corner anchor -> wheel centre) — the suspension travel.
+// springStiffness/springDamping : the FxSpringJoint soft-restore + normal-velocity damper (in [0,kOne]).
+// chassisHalfX/Y/Z : the chassis box half-extents (render-only side view; the body is sphere-bound).
+// chassisRadius  : the chassis broadphase/ground sphere radius (Q16.16; VH2 has no broadphase — used by
+//                  the Phase-C ground clamp + the render).
+// wheelRadius    : the wheel sphere radius (the wheels rest at groundY + wheelRadius).
+// wheelBaseX/wheelBaseZ : the 4 chassis-corner offsets (±wheelBaseX, ±wheelBaseZ) the wheels hang from.
+// hingeCosHalf/hingeSinHalf : the JT2 host cos(θ/2)/sin(θ/2) hinge constants (a HINGE = kOne/0).
+// gravity        : the Q16.16 acceleration (e.g. (0,-9.8,0)). groundY : the floor the wheels rest on.
+// chassisInvMass/wheelInvMass : the dynamic inverse masses (Q16.16; a heavier chassis -> smaller invMass).
+struct VehicleConfig {
+    fx       rideHeight    = (fx)(3 * (int)kOne / 2); // chassis centre 1.5 above ground at rest
+    fx       suspensionLen = kOne;                   // 1.0 spring rest length (suspension travel)
+    fx       springStiffness = (fx)(kOne * 6 / 10);  // 0.6 stiff per-iteration positional restore (holds the chassis up)
+    fx       springDamping   = kOne / 4;             // 0.25 normal-velocity damping
+    fx       chassisHalfX  = (fx)(3 * (int)kOne / 2);// chassis box half-extents (render side-view)
+    fx       chassisHalfY  = (fx)(kOne * 3 / 10);    // 0.3 half-height (a slim chassis -> a clear gap to the wheels)
+    fx       chassisHalfZ  = kOne;
+    fx       chassisRadius = (fx)(kOne / 4);         // 0.25 chassis ground sphere radius (slack vs the springs)
+    fx       wheelRadius   = kOne / 2;               // 0.5 wheel sphere radius
+    fx       wheelBaseX    = (fx)(3 * (int)kOne / 2);// ±1.5 corner offset along the car length (X)
+    fx       wheelBaseZ    = kOne;                   // ±1.0 corner offset across the car width (Z)
+    fx       hingeCosHalf  = kOne;                   // HINGE: cos(0/2) = 1 (swing forced to identity)
+    fx       hingeSinHalf  = 0;                      // HINGE: sin(0/2) = 0
+    FxVec3   gravity{0, (fx)(-9 * (int)kOne - kOne * 8 / 10), 0};  // (0, -9.8, 0) Q16.16
+    fx       groundY       = 0;                      // the floor the wheels rest on
+    fx       chassisInvMass = kOne / 2;              // a moderately heavy chassis
+    fx       wheelInvMass   = kOne;                  // lighter wheels
+};
+
+// ----- Vehicle: the assembled rig (an fpx::FxWorld + its spring/hinge graph + the body indices) --------
+// world.bodies[chassisIndex] = the chassis; world.bodies[wheelIndex[k]] = wheel k (k in 0..3). springs +
+// hinges are PARALLEL per-corner (spring[k] + hinge[k] tie the chassis to wheel k). All host-fixed,
+// integer — the deterministic init the StepVehicleRig settle runs over (the bit-reproducible scene).
+struct Vehicle {
+    fpx::FxWorld                world;       // 1 chassis + 4 wheel bodies (chassis first)
+    std::vector<FxSpringJoint>  springs;     // 4 suspension springs (chassis <-> wheel k)
+    std::vector<FxAngularLimit> hinges;      // 4 wheel hinges (kAngularHinge, axle = the car lateral axis)
+    uint32_t chassisIndex = 0;               // index of the chassis body in world.bodies
+    uint32_t wheelIndex[4] = {1, 2, 3, 4};   // indices of the 4 wheel bodies
+};
+
+// ----- VehicleFromConfig: host-assemble the car (the RagdollFromSkeleton twin — bodies + constraints) --
+// Builds (pure integer, host-fixed): the chassis FxBody (box, sphere-bound chassisRadius, at ride height)
+// + 4 wheel FxBodies (at the 4 chassis-corner offsets ±wheelBaseX/±wheelBaseZ, dropped by suspensionLen
+// below the chassis), 4 FxSpringJoints (bodyA=chassis, bodyB=wheel; anchorA = the chassis corner in the
+// chassis-LOCAL frame, anchorB = (0,0,0) the wheel centre; restLen=suspensionLen; stiffness/damping from
+// cfg), and 4 FxAngularLimit hinges (kAngularHinge; axis = the wheel spin axis = the car LATERAL axis
+// (0,0,1) on the chassis — body-local on the chassis A; a hinge limits the off-axis swing). Anchors are
+// taken in the body-LOCAL frame via FxRotate(QConj(orient), worldPos − bodyPos) — the RagdollFromSkeleton
+// convention (the bodies start at identity orientation so this is the identity map, but the form is
+// future-proof + matches the JT4 mold). The 4 corners are laid out in a FIXED order:
+//   0 = (+wheelBaseX, +wheelBaseZ)  (front-right)   2 = (−wheelBaseX, +wheelBaseZ)  (rear-right)
+//   1 = (+wheelBaseX, −wheelBaseZ)  (front-left)    3 = (−wheelBaseX, −wheelBaseZ)  (rear-left)
+inline Vehicle VehicleFromConfig(const VehicleConfig& cfg) {
+    Vehicle v;
+    v.world.gravity = cfg.gravity;
+    v.world.groundY = cfg.groundY;
+
+    const FxVec3 identityQxyz{0, 0, 0};  // (kept for clarity; orient is identity below)
+    (void)identityQxyz;
+
+    // (1) the chassis body at ride height (sphere-bound chassisRadius; the heavier dynamic body).
+    FxBody chassis;
+    chassis.pos = FxVec3{0, cfg.groundY + cfg.rideHeight, 0};
+    chassis.vel = FxVec3{0, 0, 0};
+    chassis.invMass = cfg.chassisInvMass;
+    chassis.flags   = fpx::kFlagDynamic;
+    chassis.radius  = cfg.chassisRadius;
+    chassis.orient  = fpx::FxQuat{0, 0, 0, kOne};
+    chassis.angVel  = FxVec3{0, 0, 0};
+    v.chassisIndex = 0;
+    v.world.bodies.push_back(chassis);
+
+    // The 4 corner offsets (chassis-local), FIXED order. The wheels start dropped by suspensionLen.
+    const FxVec3 corner[4] = {
+        FxVec3{ cfg.wheelBaseX,  0,  cfg.wheelBaseZ},   // 0 front-right
+        FxVec3{ cfg.wheelBaseX,  0, -cfg.wheelBaseZ},   // 1 front-left
+        FxVec3{-cfg.wheelBaseX,  0,  cfg.wheelBaseZ},   // 2 rear-right
+        FxVec3{-cfg.wheelBaseX,  0, -cfg.wheelBaseZ},   // 3 rear-left
+    };
+
+    // (2) the 4 wheel bodies — each at the chassis corner, dropped suspensionLen below the chassis centre.
+    for (int k = 0; k < 4; ++k) {
+        FxBody wheel;
+        wheel.pos = FxVec3{chassis.pos.x + corner[k].x,
+                           chassis.pos.y + corner[k].y - cfg.suspensionLen,
+                           chassis.pos.z + corner[k].z};
+        wheel.vel = FxVec3{0, 0, 0};
+        wheel.invMass = cfg.wheelInvMass;
+        wheel.flags   = fpx::kFlagDynamic;
+        wheel.radius  = cfg.wheelRadius;
+        wheel.orient  = fpx::FxQuat{0, 0, 0, kOne};
+        wheel.angVel  = FxVec3{0, 0, 0};
+        v.wheelIndex[k] = (uint32_t)v.world.bodies.size();
+        v.world.bodies.push_back(wheel);
+    }
+
+    // (3) per corner: a suspension spring (chassis corner <-> wheel centre) + a wheel hinge.
+    const FxBody& chassisRef = v.world.bodies[(size_t)v.chassisIndex];
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t wk = v.wheelIndex[k];
+        const FxBody& wheelRef = v.world.bodies[(size_t)wk];
+        // The chassis-corner world position (where the spring's chassis end attaches).
+        const FxVec3 cornerWorld = FxAdd(chassisRef.pos, corner[k]);
+
+        // The spring: anchorA = the chassis corner in the chassis-LOCAL frame; anchorB = the wheel centre
+        // in the wheel-LOCAL frame (== (0,0,0)). FxRotate(QConj(orient), worldPos − bodyPos) (JT4 mold).
+        FxSpringJoint s;
+        s.bodyA = v.chassisIndex;
+        s.bodyB = wk;
+        s.anchorA = FxRotate(QConj(chassisRef.orient), FxSub(cornerWorld, chassisRef.pos));
+        s.anchorB = FxRotate(QConj(wheelRef.orient), FxSub(wheelRef.pos, wheelRef.pos));  // (0,0,0)
+        s.restLen = cfg.suspensionLen;
+        s.stiffness = cfg.springStiffness;
+        s.damping = cfg.springDamping;
+        v.springs.push_back(s);
+
+        // The hinge: axis = the wheel spin axis = the car LATERAL axis (0,0,1) in the chassis-local frame
+        // (the chassis starts at identity so the world lateral axis IS the local axis). A HINGE
+        // (kAngularHinge, cos/sin = kOne/0 -> cone limit 0) clamps the off-axis swing -> the wheel may
+        // spin about Z but does not flop out of its rolling plane.
+        FxAngularLimit h;
+        h.bodyA = v.chassisIndex;
+        h.bodyB = wk;
+        h.axis = FxRotate(QConj(chassisRef.orient), FxVec3{0, 0, kOne});  // lateral (Z) axle, local on A
+        h.cosHalfLimit = cfg.hingeCosHalf;
+        h.sinHalfLimit = cfg.hingeSinHalf;
+        h.kind = kAngularHinge;
+        v.hinges.push_back(h);
+    }
+    return v;
+}
+
+// ----- StepVehicleRig: ONE vehicle-rig settle tick (the JT3 two-phase-block + the WHEEL ground clamp) ---
+// The PHASE A / PHASE B / PHASE C structure documented above — the exact op order the GPU driver
+// reproduces with the EXISTING spring + angular shaders:
+//   PHASE A (spring): IntegrateBodyFull(all, real dt) -> K Gauss-Seidel passes of all SolveSpringJoint.
+//   PHASE B (hinge):  IntegrateBodyFull(all, dt=0) [the angular shader's per-step orientation re-normalize
+//                     — a no-op for translation; mirrors the shader] -> K passes of all SolveAngularLimit.
+//   PHASE C (ground): lift each DYNAMIC body to pos.y >= groundY + radius (the wheels rest ON the floor at
+//                     their radius; the chassis, held by the springs, floats above — its radius clamp is
+//                     slack because the springs keep it well above groundY + chassisRadius).
+// Pure integer, fixed op order -> two-run bit-identical AND bit-exact GPU==CPU. NO inter-body contacts.
+inline void StepVehicleRig(Vehicle& v, fx dt, int iters) {
+    FxWorld& world = v.world;
+    const size_t n = world.bodies.size();
+
+    // PHASE A — the spring phase (== vehicle_spring_solve.comp, SENTINEL groundY so no floor clamp).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, dt);
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < v.springs.size(); ++e)
+            SolveSpringJoint(world, v.springs[e]);
+
+    // PHASE B — the hinge phase (== joint_angular_solve.comp, dt=0 + jointCount=0 + SENTINEL groundY). The
+    // dt=0 IntegrateBodyFull mirrors the angular shader's per-step integrate (its orientation FxQuatNormalize
+    // runs; translation is a no-op at dt=0) so the CPU reference is byte-identical to the GPU phase.
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, /*dt=*/0);
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < v.hinges.size(); ++e)
+            SolveAngularLimit(world, v.hinges[e]);
+
+    // PHASE C — the WHEEL/CHASSIS ground clamp (each dynamic body rests at groundY + its radius). Like the
+    // fpx IntegrateBody floor clamp, a clamped body's DOWNWARD velocity is zeroed (it stops falling — the
+    // wheel rests; without this the clamped bodies keep accumulating gravity velocity and the spring damper
+    // sees zero RELATIVE velocity, so the suspension never settles).
+    for (size_t i = 0; i < n; ++i) {
+        FxBody& b = world.bodies[i];
+        if ((b.flags & fpx::kFlagDynamic) && b.pos.y < world.groundY + b.radius) {
+            b.pos.y = world.groundY + b.radius;
+            if (b.vel.y < 0) b.vel.y = 0;
+        }
+    }
+}
+
+// ----- StepVehicleRigSteps: run K full vehicle-rig settle ticks (the showcase / GPU K-step driver) ------
+inline void StepVehicleRigSteps(Vehicle& v, fx dt, int iters, int steps) {
+    for (int s = 0; s < steps; ++s)
+        StepVehicleRig(v, dt, iters);
+}
+
+// ----- VehicleRigState + MeasureVehicleRig: the honest settled-rig metrics (deterministic Q16.16) -------
+// chassisY        : the chassis centre pos.y (the ride-height proof — settles near groundY + rideHeight).
+// meanSpringLen   : the mean of the 4 spring lengths (compression: < restLen means the springs hold the
+//                   chassis up under its weight).
+// minWheelBottom  : the lowest (wheel.pos.y − wheelRadius) over the 4 wheels (>= groundY -> on the ground,
+//                   nothing buried).
+// wheelsOnGround  : true iff every wheel rests AT the ground band (|wheel.pos.y − (groundY+wheelRadius)|
+//                   within a small band — the wheels rest on the floor, not floating, not buried).
+// maxHingeOffAxis : the max (kOne − SwingAngleCos) over the 4 hinges (small -> the wheels stayed IN their
+//                   rolling plane; a held hinge keeps SwingAngleCos near kOne).
+struct VehicleRigState {
+    fx       chassisY        = 0;
+    fx       meanSpringLen   = 0;
+    fx       minWheelBottom  = 0;
+    bool     wheelsOnGround  = false;
+    fx       maxHingeOffAxis = 0;
+};
+
+inline VehicleRigState MeasureVehicleRig(const Vehicle& v, const VehicleConfig& cfg) {
+    VehicleRigState st;
+    const FxWorld& world = v.world;
+    st.chassisY = world.bodies[(size_t)v.chassisIndex].pos.y;
+
+    // Mean spring length over the 4 springs (the suspension compression metric).
+    int64_t sumLen = 0;
+    for (const FxSpringJoint& s : v.springs)
+        sumLen += (int64_t)SpringLength(world, s);
+    st.meanSpringLen = v.springs.empty() ? 0 : (fx)(sumLen / (int64_t)v.springs.size());
+
+    // The wheels-on-ground stat: every wheel's bottom (pos.y − wheelRadius) within a band of groundY.
+    const fx kGroundBand = kOne / 8;   // 0.125 unit band around the floor
+    bool allOnGround = true;
+    bool haveBottom = false;
+    for (int k = 0; k < 4; ++k) {
+        const FxBody& w = world.bodies[(size_t)v.wheelIndex[k]];
+        const fx bottom = w.pos.y - w.radius;
+        if (!haveBottom || bottom < st.minWheelBottom) { st.minWheelBottom = bottom; haveBottom = true; }
+        const fx d = bottom - world.groundY;
+        const fx ad = d < 0 ? -d : d;
+        if (ad > kGroundBand) allOnGround = false;
+    }
+    st.wheelsOnGround = allOnGround;
+    (void)cfg;
+
+    // The max hinge off-axis swing (kOne − SwingAngleCos; small -> the wheels stayed in-plane).
+    fx maxOff = 0;
+    for (const FxAngularLimit& h : v.hinges) {
+        const fx cosSwing = SwingAngleCos(world, h);
+        const fx off = kOne - cosSwing;   // 0 at perfectly in-plane
+        if (off > maxOff) maxOff = off;
+    }
+    st.maxHingeOffAxis = maxOff;
+    return st;
+}
+
 }  // namespace vehicle
 }  // namespace hf::sim

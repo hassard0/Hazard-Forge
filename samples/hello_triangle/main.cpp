@@ -497,6 +497,7 @@ int main(int argc, char** argv) {
     const char* jointLockstepShotPath = nullptr; // --joint-lockstep-shot <out.bmp> (Slice JT5: Deterministic Articulated-Body Ragdoll LOCKSTEP + ROLLBACK — the NETCODE HEADLINE of FLAGSHIP #15, the FPX5/FR5/GR5/CG5 twin. PURE-CPU harness over the JT3 articulated step (StepArticulatedContacts): the JT4 synthetic-humanoid ragdoll (RagdollFromSkeleton, free root so it collapses fully) is the init + a scripted impact stream that punches a couple of bones at a few ticks; authority==replica BIT-IDENTICAL inputs-only + RunRagdollRollback corrects a misprediction to authority BIT-EXACT (mispredict diverged before rollback) + two-run determinism. Reuses fpx's FPX5 machinery VERBATIM (fpx::FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld) — the per-tick step is joint::StepArticulatedContacts (threading the CONSTANT joints + angularLimits) instead of fpx's StepWorld; the three thin harness functions (SimRagdollTick/RunRagdollLockstep/RunRagdollRollback) are the fpx::SimTick/RunLockstep/RunRollback twins. The final collapsed ragdoll is rendered via the JT4 joint_ragdoll render path REUSED VERBATIM (bodies as discs at their bit-exact pos>>kFrac + skeleton edges as segments), bit-identical Vulkan-Windows == Metal-Mac by construction. NO GPU dispatch, NO new shader, NO new RHI; JT1-JT4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple*.h/fract.h + engine/physics/ UNTOUCHED (JT5 is additive — only the harness + the showcase))
     const char* jointRenderShotPath = nullptr; // --joint-render-shot <out.bmp> (Slice JT6: Deterministic Articulated-Body Ragdoll LIT 3D SKINNED RENDER CAPSTONE — the PILLAR-BRIDGE money-shot COMPLETING FLAGSHIP #15 (the FIFTEENTH flagship). The bit-exact ragdoll pose drives the EXISTING GPU skinned render: load the Fox skeleton -> joint::RagdollFromSkeleton (the JT4 float->Q16.16 bind, pinned root so the fox SAGS into a coherent slumped pose) -> joint::StepArticulatedContactsSteps K SHORT steps (the bit-exact JT3 collapse) -> joint::PoseToPalette (the ONE float crossing, the JT4 Q16.16->float read-back) -> dev.SetJointPalette -> render the Fox SKINNED + lit + shadowed through the EXISTING lit_skinned/shadow_skinned pipelines (the --skinning-shot/--anim-fsm-shot path REUSED VERBATIM — camera/light/shadow/sky/post unchanged); the ONLY swap is the palette SOURCE (ragdoll pose vs anim clip), so the Fox is POSED BY PHYSICS. FLOAT visresolve-bar (the FPX6/FR6 precedent): the golden is Metal-baked, the gate is Metal-determinism (two renders BYTE-IDENTICAL) + provenance (the palette IS a pure function of the bit-exact ragdoll state) + a coherent posed-character image; cross-vendor ~the float skinned-render baseline. PROOFS: palette provenance/count, two-run BYTE-IDENTICAL, ragdoll palette != bind palette (physics posed the mesh). STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader (hf_gen_msl UNCHANGED), NO new RHI; JT1-JT5 joint.h code + shaders + engine/anim/ + their goldens UNCHANGED (JT6 additive — only a thin RagdollToPalette alias + the showcase))
     const char* vehicleSpringShotPath = nullptr; // --vehicle-spring-shot <out.bmp> (Slice VH1: Deterministic Vehicle Physics SUSPENSION SPRING JOINT, the BEACHHEAD of FLAGSHIP #16 — a BODY BOBBING ON A SPRING (a pinned invMass-0 anchor + a dynamic body hung below by a FxSpringJoint, started displaced from restLen) settled K StepSpringWorld steps under gravity by one GPU thread (shaders/vehicle_spring_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel spring passes [SolveSpringJoint = cloth::SolveDistanceConstraint generalized to restLen != 0 + a stiffness scale + normal-velocity damping over the WORLD anchors, the inverse-mass split translating the body centres] -> ground clamp), GPU==CPU body array bit-exact vs vehicle.h::StepSpringWorld, integer 2D side-view of the body hung on the spring below the anchor, settled at rest; int64 -> vehicle_spring_solve.comp is Vulkan-only, Metal runs CPU StepSpringWorld)
+    const char* vehicleRigShotPath = nullptr; // --vehicle-rig-shot <out.bmp> (Slice VH2: Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE, the 2nd slice of FLAGSHIP #16 — ASSEMBLE a car (1 chassis FxBody + 4 wheel FxBodies tied by 4 VH1 FxSpringJoints + 4 joint::FxAngularLimit hinges) via VehicleFromConfig + settle it K StepVehicleRig steps so the chassis floats at ride height + the 4 wheels rest on the ground, the suspension compressed. NO new shader: the GPU driver composes the EXISTING vehicle_spring_solve.comp (PHASE A: integrate + K spring passes, SENTINEL groundY) + joint_angular_solve.comp (PHASE B: dt=0, jointCount=0, K angular/hinge passes, SENTINEL groundY) in the locked order, then the HOST wheel ground clamp (PHASE C) -> the SAME ops as the CPU StepVehicleRig -> GPU body world memcmp'd BIT-EXACT. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) settled on its suspension (wheels on ground + chassis at ride height + springs compressed); (4) hinges hold the wheels in-plane. int64 -> both shaders Vulkan-only; Metal --vehicle-rig runs the CPU StepVehicleRig. NO new shader/RHI; VH1 + JT2's shaders + their goldens + fpx.h/joint.h/grain.h/fluid.h/cloth.h/couple*.h/fract.h + engine/physics UNCHANGED (VH2 additive))
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -2445,6 +2446,19 @@ int main(int argc, char** argv) {
     // RHI. Its OWN loop (the FR1 C1061 standalone-loop pattern — NOT the big else-if ladder).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--vehicle-spring-shot") == 0) { vehicleSpringShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice VH2: --vehicle-rig-shot <out.bmp> (Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE,
+    // the 2nd slice of FLAGSHIP #16). ASSEMBLE a car (1 chassis + 4 wheels tied by 4 VH1 springs + 4 JT2
+    // hinges) via VehicleFromConfig, drop it, settle K StepVehicleRig steps -> the chassis floats at ride
+    // height + the 4 wheels rest on the ground, the suspension compressed. NO new shader: the GPU driver
+    // composes the EXISTING vehicle_spring_solve.comp (Phase A: integrate + K springs) + joint_angular_solve.
+    // comp (Phase B: dt=0, jointCount=0, K hinge passes) in the locked order then the HOST wheel ground clamp
+    // (Phase C) -> the SAME ops as the CPU StepVehicleRig -> GPU body world memcmp BIT-EXACT. int64 -> both
+    // shaders Vulkan-only; Metal --vehicle-rig runs the CPU StepVehicleRig. Its OWN loop (the FR1 C1061
+    // standalone-loop pattern — NOT the big else-if ladder).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--vehicle-rig-shot") == 0) { vehicleRigShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -27237,6 +27251,335 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — suspension spring side-view (%d bodies, %u springs)\n",
                                 vehicleSpringShotPath, imgW, imgH, kBodyCount, kSpringCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vehicleSpringShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE (--vehicle-rig-shot <out.bmp>,
+        // Slice VH2, the 2nd slice of FLAGSHIP #16). ASSEMBLE a car: 1 chassis FxBody + 4 wheel FxBodies tied
+        // by 4 VH1 FxSpringJoints (the suspension) + 4 JT2 FxAngularLimit hinges (kAngularHinge — the wheels
+        // spin about their axle but the hinge clamps the off-axis swing so a wheel stays in its rolling
+        // plane). VehicleFromConfig host-builds the rig; the car is DROPPED + SETTLED K StepVehicleRig steps
+        // -> the chassis floats at ride height + the 4 wheels rest on the ground, the suspension compressed.
+        // NO new shader: each StepVehicleRig tick is the JT3 two-PHASE-block mold, so the GPU driver drives
+        // (per tick) PHASE A = the EXISTING vehicle_spring_solve.comp (steps=1, iters=K, SENTINEL groundY so
+        // its floor clamp is a DEAD no-op) [integrate + K spring passes], then PHASE B = the EXISTING
+        // joint_angular_solve.comp (steps=1, iters=K, dt=0, jointCount=0, SENTINEL groundY) [the dt=0
+        // orientation re-normalize + K angular/hinge passes; jointCount=0 -> its ball pass is a no-op], then
+        // PHASE C = the HOST wheel/chassis ground clamp (pos.y >= groundY + radius). Composed, this is
+        // BYTE-IDENTICAL to the CPU vehicle::StepVehicleRig (the SAME IntegrateBodyFull[dt]/SolveSpringJoint +
+        // IntegrateBodyFull[dt=0]/SolveAngularLimit + the wheel clamp ops). The final GPU body world is
+        // memcmp'd BIT-EXACT vs the CPU reference (NO tol — the make-or-break). int64 -> both shaders are
+        // Vulkan-only; Metal --vehicle-rig runs the CPU StepVehicleRig. NO new RHI. CAVEAT: NO inter-body
+        // broadphase/contacts (VH3); the suspension residual is deterministic-but-nonzero (the cloth/JT/VH1
+        // within-band caveat).
+        if (vehicleRigShotPath) {
+            using math::Vec3;
+            namespace vehicle = hf::sim::vehicle;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic vehicle scene (== the Metal --vehicle-rig config + the vehicle_test VH2 case).
+            const vehicle::fx kDt = vehicle::kOne / 60;
+            const int kSteps = 400;                      // settle the car on its suspension
+            const int kIters = 16;                       // Gauss-Seidel spring/hinge passes per tick
+            const vehicle::fx kSentinelGroundY = (vehicle::fx)(-1000 * (int)vehicle::kOne); // far below -> shader floor-clamp dead
+
+            vehicle::VehicleConfig cfg;                  // the documented defaults (ride height 2, etc.)
+            const vehicle::Vehicle vehInit = vehicle::VehicleFromConfig(cfg);
+            const int kBodyCount = (int)vehInit.world.bodies.size();   // 5 (1 chassis + 4 wheels)
+            const uint32_t kSpringCount = (uint32_t)vehInit.springs.size();   // 4
+            const uint32_t kHingeCount = (uint32_t)vehInit.hinges.size();     // 4
+
+            // std430 FxBody mirror (matches both shaders' FxBody): 16 x int32 (64 bytes).
+            struct FxBodyGpu {
+                int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+                int32_t ox, oy, oz, ow, ax, ay, az;
+            };
+            static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+            static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout (16 x int32)");
+            auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+                std::vector<FxBodyGpu> out(bs.size());
+                for (size_t i = 0; i < bs.size(); ++i) {
+                    const fpx::FxBody& b = bs[i];
+                    out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                                       b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                                       b.angVel.x, b.angVel.y, b.angVel.z};
+                }
+                return out;
+            };
+            const std::vector<FxBodyGpu> bodiesInit = packBodies(vehInit.world.bodies);
+
+            // std430 FxSpringJoint mirror (matches vehicle_spring_solve.comp FxSpringJoint): 11 x int32 (44 B).
+            struct FxSpringJointGpu {
+                uint32_t bodyA, bodyB; int32_t aax, aay, aaz, abx, aby, abz;
+                int32_t restLen, stiffness, damping;
+            };
+            static_assert(sizeof(FxSpringJointGpu) == 44, "FxSpringJointGpu std430 layout");
+            static_assert(sizeof(vehicle::FxSpringJoint) == 44, "FxSpringJoint std430 layout (11 x int32)");
+            std::vector<FxSpringJointGpu> springsInit;
+            for (const vehicle::FxSpringJoint& j : vehInit.springs)
+                springsInit.push_back(FxSpringJointGpu{j.bodyA, j.bodyB, j.anchorA.x, j.anchorA.y, j.anchorA.z,
+                                                       j.anchorB.x, j.anchorB.y, j.anchorB.z, j.restLen,
+                                                       j.stiffness, j.damping});
+
+            // std430 FxJoint mirror (matches joint_angular_solve.comp FxJoint): 10 x int32 (40 bytes). VH2 has
+            // NO ball joints (jointCount=0), so this is a single dummy entry to satisfy the bound buffer.
+            struct FxJointGpu { uint32_t bodyA, bodyB; int32_t aax, aay, aaz, abx, aby, abz; uint32_t kind; int32_t limit; };
+            static_assert(sizeof(FxJointGpu) == 40, "FxJointGpu std430 layout");
+
+            // std430 FxAngularLimit mirror (matches joint_angular_solve.comp FxAngularLimit): 8 x int32 (32 B).
+            struct FxAngularLimitGpu { uint32_t bodyA, bodyB; int32_t axx, axy, axz, cosHalf, sinHalf; uint32_t kind; };
+            static_assert(sizeof(FxAngularLimitGpu) == 32, "FxAngularLimitGpu std430 layout");
+            static_assert(sizeof(vehicle::FxAngularLimit) == 32, "FxAngularLimit std430 layout (8 x int32)");
+            std::vector<FxAngularLimitGpu> hingesInit;
+            for (const vehicle::FxAngularLimit& l : vehInit.hinges)
+                hingesInit.push_back(FxAngularLimitGpu{l.bodyA, l.bodyB, l.axis.x, l.axis.y, l.axis.z,
+                                                       l.cosHalfLimit, l.sinHalfLimit, l.kind});
+
+            // Params (matches vehicle_spring_solve.comp SpringSolveParams): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, bodyCount, springCount, steps} + int4 cfg2 {iters, solveEnabled, _, _}.
+            struct SpringSolveParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(SpringSolveParams) == 48, "SpringSolveParams std430 layout");
+            // Params (matches joint_angular_solve.comp JointAngularParams): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, bodyCount, jointCount, steps} + int4 cfg2 {iters, limitCount, solveEnabled, _}.
+            struct JointAngularParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(JointAngularParams) == 48, "JointAngularParams std430 layout");
+
+            auto mkBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data;
+                d.usage = rhi::BufferUsage::Storage; return device->CreateBuffer(d);
+            };
+
+            // The PHASE A pipeline (vehicle_spring_solve.comp: 3 storage buffers; SINGLE thread).
+            auto springCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/vehicle_spring_solve.comp.hlsl.spv");
+            auto springCs = device->CreateShaderModule({std::span<const uint32_t>(springCsWords)});
+            rhi::ComputePipelineDesc springCdesc;
+            springCdesc.compute = springCs.get(); springCdesc.storageBufferCount = 3; springCdesc.threadsPerGroupX = 1;
+            auto springCompute = device->CreateComputePipeline(springCdesc);
+            // The PHASE B pipeline (joint_angular_solve.comp: 4 storage buffers; SINGLE thread).
+            auto angCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/joint_angular_solve.comp.hlsl.spv");
+            auto angCs = device->CreateShaderModule({std::span<const uint32_t>(angCsWords)});
+            rhi::ComputePipelineDesc angCdesc;
+            angCdesc.compute = angCs.get(); angCdesc.storageBufferCount = 4; angCdesc.threadsPerGroupX = 1;
+            auto angCompute = device->CreateComputePipeline(angCdesc);
+
+            // The springs/joints/hinges buffers are FIXED across the run (read-only) — allocate once.
+            std::vector<FxSpringJointGpu> springsAlloc = springsInit;
+            if (springsAlloc.empty()) springsAlloc.push_back(FxSpringJointGpu{});
+            auto springsBuf = mkBuf(springsAlloc.data(), springsAlloc.size() * sizeof(FxSpringJointGpu));
+            std::vector<FxJointGpu> jointsAlloc; jointsAlloc.push_back(FxJointGpu{});   // dummy (jointCount=0)
+            auto jointsBuf = mkBuf(jointsAlloc.data(), jointsAlloc.size() * sizeof(FxJointGpu));
+            std::vector<FxAngularLimitGpu> hingesAlloc = hingesInit;
+            if (hingesAlloc.empty()) hingesAlloc.push_back(FxAngularLimitGpu{});
+            auto hingesBuf = mkBuf(hingesAlloc.data(), hingesAlloc.size() * sizeof(FxAngularLimitGpu));
+
+            // dispatchSprings (PHASE A): one vehicle_spring_solve dispatch (steps=1, iters=K, SENTINEL groundY)
+            // over a FRESH bodies buffer uploaded from `cur` -> integrate + K spring passes; reads back.
+            auto dispatchSprings = [&](std::vector<FxBodyGpu>& cur) {
+                auto bodiesBuf = mkBuf(cur.data(), cur.size() * sizeof(FxBodyGpu));
+                SpringSolveParams p{};
+                p.grav[0] = 0; p.grav[1] = cfg.gravity.y; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kSentinelGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = (int32_t)kSpringCount; p.cfg[3] = 1;
+                p.cfg2[0] = kIters; p.cfg2[1] = 1; p.cfg2[2] = 0; p.cfg2[3] = 0;
+                auto paramsBuf = mkBuf(&p, sizeof(SpringSolveParams));
+                render::RenderGraph g; render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("vehicle_rig_springs", {}, {rgSwap}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BindComputePipeline(*springCompute);
+                    cmd.BindStorageBuffer(*bodiesBuf, 0);
+                    cmd.BindStorageBuffer(*springsBuf, 1);
+                    cmd.BindStorageBuffer(*paramsBuf, 2);
+                    cmd.DispatchCompute(1);
+                    cmd.ComputeToVertexBarrier();
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.EndRenderPass();
+                });
+                g.Execute(*device); device->WaitIdle();
+                device->ReadBuffer(*bodiesBuf, cur.data(), cur.size() * sizeof(FxBodyGpu), 0);
+            };
+            // dispatchHinges (PHASE B): one joint_angular_solve dispatch (steps=1, iters=K, dt=0, jointCount=0,
+            // SENTINEL groundY) over a FRESH bodies buffer from `cur` -> the dt=0 orientation re-normalize + K
+            // angular/hinge passes; reads back.
+            auto dispatchHinges = [&](std::vector<FxBodyGpu>& cur) {
+                auto bodiesBuf = mkBuf(cur.data(), cur.size() * sizeof(FxBodyGpu));
+                JointAngularParams p{};
+                p.grav[0] = 0; p.grav[1] = cfg.gravity.y; p.grav[2] = 0; p.grav[3] = 0;   // dt=0
+                p.cfg[0] = kSentinelGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = 0; p.cfg[3] = 1;  // jointCount=0
+                p.cfg2[0] = kIters; p.cfg2[1] = (int32_t)kHingeCount; p.cfg2[2] = 1; p.cfg2[3] = 0;
+                auto paramsBuf = mkBuf(&p, sizeof(JointAngularParams));
+                render::RenderGraph g; render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("vehicle_rig_hinges", {}, {rgSwap}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BindComputePipeline(*angCompute);
+                    cmd.BindStorageBuffer(*bodiesBuf, 0);
+                    cmd.BindStorageBuffer(*jointsBuf, 1);
+                    cmd.BindStorageBuffer(*hingesBuf, 2);
+                    cmd.BindStorageBuffer(*paramsBuf, 3);
+                    cmd.DispatchCompute(1);
+                    cmd.ComputeToVertexBarrier();
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.EndRenderPass();
+                });
+                g.Execute(*device); device->WaitIdle();
+                device->ReadBuffer(*bodiesBuf, cur.data(), cur.size() * sizeof(FxBodyGpu), 0);
+            };
+
+            // runGpu: the full host-driven K-tick driver. Per tick: PHASE A springs -> PHASE B hinges -> PHASE
+            // C host wheel/chassis ground clamp -> byte-identical to vehicle::StepVehicleRig.
+            const vehicle::fx kGroundY = cfg.groundY;
+            auto runGpu = [&](std::vector<FxBodyGpu>& outBodies) {
+                std::vector<FxBodyGpu> cur = bodiesInit;
+                for (int step = 0; step < kSteps; ++step) {
+                    dispatchSprings(cur);                         // PHASE A
+                    dispatchHinges(cur);                          // PHASE B
+                    for (int i = 0; i < kBodyCount; ++i) {        // PHASE C (host wheel clamp + vel.y zero)
+                        if ((cur[(size_t)i].flags & fpx::kFlagDynamic) == 0u) continue;
+                        const vehicle::fx floor = kGroundY + cur[(size_t)i].radius;
+                        if (cur[(size_t)i].py < floor) {
+                            cur[(size_t)i].py = floor;
+                            if (cur[(size_t)i].vy < 0) cur[(size_t)i].vy = 0;
+                        }
+                    }
+                }
+                outBodies = cur;
+            };
+
+            // === GPU drive (K ticks) ===
+            std::vector<FxBodyGpu> gpuBodies;
+            runGpu(gpuBodies);
+
+            // === CPU reference: StepVehicleRigSteps K times over the SAME scene ===
+            vehicle::Vehicle cpuVeh = vehInit;
+            vehicle::StepVehicleRigSteps(cpuVeh, kDt, kIters, kSteps);
+            const std::vector<FxBodyGpu> cpuBodies = packBodies(cpuVeh.world.bodies);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K ticks (integer memcmp, NO tol) — the MAKE-OR-BREAK.
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: vehicle-rig GPU body world != CPU StepVehicleRig "
+                             "(a float/order divergence crept into the vehicle rig step?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vehicle-rig: {bodies:%d, springs:%u, hinges:%u, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kSpringCount, kHingeCount, kSteps);
+
+            // PROOF (2) determinism: a second full GPU drive byte-identical.
+            std::vector<FxBodyGpu> gpuBodies2;
+            runGpu(gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: vehicle-rig two GPU drives differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vehicle-rig determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) the car SETTLED on its suspension: the 4 wheels rest on the ground AND the chassis
+            // floats above at ~ride height AND the springs are COMPRESSED. Measured on the CPU world (== GPU).
+            const vehicle::VehicleRigState st = vehicle::MeasureVehicleRig(cpuVeh, cfg);
+            const vehicle::fx chassisY = st.chassisY;
+            const bool chassisInBand = chassisY > kGroundY &&
+                                       chassisY < kGroundY + 4 * (int)vehicle::kOne;
+            const bool springCompressed = st.meanSpringLen < cfg.suspensionLen;
+            if (!(st.wheelsOnGround && chassisInBand && springCompressed)) {
+                std::fprintf(stderr, "FATAL: vehicle-rig did not settle (chassisY=%d, wheelsOnGround=%d, "
+                             "meanSpringLen=%d restLen=%d, minWheelBottom=%d)\n", chassisY,
+                             (int)st.wheelsOnGround, st.meanSpringLen, cfg.suspensionLen, st.minWheelBottom);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vehicle-rig settled: {chassisY:%d, wheelsOnGround:true, springCompressed:true}\n",
+                        chassisY);
+
+            // PROOF (4) the hinges hold the wheels IN-PLANE: every wheel's off-axis swing is within the hinge
+            // band (kOne - SwingAngleCos small -> the wheels did not flop out of their rolling plane).
+            const vehicle::fx kHingeBand = vehicle::kOne / 4;   // the within-band off-axis tolerance
+            if (st.maxHingeOffAxis >= kHingeBand) {
+                std::fprintf(stderr, "FATAL: vehicle-rig hinges let a wheel flop off-axis "
+                             "(maxHingeOffAxis=%d band=%d)\n", st.maxHingeOffAxis, kHingeBand);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vehicle-rig hinges: all 4 wheels in-plane\n");
+
+            // --- Golden: a PURE-INTEGER 2D SIDE-VIEW (X right, Y up; Z dropped) of the settled car. The
+            // chassis as a box (half-extents), 2 visible wheels (the +Z corners 0 + 2) as discs at their
+            // bit-exact pos>>kFrac, the suspension springs as segments (chassis corner -> wheel centre), the
+            // ground line. CPU-coloured from the read-back integers -> identical both backends by construction.
+            const int kPxPerUnit = 56;
+            const int kMargin = 40;
+            const int kWorldW = 8;     // x spans ~-1.5..+1.5 + chassis half + headroom -> centred
+            const int kWorldH = 5;     // y spans 0..~3 + headroom
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, const Vec3& col) {
+                if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+                uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+                d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                d[3] = 255;
+            };
+            // world (Q16.16) -> pixel; X centred about the car (offset +kWorldW/2 world units).
+            auto worldToPx = [&](vehicle::fx wx, vehicle::fx wy, int& ix, int& iy) {
+                const int64_t sx = ((int64_t)(wx + (vehicle::fx)((kWorldW / 2) * (int)vehicle::kOne)) * kPxPerUnit) >> vehicle::kFrac;
+                const int64_t sy = ((int64_t)wy * kPxPerUnit) >> vehicle::kFrac;
+                ix = kMargin + (int)sx;
+                iy = (int)imgH - kMargin - (int)sy;
+            };
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int n = adx > ady ? adx : ady;
+                if (n == 0) { putPx(x0, y0, col); return; }
+                for (int s = 0; s <= n; ++s)
+                    putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+            };
+            // The ground line (y == groundY).
+            { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+              for (int x = 0; x < (int)imgW; ++x) {
+                  if (gy0 < 0 || gy0 >= (int)imgH) break;
+                  uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+                  d[0] = 70; d[1] = 70; d[2] = 70; d[3] = 255;
+              } }
+            // The chassis box (its half-extents about the chassis centre).
+            {
+                const FxBodyGpu& c = gpuBodies[(size_t)cpuVeh.chassisIndex];
+                int x0, y0, x1, y1;
+                worldToPx(c.px - cfg.chassisHalfX, c.py + cfg.chassisHalfY, x0, y0);
+                worldToPx(c.px + cfg.chassisHalfX, c.py - cfg.chassisHalfY, x1, y1);
+                const Vec3 chassisCol{0.85f, 0.7f, 0.3f};
+                for (int yy = (y0 < y1 ? y0 : y1); yy <= (y0 < y1 ? y1 : y0); ++yy)
+                    for (int xx = (x0 < x1 ? x0 : x1); xx <= (x0 < x1 ? x1 : x0); ++xx)
+                        putPx(xx, yy, chassisCol);
+            }
+            // The suspension springs (segments chassis-corner -> wheel centre) for the 2 visible (+Z) corners.
+            const int visibleCorner[2] = {0, 2};   // front-right + rear-right (the +Z side; X-Y side view)
+            for (int vi = 0; vi < 2; ++vi) {
+                const vehicle::FxSpringJoint& j = cpuVeh.springs[(size_t)visibleCorner[vi]];
+                const fpx::FxBody& ba = cpuVeh.world.bodies[(size_t)j.bodyA];
+                const fpx::FxBody& bb = cpuVeh.world.bodies[(size_t)j.bodyB];
+                const vehicle::FxVec3 pa = vehicle::WorldAnchor(ba, j.anchorA);
+                const vehicle::FxVec3 pb = vehicle::WorldAnchor(bb, j.anchorB);
+                int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+                drawLine(ax, ay, bx, by, Vec3{0.6f, 0.85f, 0.95f});
+            }
+            // The 2 visible wheels as filled discs of wheelRadius, hashColor'd.
+            const int radPx = (int)(((int64_t)cfg.wheelRadius * kPxPerUnit) >> vehicle::kFrac);
+            for (int vi = 0; vi < 2; ++vi) {
+                const FxBodyGpu& w = gpuBodies[(size_t)cpuVeh.wheelIndex[visibleCorner[vi]]];
+                int cx, cy; worldToPx(w.px, w.py, cx, cy);
+                const Vec3 col = vg::hashColor((uint32_t)(visibleCorner[vi] + 2));
+                for (int yy = -radPx; yy <= radPx; ++yy)
+                    for (int xx = -radPx; xx <= radPx; ++xx)
+                        if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+            }
+            bool ok = WriteBMP(vehicleRigShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — vehicle rig side-view (%d bodies, %u springs, %u hinges, settled)\n",
+                                vehicleRigShotPath, imgW, imgH, kBodyCount, kSpringCount, kHingeCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vehicleRigShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -294,6 +294,89 @@ int main() {
               "StepSpringWorld control: damping=0 keeps oscillating (end speed exceeds the rest band)");
     }
 
+    // ============================================================================================
+    // Slice VH2 — THE VEHICLE RIG + WHEEL HINGE (VehicleFromConfig / StepVehicleRig / MeasureVehicleRig).
+    // ============================================================================================
+
+    // ================= VehicleFromConfig: 5 bodies (1 chassis + 4 wheels), 4 springs, 4 hinges =========
+    {
+        vehicle::VehicleConfig cfg;   // the documented defaults
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        check(veh.world.bodies.size() == 5, "VehicleFromConfig: 5 bodies (1 chassis + 4 wheels)");
+        check(veh.springs.size() == 4, "VehicleFromConfig: 4 suspension springs");
+        check(veh.hinges.size() == 4, "VehicleFromConfig: 4 wheel hinges");
+        check(veh.chassisIndex == 0, "VehicleFromConfig: chassis is body 0");
+        // The chassis is at ride height (groundY + rideHeight).
+        check(veh.world.bodies[veh.chassisIndex].pos.y == cfg.groundY + cfg.rideHeight,
+              "VehicleFromConfig: the chassis is at ride height");
+        // Each wheel hangs ~suspensionLen below the chassis centre, at its corner.
+        for (int k = 0; k < 4; ++k) {
+            const fpx::FxBody& w = veh.world.bodies[veh.wheelIndex[k]];
+            check(w.pos.y == veh.world.bodies[veh.chassisIndex].pos.y - cfg.suspensionLen,
+                  "VehicleFromConfig: the wheel hangs suspensionLen below the chassis");
+            check(w.invMass == cfg.wheelInvMass, "VehicleFromConfig: the wheel invMass is set per cfg");
+            check((w.flags & fpx::kFlagDynamic) != 0u, "VehicleFromConfig: the wheel is dynamic");
+        }
+        check(veh.world.bodies[veh.chassisIndex].invMass == cfg.chassisInvMass,
+              "VehicleFromConfig: the chassis invMass is set per cfg");
+        // Each spring ties the chassis to its wheel (bodyA chassis, bodyB wheel); each hinge is a hinge.
+        for (int k = 0; k < 4; ++k) {
+            check(veh.springs[k].bodyA == veh.chassisIndex && veh.springs[k].bodyB == veh.wheelIndex[k],
+                  "VehicleFromConfig: spring k ties chassis -> wheel k");
+            check(veh.springs[k].restLen == cfg.suspensionLen,
+                  "VehicleFromConfig: spring restLen == suspensionLen");
+            check(veh.hinges[k].bodyA == veh.chassisIndex && veh.hinges[k].bodyB == veh.wheelIndex[k],
+                  "VehicleFromConfig: hinge k ties chassis -> wheel k");
+            check(veh.hinges[k].kind == vehicle::kAngularHinge,
+                  "VehicleFromConfig: hinge k is kAngularHinge");
+        }
+    }
+
+    // ================= StepVehicleRig: a dropped car settles at ride height, wheels on the ground =======
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        const vehicle::fx dt = vehicle::kOne / 60;
+        const int kIters = 16;
+        vehicle::StepVehicleRigSteps(veh, dt, kIters, 400);   // settle
+
+        const vehicle::VehicleRigState st = vehicle::MeasureVehicleRig(veh, cfg);
+        // The wheels rest ON the ground (every wheel bottom within the band of groundY; nothing buried).
+        check(st.wheelsOnGround, "StepVehicleRig: the 4 wheels rest on the ground");
+        check(st.minWheelBottom >= cfg.groundY - vehicle::kOne / 16,
+              "StepVehicleRig: no wheel is buried below the ground");
+        // The chassis floats ABOVE the wheels (the suspension holds it up).
+        const vehicle::fx wheelMeanY = [&]() {
+            int64_t s = 0;
+            for (int k = 0; k < 4; ++k) s += (int64_t)veh.world.bodies[veh.wheelIndex[k]].pos.y;
+            return (vehicle::fx)(s / 4);
+        }();
+        check(st.chassisY > wheelMeanY, "StepVehicleRig: the chassis floats above the wheels");
+        // The chassis settled in a plausible ride-height band (above the ground, not flown away).
+        check(st.chassisY > cfg.groundY && st.chassisY < cfg.groundY + 4 * (int)vehicle::kOne,
+              "StepVehicleRig: the chassis settled in the ride-height band");
+        // The springs are COMPRESSED (mean spring length < restLen — they hold the chassis up).
+        check(st.meanSpringLen < cfg.suspensionLen,
+              "StepVehicleRig: the springs are compressed (mean length < restLen — holding the chassis)");
+        // The hinges keep the wheels IN-PLANE (the off-axis swing is small).
+        check(st.maxHingeOffAxis < vehicle::kOne / 4,
+              "StepVehicleRig: the hinges keep the wheels in their rolling plane");
+    }
+
+    // ================= StepVehicleRig: two runs byte-identical (determinism) =================
+    {
+        vehicle::VehicleConfig cfg;
+        const vehicle::fx dt = vehicle::kOne / 60;
+        vehicle::Vehicle a = vehicle::VehicleFromConfig(cfg);
+        vehicle::Vehicle b = vehicle::VehicleFromConfig(cfg);
+        vehicle::StepVehicleRigSteps(a, dt, 16, 200);
+        vehicle::StepVehicleRigSteps(b, dt, 16, 200);
+        const bool same = a.world.bodies.size() == b.world.bodies.size() &&
+                          std::memcmp(a.world.bodies.data(), b.world.bodies.data(),
+                                      a.world.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "StepVehicleRig determinism: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("vehicle_test: ALL PASS\n");
     else std::printf("vehicle_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;
