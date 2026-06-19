@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>     // Slice JT2: test-side host construction of angle/axis quaternions (NOT the sim path)
 #include <vector>
 #include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
@@ -262,6 +263,254 @@ int main() {
         // MaxAnchorGap stays small (the chain held together).
         check(joint::MaxAnchorGap(a, joints) < 2 * (int)joint::kOne,
               "StepJointWorld: max anchor gap small (chain connected, not scattered)");
+    }
+
+    // =============================================================================================
+    // ===== Slice JT2 — ANGULAR LIMITS (hinge + cone): the swing-twist + cone clamp + nlerp =========
+    // =============================================================================================
+
+    // A Q16.16 quaternion from an axis (host doubles) + angle (radians), host-snapped (test construction
+    // only — the SIM path stays pure-integer). q = {axis*sin(θ/2), cos(θ/2)}.
+    auto quatAxisAngle = [](double ax, double ay, double az, double ang) {
+        const double s = std::sin(ang * 0.5), c = std::cos(ang * 0.5);
+        const double len = std::sqrt(ax * ax + ay * ay + az * az);
+        if (len > 0) { ax /= len; ay /= len; az /= len; }
+        auto snap = [](double v) { return (fpx::fx)(v * (double)joint::kOne + (v < 0 ? -0.5 : 0.5)); };
+        return fpx::FxQuat{snap(ax * s), snap(ay * s), snap(az * s), snap(c)};
+    };
+    // |quaternion| within an LSB band of kOne (the normalize tolerance).
+    auto unitish = [](const fpx::FxQuat& q) {
+        const int64_t m2 = (int64_t)q.x * q.x + (int64_t)q.y * q.y + (int64_t)q.z * q.z + (int64_t)q.w * q.w;
+        const int64_t one2 = (int64_t)joint::kOne * (int64_t)joint::kOne;
+        const int64_t band = one2 / 64;   // ~1.5% on |q|^2
+        const int64_t d = m2 - one2;
+        return (d < 0 ? -d : d) < band;
+    };
+
+    // ================= QConj: the conjugate negates xyz, keeps w =================
+    {
+        const fpx::FxQuat q{1, 2, 3, 4};
+        const fpx::FxQuat c = joint::QConj(q);
+        check(c.x == -1 && c.y == -2 && c.z == -3 && c.w == 4, "QConj negates xyz, keeps w");
+    }
+
+    // ================= FxDot: the Q16.16 3-vector dot =================
+    {
+        // (1,2,0)·(3,0,0) = 3 (in Q16.16).
+        const joint::FxVec3 a{joint::kOne, 2 * (int)joint::kOne, 0};
+        const joint::FxVec3 b{3 * (int)joint::kOne, 0, 0};
+        check(joint::FxDot(a, b) == 3 * (int)joint::kOne, "FxDot computes the Q16.16 dot product");
+    }
+
+    // ================= QNlerp: t=0 -> p, t=kOne -> q, midpoint =================
+    {
+        const fpx::FxQuat p{0, 0, 0, joint::kOne};
+        const fpx::FxQuat q{joint::kOne, 0, 0, 0};
+        const fpx::FxQuat at0 = joint::QNlerp(p, q, 0);
+        check(at0.x == p.x && at0.w == p.w, "QNlerp t=0 -> p");
+        const fpx::FxQuat at1 = joint::QNlerp(p, q, joint::kOne);
+        check(at1.x == q.x && at1.w == q.w, "QNlerp t=kOne -> q");
+        const fpx::FxQuat mid = joint::QNlerp(p, q, joint::kOne / 2);
+        check(mid.x == joint::kOne / 2 && mid.w == joint::kOne / 2, "QNlerp midpoint is the component mean");
+    }
+
+    // ================= swing-twist round-trip: swing * twist == qrel (within an LSB band) =============
+    {
+        // qrel = a rotation about an off-axis direction (so both swing + twist are non-trivial). Decompose
+        // about Y; recompose swing*twist and compare to qrel.
+        const fpx::FxQuat qrel = quatAxisAngle(0.3, 1.0, 0.2, 0.8);   // a generic rotation
+        const joint::FxVec3 axis{0, joint::kOne, 0};
+        const joint::FxVec3 qrelXyz{qrel.x, qrel.y, qrel.z};
+        const joint::fx proj = joint::FxDot(qrelXyz, axis);
+        const fpx::FxQuat twist = joint::FxQuatNormalize(
+            fpx::FxQuat{joint::fxmul(axis.x, proj), joint::fxmul(axis.y, proj),
+                        joint::fxmul(axis.z, proj), qrel.w});
+        const fpx::FxQuat swing = joint::FxQuatMul(qrel, joint::QConj(twist));
+        const fpx::FxQuat recomposed = joint::FxQuatNormalize(joint::FxQuatMul(swing, twist));
+        // qrel was built unit; compare recomposed against the normalized qrel within a band.
+        const fpx::FxQuat qrelN = joint::FxQuatNormalize(qrel);
+        const joint::fx band = joint::kOne / 32;   // ~3% per component
+        auto near = [&](joint::fx u, joint::fx v) { joint::fx d = u - v; return (d < 0 ? -d : d) < band; };
+        // The decomposition is sign-ambiguous (q and -q are the same rotation); accept either.
+        const bool same = near(recomposed.x, qrelN.x) && near(recomposed.y, qrelN.y) &&
+                          near(recomposed.z, qrelN.z) && near(recomposed.w, qrelN.w);
+        const bool neg = near(recomposed.x, -qrelN.x) && near(recomposed.y, -qrelN.y) &&
+                         near(recomposed.z, -qrelN.z) && near(recomposed.w, -qrelN.w);
+        check(same || neg, "swing-twist round-trip: swing*twist == qrel within an LSB band");
+        check(unitish(swing) && unitish(twist), "swing-twist: both swing and twist are unit");
+    }
+
+    // Build a 2-body world (frame A pinned-or-dynamic + body B) for the angular-limit cases.
+    auto twoBodyWorld = [&](bool aPinned, const fpx::FxQuat& qA, const fpx::FxQuat& qB) {
+        joint::FxWorld w;
+        w.gravity = joint::FxVec3{0, 0, 0};
+        w.groundY = (joint::fx)(-1000 * (int)joint::kOne);
+        fpx::FxBody a = aPinned ? pinned(0, 0, 0) : dyn(0, 0, 0);
+        fpx::FxBody b = dyn(1, 0, 0);
+        a.orient = qA; b.orient = qB;
+        w.bodies = {a, b};
+        return w;
+    };
+
+    // ================= SolveAngularLimit HINGE drives an off-axis body back into the hinge plane ======
+    {
+        // A is identity; B is rotated about X (off the Y hinge axis) by ~0.6 rad -> a pure SWING. A HINGE
+        // (cosHalfLimit=kOne, sinHalfLimit=0) forces the swing toward identity, so the swing .w rises toward
+        // kOne (the body is driven back into the hinge plane). Multiple passes tighten (Gauss-Seidel).
+        const fpx::FxQuat qA{0, 0, 0, joint::kOne};
+        const fpx::FxQuat qB = quatAxisAngle(1, 0, 0, 0.6);   // a swing about X
+        joint::FxWorld w = twoBodyWorld(/*aPinned=*/false, qA, qB);
+        joint::FxAngularLimit lim;
+        lim.bodyA = 0; lim.bodyB = 1;
+        lim.axis = joint::FxVec3{0, joint::kOne, 0};   // Y hinge
+        lim.cosHalfLimit = joint::kOne; lim.sinHalfLimit = 0;
+        lim.kind = joint::kAngularHinge;
+        const joint::fx before = joint::SwingAngleCos(w, lim);
+        for (int it = 0; it < 8; ++it) joint::SolveAngularLimit(w, lim);
+        const joint::fx after = joint::SwingAngleCos(w, lim);
+        check(after > before, "SolveAngularLimit HINGE: the swing .w rises toward cosHalfLimit (driven in-plane)");
+        check(after > joint::kOne - joint::kOne / 16,
+              "SolveAngularLimit HINGE: the body is driven (nearly) into the hinge plane");
+    }
+
+    // ================= SolveAngularLimit CONE clamps a beyond-cone orientation to the cone =============
+    {
+        // The cone half-angle is 30° -> cosHalfLimit = cos(15°), sinHalfLimit = sin(15°). B is swung 60°
+        // about X (well beyond the cone). After the clamp the swing .w must rise to AT LEAST ~cos(15°).
+        const double half = 30.0 * 3.14159265358979323846 / 180.0;   // cone half-angle 30°
+        const joint::fx cosHalf = (joint::fx)(std::cos(half * 0.5) * (double)joint::kOne + 0.5);
+        const joint::fx sinHalf = (joint::fx)(std::sin(half * 0.5) * (double)joint::kOne + 0.5);
+        const fpx::FxQuat qA{0, 0, 0, joint::kOne};
+        const fpx::FxQuat qB = quatAxisAngle(1, 0, 0, 60.0 * 3.14159265358979323846 / 180.0);  // 60° swing
+        joint::FxWorld w = twoBodyWorld(/*aPinned=*/true, qA, qB);   // pin A so all correction lands on B
+        joint::FxAngularLimit lim;
+        lim.bodyA = 0; lim.bodyB = 1;
+        lim.axis = joint::FxVec3{0, joint::kOne, 0};
+        lim.cosHalfLimit = cosHalf; lim.sinHalfLimit = sinHalf;
+        lim.kind = joint::kAngularCone;
+        const joint::fx before = joint::SwingAngleCos(w, lim);
+        for (int it = 0; it < 8; ++it) joint::SolveAngularLimit(w, lim);
+        const joint::fx after = joint::SwingAngleCos(w, lim);
+        check(before < cosHalf, "SolveAngularLimit CONE: the beyond-cone orientation starts outside the cone");
+        check(after >= cosHalf - joint::kOne / 64,
+              "SolveAngularLimit CONE: the swing is clamped to (about) the cone half-angle");
+    }
+
+    // ================= SolveAngularLimit: an in-limit orientation is a (near) no-op =================
+    {
+        // A 10° swing inside a 30° cone -> the clamp branch never triggers; the orientation barely changes.
+        const double half = 30.0 * 3.14159265358979323846 / 180.0;
+        const joint::fx cosHalf = (joint::fx)(std::cos(half * 0.5) * (double)joint::kOne + 0.5);
+        const joint::fx sinHalf = (joint::fx)(std::sin(half * 0.5) * (double)joint::kOne + 0.5);
+        const fpx::FxQuat qA{0, 0, 0, joint::kOne};
+        const fpx::FxQuat qB = quatAxisAngle(1, 0, 0, 10.0 * 3.14159265358979323846 / 180.0);
+        joint::FxWorld w = twoBodyWorld(/*aPinned=*/true, qA, qB);
+        const fpx::FxQuat bBefore = w.bodies[1].orient;
+        joint::FxAngularLimit lim;
+        lim.bodyA = 0; lim.bodyB = 1;
+        lim.axis = joint::FxVec3{0, joint::kOne, 0};
+        lim.cosHalfLimit = cosHalf; lim.sinHalfLimit = sinHalf;
+        lim.kind = joint::kAngularCone;
+        joint::SolveAngularLimit(w, lim);
+        const fpx::FxQuat bAfter = w.bodies[1].orient;
+        const joint::fx band = joint::kOne / 32;
+        auto near = [&](joint::fx u, joint::fx v) { joint::fx d = u - v; return (d < 0 ? -d : d) < band; };
+        check(near(bAfter.x, bBefore.x) && near(bAfter.y, bBefore.y) &&
+              near(bAfter.z, bBefore.z) && near(bAfter.w, bBefore.w),
+              "SolveAngularLimit in-limit: a within-cone orientation is a (near) no-op");
+    }
+
+    // ================= SolveAngularLimit: a pinned body (invMass 0) is NOT rotated =================
+    {
+        // A is PINNED. A HINGE should rotate ONLY B (A holds its orientation exactly — wA = 0).
+        const fpx::FxQuat qA{0, 0, 0, joint::kOne};
+        const fpx::FxQuat qB = quatAxisAngle(1, 0, 0, 0.6);
+        joint::FxWorld w = twoBodyWorld(/*aPinned=*/true, qA, qB);
+        const fpx::FxQuat aBefore = w.bodies[0].orient;
+        joint::FxAngularLimit lim;
+        lim.bodyA = 0; lim.bodyB = 1;
+        lim.axis = joint::FxVec3{0, joint::kOne, 0};
+        lim.cosHalfLimit = joint::kOne; lim.sinHalfLimit = 0;
+        lim.kind = joint::kAngularHinge;
+        joint::SolveAngularLimit(w, lim);
+        check(w.bodies[0].orient.x == aBefore.x && w.bodies[0].orient.y == aBefore.y &&
+              w.bodies[0].orient.z == aBefore.z && w.bodies[0].orient.w == aBefore.w,
+              "SolveAngularLimit pinned: the pinned body's orientation is NOT rotated");
+    }
+
+    // ================= SolveAngularLimit: a FREE limit (cosHalfLimit = -kOne) never clamps ============
+    {
+        // cosHalfLimit = -kOne is a 180° cone -> swing.w >= -kOne is ALWAYS true -> the clamp branch never
+        // triggers -> the orientation is (nlerp toward itself, since qrelClamped == qrel) a near no-op.
+        const fpx::FxQuat qA{0, 0, 0, joint::kOne};
+        const fpx::FxQuat qB = quatAxisAngle(1, 0, 0, 1.2);   // a large swing
+        joint::FxWorld w = twoBodyWorld(/*aPinned=*/true, qA, qB);
+        const fpx::FxQuat bBefore = w.bodies[1].orient;
+        joint::FxAngularLimit lim;
+        lim.bodyA = 0; lim.bodyB = 1;
+        lim.axis = joint::FxVec3{0, joint::kOne, 0};
+        lim.cosHalfLimit = -(joint::fx)joint::kOne; lim.sinHalfLimit = 0;   // free
+        lim.kind = joint::kAngularCone;
+        joint::SolveAngularLimit(w, lim);
+        const fpx::FxQuat bAfter = w.bodies[1].orient;
+        const joint::fx band = joint::kOne / 16;
+        auto near = [&](joint::fx u, joint::fx v) { joint::fx d = u - v; return (d < 0 ? -d : d) < band; };
+        check(near(bAfter.x, bBefore.x) && near(bAfter.y, bBefore.y) &&
+              near(bAfter.z, bBefore.z) && near(bAfter.w, bBefore.w),
+              "SolveAngularLimit free (cosHalfLimit=-kOne): never clamps (a near no-op)");
+    }
+
+    // ================= StepArticulated: two runs byte-identical (determinism) =================
+    {
+        // The swinging-door scene (== the showcase): a pinned frame + a door, a ball joint at the hinge + a
+        // HINGE limit about Y, the door seeded a twist + a small off-axis angVel.
+        const joint::fx gravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const joint::fx kDoorHalf = joint::kOne;
+        auto build = [&]() {
+            joint::FxWorld w;
+            w.gravity = joint::FxVec3{0, gravY, 0};
+            w.groundY = (joint::fx)(-100 * (int)joint::kOne);
+            fpx::FxBody frame = pinned(6, 12, 0);
+            fpx::FxBody door = dyn(6, 12, 0);
+            door.pos.x += kDoorHalf;
+            door.angVel = joint::FxVec3{joint::kOne * 3 / 4, joint::kOne * 3 / 2, 0};  // off-axis + twist
+            w.bodies = {frame, door};
+            return w;
+        };
+        std::vector<joint::FxJoint> joints2;
+        {
+            joint::FxJoint j;
+            j.bodyA = 0; j.bodyB = 1;
+            j.anchorA = joint::FxVec3{0, 0, 0};
+            j.anchorB = joint::FxVec3{-kDoorHalf, 0, 0};
+            j.kind = joint::kJointBall;
+            joints2.push_back(j);
+        }
+        std::vector<joint::FxAngularLimit> limits2;
+        {
+            joint::FxAngularLimit lim;
+            lim.bodyA = 0; lim.bodyB = 1;
+            lim.axis = joint::FxVec3{0, joint::kOne, 0};
+            lim.cosHalfLimit = joint::kOne; lim.sinHalfLimit = 0;
+            lim.kind = joint::kAngularHinge;
+            limits2.push_back(lim);
+        }
+        const joint::fx dt = joint::kOne / 60;
+        joint::FxWorld a = build(), b = build();
+        joint::StepArticulatedSteps(a, joints2, limits2, dt, 16, 120);
+        joint::StepArticulatedSteps(b, joints2, limits2, dt, 16, 120);
+        const bool same = a.bodies.size() == b.bodies.size() &&
+                          std::memcmp(a.bodies.data(), b.bodies.data(),
+                                      a.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "StepArticulated determinism: two runs BYTE-IDENTICAL");
+        // The pinned frame never moved.
+        check(a.bodies[0].pos.x == (joint::fx)(6 * (int)joint::kOne) &&
+              a.bodies[0].pos.y == (joint::fx)(12 * (int)joint::kOne),
+              "StepArticulated: the pinned frame holds exactly");
+        // The door held its hinge: its off-axis swing stayed within the cone (in the hinge plane).
+        const joint::fx swingCos = joint::SwingAngleCos(a, limits2[0]);
+        check(swingCos >= joint::kOne - joint::kOne / 64,
+              "StepArticulated: the door stayed in the hinge plane (swing within the cone)");
     }
 
     if (g_fail == 0) std::printf("joint_test: ALL PASS\n");
