@@ -380,6 +380,8 @@ int main() {
             bool sawFractBreakFeature = false;
             // Slice FR4: the deterministic-fract-step capability is advertised.
             bool sawFractStepFeature = false;
+            // Slice FR5: the deterministic-fract-lockstep capability is advertised.
+            bool sawFractLockstepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -530,6 +532,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-fract-fragments") sawFractFragmentsFeature = true;
                     if (AsString(el->value) == "deterministic-fract-break") sawFractBreakFeature = true;
                     if (AsString(el->value) == "deterministic-fract-step") sawFractStepFeature = true;
+                    if (AsString(el->value) == "deterministic-fract-lockstep") sawFractLockstepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -664,6 +667,7 @@ int main() {
         check(sawFractFragmentsFeature, "engine.features includes deterministic-fract-fragments");
         check(sawFractBreakFeature, "engine.features includes deterministic-fract-break");
         check(sawFractStepFeature, "engine.features includes deterministic-fract-step");
+        check(sawFractLockstepFeature, "engine.features includes deterministic-fract-lockstep");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -882,6 +886,8 @@ int main() {
         bool sawFractBreakShot = false;
         // Slice FR4: the --fract-step-shot showcase flag is listed in the showcase manifest.
         bool sawFractStepShot = false;
+        // Slice FR5: the --fract-lockstep-shot showcase flag is listed in the showcase manifest.
+        bool sawFractLockstepShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1053,6 +1059,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--fract-fragments-shot") sawFractFragmentsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fract-break-shot") sawFractBreakShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fract-step-shot") sawFractStepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--fract-lockstep-shot") sawFractLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-contact-shot") sawGrainContactShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-friction-shot") sawGrainFrictionShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-lockstep-shot") sawGrainLockstepShot = true;
@@ -1189,6 +1196,7 @@ int main() {
         check(sawFractFragmentsShot, "showcases manifest includes --fract-fragments-shot");
         check(sawFractBreakShot, "showcases manifest includes --fract-break-shot");
         check(sawFractStepShot, "showcases manifest includes --fract-step-shot");
+        check(sawFractLockstepShot, "showcases manifest includes --fract-lockstep-shot");
         check(sawGrainContactShot, "showcases manifest includes --grain-contact-shot");
         check(sawGrainFrictionShot, "showcases manifest includes --grain-friction-shot");
         check(sawGrainLockstepShot, "showcases manifest includes --grain-lockstep-shot");
