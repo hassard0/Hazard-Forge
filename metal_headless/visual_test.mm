@@ -94,6 +94,7 @@
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
 #include "sim/couple_gf.h"           // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
+#include "sim/fract.h"               // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -16521,6 +16522,184 @@ static int RunMcClassifyShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — MC case-index Z-slice viz (%d surface cells)\n",
                 outPath, imgW, imgH, surfaceCells);
+    return 0;
+}
+
+// --- Deterministic Rigid-Body Fracture CELL PRE-FRACTURE / VORONOI DECOMPOSITION showcase (Slice FR1,
+// the BEACHHEAD of FLAGSHIP #14). The TRUE pass is identical on both backends: a fixed source-volume
+// integer LATTICE (32x32x16 samples) + a fixed deterministic host-listed seed set (M=16 seeds in lattice
+// coords) feed the SAME shaders/fract_classify.comp (here fract_classify.comp.gen.metal — PURE INT32 ->
+// MSL-NATIVE, a TRUE GPU pass on Metal, NOT a CPU fallback). One thread per lattice SAMPLE runs the
+// nearest-seed loop (bestId = argmin_k dx*dx+dy*dy+dz*dz, STRICTLY-less lowest-index tie-break, copied
+// VERBATIM from engine/sim/fract.h::NearestSeed) + writes gCells[sample]=bestId (an order-independent
+// per-sample integer write). ReadBuffer reads the cellId field and it is PROVEN BIT-EXACT vs the CPU
+// fract.h::ClassifyFractCells reference (memcmp, NO tolerance) — the same GPU==CPU proof the Vulkan
+// --fract-cells-shot runs; classifyEnabled=false -> all-zero; two runs byte-identical; partition complete
+// (every sample assigned, every cellId in [0,M)). The image golden is the cellId field CPU-colored as a
+// grid of Z-slices (hashColor(cellId) per sample -> the Voronoi cell mosaic; 16 slices tiled 4x4) ->
+// identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). New golden
+// tests/golden/metal/fract_cells.png; two runs DIFF 0.0000. NO rendering, NO new RHI.
+static int RunFractCellsShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fract = hf::sim::fract;
+    namespace vg = render::vg;
+
+    // The fixed lattice + seed set (== the Vulkan --fract-cells-shot config, verbatim).
+    const int kNx = 32, kNy = 32, kNz = 16;
+    fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+    const int sampleCount = field.sampleCount();
+    const std::vector<fract::FractSeed> seeds = {
+        { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+        {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+        {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+        {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+    };
+    const int kM = (int)seeds.size();
+
+    const int kTilesX = 4, kTilesY = 4, kPad = 2;
+    const uint32_t imgW = (uint32_t)(kTilesX * kNx + (kTilesX + 1) * kPad);
+    const uint32_t imgH = (uint32_t)(kTilesY * kNy + (kTilesY + 1) * kPad);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // gSeeds SSBO (Seed{int4 coord} std430 — uploaded once, read-only on the GPU).
+    struct SeedGpu { int32_t x, y, z, w; };
+    static_assert(sizeof(SeedGpu) == 16, "SeedGpu std430 layout");
+    std::vector<SeedGpu> seedsGpu((size_t)kM);
+    for (int k = 0; k < kM; ++k)
+        seedsGpu[(size_t)k] = SeedGpu{seeds[(size_t)k].x, seeds[(size_t)k].y, seeds[(size_t)k].z, 0};
+    rhi::BufferDesc sDesc;
+    sDesc.size = seedsGpu.size() * sizeof(SeedGpu);
+    sDesc.initialData = seedsGpu.data();
+    sDesc.usage = rhi::BufferUsage::Storage;
+    auto seedsBuf = device->CreateBuffer(sDesc);
+
+    std::vector<uint32_t> cellsInit((size_t)sampleCount, 0u);
+    auto makeCellsBuf = [&]() {
+        rhi::BufferDesc d;
+        d.size = cellsInit.size() * sizeof(uint32_t);
+        d.initialData = cellsInit.data();
+        d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct FractParams { int32_t dims[4]; int32_t cfg[4]; };
+    static_assert(sizeof(FractParams) == 32, "FractParams std430 layout");
+    auto makeParams = [&](int32_t classifyEnabled) {
+        FractParams p{};
+        p.dims[0] = kNx; p.dims[1] = kNy; p.dims[2] = kNz; p.dims[3] = 0;
+        p.cfg[0] = kM; p.cfg[1] = classifyEnabled; p.cfg[2] = sampleCount; p.cfg[3] = 0;
+        return p;
+    };
+
+    auto frCs = loadMSL("fract_classify.comp.gen.metal", "fract_classify_main");
+    rhi::ComputePipelineDesc frCd;
+    frCd.compute = frCs.get(); frCd.storageBufferCount = 3; frCd.threadsPerGroupX = 64;
+    auto frCompute = device->CreateComputePipeline(frCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)sampleCount + 63u) / 64u;
+
+    auto runClassify = [&](int32_t classifyEnabled, std::vector<uint32_t>& outCells) {
+        auto cellsBuf = makeCellsBuf();
+        FractParams params = makeParams(classifyEnabled);
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(FractParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("fract_classify", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*frCompute);
+                cmd.BindStorageBuffer(*seedsBuf, 0);
+                cmd.BindStorageBuffer(*cellsBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCells.assign((size_t)sampleCount, 0u);
+        device->ReadBuffer(*cellsBuf, outCells.data(), outCells.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU classify (enabled).
+    std::vector<uint32_t> gpuCells;
+    runClassify(1, gpuCells);
+
+    // CPU reference over the SAME field+seeds.
+    fract::FractCells cpu;
+    fract::ClassifyFractCells(field, seeds, cpu);
+
+    if (gpuCells.size() != cpu.cellId.size() ||
+        std::memcmp(gpuCells.data(), cpu.cellId.data(), (size_t)sampleCount * sizeof(uint32_t)) != 0)
+        return fail("fract-cells: GPU cellId set != CPU ClassifyFractCells (non-int32 crept in?)");
+    auto counts = fract::CellSampleCounts(cpu, kM);
+    const int distinctCells = fract::DistinctCellCount(counts);
+    std::printf("fract-cells: {lattice:%dx%dx%d, seeds:%d, cells:%d} GPU==CPU BIT-EXACT\n",
+                kNx, kNy, kNz, kM, distinctCells);
+
+    // two-run determinism.
+    std::vector<uint32_t> gpuCells2;
+    runClassify(1, gpuCells2);
+    if (gpuCells.size() != gpuCells2.size() ||
+        std::memcmp(gpuCells.data(), gpuCells2.data(), gpuCells.size() * sizeof(uint32_t)) != 0)
+        return fail("fract-cells: two dispatches differ (nondeterministic)");
+    std::printf("fract-cells determinism: two runs BYTE-IDENTICAL\n");
+
+    // partition completeness: every sample assigned + every cellId in [0,M).
+    int assigned = 0; bool inRange = true;
+    for (uint32_t id : gpuCells) { ++assigned; if ((int)id >= kM) inRange = false; }
+    if (!inRange || assigned != sampleCount)
+        return fail("fract-cells: partition incomplete (cellId out of [0,M) or unassigned)");
+    std::printf("fract-cells partition: {samples:%d, assigned:%d} complete\n", sampleCount, assigned);
+
+    // (sanity) classifyEnabled=false -> all-zero.
+    {
+        std::vector<uint32_t> disabledCells;
+        runClassify(0, disabledCells);
+        for (uint32_t c : disabledCells) if (c != 0u) return fail("fract-cells: disabled path not zero");
+    }
+
+    // --- Golden: the cellId field CPU-colored as a grid of Z-slices (IDENTICAL to the Vulkan
+    // --fract-cells-shot by construction). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    for (int z = 0; z < kNz; ++z) {
+        const int tileX = z % kTilesX;
+        const int tileY = z / kTilesX;
+        const int ox = kPad + tileX * (kNx + kPad);
+        const int oy = kPad + tileY * (kNy + kPad);
+        for (int y = 0; y < kNy; ++y)
+            for (int x = 0; x < kNx; ++x) {
+                const int idx = (z * kNy + y) * kNx + x;
+                const uint32_t cellId = gpuCells[(size_t)idx];
+                const int ix = ox + x;
+                const int iy = oy + y;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                Vec3 col = vg::hashColor(cellId);
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — fracture Voronoi cell mosaic (%d cells over %d samples)\n",
+                outPath, imgW, imgH, distinctCells, sampleCount);
     return 0;
 }
 
@@ -37941,6 +38120,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mc-classify") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mc_classify.png";
             try { return RunMcClassifyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fract-cells <out.png>: render the Deterministic Rigid-Body Fracture CELL PRE-FRACTURE /
+        // VORONOI DECOMPOSITION showcase (Slice FR1, the beachhead of FLAGSHIP #14). A fixed source-volume
+        // integer LATTICE (32x32x16 samples) + a fixed deterministic host seed set (M=16) feed the SAME
+        // fract_classify.comp (PURE INT32 -> MSL-NATIVE, a true GPU pass: one thread per lattice sample
+        // runs the nearest-seed loop + writes gCells[sample]=bestId, verbatim engine/sim/fract.h) ->
+        // ReadBuffer reads the cellId field, PROVEN BIT-EXACT vs the CPU fract.h::ClassifyFractCells
+        // reference (memcmp, no tol — the same GPU==CPU proof the Vulkan --fract-cells-shot runs);
+        // classifyEnabled=false -> all-zero; two runs byte-identical; partition complete. The image golden
+        // is the cellId field CPU-colored as a grid of 16 Z-slices (hashColor(cellId), the Voronoi mosaic;
+        // tiled 4x4), identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/fract_cells.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fract-cells") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fract_cells.png";
+            try { return RunFractCellsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer
