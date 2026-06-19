@@ -731,6 +731,128 @@ int main() {
               "RagdollFromSkeleton: pinned root holds exactly through the collapse");
     }
 
+    // ================= Slice JT5: lockstep + rollback over the ragdoll collapse =================
+    // Build a small deterministic ragdoll (a free-root humanoid-ish skeleton) + an impact stream, and pin:
+    // SimRagdollTick advances deterministically; RunRagdollLockstep authority==replica BIT-EXACT (inputs
+    // only); RunRagdollRollback == RunRagdollLockstep(auth) AND mispredicted != authority; an impact changes
+    // a bone's trajectory (the stream does work); fpx::SnapshotWorld/RestoreWorld round-trip is bit-exact.
+    // The harness reuses fpx's command + snapshot functions VERBATIM (the JT5 design).
+    {
+        namespace anim = hf::anim;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        anim::Skeleton skel;
+        skel.joints.push_back(J(-1, 0.0f, 5.0f, 0.0f));  // 0 root (pelvis)
+        skel.joints.push_back(J(0,  0.0f, 1.0f, 0.0f));  // 1 spine
+        skel.joints.push_back(J(1,  0.0f, 1.0f, 0.0f));  // 2 head
+        skel.joints.push_back(J(1, -0.6f, 0.4f, 0.0f));  // 3 L arm
+        skel.joints.push_back(J(1,  0.6f, 0.4f, 0.0f));  // 4 R arm
+        const size_t n = skel.joints.size();
+        std::vector<math::Mat4> g(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(skel.joints[j].t, skel.joints[j].r, skel.joints[j].s);
+            const int p = skel.joints[j].parent;
+            g[j] = (p >= 0) ? (g[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) skel.joints[j].inverseBind = g[j].Inverse();
+
+        joint::RagdollConfig cfg;
+        cfg.worldScale = joint::kOne;
+        cfg.boneRadius = joint::kOne * 30 / 100;
+        cfg.invMass = joint::kOne;
+        cfg.coneCos = -joint::kOne;
+        cfg.coneSin = 0;
+        cfg.gravity = joint::FxVec3{0, (joint::fx)(-9.8 * (double)joint::kOne - 0.5), 0};
+        cfg.groundY = 0;
+        cfg.rootStatic = false;                          // FREE root -> the impacts do visible work
+
+        const joint::Ragdoll rag = joint::RagdollFromSkeleton(skel, cfg);
+        const joint::FxWorld init = rag.world;
+        const std::vector<joint::FxJoint>& joints = rag.joints;          // CONSTANT topology
+        const std::vector<joint::FxAngularLimit>& limits = rag.limits;   // CONSTANT topology
+
+        // Punch the head (body 2) — a dynamic bone.
+        const uint32_t punch = 2u;
+        check(init.bodies[punch].flags & fpx::kFlagDynamic, "JT5 scene: the punched bone is dynamic");
+
+        const joint::fx dt = joint::kOne / 60;
+        const int kIters = 8;
+        const int kSolveIters = 4;
+        const int kTicks = 30;
+        const int kMispredictTick = 8;
+
+        const std::vector<fpx::FxCommand> authStream = {
+            fpx::FxCommand{2,  fpx::kCmdImpulse,   punch, fpx::FxVec3{(joint::fx)(3 * (int)joint::kOne), 0, 0}},
+            fpx::FxCommand{5,  fpx::kCmdSetAngVel, punch, fpx::FxVec3{0, joint::kOne, 0}},
+            fpx::FxCommand{10, fpx::kCmdImpulse,   punch, fpx::FxVec3{0, 0, (joint::fx)(2 * (int)joint::kOne)}},
+        };
+
+        auto worldEqual = [&](const fpx::FxWorld& a, const fpx::FxWorld& b) {
+            return a.bodies.size() == b.bodies.size() &&
+                   std::memcmp(a.bodies.data(), b.bodies.data(),
+                               a.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+                   a.gravity.x == b.gravity.x && a.gravity.y == b.gravity.y &&
+                   a.gravity.z == b.gravity.z && a.groundY == b.groundY;
+        };
+
+        // SimRagdollTick advances the world deterministically: over a single tick a bone's state CHANGES and
+        // two ticks from the same start are byte-identical (the per-tick determinism the lockstep builds on).
+        {
+            fpx::FxWorld w0 = init;
+            joint::SimRagdollTick(w0, joints, limits, authStream, 0u, dt, kIters, kSolveIters);
+            const bool moved = std::memcmp(w0.bodies.data(), init.bodies.data(),
+                                           init.bodies.size() * sizeof(fpx::FxBody)) != 0;
+            check(moved, "JT5 SimRagdollTick: a bone's state advances over one tick");
+            fpx::FxWorld w1 = init;
+            joint::SimRagdollTick(w1, joints, limits, authStream, 0u, dt, kIters, kSolveIters);
+            check(worldEqual(w0, w1), "JT5 SimRagdollTick: two ticks from the same start are BIT-IDENTICAL");
+        }
+
+        // LOCKSTEP: authority == replica BIT-EXACT (two runs from the SAME init+stream, inputs only).
+        const fpx::FxWorld authority =
+            joint::RunRagdollLockstep(init, joints, limits, authStream, kTicks, dt, kIters, kSolveIters);
+        const fpx::FxWorld replica =
+            joint::RunRagdollLockstep(init, joints, limits, authStream, kTicks, dt, kIters, kSolveIters);
+        check(worldEqual(authority, replica),
+              "JT5 lockstep: authority == replica BIT-EXACT (inputs-only re-sim)");
+
+        // The MISPREDICTED stream: authStream + a WRONG strong punch at mispredictTick.
+        std::vector<fpx::FxCommand> mispredictStream = authStream;
+        mispredictStream.push_back(fpx::FxCommand{(uint32_t)kMispredictTick, fpx::kCmdImpulse, punch,
+                                                  fpx::FxVec3{(joint::fx)(40 * (int)joint::kOne), 0, 0}});
+
+        // ROLLBACK: rolledBack == authority BIT-EXACT, AND the mispredicted run DIFFERED (a real divergence).
+        const fpx::FxWorld rolledBack =
+            joint::RunRagdollRollback(init, joints, limits, authStream, mispredictStream, kTicks,
+                                      kMispredictTick, dt, kIters, kSolveIters);
+        const fpx::FxWorld mispredicted =
+            joint::RunRagdollLockstep(init, joints, limits, mispredictStream, kTicks, dt, kIters, kSolveIters);
+        check(worldEqual(rolledBack, authority), "JT5 rollback: corrected == authority BIT-EXACT");
+        check(!worldEqual(mispredicted, authority),
+              "JT5 rollback: the mispredicted state DIFFERED from authority (non-vacuous proof)");
+
+        // MOTION: the impact stream did non-trivial work (authority bone pos != the no-command baseline).
+        const std::vector<fpx::FxCommand> noStream;
+        const fpx::FxWorld noInput =
+            joint::RunRagdollLockstep(init, joints, limits, noStream, kTicks, dt, kIters, kSolveIters);
+        const bool moved = authority.bodies[punch].pos.x != noInput.bodies[punch].pos.x ||
+                           authority.bodies[punch].pos.z != noInput.bodies[punch].pos.z;
+        check(moved, "JT5 motion: the impact stream changed a bone's trajectory (the stream does work)");
+
+        // SNAPSHOT round-trip: RestoreWorld(SnapshotWorld(w)) == w byte-for-byte (reused fpx VERBATIM).
+        {
+            fpx::FxWorld w =
+                joint::RunRagdollLockstep(init, joints, limits, authStream, kMispredictTick, dt, kIters, kSolveIters);
+            const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+            joint::SimRagdollTick(w, joints, limits, authStream, (uint32_t)kMispredictTick, dt, kIters,
+                                  kSolveIters);   // mutate
+            fpx::RestoreWorld(w, snap);
+            check(worldEqual(w, snap), "JT5 snapshot: SnapshotWorld/RestoreWorld round-trip BIT-EXACT");
+        }
+    }
+
     if (g_fail == 0) std::printf("joint_test: ALL PASS\n");
     else std::printf("joint_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

@@ -670,5 +670,102 @@ inline RagdollState MeasureRagdoll(const anim::Skeleton& /*skeleton*/, const Rag
     return st;
 }
 
+// ====================================================================================================
+// Slice JT5 — LOCKSTEP + ROLLBACK over the ragdoll collapse (THE NETCODE HEADLINE — pure CPU). Additive
+// over JT1-JT4 (ALL code above is byte-unchanged). THE DESIGN: the ragdoll world IS an fpx::FxWorld
+// (the Ragdoll.world bone bodies). fpx already ships the bit-exact FPX5 lockstep/rollback machinery over
+// FxWorld — fpx::FxCommand (an input impulse/spin on a body), fpx::ApplyCommand, fpx::SnapshotWorld
+// (deep-copy the world), fpx::RestoreWorld. JT5 REUSES ALL of it VERBATIM and changes ONE thing: the
+// per-tick step is joint::StepArticulatedContacts (JT3: integrate -> K {ball|angular} joint passes ->
+// broadphase -> contacts -> ground) instead of fpx's StepWorld. So JT5 is a THIN harness — the direct
+// FR5 twin (fract.h::SimFractTick/RunFractLockstep/RunFractRollback over StepFracture), with the extra
+// joints/angularLimits/iters/solveIters params threaded through. Pure integer, fixed op order ->
+// bit-identical on every peer/platform (and cross-backend by StepArticulatedContacts's proven bit-
+// exactness — JT3 proved it; JT5 only sequences it via inputs).
+//
+// WHAT IS REPLAYED: the ragdoll TOPOLOGY (bones + joints + cone limits) is the deterministic `init`
+// (JT4 RagdollFromSkeleton, bit-reproducible) + the const joints/angularLimits (CONSTANT across ticks,
+// passed by const-ref, NOT part of the snapshot). JT5 replays the COLLAPSE DYNAMICS — every bone's fall,
+// swing, tumble, self-collision, and settle — from the input impact stream, bit-for-bit. The command is
+// a body impulse (kCmdImpulse, "punch a bone") / spin (kCmdSetAngVel) on a ragdoll bone, re-simulated
+// identically on two peers; a peer with only the impacts re-derives the EXACT slumped pose; a rollback
+// corrects a mispredicted punch.
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only, PURE CPU. NO new shader, NO new RHI.
+// JT5 only ADDS the three harness functions; it reuses fpx.h's FxCommand/ApplyCommand/SnapshotWorld/
+// RestoreWorld (already #included read-only) — it does NOT re-implement them.
+
+// Re-export the fpx FPX5 command + snapshot primitives (read-only — REUSED VERBATIM, not re-implemented).
+using fpx::FxCommand;
+using fpx::kCmdImpulse;
+using fpx::kCmdSetAngVel;
+using fpx::ApplyCommand;
+using fpx::SnapshotWorld;
+using fpx::RestoreWorld;
+
+// SimRagdollTick(world, joints, angularLimits, stream, tick, dt, iters, solveIters): the deterministic
+// per-tick step (the fpx::SimTick twin with StepArticulatedContacts substituted for StepWorld). (1) apply
+// ALL `stream` commands whose .tick == `tick`, in ARRAY ORDER (the deterministic input-order contract —
+// the same order on every peer/platform) via fpx::ApplyCommand; (2) StepArticulatedContacts(world, joints,
+// angularLimits, dt, iters, solveIters) — the JT3 articulated tick, reused VERBATIM. Pure integer, fixed
+// order -> bit-identical on every peer/platform. (No new command type — reuses fpx::FxCommand.)
+inline void SimRagdollTick(fpx::FxWorld& world, const std::vector<FxJoint>& joints,
+                           const std::vector<FxAngularLimit>& angularLimits,
+                           const std::vector<fpx::FxCommand>& stream, uint32_t tick, fx dt, int iters,
+                           int solveIters) {
+    for (const fpx::FxCommand& c : stream)
+        if (c.tick == tick) fpx::ApplyCommand(world, c);
+    StepArticulatedContacts(world, joints, angularLimits, dt, iters, solveIters);
+}
+
+// RunRagdollLockstep(init, joints, angularLimits, stream, ticks, dt, iters, solveIters): THE peer entry
+// point (the fpx::RunLockstep control flow over SimRagdollTick). Run `ticks` SimRagdollTicks from a COPY
+// of `init`, applying the command stream -> the final collapsed ragdoll world. authority =
+// RunRagdollLockstep(init, ..., stream, N); replica = RunRagdollLockstep(init, ..., stream, N) from the
+// SAME init + stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism (the lockstep proof
+// memcmps them). joints/angularLimits are the CONSTANT topology, passed by const-ref (not snapshotted).
+inline fpx::FxWorld RunRagdollLockstep(const fpx::FxWorld& init, const std::vector<FxJoint>& joints,
+                                       const std::vector<FxAngularLimit>& angularLimits,
+                                       const std::vector<fpx::FxCommand>& stream, int ticks, fx dt,
+                                       int iters, int solveIters) {
+    fpx::FxWorld w = init;
+    for (int t = 0; t < ticks; ++t)
+        SimRagdollTick(w, joints, angularLimits, stream, (uint32_t)t, dt, iters, solveIters);
+    return w;
+}
+
+// RunRagdollRollback(init, joints, angularLimits, authStream, mispredictStream, ticks, mispredictTick,
+// dt, iters, solveIters): the rollback harness (the fpx::RunRollback control flow over SimRagdollTick).
+// (1) run ticks 0..mispredictTick from `init` applying authStream; (2) SAVE a snapshot AT mispredictTick
+// (fpx::SnapshotWorld — the FxWorld deep-copy); (2b) speculatively advance <=3 ticks with the MISPREDICTED
+// stream (the wrong input — the client prediction that diverges); (3) ROLLBACK — fpx::RestoreWorld to the
+// snapshot + RE-SIMULATE mispredictTick..ticks with the CORRECT authStream -> the corrected final world.
+// The proof asserts this == RunRagdollLockstep(init, ..., authStream, ticks) (rollback corrected the
+// misprediction EXACTLY) AND that the speculative pre-rollback state DIFFERED from authority (a real
+// divergence was fixed). Reuses fpx::SnapshotWorld/RestoreWorld VERBATIM. joints/angularLimits const-ref.
+inline fpx::FxWorld RunRagdollRollback(const fpx::FxWorld& init, const std::vector<FxJoint>& joints,
+                                       const std::vector<FxAngularLimit>& angularLimits,
+                                       const std::vector<fpx::FxCommand>& authStream,
+                                       const std::vector<fpx::FxCommand>& mispredictStream, int ticks,
+                                       int mispredictTick, fx dt, int iters, int solveIters) {
+    fpx::FxWorld w = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimRagdollTick(w, joints, angularLimits, authStream, (uint32_t)t, dt, iters, solveIters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point).
+    const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (bounded to the remaining ticks).
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimRagdollTick(w, joints, angularLimits, mispredictStream, (uint32_t)(mispredictTick + s), dt,
+                       iters, solveIters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    fpx::RestoreWorld(w, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimRagdollTick(w, joints, angularLimits, authStream, (uint32_t)t, dt, iters, solveIters);
+    return w;
+}
+
 }  // namespace joint
 }  // namespace hf::sim
