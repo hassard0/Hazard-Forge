@@ -48,6 +48,7 @@
 // DETERMINISM + cross-platform bit-identity (the UE5-Chaos differentiator), NOT analytic spring mechanics.
 
 #include <cstdint>
+#include <span>          // Slice VH3: std::span for the fpx::BuildPairs / fpx::StepWorld contact block
 #include <vector>
 
 #include "sim/fpx.h"     // read-only: fx / fxmul / fxdiv / FxVec3 / FxAdd / FxSub / FxScale / FxLength /
@@ -471,6 +472,223 @@ inline VehicleRigState MeasureVehicleRig(const Vehicle& v, const VehicleConfig& 
         if (off > maxOff) maxOff = off;
     }
     st.maxHingeOffAxis = maxOff;
+    return st;
+}
+
+// ====================================================================================================
+// Slice VH3 — DRIVE + STEER COMMANDS + THE LOCKED VEHICLE TICK (the 3rd slice of FLAGSHIP #16:
+// DETERMINISTIC VEHICLE PHYSICS, hf::sim::vehicle). VH1 built the suspension spring; VH2 assembled +
+// settled the car (chassis + 4 wheels + 4 springs + 4 hinges). VH3 makes it RESPOND TO INPUT: two new
+// integer command kinds — kCmdDriveTorque (spin a wheel about its axle) + kCmdSteer (rotate the front-
+// wheel hinge axes) — fed through a single locked vehicle tick StepVehicle that adds the fpx broadphase +
+// sphere-sphere CONTACT pass to VH2's spring+hinge solve (the JT3 contacts-as-a-trailing-block mold).
+// INTEGER-bit-exact. NO new shader — the GPU showcase drives the EXISTING VH1 vehicle_spring_solve.comp +
+// JT2 joint_angular_solve.comp + fpx fpx_solve.comp in the locked order. ADDITIVE — VH1/VH2 byte-frozen.
+//
+// THE DESIGN CALL (input as deterministic integer commands, contacts as a trailing block — the JT3 mold):
+// drive + steer = 2 new integer command kinds. fpx::FxCommand{tick, kind, target, arg} already exists (the
+// FPX5/lockstep substrate). VH3 adds two NEW `kind` values DEFINED HERE (NOT in fpx.h — fpx.h stays
+// frozen; the values are vehicle-local constants ABOVE fpx's existing kind range, applied ONLY by
+// ApplyVehicleCommand, never by fpx::ApplyCommand):
+//   - kCmdDriveTorque: target = a wheel body index, arg = a signed Q16.16 magnitude. Adds an angular
+//     impulse about the wheel's spin axis to the wheel's angVel (wheel.angVel += FxScale(spinAxis, arg)).
+//     The throttle — spins the driven wheels. Out-of-range / static targets are deterministic no-ops.
+//   - kCmdSteer: target = a front hinge index (0/1), arg = a signed Q16.16 steer angle. Rotates that
+//     hinge's `axis` about the chassis up-axis by a HOST-SNAPPED steer quaternion (QFromAxisAngleSnapped —
+//     a PURE-INTEGER fixed-point half-angle series so the snap is bit-reproducible on EVERY platform, the
+//     BuildPileWorld host-snap idiom but with NO <cmath>), then re-normalizes the axis. Steering re-aims
+//     the front wheels' rolling plane. Non-front targets (∉ {0,1}) are deterministic no-ops.
+// Integer adds + a host-snapped quaternion only — NO runtime transcendentals, NO float in the sim path.
+//
+// HONEST CAVEAT (the FR4/JT3 caveat carried forward): fpx contacts are sphere-sphere with NO inertia
+// tensor — a contact does NOT spin a body, so wheel rolling-from-ground-contact is NOT emergent; drive
+// comes from the command/integrate path and VH4's traction is a deterministic tangential PROXY, not
+// analytic tyre mechanics. The headline is DETERMINISM + cross-platform bit-identity, NOT physical
+// correctness. The Gauss-Seidel spring/hinge + the contact residual is deterministic-but-nonzero.
+
+// Re-export the fpx command primitive (read-only — REUSED, not re-implemented). VH3's command kinds are
+// vehicle-local; we reuse the FxCommand RECORD shape so the showcase/test command stream is a plain
+// std::vector<fpx::FxCommand>. (fpx::kCmdImpulse=0/kCmdSetAngVel=1 live in fpx.h; VH3's kinds are above.)
+using fpx::FxCommand;
+inline constexpr uint32_t kFlagDynamic = fpx::kFlagDynamic;
+
+// VH3 vehicle-local command kinds. Chosen ABOVE fpx's existing FxCommand kind range (fpx uses 0,1) so a
+// vehicle command stream is unambiguous and ApplyVehicleCommand is the ONLY applier (fpx::ApplyCommand
+// ignores these — it only knows kCmdImpulse/kCmdSetAngVel). NOT added to fpx.h (frozen).
+inline constexpr uint32_t kCmdDriveTorque = 100u;  // arg = Q16.16 axle spin added to wheel target's angVel
+inline constexpr uint32_t kCmdSteer       = 101u;  // arg.x = Q16.16 steer angle for front hinge `target`
+
+// The chassis UP-axis (the steer rotation axis) + the wheel SPIN axis (the axle, the lateral Z axis). These
+// are the FIXED body-local frame constants VehicleFromConfig laid the hinges out about (the hinge axis is
+// the lateral (0,0,1) Z axle; the up axis the chassis (0,1,0) Y). Steering rotates the hinge axle about Y.
+inline const FxVec3 kChassisUpAxis{0, kOne, 0};    // (0,1,0) — the steer rotation axis
+inline const FxVec3 kWheelSpinAxis{0, 0, kOne};    // (0,0,1) — the wheel axle / drive-torque axis
+
+// The 2 FRONT hinge indices (VehicleFromConfig corner order: 0 front-right, 1 front-left, 2/3 rear). Only a
+// front hinge accepts a kCmdSteer (the rears are unchanged — the steer re-aims the FRONT rolling plane).
+inline bool IsFrontHinge(uint32_t hingeIndex) { return hingeIndex == 0u || hingeIndex == 1u; }
+
+// ----- QFromAxisAngleSnapped: a PURE-INTEGER host-snapped quaternion about a unit axis ------------------
+// q = {axis*sin(θ/2), cos(θ/2)} with cos/sin built from a fixed-point half-angle SERIES (NO <cmath>, NO
+// runtime transcendentals): for the half-angle h = θ/2 (Q16.16), cos(h) = 1 - h²/2 + h⁴/24 - h⁶/720 and
+// sin(h) = h - h³/6 + h⁵/120 (the Taylor series), each term an fxmul — bit-identical on EVERY compiler/
+// vendor by construction (the steer angles are small, well within the series' accurate range). This is the
+// "host round-to-nearest snap" of the BuildPileWorld idiom made cross-platform-EXACT by being integer-only
+// (a std::cos/std::sin host snap is NOT guaranteed bit-identical cross-vendor; this series IS). The result
+// is FxQuatNormalize'd so |q|≈kOne deterministically. axis MUST be unit (the caller passes kChassisUpAxis).
+inline fpx::FxQuat QFromAxisAngleSnapped(const FxVec3& axis, fx angle) {
+    const fx h = angle / 2;                         // the half-angle (Q16.16)
+    const fx h2 = fxmul(h, h);                       // h²
+    // cos(h) = 1 - h²/2 + h⁴/24 - h⁶/720 (Q16.16 integer Horner — fixed op order).
+    const fx h4 = fxmul(h2, h2);
+    const fx h6 = fxmul(h4, h2);
+    const fx cosH = kOne - h2 / 2 + h4 / 24 - h6 / 720;
+    // sin(h) = h - h³/6 + h⁵/120 (Q16.16 integer — fixed op order).
+    const fx h3 = fxmul(h2, h);
+    const fx h5 = fxmul(h3, h2);
+    const fx sinH = h - h3 / 6 + h5 / 120;
+    fpx::FxQuat q{fxmul(axis.x, sinH), fxmul(axis.y, sinH), fxmul(axis.z, sinH), cosH};
+    return fpx::FxQuatNormalize(q);                  // deterministic |q|≈kOne
+}
+
+// ----- ApplyVehicleCommand: apply ONE vehicle input command (drive-torque / steer) ---------------------
+// kCmdDriveTorque: add FxScale(kWheelSpinAxis, cmd.arg.x) to world.bodies[cmd.target].angVel (the axle
+//   spin). Out-of-range target or a STATIC (!kFlagDynamic) body is a deterministic no-op.
+// kCmdSteer: rotate hinges[cmd.target].axis by QFromAxisAngleSnapped(kChassisUpAxis, cmd.arg.x) about the
+//   chassis up-axis (FxRotate), then re-normalize the axis. Non-front targets (∉ {0,1}) / out-of-range are
+//   no-ops. (The hinge axis is body-local on the chassis A; the chassis starts at identity so the local up
+//   axis IS world (0,1,0) — the VH2 layout convention.)
+// Integer adds + the host-snapped quaternion only. The deterministic input event the stream is made of.
+inline void ApplyVehicleCommand(Vehicle& v, const VehicleConfig& cfg, const FxCommand& cmd) {
+    (void)cfg;
+    // NOTE: fpx::FxCommand's target-index field is named `bodyId` (the FPX5 substrate). VH3 uses it as the
+    // wheel-body / front-hinge index `target` (the spec's term) — same field, no fpx.h change.
+    if (cmd.kind == kCmdDriveTorque) {
+        if (cmd.bodyId >= (uint32_t)v.world.bodies.size()) return;        // out-of-range -> no-op
+        FxBody& b = v.world.bodies[(size_t)cmd.bodyId];
+        if (!(b.flags & kFlagDynamic)) return;                            // static -> no-op
+        const FxVec3 dOmega = FxScale(kWheelSpinAxis, cmd.arg.x);         // axle spin (Q16.16)
+        b.angVel = FxAdd(b.angVel, dOmega);
+    } else if (cmd.kind == kCmdSteer) {
+        if (cmd.bodyId >= (uint32_t)v.hinges.size()) return;            // out-of-range -> no-op
+        if (!IsFrontHinge(cmd.bodyId)) return;                          // only front hinges steer
+        const fpx::FxQuat q = QFromAxisAngleSnapped(kChassisUpAxis, cmd.arg.x);
+        FxVec3 newAxis = FxRotate(q, v.hinges[(size_t)cmd.bodyId].axis);// re-aim the rolling plane
+        const fx len = FxLength(newAxis);
+        if (len != 0) newAxis = FxNormalize(newAxis);                    // keep the hinge axis unit
+        v.hinges[(size_t)cmd.bodyId].axis = newAxis;
+    }
+    // unknown kind -> no-op (deterministic).
+}
+
+// ----- StepVehicle: ONE locked, command-driven vehicle tick (the JT3 contacts-as-a-trailing-block mold) -
+// The VH2 StepVehicleRig TWO-PHASE-BLOCK tick (PHASE A spring / PHASE B hinge — the structure the EXISTING
+// whole-step int64 shaders reproduce byte-for-byte) with a command-apply PROLOGUE + the JT3 contacts
+// TRAILING block replacing VH2's PHASE-C ground clamp:
+//   (0) APPLY this tick's commands in ARRAY ORDER (every cmd with cmd.tick == tick) via ApplyVehicleCommand.
+//   PHASE A (spring, == vehicle_spring_solve.comp): IntegrateBodyFull(all, real dt) [the FPX4 6-DOF
+//           integrate] -> K Gauss-Seidel passes of all SolveSpringJoint. Touches pos/vel + orientation.
+//   PHASE B (hinge, == joint_angular_solve.comp, dt=0): IntegrateBodyFull(all, dt=0) [the dt=0 translation
+//           integrate is a no-op; the orientation integrate runs its FxQuatNormalize — mirrors the angular
+//           shader's per-step integrate] -> K Gauss-Seidel passes of all SolveAngularLimit. Touches orient.
+//   PHASE D (contacts, == fpx_solve.comp, dt=0): fpx::BuildPairs ONCE over the world + fpx::StepWorld(dt=0,
+//           solveIters) — the dt=0 integrate-suppressed ground + FPX3 sphere-sphere contacts so the wheels/
+//           chassis rest on the ground and on each other as a coherent body. (REPLACES VH2's host PHASE-C
+//           per-wheel ground clamp with real inter-body broadphase + contacts — the VH3 addition.)
+// WHY the TWO-PHASE block (not a single integrate + interleaved {spring | hinge}): the existing shaders are
+// WHOLE-STEP and each integrates internally; the dt=0 PHASE-B integrate is NOT bit-idempotent for
+// orientation, so the CPU reference MUST call the EXACT same two integrate ops in the same order as the GPU
+// composes the two whole-step shaders (the JT3/VH2 hard lesson) — otherwise GPU != CPU. Pure integer, fixed
+// op order -> two-run bit-identical AND bit-exact GPU==CPU.
+inline void StepVehicle(Vehicle& v, const VehicleConfig& cfg, const std::vector<FxCommand>& commands,
+                        uint32_t tick, fx dt, int iters, int solveIters) {
+    FxWorld& world = v.world;
+    const size_t n = world.bodies.size();
+    // (0) apply this tick's commands in ARRAY ORDER (deterministic input-order contract).
+    for (const FxCommand& c : commands)
+        if (c.tick == tick) ApplyVehicleCommand(v, cfg, c);
+    // PHASE A — the spring phase (== vehicle_spring_solve.comp, SENTINEL groundY so no shader floor clamp).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, dt);
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < v.springs.size(); ++e)
+            SolveSpringJoint(world, v.springs[e]);
+    // PHASE B — the hinge phase (== joint_angular_solve.comp, dt=0). The dt=0 IntegrateBodyFull mirrors the
+    // angular shader's per-step integrate (orientation FxQuatNormalize runs; translation is a no-op).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, /*dt=*/0);
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < v.hinges.size(); ++e)
+            SolveAngularLimit(world, v.hinges[e]);
+    // PHASE D — FPX2 broadphase ONCE + FPX3 ground + sphere contacts (dt=0 -> no re-integrate). VERBATIM fpx.
+    std::vector<uint32_t> perBodyOffset;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, perBodyOffset, pairs);
+    fpx::StepWorld(world, std::span<const fpx::FxPair>(pairs), /*dt=*/0, solveIters);
+}
+
+// ----- StepVehicleSteps: run K command-driven vehicle ticks 0..K-1 (the showcase / GPU K-step driver) ---
+// Each tick applies its OWN commands (cmd.tick == the tick index). The GPU driver reproduces this with the
+// EXISTING shaders in the locked order; the CPU reference here is the exact byte-for-byte target.
+inline void StepVehicleSteps(Vehicle& v, const VehicleConfig& cfg, const std::vector<FxCommand>& commands,
+                             fx dt, int ticks, int iters, int solveIters) {
+    for (int t = 0; t < ticks; ++t)
+        StepVehicle(v, cfg, commands, (uint32_t)t, dt, iters, solveIters);
+}
+
+// ----- VehicleDriveState + MeasureVehicleDrive: the honest drive/steer metrics (deterministic Q16.16) ---
+// chassisPos        : the chassis world position (the moved-under-drive proof).
+// forwardDisp       : the chassis forward (X) displacement from a reference start-X (did it move).
+// meanDrivenAngVel  : the mean |angVel| magnitude over the driven wheels (did the throttle take).
+// frontHingeHeadingX: the front-hinge axis X component (the steer-re-aim proof — a steered hinge's lateral
+//                     Z axle gains an X component as it rotates about the up axis; 0 at the rest heading).
+// rearHingeHeadingX : the rear-hinge axis X component (UNCHANGED by a front steer — stays at rest heading).
+// residualOverlaps  : the FPX3 residual-overlap count over the CURRENT broadphase pairs (non-penetration).
+struct VehicleDriveState {
+    FxVec3   chassisPos;
+    fx       forwardDisp        = 0;
+    fx       meanDrivenAngVel   = 0;
+    fx       frontHingeHeadingX = 0;
+    fx       rearHingeHeadingX  = 0;
+    uint32_t residualOverlaps   = 0;
+};
+
+// MeasureVehicleDrive(v, cfg, drivenWheels, startChassisX): the deterministic drive/steer stats. drivenWheels
+// is the list of wheel body indices the drive stream spun (the rear wheels in the showcase). startChassisX
+// is the chassis X at tick 0 (the forward-displacement reference). Pure integer FxLength -> bit-exact.
+inline VehicleDriveState MeasureVehicleDrive(const Vehicle& v, const VehicleConfig& cfg,
+                                             const std::vector<uint32_t>& drivenWheels, fx startChassisX) {
+    VehicleDriveState st;
+    const FxWorld& world = v.world;
+    const FxBody& chassis = world.bodies[(size_t)v.chassisIndex];
+    st.chassisPos = chassis.pos;
+    st.forwardDisp = chassis.pos.x - startChassisX;
+
+    // Mean |angVel| over the driven wheels (the throttle-took metric).
+    int64_t sumSpin = 0;
+    uint32_t cnt = 0;
+    for (uint32_t wi : drivenWheels) {
+        if (wi >= (uint32_t)world.bodies.size()) continue;
+        sumSpin += (int64_t)FxLength(world.bodies[(size_t)wi].angVel);
+        ++cnt;
+    }
+    st.meanDrivenAngVel = cnt > 0u ? (fx)(sumSpin / (int64_t)cnt) : 0;
+
+    // The front + rear hinge axis headings (the steer-re-aim proof). A front steer rotates the front axle
+    // about Y so its X component grows; the rears stay at the rest lateral (0,0,1) heading (axis.x == 0).
+    if (v.hinges.size() >= 4) {
+        const fx f0 = v.hinges[0].axis.x, f1 = v.hinges[1].axis.x;
+        st.frontHingeHeadingX = (f0 < 0 ? -f0 : f0) > (f1 < 0 ? -f1 : f1) ? f0 : f1;  // the larger-magnitude
+        const fx r2 = v.hinges[2].axis.x, r3 = v.hinges[3].axis.x;
+        st.rearHingeHeadingX = (r2 < 0 ? -r2 : r2) > (r3 < 0 ? -r3 : r3) ? r2 : r3;
+    }
+
+    // Residual overlaps over the CURRENT broadphase pairs (the FPX3 non-penetration coherence stat).
+    std::vector<uint32_t> off;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, off, pairs);
+    st.residualOverlaps = fpx::CountResidualOverlaps(world, std::span<const fpx::FxPair>(pairs));
+    (void)cfg;
     return st;
 }
 
