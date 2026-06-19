@@ -465,6 +465,7 @@ int main(int argc, char** argv) {
     const char* cgfQueryShotPath = nullptr; // --cgf-query-shot <out.bmp> (Slice GF1: Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL WORLD + SHARED-GRID CROSS QUERY, the BEACHHEAD of FLAGSHIP #13 — a settled grain bed (GR1 InitGrainBlock + GR4 friction) + an overlapping fluid block (FL1 InitBlock). Build ONE shared grid over BOTH pools' union AABB, bucket each pool into its own cell table (reused grain_cell_* + fluid_cell_* sized to the shared grid), then the two CROSS lists via SIX pure-INT32 count->scan->emit passes (cgf_gf_{count,scan,emit} grain->fluid + cgf_fg_{count,scan,emit} fluid->grain, MSL-native): each grain gathers the FLUID in its 27-cell stencil + each fluid the GRAINS in its 27-cell stencil, accepted iff the per-axis |query.axis - target.axis| < h box reject passes (the exact radial cull deferred to GF2/GF3). GPU=={grainCellTable,fluidCellTable,gfStart,gfNeighbors,fgStart,fgNeighbors}==CPU couple_gf.h::BuildCGFNeighbors bit-exact (memcmp), cross-pool neighbour heat viz (overlap populated, separated empty), the symmetry X==Y. NO momentum exchange (GF2-GF6), NO new RHI; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only)
     const char* cgfBuoyancyShotPath = nullptr; // --cgf-buoyancy-shot <out.bmp> (Slice GF2, the BUOYANCY + DRAG fluid->grain pass, the CRUX of FLAGSHIP #13 — the FIRST momentum exchange. A settled grain bed with a fluid block over PART of it: each step re-runs the GF1 cross-query (cgf_gf/cgf_fg_{count,scan,emit}, int32 MSL-native) from the grains' CURRENT positions, then cgf_buoyancy.comp (ONE thread per GRAIN, int64 -> Vulkan-only) sums over its OWN gfNeighbors fluid list a buoyant impulse (∝ the fluid count, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the grain's vel, then the host integrates (IntegrateGrains). Over K steps the SUBMERGED grains LIGHTEN/rise while DRY grains pack. AccumGrainBuoyancy copied VERBATIM from engine/sim/couple_gf.h. GPU grain state PROVEN BIT-EXACT vs the CPU couple_gf.h::StepCGFBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) WET LIGHTENS — wetY > dryY by a margin (the honest emergent wet/dry contrast, NOT an exact buoyancy depth — the CP2/GR4 caveat); (4) buoy=0 control packs dry (wetY ≈ dryY), proving buoyancy does work. Metal --cgf-buoyancy runs the CPU StepCGFBuoyancy. PER-GRAIN Jacobi (multi-thread, NO TDR). NO grain->fluid reaction (GF3), NO coupled step (GF4), NO lockstep (GF5), NO lit render (GF6), NO grain torque, NO new RHI; GF1's cross-query passes + their goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h/couple_grain.h + engine/physics/ UNTOUCHED)
     const char* cgfDisplaceShotPath = nullptr; // --cgf-displace-shot <out.bmp> (Slice GF3, the CONTACT REACTION / DISPLACEMENT grain->fluid pass, the Newton's-3rd-law half of GF2; the 3rd slice of FLAGSHIP #13. The grains now push BACK on the fluid: each fluid particle inside a grain is projected out to the grain surface (the sand DISPLACES the fluid — the fluid sits ON / seeps AROUND the bed) + receives the equal-opposite drag reaction. cgf_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) runs ApplyGrainsToFluid VERBATIM from couple_gf.h over the GF1 fgNeighbors grain list; the positional push == grain.h::CollideGrainSphere with the grain as the sphere (surf = g.radius). The GPU fluid array PROVEN BIT-EXACT vs the CPU couple_gf.h::ApplyGrainsToFluid (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) no-penetration penAfter<penBefore + displaced>0 (the fluid parted, the Jacobi single-projection caveat — relieved NOT zero); (4) fluid clear of the grains -> unchanged (no-op). Metal --cgf-displace runs the CPU ApplyGrainsToFluid. NO new RHI; GF1/GF2 cgf code+shaders + their goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h/couple_grain.h + engine/physics/ UNTOUCHED)
+    const char* cgfStepShotPath = nullptr; // --cgf-step-shot <out.bmp> (Slice GF4, THE COUPLED STEP — the deterministic grain+fluid settling tick, the CONVERGENCE of FLAGSHIP #13. ONE deterministic tick composes the FL4 fluid density sub-passes + GR3/GR4 grain contact/friction in the K JACOBI iters (POSITIONAL self-constraints only) + the GF3 grain->fluid displacement + GF2 fluid->grain buoyancy ONCE in a POST pass (after the pos−prev velocity derivation, so the velocity impulses survive) -> a frictional sand bed + an incompressible PBF fluid co-settle: WET SAND / MUD / SLURRY, NO script. GF4 ORCHESTRATES the existing fluid_density/lambda/dp/apply + grain_contact_dp/apply + grain_friction + cgf_displace + cgf_buoyancy + the GF1 cross-query/cell passes (NO new shader, NO new RHI): the Vulkan GPU driver is the host-driven multi-pass mold of --cgrain-step-shot with TWO particle pools, dispatching per step (1) fluid_integrate+grain_integrate predict -> (2) host: build the FL2+GR2 neighbour lists + the GF1 cross lists -> (3) K iters {fluid density solve -> grain contact -> grain friction} -> (4) fluid+grain velocity-from-dpos -> (5) cgf_displace + cgf_buoyancy ONCE -> (6) ground clamps, ComputeToComputeBarrier between. ReadBuffer reads the fluid + grain arrays PROVEN BIT-EXACT vs the CPU couple_gf.h::StepCGFSteps (memcmp, NO tol — the make-or-break). A small/fast scene (~144 grains + 96 fluid, iters=3, ~120 steps). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) co-settling — fluidY>bedY, repose>0, wetY>=dryY (the honest emergent within-band metrics); (4) no-penetration relieved vs the initial buried state (the fluid seeded interpenetrating the bed; GF3 parts it out). int64 -> the FL4/GR3/GR4/GF2/GF3 shaders are Vulkan-only; Metal --cgf-step runs the CPU StepCGFSteps. GF1/GF2/GF3 cgf code+shaders + their goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h/couple_grain.h + engine/physics/ UNTOUCHED; NO hf_gen_msl change)
     const char* coupleDisplaceShotPath = nullptr; // --couple-displace-shot <out.bmp> (Slice CP3, the FLUID REACTION / DISPLACEMENT body->fluid pass, the Newton's-3rd-law half of CP2; the 3rd slice of FLAGSHIP #11. A body submerged in a fluid pool pushes BACK on the fluid: each fluid particle inside the body is projected out to the body surface (the body DISPLACES the fluid — a cavity/wake) + receives the equal-opposite drag impulse. couple_displace.comp (ONE thread per fluid particle, int64 -> Vulkan-only) runs ApplyBodyToFluid VERBATIM from couple.h; the GPU fluid array PROVEN BIT-EXACT vs the CPU couple.h::ApplyBodyToFluid (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) no-penetration penAfter<penBefore + displaced>0 (the fluid parted, the Jacobi single-projection caveat — relieved NOT zero); (4) a body clear of the fluid -> unchanged (no-op). Metal --couple-displace runs the CPU ApplyBodyToFluid. NO new RHI; CP1/CP2 couple code+shaders + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleStepShotPath = nullptr; // --couple-step-shot <out.bmp> (Slice CP4, THE COUPLED STEP — the bobbing barrel, the INTEGRATED two-way solver of FLAGSHIP #11. ONE deterministic tick composes the FL4 fluid sub-passes + CP2 fluid->body + CP3 body->fluid + the rigid integrate in the LOCKED (1)-(5) order -> a barrel BOBS under emergent buoyancy in an incompressible fluid, NO script. CP4 ORCHESTRATES the existing FL4 fluid_* + CP2 couple_buoyancy + CP3 couple_displace shaders (NO new shader, NO new RHI): the Vulkan GPU driver is the host-driven multi-pass mold of --fluid-solve-shot, re-running per step the FL2 query + FL4 density + CP3 displace + CP2 buoyancy passes with ComputeToComputeBarrier between, ReadBuffer reads the fluid + body arrays PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleSteps. A static basin holds a dynamic pool + a body dropped above it (radius 2, invMass=kOne/iters; h=2.0, iters=3, K=400). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) coupled — the body floats above the bed by a margin AND bobbed peak-to-trough>threshold AND the fluid stayed coherent (density residual bounded); (4) buoy=0 control sinks while the fluid settles. The HONEST emergent float line + bob (the GR4/FL4 caveat). int64 -> the FL4/CP2/CP3 shaders are Vulkan-only; Metal --couple-step runs the CPU StepCoupleSteps. CP1-CP3 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* coupleBuoyancyShotPath = nullptr; // --couple-buoyancy-shot <out.bmp> (Slice CP2, the BUOYANCY + DRAG fluid->body pass, the CRUX of FLAGSHIP #11 — the FIRST momentum exchange. A settled fluid pool (FL1 InitBlock) + an FxBody sphere dropped ABOVE it: each step re-runs the CP1 body->fluid query (couple_body_{count,scan,emit}, int32 MSL-native) from the body's CURRENT position, then couple_buoyancy.comp (ONE thread per body, int64 -> Vulkan-only) sums over the gathered list a buoyant impulse (∝ the gathered count = the displaced volume, up = -normalize(gravity)) + a drag impulse (toward the static fluid's mean velocity) into the body's vel, then the host integrates (IntegrateBody + ResolveGround). Over K steps the body falls, enters the pool, buoyancy builds as it submerges, and it settles to an emergent float line. AccumBodyForces copied VERBATIM from engine/sim/couple.h. GPU body state PROVEN BIT-EXACT vs the CPU couple.h::StepCoupleBuoyancySteps (memcmp). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) FLOATS — floatY > groundY+radius by a margin, bounded above (the honest emergent float line, NOT an exact Archimedes depth — the GR4/FL4 caveat); (4) buoy=0 control SINKS to the bed (floatY == groundY+radius), proving buoyancy does work. Metal --couple-buoyancy runs the CPU StepCoupleBuoyancy. NO fluid reaction (CP3), NO coupled step (CP4), NO lockstep (CP5), NO float render (CP6), NO buoyancy torque, NO new RHI; CP1's query passes + their goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -737,6 +738,18 @@ int main(int argc, char** argv) {
         // the cgf-buoyancy/cgrain-displace shots.
         if (std::strcmp(argv[i], "--cgf-displace-shot") == 0 && i + 1 < argc) {
             cgfDisplaceShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GF4: --cgf-step-shot <out.bmp> — THE COUPLED STEP (the deterministic grain+fluid settling tick,
+        // the CONVERGENCE of FLAGSHIP #13). A small sand bed + a fluid block co-settle in ONE Q16.16 world: the
+        // host-driven multi-pass GPU driver dispatches per step the FL4 fluid density sub-passes + GR3/GR4 grain
+        // contact/friction (K JACOBI iters, positional only) + the GF3 cgf_displace + GF2 cgf_buoyancy ONCE in a
+        // POST pass + the GF1 cross-query/cell passes, in the locked (1)-(6) order, then memcmp's the final fluid
+        // + grain arrays vs the CPU couple_gf.h::StepCGFSteps. NO new shader, NO new RHI. int64 -> Vulkan-only;
+        // Metal --cgf-step runs the CPU StepCGFSteps. STANDALONE branch (C1061 avoidance), like the cgrain-step shot.
+        if (std::strcmp(argv[i], "--cgf-step-shot") == 0 && i + 1 < argc) {
+            cgfStepShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -17636,6 +17649,661 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cgf displacement (fluid parted from sand, displaced %u)\n",
                                 cgfDisplaceShotPath, imgW, imgH, kDisplaced);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgfDisplaceShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Grain<->Fluid Coupling THE COUPLED STEP (--cgf-step-shot <out.bmp>, Slice GF4, the
+        // CONVERGENCE — a sand bed + a fluid block co-settle, the CG4 StepCGrain mold with TWO particle pools).
+        // ONE deterministic tick composes the FL4 fluid density sub-passes + GR3/GR4 grain contact/friction in
+        // the K JACOBI iters (POSITIONAL self-constraints only) + the GF3 grain->fluid displacement + GF2
+        // fluid->grain buoyancy ONCE in a POST pass (after the pos−prev velocity derivation, so the velocity
+        // impulses survive). GF4 ORCHESTRATES the existing fluid_*/grain_*/cgf_displace/cgf_buoyancy + GF1
+        // cross-query shaders (NO new shader, NO new RHI): per step (1) fluid_integrate + grain_integrate predict
+        // -> (2) host: build the FL2 + GR2 neighbour lists + the GF1 cross lists from the predicted positions ->
+        // (3) K iters {fluid density->lambda->dp->apply [FL4] -> grain_contact_dp->apply [GR3] ->
+        // grain_friction->apply [GR4]} -> (4) fluid_collide + grain_collide as PURE velocity updates (groundY
+        // sentinel below all, sphereCount 0 -> NO clamp at (4); StepCGF clamps at (6)) -> (5) the GF1 cross-query
+        // passes + cgf_displace [GF3] + cgf_buoyancy [GF2] ONCE -> (6) host CollidePlane + CollideGrainPlane
+        // (a pure pos.y clamp — NOT re-running the collide shaders, which would re-derive velocity and clobber
+        // the (5) drag impulses). ReadBuffer reads the fluid + grain arrays PROVEN BIT-EXACT vs the CPU
+        // couple_gf.h::StepCGFSteps (memcmp, NO tol — the make-or-break). int64 -> Vulkan-only; Metal --cgf-step
+        // runs the CPU StepCGFSteps. NO new RHI. STANDALONE branch (C1061 avoidance).
+        if (cgfStepShotPath) {
+            using math::Vec3;
+            namespace cgf   = hf::sim::cgf;
+            namespace grain = hf::sim::grain;
+            namespace fluid = hf::sim::fluid;
+
+            // The scene (== the Metal --cgf-step config). -9.8 host-snapped. SMALL/FAST (the heaviest step):
+            // a 8x3x6 = 144 grain bed (pre-settled by GR4 friction) + a 4x4x6 = 96 fluid block seeded above it.
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius (0.5 spacing, packed)
+            const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (the coupling radius + smoothing h)
+            const int kBins = fluid::kKernelBins;
+            const grain::fx kEpsilon = grain::kOne / 100;
+            const int kSteps = 120;
+            const int kIters = 3;
+            // The fluid_collide / grain_collide velocity-only sentinel: a groundY far below so the plane clamp is
+            // a no-op at (4) (StepCGF's (4) is the velocity update ONLY; the ground clamp is (6), host-side).
+            const grain::fx kNoClampGroundY = -(grain::fx)(1 << 28);
+
+            // A packed 8x3x6 = 144 grain bed, 0.5 spacing, settled by GR4 friction.
+            grain::GrainBlock gblock;
+            gblock.W = 8; gblock.H = 3; gblock.D = 6;                   // 144 grains
+            gblock.spacing = grain::kOne / 2;
+            gblock.radius = kRadius;
+            gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+            std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+            grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+            // A 4x4x6 = 96 fluid block over the settled bed's LEFT HALF (x in [0,1.5]), interpenetrating it from
+            // the start (+0.125 y offset so each fluid particle sits within a grain's exclusion radius) so the
+            // LEFT (submerged) grains stay WET — accumulating the GF2 buoyancy lift each step — while the RIGHT
+            // grains stay DRY (the GF2-buoyancy proven wet>dry config; a high seed pools only on the top grains).
+            fluid::FluidBlock fblock;
+            fblock.W = 4; fblock.H = 4; fblock.D = 6;                   // 96 fluid particles
+            fblock.spacing = grain::kOne / 2;
+            fblock.origin = grain::FxVec3{0, bed[0].pos.y + grain::kOne / 8, 0};
+            std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+            auto makeWorld = [&]() {
+                cgf::CGFWorld w;
+                w.grains = bed; w.fluid = fluidP; w.h = kH;
+                w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+                return w;
+            };
+            cgf::CGFWorld world = makeWorld();
+            const int kGrainCount = (int)world.grains.size();
+            const int kFluidCount = (int)world.fluid.size();
+
+            // The kernel: ρ0 = the mean density of the packed initial fluid lattice (the FL4 probe recipe).
+            fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, grain::kOne, kBins, kEpsilon);
+            {
+                const fluid::FluidGrid pg = fluid::MakeGrid(world.fluid, kH);
+                const fluid::FluidCellTable pt = fluid::BuildCellTable(world.fluid, pg);
+                const fluid::FluidNeighborList pl = fluid::BuildNeighborList(world.fluid, pg, pt, kH);
+                std::vector<fluid::fx> probeRho;
+                fluid::ComputeDensity(world.fluid, pl, kernel, probeRho);
+                kernel = fluid::BuildKernelTable(kH, fluid::MeanDensity(probeRho), kBins, kEpsilon);
+            }
+            const grain::fx kRestDensity = kernel.restDensity;
+
+            // === CPU reference: StepCGFSteps K steps (the GPU fluid+grain memcmp's against this). ===
+            cgf::CGFWorld cpuWorld = world;
+            cgf::StepCGFSteps(cpuWorld, kernel, kDt, kIters, kSteps);
+            const cgf::CGFState cpuState = cgf::MeasureCGFState(cpuWorld);
+
+            // std430 mirrors (match the shaders).
+            struct GrainParticleGpu {
+                int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass, radius; uint32_t flags;
+            };
+            static_assert(sizeof(GrainParticleGpu) == 48, "GrainParticleGpu std430 layout");
+            static_assert(sizeof(grain::GrainParticle) == 48, "GrainParticle std430 layout");
+            struct FluidParticleGpu { int32_t px, py, pz, prx, pry, prz, vx, vy, vz, invMass; uint32_t flags; };
+            static_assert(sizeof(FluidParticleGpu) == 44, "FluidParticleGpu std430 layout");
+            static_assert(sizeof(fluid::FluidParticle) == 44, "FluidParticle std430 layout");
+            struct FxVec3Gpu { int32_t x, y, z; };
+            static_assert(sizeof(FxVec3Gpu) == 12, "FxVec3Gpu std430 layout");
+            struct SphereGpu { int32_t cx, cy, cz, radius; };
+            static_assert(sizeof(SphereGpu) == 16, "SphereGpu std430 layout");
+            struct FluidParams       { int32_t grav[4]; int32_t cfg[4]; };        // fluid_integrate
+            struct GrainParams       { int32_t grav[4]; int32_t cfg[4]; };        // grain_integrate
+            struct FluidKernelParams { int32_t ker[4];  int32_t cfg[4]; };        // fluid_density/lambda/dp
+            struct FluidSolveParams  { int32_t cfg0[4]; int32_t cfg1[4]; };       // fluid_collide
+            struct GrainGridParams   { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };  // GR2 passes
+            struct GrainContactParams{ int32_t cfg[4]; };                         // grain_contact_dp/apply
+            struct GrainFrictionParams{ int32_t cfg[4]; };                        // grain_friction (mu in cfg.z)
+            struct GrainSolveParams  { int32_t cfg0[4]; int32_t cfg1[4]; };       // grain_collide
+            struct CGFParams         { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };  // GF1 query params
+            struct CGFDisplaceParams { int32_t cfg[4]; };                         // GF3 displace
+            struct CGFBuoyancyParams { int32_t cfg[4]; int32_t grav[4]; int32_t coef[4]; };  // GF2 buoyancy
+            static_assert(sizeof(CGFParams) == 48 && sizeof(CGFDisplaceParams) == 16 &&
+                          sizeof(CGFBuoyancyParams) == 48, "GF4 std430");
+
+            auto makeBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto packGrain = [&](const std::vector<grain::GrainParticle>& ps) {
+                std::vector<GrainParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const grain::GrainParticle& p = ps[i];
+                    out[i] = GrainParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.radius, p.flags};
+                }
+                return out;
+            };
+            auto packFluid = [&](const std::vector<fluid::FluidParticle>& ps) {
+                std::vector<FluidParticleGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const fluid::FluidParticle& p = ps[i];
+                    out[i] = FluidParticleGpu{p.pos.x, p.pos.y, p.pos.z, p.prev.x, p.prev.y, p.prev.z,
+                                              p.vel.x, p.vel.y, p.vel.z, p.invMass, p.flags};
+                }
+                return out;
+            };
+
+            // Static buffers: the kernel LUTs + an empty sphere set (GF4 has no static sphere colliders).
+            std::vector<int32_t> kWup(kernel.W.begin(), kernel.W.end());
+            std::vector<int32_t> kGWup(kernel.gradW.begin(), kernel.gradW.end());
+            auto kernelWBuf  = makeBuf(kWup.data(),  kWup.size()  * sizeof(int32_t));
+            auto kernelGWBuf = makeBuf(kGWup.data(), kGWup.size() * sizeof(int32_t));
+            SphereGpu sph0{0, 0, 0, 0};
+            auto sphereBuf = makeBuf(&sph0, sizeof(sph0));
+
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                return std::make_pair(std::move(cs), device->CreateComputePipeline(d));
+            };
+            // FL4 fluid passes.
+            auto fIntegratePipe = mkPipe("fluid_integrate.comp.hlsl.spv", 2, 64);
+            auto densityPipe    = mkPipe("fluid_density.comp.hlsl.spv", 6, 64);
+            auto lambdaPipe     = mkPipe("fluid_lambda.comp.hlsl.spv", 7, 64);
+            auto fdpPipe        = mkPipe("fluid_dp.comp.hlsl.spv", 7, 64);
+            auto fApplyPipe     = mkPipe("fluid_apply.comp.hlsl.spv", 3, 64);
+            auto fCollidePipe   = mkPipe("fluid_collide.comp.hlsl.spv", 3, 64);
+            // GR1/GR2/GR3/GR4 grain passes.
+            auto gIntegratePipe = mkPipe("grain_integrate.comp.hlsl.spv", 2, 64);
+            auto gCellCountPipe = mkPipe("grain_cell_count.comp.hlsl.spv", 3, 64);
+            auto gCellScanPipe  = mkPipe("grain_cell_scan.comp.hlsl.spv", 3, 1);
+            auto gCellEmitPipe  = mkPipe("grain_cell_emit.comp.hlsl.spv", 5, 1);
+            auto gNbrCountPipe  = mkPipe("grain_neighbor_count.comp.hlsl.spv", 5, 64);
+            auto gNbrScanPipe   = mkPipe("grain_neighbor_scan.comp.hlsl.spv", 3, 1);
+            auto gNbrEmitPipe   = mkPipe("grain_neighbor_emit.comp.hlsl.spv", 6, 64);
+            auto gContactPipe   = mkPipe("grain_contact_dp.comp.hlsl.spv", 5, 64);
+            auto gApplyPipe     = mkPipe("grain_contact_apply.comp.hlsl.spv", 3, 64);
+            auto gFrictionPipe  = mkPipe("grain_friction.comp.hlsl.spv", 5, 64);
+            auto gCollidePipe   = mkPipe("grain_collide.comp.hlsl.spv", 3, 64);
+            // FL2 fluid cell passes (for the GF1 cross-query) + GF1 cross + GF3/GF2 couplings.
+            auto fCellCountPipe = mkPipe("fluid_cell_count.comp.hlsl.spv", 3, 64);
+            auto fCellScanPipe  = mkPipe("fluid_cell_scan.comp.hlsl.spv", 3, 1);
+            auto fCellEmitPipe  = mkPipe("fluid_cell_emit.comp.hlsl.spv", 5, 1);
+            auto gfCountPipe = mkPipe("cgf_gf_count.comp.hlsl.spv", 6, 64);
+            auto gfScanPipe  = mkPipe("cgf_gf_scan.comp.hlsl.spv", 3, 1);
+            auto gfEmitPipe  = mkPipe("cgf_gf_emit.comp.hlsl.spv", 7, 64);
+            auto fgCountPipe = mkPipe("cgf_fg_count.comp.hlsl.spv", 6, 64);
+            auto fgScanPipe  = mkPipe("cgf_fg_scan.comp.hlsl.spv", 3, 1);
+            auto fgEmitPipe  = mkPipe("cgf_fg_emit.comp.hlsl.spv", 7, 64);
+            auto displacePipe = mkPipe("cgf_displace.comp.hlsl.spv", 5, 64);
+            auto buoyPipe     = mkPipe("cgf_buoyancy.comp.hlsl.spv", 5, 64);
+
+            const uint32_t kGrainGroups = ((uint32_t)kGrainCount + 63u) / 64u;
+            const uint32_t kFluidGroups = ((uint32_t)kFluidCount + 63u) / 64u;
+
+            // runGpu: the full host-driven coupled K-step loop over the GPU. Returns the final fluid + grain
+            // state. The (6) ground clamps are host-side (a pure pos.y clamp -> the SAME op StepCGF's (6) runs).
+            auto runGpu = [&](std::vector<FluidParticleGpu>& outFluid, std::vector<GrainParticleGpu>& outGrain) {
+                cgf::CGFWorld hostW = world;   // carries the fluid + grain state across steps (the (6) clamp host)
+
+                for (int step = 0; step < kSteps; ++step) {
+                    // Re-upload the host-carried state at the start of each step (the GF2-buoyancy carry pattern;
+                    // WriteBuffer is not in the RHI, so the (6) ground clamp lands on the host-carried world).
+                    std::vector<FluidParticleGpu> fluidPk = packFluid(hostW.fluid);
+                    std::vector<GrainParticleGpu> grainPk = packGrain(hostW.grains);
+                    auto fluidBuf = makeBuf(fluidPk.data(), fluidPk.size() * sizeof(FluidParticleGpu));
+                    auto grainsBuf = makeBuf(grainPk.data(), grainPk.size() * sizeof(GrainParticleGpu));
+                    std::vector<FxVec3Gpu> gdpInit((size_t)kGrainCount, FxVec3Gpu{0, 0, 0});
+                    auto gdpBuf = makeBuf(gdpInit.data(), gdpInit.size() * sizeof(FxVec3Gpu));
+                    // (1) PREDICT both pools: fluid_integrate + grain_integrate (FL1 + GR1) on the GPU.
+                    FluidParams fip{};
+                    fip.grav[0] = 0; fip.grav[1] = kGravY; fip.grav[2] = 0; fip.grav[3] = kDt;
+                    fip.cfg[0] = kGroundY; fip.cfg[1] = kFluidCount; fip.cfg[2] = 1; fip.cfg[3] = 1;
+                    auto fipBuf = makeBuf(&fip, sizeof(fip));
+                    GrainParams gip{};
+                    gip.grav[0] = 0; gip.grav[1] = kGravY; gip.grav[2] = 0; gip.grav[3] = kDt;
+                    gip.cfg[0] = kGroundY; gip.cfg[1] = kGrainCount; gip.cfg[2] = 1; gip.cfg[3] = 1;
+                    auto gipBuf = makeBuf(&gip, sizeof(gip));
+                    {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gf4_predict", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*fIntegratePipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fipBuf, 1);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gIntegratePipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gipBuf, 1);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+
+                    // (2) BUILD (host): read back the predicted pools, build the FL2 fluid neighbour list, the
+                    // GR2 grain neighbour list, and the GF1 cross lists — the SAME deterministic integer data the
+                    // CPU StepCGF builds. (The kernel LUT is fixed across the run.)
+                    std::vector<FluidParticleGpu> fpred((size_t)kFluidCount);
+                    device->ReadBuffer(*fluidBuf, fpred.data(), fpred.size() * sizeof(FluidParticleGpu), 0);
+                    std::vector<GrainParticleGpu> gpred((size_t)kGrainCount);
+                    device->ReadBuffer(*grainsBuf, gpred.data(), gpred.size() * sizeof(GrainParticleGpu), 0);
+                    cgf::CGFWorld predW; predW.h = kH;
+                    predW.gravity = kGravity; predW.dt = kDt; predW.groundY = kGroundY;
+                    predW.fluid.resize((size_t)kFluidCount); predW.grains.resize((size_t)kGrainCount);
+                    for (int i = 0; i < kFluidCount; ++i) {
+                        const FluidParticleGpu& q = fpred[(size_t)i];
+                        predW.fluid[(size_t)i] = fluid::FluidParticle{
+                            fluid::FxVec3{q.px, q.py, q.pz}, fluid::FxVec3{q.prx, q.pry, q.prz},
+                            fluid::FxVec3{q.vx, q.vy, q.vz}, q.invMass, q.flags};
+                    }
+                    for (int i = 0; i < kGrainCount; ++i) {
+                        const GrainParticleGpu& q = gpred[(size_t)i];
+                        predW.grains[(size_t)i] = grain::GrainParticle{
+                            grain::FxVec3{q.px, q.py, q.pz}, grain::FxVec3{q.prx, q.pry, q.prz},
+                            grain::FxVec3{q.vx, q.vy, q.vz}, q.invMass, q.radius, q.flags};
+                    }
+                    // FL2 fluid neighbour list.
+                    const fluid::FluidGrid fgrid = fluid::MakeGrid(predW.fluid, kH);
+                    const fluid::FluidCellTable ftab = fluid::BuildCellTable(predW.fluid, fgrid);
+                    const fluid::FluidNeighborList flist = fluid::BuildNeighborList(predW.fluid, fgrid, ftab, kH);
+                    const uint32_t ftotal = (uint32_t)flist.neighbors.size();
+                    const uint32_t falloc = ftotal > 0u ? ftotal : 1u;
+                    std::vector<uint32_t> fNbrStartUp(flist.neighborStart.begin(), flist.neighborStart.end());
+                    std::vector<uint32_t> fNbrUp(falloc, 0u);
+                    for (uint32_t s = 0; s < ftotal; ++s) fNbrUp[s] = flist.neighbors[s];
+                    auto fNbrStartBuf = makeBuf(fNbrStartUp.data(), fNbrStartUp.size() * sizeof(uint32_t));
+                    auto fNbrBuf      = makeBuf(fNbrUp.data(),      fNbrUp.size()      * sizeof(uint32_t));
+                    // GR2 grain neighbour list.
+                    const grain::GrainGrid ggrid = grain::MakeGrainGrid(predW.grains, kH);
+                    const grain::GrainCellTable gtab = grain::BuildGrainCellTable(predW.grains, ggrid);
+                    const grain::GrainNeighborList glist =
+                        grain::BuildGrainNeighborList(predW.grains, ggrid, gtab, kH);
+                    const uint32_t gtotal = (uint32_t)glist.neighbors.size();
+                    const uint32_t galloc = gtotal > 0u ? gtotal : 1u;
+                    std::vector<uint32_t> gNbrStartUp(glist.neighborStart.begin(), glist.neighborStart.end());
+                    std::vector<uint32_t> gNbrUp(galloc, 0u);
+                    for (uint32_t s = 0; s < gtotal; ++s) gNbrUp[s] = glist.neighbors[s];
+                    auto gNbrStartBuf = makeBuf(gNbrStartUp.data(), gNbrStartUp.size() * sizeof(uint32_t));
+                    auto gNbrBuf      = makeBuf(gNbrUp.data(),      gNbrUp.size()      * sizeof(uint32_t));
+                    // GF1 shared grid (for the cross-query passes) + the GR2/FL2 cell tables over it.
+                    const cgf::CGFGrid cgrid = cgf::MakeCGFGrid(predW);
+                    const uint32_t kCellCount = cgf::CGFCellCount(cgrid);
+                    const cgf::CGFNeighbors cpuNbr = cgf::BuildCGFNeighbors(predW);
+                    const uint32_t kGF = cgf::CountGF(cpuNbr);
+                    const uint32_t kFG = cgf::CountFG(cpuNbr);
+                    const uint32_t kGFAlloc = kGF > 0u ? kGF : 1u;
+                    const uint32_t kFGAlloc = kFG > 0u ? kFG : 1u;
+
+                    // (3)/(4)/(5) param buffers.
+                    FluidKernelParams kp{};
+                    kp.ker[0] = kH; kp.ker[1] = kRestDensity; kp.ker[2] = kEpsilon; kp.ker[3] = kBins;
+                    kp.cfg[0] = kFluidCount; kp.cfg[1] = 1;
+                    auto kpBuf = makeBuf(&kp, sizeof(kp));
+                    GrainContactParams cp{};
+                    cp.cfg[0] = kGrainCount; cp.cfg[1] = (kIters > 0) ? 1 : 0;
+                    auto cpBuf = makeBuf(&cp, sizeof(cp));
+                    GrainFrictionParams gfp{};
+                    gfp.cfg[0] = kGrainCount; gfp.cfg[1] = 1; gfp.cfg[2] = grain::kGrainMu; gfp.cfg[3] = 0;
+                    auto gfpBuf = makeBuf(&gfp, sizeof(gfp));
+
+                    // Density/λ/dp scratch (fluid).
+                    std::vector<int32_t> rhoInit((size_t)kFluidCount, 0), lamInit((size_t)kFluidCount, 0);
+                    std::vector<FxVec3Gpu> fdpInit((size_t)kFluidCount, FxVec3Gpu{0,0,0});
+                    auto densityBuf = makeBuf(rhoInit.data(), rhoInit.size() * sizeof(int32_t));
+                    auto lambdaBuf  = makeBuf(lamInit.data(), lamInit.size() * sizeof(int32_t));
+                    auto fdpBuf     = makeBuf(fdpInit.data(), fdpInit.size() * sizeof(FxVec3Gpu));
+
+                    // (3) K JACOBI iters: FL4 density solve -> GR3 contact -> GR4 friction (positional only).
+                    for (int it = 0; it < kIters; ++it) {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gf4_iter", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            // (3a) FL4 density: density -> λ -> dp -> apply (fluid pos += dp).
+                            cmd.BindComputePipeline(*densityPipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fNbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*fNbrBuf, 2);  cmd.BindStorageBuffer(*kernelWBuf, 3);
+                            cmd.BindStorageBuffer(*densityBuf, 4); cmd.BindStorageBuffer(*kpBuf, 5);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*lambdaPipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fNbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*fNbrBuf, 2);  cmd.BindStorageBuffer(*kernelGWBuf, 3);
+                            cmd.BindStorageBuffer(*densityBuf, 4); cmd.BindStorageBuffer(*lambdaBuf, 5);
+                            cmd.BindStorageBuffer(*kpBuf, 6);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*fdpPipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fNbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*fNbrBuf, 2);  cmd.BindStorageBuffer(*kernelGWBuf, 3);
+                            cmd.BindStorageBuffer(*lambdaBuf, 4); cmd.BindStorageBuffer(*fdpBuf, 5);
+                            cmd.BindStorageBuffer(*kpBuf, 6);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*fApplyPipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fdpBuf, 1);
+                            cmd.BindStorageBuffer(*kpBuf, 2);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            // (3b) GR3 NORMAL push: grain_contact_dp -> grain_contact_apply.
+                            cmd.BindComputePipeline(*gContactPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gNbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*gNbrBuf, 2);   cmd.BindStorageBuffer(*gdpBuf, 3);
+                            cmd.BindStorageBuffer(*cpBuf, 4);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gApplyPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gdpBuf, 1);
+                            cmd.BindStorageBuffer(*cpBuf, 2);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                            // (3c) GR4 TANGENTIAL friction: grain_friction -> grain_contact_apply (REUSED).
+                            cmd.BindComputePipeline(*gFrictionPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gNbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*gNbrBuf, 2);   cmd.BindStorageBuffer(*gdpBuf, 3);
+                            cmd.BindStorageBuffer(*gfpBuf, 4);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gApplyPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gdpBuf, 1);
+                            cmd.BindStorageBuffer(*cpBuf, 2);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+
+                    // (4) VELOCITY UPDATE both pools: fluid_collide + grain_collide as PURE velocity updates
+                    // (groundY sentinel below all, sphereCount 0 -> NO clamp; StepCGF's (4) is velocity only).
+                    FluidSolveParams fsp{};
+                    fsp.cfg0[0] = kDt; fsp.cfg0[1] = kNoClampGroundY; fsp.cfg0[2] = kFluidCount; fsp.cfg0[3] = 0;
+                    fsp.cfg1[0] = 1;
+                    auto fspBuf = makeBuf(&fsp, sizeof(fsp));
+                    GrainSolveParams gsp{};
+                    gsp.cfg0[0] = kDt; gsp.cfg0[1] = kNoClampGroundY; gsp.cfg0[2] = kGrainCount; gsp.cfg0[3] = 0;
+                    gsp.cfg1[0] = 1;
+                    auto gspBuf = makeBuf(&gsp, sizeof(gsp));
+                    {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gf4_vel", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*fCollidePipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*sphereBuf, 1);
+                            cmd.BindStorageBuffer(*fspBuf, 2);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gCollidePipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*sphereBuf, 1);
+                            cmd.BindStorageBuffer(*gspBuf, 2);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+
+                    // (5) CROSS-POOL VELOCITY COUPLING — ONCE: build the GF1 cross lists (the GR2/FL2 cell passes
+                    // + the SIX cgf_gf/cgf_fg passes, int32 MSL-native) from the post-velocity state, then GF3
+                    // cgf_displace + GF2 cgf_buoyancy. The cross-query cell tables are over the SHARED grid.
+                    CGFParams crossGrainParams{}, crossFluidParams{};
+                    {
+                        CGFParams base{};
+                        base.grid[0] = kH; base.grid[1] = cgrid.cellMin.x; base.grid[2] = cgrid.cellMin.y;
+                        base.grid[3] = cgrid.cellMin.z;
+                        base.dim[0] = cgrid.gridDim.x; base.dim[1] = cgrid.gridDim.y; base.dim[2] = cgrid.gridDim.z;
+                        base.cfg[0] = (int32_t)kCellCount; base.cfg[1] = 1;
+                        crossGrainParams = base; crossGrainParams.dim[3] = kGrainCount;
+                        crossFluidParams = base; crossFluidParams.dim[3] = kFluidCount;
+                    }
+                    auto crossGrainParamsBuf = makeBuf(&crossGrainParams, sizeof(crossGrainParams));
+                    auto crossFluidParamsBuf = makeBuf(&crossFluidParams, sizeof(crossFluidParams));
+                    // PREDICTED-position snapshot buffers (the CPU StepCGF builds the GF1 cross lists ONCE from
+                    // the predicted positions at (2) + reuses them at (5); the GPU cross-query must run on the
+                    // SAME predicted positions, NOT the post-(3)/(4) live positions, to stay bit-exact. The cgf
+                    // displace/buoyancy then read the LIVE fluid/grain buffers for the particle pos/vel).
+                    std::vector<FluidParticleGpu> fluidPredPk = packFluid(predW.fluid);
+                    std::vector<GrainParticleGpu> grainPredPk = packGrain(predW.grains);
+                    auto fluidPredBuf = makeBuf(fluidPredPk.data(), fluidPredPk.size() * sizeof(FluidParticleGpu));
+                    auto grainsPredBuf = makeBuf(grainPredPk.data(), grainPredPk.size() * sizeof(GrainParticleGpu));
+                    std::vector<uint32_t> gCellCountInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> gCellStartInit((size_t)kCellCount + 1u, 0u);
+                    std::vector<uint32_t> gCellCursorInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> gCellGrainInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> fCellCountInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> fCellStartInit((size_t)kCellCount + 1u, 0u);
+                    std::vector<uint32_t> fCellCursorInit((size_t)kCellCount, 0u);
+                    std::vector<uint32_t> fCellPartInit((size_t)kFluidCount, 0u);
+                    std::vector<uint32_t> gfCountInit((size_t)kGrainCount, 0u);
+                    std::vector<uint32_t> gfStartInit((size_t)kGrainCount + 1u, 0u);
+                    std::vector<uint32_t> gfNbrInit((size_t)kGFAlloc, 0u);
+                    std::vector<uint32_t> fgCountInit((size_t)kFluidCount, 0u);
+                    std::vector<uint32_t> fgStartInit((size_t)kFluidCount + 1u, 0u);
+                    std::vector<uint32_t> fgNbrInit((size_t)kFGAlloc, 0u);
+                    auto gcCountBuf = makeBuf(gCellCountInit.data(), gCellCountInit.size() * sizeof(uint32_t));
+                    auto gcStartBuf = makeBuf(gCellStartInit.data(), gCellStartInit.size() * sizeof(uint32_t));
+                    auto gcCursorBuf = makeBuf(gCellCursorInit.data(), gCellCursorInit.size() * sizeof(uint32_t));
+                    auto gcGrainBuf = makeBuf(gCellGrainInit.data(), gCellGrainInit.size() * sizeof(uint32_t));
+                    auto fcCountBuf = makeBuf(fCellCountInit.data(), fCellCountInit.size() * sizeof(uint32_t));
+                    auto fcStartBuf = makeBuf(fCellStartInit.data(), fCellStartInit.size() * sizeof(uint32_t));
+                    auto fcCursorBuf = makeBuf(fCellCursorInit.data(), fCellCursorInit.size() * sizeof(uint32_t));
+                    auto fcPartBuf = makeBuf(fCellPartInit.data(), fCellPartInit.size() * sizeof(uint32_t));
+                    auto gfCountBuf = makeBuf(gfCountInit.data(), gfCountInit.size() * sizeof(uint32_t));
+                    auto gfStartBuf = makeBuf(gfStartInit.data(), gfStartInit.size() * sizeof(uint32_t));
+                    auto gfNbrBuf = makeBuf(gfNbrInit.data(), gfNbrInit.size() * sizeof(uint32_t));
+                    auto fgCountBuf = makeBuf(fgCountInit.data(), fgCountInit.size() * sizeof(uint32_t));
+                    auto fgStartBuf = makeBuf(fgStartInit.data(), fgStartInit.size() * sizeof(uint32_t));
+                    auto fgNbrBuf = makeBuf(fgNbrInit.data(), fgNbrInit.size() * sizeof(uint32_t));
+                    CGFDisplaceParams dpar{};
+                    dpar.cfg[0] = kFluidCount; dpar.cfg[1] = 1; dpar.cfg[2] = kDt;
+                    auto dparBuf = makeBuf(&dpar, sizeof(dpar));
+                    CGFBuoyancyParams bpar{};
+                    bpar.cfg[0] = kGrainCount; bpar.cfg[1] = 1;
+                    bpar.grav[0] = 0; bpar.grav[1] = kGravY; bpar.grav[2] = 0; bpar.grav[3] = kDt;
+                    bpar.coef[0] = cgf::kBuoyPerFluid; bpar.coef[1] = cgf::kDrag;
+                    auto bparBuf = makeBuf(&bpar, sizeof(bpar));
+                    {
+                        render::RenderGraph g; render::RgResource sw = g.ImportSwapchain("swapchain");
+                        g.AddPass("gf4_couple", {}, {sw}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            // GF1 cross-query runs on the PREDICTED-position snapshot buffers (to match the CPU's
+                            // step-(2) cross lists reused at (5)). GF1: GRAIN cell table (reused GR2, shared grid).
+                            cmd.BindComputePipeline(*gCellCountPipe.second);
+                            cmd.BindStorageBuffer(*grainsPredBuf, 0); cmd.BindStorageBuffer(*gcCountBuf, 1);
+                            cmd.BindStorageBuffer(*crossGrainParamsBuf, 2);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gCellScanPipe.second);
+                            cmd.BindStorageBuffer(*gcCountBuf, 0); cmd.BindStorageBuffer(*gcStartBuf, 1);
+                            cmd.BindStorageBuffer(*crossGrainParamsBuf, 2);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gCellEmitPipe.second);
+                            cmd.BindStorageBuffer(*grainsPredBuf, 0); cmd.BindStorageBuffer(*gcStartBuf, 1);
+                            cmd.BindStorageBuffer(*gcCursorBuf, 2); cmd.BindStorageBuffer(*gcGrainBuf, 3);
+                            cmd.BindStorageBuffer(*crossGrainParamsBuf, 4);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            // GF1: FLUID cell table (reused FL2, over the SHARED grid).
+                            cmd.BindComputePipeline(*fCellCountPipe.second);
+                            cmd.BindStorageBuffer(*fluidPredBuf, 0); cmd.BindStorageBuffer(*fcCountBuf, 1);
+                            cmd.BindStorageBuffer(*crossFluidParamsBuf, 2);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*fCellScanPipe.second);
+                            cmd.BindStorageBuffer(*fcCountBuf, 0); cmd.BindStorageBuffer(*fcStartBuf, 1);
+                            cmd.BindStorageBuffer(*crossFluidParamsBuf, 2);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*fCellEmitPipe.second);
+                            cmd.BindStorageBuffer(*fluidPredBuf, 0); cmd.BindStorageBuffer(*fcStartBuf, 1);
+                            cmd.BindStorageBuffer(*fcCursorBuf, 2); cmd.BindStorageBuffer(*fcPartBuf, 3);
+                            cmd.BindStorageBuffer(*crossFluidParamsBuf, 4);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            // GF1: gf cross list (grain -> fluid).
+                            cmd.BindComputePipeline(*gfCountPipe.second);
+                            cmd.BindStorageBuffer(*fluidPredBuf, 0); cmd.BindStorageBuffer(*fcStartBuf, 1);
+                            cmd.BindStorageBuffer(*fcPartBuf, 2); cmd.BindStorageBuffer(*grainsPredBuf, 3);
+                            cmd.BindStorageBuffer(*gfCountBuf, 4); cmd.BindStorageBuffer(*crossGrainParamsBuf, 5);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gfScanPipe.second);
+                            cmd.BindStorageBuffer(*gfCountBuf, 0); cmd.BindStorageBuffer(*gfStartBuf, 1);
+                            cmd.BindStorageBuffer(*crossGrainParamsBuf, 2);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*gfEmitPipe.second);
+                            cmd.BindStorageBuffer(*fluidPredBuf, 0); cmd.BindStorageBuffer(*fcStartBuf, 1);
+                            cmd.BindStorageBuffer(*fcPartBuf, 2); cmd.BindStorageBuffer(*grainsPredBuf, 3);
+                            cmd.BindStorageBuffer(*gfStartBuf, 4); cmd.BindStorageBuffer(*gfNbrBuf, 5);
+                            cmd.BindStorageBuffer(*crossGrainParamsBuf, 6);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToComputeBarrier();
+                            // GF1: fg cross list (fluid -> grain) — the list GF3 cgf_displace iterates.
+                            cmd.BindComputePipeline(*fgCountPipe.second);
+                            cmd.BindStorageBuffer(*grainsPredBuf, 0); cmd.BindStorageBuffer(*gcStartBuf, 1);
+                            cmd.BindStorageBuffer(*gcGrainBuf, 2); cmd.BindStorageBuffer(*fluidPredBuf, 3);
+                            cmd.BindStorageBuffer(*fgCountBuf, 4); cmd.BindStorageBuffer(*crossFluidParamsBuf, 5);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*fgScanPipe.second);
+                            cmd.BindStorageBuffer(*fgCountBuf, 0); cmd.BindStorageBuffer(*fgStartBuf, 1);
+                            cmd.BindStorageBuffer(*crossFluidParamsBuf, 2);
+                            cmd.DispatchCompute(1); cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*fgEmitPipe.second);
+                            cmd.BindStorageBuffer(*grainsPredBuf, 0); cmd.BindStorageBuffer(*gcStartBuf, 1);
+                            cmd.BindStorageBuffer(*gcGrainBuf, 2); cmd.BindStorageBuffer(*fluidPredBuf, 3);
+                            cmd.BindStorageBuffer(*fgStartBuf, 4); cmd.BindStorageBuffer(*fgNbrBuf, 5);
+                            cmd.BindStorageBuffer(*crossFluidParamsBuf, 6);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            // (5a) GF3 grain->fluid displace (ONE thread per FLUID particle, int64) — VERBATIM.
+                            cmd.BindComputePipeline(*displacePipe.second);
+                            cmd.BindStorageBuffer(*fluidBuf, 0); cmd.BindStorageBuffer(*fgStartBuf, 1);
+                            cmd.BindStorageBuffer(*fgNbrBuf, 2); cmd.BindStorageBuffer(*grainsBuf, 3);
+                            cmd.BindStorageBuffer(*dparBuf, 4);
+                            cmd.DispatchCompute(kFluidGroups); cmd.ComputeToComputeBarrier();
+                            // (5b) GF2 fluid->grain buoyancy (ONE thread per GRAIN, int64) — VERBATIM.
+                            cmd.BindComputePipeline(*buoyPipe.second);
+                            cmd.BindStorageBuffer(*grainsBuf, 0); cmd.BindStorageBuffer(*gfStartBuf, 1);
+                            cmd.BindStorageBuffer(*gfNbrBuf, 2); cmd.BindStorageBuffer(*fluidBuf, 3);
+                            cmd.BindStorageBuffer(*bparBuf, 4);
+                            cmd.DispatchCompute(kGrainGroups); cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0,0,0,1}); cmd.EndRenderPass();
+                        });
+                        g.Execute(*device); device->WaitIdle();
+                    }
+
+                    // (6) GROUND CLAMPS both pools (host-side pure pos.y clamp — NOT the collide shaders, which
+                    // would re-derive velocity and clobber the (5) drag impulses). The SAME op StepCGF's (6) runs.
+                    std::vector<FluidParticleGpu> fpost((size_t)kFluidCount);
+                    device->ReadBuffer(*fluidBuf, fpost.data(), fpost.size() * sizeof(FluidParticleGpu), 0);
+                    std::vector<GrainParticleGpu> gpost((size_t)kGrainCount);
+                    device->ReadBuffer(*grainsBuf, gpost.data(), gpost.size() * sizeof(GrainParticleGpu), 0);
+                    for (int i = 0; i < kFluidCount; ++i) {
+                        if (fpost[(size_t)i].py < kGroundY) fpost[(size_t)i].py = kGroundY;       // CollidePlane
+                        const FluidParticleGpu& q = fpost[(size_t)i];
+                        hostW.fluid[(size_t)i] = fluid::FluidParticle{
+                            fluid::FxVec3{q.px, q.py, q.pz}, fluid::FxVec3{q.prx, q.pry, q.prz},
+                            fluid::FxVec3{q.vx, q.vy, q.vz}, q.invMass, q.flags};
+                    }
+                    for (int i = 0; i < kGrainCount; ++i) {
+                        const int32_t restY = kGroundY + gpost[(size_t)i].radius;                 // CollideGrainPlane
+                        if (gpost[(size_t)i].py < restY) gpost[(size_t)i].py = restY;
+                        const GrainParticleGpu& q = gpost[(size_t)i];
+                        hostW.grains[(size_t)i] = grain::GrainParticle{
+                            grain::FxVec3{q.px, q.py, q.pz}, grain::FxVec3{q.prx, q.pry, q.prz},
+                            grain::FxVec3{q.vx, q.vy, q.vz}, q.invMass, q.radius, q.flags};
+                    }
+                }
+                outFluid = packFluid(hostW.fluid);
+                outGrain = packGrain(hostW.grains);
+            };
+
+            // === GPU coupled step (K steps) ===
+            std::vector<FluidParticleGpu> gpuFluid; std::vector<GrainParticleGpu> gpuGrain;
+            runGpu(gpuFluid, gpuGrain);
+
+            // PROOF (1) GPU==CPU BIT-EXACT (the fluid + grain state, integer memcmp, NO tol — the make-or-break).
+            std::vector<FluidParticleGpu> cpuFluidGpu = packFluid(cpuWorld.fluid);
+            std::vector<GrainParticleGpu> cpuGrainGpu = packGrain(cpuWorld.grains);
+            bool exact = (gpuFluid.size() == cpuFluidGpu.size()) && (gpuGrain.size() == cpuGrainGpu.size()) &&
+                std::memcmp(gpuFluid.data(), cpuFluidGpu.data(), cpuFluidGpu.size() * sizeof(FluidParticleGpu)) == 0 &&
+                std::memcmp(gpuGrain.data(), cpuGrainGpu.data(), cpuGrainGpu.size() * sizeof(GrainParticleGpu)) == 0;
+            if (!exact) {
+                std::fprintf(stderr, "FATAL: cgf-step GPU != CPU StepCGFSteps (a float crept into the "
+                             "fixed-point coupled tick?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgf-step: {grains:%d, fluid:%d, iters:%d, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kGrainCount, kFluidCount, kIters, kSteps);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical (fluid + grain).
+            {
+                std::vector<FluidParticleGpu> f2; std::vector<GrainParticleGpu> g2;
+                runGpu(f2, g2);
+                bool same = (f2.size() == gpuFluid.size()) && (g2.size() == gpuGrain.size()) &&
+                    std::memcmp(f2.data(), gpuFluid.data(), gpuFluid.size() * sizeof(FluidParticleGpu)) == 0 &&
+                    std::memcmp(g2.data(), gpuGrain.data(), gpuGrain.size() * sizeof(GrainParticleGpu)) == 0;
+                if (!same) {
+                    std::fprintf(stderr, "FATAL: cgf-step two runs differ (nondeterministic)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-step determinism: two runs BYTE-IDENTICAL\n");
+            }
+
+            // PROOF (3) co-settling (the emergent metric, honest/within-band): the fluid POOLS ABOVE the bed by a
+            // margin AND the GR4 bed still holds an angle of repose AND submerged grains sit at/above dry (the GF2
+            // lift survives the coupled step). The wet/dry + pool-above margins are EMERGENT/within-band (the
+            // CP2/GR4/GF2 caveat), NOT exact depths.
+            {
+                const cgf::CGFState st = cpuState;
+                if (!(st.fluidY > st.bedY)) {
+                    std::fprintf(stderr, "FATAL: cgf-step fluid did NOT pool above the bed (fluidY=%d bedY=%d)\n",
+                                 (int)st.fluidY, (int)st.bedY);
+                    device->WaitIdle(); return 1;
+                }
+                if (!(st.repose > 0)) {
+                    std::fprintf(stderr, "FATAL: cgf-step bed lost its repose (repose=%d)\n", (int)st.repose);
+                    device->WaitIdle(); return 1;
+                }
+                if (!(st.wetY >= st.dryY)) {
+                    std::fprintf(stderr, "FATAL: cgf-step wet did NOT survive (wetY=%d dryY=%d)\n",
+                                 (int)st.wetY, (int)st.dryY);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-step settled: {bedY:%d, fluidY:%d, repose:%d, wetY:%d, dryY:%d}\n",
+                            (int)st.bedY, (int)st.fluidY, (int)st.repose, (int)st.wetY, (int)st.dryY);
+            }
+
+            // PROOF (4) no-penetration: the fluid rests ON the bed — the fluid-into-grain penetration after the
+            // coupled run is RELIEVED vs the INITIAL buried state (the fluid seeded interpenetrating the bed; the
+            // control). The GF3 grain->fluid displacement parts the fluid OUT of the sand each step. The Jacobi
+            // single-projection residual is deterministic-but-nonzero (the FL4/GR3/GF3 caveat — relieved, NOT 0).
+            {
+                const cgf::FluidGrainPenetration penInitial = cgf::MeasureFluidGrainPenetration(world);  // buried
+                const cgf::FluidGrainPenetration penCoupled = cgf::MeasureFluidGrainPenetration(cpuWorld);// parted
+                if (!(penInitial.summed > 0) || !(penCoupled.summed < penInitial.summed)) {
+                    std::fprintf(stderr, "FATAL: cgf-step fluid did NOT rest on the bed (penCoupled %lld >= "
+                                 "penInitial %lld)\n", (long long)penCoupled.summed, (long long)penInitial.summed);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("cgf-step no-penetration: {pen:%lld} (fluid rests on the bed)\n",
+                            (long long)penCoupled.summed);
+            }
+
+            // --- Golden: a PURE-INTEGER side-view (x,y) of the co-settled WET SAND — the tan grain bed (the bed
+            // holding its repose) with the cyan fluid POOLED ON/AROUND it, from the bit-exact CPU reference
+            // (GPU==CPU proven above) -> identical both backends by construction (the strict zero-diff bar). ---
+            const int kPxPerUnit = 34, kImgMargin = 26;
+            const int kWorldLo = -1, kWorldW = 8, kWorldH = 9;
+            const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+                cx = kImgMargin + (wx - kWorldLo) * kPxPerUnit;
+                cy = (int)imgH - kImgMargin - (wy - kWorldLo) * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            // The settled wet sand bed (warm tan) first, then the pooled fluid (cyan) on top.
+            for (int i = 0; i < kGrainCount; ++i) {
+                int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.62f, 0.46f, 0.24f}, 1);
+            }
+            for (int i = 0; i < kFluidCount; ++i) {
+                int cx, cy; toPx(cpuWorld.fluid[(size_t)i].pos.x, cpuWorld.fluid[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.18f, 0.58f, 0.95f}, 1);
+            }
+            bool ok = WriteBMP(cgfStepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cgf coupled step (wet sand: fluid pooled on the settled bed, "
+                                "fluidY %d, bedY %d)\n", cgfStepShotPath, imgW, imgH,
+                                (int)cpuState.fluidY, (int)cpuState.bedY);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgfStepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

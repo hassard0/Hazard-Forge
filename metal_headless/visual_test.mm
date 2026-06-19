@@ -19974,6 +19974,159 @@ static int RunCgfDisplaceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GF4 — Deterministic Grain<->Fluid Coupling THE COUPLED STEP showcase (--cgf-step) ===============
+// (the CONVERGENCE of FLAGSHIP #13 — a sand bed + a fluid block co-settle, the CG4 StepCGrain mold with TWO
+// particle pools). The FL4 density + GR3/GR4 contact/friction + GF2/GF3 exchange math is int64 (FxLength/
+// FxNormalize via FxISqrt + the density/friction/coupling fxmul/fxdiv) -> glslc can't parse int64 -> the
+// fluid_*/grain_*/cgf_displace/cgf_buoyancy shaders are VULKAN-SPIR-V-ONLY (NOT in this dir's hf_gen_msl list;
+// the GF1 cross-query/cell passes stay int32 MSL-native); on Metal the --cgf-step showcase runs the CPU
+// cgf::StepCGFSteps — the EXACT bit-exact reference the Vulkan --cgf-step-shot GPU==CPU memcmp compares against
+// -> byte-identical to the Vulkan GPU result BY CONSTRUCTION (the cgf_buoyancy.comp convention). So this builds
+// the SAME scene (a settled packed 8x3x6 grain bed + a 4x4x6 fluid block seeded above its centre, gravity -9.8
+// host-snapped, groundY=0, dt=kOne/60, h=1.5, iters=3, K=120), runs cgf::StepCGFSteps, and CPU-colors the SAME
+// integer side-view golden as the Vulkan --cgf-step-shot -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). New golden tests/golden/metal/cgf_step.png (baked on the
+// Mac by the CONTROLLER); two runs DIFF 0.0000. NO new shader, NO new RHI.
+static int RunCgfStepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgf   = hf::sim::cgf;
+    namespace grain = hf::sim::grain;
+    namespace fluid = hf::sim::fluid;
+
+    // The scene (== the Vulkan --cgf-step-shot config). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius (0.5 spacing, packed)
+    const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (coupling radius + smoothing h)
+    const int kBins = fluid::kKernelBins;
+    const grain::fx kEpsilon = grain::kOne / 100;
+    const int kSteps = 120;
+    const int kIters = 3;
+
+    // A packed 8x3x6 = 144 grain bed, 0.5 spacing, settled by GR4 friction.
+    grain::GrainBlock gblock;
+    gblock.W = 8; gblock.H = 3; gblock.D = 6;
+    gblock.spacing = grain::kOne / 2;
+    gblock.radius = kRadius;
+    gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+    std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+    grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+    // A 4x4x6 = 96 fluid block over the settled bed's LEFT HALF, interpenetrating it from the start (the
+    // GF2-buoyancy proven wet>dry config — the left grains stay submerged/lifted, the right grains stay dry).
+    fluid::FluidBlock fblock;
+    fblock.W = 4; fblock.H = 4; fblock.D = 6;
+    fblock.spacing = grain::kOne / 2;
+    fblock.origin = grain::FxVec3{0, bed[0].pos.y + grain::kOne / 8, 0};
+    std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+    auto makeWorld = [&]() {
+        cgf::CGFWorld w;
+        w.grains = bed; w.fluid = fluidP; w.h = kH;
+        w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+        return w;
+    };
+    cgf::CGFWorld world = makeWorld();
+    const int kGrainCount = (int)world.grains.size();
+    const int kFluidCount = (int)world.fluid.size();
+
+    // The kernel: ρ0 = the mean density of the packed initial fluid lattice (the FL4 probe recipe).
+    fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, grain::kOne, kBins, kEpsilon);
+    {
+        const fluid::FluidGrid pg = fluid::MakeGrid(world.fluid, kH);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(world.fluid, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(world.fluid, pg, pt, kH);
+        std::vector<fluid::fx> probeRho;
+        fluid::ComputeDensity(world.fluid, pl, kernel, probeRho);
+        kernel = fluid::BuildKernelTable(kH, fluid::MeanDensity(probeRho), kBins, kEpsilon);
+    }
+
+    // CPU StepCGFSteps (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the Metal
+    // result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    cgf::CGFWorld cpuWorld = world;
+    cgf::StepCGFSteps(cpuWorld, kernel, kDt, kIters, kSteps);
+    const cgf::CGFState st = cgf::MeasureCGFState(cpuWorld);
+
+    std::printf("cgf-step: {grains:%d, fluid:%d, iters:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cgf::StepCGFSteps, byte-identical to the Vulkan GPU result by construction]\n",
+                kGrainCount, kFluidCount, kIters, kSteps);
+
+    // determinism: two runs byte-identical (fluid + grain).
+    {
+        cgf::CGFWorld w2 = world;
+        cgf::StepCGFSteps(w2, kernel, kDt, kIters, kSteps);
+        if (w2.fluid.size() != cpuWorld.fluid.size() || w2.grains.size() != cpuWorld.grains.size() ||
+            std::memcmp(w2.fluid.data(), cpuWorld.fluid.data(),
+                        w2.fluid.size() * sizeof(fluid::FluidParticle)) != 0 ||
+            std::memcmp(w2.grains.data(), cpuWorld.grains.data(),
+                        w2.grains.size() * sizeof(grain::GrainParticle)) != 0)
+            return fail("cgf-step: two runs differ (nondeterministic)");
+        std::printf("cgf-step determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // co-settling (the HONEST emergent metric, within-band): the fluid POOLS ABOVE the bed by a margin AND the
+    // GR4 bed still holds a repose AND submerged grains sit at/above dry (the GF2 lift survives).
+    {
+        if (!(st.fluidY > st.bedY) || !(st.repose > 0) || !(st.wetY >= st.dryY))
+            return fail("cgf-step: not co-settled (fluidY<=bedY / repose<=0 / wetY<dryY)");
+        std::printf("cgf-step settled: {bedY:%d, fluidY:%d, repose:%d, wetY:%d, dryY:%d}\n",
+                    (int)st.bedY, (int)st.fluidY, (int)st.repose, (int)st.wetY, (int)st.dryY);
+    }
+
+    // no-penetration: the fluid rests ON the bed — the fluid-into-grain penetration after the coupled run is
+    // RELIEVED vs the INITIAL buried state (the fluid seeded interpenetrating the bed). GF3 parts it out.
+    {
+        const cgf::FluidGrainPenetration penInitial = cgf::MeasureFluidGrainPenetration(world);
+        const cgf::FluidGrainPenetration penCoupled = cgf::MeasureFluidGrainPenetration(cpuWorld);
+        if (!(penInitial.summed > 0) || !(penCoupled.summed < penInitial.summed))
+            return fail("cgf-step: fluid did NOT rest on the bed (penCoupled >= penInitial)");
+        std::printf("cgf-step no-penetration: {pen:%lld} (fluid rests on the bed)\n",
+                    (long long)penCoupled.summed);
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the co-settled WET SAND — the tan grain bed (holding its
+    // repose) with the cyan fluid POOLED ON/AROUND it — IDENTICAL to the Vulkan --cgf-step-shot by construction. ---
+    const int kPxPerUnit = 34, kImgMargin = 26;
+    const int kWorldLo = -1, kWorldW = 8, kWorldH = 9;
+    const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kImgMargin + (wx - kWorldLo) * kPxPerUnit;
+        cy = (int)imgH - kImgMargin - (wy - kWorldLo) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.62f, 0.46f, 0.24f}, 1);
+    }
+    for (int i = 0; i < kFluidCount; ++i) {
+        int cx, cy; toPx(cpuWorld.fluid[(size_t)i].pos.x, cpuWorld.fluid[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.18f, 0.58f, 0.95f}, 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgf coupled step (wet sand: fluid pooled on the bed, fluidY %d, bedY %d)\n",
+                outPath, imgW, imgH, (int)st.fluidY, (int)st.bedY);
+    return 0;
+}
+
 // ===== Slice CG2 — Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG showcase (--cgrain-support) ====
 // (the CRUX of FLAGSHIP #12, the FIRST momentum exchange, the CP2 buoyancy twin with contact-support physics).
 // Like --couple-buoyancy / --grain-contact, the CG2 support/drag math is int64 (FxLength/FxNormalize via FxISqrt
@@ -37402,6 +37555,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cgf-displace") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cgf_displace.png";
             try { return RunCgfDisplaceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgf-step <out.png>: render the Deterministic Grain<->Fluid Coupling THE COUPLED STEP showcase
+        // (Slice GF4, the CONVERGENCE — a sand bed + a fluid block co-settle, the CG4 StepCGrain mold with TWO
+        // particle pools). The FL4 density + GR3/GR4 contact/friction + GF2/GF3 exchange math is int64 -> those
+        // shaders are Vulkan-only; on Metal --cgf-step runs the CPU cgf::StepCGFSteps — the EXACT bit-exact
+        // reference the Vulkan --cgf-step-shot GPU==CPU memcmp compares against -> byte-identical to the Vulkan
+        // GPU result BY CONSTRUCTION. The SAME scene (a settled grain bed + a fluid block seeded above it) co-
+        // settles into WET SAND; the four proofs (GPU==CPU bit-exact, determinism, co-settling fluidY>bedY +
+        // repose>0 + wetY>=dryY, no-penetration relieved vs a free-fall control) run on the CPU reference. The
+        // image golden is the integer side-view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/cgf_step.png; two runs DIFF 0.0000. The GF1 cross-query passes (re-run each step)
+        // stay int32 MSL-native. NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgf-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgf_step.png";
+            try { return RunCgfStepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cgrain-support <out.png>: render the Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG
