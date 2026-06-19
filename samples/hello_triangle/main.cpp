@@ -28403,9 +28403,12 @@ int main(int argc, char** argv) {
             auto shadowMap = device->CreateShadowMap(2048);
             device->SetShadowMap(*shadowMap);
 
-            std::vector<uint8_t> checker = MakeCheckerboard();
+            // Ground: a solid DARK WARM wet-sand floor (NOT the shared blue-tinted checkerboard, whose white
+            // checks mirror the blue sky IBL through the porous grain bed and read as an iridescent slab). A
+            // muted brown beach floor lets the warm grain bed + cyan fluid read as the subject. SHOWCASE-LOCAL.
+            const uint8_t groundPx[4] = {120, 82, 50, 255};   // muted warm wet-sand floor
             auto groundTex = device->CreateTexture(
-                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+                {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
             const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
             auto flatNormal = device->CreateTexture(
                 {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
@@ -28519,7 +28522,7 @@ int main(int argc, char** argv) {
                     {
                         float pc[20];
                         for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
-                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;  // fully matte warm floor
                         cmd.PushConstants(pc, sizeof(pc));
                         cmd.BindMaterial(*groundTex, *flatNormal);
                         cmd.BindVertexBuffer(plane.vertices());
@@ -28532,7 +28535,11 @@ int main(int argc, char** argv) {
                         cmd.BindIndexBuffer(sphere.indices());
                         // DRAW 1: the warm SAND grains — the warm albedo texture (per-draw BindMaterial).
                         if (kGrainCount > 0) {
-                            float sandMat[4] = {0.0f, 0.85f, 0.0f, 0.0f};   // metallic 0, rough 0.85 (matte sand)
+                            // metallic 0, roughness 1.0 (FULLY matte sand). At roughness==1 the IBL Fresnel
+                            // rim term collapses to F0 (0.04) — (1-roughness)=0 so the grazing-angle blue-sky
+                            // reflection that made the dense bed read as an iridescent checkerboard vanishes,
+                            // leaving the warm diffuse albedo to dominate (warm matte sand).
+                            float sandMat[4] = {0.0f, 1.0f, 0.0f, 0.0f};
                             cmd.PushConstants(sandMat, sizeof(sandMat));
                             cmd.BindMaterial(*sandTex, *flatNormal);
                             cmd.BindInstanceBuffer(*grainBuffer);
