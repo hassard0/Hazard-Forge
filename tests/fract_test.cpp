@@ -156,6 +156,158 @@ int main() {
               "determinism: two classifies BYTE-IDENTICAL");
     }
 
+    // ================= FR2: SampleCoord round-trips SampleIndex =================
+    {
+        fract::FractField f; f.nx = 7; f.ny = 5; f.nz = 3;
+        bool roundTrip = true;
+        for (int idx = 0; idx < f.sampleCount(); ++idx) {
+            fract::FractCoord c = fract::SampleCoord(f, idx);
+            if (fract::SampleIndex(f, c.x, c.y, c.z) != idx) roundTrip = false;
+            if (c.x < 0 || c.x >= f.nx || c.y < 0 || c.y >= f.ny || c.z < 0 || c.z >= f.nz)
+                roundTrip = false;
+        }
+        check(roundTrip, "SampleCoord round-trips SampleIndex over the whole lattice");
+        fract::FractCoord c0 = fract::SampleCoord(f, 0);
+        check(c0.x == 0 && c0.y == 0 && c0.z == 0, "SampleCoord(0) == origin");
+    }
+
+    // ================= FR2: ISqrt32 floor integer sqrt =================
+    {
+        check(fract::ISqrt32(0) == 0, "ISqrt32(0)==0");
+        check(fract::ISqrt32(1) == 1, "ISqrt32(1)==1");
+        check(fract::ISqrt32(3) == 1, "ISqrt32(3)==1 (floor)");
+        check(fract::ISqrt32(4) == 2, "ISqrt32(4)==2");
+        check(fract::ISqrt32(8) == 2, "ISqrt32(8)==2 (floor)");
+        check(fract::ISqrt32(9) == 3, "ISqrt32(9)==3");
+        check(fract::ISqrt32(3145728) == 1773, "ISqrt32 near the FR1 max squared distance");
+    }
+
+    // ================= FR2: 1-seed field -> 1 fragment, centroid the lattice center =================
+    {
+        fract::FractField f; f.nx = 5; f.ny = 5; f.nz = 5;
+        std::vector<fract::FractSeed> seeds = {{2, 2, 2}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 1, frags);
+        check(frags.fragments.size() == 1, "1-seed: 1 fragment");
+        const auto& fr = frags.fragments[0];
+        // every sample -> cell 0; centroid = mean of [0,4]^3 = (2,2,2).
+        check(fr.cx == 2 && fr.cy == 2 && fr.cz == 2, "1-seed: centroid == lattice center (2,2,2)");
+        check(fr.minx == 0 && fr.miny == 0 && fr.minz == 0, "1-seed: AABB min == (0,0,0)");
+        check(fr.maxx == 4 && fr.maxy == 4 && fr.maxz == 4, "1-seed: AABB max == (4,4,4)");
+        check(fr.volume == (uint32_t)f.sampleCount(), "1-seed: volume == sampleCount (125)");
+        check(fr.cellId == 0u, "1-seed: cellId == 0");
+        check(frags.cellToFragment[0] == 0u, "1-seed: cellToFragment[0] == 0");
+        check(frags.fragmentToCell[0] == 0u, "1-seed: fragmentToCell[0] == 0");
+        // boundRadiusSq = max corner dist² = 2²+2²+2² = 12.
+        check(fr.boundRadiusSq == 12, "1-seed: boundRadiusSq == 12 (corner)");
+        check(fr.boundRadius == fract::ISqrt32(12), "1-seed: boundRadius == ISqrt32(12)");
+        check(fr.invMass == fract::FractInvMass(fr.volume), "1-seed: invMass == kOne/volume");
+    }
+
+    // ================= FR2: 2-seed split -> 2 fragments, complementary volumes summing to N =====
+    {
+        fract::FractField f; f.nx = 10; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {9, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 2, frags);
+        check(frags.fragments.size() == 2, "2-seed: 2 fragments");
+        check(frags.fragments[0].volume + frags.fragments[1].volume == (uint32_t)f.sampleCount(),
+              "2-seed: complementary volumes sum to N");
+        // x in [0,4] -> seed0 (5), x in [5,9] -> seed1 (5); bisector x=4.5 has no integer sample,
+        // x=4 (d=4 vs 5) -> seed0, x=5 (d=5 vs 4) -> seed1.
+        check(frags.fragments[0].volume == 5 && frags.fragments[1].volume == 5,
+              "2-seed: even 5/5 split");
+        check(frags.fragments[0].cellId == 0u && frags.fragments[1].cellId == 1u,
+              "2-seed: fragments ordered by ascending cell index");
+    }
+
+    // ================= FR2: a dominated seed (0 samples) -> NO fragment + sentinel remap =========
+    {
+        // seed 1 sits AT seed 0 but with higher index -> the STRICTLY-less tie-break gives it 0 samples.
+        fract::FractField f; f.nx = 4; f.ny = 4; f.nz = 4;
+        std::vector<fract::FractSeed> seeds = {{1, 1, 1}, {1, 1, 1}, {3, 3, 3}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        auto counts = fract::CellSampleCounts(cells, 3);
+        check(counts[1] == 0u, "dominated: seed 1 owns 0 samples (verify the scene)");
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        check(frags.fragments.size() == 2, "dominated: 2 fragments (seed 1 dropped)");
+        check(frags.cellToFragment[1] == fract::kNoFragment,
+              "dominated: cellToFragment[1] == kNoFragment sentinel");
+        check(frags.cellToFragment[0] == 0u && frags.cellToFragment[2] == 1u,
+              "dominated: surviving cells compacted to ascending fragment indices 0,1");
+        check(frags.fragments[0].cellId == 0u && frags.fragments[1].cellId == 2u,
+              "dominated: fragmentToCell skips the empty cell");
+        // CSR sentinel == sampleCount.
+        check(frags.fragStart[3] == (uint32_t)f.sampleCount(), "dominated: CSR sentinel == sampleCount");
+    }
+
+    // ================= FR2: hand-computed centroid/AABB on a known small field =================
+    {
+        // A 3x1x1 field with seeds so cell 0 = {x=0,1}, cell 1 = {x=2}. Centroid of {0,1} = 0 (trunc),
+        // of {2} = 2.
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 2, frags);
+        check(frags.fragments.size() == 2, "hand: 2 fragments");
+        // x=0->seed0, x=1->seed0 (d=1 vs 1, tie -> lower idx 0), x=2->seed1.
+        check(frags.fragments[0].volume == 2 && frags.fragments[1].volume == 1, "hand: volumes 2,1");
+        check(frags.fragments[0].cx == 0, "hand: centroid of {0,1} == 0 (truncating divide)");
+        check(frags.fragments[0].minx == 0 && frags.fragments[0].maxx == 1, "hand: AABB x [0,1]");
+        check(frags.fragments[1].cx == 2, "hand: centroid of {2} == 2");
+        // boundRadiusSq of {0,1} about centroid 0: max(0, 1) = 1.
+        check(frags.fragments[0].boundRadiusSq == 1, "hand: boundRadiusSq of {0,1} == 1");
+        check(frags.fragments[1].boundRadiusSq == 0, "hand: singleton boundRadiusSq == 0");
+    }
+
+    // ================= FR2: Svol == N + every member inside its AABB+sphere (multi-seed) =========
+    {
+        fract::FractField f; f.nx = 16; f.ny = 12; f.nz = 8;
+        std::vector<fract::FractSeed> seeds = {
+            {2, 2, 1}, {13, 3, 2}, {3, 9, 5}, {12, 10, 6}, {8, 6, 3},
+            {5, 1, 6}, {10, 7, 1}, {1, 5, 3},
+        };
+        const int M = (int)seeds.size();
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+
+        uint64_t sumVol = 0;
+        for (const auto& fr : frags.fragments) sumVol += fr.volume;
+        check(sumVol == (uint64_t)f.sampleCount(), "multi: Svol == sampleCount (mass partition)");
+
+        bool allInside = true; int membersChecked = 0;
+        for (size_t fi = 0; fi < frags.fragments.size(); ++fi) {
+            const auto& fr = frags.fragments[fi];
+            const uint32_t cell = frags.fragmentToCell[fi];
+            for (uint32_t k = frags.fragStart[cell]; k < frags.fragStart[cell + 1u]; ++k) {
+                fract::FractCoord p = fract::SampleCoord(f, (int)frags.fragSamples[k]);
+                if (p.x < fr.minx || p.x > fr.maxx || p.y < fr.miny || p.y > fr.maxy ||
+                    p.z < fr.minz || p.z > fr.maxz) allInside = false;
+                const int dx = p.x - fr.cx, dy = p.y - fr.cy, dz = p.z - fr.cz;
+                if (dx * dx + dy * dy + dz * dz > fr.boundRadiusSq) allInside = false;
+                ++membersChecked;
+            }
+        }
+        check(allInside, "multi: every member inside its fragment AABB + bounding sphere");
+        check(membersChecked == f.sampleCount(), "multi: CSR covers every sample exactly once");
+    }
+
+    // ================= FR2: ExtractFragments determinism (two runs byte-identical) =================
+    {
+        fract::FractField f; f.nx = 12; f.ny = 9; f.nz = 6;
+        std::vector<fract::FractSeed> seeds = {{1, 1, 1}, {10, 7, 4}, {5, 4, 2}, {2, 8, 5}, {9, 2, 1}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments a, b;
+        fract::ExtractFragments(f, cells, 5, a);
+        fract::ExtractFragments(f, cells, 5, b);
+        bool same = a.fragments.size() == b.fragments.size()
+            && a.fragStart == b.fragStart && a.fragSamples == b.fragSamples
+            && a.cellToFragment == b.cellToFragment && a.fragmentToCell == b.fragmentToCell
+            && (a.fragments.empty() || std::memcmp(a.fragments.data(), b.fragments.data(),
+                    a.fragments.size() * sizeof(fract::FractFragment)) == 0);
+        check(same, "FR2 determinism: two ExtractFragments BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
     else std::printf("fract_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;
