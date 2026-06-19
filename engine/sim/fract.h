@@ -130,4 +130,194 @@ inline int DistinctCellCount(const std::vector<uint32_t>& counts) {
     return distinct;
 }
 
+// ====================================================================================================
+// Slice FR2 — FRAGMENT EXTRACTION (per-cell mass properties). Additive over FR1 (FR1 code above is
+// byte-unchanged). Turns each NON-EMPTY FR1 Voronoi cell into a FRAGMENT RECORD — integer centroid,
+// AABB, bounding-sphere radius², volume, invMass — via the GR2/FL2 count->scan->emit CSR compaction
+// (grain.h:301 BuildGrainCellTable) over FR1's cellId[] array (cells == seedCount, the sample->cell map
+// is cells.cellId[sample] DIRECTLY, no CellOf recompute), then ONE fragment per non-empty cell reducing
+// its CSR slice in ASCENDING sample-index order. The output is a COMPACT array of F <= seedCount
+// fragments ordered by ASCENDING cell index (the CL2/MC3 stream-compaction) + a cellToFragment[] remap
+// (cell -> fragment index, or kNoFragment for an empty/dominated cell).
+//
+// THE CROSS-BACKEND CRUX — PURE INT32 -> MSL-NATIVE. Centroid/AABB/boundRadiusSq/volume are all small
+// integers: lattice coords < ~1024, squared distances 3*1023² ~ 3.1M fit int32 with headroom (the FR1
+// bound). NO int64, NO float, NO Q16.16 world scaling at FR2 -> the FR2 shaders MSL-generate natively (a
+// TRUE GPU pass on both Vulkan AND Metal, the strict zero-differing-pixel bar). World-unit Q16.16
+// fragment positions (for FR4's fpx::FxBody spawn) are DEFERRED to FR4 (worldPos = latticeCoord *
+// worldCellSize); FR2 stays integer lattice-space. The fixed ascending reduction order makes the integer
+// sums/min/max bit-identical CPU<->GPU<->cross-vendor; each fragment writes ONLY its own record ->
+// per-fragment disjoint, race-free, NO atomics in the reduction.
+
+// kNoFragment: the cellToFragment[] sentinel for an empty/dominated cell (no fragment emitted for it).
+inline constexpr uint32_t kNoFragment = 0xFFFFFFFFu;
+
+// SampleCoord(field, idx): the (x,y,z) lattice coord of flat sample index `idx` — the INVERSE of
+// SampleIndex (x = idx % nx; y = (idx / nx) % ny; z = idx / (nx*ny)). Pure int32 helper. Round-trips
+// SampleIndex (SampleIndex(f, SampleCoord(f, i)...) == i for i in [0, sampleCount)).
+struct FractCoord { int x, y, z; };
+inline FractCoord SampleCoord(const FractField& f, int idx) {
+    FractCoord c;
+    c.x =  idx % f.nx;
+    c.y = (idx / f.nx) % f.ny;
+    c.z =  idx / (f.nx * f.ny);
+    return c;
+}
+
+// ISqrt32(v): deterministic integer floor(sqrt(v)) for a non-negative int32 (pure int32 binary
+// digit-by-digit — identical on every compiler/vendor, NO <cmath>, NO int64). The int32 twin of
+// render/mc.h::ISqrt; used ONCE per fragment for boundRadius = ISqrt32(boundRadiusSq). boundRadiusSq
+// (< ~3.1M) fits int32, so the int32 form is exact and MSL-native.
+inline int32_t ISqrt32(int32_t v) {
+    if (v <= 0) return 0;
+    int32_t bit = (int32_t)1 << 30;           // highest even power-of-4 within int32
+    while (bit > v) bit >>= 2;
+    int32_t res = 0;
+    while (bit != 0) {
+        if (v >= res + bit) { v -= res + bit; res = (res >> 1) + bit; }
+        else { res >>= 1; }
+        bit >>= 2;
+    }
+    return res;
+}
+
+// FractInvMass(volume): the per-fragment inverse mass, a PURE-INTEGER Q16.16 reciprocal of the integer
+// voxel count — invMass = kOne / volume (an integer truncating divide; kOne=65536, volume>=1, so this is
+// pure int32, NO fxdiv/int64). Mass is proportional to the voxel count (uniform density), so invMass is a
+// deterministic integer function of volume. volume==0 (never emitted — empty cells produce no fragment)
+// -> 0 (a static/immovable guard). Documented derivation: invMass = 1/mass with mass == volume voxels.
+inline fx FractInvMass(uint32_t volume) {
+    return volume > 0u ? (fx)(fpx::kOne / (int32_t)volume) : (fx)0;
+}
+
+// ----- The per-fragment record (integer lattice-space; FR4 maps to world-unit fpx::FxBody) ----------
+// Every field is pure-integer-derivable from the cell's member samples (the documented FR2 claim — a
+// centroid + AABB + bounding sphere, NOT a triangulated hull; the sphere-bound fragment is the honest
+// first cut, the FPX3-sphere-contact reuse). cellId is the source FR1 seed index; volume is the integer
+// voxel count; invMass = FractInvMass(volume).
+struct FractFragment {
+    int32_t cx = 0, cy = 0, cz = 0;                       // integer centroid (Sum lattice-pos / count)
+    int32_t minx = 0, miny = 0, minz = 0;                 // AABB min (per-axis member min)
+    int32_t maxx = 0, maxy = 0, maxz = 0;                 // AABB max (per-axis member max)
+    int32_t boundRadiusSq = 0;                            // max member squared-dist to centroid (int32)
+    int32_t boundRadius = 0;                              // ISqrt32(boundRadiusSq), once per fragment
+    uint32_t volume = 0;                                  // integer voxel count (== member count)
+    uint32_t cellId = 0;                                  // the source FR1 seed index this fragment owns
+    fx invMass = 0;                                       // FractInvMass(volume) — Q16.16, pure-integer
+};
+
+// ----- The CSR + compact fragment array + remap (the ExtractFragments output) ----------------------
+// fragStart[]/fragSamples[] are the GR2 CSR over cellId (one ROW per CELL, cells == seedCount): cell c's
+// member sample indices are fragSamples[fragStart[c] .. fragStart[c+1]), ASCENDING sample index.
+// fragments[] is the COMPACT array of F <= seedCount fragments, one per NON-EMPTY cell, ordered by
+// ASCENDING cell index. cellToFragment[c] is the cell->fragment remap (or kNoFragment if cell c is
+// empty). fragmentToCell[f] is the inverse (fragment f owns cell fragmentToCell[f]) — the per-fragment
+// reduce reads it to find its CSR slice.
+struct FractFragments {
+    std::vector<uint32_t> fragStart;        // seedCount+1 exclusive prefix-sum (CSR row pointers)
+    std::vector<uint32_t> fragSamples;      // sample indices grouped by cell (size sampleCount)
+    std::vector<uint32_t> cellToFragment;   // seedCount entries; cell -> fragment idx or kNoFragment
+    std::vector<uint32_t> fragmentToCell;   // F entries; fragment -> its source cell index
+    std::vector<FractFragment> fragments;   // F <= seedCount compact fragment records (ascending cell)
+};
+
+// ----- ExtractFragments: count->scan->emit CSR over cellId + per-fragment reduction (the CPU reference)
+// The byte-for-byte reference the GPU FR2 passes memcmp against (the CSR + the remap + the fragment
+// array). Mirrors grain.h::BuildGrainCellTable (count->scan->emit) with cells == seedCount and the
+// sample->cell map = cells.cellId[sample] directly:
+//   (1) COUNT  per-cell sample count (ascending sample loop).
+//   (2) SCAN   exclusive prefix-sum -> fragStart[seedCount+1] (sentinel == sampleCount); SAME pass
+//              assigns each NON-EMPTY cell its compact fragment index (ascending cell) -> cellToFragment
+//              + fragmentToCell.
+//   (3) EMIT   single-thread ASCENDING-sample scatter each sample into its cell's slice (the GR2
+//              within-cell ascending order — deterministic).
+//   (4) REDUCE one fragment per non-empty cell: walk its CSR slice [fragStart[c], fragStart[c+1]) in
+//              ascending sample order -> centroid = Sum pos / count (per-axis truncating divide), AABB =
+//              per-axis min/max, boundRadiusSq = max (pos-centroid)·(pos-centroid), volume = count,
+//              boundRadius = ISqrt32(boundRadiusSq), invMass = FractInvMass(volume). Each fragment writes
+//              ONLY its own record -> disjoint, race-free (the GPU one-thread-per-fragment mirror).
+inline void ExtractFragments(const FractField& field, const FractCells& cells, int seedCount,
+                             FractFragments& out) {
+    const int sampleCount = field.sampleCount();
+    const uint32_t cellsN = (uint32_t)(seedCount > 0 ? seedCount : 0);
+
+    // (1) COUNT per-cell sample count.
+    std::vector<uint32_t> counts((size_t)cellsN, 0u);
+    for (int s = 0; s < sampleCount; ++s) {
+        const uint32_t c = cells.cellId[(size_t)s];
+        if (c < cellsN) ++counts[(size_t)c];
+    }
+
+    // (2) SCAN exclusive prefix-sum -> fragStart (cellsN+1, sentinel == sampleCount); assign compact
+    //     fragment indices to non-empty cells in ascending cell order.
+    out.fragStart.assign((size_t)cellsN + 1u, 0u);
+    out.cellToFragment.assign((size_t)cellsN, kNoFragment);
+    out.fragmentToCell.clear();
+    uint32_t running = 0u;
+    uint32_t fragCount = 0u;
+    for (uint32_t c = 0; c < cellsN; ++c) {
+        out.fragStart[c] = running;
+        if (counts[(size_t)c] > 0u) {
+            out.cellToFragment[(size_t)c] = fragCount;
+            out.fragmentToCell.push_back(c);
+            ++fragCount;
+        }
+        running += counts[(size_t)c];
+    }
+    out.fragStart[cellsN] = running;   // sentinel: == sampleCount (every sample owned by exactly one cell)
+
+    // (3) EMIT ascending-sample scatter into each cell's slice (the GR2 single-thread ascending cursor).
+    out.fragSamples.assign((size_t)sampleCount, 0u);
+    std::vector<uint32_t> cursor((size_t)cellsN, 0u);
+    for (int s = 0; s < sampleCount; ++s) {
+        const uint32_t c = cells.cellId[(size_t)s];
+        if (c >= cellsN) continue;
+        out.fragSamples[(size_t)(out.fragStart[c] + cursor[(size_t)c])] = (uint32_t)s;
+        ++cursor[(size_t)c];
+    }
+
+    // (4) REDUCE one fragment per non-empty cell over its CSR slice (ascending sample order).
+    out.fragments.assign((size_t)fragCount, FractFragment{});
+    for (uint32_t f = 0; f < fragCount; ++f) {
+        const uint32_t c = out.fragmentToCell[(size_t)f];
+        const uint32_t begin = out.fragStart[(size_t)c];
+        const uint32_t end   = out.fragStart[(size_t)c + 1u];
+        const uint32_t count = end - begin;
+
+        // Pass A: centroid (sum / count) + AABB.
+        int32_t sx = 0, sy = 0, sz = 0;
+        int32_t minx = INT32_MAX, miny = INT32_MAX, minz = INT32_MAX;
+        int32_t maxx = INT32_MIN, maxy = INT32_MIN, maxz = INT32_MIN;
+        for (uint32_t k = begin; k < end; ++k) {
+            const FractCoord p = SampleCoord(field, (int)out.fragSamples[(size_t)k]);
+            sx += p.x; sy += p.y; sz += p.z;
+            if (p.x < minx) minx = p.x; if (p.x > maxx) maxx = p.x;
+            if (p.y < miny) miny = p.y; if (p.y > maxy) maxy = p.y;
+            if (p.z < minz) minz = p.z; if (p.z > maxz) maxz = p.z;
+        }
+        const int32_t cx = sx / (int32_t)count;   // truncating integer divide (deterministic)
+        const int32_t cy = sy / (int32_t)count;
+        const int32_t cz = sz / (int32_t)count;
+
+        // Pass B: boundRadiusSq = max member squared-dist to centroid.
+        int32_t brSq = 0;
+        for (uint32_t k = begin; k < end; ++k) {
+            const FractCoord p = SampleCoord(field, (int)out.fragSamples[(size_t)k]);
+            const int32_t dx = p.x - cx, dy = p.y - cy, dz = p.z - cz;
+            const int32_t d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 > brSq) brSq = d2;
+        }
+
+        FractFragment& fr = out.fragments[(size_t)f];
+        fr.cx = cx; fr.cy = cy; fr.cz = cz;
+        fr.minx = minx; fr.miny = miny; fr.minz = minz;
+        fr.maxx = maxx; fr.maxy = maxy; fr.maxz = maxz;
+        fr.boundRadiusSq = brSq;
+        fr.boundRadius = ISqrt32(brSq);
+        fr.volume = count;
+        fr.cellId = c;
+        fr.invMass = FractInvMass(count);
+    }
+}
+
 }  // namespace hf::sim::fract
