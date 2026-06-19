@@ -692,5 +692,167 @@ inline VehicleDriveState MeasureVehicleDrive(const Vehicle& v, const VehicleConf
     return st;
 }
 
+// ====================================================================================================
+// Slice VH4 — WHEEL-GROUND TRACTION / FRICTION (the NEW-PHYSICS BEAT of FLAGSHIP #16: DETERMINISTIC
+// VEHICLE PHYSICS, hf::sim::vehicle). VH3 drove the car forward with an honest velocity SEED (the
+// integrate-path throttle) because fpx sphere contacts have no inertia tensor — a ground contact can
+// neither spin a wheel nor be spun BY a wheel, so wheel-roll-drives-chassis is NOT emergent. VH4 replaces
+// that seed with a REAL deterministic TRACTION model: at each grounded wheel a Coulomb-friction-cone-
+// clamped tangential ground force converts the wheel's spin (from kCmdDriveTorque) into chassis forward
+// motion — "the car actually drives". INTEGER-bit-exact. NO new shader — traction is a pure-integer HOST
+// pass applied identically on the GPU and CPU paths (the VH3 command-apply precedent), folded into a NEW
+// additive tick StepVehicleDriven (VH3's StepVehicle stays byte-FROZEN — VH4 is APPEND-ONLY). ADDITIVE:
+// VH1/VH2/VH3 byte-unchanged. The GR4 dry-friction / joint.h SolveAngularLimit cone-clamp idiom: an
+// integer min/max clamp of a slip-proportional correction to the friction cone ±kMuMax.
+//
+// THE PER-WHEEL TRACTION (ApplyWheelTraction, FIXED wheel-index order, Gauss-Seidel — chassis.vel updated
+// in place + read by later wheels; deterministic because the order is FIXED):
+//   For each WHEEL that is GROUNDED (its bottom wheel.pos.y - cfg.wheelRadius <= cfg.groundY + kContactEps):
+//   1. fwd = FxNormalize(cross(groundNormal=(0,kOne,0), axleWorld)) where axleWorld = the wheel spin axle
+//      (the hinge's CURRENT axis — STEERED front wheels push along their re-aimed heading; the hinge axis
+//      lives on the chassis in VH2's body-local-at-identity frame, == the world axle). |fwd|==0 -> skip.
+//   2. vTarget = fxmul(spinAboutAxle, cfg.wheelRadius) where spinAboutAxle = FxDot(wheel.angVel, axleWorld)
+//      — the wheel's contact-patch surface speed (spin × radius), the no-slip ground speed.
+//   3. slip = vTarget - FxDot(chassis.vel, fwd) (target minus the chassis's current forward ground speed).
+//   4. j = clamp(fxmul(slip, kGripK), -kMuMax, +kMuMax) — a stiffness-scaled correction toward no-slip,
+//      CLAMPED to the friction cone (the Coulomb limit: large slip saturates). Apply chassis.vel +=
+//      FxScale(fwd, fxmul(j, kChassisShare)) (the chassis accelerates toward rolling) AND bleed the wheel
+//      spin by FxScale(axleWorld, -fxmul(j, kWheelBleed)) (momentum leaves the spin as the tyre grips).
+//   Pure integer (cross/FxDot/FxNormalize/fxmul/FxScale + integer clamp), NO transcendentals.
+//
+// StepVehicleDriven = VH3 StepVehicle's EXACT phase order (apply tick commands -> PHASE A spring -> PHASE B
+// hinge) + NEW PHASE C ApplyWheelTraction (between hinge and contacts, after the wheels' grounded state is
+// set by integrate+constraints, before the contact solve) + PHASE D fpx contacts. Keep it in LOCKSTEP with
+// StepVehicle (a comment cross-refs it) — only PHASE C is inserted.
+//
+// HONEST CAVEAT (the GR4/JT2 caveat): traction is a deterministic tangential PROXY (a slip-proportional
+// cone-clamped force), NOT analytic tyre mechanics (no Pacejka slip curves, no lateral/longitudinal slip
+// separation, no load-dependent grip, no differential/ABS/rolling-resistance/aero). The chassis has no
+// inertia tensor (fpx limitation) so the car does not pitch/roll under traction — planar drive only. The
+// headline is DETERMINISM + cross-platform bit-identity + "it drives from spin, not a seed".
+
+// ----- VH4 host-fixed Q16.16 traction constants (documented; the GR4/cone-clamp tuning) ----------------
+// kContactEps : the ground-contact band — a wheel is "grounded" if its bottom is within this of groundY
+//               (kOne/16 = 0.0625 world units — generous enough to catch the settled-suspension wheel,
+//               tight enough not to engage an airborne wheel).
+// kGripK      : the slip->force stiffness (the per-tick correction fraction toward no-slip; kOne/4 = 0.25
+//               — a soft correction so the car accelerates over several ticks, not a single jolt).
+// kMuMax      : the friction cone (the max tangential delta-velocity per tick a tyre can transmit; kOne/8
+//               = 0.125 world units/s — the Coulomb limit that bounds the traction; a kMuMax==0 control
+//               leaves the car idle DESPITE spinning wheels — the proof the cone, not a seed, drives it).
+// kChassisShare : the fraction of the cone-clamped impulse the CHASSIS gains (3*kOne/4 = 0.75 — most of
+//               the gripped force pushes the body forward).
+// kWheelBleed : the fraction of the impulse bled OFF the wheel spin as the tyre grips (kOne/4 = 0.25 —
+//               momentum leaves the spin into forward motion; a freely-spinning driven wheel loses spin
+//               as it grips, the chassis gains speed — the momentum-transfer signal).
+inline constexpr fx kContactEps   = kOne / 16;       // 0.0625 ground-contact band
+inline constexpr fx kGripK        = kOne / 4;        // 0.25 slip->force stiffness
+inline constexpr fx kMuMax        = kOne / 8;        // 0.125 friction-cone limit (the Coulomb cap)
+inline constexpr fx kChassisShare = (fx)(3 * (int)kOne / 4);  // 0.75 chassis impulse share
+inline constexpr fx kWheelBleed   = kOne / 4;        // 0.25 wheel-spin bleed fraction
+
+// ----- FxCrossLocal: the Q16.16 cross product a×b (inline — fpx.h has none; the FxRotate idiom) ---------
+// Each term is an int64 fxmul difference (the swraster/mc int64 discipline). NOT added to fpx.h (frozen).
+inline FxVec3 FxCrossLocal(const FxVec3& a, const FxVec3& b) {
+    return FxVec3{
+        fxmul(a.y, b.z) - fxmul(a.z, b.y),
+        fxmul(a.z, b.x) - fxmul(a.x, b.z),
+        fxmul(a.x, b.y) - fxmul(a.y, b.x),
+    };
+}
+
+// ----- FxClampCone: the integer Coulomb-cone clamp of a scalar to [-lim, +lim] (the GR4/JT2 idiom) ------
+inline fx FxClampCone(fx v, fx lim) {
+    if (v >  lim) return  lim;
+    if (v < -lim) return -lim;
+    return v;
+}
+
+// ----- ApplyWheelTraction: the per-wheel Coulomb-cone tangential ground-traction pass (the HOST beat) ---
+// Runs the per-wheel traction documented above over all four wheels in FIXED index order (Gauss-Seidel:
+// the chassis vel is updated in place, read by later wheels — deterministic because the order is fixed).
+// Pure integer, fixed op order -> two-run bit-identical AND identical on the GPU host path (the VH3
+// command-apply precedent). The chassis is world.bodies[chassisIndex]; the wheels are world.bodies[
+// wheelIndex[k]] with the matching hinge axle hinges[k].axis (the steered front wheels' re-aimed heading).
+inline void ApplyWheelTraction(Vehicle& v, const VehicleConfig& cfg) {
+    FxWorld& world = v.world;
+    if (v.chassisIndex >= (uint32_t)world.bodies.size()) return;
+    FxBody& chassis = world.bodies[(size_t)v.chassisIndex];
+    const FxVec3 groundNormal{0, kOne, 0};
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t wi = v.wheelIndex[k];
+        if (wi >= (uint32_t)world.bodies.size()) continue;          // out-of-range -> skip
+        if ((size_t)k >= v.hinges.size()) continue;                // no axle -> skip
+        FxBody& wheel = world.bodies[(size_t)wi];
+        // GROUNDED test: the wheel bottom within the contact band of the ground.
+        const fx bottom = wheel.pos.y - cfg.wheelRadius;
+        if (bottom > cfg.groundY + kContactEps) continue;          // airborne -> no traction
+        // (1) the rolling-forward direction = ground-up × axle (the hinge's CURRENT axis -> world).
+        const FxVec3 axleWorld = v.hinges[(size_t)k].axis;         // VH2 body-local-at-identity == world axle
+        const FxVec3 fwdRaw = FxCrossLocal(groundNormal, axleWorld);
+        if (FxLength(fwdRaw) == 0) continue;                       // degenerate (axle ∥ up) -> skip
+        const FxVec3 fwd = FxNormalize(fwdRaw);
+        // (2) the no-slip target ground speed = (spin about the axle) × wheelRadius.
+        const fx spinAboutAxle = FxDot(wheel.angVel, axleWorld);
+        const fx vTarget = fxmul(spinAboutAxle, cfg.wheelRadius);
+        // (3) the slip = target minus the chassis's current forward ground speed.
+        const fx slip = vTarget - FxDot(chassis.vel, fwd);
+        // (4) the cone-clamped traction impulse + the chassis accel + the wheel-spin bleed.
+        const fx j = FxClampCone(fxmul(slip, kGripK), kMuMax);
+        chassis.vel = FxAdd(chassis.vel, FxScale(fwd, fxmul(j, kChassisShare)));
+        // bleed the wheel spin along the axle (momentum leaves the spin as the tyre grips).
+        wheel.angVel = FxSub(wheel.angVel, FxScale(axleWorld, fxmul(j, kWheelBleed)));
+    }
+}
+
+// ----- StepVehicleDriven: ONE traction-driven vehicle tick (VH3 StepVehicle + PHASE C ApplyWheelTraction)
+// CROSS-REF: this is vehicle::StepVehicle (above) with ONE pass inserted — PHASE C ApplyWheelTraction
+// between PHASE B (hinge) and PHASE D (contacts). KEEP THESE TWO IN LOCKSTEP: the phase order + the
+// integrate calls (PHASE A integrate at dt, PHASE B integrate at dt=0) MUST match StepVehicle byte-for-byte
+// so the GPU showcase's two-shader composition (vehicle_spring_solve + joint_angular_solve) stays bit-exact
+// against this CPU reference; PHASE C is a pure HOST velocity adjustment applied between the GPU constraint
+// dispatches and the GPU contact dispatch (the VH3 command-apply seam). Pure integer, fixed op order ->
+// two-run bit-identical AND bit-exact GPU==CPU.
+inline void StepVehicleDriven(Vehicle& v, const VehicleConfig& cfg, const std::vector<FxCommand>& commands,
+                              uint32_t tick, fx dt, int iters, int solveIters) {
+    FxWorld& world = v.world;
+    const size_t n = world.bodies.size();
+    // (0) apply this tick's commands in ARRAY ORDER (deterministic input-order contract).
+    for (const FxCommand& c : commands)
+        if (c.tick == tick) ApplyVehicleCommand(v, cfg, c);
+    // PHASE A — the spring phase (== vehicle_spring_solve.comp, SENTINEL groundY so no shader floor clamp).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, dt);
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < v.springs.size(); ++e)
+            SolveSpringJoint(world, v.springs[e]);
+    // PHASE B — the hinge phase (== joint_angular_solve.comp, dt=0). The dt=0 IntegrateBodyFull mirrors the
+    // angular shader's per-step integrate (orientation FxQuatNormalize runs; translation is a no-op).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, /*dt=*/0);
+    for (int it = 0; it < iters; ++it)
+        for (size_t e = 0; e < v.hinges.size(); ++e)
+            SolveAngularLimit(world, v.hinges[e]);
+    // PHASE C — THE VH4 BEAT: the Coulomb-cone wheel-ground traction (a pure HOST velocity adjustment, the
+    // VH3 command-apply seam; applied after the wheels' grounded state is set, before the contact solve).
+    ApplyWheelTraction(v, cfg);
+    // PHASE D — FPX2 broadphase ONCE + FPX3 ground + sphere contacts (dt=0 -> no re-integrate). VERBATIM fpx.
+    std::vector<uint32_t> perBodyOffset;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, perBodyOffset, pairs);
+    fpx::StepWorld(world, std::span<const fpx::FxPair>(pairs), /*dt=*/0, solveIters);
+}
+
+// ----- StepVehicleDrivenSteps: run K traction-driven vehicle ticks 0..K-1 (the showcase / GPU driver) ---
+// Each tick applies its OWN commands (cmd.tick == the tick index). The GPU driver reproduces this with the
+// EXISTING shaders in the locked order + the host PHASE-C traction; the CPU reference here is the exact
+// byte-for-byte target.
+inline void StepVehicleDrivenSteps(Vehicle& v, const VehicleConfig& cfg,
+                                   const std::vector<FxCommand>& commands, fx dt, int ticks, int iters,
+                                   int solveIters) {
+    for (int t = 0; t < ticks; ++t)
+        StepVehicleDriven(v, cfg, commands, (uint32_t)t, dt, iters, solveIters);
+}
+
 }  // namespace vehicle
 }  // namespace hf::sim

@@ -571,6 +571,153 @@ int main() {
               "StepVehicle contacts: residual overlaps within band (the car non-interpenetrating)");
     }
 
+    // ====================================================================================================
+    // Slice VH4 — WHEEL-GROUND TRACTION / FRICTION (ApplyWheelTraction / StepVehicleDriven /
+    // StepVehicleDrivenSteps). The car drives from wheel SPIN via a Coulomb-cone tangential ground force —
+    // NOT a velocity seed. Pure CPU; ASan-eligible.
+
+    // ================= ApplyWheelTraction: a grounded spinning wheel accelerates the chassis along fwd ===
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        // Settle the rig so the wheels are grounded (their bottoms within kContactEps of groundY).
+        const vehicle::fx dt = vehicle::kOne / 60;
+        vehicle::StepVehicleRigSteps(veh, dt, 16, 200);
+        // Spin a rear wheel about its axle (the +Z lateral spin axis -> a +X rolling direction).
+        const fpx::FxVec3 chassisVel0 = veh.world.bodies[veh.chassisIndex].vel;
+        veh.world.bodies[veh.wheelIndex[2]].angVel =
+            fpx::FxVec3{0, 0, 4 * (int)vehicle::kOne};   // spin about +Z axle
+        veh.world.bodies[veh.wheelIndex[3]].angVel =
+            fpx::FxVec3{0, 0, 4 * (int)vehicle::kOne};
+        vehicle::ApplyWheelTraction(veh, cfg);
+        const fpx::FxVec3 chassisVel1 = veh.world.bodies[veh.chassisIndex].vel;
+        // The chassis gained forward (X) velocity from the gripped spin (fwd = up × Z-axle = +X).
+        check(chassisVel1.x > chassisVel0.x,
+              "ApplyWheelTraction: a grounded spinning wheel accelerated the chassis forward (+X)");
+        // The wheel spin was bled (the tyre gripped — momentum left the spin).
+        check(veh.world.bodies[veh.wheelIndex[2]].angVel.z < 4 * (int)vehicle::kOne,
+              "ApplyWheelTraction: the gripped wheel's spin was bled toward no-slip");
+    }
+
+    // ================= ApplyWheelTraction: a NON-grounded wheel contributes no traction =================
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        // Lift the whole car well above the ground so NO wheel is grounded.
+        const vehicle::fx lift = 10 * (int)vehicle::kOne;
+        for (auto& b : veh.world.bodies) b.pos.y += lift;
+        // Spin all wheels.
+        for (int k = 0; k < 4; ++k)
+            veh.world.bodies[veh.wheelIndex[k]].angVel = fpx::FxVec3{0, 0, 4 * (int)vehicle::kOne};
+        const fpx::FxVec3 chassisVel0 = veh.world.bodies[veh.chassisIndex].vel;
+        vehicle::ApplyWheelTraction(veh, cfg);
+        const fpx::FxVec3 chassisVel1 = veh.world.bodies[veh.chassisIndex].vel;
+        check(chassisVel1.x == chassisVel0.x && chassisVel1.y == chassisVel0.y &&
+              chassisVel1.z == chassisVel0.z,
+              "ApplyWheelTraction: airborne wheels contribute NO traction (chassis vel unchanged)");
+    }
+
+    // ================= ApplyWheelTraction: kMuMax==0 -> zero chassis acceleration (cone saturates) =======
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        const vehicle::fx dt = vehicle::kOne / 60;
+        vehicle::StepVehicleRigSteps(veh, dt, 16, 200);
+        // Isolate ONE grounded driven wheel (lift the other three) so the chassis gain is bounded by a
+        // SINGLE friction cone. The friction-cone proof: an over-spun wheel's per-tick chassis gain
+        // saturates at kMuMax * kChassisShare, NOT the raw slip*kGripK (which would be enormous). The
+        // PRIMARY no-grip proof is the showcase's kMuMax==0 path; here we assert the saturation bound.
+        for (int k = 1; k < 4; ++k) veh.world.bodies[veh.wheelIndex[k]].pos.y += 10 * (int)vehicle::kOne;
+        veh.world.bodies[veh.chassisIndex].vel = fpx::FxVec3{0, 0, 0};
+        veh.world.bodies[veh.wheelIndex[0]].angVel = fpx::FxVec3{0, 0, 1000 * (int)vehicle::kOne};
+        vehicle::ApplyWheelTraction(veh, cfg);
+        const vehicle::fx gain = veh.world.bodies[veh.chassisIndex].vel.x;
+        // The single grounded wheel's huge slip clamps to +kMuMax -> chassis gains kMuMax*kChassisShare.
+        const vehicle::fx perWheelCap = vehicle::fxmul(vehicle::kMuMax, vehicle::kChassisShare);
+        check(gain > 0 && gain <= perWheelCap + 1,
+              "ApplyWheelTraction: a huge over-spin SATURATES to the friction cone (bounded chassis gain)");
+    }
+
+    // ================= ApplyWheelTraction: a steered front wheel pushes along its re-aimed heading ========
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        const vehicle::fx dt = vehicle::kOne / 60;
+        vehicle::StepVehicleRigSteps(veh, dt, 16, 200);
+        // Steer the front-right hinge (index 0) so its axle re-aims -> fwd gains a Z component.
+        vehicle::ApplyVehicleCommand(veh, cfg, steerCmd(0, 0u, vehicle::kOne / 2));  // ~0.5 rad
+        // Zero the chassis vel + spin ONLY the steered front wheel.
+        veh.world.bodies[veh.chassisIndex].vel = fpx::FxVec3{0, 0, 0};
+        veh.world.bodies[veh.wheelIndex[0]].angVel = fpx::FxVec3{0, 0, 4 * (int)vehicle::kOne};
+        // Make ONLY wheel 0 grounded (lift the others so they don't contribute) to isolate the heading.
+        for (int k = 1; k < 4; ++k) veh.world.bodies[veh.wheelIndex[k]].pos.y += 10 * (int)vehicle::kOne;
+        vehicle::ApplyWheelTraction(veh, cfg);
+        const fpx::FxVec3 cv = veh.world.bodies[veh.chassisIndex].vel;
+        // The re-aimed axle (now with an X component) gives fwd = up × axle a LATERAL (Z) component, so the
+        // chassis gains a Z component it would NOT have at the rest heading (fwd would be pure +X).
+        check(fxabs(cv.z) > 0,
+              "ApplyWheelTraction: a steered front wheel pushes along its re-aimed heading (lateral gain)");
+    }
+
+    // ================= StepVehicleDriven: a drive stream with NO seed moves the chassis forward ==========
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        const vehicle::fx dt = vehicle::kOne / 60;
+        const int kIters = 16, kSolveIters = 8, kTicks = 240;
+        const vehicle::fx startX = veh.world.bodies[veh.chassisIndex].pos.x;
+        const std::vector<uint32_t> driven = {veh.wheelIndex[2], veh.wheelIndex[3]};
+        // Spin BOTH rear wheels every tick — NO chassis velocity seed (the VH3 seed is GONE; forward must
+        // come from TRACTION).
+        std::vector<vehicle::FxCommand> stream;
+        for (int t = 0; t < kTicks; ++t) {
+            stream.push_back(driveCmd((uint32_t)t, veh.wheelIndex[2], vehicle::kOne));
+            stream.push_back(driveCmd((uint32_t)t, veh.wheelIndex[3], vehicle::kOne));
+        }
+        vehicle::StepVehicleDrivenSteps(veh, cfg, stream, dt, kTicks, kIters, kSolveIters);
+        const vehicle::VehicleDriveState st = vehicle::MeasureVehicleDrive(veh, cfg, driven, startX);
+        check(st.forwardDisp > vehicle::kOne / 2,
+              "StepVehicleDriven: the drive stream moved the chassis forward WITHOUT a seed (traction)");
+        check(st.meanDrivenAngVel > 0,
+              "StepVehicleDriven: the driven wheels are spinning (the throttle took)");
+    }
+
+    // ================= StepVehicleDriven: a no-grip control (no commands, no seed) stays put =============
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle ctrl = vehicle::VehicleFromConfig(cfg);
+        const vehicle::fx dt = vehicle::kOne / 60;
+        const int kIters = 16, kSolveIters = 8, kTicks = 240;
+        const vehicle::fx startX = ctrl.world.bodies[ctrl.chassisIndex].pos.x;
+        const std::vector<vehicle::FxCommand> empty;
+        vehicle::StepVehicleDrivenSteps(ctrl, cfg, empty, dt, kTicks, kIters, kSolveIters);
+        const vehicle::VehicleDriveState st = vehicle::MeasureVehicleDrive(
+            ctrl, cfg, {ctrl.wheelIndex[2], ctrl.wheelIndex[3]}, startX);
+        check(fxabs(st.forwardDisp) < vehicle::kOne / 4,
+              "StepVehicleDriven control: no commands + no seed -> the chassis stays put (no traction)");
+    }
+
+    // ================= StepVehicleDriven: two runs byte-identical (determinism) =================
+    {
+        vehicle::VehicleConfig cfg;
+        const vehicle::fx dt = vehicle::kOne / 60;
+        const int kIters = 16, kSolveIters = 8, kTicks = 120;
+        std::vector<vehicle::FxCommand> stream;
+        for (int t = 0; t < kTicks; ++t) {
+            stream.push_back(driveCmd((uint32_t)t, 3u, vehicle::kOne));
+            stream.push_back(driveCmd((uint32_t)t, 4u, vehicle::kOne));
+        }
+        stream.push_back(steerCmd(0, 0u, vehicle::kOne / 4));
+        vehicle::Vehicle a = vehicle::VehicleFromConfig(cfg);
+        vehicle::Vehicle b = vehicle::VehicleFromConfig(cfg);
+        vehicle::StepVehicleDrivenSteps(a, cfg, stream, dt, kTicks, kIters, kSolveIters);
+        vehicle::StepVehicleDrivenSteps(b, cfg, stream, dt, kTicks, kIters, kSolveIters);
+        const bool same = a.world.bodies.size() == b.world.bodies.size() &&
+                          std::memcmp(a.world.bodies.data(), b.world.bodies.data(),
+                                      a.world.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "StepVehicleDriven determinism: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("vehicle_test: ALL PASS\n");
     else std::printf("vehicle_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;
