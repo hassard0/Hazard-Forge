@@ -596,6 +596,132 @@ int main() {
         check(match, "displace: per-fluid result is fluid-order-independent (Jacobi)");
     }
 
+    // ===== Slice GF4 — THE COUPLED STEP (StepCGF, the (1)-(6) locked-order host driver) ====================
+
+    // A small co-settling scene builder: a packed grain bed + a fluid block resting on it, in one Q16.16 world,
+    // with a kernel built from the scene (the FL4 probe recipe). Reused across the GF4 cases.
+    auto buildStepScene = [&](cgf::CGFWorld& w, fluid::FluidKernel& kernel) {
+        const fx kDt = kOne / 60;
+        const fx kHb = kOne + kOne / 2;                  // 1.5 coupling radius
+        const fpx::FxVec3 kGravity{0, (fx)(-9 * (int)kOne), 0};
+        const fx kHalf = kOne / 2;                       // 0.5 spacing (packed)
+        w = cgf::CGFWorld{};
+        w.h = kHb; w.gravity = kGravity; w.dt = kDt; w.groundY = 0;
+        // A packed 6(x) x 3(y) x 3(z) grain bed at 0.5 spacing, just above the ground (54 grains).
+        for (int gx = 0; gx < 6; ++gx)
+            for (int gy = 0; gy < 3; ++gy)
+                for (int gz = 0; gz < 3; ++gz) {
+                    grain::GrainParticle g = GrainAt(0, 0, 0);
+                    g.pos = fpx::FxVec3{(fx)(gx * (int)kHalf), kOne + (fx)(gy * (int)kHalf), (fx)(gz * (int)kHalf)};
+                    g.prev = g.pos;
+                    w.grains.push_back(g);
+                }
+        // A packed fluid block seeded just above the bed centre (3x3x3 = 27 particles).
+        for (int fx_ = 0; fx_ < 3; ++fx_)
+            for (int fy = 0; fy < 3; ++fy)
+                for (int fz = 0; fz < 3; ++fz) {
+                    fluid::FluidParticle f = FluidAt(0, 0, 0);
+                    f.pos = fpx::FxVec3{kOne + (fx)(fx_ * (int)kHalf),
+                                        (fx)(3 * (int)kOne) + (fx)(fy * (int)kHalf), (fx)(fz * (int)kHalf)};
+                    f.prev = f.pos;
+                    w.fluid.push_back(f);
+                }
+        // The kernel: ρ0 = the mean density of the packed initial fluid lattice (the FL4 probe recipe).
+        kernel = fluid::BuildKernelTable(kHb, kOne, fluid::kKernelBins, kOne / 100);
+        const fluid::FluidGrid pg = fluid::MakeGrid(w.fluid, kHb);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(w.fluid, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(w.fluid, pg, pt, kHb);
+        std::vector<fx> probeRho;
+        fluid::ComputeDensity(w.fluid, pl, kernel, probeRho);
+        kernel = fluid::BuildKernelTable(kHb, fluid::MeanDensity(probeRho), fluid::kKernelBins, kOne / 100);
+    };
+
+    // ---- StepCGF on a tiny scene: two runs byte-identical (determinism) -----------------------------------
+    {
+        cgf::CGFWorld w; fluid::FluidKernel kernel;
+        buildStepScene(w, kernel);
+        cgf::CGFWorld a = w, b = w;
+        cgf::StepCGFSteps(a, kernel, w.dt, 3, 30);
+        cgf::StepCGFSteps(b, kernel, w.dt, 3, 30);
+        bool same = (a.grains.size() == b.grains.size() && a.fluid.size() == b.fluid.size());
+        for (size_t i = 0; same && i < a.grains.size(); ++i)
+            if (std::memcmp(&a.grains[i], &b.grains[i], sizeof(grain::GrainParticle)) != 0) same = false;
+        for (size_t i = 0; same && i < a.fluid.size(); ++i)
+            if (std::memcmp(&a.fluid[i], &b.fluid[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "cgf-step: two runs byte-identical (deterministic)");
+    }
+
+    // ---- StepCGF: the fluid ends ABOVE the grains (co-settle) + the bed holds a repose + wet > dry --------
+    {
+        cgf::CGFWorld w; fluid::FluidKernel kernel;
+        buildStepScene(w, kernel);
+        cgf::StepCGFSteps(w, kernel, w.dt, 3, 80);
+        const cgf::CGFState st = cgf::MeasureCGFState(w);
+        check(st.dynamicGrains > 0u && st.dynamicFluid > 0u, "cgf-step: dynamic grains + fluid present");
+        check(st.fluidY > st.bedY, "cgf-step: the fluid POOLS ABOVE the bed (fluidY > bedY)");
+        check(st.repose > 0, "cgf-step: the bed still holds an angle of repose (repose > 0)");
+        check(st.wetY >= st.dryY, "cgf-step: submerged grains sit at/above dry (the GF2 lift survives)");
+        // Coherence: no dynamic grain or fluid rockets out (a bounded, deterministic settle).
+        bool coherent = true;
+        for (const grain::GrainParticle& g : w.grains)
+            if (!(g.flags & grain::kFlagStatic) && g.pos.y > (fx)(40 * (int)kOne)) coherent = false;
+        for (const fluid::FluidParticle& f : w.fluid)
+            if (!(f.flags & fluid::kFlagStatic) && f.pos.y > (fx)(40 * (int)kOne)) coherent = false;
+        check(coherent, "cgf-step: the coupled state stays coherent (no explosion)");
+    }
+
+    // ---- A static grain AND a static fluid particle are untouched by the coupled step --------------------
+    {
+        cgf::CGFWorld w; fluid::FluidKernel kernel;
+        buildStepScene(w, kernel);
+        // Pin grain 0 and fluid 0 static (invMass 0, kFlagStatic) — every sub-pass must skip them.
+        w.grains[0].flags = grain::kFlagStatic; w.grains[0].invMass = 0;
+        w.fluid[0].flags  = fluid::kFlagStatic; w.fluid[0].invMass  = 0;
+        const fpx::FxVec3 gPos = w.grains[0].pos, gVel = w.grains[0].vel;
+        const fpx::FxVec3 fPos = w.fluid[0].pos,  fVel = w.fluid[0].vel;
+        cgf::StepCGFSteps(w, kernel, w.dt, 3, 20);
+        check(std::memcmp(&w.grains[0].pos, &gPos, sizeof(fpx::FxVec3)) == 0 &&
+              std::memcmp(&w.grains[0].vel, &gVel, sizeof(fpx::FxVec3)) == 0,
+              "cgf-step: static grain pos+vel untouched");
+        check(std::memcmp(&w.fluid[0].pos, &fPos, sizeof(fpx::FxVec3)) == 0 &&
+              std::memcmp(&w.fluid[0].vel, &fVel, sizeof(fpx::FxVec3)) == 0,
+              "cgf-step: static fluid pos+vel untouched");
+    }
+
+    // ---- iters=0: predict + velocity + couple only (no position solve), still deterministic --------------
+    {
+        cgf::CGFWorld w; fluid::FluidKernel kernel;
+        buildStepScene(w, kernel);
+        cgf::CGFWorld a = w, b = w;
+        cgf::StepCGFSteps(a, kernel, w.dt, 0, 10);
+        cgf::StepCGFSteps(b, kernel, w.dt, 0, 10);
+        bool same = true;
+        for (size_t i = 0; same && i < a.grains.size(); ++i)
+            if (std::memcmp(&a.grains[i], &b.grains[i], sizeof(grain::GrainParticle)) != 0) same = false;
+        for (size_t i = 0; same && i < a.fluid.size(); ++i)
+            if (std::memcmp(&a.fluid[i], &b.fluid[i], sizeof(fluid::FluidParticle)) != 0) same = false;
+        check(same, "cgf-step iters=0: predict+velocity+couple only, two runs byte-identical");
+        // The pools still fell under gravity (predict moved them; no NaN/explosion).
+        const cgf::CGFState st = cgf::MeasureCGFState(a);
+        check(st.dynamicFluid > 0u, "cgf-step iters=0: dynamic fluid present (deterministic)");
+    }
+
+    // ---- MeasureCGFState on a known two-pool scene (the metric is well-formed) ----------------------------
+    {
+        cgf::CGFWorld w; w.h = kOne + kOne / 2; w.gravity = fpx::FxVec3{0, (fx)(-9 * (int)kOne), 0};
+        w.dt = kOne / 60; w.groundY = 0;
+        // 2 dynamic grains low, 2 dynamic fluid high overlapping them.
+        w.grains = {GrainAt(0, 1, 0), GrainAt(1, 1, 0)};
+        fluid::FluidParticle f0 = FluidAt(0, 0, 0); f0.pos.y = (fx)(3 * (int)kOne); f0.prev = f0.pos;
+        fluid::FluidParticle f1 = FluidAt(1, 0, 0); f1.pos.y = (fx)(3 * (int)kOne); f1.prev = f1.pos;
+        w.fluid = {f0, f1};
+        const cgf::CGFState st = cgf::MeasureCGFState(w);
+        check(st.dynamicGrains == 2u && st.dynamicFluid == 2u, "MeasureCGFState: counts both dynamic pools");
+        check(st.bedY == (fx)(1 * (int)kOne), "MeasureCGFState: bedY == the grain mean y (1.0)");
+        check(st.fluidY == (fx)(3 * (int)kOne), "MeasureCGFState: fluidY == the fluid mean y (3.0)");
+        check(st.fluidY > st.bedY, "MeasureCGFState: fluidY > bedY (the pools are layered)");
+    }
+
     if (g_fail == 0) std::printf("cgf_test: ALL PASS\n");
     else             std::printf("cgf_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

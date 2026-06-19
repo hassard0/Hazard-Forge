@@ -593,5 +593,163 @@ inline void StepCGFDisplace(CGFWorld& world) {
     ApplyGrainsToFluid(world, nbr);
 }
 
+// ===== Slice GF4 — THE COUPLED STEP (StepCGF, the convergence; the 4th slice of FLAGSHIP #13) =========
+// ONE deterministic forward grain+fluid settling tick: the four GF arcs run TOGETHER. A frictional sand bed
+// (GR3 non-penetration + GR4 Coulomb friction) co-settles with an incompressible PBF fluid (FL4 density) in
+// ONE Q16.16 world, exchanging momentum two ways (GF3 grain->fluid displacement + GF2 fluid->grain buoyancy)
+// — WET SAND / MUD / SLURRY: the fluid pools on/seeps around the bed, submerged grains lighten, no script.
+// The CG4 StepCGrain mold with TWO PARTICLE pools (fluid + grain) instead of grains + rigid bodies. StepCGF
+// ORCHESTRATES the already-bit-exact pieces (FL4 density sub-passes, GR3/GR4 contact/friction, GF2/GF3
+// couplings) in the LOCKED order below. NO new shader, NO new RHI: the GPU showcase is a host-driven
+// multi-pass driver over the EXISTING fluid_* + grain_* + cgf_displace/cgf_buoyancy + GF1 cross-query shaders.
+//
+// THE MAKE-OR-BREAK DECISION (a documented refinement of the roadmap sketch): both pools are PBF/PBD, so the
+// final velocity is DERIVED as (pos − prev)/dt AFTER the position solve. Therefore any velocity impulse
+// applied INSIDE the K position iters is CLOBBERED by that derivation. So the cross-pool VELOCITY couplings
+// (GF2 buoyancy + GF3 displacement) run ONCE, in a POST pass AFTER the velocity update — exactly as PBF
+// XSPH-viscosity / vorticity confinement are applied post-velocity-update. The K Jacobi iters hold ONLY each
+// pool's POSITIONAL self-constraints (FL4 density for the fluid; GR3 normal + GR4 friction for the grains).
+// THREE wins: (1) correctness — nothing clobbered; (2) maximal reuse — GF2 AND GF3 called VERBATIM (no
+// splitting, no new coupling math); (3) no K-compensation — GF2/GF3 run once, so the CG4 invMass=kOne/iters
+// trick is UNNEEDED (grains + fluid keep their natural mass). GF1/GF2/GF3 code stays BYTE-FROZEN.
+//
+// THE COUPLED TICK (StepCGF, the locked (1)-(6) order):
+//   (1) PREDICT both pools: fluid::IntegrateFluid (FL1) + grain::IntegrateGrains (GR1).
+//   (2) BUILD ONCE from the predicted positions (fixed across the K iters — the standard PBF choice): the FL2
+//       fluid neighbour list, the GR2 grain neighbour list, the GF1 cross lists, and the FluidKernel LUT.
+//   (3) K JACOBI iters, each pool's POSITIONAL self-constraints ONLY, in this fixed sub-order:
+//         (3a) FL4 density : ComputeDensity -> ComputeLambda -> SolveDensityConstraint -> fluid.pos += dp.
+//         (3b) GR3 normal  : SolveGrainContact -> grains.pos += dp.
+//         (3c) GR4 friction: SolveGrainFriction(kGrainMu) -> grains.pos += dp.
+//   (4) VELOCITY UPDATE both pools: vel = (pos − prev)/dt (static skipped, as the sub-passes already do).
+//   (5) CROSS-POOL VELOCITY COUPLING — ONCE, AFTER (4) so it survives (reuse the step-(2) cross lists):
+//         (5a) GF3 grain->fluid : ApplyGrainsToFluid(world, nbr)  VERBATIM (snap out + drag reaction).
+//         (5b) GF2 fluid->grain : AccumGrainBuoyancy(world, nbr, kBuoyPerFluid)  VERBATIM (lift + drag).
+//   (6) GROUND CLAMPS both pools: fluid::CollidePlane + grain::CollideGrainPlane.
+// Pure integer, fixed op order -> two runs bit-identical AND bit-exact GPU==CPU (every constituent pass is
+// already proven so; the driver only sequences them). The grain->fluid displacement happening once-per-step
+// (not re-projected each iter) is exactly how GF3's StepCGFDisplace already works — the fluid's own K-iter
+// density solve keeps it incompressible, and the post pass parts it out of the sand each step.
+//
+// HONEST CAVEATS (the FL4/GR3/GF2/GF3 caveat shape): the K Jacobi iters leave a deterministic-but-nonzero
+// incompressibility + non-penetration residual (single projection); the wet/dry lift + the pool-above margin
+// are EMERGENT/within-band (NOT exact buoyancy depths). The claim is DETERMINISM + cross-platform bit-identity
+// composing the bit-exact pieces, NOT a validated continuum two-phase model.
+
+using fpx::fxdiv;          // read-only: the int64-intermediate Q16.16 divide (the PBF velocity derivation)
+
+// StepCGF(world, dt, iters): the (1)-(6) locked-order host driver. Reuses FL4/GR3/GR4 in the K iters and
+// GF2/GF3 VERBATIM in the POST pass. The neighbour lists + the kernel are built ONCE per step from the
+// PREDICTED positions (the PBF fixed-neighbour choice). Pure integer, fixed op order. The kernel is the FL
+// scene's kernel (the caller passes it via world — but the CGFWorld has no kernel field, so StepCGF rebuilds
+// it ONCE per step from world.h/restDensity probe — NO, the caller passes it as `kernel`). To keep CGFWorld
+// byte-frozen, the kernel is a STEP parameter (the showcase/test builds it once from the scene + passes it).
+inline void StepCGF(CGFWorld& world, const fluid::FluidKernel& kernel, fx dt, int iters) {
+    const size_t nf = world.fluid.size();
+    const size_t ng = world.grains.size();
+
+    // (1) PREDICT both pools (each: vel += g·dt; prev = pos; pos += vel·dt; floor clamp). FL1 + GR1, VERBATIM.
+    fluid::IntegrateFluid(world.fluid, world.gravity, dt, world.groundY);
+    grain::IntegrateGrains(world.grains, world.gravity, dt, world.groundY);
+
+    // (2) BUILD ONCE from the PREDICTED positions (fixed across the K iters).
+    const fluid::FluidGrid fGrid = fluid::MakeGrid(world.fluid, kernel.h);
+    const fluid::FluidCellTable fTable = fluid::BuildCellTable(world.fluid, fGrid);
+    const fluid::FluidNeighborList fList = fluid::BuildNeighborList(world.fluid, fGrid, fTable, kernel.h);
+    const grain::GrainGrid gGrid = grain::MakeGrainGrid(world.grains, world.h);
+    const grain::GrainCellTable gTable = grain::BuildGrainCellTable(world.grains, gGrid);
+    const grain::GrainNeighborList gList =
+        grain::BuildGrainNeighborList(world.grains, gGrid, gTable, world.h);
+    const CGFNeighbors nbr = BuildCGFNeighbors(world);   // GF1 cross lists from the predicted positions
+
+    // (3) K JACOBI iters — POSITIONAL self-constraints ONLY (their effect carried by the (4) pos−prev derive).
+    std::vector<fx> density, lambda;
+    std::vector<FxVec3> fdp, gdp;
+    for (int it = 0; it < iters; ++it) {
+        // (3a) FL4 density (the incompressible pool): ρ -> λ -> Δp -> apply (Jacobi, separate dp buffer).
+        fluid::ComputeDensity(world.fluid, fList, kernel, density);
+        fluid::ComputeLambda(world.fluid, fList, kernel, density, lambda);
+        fluid::SolveDensityConstraint(world.fluid, fList, kernel, lambda, fdp);
+        for (size_t i = 0; i < nf; ++i) {
+            if (world.fluid[i].flags & fluid::kFlagStatic) continue;
+            world.fluid[i].pos = FxAdd(world.fluid[i].pos, fdp[i]);
+        }
+        // (3b) GR3 normal push (grain-grain non-penetration; Δp into a SEPARATE dp buffer -> apply).
+        grain::SolveGrainContact(world.grains, gList, gdp);
+        for (size_t i = 0; i < ng; ++i) {
+            if (world.grains[i].flags & grain::kFlagStatic) continue;
+            world.grains[i].pos = FxAdd(world.grains[i].pos, gdp[i]);
+        }
+        // (3c) GR4 TANGENTIAL friction (reads the POST-normal positions; the angle-of-repose clamp).
+        grain::SolveGrainFriction(world.grains, gList, grain::kGrainMu, gdp);
+        for (size_t i = 0; i < ng; ++i) {
+            if (world.grains[i].flags & grain::kFlagStatic) continue;
+            world.grains[i].pos = FxAdd(world.grains[i].pos, gdp[i]);
+        }
+    }
+
+    // (4) VELOCITY UPDATE both pools (PBF: derives the constraint-corrected velocity). Static skipped.
+    if (dt != 0) {
+        for (size_t i = 0; i < nf; ++i) {
+            if (world.fluid[i].flags & fluid::kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(world.fluid[i].pos, world.fluid[i].prev);
+            world.fluid[i].vel = FxVec3{fxdiv(dpos.x, dt), fxdiv(dpos.y, dt), fxdiv(dpos.z, dt)};
+        }
+        for (size_t i = 0; i < ng; ++i) {
+            if (world.grains[i].flags & grain::kFlagStatic) continue;
+            const FxVec3 dpos = FxSub(world.grains[i].pos, world.grains[i].prev);
+            world.grains[i].vel = FxVec3{fxdiv(dpos.x, dt), fxdiv(dpos.y, dt), fxdiv(dpos.z, dt)};
+        }
+    }
+
+    // (5) CROSS-POOL VELOCITY COUPLING — ONCE, AFTER (4) so the impulses survive the pos−prev derivation.
+    // Reuse the step-(2) cross lists (fixed; the post-pass parts the fluid out + buoys the submerged grains).
+    ApplyGrainsToFluid(world, nbr);                   // (5a) GF3 grain->fluid (VERBATIM)
+    AccumGrainBuoyancy(world, nbr, kBuoyPerFluid);    // (5b) GF2 fluid->grain (VERBATIM)
+
+    // (6) GROUND CLAMPS both pools (the fluid floor + the radius-aware grain floor rest).
+    fluid::CollidePlane(world.fluid, world.groundY);
+    grain::CollideGrainPlane(world.grains, world.groundY);
+}
+
+// StepCGFSteps(world, kernel, dt, iters, steps): run K coupled ticks. The CPU reference the GPU multi-pass
+// driver memcmp's against byte-for-byte (the final fluid + grain arrays). Pure integer -> two runs
+// byte-identical, cross-backend identical (the GPU runs the FL4/GR3/GR4/GF2/GF3 int64 passes Vulkan-only +
+// the int32 GF1 cross-query / cell passes; Metal runs THIS).
+inline void StepCGFSteps(CGFWorld& world, const fluid::FluidKernel& kernel, fx dt, int iters, int steps) {
+    for (int s = 0; s < steps; ++s) StepCGF(world, kernel, dt, iters);
+}
+
+// MeasureCGFState(world): the honest emergent-metrics helper (the CG4 MeasureCGrainState twin with two
+// particle pools). Returns the mean DYNAMIC-grain pos.y (bedY), the mean DYNAMIC-fluid pos.y (fluidY), the
+// GR4 grain repose slope (repose — the bed still holds an angle of repose), and the GF2 wet/dry split
+// (wetY = mean y of submerged grains, dryY = mean y of dry grains). Deterministic Q16.16 stats for the
+// proofs. The pool-above + wet/dry margins are EMERGENT/within-band (the CP2/GR4/GF2 caveat), NOT exact
+// depths. Re-queries GF1 from the current positions to classify wet/dry (reuse MeasureWetDry verbatim).
+struct CGFState {
+    fx       bedY   = 0;     // the mean settled DYNAMIC-grain pos.y (the bed line)
+    fx       fluidY = 0;     // the mean settled DYNAMIC-fluid pos.y (the pool line — pools ABOVE the bed)
+    fx       repose = 0;     // the GR4 grain repose slope (the bed-coherence stat)
+    fx       wetY   = 0;     // the mean pos.y of submerged grains (cnt>0 fluid neighbours)
+    fx       dryY   = 0;     // the mean pos.y of dry grains (cnt==0)
+    uint32_t dynamicGrains = 0;   // the count of dynamic grains (bedY is their mean)
+    uint32_t dynamicFluid  = 0;   // the count of dynamic fluid particles (fluidY is their mean)
+};
+inline CGFState MeasureCGFState(const CGFWorld& world) {
+    CGFState s;
+    int64_t bedSum = 0, fluidSum = 0;
+    for (const grain::GrainParticle& g : world.grains)
+        if (!(g.flags & grain::kFlagStatic)) { bedSum += (int64_t)g.pos.y; ++s.dynamicGrains; }
+    for (const fluid::FluidParticle& f : world.fluid)
+        if (!(f.flags & fluid::kFlagStatic)) { fluidSum += (int64_t)f.pos.y; ++s.dynamicFluid; }
+    s.bedY   = s.dynamicGrains == 0u ? 0 : (fx)(bedSum / (int64_t)s.dynamicGrains);
+    s.fluidY = s.dynamicFluid  == 0u ? 0 : (fx)(fluidSum / (int64_t)s.dynamicFluid);
+    if (!world.grains.empty())
+        s.repose = grain::MeasureGrainRepose(world.grains, world.groundY).slope;
+    const WetDry wd = MeasureWetDry(world);   // GF2 re-query classify (submerged vs dry grains)
+    s.wetY = wd.wetY; s.dryY = wd.dryY;
+    return s;
+}
+
 }  // namespace cgf
 }  // namespace hf::sim
