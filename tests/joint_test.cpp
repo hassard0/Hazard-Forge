@@ -513,6 +513,131 @@ int main() {
               "StepArticulated: the door stayed in the hinge plane (swing within the cone)");
     }
 
+    // =============================================================================================
+    // ===== Slice JT3 — ARTICULATED MULTI-BODY STEP: joints + fpx contacts (the coherent mechanism) =
+    // =============================================================================================
+
+    // Build a dynamic FxBody at (x,y,z) with a sphere radius (in whole units) for the contact cases.
+    auto dynR = [&](int x, int y, int z, joint::fx radius) {
+        fpx::FxBody b = dyn(x, y, z);
+        b.radius = radius;
+        return b;
+    };
+
+    // ===== StepArticulatedContacts: the DRAPED CHAIN settles ON the ground (joints held + contacts work).
+    // An 8-link chain laid out diagonally from a pinned root drapes onto the floor. WITH the contact pass
+    // the resting links sit ON the ground (nothing buried) and the joints HOLD (anchor gaps small); the
+    // NO-CONTACT control (StepArticulated, no FPX3) buries the links a full radius below the floor — so the
+    // contact pass DOES the work. This is the SAME scene as the --joint-step-shot showcase (≤12 bodies). ===
+    {
+        const joint::fx kRad = joint::kOne * 2 / 5;   // 0.40 radius (diameter 0.8 < the 1.0 link spacing)
+        const joint::fx gravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const joint::fx kA = joint::kOne * 35 / 100;  // 0.35 anchor offset along the diagonal link
+        const joint::fx kStep = joint::kOne * 7 / 10; // 0.70 per-link diagonal layout step (+x, -y)
+        const int kLinks = 8;
+        auto buildChain = [&]() {
+            joint::FxWorld w;
+            w.gravity = joint::FxVec3{0, gravY, 0};
+            w.groundY = 0;
+            w.bodies = {pinned(0, 6, 0)};
+            w.bodies[0].radius = kRad;
+            joint::fx px = 0, py = (joint::fx)(6 * (int)joint::kOne);
+            for (int i = 1; i <= kLinks; ++i) {
+                px += kStep; py -= kStep;
+                fpx::FxBody b = dynR(0, 0, 0, kRad);
+                b.pos.x = px; b.pos.y = py;
+                w.bodies.push_back(b);
+            }
+            return w;
+        };
+        std::vector<joint::FxJoint> joints;
+        {
+            joint::FxWorld tmp = buildChain();
+            for (uint32_t k = 0; k + 1 < (uint32_t)tmp.bodies.size(); ++k) {
+                joint::FxJoint j;
+                j.bodyA = k; j.bodyB = k + 1;
+                j.anchorA = joint::FxVec3{kA, -kA, 0};   // the link's leading end (toward the child)
+                j.anchorB = joint::FxVec3{-kA, kA, 0};   // the child's trailing end (toward the parent)
+                j.kind = joint::kJointBall;
+                joints.push_back(j);
+            }
+        }
+        std::vector<joint::FxAngularLimit> limits;   // no angular limits in the draped-chain scene
+        const joint::fx dt = joint::kOne / 60;
+        const int kIters = 24, kSolveIters = 8, kSteps = 300;
+
+        joint::FxWorld withContacts = buildChain();
+        joint::StepArticulatedContactsSteps(withContacts, joints, limits, dt, kIters, kSolveIters, kSteps);
+        const joint::ArticulatedState st = joint::MeasureArticulated(withContacts, joints);
+
+        // The joints HELD (the chain stayed connected — anchor gaps within a small deterministic band).
+        check(st.maxAnchorGap < joint::kOne / 2,
+              "StepArticulatedContacts: the draped chain stays connected (max anchor gap small)");
+        // The pinned root NEVER moved.
+        check(withContacts.bodies[0].pos.y == (joint::fx)(6 * (int)joint::kOne),
+              "StepArticulatedContacts: the pinned root holds exactly");
+        // Nothing buried: the lowest dynamic bottom (pos.y - radius) rests at/above the ground.
+        check(st.minDynamicBottom >= -(joint::kOne / 16),
+              "StepArticulatedContacts: no link buried (bottom >= groundY, contacts held)");
+        // The contact pass relieved overlap: residual overlaps below a documented bound.
+        check(st.residualOverlaps <= 2u,
+              "StepArticulatedContacts: residual overlaps below the bound (links non-penetrating)");
+
+        // The NO-CONTACT control: the SAME chain stepped WITHOUT contacts buries the links below the floor.
+        joint::FxWorld noContacts = buildChain();
+        joint::StepArticulatedSteps(noContacts, joints, limits, dt, kIters, kSteps);
+        joint::fx ncMinBottom = (joint::fx)(1 << 30);
+        for (const fpx::FxBody& b : noContacts.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            const joint::fx bottom = b.pos.y - b.radius;
+            if (bottom < ncMinBottom) ncMinBottom = bottom;
+        }
+        check(ncMinBottom < -(joint::kOne / 8),
+              "StepArticulatedContacts: the no-contact control buries the links (contacts do the work)");
+    }
+
+    // ===== StepArticulatedContacts: two runs byte-identical (determinism). =====
+    {
+        const joint::fx kRad = joint::kOne * 3 / 5;
+        const joint::fx gravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const joint::fx kHalf = joint::kOne / 2;
+        auto build = [&]() {
+            joint::FxWorld w;
+            w.gravity = joint::FxVec3{0, gravY, 0};
+            w.groundY = 0;
+            w.bodies = {pinned(0, 8, 0), dynR(0, 7, 0, kRad), dynR(0, 6, 0, kRad), dynR(0, 5, 0, kRad),
+                        dynR(0, 4, 0, kRad)};
+            w.bodies[0].radius = kRad;
+            // a small +x wind seed on the links so the chain whips sideways (deterministic).
+            for (size_t i = 1; i < w.bodies.size(); ++i) w.bodies[i].vel.x = joint::kOne;
+            return w;
+        };
+        std::vector<joint::FxJoint> joints;
+        {
+            joint::FxWorld tmp = build();
+            for (uint32_t k = 0; k + 1 < (uint32_t)tmp.bodies.size(); ++k) {
+                joint::FxJoint j;
+                j.bodyA = k; j.bodyB = k + 1;
+                j.anchorA = joint::FxVec3{0, -kHalf, 0};
+                j.anchorB = joint::FxVec3{0,  kHalf, 0};
+                joints.push_back(j);
+            }
+        }
+        std::vector<joint::FxAngularLimit> limits;
+        const joint::fx dt = joint::kOne / 60;
+        joint::FxWorld a = build(), b = build();
+        joint::StepArticulatedContactsSteps(a, joints, limits, dt, 10, 6, 150);
+        joint::StepArticulatedContactsSteps(b, joints, limits, dt, 10, 6, 150);
+        const bool same = a.bodies.size() == b.bodies.size() &&
+                          std::memcmp(a.bodies.data(), b.bodies.data(),
+                                      a.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "StepArticulatedContacts determinism: two runs BYTE-IDENTICAL");
+        // The chain hung + settled: the mean dynamic pos.y dropped below the pinned root.
+        const joint::ArticulatedState st = joint::MeasureArticulated(a, joints);
+        check(st.meanDynamicY < a.bodies[0].pos.y,
+              "StepArticulatedContacts: the chain hung below the pinned root");
+    }
+
     if (g_fail == 0) std::printf("joint_test: ALL PASS\n");
     else std::printf("joint_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

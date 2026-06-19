@@ -353,5 +353,121 @@ inline void StepArticulatedSteps(FxWorld& world, const std::vector<FxJoint>& joi
         StepArticulated(world, joints, angularLimits, dt, iters);
 }
 
+// ====================================================================================================
+// Slice JT3 — ARTICULATED MULTI-BODY STEP: the JOINTS-MEET-CONTACTS tick (the coherent MECHANISM).
+// JT2's StepArticulated already does integrate -> K {ball | angular} -> ground, so a jointed chain SWINGS
+// and orients, but the links pass THROUGH each other and the ground (no rigid-body contacts). JT3 adds the
+// MISSING piece — the fpx FPX2 broadphase + FPX3 sphere-sphere SolveContacts — so the links self-collide
+// and rest on the floor as a COHERENT articulated structure. This is the fract.h FR4 StepFracture mold (a
+// host-driven multi-pass driver over the EXISTING int64 shaders) with the two joint passes added; NO new
+// shader, NO new RHI. ADDITIVE — JT1/JT2 (FxJoint/SolveBallJoint/SolveAngularLimit/StepArticulated/the
+// joint shaders) stay BYTE-FROZEN; JT3 is only this step + its measure helper + the showcase.
+//
+// THE LOCKED TICK (StepArticulatedContacts):
+//   (1) PREDICT:   IntegrateBodyFull(each body)                  // FPX4 6-DOF integrate (VERBATIM)
+//   (2) JOINTS:    K Gauss-Seidel iters EACH {all SolveBallJoint | all SolveAngularLimit}  // JT1+JT2
+//   (3) BROADPHASE:BuildPairs(world, off, pairs)                 // FPX2 integer broadphase, ONCE per tick
+//   (4) CONTACTS:  fpx::StepWorld(world, pairs, dt=0, solveIters)// FPX3 ground + sphere non-penetration
+// The chain swings (held by the ball joints, oriented by the angular limits) then the contact block parts
+// the overlapping links + rests them on the ground -> a self-colliding settling mechanism. Pure integer,
+// fixed op order -> two-run bit-identical AND bit-exact GPU==CPU.
+//
+// THE NO-NEW-SHADER GPU DECOMPOSITION (documented design call — the locked tick is structured so the
+// EXISTING whole-step int64 shaders reproduce it BYTE-FOR-BYTE): the GPU showcase drives (per tick) the
+// EXISTING joint_angular_solve.comp (steps=1, iters=K, groundY = a far-below SENTINEL so its internal floor
+// clamp is a dead no-op) to do (1)+(2) integrate + K {ball | angular} with NO ground/contacts, then host-
+// rebuilds the FPX2 pair list from the post-joint positions, then drives the EXISTING fpx_solve.comp (dt=0
+// -> no translation integrate, the 9-int fpx body carries no orientation so NO renormalize side-effect,
+// real groundY -> the ground clamp + K SolveContacts sweeps) for (3)+(4). The CPU StepArticulatedContacts
+// here calls the EXACT SAME ops (IntegrateBodyFull + SolveBallJoint/SolveAngularLimit + fpx::StepWorld with
+// dt=0), so the GPU body world memcmp's bit-exact vs it. WHY this structure (not a per-iteration {ball |
+// angular | contacts} interleave): the existing shaders are WHOLE-STEP and integrate-suppression via dt=0
+// is NOT bit-idempotent for orientation (FxQuatNormalize of an already-unit quaternion can drift 1 LSB), so
+// a per-iteration GPU contact interleave over the whole-step joint shader would diverge from the CPU. The
+// contacts-as-a-trailing-block tick is the SAME components (joints + FPX3 contacts) and settles a coherent
+// chain identically, while staying bit-exact GPU==CPU with ZERO new shader (the JT3 hard constraint).
+//
+// HONEST CAVEATS (carried from fpx/fract): FPX3 SolveContacts is sphere-sphere + NO inertia tensor, so the
+// links collide as SPHERES and a contact does NOT spin a body (angVel comes only from the integrate; the
+// fract FR4 / fpx caveat). The Gauss-Seidel joint + contact residual is deterministic-but-nonzero (the
+// cloth/JT1/JT2 within-band caveat). The headline is DETERMINISM + cross-platform bit-identity, NOT "more
+// physically correct".
+
+// ----- StepArticulatedContacts: ONE articulated multi-body tick (joints + fpx contacts) ----------------
+// The (1)-(4) locked tick above. After the JT2 joint passes hold the chain together, BuildPairs broadphases
+// the CURRENT positions ONCE and fpx::StepWorld(dt=0) resolves the ground + the self-collision contacts.
+// Reuses JT1/JT2 (SolveBallJoint/SolveAngularLimit) + fpx (BuildPairs/StepWorld) VERBATIM. The contact
+// block uses dt=0 so it does NOT re-integrate (the integrate already happened at (1)); fpx::StepWorld(dt=0)
+// = IntegrateStep(dt=0) [the idempotent ground clamp + the vy-zero on a grounded body] + SolveContacts.
+inline void StepArticulatedContacts(FxWorld& world, const std::vector<FxJoint>& joints,
+                                    const std::vector<FxAngularLimit>& angularLimits, fx dt, int iters,
+                                    int solveIters) {
+    const size_t n = world.bodies.size();
+    // (1) integrate one step (6-DOF: translation gated by kFlagDynamic, orientation for every body).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, dt);
+    // (2) K Gauss-Seidel joint passes: all ball joints (position), then all angular limits (orientation).
+    for (int it = 0; it < iters; ++it) {
+        for (size_t e = 0; e < joints.size(); ++e)
+            SolveBallJoint(world, joints[e]);
+        for (size_t e = 0; e < angularLimits.size(); ++e)
+            SolveAngularLimit(world, angularLimits[e]);
+    }
+    // (3) FPX2 broadphase ONCE per tick over the post-joint positions.
+    std::vector<uint32_t> perBodyOffset;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, perBodyOffset, pairs);
+    // (4) FPX3 contacts: ground + sphere-sphere non-penetration (dt=0 -> no re-integrate). VERBATIM fpx.
+    fpx::StepWorld(world, std::span<const fpx::FxPair>(pairs), /*dt=*/0, solveIters);
+}
+
+// ----- StepArticulatedContactsSteps: run K full articulated-multi-body ticks (the showcase driver) ------
+inline void StepArticulatedContactsSteps(FxWorld& world, const std::vector<FxJoint>& joints,
+                                         const std::vector<FxAngularLimit>& angularLimits, fx dt, int iters,
+                                         int solveIters, int steps) {
+    for (int s = 0; s < steps; ++s)
+        StepArticulatedContacts(world, joints, angularLimits, dt, iters, solveIters);
+}
+
+// ----- ArticulatedState + MeasureArticulated: the honest coherence metrics ------------------------------
+// The deterministic state of a settled articulated mechanism (all pure integer -> bit-exact CPU<->GPU):
+//   maxAnchorGap     : the max world-anchor gap over all joints (small -> the links stayed CONNECTED).
+//   meanDynamicY     : the mean pos.y of the DYNAMIC bodies (the settle line; > groundY after resting).
+//   minDynamicBottom : the lowest (pos.y - radius) over dynamic bodies (>= groundY -> nothing buried).
+//   residualOverlaps : the FPX3 residual-overlap count over the CURRENT broadphase pairs (links + ground
+//                      non-penetrating means the contact pass HELD; a coherence stat, NOT necessarily 0).
+//   dynamic          : the dynamic-body count (the denominator for meanDynamicY).
+struct ArticulatedState {
+    fx       maxAnchorGap = 0;
+    fx       meanDynamicY = 0;
+    fx       minDynamicBottom = 0;
+    uint32_t residualOverlaps = 0;
+    uint32_t dynamic = 0;
+};
+
+inline ArticulatedState MeasureArticulated(const FxWorld& world, const std::vector<FxJoint>& joints) {
+    ArticulatedState st;
+    st.maxAnchorGap = MaxAnchorGap(world, joints);
+    // Mean dynamic pos.y + the lowest dynamic bottom (pos.y - radius).
+    int64_t sumY = 0;
+    uint32_t dyn = 0;
+    bool haveBottom = false;
+    for (const FxBody& b : world.bodies) {
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        sumY += (int64_t)b.pos.y;
+        const fx bottom = b.pos.y - b.radius;
+        if (!haveBottom || bottom < st.minDynamicBottom) { st.minDynamicBottom = bottom; haveBottom = true; }
+        ++dyn;
+    }
+    st.dynamic = dyn;
+    st.meanDynamicY = dyn > 0u ? (fx)(sumY / (int64_t)dyn) : 0;
+    // Residual overlaps over the CURRENT broadphase pairs (the FPX3 non-penetration coherence stat).
+    std::vector<uint32_t> off;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, off, pairs);
+    st.residualOverlaps = fpx::CountResidualOverlaps(world, std::span<const fpx::FxPair>(pairs));
+    return st;
+}
+
 }  // namespace joint
 }  // namespace hf::sim
