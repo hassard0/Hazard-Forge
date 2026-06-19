@@ -751,5 +751,137 @@ inline CGFState MeasureCGFState(const CGFWorld& world) {
     return s;
 }
 
+// ===== Slice GF5 — LOCKSTEP + ROLLBACK (the netcode HEADLINE over TWO PARTICLE POOLS) ==================
+// Prove the bit-exact GF4 coupled step (StepCGF, itself integer-bit-identical Vulkan/Metal) is true
+// cross-platform LOCKSTEP + ROLLBACK over a COUPLED grain+fluid system: a peer fed the INPUT command stream
+// ALONE (NOT full state) re-derives the authority's exact coupled MUD state — BOTH the grain pool AND the
+// fluid pool — bit-for-bit, and a mispredicted input is corrected by rolling back to a saved snapshot +
+// re-simulating. PURE CPU, 0 backend symbols, NO new shader / RHI: a determinism PROPERTY of the existing
+// bit-exact StepCGF. The DIRECT TWIN of the CG5 (couple_grain.h) harness — the SAME shape with TWO PARTICLE
+// pools (grains + fluid) instead of bodies + grains, and the FluidKernel threaded through every Sim/Run entry
+// (because StepCGF(world, kernel, dt, iters) takes the GF4 per-step kernel, built ONCE by the caller from the
+// scene + constant across ticks). NO <cmath>, NO RNG, NO clock. Wind the sand, jet the fluid, and two peers
+// re-simulate the wet-sand settle bit-for-bit.
+//
+// THE TWO-POOL TWIST (the CG5/CP5 lesson): the world has TWO heterogeneous particle sets — the
+// std::vector<grain::GrainParticle> grains AND the std::vector<fluid::FluidParticle> fluid. SnapshotCGF
+// deep-copies BOTH; RunCGFLockstep's replica==authority must memcmp BOTH; a CGFCommand can target a grain OR a
+// fluid particle. A CGFCommand is the deterministic per-tick INPUT a netcode layer would put on the wire (NOT
+// full state): kCmdGrainWind adds arg (a delta-velocity) to a grain's velocity (a sand gust); kCmdFluidPush
+// adds arg (a delta-velocity) to a fluid particle's velocity (a fluid jet). Integer adds; static grains
+// (kFlagStatic) / static fluid (kFlagStatic) are never mutated; out-of-range target / unknown kind -> a no-op
+// (deterministic). A std::vector<CGFCommand> is the command STREAM, processed in ARRAY ORDER per tick (the
+// deterministic-order contract — the same order on every peer).
+
+inline constexpr uint32_t kCmdGrainWind = 0u;   // arg added to target GRAIN's velocity (a sand-wind gust)
+inline constexpr uint32_t kCmdFluidPush = 1u;   // arg added to target FLUID particle's velocity (a fluid jet)
+
+struct CGFCommand {
+    uint32_t tick   = 0;   // the tick this input applies on
+    uint32_t kind   = 0;   // kCmdGrainWind / kCmdFluidPush
+    uint32_t target = 0;   // the target index (a grain index for wind; a fluid index for push)
+    FxVec3   arg;          // the Q16.16 payload (delta-velocity)
+};
+
+// ApplyCGFCommand(world, c): apply ONE input command to the coupled world (pure integer — add to a grain's or
+// a fluid particle's velocity). Out-of-range target is a no-op (deterministic); unknown kind is a no-op; static
+// grains (kFlagStatic) and static fluid (kFlagStatic) are never mutated (they hold). The input event the
+// lockstep/rollback streams are made of. The couple_grain.h::ApplyCGrainCommand twin, over the grains+fluid
+// world.
+inline void ApplyCGFCommand(CGFWorld& world, const CGFCommand& c) {
+    if (c.kind == kCmdGrainWind) {
+        if (c.target >= (uint32_t)world.grains.size()) return;   // out-of-range grain target -> no-op
+        grain::GrainParticle& g = world.grains[(size_t)c.target];
+        if (g.flags & grain::kFlagStatic) return;                // static boundary grain holds
+        g.vel.x += c.arg.x; g.vel.y += c.arg.y; g.vel.z += c.arg.z;
+    } else if (c.kind == kCmdFluidPush) {
+        if (c.target >= (uint32_t)world.fluid.size()) return;    // out-of-range fluid target -> no-op
+        fluid::FluidParticle& f = world.fluid[(size_t)c.target];
+        if (f.flags & fluid::kFlagStatic) return;                // static fluid holds
+        f.vel.x += c.arg.x; f.vel.y += c.arg.y; f.vel.z += c.arg.z;
+    }
+    // unknown kind -> a no-op (deterministic).
+}
+
+// SimCGFTick(world, kernel, stream, tick, dt, iters): the deterministic per-tick step. (1) apply ALL commands
+// in `stream` whose .tick == `tick`, in ARRAY ORDER (the deterministic input-order contract); (2) StepCGF one
+// step (GF4 — the bit-exact coupled tick over the grain + fluid pools). The kernel is threaded through (GF4's
+// per-step kernel, built once by the caller). Pure integer, fixed order -> bit-identical on every peer/platform.
+// The couple_grain.h::SimCGrainTick twin over CGFWorld (+ the kernel).
+inline void SimCGFTick(CGFWorld& world, const fluid::FluidKernel& kernel, const std::vector<CGFCommand>& stream,
+                       uint32_t tick, fx dt, int iters) {
+    for (const CGFCommand& c : stream)
+        if (c.tick == tick) ApplyCGFCommand(world, c);
+    StepCGF(world, kernel, dt, iters);
+}
+
+// CGFSnapshot: the two-pool snapshot — a deep copy of BOTH the `grains` AND the `fluid` vectors (the rollback
+// primitive — a lossless saved tick across the coupled grain+fluid state). The couple_grain.h::CGrainSnapshot
+// twin, with the fluid pool instead of the rigid bodies.
+struct CGFSnapshot {
+    std::vector<grain::GrainParticle>  grains;   // a deep copy of the grains
+    std::vector<fluid::FluidParticle>  fluid;    // a deep copy of the fluid particles
+};
+
+// SnapshotCGF(world): a deep copy of BOTH the grains AND the fluid vectors (std::vector copy is a deep copy).
+// The TWO-POOL twist: the snapshot covers BOTH particle sets. The couple_grain.h::SnapshotCGrain twin.
+inline CGFSnapshot SnapshotCGF(const CGFWorld& world) {
+    CGFSnapshot s;
+    s.grains = world.grains;   // value copy: deep-copies the grains
+    s.fluid  = world.fluid;    // value copy: deep-copies the fluid particles
+    return s;
+}
+
+// RestoreCGF(world, snap): restore BOTH the grains AND the fluid to a saved snapshot (the rollback). Bit-exact
+// round-trip with SnapshotCGF across BOTH vectors. The couple_grain.h::RestoreCGrain twin.
+inline void RestoreCGF(CGFWorld& world, const CGFSnapshot& snap) {
+    world.grains = snap.grains;
+    world.fluid  = snap.fluid;
+}
+
+// RunCGFLockstep(init, kernel, stream, ticks, dt, iters): THE peer entry point. Run `ticks` SimCGFTicks from a
+// COPY of `init`, applying the command stream -> the final coupled state (grains + fluid). authority =
+// RunCGFLockstep(...); replica = RunCGFLockstep(...) from the SAME init + stream (inputs ONLY — no state
+// shared) -> BIT-IDENTICAL by determinism (the lockstep proof memcmps BOTH the grains AND the fluid). The
+// couple_grain.h::RunCGrainLockstep twin over CGFWorld (+ the threaded kernel).
+inline CGFWorld RunCGFLockstep(const CGFWorld& init, const fluid::FluidKernel& kernel,
+                               const std::vector<CGFCommand>& stream, int ticks, fx dt, int iters) {
+    CGFWorld world = init;
+    for (int t = 0; t < ticks; ++t)
+        SimCGFTick(world, kernel, stream, (uint32_t)t, dt, iters);
+    return world;
+}
+
+// RunCGFRollback(init, kernel, authStream, mispredictStream, ticks, mispredictTick, dt, iters): the rollback
+// harness. (1) run ticks 0..mispredictTick from init applying authStream, SAVING a snapshot AT mispredictTick
+// (before that tick is simulated); (2) speculatively advance a few ticks from the snapshot with the MISPREDICTED
+// stream (the wrong input) — the client prediction that diverges; (3) "receive" the authoritative input ->
+// RestoreCGF to the snapshot + RE-SIMULATE mispredictTick..ticks with the CORRECT authStream -> the final
+// corrected coupled state. The proof asserts this == RunCGFLockstep(init, authStream, ticks) (rollback corrected
+// the misprediction EXACTLY, BOTH grains AND fluid) AND that the mispredicted-before-rollback state DIFFERED
+// from the authority (a real divergence was fixed). The couple_grain.h::RunCGrainRollback twin over CGFWorld.
+inline CGFWorld RunCGFRollback(const CGFWorld& init, const fluid::FluidKernel& kernel,
+                               const std::vector<CGFCommand>& authStream,
+                               const std::vector<CGFCommand>& mispredictStream, int ticks,
+                               int mispredictTick, fx dt, int iters) {
+    CGFWorld world = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimCGFTick(world, kernel, authStream, (uint32_t)t, dt, iters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point — BOTH grains AND fluid).
+    const CGFSnapshot snap = SnapshotCGF(world);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong input) — the client
+    // prediction that diverges from authority. Bounded to the remaining ticks.
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimCGFTick(world, kernel, mispredictStream, (uint32_t)(mispredictTick + s), dt, iters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    RestoreCGF(world, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimCGFTick(world, kernel, authStream, (uint32_t)t, dt, iters);
+    return world;
+}
+
 }  // namespace cgf
 }  // namespace hf::sim

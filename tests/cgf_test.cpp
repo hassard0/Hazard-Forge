@@ -722,6 +722,93 @@ int main() {
         check(st.fluidY > st.bedY, "MeasureCGFState: fluidY > bedY (the pools are layered)");
     }
 
+    // ===== Slice GF5 — LOCKSTEP + ROLLBACK over the coupled grain+fluid world (pure CPU) ===================
+    // A small coupled scene + a kernel (reuse buildStepScene). ticks short (the harness runs StepCGF several
+    // sequences). The grain-wind + fluid-push command stream drives a non-trivial divergence in BOTH pools.
+    {
+        cgf::CGFWorld w; fluid::FluidKernel kernel;
+        buildStepScene(w, kernel);
+        const int kTicks = 8, kIters = 3, kMispredictTick = 3;
+        const uint32_t gIdx = (uint32_t)(w.grains.size() / 2);
+        const uint32_t fIdx = (uint32_t)(w.fluid.size() / 2);
+
+        // ---- ApplyCGFCommand: grain-wind adds to a grain vel; fluid-push adds to a fluid vel ----------------
+        {
+            cgf::CGFWorld a = w;
+            const fx gv0 = a.grains[gIdx].vel.x, fv0 = a.fluid[fIdx].vel.y;
+            cgf::ApplyCGFCommand(a, cgf::CGFCommand{0, cgf::kCmdGrainWind, gIdx, fpx::FxVec3{kOne, 0, 0}});
+            cgf::ApplyCGFCommand(a, cgf::CGFCommand{0, cgf::kCmdFluidPush, fIdx, fpx::FxVec3{0, kOne, 0}});
+            check(a.grains[gIdx].vel.x == gv0 + kOne, "ApplyCGFCommand: grain-wind adds to the grain velocity");
+            check(a.fluid[fIdx].vel.y  == fv0 + kOne, "ApplyCGFCommand: fluid-push adds to the fluid velocity");
+        }
+        // ---- ApplyCGFCommand: out-of-range / unknown kind / static -> no-op --------------------------------
+        {
+            cgf::CGFWorld a = w;
+            const std::vector<grain::GrainParticle> g0 = a.grains;
+            const std::vector<fluid::FluidParticle> f0 = a.fluid;
+            cgf::ApplyCGFCommand(a, cgf::CGFCommand{0, cgf::kCmdGrainWind, 999999u, fpx::FxVec3{kOne, 0, 0}});
+            cgf::ApplyCGFCommand(a, cgf::CGFCommand{0, cgf::kCmdFluidPush, 999999u, fpx::FxVec3{kOne, 0, 0}});
+            cgf::ApplyCGFCommand(a, cgf::CGFCommand{0, 42u, gIdx, fpx::FxVec3{kOne, 0, 0}});   // unknown kind
+            bool noop = (std::memcmp(a.grains.data(), g0.data(), g0.size() * sizeof(grain::GrainParticle)) == 0 &&
+                         std::memcmp(a.fluid.data(),  f0.data(), f0.size() * sizeof(fluid::FluidParticle)) == 0);
+            check(noop, "ApplyCGFCommand: out-of-range / unknown kind -> no-op");
+            // static grain + static fluid are never mutated.
+            cgf::CGFWorld s = w;
+            s.grains[gIdx].flags |= grain::kFlagStatic;
+            s.fluid[fIdx].flags  |= fluid::kFlagStatic;
+            const fx sgv = s.grains[gIdx].vel.x, sfv = s.fluid[fIdx].vel.y;
+            cgf::ApplyCGFCommand(s, cgf::CGFCommand{0, cgf::kCmdGrainWind, gIdx, fpx::FxVec3{kOne, 0, 0}});
+            cgf::ApplyCGFCommand(s, cgf::CGFCommand{0, cgf::kCmdFluidPush, fIdx, fpx::FxVec3{0, kOne, 0}});
+            check(s.grains[gIdx].vel.x == sgv && s.fluid[fIdx].vel.y == sfv,
+                  "ApplyCGFCommand: static grain / static fluid never mutated");
+        }
+        // ---- SnapshotCGF / RestoreCGF: bit-exact round-trip on BOTH pools ----------------------------------
+        {
+            cgf::CGFWorld a = w;
+            const cgf::CGFSnapshot snap = cgf::SnapshotCGF(a);
+            cgf::SimCGFTick(a, kernel, {}, 0, w.dt, kIters);   // mutate both pools
+            cgf::RestoreCGF(a, snap);
+            bool rt = (a.grains.size() == snap.grains.size() && a.fluid.size() == snap.fluid.size() &&
+                       std::memcmp(a.grains.data(), snap.grains.data(),
+                                   snap.grains.size() * sizeof(grain::GrainParticle)) == 0 &&
+                       std::memcmp(a.fluid.data(), snap.fluid.data(),
+                                   snap.fluid.size() * sizeof(fluid::FluidParticle)) == 0);
+            check(rt, "SnapshotCGF/RestoreCGF: bit-exact round-trip on BOTH pools");
+        }
+
+        // The command stream: a sand gust + a fluid jet (drives BOTH pools).
+        const std::vector<cgf::CGFCommand> authStream = {
+            cgf::CGFCommand{1, cgf::kCmdGrainWind, gIdx, fpx::FxVec3{(fx)(2 * (int)kOne), 0, 0}},
+            cgf::CGFCommand{2, cgf::kCmdFluidPush, fIdx, fpx::FxVec3{0, 0, (fx)(2 * (int)kOne)}},
+            cgf::CGFCommand{4, cgf::kCmdGrainWind, gIdx, fpx::FxVec3{0, (fx)(1 * (int)kOne), 0}},
+        };
+        std::vector<cgf::CGFCommand> mispredictStream = authStream;
+        mispredictStream.push_back(cgf::CGFCommand{(uint32_t)kMispredictTick, cgf::kCmdGrainWind, gIdx,
+                                                   fpx::FxVec3{(fx)(20 * (int)kOne), 0, 0}});
+
+        auto coupledEqual = [&](const cgf::CGFWorld& a, const cgf::CGFWorld& b) {
+            return a.grains.size() == b.grains.size() && a.fluid.size() == b.fluid.size() &&
+                   std::memcmp(a.grains.data(), b.grains.data(),
+                               a.grains.size() * sizeof(grain::GrainParticle)) == 0 &&
+                   std::memcmp(a.fluid.data(), b.fluid.data(),
+                               a.fluid.size() * sizeof(fluid::FluidParticle)) == 0;
+        };
+
+        // ---- RunCGFLockstep: authority == replica (inputs-only re-sim) BIT-EXACT, BOTH pools ---------------
+        const cgf::CGFWorld authority = cgf::RunCGFLockstep(w, kernel, authStream, kTicks, w.dt, kIters);
+        const cgf::CGFWorld replica   = cgf::RunCGFLockstep(w, kernel, authStream, kTicks, w.dt, kIters);
+        check(coupledEqual(authority, replica), "RunCGFLockstep: authority==replica BIT-EXACT (BOTH pools)");
+
+        // ---- RunCGFRollback == RunCGFLockstep(authStream) AND mispredicted != authority --------------------
+        const cgf::CGFWorld rolledBack =
+            cgf::RunCGFRollback(w, kernel, authStream, mispredictStream, kTicks, kMispredictTick, w.dt, kIters);
+        const cgf::CGFWorld mispredicted =
+            cgf::RunCGFLockstep(w, kernel, mispredictStream, kTicks, w.dt, kIters);
+        check(coupledEqual(rolledBack, authority), "RunCGFRollback: corrected==authority BIT-EXACT (BOTH pools)");
+        check(!coupledEqual(mispredicted, authority),
+              "RunCGFRollback: the mispredicted state DIFFERED (a real divergence was fixed)");
+    }
+
     if (g_fail == 0) std::printf("cgf_test: ALL PASS\n");
     else             std::printf("cgf_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
