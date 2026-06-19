@@ -24003,6 +24003,194 @@ static int RunVehicleStepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VH4 — Deterministic Vehicle Physics WHEEL-GROUND TRACTION / FRICTION showcase
+// (--vehicle-traction) (the NEW-PHYSICS BEAT of FLAGSHIP #16). VH3 drove the car with a velocity SEED (fpx
+// sphere contacts have NO inertia tensor); VH4 replaces it with a REAL deterministic TRACTION model — at
+// each grounded wheel a Coulomb-cone-clamped tangential ground force converts the wheel's spin into chassis
+// forward motion. NO new shader: traction is a HOST pass; the A/B/D phases are the EXISTING int64 shaders
+// (Vulkan-only), so on Metal the --vehicle-traction showcase runs the CPU vehicle::StepVehicleDriven — the
+// EXACT bit-exact reference the Vulkan --vehicle-traction-shot GPU==CPU memcmp compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION. Builds the SAME deterministic car +
+// drive stream (NO chassis velocity seed — forward comes from TRACTION) over K=240 StepVehicleDriven ticks
+// -> the spun wheels grip + the car drives forward, and CPU-colors the SAME integer side-view as the Vulkan
+// path -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar).
+// Proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/vehicle_traction.png (Mac-baked
+// by the controller); two runs DIFF 0.0000. NO GPU compute (int64 -> CPU on Metal), NO new shader/RHI.
+static int RunVehicleTractionShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vehicle = hf::sim::vehicle;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic vehicle traction scene (== the Vulkan --vehicle-traction-shot config + vehicle_test).
+    const vehicle::fx kDt = vehicle::kOne / 60;
+    const int kTicks = 240;
+    const int kIters = 16;
+    const int kSolveIters = 8;
+    vehicle::VehicleConfig cfg;                       // the documented defaults
+    vehicle::Vehicle vehInit = vehicle::VehicleFromConfig(cfg);
+    const int kBodyCount = (int)vehInit.world.bodies.size();   // 5
+    const vehicle::fx kGroundY = cfg.groundY;
+    const vehicle::fx kStartX = vehInit.world.bodies[(size_t)vehInit.chassisIndex].pos.x;
+
+    // The scripted drive stream: spin BOTH rear wheels every tick. NO chassis velocity seed (the VH3 seed is
+    // GONE — forward comes from the VH4 traction). IDENTICAL to the Vulkan --vehicle-traction-shot.
+    const std::vector<uint32_t> drivenWheels = {vehInit.wheelIndex[2], vehInit.wheelIndex[3]};
+    const vehicle::fx kDriveSpin = vehicle::kOne;
+    std::vector<vehicle::FxCommand> stream;
+    for (int t = 0; t < kTicks; ++t) {
+        vehicle::FxCommand d2; d2.tick = (uint32_t)t; d2.kind = vehicle::kCmdDriveTorque;
+        d2.bodyId = vehInit.wheelIndex[2]; d2.arg = vehicle::FxVec3{kDriveSpin, 0, 0};
+        stream.push_back(d2);
+        vehicle::FxCommand d3; d3.tick = (uint32_t)t; d3.kind = vehicle::kCmdDriveTorque;
+        d3.bodyId = vehInit.wheelIndex[3]; d3.arg = vehicle::FxVec3{kDriveSpin, 0, 0};
+        stream.push_back(d3);
+    }
+    const int kCommandCount = (int)stream.size();
+
+    // std430 FxBody mirror (== the Vulkan --vehicle-traction-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    auto runSolve = [&](vehicle::Vehicle& outVeh, std::vector<FxBodyGpu>& outBodies) {
+        outVeh = vehInit;
+        vehicle::StepVehicleDrivenSteps(outVeh, cfg, stream, kDt, kTicks, kIters, kSolveIters);
+        outBodies = packBodies(outVeh.world.bodies);
+    };
+
+    vehicle::Vehicle cpuVeh;
+    std::vector<FxBodyGpu> gpuBodies;
+    runSolve(cpuVeh, gpuBodies);
+
+    // GPU==CPU is N/A on the Metal CPU path: this body array IS the CPU StepVehicleDriven reference the Vulkan
+    // --vehicle-traction-shot proved the GPU shaders bit-identical against -> byte-identical by construction.
+    std::printf("vehicle-traction: {bodies:%d, commands:%d, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU vehicle::StepVehicleDriven, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kCommandCount, kTicks);
+
+    // two-run determinism.
+    vehicle::Vehicle cpuVeh2; std::vector<FxBodyGpu> gpuBodies2;
+    runSolve(cpuVeh2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("vehicle-traction: two solves differ (nondeterministic)");
+    std::printf("vehicle-traction determinism: two runs BYTE-IDENTICAL\n");
+
+    // the traction drove the car (NO seed): the chassis moved forward + the driven wheels are spinning.
+    const vehicle::VehicleDriveState st = vehicle::MeasureVehicleDrive(cpuVeh, cfg, drivenWheels, kStartX);
+    {
+        const vehicle::fx kForwardBand = vehicle::kOne / 4;
+        const bool moved = st.forwardDisp > kForwardBand;
+        const bool wheelSpun = st.meanDrivenAngVel > 0;
+        if (!(moved && wheelSpun))
+            return fail("vehicle-traction: drive did not take (forward/wheelSpin out of band)");
+        std::printf("vehicle-traction drive: {forward:%d, wheelSpin:%d, fromTraction:true}\n",
+                    st.forwardDisp, st.meanDrivenAngVel);
+    }
+    // the no-grip control (kMuMax==0 == StepVehicle, no PHASE-C traction) stays put despite spinning wheels.
+    {
+        vehicle::Vehicle noGrip = vehicle::VehicleFromConfig(cfg);
+        const vehicle::fx noGripStartX = noGrip.world.bodies[(size_t)noGrip.chassisIndex].pos.x;
+        vehicle::StepVehicleSteps(noGrip, cfg, stream, kDt, kTicks, kIters, kSolveIters);
+        const vehicle::VehicleDriveState noGripSt =
+            vehicle::MeasureVehicleDrive(noGrip, cfg, drivenWheels, noGripStartX);
+        const vehicle::fx noGripFwd = noGripSt.forwardDisp < 0 ? -noGripSt.forwardDisp : noGripSt.forwardDisp;
+        // The no-grip car does NOT drive: a small contact/integrate drift, an order of magnitude below the
+        // traction-driven forward (the cone clamps the traction to 0). Band + contrast = the proof.
+        if (noGripFwd >= vehicle::kOne || !(noGripSt.meanDrivenAngVel > 0) || noGripFwd * 4 >= st.forwardDisp)
+            return fail("vehicle-traction: no-grip control NOT idle (traction not the sole forward source?)");
+        std::printf("vehicle-traction control: {noGrip:idle, wheelsStillSpin:true}\n");
+    }
+
+    // --- Golden: a PURE-INTEGER 2D SIDE-VIEW (IDENTICAL to the Vulkan --vehicle-traction-shot by construction).
+    const int kPxPerUnit = 40;
+    const int kMargin = 30;
+    const int kWorldW = 12;
+    const int kWorldH = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, const Vec3& col) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        d[3] = 255;
+    };
+    auto worldToPx = [&](vehicle::fx wx, vehicle::fx wy, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)(wx + (vehicle::fx)((kWorldW / 4) * (int)vehicle::kOne)) * kPxPerUnit) >> vehicle::kFrac;
+        const int64_t sy = ((int64_t)wy * kPxPerUnit) >> vehicle::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s)
+            putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+    };
+    { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+      for (int x = 0; x < (int)imgW; ++x) {
+          if (gy0 < 0 || gy0 >= (int)imgH) break;
+          uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+          d[0] = 70; d[1] = 70; d[2] = 70; d[3] = 255;
+      } }
+    {
+        const FxBodyGpu& c = gpuBodies[(size_t)cpuVeh.chassisIndex];
+        int x0, y0, x1, y1;
+        worldToPx(c.px - cfg.chassisHalfX, c.py + cfg.chassisHalfY, x0, y0);
+        worldToPx(c.px + cfg.chassisHalfX, c.py - cfg.chassisHalfY, x1, y1);
+        const Vec3 chassisCol{0.85f, 0.7f, 0.3f};
+        for (int yy = (y0 < y1 ? y0 : y1); yy <= (y0 < y1 ? y1 : y0); ++yy)
+            for (int xx = (x0 < x1 ? x0 : x1); xx <= (x0 < x1 ? x1 : x0); ++xx)
+                putPx(xx, yy, chassisCol);
+    }
+    const int visibleCorner[2] = {0, 2};
+    for (int vi = 0; vi < 2; ++vi) {
+        const vehicle::FxSpringJoint& j = cpuVeh.springs[(size_t)visibleCorner[vi]];
+        const fpx::FxBody& ba = cpuVeh.world.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuVeh.world.bodies[(size_t)j.bodyB];
+        const vehicle::FxVec3 pa = vehicle::WorldAnchor(ba, j.anchorA);
+        const vehicle::FxVec3 pb = vehicle::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.6f, 0.85f, 0.95f});
+    }
+    const int radPx = (int)(((int64_t)cfg.wheelRadius * kPxPerUnit) >> vehicle::kFrac);
+    for (int vi = 0; vi < 2; ++vi) {
+        const FxBodyGpu& w = gpuBodies[(size_t)cpuVeh.wheelIndex[visibleCorner[vi]]];
+        int cx, cy; worldToPx(w.px, w.py, cx, cy);
+        const Vec3 col = vg::hashColor((uint32_t)(visibleCorner[vi] + 2));
+        for (int yy = -radPx; yy <= radPx; ++yy)
+            for (int xx = -radPx; xx <= radPx; ++xx)
+                if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vehicle traction side-view (%d bodies, %d commands, %d ticks)\n",
+                outPath, imgW, imgH, kBodyCount, kCommandCount, kTicks);
+    return 0;
+}
+
 // ===== Slice JT2 — Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase (--joint-hinge) ======
 // THE NEW-PHYSICS BEAT of FLAGSHIP #15. The angular solve (SolveAngularLimit's swing-twist + cone clamp +
 // nlerp) is int64 (the quaternion fxmul/fxdiv/FxISqrt), so shaders/joint_angular_solve.comp is VULKAN-ONLY
@@ -41788,6 +41976,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vehicle-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vehicle_step.png";
             try { return RunVehicleStepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vehicle-traction <out.png>: render the Deterministic Vehicle Physics WHEEL-GROUND TRACTION /
+        // FRICTION showcase (Slice VH4, the NEW-PHYSICS BEAT of FLAGSHIP #16). On Metal this runs the CPU
+        // solver: traction is a HOST pass, the A/B/D shaders are int64/Vulkan-only, so Metal runs the CPU
+        // vehicle::StepVehicleDriven over a car fed a scripted drive stream with NO chassis velocity seed ->
+        // the spun wheels grip the ground + the car drives forward — the EXACT bit-exact reference the Vulkan
+        // --vehicle-traction-shot GPU==CPU memcmp compares against; two runs byte-identical. The image golden
+        // is a PURE-INTEGER vehicle side-view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/vehicle_traction.png.
+        if (argc > 1 && std::strcmp(argv[1], "--vehicle-traction") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vehicle_traction.png";
+            try { return RunVehicleTractionShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --joint-hinge <out.png>: render the Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase
