@@ -600,6 +600,19 @@ hf_add_pure_test(mc_test)
 # classifies byte-identical). Pure C++ (hf_core), ASan-eligible. fract.h #includes sim/fpx.h read-only.
 hf_add_pure_test(fract_test)
 
+# Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
+# GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
+# shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
+# toolbox (fx/fxmul/fxdiv/FxVec3/FxLength/FxNormalize/FxRotate/FxBody/IntegrateBodyFull) read-only. Pins
+# WorldAnchor (identity orient -> pos+anchor; a rotated orient rotates the local anchor by orient),
+# SolveBallJoint (two equal-mass bodies with offset anchors -> both move half the gap to coincidence; a
+# pinned body -> only the dynamic one moves; coincident anchors -> no-op; both pinned -> no-op;
+# off-centre anchors pull the anchor POINTS together), and StepJointWorld (a 1-joint chain settles with
+# the gap shrinking + the dynamic body below the pinned root; a 4-link chain hangs; two runs
+# byte-identical). JT1 is the POSITIONAL ball joint only (translates centres, NO lever-arm/angular
+# coupling — JT2+). Pure C++ (hf_core), ASan-eligible. joint.h #includes sim/fpx.h read-only.
+hf_add_pure_test(joint_test)
+
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
 # fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
 # shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products
