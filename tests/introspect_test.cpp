@@ -368,6 +368,8 @@ int main() {
             bool sawCgfDisplaceFeature = false;
             // Slice GF4: the deterministic-cgf-step capability is advertised.
             bool sawCgfStepFeature = false;
+            // Slice GF5: the deterministic-cgf-lockstep capability is advertised.
+            bool sawCgfLockstepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -512,6 +514,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-cgf-buoyancy") sawCgfBuoyancyFeature = true;
                     if (AsString(el->value) == "deterministic-cgf-displace") sawCgfDisplaceFeature = true;
                     if (AsString(el->value) == "deterministic-cgf-step") sawCgfStepFeature = true;
+                    if (AsString(el->value) == "deterministic-cgf-lockstep") sawCgfLockstepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -640,6 +643,7 @@ int main() {
         check(sawCgfBuoyancyFeature, "engine.features includes deterministic-cgf-buoyancy");
         check(sawCgfDisplaceFeature, "engine.features includes deterministic-cgf-displace");
         check(sawCgfStepFeature, "engine.features includes deterministic-cgf-step");
+        check(sawCgfLockstepFeature, "engine.features includes deterministic-cgf-lockstep");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
