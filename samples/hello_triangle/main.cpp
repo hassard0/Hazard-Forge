@@ -454,6 +454,7 @@ int main(int argc, char** argv) {
     const char* mcClassifyShotPath = nullptr; // --mc-classify-shot <out.bmp> (Slice MC1: GPU Isosurface Meshing per-cell MARCHING-CUBES CASE CLASSIFICATION, integer compute over an SDF VoxelField, GPU==CPU case-set bit-exact, case-index Z-slice debug-viz)
     const char* fractCellsShotPath = nullptr; // --fract-cells-shot <out.bmp> (Slice FR1: GPU Deterministic Rigid-Body Fracture CELL PRE-FRACTURE / VORONOI DECOMPOSITION, pure-int32 nearest-seed compute over a lattice, GPU==CPU cellId bit-exact MSL-native, Voronoi cell-mosaic Z-slice viz)
     const char* fractFragmentsShotPath = nullptr; // --fract-fragments-shot <out.bmp> (Slice FR2: GPU Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION, pure-int32 count->scan->emit CSR over FR1 cellId + per-fragment reduce, GPU==CPU fragment array+CSR+remap bit-exact MSL-native, fragment centroids/bounds over the cell mosaic)
+    const char* fractBreakShotPath = nullptr; // --fract-break-shot <out.bmp> (Slice FR3: GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK — THE NEW PHYSICS, host-built bond graph + int64 Jacobi load-diffusion break (Vulkan-only fract_break.comp) -> GPU per-bond {loadAccum,severed} memcmp'd vs CPU ApplyImpactBreak, fragments coloured by cluster/piece id with severed bonds marked red)
     const char* mcCountShotPath = nullptr; // --mc-count-shot <out.bmp> (Slice MC2: GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT — 256-case kTriTable lookup + InterlockedAdd grand total, integer compute over an SDF VoxelField, GPU==CPU counts+total bit-exact, count-grid Z-slice debug-viz)
     const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
     const char* mcInterpShotPath = nullptr; // --mc-interp-shot <out.bmp> (Slice MC4: GPU Isosurface Meshing FIXED-POINT INTERPOLATED vertex placement — mc_emit with EdgeInterp instead of EdgeMidpoint (the vertex on the ACTUAL isosurface crossing, t=((iso-s0)*kSub)/(s1-s0) on the 1/kSub=256 lattice, the same truncating integer divide both sides -> bit-exact GPU==CPU + cross-backend), reuses mc_scan UNCHANGED, GPU==CPU mesh bit-exact, a SMOOTHER 2D mesh-projection debug-viz than mc-emit)
@@ -2308,6 +2309,16 @@ int main(int argc, char** argv) {
     // memcmp'd vs the CPU fract.h::ExtractFragments reference. PURE INT32 -> MSL-native both backends.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fract-fragments-shot") == 0) { fractFragmentsShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice FR3: --fract-break-shot <out.bmp> (GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK,
+    // THE NEW PHYSICS). Its OWN loop (the FR1/FR2 standalone-loop pattern — NOT chained into the big else-if
+    // ladder, which sits at the MSVC C1061 nested-block limit). The FR1 lattice+seeds run FR1 classify + FR2
+    // extract (host) -> BuildFractBonds (host) -> a host-fixed hard impact -> fract_break.comp (int64
+    // Jacobi load-diffusion break, Vulkan-only) -> GPU per-bond {loadAccum,severed} memcmp'd vs the CPU
+    // fract.h::ApplyImpactBreak. int64 -> Vulkan-only; the Metal --fract-break runs the CPU reference.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--fract-break-shot") == 0) { fractBreakShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -15610,6 +15621,293 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — %u fragments (centroids+AABBs) over the cell mosaic\n",
                                 fractFragmentsShotPath, imgW, imgH, gpu.fragCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractFragmentsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK — THE NEW PHYSICS
+        // (--fract-break-shot <out.bmp>, Slice FR3, the 3rd slice of FLAGSHIP #14). FR1 classifies the
+        // 32x32x16 lattice + fixed seed set to a cellId per sample; FR2 extracts the fragments; FR3 BONDS
+        // adjacent fragments (BuildFractBonds, the +x/+y/+z shared-face adjacency scan, pure int32, HOST-
+        // built) into a welded aggregate, then BREAKS the bonds a host-fixed HARD impact over-stresses:
+        // fract_break.comp (int64 Jacobi load-diffusion, Vulkan-only) runs ApplyImpactBreak VERBATIM — read
+        // iteration-START load -> write a SEPARATE delta buffer -> apply (race-free), accumulate per-bond
+        // loadAccum, then SEVER iff loadAccum > fxmul(kBreakThreshold, faceArea<<kFrac). ReadBuffer reads the
+        // GPU per-bond {loadAccum, severed} PROVEN BIT-EXACT vs the CPU fract.h::ApplyImpactBreak (memcmp, NO
+        // tol). CountFractPieces (host, int32) -> the cluster/piece count. The golden colours fragments by
+        // cluster id over the FR1 cell mosaic with the severed bonds drawn as red segments. int64 ->
+        // Vulkan-only; the Metal --fract-break runs the CPU reference (byte-identical by construction). NO
+        // new RHI; FR1/FR2 code + shaders + goldens UNCHANGED (FR3 additive).
+        if (fractBreakShotPath) {
+            using math::Vec3;
+            namespace fract = hf::sim::fract;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The fixed source lattice + seed set (== the FR1/FR2 config, verbatim).
+            const int kNx = 32, kNy = 32, kNz = 16;
+            fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+            const std::vector<fract::FractSeed> seeds = {
+                { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+                {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+                {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+                {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+            };
+            const int kM = (int)seeds.size();
+
+            // ---- FR1+FR2+bond-graph on the HOST (pure int32, deterministic). ----
+            fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+            fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+            fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+            const uint32_t F = (uint32_t)frags.fragments.size();
+            const uint32_t B = (uint32_t)bonds.bonds.size();
+
+            // The host-fixed HARD impact: a strong impulse at a corner/edge fragment (fragment 0 — the
+            // first compact fragment, deterministic). The impulse is tuned with kBreakThreshold=0.5 so the
+            // diffused load over-stresses a coherent subset of bonds near the impact (S>0, P>1).
+            // K=4 diffusion iters + a hard impulse tuned (with kBreakThreshold=0.5, kFlow=0.25) so the
+            // load over-stresses a COHERENT subset of bonds near the impact -> the body fractures into a
+            // handful of pieces (NOT total shatter, NOT intact); the crack PATTERN is emergent/within-band
+            // (the honest caveat — a deterministic load-diffusion proxy, NOT FEM). 1000<<16 -> ~38 severed
+            // of 55 bonds -> ~4 pieces from the 16 fragments on this fixed scene.
+            const int kBreakIters = 4;
+            const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);  // Q16.16, a hard hit
+            fract::BreakImpact hardImpact{0u, kHardImpulse};
+
+            // ---- The GPU std430 bond mirror (40 bytes; == shaders/fract_break.comp FractBondGpu). ----
+            struct BondGpu {
+                uint32_t fragA, fragB;
+                int32_t  faceArea, _pad0;
+                int32_t  midx, midy, midz, _pad1;
+                int64_t  loadAccum;
+            };
+            static_assert(sizeof(BondGpu) == 40, "BondGpu std430 layout (== fract_break.comp FractBondGpu)");
+
+            // FR3 break params std430: cfg0 {fragmentCount, bondCount, K, impactFragment};
+            // cfg1 {impulse, threshold, flow, enabled} (Q16.16 for the latter three).
+            struct FractBreakParams { int32_t cfg0[4]; int32_t cfg1[4]; };
+            static_assert(sizeof(FractBreakParams) == 32, "FractBreakParams std430 layout");
+            const int32_t kFlowQ = (int32_t)(fpx::kOne / 4);   // 0.25 in Q16.16 (== ApplyImpactBreak's kFlow)
+
+            auto breakWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fract_break.comp.hlsl.spv");
+            auto breakCs = device->CreateShaderModule({std::span<const uint32_t>(breakWords)});
+            rhi::ComputePipelineDesc breakCd;
+            breakCd.compute = breakCs.get(); breakCd.storageBufferCount = 5; breakCd.threadsPerGroupX = 1;
+            auto breakCompute = device->CreateComputePipeline(breakCd);
+
+            // runBreak: upload the host bond graph + params, dispatch fract_break.comp (single thread),
+            // read back the per-bond {loadAccum, severed}. impulse/enabled vary for the no-op/control.
+            struct BreakOut { std::vector<BondGpu> bonds; std::vector<uint32_t> severed; };
+            auto runBreak = [&](const fract::BreakImpact& imp, int enabled, BreakOut& out) {
+                std::vector<BondGpu> bondInit((size_t)(B > 0u ? B : 1u), BondGpu{});
+                for (uint32_t b = 0; b < B; ++b) {
+                    const fract::FractBond& bd = bonds.bonds[(size_t)b];
+                    BondGpu g{};
+                    g.fragA = bd.fragA; g.fragB = bd.fragB; g.faceArea = bd.faceArea;
+                    g.midx = bd.midpoint.x; g.midy = bd.midpoint.y; g.midz = bd.midpoint.z;
+                    g.loadAccum = 0;
+                    bondInit[(size_t)b] = g;
+                }
+                std::vector<uint32_t> sevInit((size_t)(B > 0u ? B : 1u), 0u);
+                std::vector<int64_t>  loadInit((size_t)(F > 0u ? F : 1u), 0);
+                std::vector<int64_t>  deltaInit((size_t)(F > 0u ? F : 1u), 0);
+
+                auto mkBuf = [&](const void* data, size_t bytes) {
+                    rhi::BufferDesc d; d.size = bytes; d.initialData = data;
+                    d.usage = rhi::BufferUsage::Storage; return device->CreateBuffer(d);
+                };
+                auto bondsBuf = mkBuf(bondInit.data(), bondInit.size() * sizeof(BondGpu));
+                auto sevBuf   = mkBuf(sevInit.data(), sevInit.size() * 4);
+                auto loadBuf  = mkBuf(loadInit.data(), loadInit.size() * 8);
+                auto deltaBuf = mkBuf(deltaInit.data(), deltaInit.size() * 8);
+
+                FractBreakParams p{};
+                p.cfg0[0] = (int32_t)F; p.cfg0[1] = (int32_t)B; p.cfg0[2] = kBreakIters;
+                p.cfg0[3] = (int32_t)imp.fragment;
+                p.cfg1[0] = (int32_t)imp.impulse; p.cfg1[1] = (int32_t)fract::kBreakThreshold;
+                p.cfg1[2] = kFlowQ; p.cfg1[3] = enabled;
+                auto pBuf = mkBuf(&p, sizeof(FractBreakParams));
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fract_break", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*breakCompute);
+                        cmd.BindStorageBuffer(*bondsBuf, 0);
+                        cmd.BindStorageBuffer(*sevBuf, 1);
+                        cmd.BindStorageBuffer(*loadBuf, 2);
+                        cmd.BindStorageBuffer(*deltaBuf, 3);
+                        cmd.BindStorageBuffer(*pBuf, 4);
+                        cmd.DispatchCompute(1);   // single-thread break (the order-sensitive diffusion)
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+
+                out.bonds.assign((size_t)(B > 0u ? B : 1u), BondGpu{});
+                device->ReadBuffer(*bondsBuf, out.bonds.data(), out.bonds.size() * sizeof(BondGpu), 0);
+                out.bonds.resize((size_t)B);
+                out.severed.assign((size_t)(B > 0u ? B : 1u), 0u);
+                device->ReadBuffer(*sevBuf, out.severed.data(), out.severed.size() * 4, 0);
+                out.severed.resize((size_t)B);
+            };
+
+            // === GPU break (hard impact) ===
+            BreakOut gpu;
+            runBreak(hardImpact, 1, gpu);
+
+            // === CPU reference (the same hard impact over a fresh bond copy) ===
+            fract::FractBonds cpuBonds; fract::BuildFractBonds(field, cells, frags, cpuBonds);
+            std::vector<uint8_t> cpuSev;
+            uint32_t cpuSevered = fract::ApplyImpactBreak(cpuBonds, frags, hardImpact, kBreakIters, cpuSev);
+            std::vector<uint32_t> cpuCluster;
+            uint32_t cpuPieces = fract::CountFractPieces(frags, cpuBonds, cpuSev, &cpuCluster);
+
+            // PROOF (1) GPU==CPU bit-exact: per-bond loadAccum (int64) + the severed flags, byte-for-byte.
+            bool bitExact = (gpu.bonds.size() == (size_t)B) && (gpu.severed.size() == (size_t)B);
+            uint32_t gpuSevered = 0u;
+            for (uint32_t b = 0; b < B && bitExact; ++b) {
+                if (gpu.bonds[(size_t)b].loadAccum != cpuBonds.bonds[(size_t)b].loadAccum) bitExact = false;
+                if ((uint32_t)cpuSev[(size_t)b] != gpu.severed[(size_t)b]) bitExact = false;
+                if (gpu.severed[(size_t)b]) ++gpuSevered;
+            }
+            if (!bitExact || gpuSevered != cpuSevered) {
+                std::fprintf(stderr, "FATAL: fract-break GPU per-bond {loadAccum,severed} != CPU "
+                             "ApplyImpactBreak (an int64/non-verbatim crept into the break?)\n");
+                device->WaitIdle(); return 1;
+            }
+            // Build the GPU severed-flag vector for the piece count (== the CPU set, just proven).
+            std::vector<uint8_t> gpuSev((size_t)B, 0u);
+            for (uint32_t b = 0; b < B; ++b) gpuSev[(size_t)b] = (uint8_t)gpu.severed[(size_t)b];
+            std::vector<uint32_t> gpuCluster;
+            uint32_t gpuPieces = fract::CountFractPieces(frags, cpuBonds, gpuSev, &gpuCluster);
+            if (gpuPieces != cpuPieces) {   // the piece count derives from the proven-equal severed set
+                std::fprintf(stderr, "FATAL: fract-break piece count GPU %u != CPU %u\n",
+                             gpuPieces, cpuPieces);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-break: {fragments:%u, bonds:%u, severed:%u, pieces:%u} GPU==CPU BIT-EXACT\n",
+                        F, B, gpuSevered, gpuPieces);
+
+            // PROOF (2) two-run determinism (byte-identical loadAccum + severed).
+            BreakOut gpu2;
+            runBreak(hardImpact, 1, gpu2);
+            bool det = (gpu.bonds.size() == gpu2.bonds.size()) && (gpu.severed == gpu2.severed);
+            for (uint32_t b = 0; b < B && det; ++b)
+                if (gpu.bonds[(size_t)b].loadAccum != gpu2.bonds[(size_t)b].loadAccum) det = false;
+            if (!det) {
+                std::fprintf(stderr, "FATAL: fract-break two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-break determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) threshold-gated: hard severs S>0 -> P>1; a ZERO impact severs 0 -> P==1 (intact).
+            BreakOut gpuSoft;
+            fract::BreakImpact softImpact{0u, 0};
+            runBreak(softImpact, 1, gpuSoft);
+            uint32_t softSevered = 0u;
+            for (uint32_t b = 0; b < B; ++b) if (gpuSoft.severed[(size_t)b]) ++softSevered;
+            std::vector<uint8_t> softSev((size_t)B, 0u);   // all-zero (no severed)
+            uint32_t softPieces = fract::CountFractPieces(frags, cpuBonds, softSev, nullptr);
+            if (!(gpuSevered > 0u && gpuPieces > 1u)) {
+                std::fprintf(stderr, "FATAL: fract-break hard impact did NOT break (severed=%u pieces=%u; "
+                             "expected severed>0 && pieces>1)\n", gpuSevered, gpuPieces);
+                device->WaitIdle(); return 1;
+            }
+            if (!(softSevered == 0u && softPieces == 1u)) {
+                std::fprintf(stderr, "FATAL: fract-break soft/zero impact severed %u bonds / %u pieces "
+                             "(expected 0 && 1 — the welded body must stay intact)\n",
+                             softSevered, softPieces);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-break threshold: hard={severed:%u,pieces:%u} soft={severed:0,pieces:1}\n",
+                        gpuSevered, gpuPieces);
+
+            // PROOF (4) crack follows cell boundaries: every severed bond connects two ADJACENT fragments
+            // (a real bond, severed ⊆ bonds — trivially true by construction, assert it).
+            bool allAdjacent = true;
+            for (uint32_t b = 0; b < B; ++b) if (gpuSev[(size_t)b]) {
+                const BondGpu& bg = gpu.bonds[(size_t)b];
+                if (bg.fragA >= F || bg.fragB >= F || bg.fragA == bg.fragB) allAdjacent = false;
+            }
+            if (!allAdjacent) {
+                std::fprintf(stderr, "FATAL: fract-break a severed bond is not a valid cell-boundary "
+                             "adjacency (severed not subset of bonds)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-break cracks: all %u severed bonds are cell-boundary adjacencies\n",
+                        gpuSevered);
+
+            // --- Golden: the FR1 cell mosaic (Z-slice tiles), but each sample is coloured by its
+            // fragment's CLUSTER/PIECE id (hashColor(clusterLabel)) — the broken pieces — and the SEVERED
+            // bonds are drawn as RED segments between the two fragment centroids on the bond-midpoint's
+            // Z-slice. Intact bonds are dim grey. CPU-coloured from the GPU-proven severed set -> identical
+            // both backends by construction. ---
+            const int kTilesX = 4, kTilesY = 4, kPad = 2;
+            const uint32_t imgW = (uint32_t)(kTilesX * kNx + (kTilesX + 1) * kPad);
+            const uint32_t imgH = (uint32_t)(kTilesY * kNy + (kTilesY + 1) * kPad);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+            }
+            auto tileOrigin = [&](int z, int& ox, int& oy) {
+                ox = kPad + (z % kTilesX) * (kNx + kPad);
+                oy = kPad + (z / kTilesX) * (kNy + kPad);
+            };
+            auto putPx = [&](int ix, int iy, uint8_t bl, uint8_t gr, uint8_t rd) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* d = &bgra[((size_t)iy * imgW + ix) * 4];
+                d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+            };
+            // The mosaic: each sample -> its cell -> its fragment -> its cluster label -> hashColor.
+            for (int z = 0; z < kNz; ++z) {
+                int ox, oy; tileOrigin(z, ox, oy);
+                for (int y = 0; y < kNy; ++y)
+                    for (int x = 0; x < kNx; ++x) {
+                        const uint32_t cellId = cells.cellId[(size_t)((z * kNy + y) * kNx + x)];
+                        uint32_t cluster = 0xFFFFFFFFu;
+                        if (cellId < (uint32_t)frags.cellToFragment.size()) {
+                            const uint32_t fr = frags.cellToFragment[(size_t)cellId];
+                            if (fr != fract::kNoFragment && fr < (uint32_t)gpuCluster.size())
+                                cluster = gpuCluster[(size_t)fr];
+                        }
+                        Vec3 col = (cluster == 0xFFFFFFFFu) ? Vec3{0.04f, 0.03f, 0.02f}
+                                                            : vg::hashColor(cluster);
+                        putPx(ox + x, oy + y, (uint8_t)(col.z * 255.0f + 0.5f),
+                              (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.x * 255.0f + 0.5f));
+                    }
+            }
+            // Draw the bonds: severed = RED, intact = dim grey, as a short segment between the two centroids
+            // on the bond-midpoint's Z-slice (an integer Bresenham line in lattice space).
+            auto drawLine = [&](int z, int x0, int y0, int x1, int y1, uint8_t bl, uint8_t gr, uint8_t rd) {
+                int ox, oy; tileOrigin(z, ox, oy);
+                int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+                int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+                int err = dx + dy;
+                for (;;) {
+                    putPx(ox + x0, oy + y0, bl, gr, rd);
+                    if (x0 == x1 && y0 == y1) break;
+                    int e2 = 2 * err;
+                    if (e2 >= dy) { err += dy; x0 += sx; }
+                    if (e2 <= dx) { err += dx; y0 += sy; }
+                }
+            };
+            for (uint32_t b = 0; b < B; ++b) {
+                const fract::FractBond& bd = bonds.bonds[(size_t)b];
+                const fract::FractFragment& A = frags.fragments[(size_t)bd.fragA];
+                const fract::FractFragment& Bf = frags.fragments[(size_t)bd.fragB];
+                const int mz = (bd.midpoint.z / (int)fpx::kOne);   // the bond-midpoint Z-slice
+                if (gpuSev[(size_t)b])
+                    drawLine(mz, A.cx, A.cy, Bf.cx, Bf.cy, 40, 40, 235);   // severed -> red
+                else
+                    drawLine(mz, A.cx, A.cy, Bf.cx, Bf.cy, 70, 70, 70);    // intact -> dim grey
+            }
+            bool ok = WriteBMP(fractBreakShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — %u fragments in %u pieces, %u severed bonds (red)\n",
+                                fractBreakShotPath, imgW, imgH, F, gpuPieces, gpuSevered);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractBreakShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

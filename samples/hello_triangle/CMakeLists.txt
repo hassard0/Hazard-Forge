@@ -478,6 +478,17 @@ hf_compile_shaders(
     "shaders/fract_emit_scan.comp.hlsl:cs"
     "shaders/fract_emit_emit.comp.hlsl:cs"
     "shaders/fract_reduce.comp.hlsl:cs"
+    # Deterministic Rigid-Body Fracture Slice 3 (Slice FR3): BONDED-CLUSTER BREAK — THE NEW PHYSICS.
+    # fract_break.comp runs the int64 Jacobi load-diffusion break VERBATIM from fract.h::ApplyImpactBreak:
+    # inject the impact load at one fragment, K Jacobi iters (read-start load / write a SEPARATE delta
+    # buffer / apply — race-free, the FL4/GR3 discipline) accumulate per-bond loadAccum, then SEVER iff
+    # loadAccum > fxmul(kBreakThreshold, faceArea<<kFrac). Because the load + transmit + threshold use
+    # int64, fract_break.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal
+    # hf_gen_msl list; the Metal --fract-break runs the CPU ApplyImpactBreak (byte-identical by
+    # construction, the grain_contact_dp.comp/cloth_solve.comp convention). The bond graph is host-built
+    # (BuildFractBonds, pure int32) + uploaded; the GPU-proven pass is this int64 break (memcmp the per-bond
+    # {loadAccum, severed} vs the CPU). NO new RHI; FR1/FR2 shaders + goldens untouched (FR3 is additive).
+    "shaders/fract_break.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6):
     # fpx_integrate.comp runs the Q16.16 semi-implicit-Euler INTEGRATOR — ONE thread per body runs
     # `steps` iterations of (vel += gravity*dt; pos += vel*dt; ground floor-clamp) on its OWN body, the

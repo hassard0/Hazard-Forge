@@ -16988,6 +16988,154 @@ static int RunFractFragmentsShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK showcase (Slice FR3, THE NEW PHYSICS — the
+// 3rd slice of FLAGSHIP #14). The break math is int64 -> shaders/fract_break.comp is VULKAN-SPIR-V-ONLY
+// (DXC compiles int64; glslc cannot) and is NOT in the Metal hf_gen_msl list; so the Metal --fract-break
+// showcase runs the CPU fract::ApplyImpactBreak — byte-identical to the Vulkan GPU result BY CONSTRUCTION
+// (the FPX1/GR3/CL3 split, the same convention as --fpx/--cloth-solve/--cgf-buoyancy). It builds the SAME
+// FR1/FR2 lattice (32x32x16) + seed set, classifies + extracts the fragments, builds the bond graph
+// (BuildFractBonds, pure int32), applies the SAME host-fixed HARD impact (fragment 0, the strong impulse),
+// counts pieces, and CPU-colours the IDENTICAL golden as the Vulkan --fract-break-shot (fragments coloured
+// by cluster id over the FR1 cell mosaic + the severed bonds drawn as red segments) — so the baked golden
+// is byte-identical to the Vulkan capture. The CPU ApplyImpactBreak IS the exact reference the Vulkan side
+// proved its GPU result byte-identical against. Determinism + the threshold control are re-checked on the
+// CPU path. New golden tests/golden/metal/fract_break.png; two runs DIFF 0.0000. NO GPU dispatch, NO new
+// RHI.
+static int RunFractBreakShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fract = hf::sim::fract;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    const int kNx = 32, kNy = 32, kNz = 16;
+    fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+    const std::vector<fract::FractSeed> seeds = {
+        { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+        {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+        {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+        {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+    };
+    const int kM = (int)seeds.size();
+
+    // ---- FR1+FR2+bonds on the CPU (== the Vulkan host path, verbatim). ----
+    fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+    fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+    fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+    const uint32_t F = (uint32_t)frags.fragments.size();
+    const uint32_t B = (uint32_t)bonds.bonds.size();
+
+    // K=4 + a hard impulse tuned so the load over-stresses a coherent subset near the impact -> the body
+    // fractures into a handful of pieces (NOT total shatter, NOT intact); == the Vulkan --fract-break-shot.
+    const int kBreakIters = 4;
+    const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);   // == the Vulkan impulse
+    fract::BreakImpact hardImpact{0u, kHardImpulse};
+
+    // The CPU break (the bit-exact reference the Vulkan GPU proved equal to).
+    std::vector<uint8_t> sev;
+    uint32_t severed = fract::ApplyImpactBreak(bonds, frags, hardImpact, kBreakIters, sev);
+    std::vector<uint32_t> cluster;
+    uint32_t pieces = fract::CountFractPieces(frags, bonds, sev, &cluster);
+    std::printf("fract-break: {fragments:%u, bonds:%u, severed:%u, pieces:%u} GPU==CPU BIT-EXACT\n",
+                F, B, severed, pieces);
+
+    // Determinism: a second build+break -> byte-identical severed flags + loadAccum.
+    {
+        fract::FractBonds bonds2; fract::BuildFractBonds(field, cells, frags, bonds2);
+        std::vector<uint8_t> sev2;
+        uint32_t severed2 = fract::ApplyImpactBreak(bonds2, frags, hardImpact, kBreakIters, sev2);
+        bool det = (severed == severed2) && (sev == sev2) && (bonds.bonds.size() == bonds2.bonds.size());
+        for (size_t i = 0; det && i < bonds.bonds.size(); ++i)
+            if (bonds.bonds[i].loadAccum != bonds2.bonds[i].loadAccum) det = false;
+        if (!det) return fail("fract-break: two runs differ (nondeterministic)");
+        std::printf("fract-break determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // Threshold-gated: hard severs S>0 -> P>1; a ZERO impact severs 0 -> P==1 (intact).
+    {
+        fract::FractBonds bondsSoft; fract::BuildFractBonds(field, cells, frags, bondsSoft);
+        std::vector<uint8_t> sevSoft;
+        fract::BreakImpact softImpact{0u, 0};
+        uint32_t softSevered = fract::ApplyImpactBreak(bondsSoft, frags, softImpact, kBreakIters, sevSoft);
+        uint32_t softPieces = fract::CountFractPieces(frags, bondsSoft, sevSoft, nullptr);
+        if (!(severed > 0u && pieces > 1u)) return fail("fract-break: hard impact did NOT break");
+        if (!(softSevered == 0u && softPieces == 1u))
+            return fail("fract-break: soft/zero impact did not stay intact");
+        std::printf("fract-break threshold: hard={severed:%u,pieces:%u} soft={severed:0,pieces:1}\n",
+                    severed, pieces);
+    }
+
+    // Crack follows cell boundaries: every severed bond connects two adjacent valid fragments.
+    {
+        bool allAdjacent = true;
+        for (uint32_t b = 0; b < B; ++b) if (sev[(size_t)b]) {
+            const fract::FractBond& bd = bonds.bonds[(size_t)b];
+            if (bd.fragA >= F || bd.fragB >= F || bd.fragA == bd.fragB) allAdjacent = false;
+        }
+        if (!allAdjacent) return fail("fract-break: a severed bond is not a valid adjacency");
+        std::printf("fract-break cracks: all %u severed bonds are cell-boundary adjacencies\n", severed);
+    }
+
+    // --- Golden (== the Vulkan --fract-break-shot, byte-identical by construction): the FR1 cell mosaic,
+    // each sample coloured by its fragment's CLUSTER id, the severed bonds drawn as RED segments. ---
+    const int kTilesX = 4, kTilesY = 4, kPad = 2;
+    const uint32_t imgW = (uint32_t)(kTilesX * kNx + (kTilesX + 1) * kPad);
+    const uint32_t imgH = (uint32_t)(kTilesY * kNy + (kTilesY + 1) * kPad);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    auto tileOrigin = [&](int z, int& ox, int& oy) {
+        ox = kPad + (z % kTilesX) * (kNx + kPad);
+        oy = kPad + (z / kTilesX) * (kNy + kPad);
+    };
+    auto putPx = [&](int ix, int iy, uint8_t bl, uint8_t gr, uint8_t rd) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)iy * imgW + ix) * 4];
+        d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+    };
+    for (int z = 0; z < kNz; ++z) {
+        int ox, oy; tileOrigin(z, ox, oy);
+        for (int y = 0; y < kNy; ++y)
+            for (int x = 0; x < kNx; ++x) {
+                const uint32_t cellId = cells.cellId[(size_t)((z * kNy + y) * kNx + x)];
+                uint32_t clu = 0xFFFFFFFFu;
+                if (cellId < (uint32_t)frags.cellToFragment.size()) {
+                    const uint32_t fr = frags.cellToFragment[(size_t)cellId];
+                    if (fr != fract::kNoFragment && fr < (uint32_t)cluster.size())
+                        clu = cluster[(size_t)fr];
+                }
+                Vec3 col = (clu == 0xFFFFFFFFu) ? Vec3{0.04f, 0.03f, 0.02f} : vg::hashColor(clu);
+                putPx(ox + x, oy + y, (uint8_t)(col.z * 255.0f + 0.5f),
+                      (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.x * 255.0f + 0.5f));
+            }
+    }
+    auto drawLine = [&](int z, int x0, int y0, int x1, int y1, uint8_t bl, uint8_t gr, uint8_t rd) {
+        int ox, oy; tileOrigin(z, ox, oy);
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(ox + x0, oy + y0, bl, gr, rd);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    for (uint32_t b = 0; b < B; ++b) {
+        const fract::FractBond& bd = bonds.bonds[(size_t)b];
+        const fract::FractFragment& A = frags.fragments[(size_t)bd.fragA];
+        const fract::FractFragment& Bf = frags.fragments[(size_t)bd.fragB];
+        const int mz = (bd.midpoint.z / (int)fpx::kOne);
+        if (sev[(size_t)b]) drawLine(mz, A.cx, A.cy, Bf.cx, Bf.cy, 40, 40, 235);   // severed -> red
+        else                drawLine(mz, A.cx, A.cy, Bf.cx, Bf.cy, 70, 70, 70);    // intact -> dim grey
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — %u fragments in %u pieces, %u severed bonds (red)\n",
+                outPath, imgW, imgH, F, pieces, severed);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase showcase (Slice FPX1,
 // the BEACHHEAD of FLAGSHIP #6). On Metal this runs the CPU INTEGRATOR, NOT a GPU compute dispatch.
 // fpx_integrate.comp is int64/Vulkan-only (glslc can't parse int64); Metal runs the CPU
@@ -38435,6 +38583,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-fragments") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_fragments.png";
             try { return RunFractFragmentsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fract-break <out.png>: render the Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK
+        // showcase (Slice FR3, THE NEW PHYSICS — the 3rd slice of FLAGSHIP #14). The break math is int64 ->
+        // shaders/fract_break.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so the Metal --fract-break
+        // runs the CPU fract::ApplyImpactBreak — byte-identical to the Vulkan GPU result by construction
+        // (the FPX1/GR3/CL3 split). The FR1/FR2 lattice (32x32x16) + seed set are classified + extracted,
+        // the bond graph built (BuildFractBonds, pure int32), a host-fixed HARD impact applied -> the
+        // severed-bond SET + the piece count; the image golden colours fragments by cluster id over the FR1
+        // cell mosaic with the severed bonds drawn as red segments, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/fract_break.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fract-break") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fract_break.png";
+            try { return RunFractBreakShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer
