@@ -613,6 +613,17 @@ hf_add_pure_test(fract_test)
 # coupling — JT2+). Pure C++ (hf_core), ASan-eligible. joint.h #includes sim/fpx.h read-only.
 hf_add_pure_test(joint_test)
 
+# Deterministic Vehicle Physics Slice 1 (Slice VH1, the BEACHHEAD of FLAGSHIP #16): the SUSPENSION SPRING
+# JOINT integer core (engine/sim/vehicle.h) the GPU shaders/vehicle_spring_solve.comp.hlsl copies VERBATIM
+# + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxLength/FxNormalize/
+# FxBody/IntegrateBodyFull) + joint.h (WorldAnchor/FxDot) read-only. Pins SolveSpringJoint (a body stretched
+# beyond restLen pulled IN, compressed below restLen pushed OUT, at exactly restLen ~no positional
+# correction, a pinned body -> only the dynamic one moves, the velocity damping reduces the relative normal
+# speed, damping=0 -> no velocity change) + StepSpringWorld (a displaced body on a damped spring settles at
+# ~restLen at rest; two runs byte-identical; the undamped control keeps moving). Pure C++ (hf_core),
+# ASan-eligible. vehicle.h #includes sim/joint.h + sim/fpx.h read-only.
+hf_add_pure_test(vehicle_test)
+
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
 # fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
 # shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products

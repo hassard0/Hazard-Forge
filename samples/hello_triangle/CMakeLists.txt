@@ -884,6 +884,25 @@ hf_compile_shaders(
     # --joint-hinge showcase runs the CPU joint::StepArticulated (byte-identical by construction). NO new RHI;
     # existing shaders + goldens untouched (joint_ball_solve.comp + JT1's FxJoint/SolveBallJoint frozen).
     "shaders/joint_angular_solve.comp.hlsl:cs"
+    # Deterministic Vehicle Physics Slice 1 (Slice VH1, the BEACHHEAD of FLAGSHIP #16): the SUSPENSION
+    # SPRING JOINT. vehicle_spring_solve.comp runs `steps` iterations of StepSpringWorld = IntegrateBodyFull
+    # each body (the FPX4 6-DOF integrate) then `iters` Gauss-Seidel spring passes (each iterating ALL
+    # springs in the FIXED order applying SolveSpringJoint = cloth::SolveDistanceConstraint GENERALIZED to
+    # restLen != 0 + a stiffness scale + normal-velocity damping over the WORLD anchors [pa = a.pos +
+    # FxRotate(a.orient, anchorA), pb = b.pos + FxRotate(b.orient, anchorB)]; pen = len - restLen; corr =
+    # fxmul(pen, stiffness); the inverse-mass split moves the body centres; vRelN = FxDot(b.vel-a.vel, n);
+    # the damper subtracts fxmul(vRelN, damping) along n) then a ground floor-clamp — copied VERBATIM from
+    # engine/sim/vehicle.h::StepSpringWorld, so a pinned anchor holds + the spring holds the body at ~restLen
+    # + the damper kills the oscillation -> the body BOBS then SETTLES at rest (a chassis<->wheel suspension).
+    # The spring projection is SEQUENTIAL (Gauss-Seidel, order-dependent), so this is a SINGLE THREAD
+    # ([numthreads(1,1,1)], the joint_ball_solve.comp mirror) -> bit-exact GPU==CPU + cross-backend, NO
+    # atomics. solveEnabled=0 -> bodies UNCHANGED. Like joint_ball_solve.comp this is int64 (FxRotate/FxDot
+    # fxmul/fxdiv/FxISqrt) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal
+    # hf_gen_msl list; the Metal --vehicle-spring showcase runs the CPU vehicle::StepSpringWorld
+    # (byte-identical by construction, the joint_ball_solve.comp convention). Pure integer SSBO compute +
+    # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing shaders
+    # + goldens untouched (vehicle.h is the additive sibling; #includes joint.h + fpx.h read-only).
+    "shaders/vehicle_spring_solve.comp.hlsl:cs"
     # CL4 COLLISION. cloth_collide.comp FOLDS the CL3 PBD step (integrate + Gauss-Seidel constraint passes +
     # ground floor-clamp, copied VERBATIM from cloth_solve.comp/cloth.h) AND per-step COLLISION (project each
     # non-pinned particle out of a small STATIC set of SPHERE colliders along the outward normal, then a
