@@ -364,6 +364,8 @@ int main() {
             bool sawCgfQueryFeature = false;
             // Slice GF2: the deterministic-cgf-buoyancy capability is advertised.
             bool sawCgfBuoyancyFeature = false;
+            // Slice GF3: the deterministic-cgf-displace capability is advertised.
+            bool sawCgfDisplaceFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -506,6 +508,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-cgrain-render") sawCgrainRenderFeature = true;
                     if (AsString(el->value) == "deterministic-cgf-query") sawCgfQueryFeature = true;
                     if (AsString(el->value) == "deterministic-cgf-buoyancy") sawCgfBuoyancyFeature = true;
+                    if (AsString(el->value) == "deterministic-cgf-displace") sawCgfDisplaceFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -632,6 +635,7 @@ int main() {
         check(sawCgrainRenderFeature, "engine.features includes deterministic-cgrain-render");
         check(sawCgfQueryFeature, "engine.features includes deterministic-cgf-query");
         check(sawCgfBuoyancyFeature, "engine.features includes deterministic-cgf-buoyancy");
+        check(sawCgfDisplaceFeature, "engine.features includes deterministic-cgf-displace");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -836,6 +840,8 @@ int main() {
         bool sawCgfQueryShot = false;
         // Slice GF2: the --cgf-buoyancy-shot showcase flag is listed in the showcase manifest.
         bool sawCgfBuoyancyShot = false;
+        // Slice GF3: the --cgf-displace-shot showcase flag is listed in the showcase manifest.
+        bool sawCgfDisplaceShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1000,6 +1006,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--cgrain-render-shot") sawCgrainRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cgf-query-shot") sawCgfQueryShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cgf-buoyancy-shot") sawCgfBuoyancyShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--cgf-displace-shot") sawCgfDisplaceShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-contact-shot") sawGrainContactShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-friction-shot") sawGrainFrictionShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-lockstep-shot") sawGrainLockstepShot = true;
@@ -1129,6 +1136,7 @@ int main() {
         check(sawCgrainRenderShot, "showcases manifest includes --cgrain-render-shot");
         check(sawCgfQueryShot, "showcases manifest includes --cgf-query-shot");
         check(sawCgfBuoyancyShot, "showcases manifest includes --cgf-buoyancy-shot");
+        check(sawCgfDisplaceShot, "showcases manifest includes --cgf-displace-shot");
         check(sawGrainContactShot, "showcases manifest includes --grain-contact-shot");
         check(sawGrainFrictionShot, "showcases manifest includes --grain-friction-shot");
         check(sawGrainLockstepShot, "showcases manifest includes --grain-lockstep-shot");

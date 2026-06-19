@@ -600,6 +600,22 @@ hf_compile_shaders(
     # couple_gf.h::StepCGFBuoyancySteps (memcmp — the make-or-break). NO new RHI; GF1's cgf_gf/cgf_fg
     # {count,scan,emit} shaders + their goldens UNCHANGED (GF2 is additive; the GF1 cross-query passes stay int32 MSL-native).
     "shaders/cgf_buoyancy.comp.hlsl:cs"
+    # Deterministic Grain<->Fluid Coupling Slice 3 (Slice GF3, the CONTACT REACTION / DISPLACEMENT grain->fluid
+    # pass — the Newton's-3rd-law HALF of GF2, the 3rd slice of FLAGSHIP #13). ONE new int64 shader:
+    # cgf_displace.comp — ONE THREAD PER FLUID PARTICLE (multi-thread OVER fluid particles, each thread serially
+    # iterates its GF1 fgNeighbors grain list, the FIXED ascending GF1 emit order). For each grain that CONTAINS
+    # the fluid particle (dist < g.radius), it (1) accumulates the surface-snap push (snap the fluid particle to
+    # g.radius along the outward normal — LITERALLY grain.h::CollideGrainSphere with the GRAIN as the sphere, fluid
+    # particles are points) into a per-thread Jacobi dp + (2) applies the equal-opposite drag-reaction velocity
+    # impulse (toward the grain velocity), then writes pos += dp + the updated vel; ApplyGrainsToFluid copied
+    # VERBATIM from engine/sim/couple_gf.h. Per-fluid DISJOINT -> NO race, NO atomics, [numthreads(64,1,1)]
+    # MULTI-THREAD, NO TDR (the GR3/CG3/CP3 win). Because the FxLength/FxNormalize (FxISqrt) + the drag-reaction
+    # fxmul use int64, cgf_displace.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the
+    # Metal hf_gen_msl list; the Metal --cgf-displace showcase runs the CPU cgf::ApplyGrainsToFluid (byte-identical
+    # by construction). The GPU fluid array is PROVEN BIT-EXACT vs the CPU reference (memcmp — the make-or-break).
+    # NO new RHI; GF1/GF2 cgf code + shaders + their goldens UNCHANGED (GF3 is additive; the GF1 cross-query passes
+    # stay int32 MSL-native).
+    "shaders/cgf_displace.comp.hlsl:cs"
     # Deterministic Rigid<->Grain Coupling Slice 2 (Slice CG2, the CONTACT SUPPORT + DRAG grain->body pass — the
     # CRUX of FLAGSHIP #12, the FIRST momentum exchange). ONE new int64 shader: cgrain_support.comp — ONE THREAD
     # PER BODY (multi-thread OVER bodies, NOT per grain), each thread SERIALLY sums its body's CG1 gathered grain

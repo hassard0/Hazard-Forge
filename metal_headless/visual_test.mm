@@ -19830,6 +19830,150 @@ static int RunCgfBuoyancyShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GF3 — Deterministic Grain<->Fluid Coupling CONTACT REACTION / DISPLACEMENT showcase (--cgf-displace)
+// (the Newton's-3rd-law HALF of GF2, the 3rd slice of FLAGSHIP #13, the CG3/CP3 fluid-displacement twin). Like
+// --cgrain-displace / --couple-displace, the GF3 projection math is int64 (FxLength/FxNormalize via FxISqrt + the
+// drag-reaction fxmul) -> glslc can't parse int64 -> cgf_displace.comp is VULKAN-SPIR-V-ONLY (NOT in this dir's
+// hf_gen_msl list); on Metal the --cgf-displace showcase runs the CPU cgf::ApplyGrainsToFluid — the EXACT
+// bit-exact reference the Vulkan --cgf-displace-shot GPU==CPU memcmp compares against -> byte-identical to the
+// Vulkan GPU result BY CONSTRUCTION (the cgf_buoyancy.comp convention). The GF1 cross-query (re-run inside the
+// driver) stays int32 MSL-native. So this builds the SAME scene (a settled packed 12x4x6 grain bed + a 4x4x6
+// fluid block overlapping it, the grains seeded a small +X velocity, gravity -9.8 host-snapped, groundY=0,
+// dt=kOne/60), runs cgf::ApplyGrainsToFluid, and CPU-colors the SAME integer side-view displacement golden as
+// the Vulkan --cgf-displace-shot -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict
+// zero-differing-pixel bar). New golden tests/golden/metal/cgf_displace.png (baked on the Mac by the CONTROLLER);
+// two runs DIFF 0.0000. NO new RHI.
+static int RunCgfDisplaceShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgf   = hf::sim::cgf;
+    namespace grain = hf::sim::grain;
+    namespace fluid = hf::sim::fluid;
+
+    // The scene (== the Vulkan --cgf-displace-shot config). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 4;                 // 0.25 grain radius
+    const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (coupling radius)
+
+    // A packed grain bed: 12x4x6 = 288 grains, 0.5 spacing, settled by GR4 friction.
+    grain::GrainBlock gblock;
+    gblock.W = 12; gblock.H = 4; gblock.D = 6;
+    gblock.spacing = grain::kOne / 2;
+    gblock.radius = kRadius;
+    gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+    std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+    grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+    // A fluid block overlapping the bed (offset +0.125 in y so each fluid particle sits inside a grain's 0.25
+    // exclusion radius). 4x4x6 = 96 fluid particles.
+    fluid::FluidBlock fblock;
+    fblock.W = 4; fblock.H = 4; fblock.D = 6;
+    fblock.spacing = grain::kOne / 2;
+    fblock.origin = grain::FxVec3{0, bed[0].pos.y + grain::kOne / 8, 0};
+    std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+    auto makeWorld = [&]() {
+        cgf::CGFWorld w;
+        w.grains  = bed;
+        w.fluid   = fluidP;
+        w.h       = kH;
+        w.gravity = kGravity; w.dt = kDt; w.groundY = kGroundY;
+        for (grain::GrainParticle& g : w.grains)
+            g.vel = grain::FxVec3{(grain::fx)(2 * (int)grain::kOne), 0, 0};
+        return w;
+    };
+    cgf::CGFWorld world = makeWorld();
+    const int kGrainCount = (int)world.grains.size();
+    const int kFluidCount = (int)world.fluid.size();
+
+    // CPU ApplyGrainsToFluid (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against -> the Metal
+    // result is byte-identical to the Vulkan GPU result BY CONSTRUCTION).
+    const uint32_t kDisplaced = cgf::CountDisplacedFluid(world);
+    const cgf::CGFNeighbors cpuNbr = cgf::BuildCGFNeighbors(world);
+    cgf::CGFWorld cpuWorld = world;
+    cgf::ApplyGrainsToFluid(cpuWorld, cpuNbr);
+
+    std::printf("cgf-displace: {grains:%d, fluid:%d, displaced:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU cgf::ApplyGrainsToFluid, byte-identical to the Vulkan GPU result by construction]\n",
+                kGrainCount, kFluidCount, kDisplaced);
+
+    // determinism: two runs byte-identical.
+    {
+        cgf::CGFWorld b = world;
+        cgf::ApplyGrainsToFluid(b, cpuNbr);
+        if (b.fluid.size() != cpuWorld.fluid.size() ||
+            std::memcmp(b.fluid.data(), cpuWorld.fluid.data(),
+                        b.fluid.size() * sizeof(fluid::FluidParticle)) != 0)
+            return fail("cgf-displace: two runs differ (nondeterministic)");
+        std::printf("cgf-displace determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // no-penetration (the HONEST FL4/GR3/CG3 metric): penAfter < penBefore + displaced > 0 (the fluid parted).
+    {
+        const cgf::FluidGrainPenetration before = cgf::MeasureFluidGrainPenetration(world);
+        const cgf::FluidGrainPenetration after  = cgf::MeasureFluidGrainPenetration(cpuWorld);
+        if (!(kDisplaced > 0u) || !(after.summed < before.summed))
+            return fail("cgf-displace: did NOT part the fluid (penAfter >= penBefore or 0 displaced)");
+        std::printf("cgf-displace no-penetration: {penBefore:%lld, penAfter:%lld} (fluid parted from sand)\n",
+                    (long long)before.summed, (long long)after.summed);
+    }
+
+    // no-op: the fluid clear of the grains (zero grains) -> the fluid is unchanged.
+    {
+        cgf::CGFWorld clearWorld = world;
+        clearWorld.grains.clear();
+        std::vector<fluid::FluidParticle> beforeFluid = clearWorld.fluid;
+        const cgf::CGFNeighbors clearNbr = cgf::BuildCGFNeighbors(clearWorld);
+        cgf::ApplyGrainsToFluid(clearWorld, clearNbr);
+        if (std::memcmp(beforeFluid.data(), clearWorld.fluid.data(),
+                        beforeFluid.size() * sizeof(fluid::FluidParticle)) != 0)
+            return fail("cgf-displace: clear (zero grains) changed the fluid");
+        std::printf("cgf-displace clear: fluid unchanged (no-op)\n");
+    }
+
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the grain bed (dim sand) + the displaced fluid (cool
+    // droplets parted OUT of the grain volumes) — IDENTICAL to the Vulkan --cgf-displace-shot by construction. ---
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldW = 8, kWorldH = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
+        cx = kMargin + wx * kPxPerUnit;
+        cy = (int)imgH - kMargin - wy * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.55f, 0.42f, 0.22f}, 0);
+    }
+    for (int i = 0; i < kFluidCount; ++i) {
+        int cx, cy; toPx(cpuWorld.fluid[(size_t)i].pos.x, cpuWorld.fluid[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.18f, 0.55f, 0.95f}, 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgf displacement (fluid parted from sand, displaced %u)\n",
+                outPath, imgW, imgH, kDisplaced);
+    return 0;
+}
+
 // ===== Slice CG2 — Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG showcase (--cgrain-support) ====
 // (the CRUX of FLAGSHIP #12, the FIRST momentum exchange, the CP2 buoyancy twin with contact-support physics).
 // Like --couple-buoyancy / --grain-contact, the CG2 support/drag math is int64 (FxLength/FxNormalize via FxISqrt
@@ -37245,6 +37389,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cgf-buoyancy") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cgf_buoyancy.png";
             try { return RunCgfBuoyancyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgf-displace <out.png>: render the Deterministic Grain<->Fluid Coupling CONTACT REACTION /
+        // DISPLACEMENT grain->fluid showcase (Slice GF3, the Newton's-3rd-law HALF of GF2). Like --cgrain-displace,
+        // the GF3 projection math is int64 -> cgf_displace.comp is Vulkan-only; on Metal --cgf-displace runs the
+        // CPU cgf::ApplyGrainsToFluid — the EXACT bit-exact reference the Vulkan --cgf-displace-shot GPU==CPU
+        // memcmp compares against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. The SAME grain bed +
+        // a fluid block overlapping it parts the fluid out of the sand; the four proofs (GPU==CPU bit-exact,
+        // determinism, penAfter<penBefore + displaced>0, the zero-grain no-op) print. New golden
+        // tests/golden/metal/cgf_displace.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgf-displace") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgf_displace.png";
+            try { return RunCgfDisplaceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cgrain-support <out.png>: render the Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG
