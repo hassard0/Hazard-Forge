@@ -75,6 +75,7 @@
 #include "sim/couple_grain.h"   // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
 #include "sim/couple_gf.h"      // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
 #include "sim/fract.h"          // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
+#include "sim/joint.h"          // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -488,6 +489,7 @@ int main(int argc, char** argv) {
     const char* clothIntegrateShotPath = nullptr; // --cloth-integrate-shot <out.bmp> (Slice CL1: Deterministic GPU Cloth Q16.16 PARTICLE LATTICE INTEGRATOR, the BEACHHEAD of FLAGSHIP #8 — a 24x24 sheet with the top corners pinned integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/hanging lattice)
     const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
+    const char* jointBallShotPath = nullptr; // --joint-ball-shot <out.bmp> (Slice JT1: Deterministic Articulated-Body Ragdoll JOINT GRAPH + BALL-JOINT CONSTRAINT, the BEACHHEAD of FLAGSHIP #15 — a HANGING CHAIN (a pinned invMass-0 root + ~8 dynamic links, each ball-jointed to its parent at the link ends) settled K StepJointWorld steps under gravity by one GPU thread (shaders/joint_ball_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel ball passes [SolveBallJoint = cloth::SolveDistanceConstraint restLen-0 over the WORLD anchors, the correction translating the body centres — the JT1 translation-only split] -> ground clamp), GPU==CPU body array bit-exact vs joint.h::StepJointWorld, integer 2D side-view of the connected hanging/swinging chain; int64 -> joint_ball_solve.comp is Vulkan-only, Metal runs CPU StepJointWorld)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -986,6 +988,20 @@ int main(int argc, char** argv) {
         // as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's C1061, like the cl1/cl2/fpx shots.
         if (std::strcmp(argv[i], "--cloth-solve-shot") == 0 && i + 1 < argc) {
             clothSolveShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice JT1: --joint-ball-shot <out.bmp> — the Deterministic Articulated-Body Ragdoll JOINT GRAPH +
+        // BALL-JOINT CONSTRAINT (the BEACHHEAD of FLAGSHIP #15). A HANGING CHAIN (a pinned invMass-0 root + ~8
+        // dynamic links each ball-jointed to its parent at the link ends), StepJointWorld K steps x iters
+        // Gauss-Seidel ball passes under gravity -> the chain hangs/swings, links stay connected. One GPU
+        // thread runs the K-step StepJointWorld (IntegrateBodyFull + SolveBallJoint passes, copied VERBATIM
+        // from joint.h), GPU==CPU body array bit-exact vs joint.h::StepJointWorld. int64 FxRotate/fxdiv/FxISqrt
+        // -> joint_ball_solve.comp is Vulkan-only; Metal --joint-ball runs the CPU StepJointWorld. NO new RHI.
+        // Handled as a STANDALONE branch (not in the --shot else-if chain) to avoid MSVC's C1061, like the
+        // cl1/cl2/cl3/fpx/fract shots.
+        if (std::strcmp(argv[i], "--joint-ball-shot") == 0 && i + 1 < argc) {
+            jointBallShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -26486,6 +26502,329 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — cloth PBD drape side-view (%u constraints, %d pinned)\n",
                                 clothSolveShotPath, imgW, imgH, kConstraintCount, kPinned);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", clothSolveShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Articulated-Body Ragdoll JOINT GRAPH + BALL-JOINT CONSTRAINT (--joint-ball-shot
+        // <out.bmp>, Slice JT1, the BEACHHEAD of FLAGSHIP #15). A HANGING CHAIN: a static (pinned, invMass 0)
+        // root body at the top + a chain of dynamic bodies, each ball-jointed to its parent at the link ends
+        // (anchorA at the parent's lower end, anchorB at the child's upper end). The chain is stepped K times
+        // by a SINGLE-THREAD compute (shaders/joint_ball_solve.comp): each step = IntegrateBodyFull each body
+        // (the FPX4 6-DOF integrate) then iters Gauss-Seidel ball passes (each iterating ALL joints in the
+        // FIXED order applying SolveBallJoint = the verbatim cloth::SolveDistanceConstraint with restLen 0
+        // over the WORLD anchors [pa = a.pos + FxRotate(a.orient, anchorA), pb = b.pos + FxRotate(b.orient,
+        // anchorB)], the correction TRANSLATING the body centres — the JT1 translation-only split, NO
+        // lever-arm coupling) then a ground floor-clamp -> a hanging/swinging chain (the pinned root holds,
+        // the ball joints keep the links connected). The joint list is built ONCE on the host + uploaded; the
+        // integrate + projection math is copied VERBATIM from engine/sim/joint.h::StepJointWorld. ReadBuffer
+        // reads the integer Q16.16 body array; the CPU joint.h::StepJointWorld over the SAME chain must match
+        // it BIT-EXACT (memcmp, NO tol — the GPU==CPU make-or-break). solveEnabled=false -> bodies UNCHANGED.
+        // The golden is a PURE-INTEGER side-view of the chain (each body's integer (pos.x>>kFrac, pos.y>>kFrac)
+        // -> a disc, the joints as segments between world anchors, the pinned root white) -> identical both
+        // backends by construction. int64 FxRotate/fxdiv/FxISqrt -> joint_ball_solve.comp is VULKAN-ONLY
+        // (Metal --joint-ball runs the CPU StepJointWorld). NO new RHI.
+        if (jointBallShotPath) {
+            using math::Vec3;
+            namespace joint = hf::sim::joint;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic hanging chain (== the Metal --joint-ball config). gravity -9.8 host-snapped.
+            const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const joint::fx kDt = joint::kOne / 60;
+            const int kLinks = 8;                       // 8 dynamic links + 1 pinned root = 9 bodies
+            const int kBodyCount = kLinks + 1;
+            const int kSteps = 200;                     // settle the chain to a hang/swing
+            const int kIters = 16;                      // Gauss-Seidel ball passes per step (stiffer -> tight links)
+            const joint::fx kGroundY = (joint::fx)(-100 * (int)joint::kOne); // far below -> focus the hang
+            const joint::fx kLinkLen = joint::kOne;     // 1.0 world unit between consecutive link centres
+            const joint::fx kHalfLink = joint::kOne / 2; // anchor at the link END (half a link from centre)
+
+            // Build the world: a pinned root at (rootX, rootY), the links hanging straight down at rest, each
+            // ball-jointed to its parent. anchorA = the parent's LOWER end (-halfLink in y), anchorB = the
+            // child's UPPER end (+halfLink in y) -> at rest the two world anchors coincide (a connected chain).
+            const int rootX = 6, rootY = 20;
+            // A steady "wind" along +x (~1/3 g) so the chain settles at a clear DIAGONAL lean (a visibly
+            // non-vertical, deterministic hang) instead of a straight vertical drop.
+            const joint::fx kWindX = (joint::fx)(-kGravY / 3);   // ~+3.27 (a third of |g|), positive (+x)
+            joint::FxWorld world;
+            world.gravity = joint::FxVec3{kWindX, kGravY, 0};
+            world.groundY = kGroundY;
+            auto makeBody = [&](int gx, int gy, bool pinned) {
+                fpx::FxBody b;
+                b.pos = joint::FxVec3{(joint::fx)(gx * (int)joint::kOne), (joint::fx)(gy * (int)joint::kOne), 0};
+                b.vel = joint::FxVec3{0, 0, 0};
+                b.invMass = pinned ? 0 : joint::kOne;
+                b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+                b.radius  = 0;
+                b.orient  = fpx::FxQuat{0, 0, 0, joint::kOne};
+                b.angVel  = joint::FxVec3{0, 0, 0};
+                return b;
+            };
+            // Body 0 = pinned root; bodies 1..kLinks hang 1 unit apart below it (a vertical chain at rest).
+            // A small CONSTANT horizontal gravity component (a steady "wind") makes the whole chain settle at
+            // a clear DIAGONAL lean instead of straight down -> a visibly non-vertical, deterministic hang
+            // (the y-axis end-anchors keep the links strung out at 1-unit spacing). Set above as gravity.x.
+            world.bodies.push_back(makeBody(rootX, rootY, true));
+            for (int k = 1; k <= kLinks; ++k)
+                world.bodies.push_back(makeBody(rootX, rootY - k, false));
+
+            // The joints: link k connects body k-1 (parent) to body k (child). anchorA at the parent's lower
+            // end (-halfLink), anchorB at the child's upper end (+halfLink). For consecutive centres 1 unit
+            // apart at rest, the two world anchors coincide exactly.
+            std::vector<joint::FxJoint> joints;
+            for (int k = 1; k <= kLinks; ++k) {
+                joint::FxJoint j;
+                j.bodyA = (uint32_t)(k - 1);
+                j.bodyB = (uint32_t)k;
+                j.anchorA = joint::FxVec3{0, -kHalfLink, 0};   // parent's lower end
+                j.anchorB = joint::FxVec3{0,  kHalfLink, 0};   // child's upper end
+                j.kind = joint::kJointBall;
+                joints.push_back(j);
+            }
+            const uint32_t kJointCount = (uint32_t)joints.size();
+            const uint32_t kJointAlloc = kJointCount > 0u ? kJointCount : 1u;
+            (void)kLinkLen;
+
+            // std430 FxBody mirror (matches joint_ball_solve.comp FxBody): 16 x int32 (64 bytes).
+            struct FxBodyGpu {
+                int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+                int32_t ox, oy, oz, ow, ax, ay, az;
+            };
+            static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+            static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout (16 x int32)");
+            auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+                std::vector<FxBodyGpu> out(bs.size());
+                for (size_t i = 0; i < bs.size(); ++i) {
+                    const fpx::FxBody& b = bs[i];
+                    out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                                       b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                                       b.angVel.x, b.angVel.y, b.angVel.z};
+                }
+                return out;
+            };
+            const std::vector<FxBodyGpu> bodiesInit = packBodies(world.bodies);
+
+            auto makeBodiesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = bodiesInit.size() * sizeof(FxBodyGpu);
+                d.initialData = bodiesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // std430 FxJoint mirror (matches joint_ball_solve.comp FxJoint): 10 x int32 (40 bytes).
+            struct FxJointGpu { uint32_t bodyA, bodyB; int32_t aax, aay, aaz, abx, aby, abz; uint32_t kind; int32_t limit; };
+            static_assert(sizeof(FxJointGpu) == 40, "FxJointGpu std430 layout");
+            static_assert(sizeof(joint::FxJoint) == 40, "FxJoint std430 layout (10 x int32)");
+            std::vector<FxJointGpu> jointsInit((size_t)kJointAlloc, FxJointGpu{});
+            for (uint32_t e = 0; e < kJointCount; ++e) {
+                const joint::FxJoint& j = joints[e];
+                jointsInit[e] = FxJointGpu{j.bodyA, j.bodyB, j.anchorA.x, j.anchorA.y, j.anchorA.z,
+                                           j.anchorB.x, j.anchorB.y, j.anchorB.z, j.kind, j.limit};
+            }
+            rhi::BufferDesc jDesc;
+            jDesc.size = jointsInit.size() * sizeof(FxJointGpu);
+            jDesc.initialData = jointsInit.data();
+            jDesc.usage = rhi::BufferUsage::Storage;
+            auto jointsBuf = device->CreateBuffer(jDesc);
+
+            // Params (matches joint_ball_solve.comp JointSolveParams std430): int4 grav {gx,gy,gz,dt} + int4
+            // cfg {groundY, bodyCount, jointCount, steps} + int4 cfg2 {iters, solveEnabled, _, _}.
+            struct JointSolveParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(JointSolveParams) == 48, "JointSolveParams std430 layout");
+            auto makeParams = [&](int32_t solveEnabled) {
+                JointSolveParams p{};
+                p.grav[0] = kWindX; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = (int32_t)kJointCount; p.cfg[3] = kSteps;
+                p.cfg2[0] = kIters; p.cfg2[1] = solveEnabled; p.cfg2[2] = 0; p.cfg2[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 3 storage buffers (bodies, joints, params); SINGLE thread.
+            auto jointCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/joint_ball_solve.comp.hlsl.spv");
+            auto jointCs = device->CreateShaderModule({std::span<const uint32_t>(jointCsWords)});
+            rhi::ComputePipelineDesc jointCdesc;
+            jointCdesc.compute = jointCs.get();
+            jointCdesc.storageBufferCount = 3;
+            jointCdesc.pushConstantSize = 0;
+            jointCdesc.threadsPerGroupX = 1;
+            auto jointCompute = device->CreateComputePipeline(jointCdesc);
+
+            // Run the solve compute over a fresh bodies buffer + params, read back gBodies.
+            auto runSolve = [&](int32_t solveEnabled, std::vector<FxBodyGpu>& outBodies) {
+                auto bodiesBuf = makeBodiesBuf();
+                JointSolveParams params = makeParams(solveEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(JointSolveParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("joint_ball_solve", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*jointCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*jointsBuf, 1);
+                        cmd.BindStorageBuffer(*paramsBuf, 2);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outBodies.assign((size_t)kBodyCount, FxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(),
+                                   outBodies.size() * sizeof(FxBodyGpu), 0);
+            };
+
+            // === GPU solve (enabled, K steps) ===
+            std::vector<FxBodyGpu> gpuBodies;
+            runSolve(1, gpuBodies);
+
+            // === CPU reference: StepJointWorld K times over the SAME chain + the SAME joint list ===
+            joint::FxWorld cpuWorld = world;
+            joint::StepJointWorldSteps(cpuWorld, joints, kDt, kIters, kSteps);
+            std::vector<FxBodyGpu> cpuBodies = packBodies(cpuWorld.bodies);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K solve steps (integer memcmp, NO tol) — the
+            // MAKE-OR-BREAK.
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: joint-ball GPU body array != CPU StepJointWorld "
+                             "(a float/overflow/order divergence crept into the ball-joint solver?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("joint-ball: {bodies:%d, joints:%u, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kJointCount, kSteps);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            std::vector<FxBodyGpu> gpuBodies2;
+            runSolve(1, gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: joint-ball two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("joint-ball determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) the joints HOLD: after settling, every joint's world-anchor gap |pb - pa| is within a
+            // small Q16.16 band (the chain is connected, not flying apart). The Gauss-Seidel residual is
+            // deterministic-but-nonzero (the cloth/fract caveat); assert the gap is SMALL, not zero. The band
+            // is a small fraction of the link length (kLinkLen 1.0): a free-fall scatter would blow it up.
+            {
+                const joint::fx maxGap = joint::MaxAnchorGap(cpuWorld, joints);
+                const joint::fx kGapBand = joint::kOne / 2;   // 0.5 world units (half a link — clearly connected, not scattered; the Gauss-Seidel residual is deterministic-but-nonzero, the cloth/fract caveat)
+                if (maxGap >= kGapBand) {
+                    std::fprintf(stderr, "FATAL: joint-ball chain not connected (maxGap=%d >= band=%d)\n",
+                                 maxGap, kGapBand);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("joint-ball connected: max anchor gap %d within band\n", maxGap);
+            }
+
+            // PROOF (4) the pinned root HELD + the chain hung: the static root body is UNCHANGED (invMass 0)
+            // AND the chain's mean pos.y dropped below the root (it hung under gravity).
+            {
+                const bool rootHeld = std::memcmp(&gpuBodies[0], &bodiesInit[0], sizeof(FxBodyGpu)) == 0;
+                int64_t sumY = 0; int dynCount = 0;
+                for (int i = 1; i < kBodyCount; ++i) { sumY += gpuBodies[(size_t)i].py; ++dynCount; }
+                const joint::fx meanY = dynCount ? (joint::fx)(sumY / dynCount) : 0;
+                const bool dropped = meanY < gpuBodies[0].py;
+                if (!rootHeld || !dropped) {
+                    std::fprintf(stderr, "FATAL: joint-ball hang failed (rootHeld=%d, dropped=%d, meanY=%d, rootY=%d)\n",
+                                 (int)rootHeld, (int)dropped, meanY, gpuBodies[0].py);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("joint-ball hang: {rootHeld:true, dropped:true}\n");
+            }
+
+            // The disabled-path no-op: solveEnabled=false -> bodies UNCHANGED (byte-identical to the upload).
+            std::vector<FxBodyGpu> disabledBodies;
+            runSolve(0, disabledBodies);
+            if (disabledBodies.size() != bodiesInit.size() ||
+                std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                            bodiesInit.size() * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: joint-ball solveEnabled=false changed the bodies\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Golden: a PURE-INTEGER side-view of the hanging chain. Each body's integer
+            // (pos.x>>kFrac, pos.y>>kFrac) -> a pixel via a FIXED integer transform (y up); draw the joints
+            // as line segments between the two world anchors, then splat each body as a small disc (the
+            // pinned root bright white). CPU-colored from the read-back integers -> identical both backends. ---
+            const int kPxPerUnit = 24;
+            const int kMargin = 24;
+            const int kWorldW = 18, kWorldH = 24;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            auto putPx = [&](int ix, int iy, const Vec3& col) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            };
+            // Rebuild the settled CPU world's bodies into a joint::FxWorld so WorldAnchor uses the bit-exact
+            // settled positions for the joint segments.
+            // Draw each joint as a segment between its two world anchors (a dim grey line).
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int n = adx > ady ? adx : ady;
+                if (n == 0) { putPx(x0, y0, col); return; }
+                for (int s = 0; s <= n; ++s) {
+                    int ix = x0 + (int)((int64_t)dx * s / n);
+                    int iy = y0 + (int)((int64_t)dy * s / n);
+                    putPx(ix, iy, col);
+                }
+            };
+            for (const joint::FxJoint& j : joints) {
+                // The chain link: a segment between the two bodies' CENTRES (the visible link), plus the
+                // joint's world-anchor span (the connection point — near-coincident, the residual gap).
+                const fpx::FxBody& ba = cpuWorld.bodies[(size_t)j.bodyA];
+                const fpx::FxBody& bb = cpuWorld.bodies[(size_t)j.bodyB];
+                int cax, cay, cbx, cby;
+                worldToPx(ba.pos.x >> joint::kFrac, ba.pos.y >> joint::kFrac, cax, cay);
+                worldToPx(bb.pos.x >> joint::kFrac, bb.pos.y >> joint::kFrac, cbx, cby);
+                drawLine(cax, cay, cbx, cby, Vec3{0.55f, 0.55f, 0.6f});
+                const joint::FxVec3 pa = joint::WorldAnchor(ba, j.anchorA);
+                const joint::FxVec3 pb = joint::WorldAnchor(bb, j.anchorB);
+                int ax, ay, bx, by;
+                worldToPx(pa.x >> joint::kFrac, pa.y >> joint::kFrac, ax, ay);
+                worldToPx(pb.x >> joint::kFrac, pb.y >> joint::kFrac, bx, by);
+                drawLine(ax, ay, bx, by, Vec3{0.85f, 0.7f, 0.3f});
+            }
+            // Draw each body as a small disc; the pinned root white, the links hashColor'd.
+            for (int i = 0; i < kBodyCount; ++i) {
+                const int wx = gpuBodies[(size_t)i].px >> joint::kFrac;
+                const int wy = gpuBodies[(size_t)i].py >> joint::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                const bool pinned = (gpuBodies[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+                const Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i + 1u);
+                for (int dy = -2; dy <= 2; ++dy)
+                    for (int dx = -2; dx <= 2; ++dx)
+                        if (dx * dx + dy * dy <= 4) putPx(cx + dx, cy + dy, col);
+            }
+            bool ok = WriteBMP(jointBallShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — ball-joint hanging chain side-view (%d bodies, %u joints)\n",
+                                jointBallShotPath, imgW, imgH, kBodyCount, kJointCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", jointBallShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

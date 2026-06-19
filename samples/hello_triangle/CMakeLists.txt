@@ -852,6 +852,23 @@ hf_compile_shaders(
     # the fpx_solve.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU particle
     # array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/cloth_solve.comp.hlsl:cs"
+    # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the
+    # JOINT GRAPH + BALL-JOINT CONSTRAINT. joint_ball_solve.comp runs `steps` iterations of StepJointWorld
+    # = IntegrateBodyFull each body (the FPX4 6-DOF integrate) then `iters` Gauss-Seidel ball passes (each
+    # iterating ALL joints in the FIXED order applying SolveBallJoint = cloth::SolveDistanceConstraint with
+    # restLen 0 over the WORLD anchors [pa = a.pos + FxRotate(a.orient, anchorA), pb = b.pos +
+    # FxRotate(b.orient, anchorB)], the correction applied to the body CENTRES — the JT1 translation-only
+    # split, NO lever-arm/angular coupling [JT2]) then a ground floor-clamp — copied VERBATIM from
+    # engine/sim/joint.h::StepJointWorld, so the pinned root holds + the ball joints keep the links
+    # connected -> the chain HANGS / SWINGS (unlike independent free-fall). The ball projection is
+    # SEQUENTIAL (Gauss-Seidel, order-dependent), so this is a SINGLE THREAD ([numthreads(1,1,1)], the
+    # cloth_solve.comp/fpx_solve.comp mirror) -> bit-exact GPU==CPU + cross-backend, NO atomics.
+    # solveEnabled=0 -> bodies UNCHANGED. Like cloth_solve.comp / fpx_solve.comp this is int64 (FxRotate
+    # fxmul/fxdiv/FxISqrt) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal
+    # hf_gen_msl list; the Metal --joint-ball showcase runs the CPU joint::StepJointWorld (byte-identical
+    # by construction, the cloth_solve.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
+    # GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/joint_ball_solve.comp.hlsl:cs"
     # CL4 COLLISION. cloth_collide.comp FOLDS the CL3 PBD step (integrate + Gauss-Seidel constraint passes +
     # ground floor-clamp, copied VERBATIM from cloth_solve.comp/cloth.h) AND per-step COLLISION (project each
     # non-pinned particle out of a small STATIC set of SPHERE colliders along the outward normal, then a
