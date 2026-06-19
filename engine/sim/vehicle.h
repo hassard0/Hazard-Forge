@@ -854,5 +854,120 @@ inline void StepVehicleDrivenSteps(Vehicle& v, const VehicleConfig& cfg,
         StepVehicleDriven(v, cfg, commands, (uint32_t)t, dt, iters, solveIters);
 }
 
+// ====================================================================================================
+// Slice VH5 — LOCKSTEP + ROLLBACK (THE NETCODE HEADLINE of FLAGSHIP #16: DETERMINISTIC VEHICLE PHYSICS,
+// hf::sim::vehicle). VH1-VH4 built a drivable car (suspension -> rig -> drive/steer -> traction). VH5
+// proves the bit-exact driven tick (StepVehicleDriven) is true cross-platform LOCKSTEP + ROLLBACK — the
+// FPX5/FR5/GR5/CG5/JT5 twin. Two peers fed ONLY the input command stream (NOT full state) re-derive the
+// authority's exact car trajectory bit-for-bit; a mispredicted input is corrected by rolling back to a
+// saved snapshot + re-simulating. PURE CPU (NO GPU dispatch, NO new shader, NO new RHI). ADDITIVE — the
+// VH1-VH4 code above is byte-FROZEN; VH5 only APPENDS the snapshot + the three harness functions.
+//
+// THE ONE VH-SPECIFIC TWIST — the snapshot must include the HINGE AXES. The ragdoll JT5 snapshot was just
+// the fpx::FxWorld (bodies); JT5 reused fpx::SnapshotWorld/RestoreWorld VERBATIM. But a vehicle's kCmdSteer
+// MUTATES hinges[i].axis (the steered heading) and ApplyWheelTraction READS those axes — so the four hinge
+// axes are LIVE replayable state. VehicleSnapshot therefore captures BOTH the body world (world.bodies, via
+// fpx::SnapshotWorld) AND the four hinges[i].axis. RestoreVehicle restores both. The springs are immutable
+// (restLen/stiffness/damping never change) so they are NOT snapshotted; the chassis/wheel indices are
+// structural constants. (We capture EXACTLY what mutates: bodies + hinge axes.)
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only, PURE CPU. NO new shader, NO new RHI. VH5
+// reuses fpx::SnapshotWorld/RestoreWorld read-only for the body half (fpx.h FROZEN) and adds the hinge axes
+// alongside; the three harness functions are the JT5 SimRagdollTick/RunRagdollLockstep/RunRagdollRollback
+// twins with StepVehicleDriven as the per-tick step.
+
+// ----- VehicleSnapshot: the captured mutable vehicle state (bodies + the 4 steered hinge axes) ----------
+// The body world (deep-copied via fpx::SnapshotWorld — the std::vector<FxBody> + gravity/groundY scalars)
+// PLUS the four hinge axes (the steered headings kCmdSteer mutates + ApplyWheelTraction reads). Captures
+// EXACTLY the mutable state — springs (immutable) + the structural indices are NOT part of the snapshot.
+struct VehicleSnapshot {
+    fpx::FxWorld bodies;        // the body world (fpx::SnapshotWorld deep-copy: bodies + gravity/groundY)
+    FxVec3       hingeAxis[4];  // the 4 steered hinge axes (kCmdSteer-mutated, ApplyWheelTraction-read)
+};
+
+// ----- SnapshotVehicle: deep-copy the mutable vehicle state (the rollback restore point) ----------------
+// Reuses fpx::SnapshotWorld VERBATIM for the bodies (a value copy -> deep-copies the bodies vector) + copies
+// the four hinge axes. Bit-exact round-trip with RestoreVehicle. The four hinge slots are captured from the
+// FIRST four hinges in the fixed VH2 corner order (0/1 front, 2/3 rear); a vehicle always has 4.
+inline VehicleSnapshot SnapshotVehicle(const Vehicle& v) {
+    VehicleSnapshot snap;
+    snap.bodies = fpx::SnapshotWorld(v.world);
+    for (int k = 0; k < 4; ++k)
+        snap.hingeAxis[k] = ((size_t)k < v.hinges.size()) ? v.hinges[(size_t)k].axis : FxVec3{0, 0, 0};
+    return snap;
+}
+
+// ----- RestoreVehicle: restore the mutable vehicle state from a snapshot (the rollback) -----------------
+// Restores BOTH the body world (fpx::RestoreWorld) AND the four hinge axes. Bit-exact round-trip:
+// RestoreVehicle(v, SnapshotVehicle(v0)) leaves v's bodies + hinge axes == v0's byte-for-byte. Springs +
+// indices are untouched (immutable / structural).
+inline void RestoreVehicle(Vehicle& v, const VehicleSnapshot& snap) {
+    fpx::RestoreWorld(v.world, snap.bodies);
+    for (int k = 0; k < 4; ++k)
+        if ((size_t)k < v.hinges.size()) v.hinges[(size_t)k].axis = snap.hingeAxis[k];
+}
+
+// ----- SimVehicleTick: the deterministic per-tick step (the JT5 SimRagdollTick twin) -------------------
+// One StepVehicleDriven step — which ALREADY applies every command with cmd.tick == tick in ARRAY ORDER at
+// its prologue (the VH3/VH4 contract), then runs PHASE A spring / PHASE B hinge / PHASE C traction / PHASE D
+// contacts. Pure integer, fixed op order -> bit-identical on every peer/platform. (No new command type —
+// reuses the vehicle-local kCmdDriveTorque/kCmdSteer through ApplyVehicleCommand inside StepVehicleDriven.)
+inline void SimVehicleTick(Vehicle& v, const VehicleConfig& cfg, const std::vector<FxCommand>& commands,
+                           uint32_t tick, fx dt, int iters, int solveIters) {
+    StepVehicleDriven(v, cfg, commands, tick, dt, iters, solveIters);
+}
+
+// ----- RunVehicleLockstep: authority + replica from the SAME inputs, bit-identical every tick ----------
+// THE peer entry point (the JT5 RunRagdollLockstep / fpx::RunLockstep control flow over SimVehicleTick).
+// Run `ticks` SimVehicleTicks from a COPY of `initialVehicle`, applying the command stream -> the converged
+// car. authority = RunVehicleLockstep(cfg, init, commands, N, ...); replica = RunVehicleLockstep(cfg, init,
+// commands, N, ...) from the SAME init + stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by
+// determinism (the lockstep proof memcmps the bodies + the hinge axes). cfg is the CONSTANT config (NOT
+// snapshotted). Returns the converged authority Vehicle (the caller memcmps two runs for the proof).
+inline Vehicle RunVehicleLockstep(const VehicleConfig& cfg, const Vehicle& initialVehicle,
+                                  const std::vector<FxCommand>& commands, int ticks, fx dt, int iters,
+                                  int solveIters) {
+    Vehicle v = initialVehicle;
+    for (int t = 0; t < ticks; ++t)
+        SimVehicleTick(v, cfg, commands, (uint32_t)t, dt, iters, solveIters);
+    return v;
+}
+
+// ----- RunVehicleRollback: snapshot -> mispredict diverges -> rollback -> corrected == authority --------
+// The rollback harness (the JT5 RunRagdollRollback / fpx::RunRollback control flow over SimVehicleTick).
+// (1) advance ticks 0..divergeTick from `initialVehicle` applying authorityCommands; (2) SAVE a
+// VehicleSnapshot AT divergeTick (SnapshotVehicle — the bodies + the STEERED hinge axes); (2b) speculatively
+// advance <=3 ticks with the MISPREDICTED stream (the wrong drive/steer — the client prediction that
+// diverges); (3) ROLLBACK — RestoreVehicle to the snapshot (restoring the bodies AND the steered hinge
+// axes) + RE-SIMULATE divergeTick..ticks with the CORRECT authorityCommands -> the corrected final car. The
+// proof asserts this == RunVehicleLockstep(cfg, init, authorityCommands, ticks) (rollback corrected the
+// misprediction EXACTLY) AND that the speculative pre-rollback state DIFFERED from authority (a real
+// divergence — including a steered-hinge divergence — was fixed). NOTE: snapshotTick == divergeTick (the
+// restore point IS the divergence point, the JT5 mispredictTick convention); we keep a single divergeTick
+// parameter so the snapshot is taken at exactly the tick the misprediction begins. Reuses SnapshotVehicle/
+// RestoreVehicle (which carry the hinge axes). cfg is CONSTANT, NOT snapshotted.
+inline Vehicle RunVehicleRollback(const VehicleConfig& cfg, const Vehicle& initialVehicle,
+                                  const std::vector<FxCommand>& authorityCommands,
+                                  const std::vector<FxCommand>& mispredictCommands, int snapshotTick,
+                                  int divergeTick, int ticks, fx dt, int iters, int solveIters) {
+    (void)snapshotTick;   // the restore point is divergeTick (snapshotTick == divergeTick by contract)
+    Vehicle v = initialVehicle;
+    // (1) advance 0..divergeTick with the authoritative stream.
+    for (int t = 0; t < divergeTick; ++t)
+        SimVehicleTick(v, cfg, authorityCommands, (uint32_t)t, dt, iters, solveIters);
+    // (2) SAVE the snapshot at divergeTick (the rollback restore point — bodies + STEERED hinge axes).
+    const VehicleSnapshot snap = SnapshotVehicle(v);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (bounded to the remaining ticks).
+    int specTicks = ticks - divergeTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimVehicleTick(v, cfg, mispredictCommands, (uint32_t)(divergeTick + s), dt, iters, solveIters);
+    // (3) ROLLBACK: restore the snapshot (bodies + hinge axes) + re-sim divergeTick..ticks with authStream.
+    RestoreVehicle(v, snap);
+    for (int t = divergeTick; t < ticks; ++t)
+        SimVehicleTick(v, cfg, authorityCommands, (uint32_t)t, dt, iters, solveIters);
+    return v;
+}
+
 }  // namespace vehicle
 }  // namespace hf::sim

@@ -718,6 +718,151 @@ int main() {
         check(same, "StepVehicleDriven determinism: two runs BYTE-IDENTICAL");
     }
 
+    // ============================================================================================
+    // Slice VH5 — LOCKSTEP + ROLLBACK (SnapshotVehicle / RestoreVehicle / SimVehicleTick /
+    // RunVehicleLockstep / RunVehicleRollback). The bit-exact driven tick is true cross-platform LOCKSTEP +
+    // ROLLBACK: two peers fed ONLY the command stream re-derive the car bit-for-bit; a mispredicted steer is
+    // corrected by rolling back to a snapshot (INCLUDING the steered hinge axes) + re-simulating. PURE CPU.
+    // ============================================================================================
+
+    // A bodies+hinge-axes equality predicate (the lockstep proof: the snapshot captures BOTH).
+    auto vehicleEqual = [](const vehicle::Vehicle& a, const vehicle::Vehicle& b) {
+        if (a.world.bodies.size() != b.world.bodies.size()) return false;
+        if (std::memcmp(a.world.bodies.data(), b.world.bodies.data(),
+                        a.world.bodies.size() * sizeof(fpx::FxBody)) != 0) return false;
+        if (a.hinges.size() != b.hinges.size()) return false;
+        for (size_t i = 0; i < a.hinges.size(); ++i) {
+            const vehicle::FxVec3& xa = a.hinges[i].axis;
+            const vehicle::FxVec3& xb = b.hinges[i].axis;
+            if (xa.x != xb.x || xa.y != xb.y || xa.z != xb.z) return false;
+        }
+        return true;
+    };
+    // A snapshot==vehicle predicate (the round-trip proof: bodies + the 4 captured hinge axes).
+    auto snapEqualsVehicle = [](const vehicle::VehicleSnapshot& s, const vehicle::Vehicle& v) {
+        if (s.bodies.bodies.size() != v.world.bodies.size()) return false;
+        if (std::memcmp(s.bodies.bodies.data(), v.world.bodies.data(),
+                        v.world.bodies.size() * sizeof(fpx::FxBody)) != 0) return false;
+        for (int k = 0; k < 4; ++k) {
+            const vehicle::FxVec3& sa = s.hingeAxis[k];
+            const vehicle::FxVec3& va = v.hinges[(size_t)k].axis;
+            if (sa.x != va.x || sa.y != va.y || sa.z != va.z) return false;
+        }
+        return true;
+    };
+
+    // The shared VH5 drive+steer scene (a non-trivial path: spin the rear wheels every tick + steer a front
+    // hinge at a few ticks so the steered hinge axes become live replayable state the snapshot must carry).
+    auto buildVh5Stream = [&](const vehicle::Vehicle& veh, int ticks) {
+        std::vector<vehicle::FxCommand> stream;
+        for (int t = 0; t < ticks; ++t) {
+            stream.push_back(driveCmd((uint32_t)t, veh.wheelIndex[2], vehicle::kOne));
+            stream.push_back(driveCmd((uint32_t)t, veh.wheelIndex[3], vehicle::kOne));
+        }
+        // Steer the front-right hinge (index 0) at ticks 4 and 9 -> the hinge axis is genuinely mutated.
+        stream.push_back(steerCmd(4u, 0u, vehicle::kOne / 4));
+        stream.push_back(steerCmd(9u, 0u, vehicle::kOne / 4));
+        return stream;
+    };
+
+    const vehicle::fx kVh5Dt = vehicle::kOne / 60;
+    const int kVh5Iters = 16, kVh5SolveIters = 8, kVh5Ticks = 40;
+    const int kVh5DivergeTick = 12;
+
+    // ================= SnapshotVehicle/RestoreVehicle round-trip INCLUDING the hinge axes ================
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        const std::vector<vehicle::FxCommand> stream = buildVh5Stream(veh, kVh5Ticks);
+        // Advance a few ticks (PAST the first steer at tick 4) so the bodies moved AND a front hinge axis
+        // was steered off its rest heading -> the snapshot must capture the steered state.
+        for (int t = 0; t < 8; ++t)
+            vehicle::SimVehicleTick(veh, cfg, stream, (uint32_t)t, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        // The front hinge actually steered (axis.x != 0 -> a non-vacuous hinge-axis-in-snapshot proof).
+        check(veh.hinges[0].axis.x != 0,
+              "VH5 snapshot scene: the front hinge axis was steered off its rest heading (axis.x != 0)");
+        const vehicle::VehicleSnapshot snap = vehicle::SnapshotVehicle(veh);
+        check(snapEqualsVehicle(snap, veh),
+              "VH5 SnapshotVehicle: captures the bodies AND the 4 hinge axes BIT-EXACT");
+        // Mutate (drive+steer a few more ticks -> the bodies AND the steered hinge axis change), then restore.
+        const vehicle::FxVec3 preAxis = veh.hinges[0].axis;
+        for (int t = 8; t < 12; ++t)
+            vehicle::SimVehicleTick(veh, cfg, stream, (uint32_t)t, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        // (tick 9 steered the front hinge again -> the live axis differs from the snapshot's.)
+        check(veh.hinges[0].axis.x != preAxis.x || veh.hinges[0].axis.y != preAxis.y ||
+              veh.hinges[0].axis.z != preAxis.z,
+              "VH5 snapshot scene: mutation changed the steered hinge axis (a real hinge divergence)");
+        vehicle::RestoreVehicle(veh, snap);
+        check(snapEqualsVehicle(snap, veh),
+              "VH5 RestoreVehicle: restores the bodies AND the hinge axes to the snapshot BIT-EXACT");
+        check(veh.hinges[0].axis.x == preAxis.x && veh.hinges[0].axis.y == preAxis.y &&
+              veh.hinges[0].axis.z == preAxis.z,
+              "VH5 RestoreVehicle: the restored hinge axis == the pre-mutation steered axis");
+    }
+
+    // ================= RunVehicleLockstep: authority == replica BIT-IDENTICAL (inputs-only) ==============
+    {
+        vehicle::VehicleConfig cfg;
+        const vehicle::Vehicle init = vehicle::VehicleFromConfig(cfg);
+        const std::vector<vehicle::FxCommand> stream = buildVh5Stream(init, kVh5Ticks);
+        const vehicle::Vehicle authority =
+            vehicle::RunVehicleLockstep(cfg, init, stream, kVh5Ticks, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        const vehicle::Vehicle replica =
+            vehicle::RunVehicleLockstep(cfg, init, stream, kVh5Ticks, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        check(vehicleEqual(authority, replica),
+              "VH5 lockstep: authority == replica BIT-IDENTICAL (inputs-only re-sim, bodies + hinge axes)");
+        // The stream did non-trivial work: the steer re-aimed the front hinge away from its rest lateral
+        // heading (axis.x != 0) -> the replay is non-vacuous.
+        check(authority.hinges[0].axis.x != 0,
+              "VH5 lockstep: the steer stream re-aimed the front hinge (the inputs do work)");
+    }
+
+    // ================= RunVehicleRollback: mispredict diverges, rollback corrects to authority ===========
+    {
+        vehicle::VehicleConfig cfg;
+        const vehicle::Vehicle init = vehicle::VehicleFromConfig(cfg);
+        const std::vector<vehicle::FxCommand> authStream = buildVh5Stream(init, kVh5Ticks);
+        // The MISPREDICTED stream: authStream + a WRONG strong steer on the front hinge AT divergeTick (so
+        // the divergence is specifically a STEERED-HINGE divergence — the VH twist the snapshot must carry).
+        std::vector<vehicle::FxCommand> mispredictStream = authStream;
+        mispredictStream.push_back(steerCmd((uint32_t)kVh5DivergeTick, 0u, vehicle::kOne));   // wrong big steer
+
+        const vehicle::Vehicle authority =
+            vehicle::RunVehicleLockstep(cfg, init, authStream, kVh5Ticks, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        const vehicle::Vehicle rolledBack =
+            vehicle::RunVehicleRollback(cfg, init, authStream, mispredictStream, kVh5DivergeTick,
+                                        kVh5DivergeTick, kVh5Ticks, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        const vehicle::Vehicle mispredicted =
+            vehicle::RunVehicleLockstep(cfg, init, mispredictStream, kVh5Ticks, kVh5Dt, kVh5Iters,
+                                        kVh5SolveIters);
+        check(vehicleEqual(rolledBack, authority),
+              "VH5 rollback: corrected == authority BIT-EXACT (bodies + hinge axes)");
+        check(!vehicleEqual(mispredicted, authority),
+              "VH5 rollback: the mispredicted state DIFFERED from authority (a real divergence, non-vacuous)");
+        // The divergence is specifically a STEERED-HINGE divergence: the mispredicted front hinge axis differs
+        // from authority's (the snapshot/restore preserving the hinge axes is what fixes it).
+        check(mispredicted.hinges[0].axis.x != authority.hinges[0].axis.x ||
+              mispredicted.hinges[0].axis.y != authority.hinges[0].axis.y ||
+              mispredicted.hinges[0].axis.z != authority.hinges[0].axis.z,
+              "VH5 rollback: the mispredicted front-hinge axis diverged (the steered-state divergence)");
+        check(rolledBack.hinges[0].axis.x == authority.hinges[0].axis.x &&
+              rolledBack.hinges[0].axis.y == authority.hinges[0].axis.y &&
+              rolledBack.hinges[0].axis.z == authority.hinges[0].axis.z,
+              "VH5 rollback: the corrected front-hinge axis == authority (the steered state was restored)");
+    }
+
+    // ================= RunVehicleLockstep: two full runs byte-identical (determinism) ====================
+    {
+        vehicle::VehicleConfig cfg;
+        const vehicle::Vehicle init = vehicle::VehicleFromConfig(cfg);
+        const std::vector<vehicle::FxCommand> stream = buildVh5Stream(init, kVh5Ticks);
+        const vehicle::Vehicle a =
+            vehicle::RunVehicleLockstep(cfg, init, stream, kVh5Ticks, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        const vehicle::Vehicle b =
+            vehicle::RunVehicleLockstep(cfg, init, stream, kVh5Ticks, kVh5Dt, kVh5Iters, kVh5SolveIters);
+        check(vehicleEqual(a, b), "VH5 determinism: two full lockstep runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("vehicle_test: ALL PASS\n");
     else std::printf("vehicle_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;
