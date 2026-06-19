@@ -16703,6 +16703,291 @@ static int RunFractCellsShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION showcase (Slice FR2, the 2nd slice of
+// FLAGSHIP #14). The TRUE pass is identical on both backends: the FR1 lattice (32x32x16) + the fixed seed
+// set are classified to a cellId per sample (fract_classify.comp.gen.metal, FR1), then FR2 turns each
+// NON-EMPTY cell into a FRAGMENT RECORD via the GR2/FL2 count->scan->emit CSR over cellId (cells ==
+// seedCount) + a per-fragment reduction — FOUR pure-int32 MSL-NATIVE passes (a TRUE GPU pass on Metal,
+// NOT a CPU fallback): fract_emit_count (one thread/sample InterlockedAdd into its cell's counter) ->
+// barrier -> fract_emit_scan ([numthreads(1,1,1)] exclusive prefix-sum + the CL2/MC3 stream-compaction)
+// -> barrier -> fract_emit_emit (SINGLE-THREAD ascending-sample scatter) -> barrier -> fract_reduce (one
+// thread/FRAGMENT reduce its CSR slice -> its FractFragment record). ReadBuffer reads the GPU fragment
+// array + CSR + remap, PROVEN BIT-EXACT vs the CPU fract.h::ExtractFragments reference (memcmp, NO tol —
+// the same GPU==CPU proof the Vulkan --fract-fragments-shot runs). The image golden marks each fragment's
+// centroid + AABB over the FR1 cell mosaic, identical to the Vulkan path BY CONSTRUCTION (same integer
+// bits -> same RGB). New golden tests/golden/metal/fract_fragments.png; two runs DIFF 0.0000. NO new RHI.
+static int RunFractFragmentsShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fract = hf::sim::fract;
+    namespace vg = render::vg;
+
+    const int kNx = 32, kNy = 32, kNz = 16;
+    fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+    const int sampleCount = field.sampleCount();
+    const std::vector<fract::FractSeed> seeds = {
+        { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+        {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+        {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+        {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+    };
+    const int kM = (int)seeds.size();
+
+    const int kTilesX = 4, kTilesY = 4, kPad = 2;
+    const uint32_t imgW = (uint32_t)(kTilesX * kNx + (kTilesX + 1) * kPad);
+    const uint32_t imgH = (uint32_t)(kTilesY * kNy + (kTilesY + 1) * kPad);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // ---- FR1 classify (cellId per sample). ----
+    struct SeedGpu { int32_t x, y, z, w; };
+    static_assert(sizeof(SeedGpu) == 16, "SeedGpu std430 layout");
+    std::vector<SeedGpu> seedsGpu((size_t)kM);
+    for (int k = 0; k < kM; ++k)
+        seedsGpu[(size_t)k] = SeedGpu{seeds[(size_t)k].x, seeds[(size_t)k].y, seeds[(size_t)k].z, 0};
+    rhi::BufferDesc sDesc;
+    sDesc.size = seedsGpu.size() * sizeof(SeedGpu); sDesc.initialData = seedsGpu.data();
+    sDesc.usage = rhi::BufferUsage::Storage;
+    auto seedsBuf = device->CreateBuffer(sDesc);
+
+    struct FractParams { int32_t dims[4]; int32_t cfg[4]; };
+    static_assert(sizeof(FractParams) == 32, "FractParams std430 layout");
+    FractParams clsParams{};
+    clsParams.dims[0] = kNx; clsParams.dims[1] = kNy; clsParams.dims[2] = kNz; clsParams.dims[3] = 0;
+    clsParams.cfg[0] = kM; clsParams.cfg[1] = 1; clsParams.cfg[2] = sampleCount; clsParams.cfg[3] = 0;
+    rhi::BufferDesc clsPDesc;
+    clsPDesc.size = sizeof(FractParams); clsPDesc.initialData = &clsParams;
+    clsPDesc.usage = rhi::BufferUsage::Storage;
+    auto clsParamsBuf = device->CreateBuffer(clsPDesc);
+
+    std::vector<uint32_t> cellsInit((size_t)sampleCount, 0u);
+    rhi::BufferDesc cDesc;
+    cDesc.size = cellsInit.size() * sizeof(uint32_t); cDesc.initialData = cellsInit.data();
+    cDesc.usage = rhi::BufferUsage::Storage;
+    auto cellsBuf = device->CreateBuffer(cDesc);
+
+    auto clsCs = loadMSL("fract_classify.comp.gen.metal", "fract_classify_main");
+    rhi::ComputePipelineDesc clsCd;
+    clsCd.compute = clsCs.get(); clsCd.storageBufferCount = 3; clsCd.threadsPerGroupX = 64;
+    auto clsCompute = device->CreateComputePipeline(clsCd);
+
+    // ---- FR2 params + record layout. ----
+    struct FractFragParams { int32_t cfg0[4]; int32_t cfg1[4]; };
+    static_assert(sizeof(FractFragParams) == 32, "FractFragParams std430 layout");
+    FractFragParams fp0{};
+    fp0.cfg0[0] = sampleCount; fp0.cfg0[1] = kM; fp0.cfg0[2] = kNx; fp0.cfg0[3] = kNy;
+    fp0.cfg1[0] = kNz; fp0.cfg1[1] = kM; fp0.cfg1[2] = 1; fp0.cfg1[3] = 0;   // fragCount=kM (reduce bound)
+
+    struct FragGpu {
+        int32_t cx, cy, cz, minx, miny, minz, maxx, maxy, maxz, boundRadiusSq, boundRadius;
+        uint32_t volume, cellId; int32_t invMass;
+    };
+    static_assert(sizeof(FragGpu) == 56, "FragGpu std430 layout (== fract.h::FractFragment)");
+
+    auto csCount = loadMSL("fract_emit_count.comp.gen.metal", "fract_emit_count_main");
+    auto csScan  = loadMSL("fract_emit_scan.comp.gen.metal",  "fract_emit_scan_main");
+    auto csEmit  = loadMSL("fract_emit_emit.comp.gen.metal",  "fract_emit_emit_main");
+    auto csRed   = loadMSL("fract_reduce.comp.gen.metal",     "fract_reduce_main");
+    auto mkPipe = [&](rhi::IShaderModule* m, int sbCount) {
+        rhi::ComputePipelineDesc d; d.compute = m; d.storageBufferCount = sbCount; d.threadsPerGroupX = 64;
+        return device->CreateComputePipeline(d);
+    };
+    auto pCount = mkPipe(csCount.get(), 3);
+    auto pScan  = mkPipe(csScan.get(), 6);
+    auto pEmit  = mkPipe(csEmit.get(), 5);
+    auto pRed   = mkPipe(csRed.get(), 5);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+
+    struct FR2Out {
+        std::vector<uint32_t> fragStart, fragSamples, cellToFragment, fragmentToCell;
+        std::vector<FragGpu> fragments; uint32_t fragCount = 0;
+    };
+    auto runFR2 = [&](FR2Out& out) {
+        std::vector<uint32_t> zerosCells((size_t)kM, 0u);
+        std::vector<uint32_t> zerosStart((size_t)kM + 1u, 0u);
+        std::vector<uint32_t> zerosSamples((size_t)sampleCount, 0u);
+        std::vector<uint32_t> sentToFrag((size_t)kM, fract::kNoFragment);
+        std::vector<uint32_t> zerosToCell((size_t)kM, 0u);
+        std::vector<uint32_t> oneFragCount(1u, 0u);
+        std::vector<FragGpu> fragInit((size_t)kM, FragGpu{});
+        auto mkBuf = [&](const void* data, size_t bytes) {
+            rhi::BufferDesc d; d.size = bytes; d.initialData = data;
+            d.usage = rhi::BufferUsage::Storage; return device->CreateBuffer(d);
+        };
+        auto cellCountBuf  = mkBuf(zerosCells.data(), zerosCells.size() * 4);
+        auto fragStartBuf  = mkBuf(zerosStart.data(), zerosStart.size() * 4);
+        auto cellToFragBuf = mkBuf(sentToFrag.data(), sentToFrag.size() * 4);
+        auto fragToCellBuf = mkBuf(zerosToCell.data(), zerosToCell.size() * 4);
+        auto fragCountBuf  = mkBuf(oneFragCount.data(), 4);
+        auto cellCursorBuf = mkBuf(zerosCells.data(), zerosCells.size() * 4);
+        auto fragSamplesBuf = mkBuf(zerosSamples.data(), zerosSamples.size() * 4);
+        auto fragmentsBuf  = mkBuf(fragInit.data(), fragInit.size() * sizeof(FragGpu));
+        auto fpBuf = mkBuf(&fp0, sizeof(FractFragParams));
+        auto cellsRunBuf = mkBuf(cellsInit.data(), cellsInit.size() * 4);
+
+        const uint32_t sampleGroups = ((uint32_t)sampleCount + 63u) / 64u;
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("fract_fr2", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*clsCompute);
+                cmd.BindStorageBuffer(*seedsBuf, 0);
+                cmd.BindStorageBuffer(*cellsRunBuf, 1);
+                cmd.BindStorageBuffer(*clsParamsBuf, 2);
+                cmd.DispatchCompute(sampleGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*pCount);
+                cmd.BindStorageBuffer(*cellsRunBuf, 0);
+                cmd.BindStorageBuffer(*cellCountBuf, 1);
+                cmd.BindStorageBuffer(*fpBuf, 2);
+                cmd.DispatchCompute(sampleGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*pScan);
+                cmd.BindStorageBuffer(*cellCountBuf, 0);
+                cmd.BindStorageBuffer(*fragStartBuf, 1);
+                cmd.BindStorageBuffer(*cellToFragBuf, 2);
+                cmd.BindStorageBuffer(*fragToCellBuf, 3);
+                cmd.BindStorageBuffer(*fragCountBuf, 4);
+                cmd.BindStorageBuffer(*fpBuf, 5);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*pEmit);
+                cmd.BindStorageBuffer(*cellsRunBuf, 0);
+                cmd.BindStorageBuffer(*fragStartBuf, 1);
+                cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                cmd.BindStorageBuffer(*fragSamplesBuf, 3);
+                cmd.BindStorageBuffer(*fpBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*pRed);
+                cmd.BindStorageBuffer(*fragToCellBuf, 0);
+                cmd.BindStorageBuffer(*fragStartBuf, 1);
+                cmd.BindStorageBuffer(*fragSamplesBuf, 2);
+                cmd.BindStorageBuffer(*fragmentsBuf, 3);
+                cmd.BindStorageBuffer(*fpBuf, 4);
+                cmd.DispatchCompute(((uint32_t)kM + 63u) / 64u);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+
+        out.fragStart.assign((size_t)kM + 1u, 0u);
+        device->ReadBuffer(*fragStartBuf, out.fragStart.data(), out.fragStart.size() * 4, 0);
+        out.cellToFragment.assign((size_t)kM, 0u);
+        device->ReadBuffer(*cellToFragBuf, out.cellToFragment.data(), out.cellToFragment.size() * 4, 0);
+        out.fragmentToCell.assign((size_t)kM, 0u);
+        device->ReadBuffer(*fragToCellBuf, out.fragmentToCell.data(), out.fragmentToCell.size() * 4, 0);
+        out.fragSamples.assign((size_t)sampleCount, 0u);
+        device->ReadBuffer(*fragSamplesBuf, out.fragSamples.data(), out.fragSamples.size() * 4, 0);
+        device->ReadBuffer(*fragCountBuf, &out.fragCount, 4, 0);
+        out.fragments.assign((size_t)kM, FragGpu{});
+        device->ReadBuffer(*fragmentsBuf, out.fragments.data(), out.fragments.size() * sizeof(FragGpu), 0);
+        out.fragments.resize((size_t)out.fragCount);
+        out.fragmentToCell.resize((size_t)out.fragCount);
+        // The display cell mosaic.
+        device->ReadBuffer(*cellsRunBuf, cellsInit.data(), cellsInit.size() * 4, 0);
+    };
+
+    FR2Out gpu;
+    runFR2(gpu);
+
+    fract::FractCells cpuCells; fract::ClassifyFractCells(field, seeds, cpuCells);
+    fract::FractFragments cpu; fract::ExtractFragments(field, cpuCells, kM, cpu);
+    const uint32_t F = (uint32_t)cpu.fragments.size();
+
+    bool bitExact = (gpu.fragCount == F)
+        && std::memcmp(gpu.fragStart.data(), cpu.fragStart.data(), cpu.fragStart.size() * 4) == 0
+        && std::memcmp(gpu.fragSamples.data(), cpu.fragSamples.data(), cpu.fragSamples.size() * 4) == 0
+        && std::memcmp(gpu.cellToFragment.data(), cpu.cellToFragment.data(), cpu.cellToFragment.size() * 4) == 0
+        && (F == 0 || std::memcmp(gpu.fragmentToCell.data(), cpu.fragmentToCell.data(), (size_t)F * 4) == 0)
+        && (F == 0 || std::memcmp(gpu.fragments.data(), cpu.fragments.data(), (size_t)F * sizeof(FragGpu)) == 0);
+    if (!bitExact) return fail("fract-fragments: GPU fragment array/CSR/remap != CPU ExtractFragments");
+    std::printf("fract-fragments: {cells:%u, fragments:%u, samples:%d} GPU==CPU BIT-EXACT\n",
+                gpu.fragCount, F, sampleCount);
+
+    FR2Out gpu2; runFR2(gpu2);
+    bool det = (gpu.fragCount == gpu2.fragCount)
+        && std::memcmp(gpu.fragStart.data(), gpu2.fragStart.data(), gpu.fragStart.size() * 4) == 0
+        && std::memcmp(gpu.fragSamples.data(), gpu2.fragSamples.data(), gpu.fragSamples.size() * 4) == 0
+        && (F == 0 || std::memcmp(gpu.fragments.data(), gpu2.fragments.data(), (size_t)F * sizeof(FragGpu)) == 0);
+    if (!det) return fail("fract-fragments: two dispatches differ (nondeterministic)");
+    std::printf("fract-fragments determinism: two runs BYTE-IDENTICAL\n");
+
+    uint64_t sumVol = 0;
+    for (const auto& fr : gpu.fragments) sumVol += fr.volume;
+    if (sumVol != (uint64_t)sampleCount) return fail("fract-fragments: mass partition broken");
+    std::printf("fract-fragments mass: {Svol:%llu, samples:%d} partition-exact\n",
+                (unsigned long long)sumVol, sampleCount);
+
+    int membersChecked = 0; bool boundsOk = true;
+    for (uint32_t f = 0; f < gpu.fragCount && boundsOk; ++f) {
+        const FragGpu& fr = gpu.fragments[(size_t)f];
+        const uint32_t cell = gpu.fragmentToCell[(size_t)f];
+        for (uint32_t k = gpu.fragStart[cell]; k < gpu.fragStart[cell + 1u]; ++k) {
+            fract::FractCoord p = fract::SampleCoord(field, (int)gpu.fragSamples[(size_t)k]);
+            if (p.x < fr.minx || p.x > fr.maxx || p.y < fr.miny || p.y > fr.maxy ||
+                p.z < fr.minz || p.z > fr.maxz) { boundsOk = false; break; }
+            const int32_t dx = p.x - fr.cx, dy = p.y - fr.cy, dz = p.z - fr.cz;
+            if (dx * dx + dy * dy + dz * dz > fr.boundRadiusSq) { boundsOk = false; break; }
+            ++membersChecked;
+        }
+    }
+    if (!boundsOk || membersChecked != sampleCount)
+        return fail("fract-fragments: a member sample lies outside its fragment AABB/sphere");
+    std::printf("fract-fragments bounds: all %d members inside fragment AABB+sphere\n", sampleCount);
+
+    // --- Golden: the FR1 cell mosaic + each fragment's centroid (white cross) + AABB outline. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 4; bgra[p * 4 + 3] = 255;
+    }
+    auto tileOrigin = [&](int z, int& ox, int& oy) {
+        ox = kPad + (z % kTilesX) * (kNx + kPad);
+        oy = kPad + (z / kTilesX) * (kNy + kPad);
+    };
+    auto putPx = [&](int ix, int iy, uint8_t b, uint8_t g, uint8_t r) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)iy * imgW + ix) * 4];
+        d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+    };
+    for (int z = 0; z < kNz; ++z) {
+        int ox, oy; tileOrigin(z, ox, oy);
+        for (int y = 0; y < kNy; ++y)
+            for (int x = 0; x < kNx; ++x) {
+                const uint32_t cellId = cellsInit[(size_t)((z * kNy + y) * kNx + x)];
+                Vec3 col = vg::hashColor(cellId);
+                putPx(ox + x, oy + y, (uint8_t)(col.z * 255.0f + 0.5f),
+                      (uint8_t)(col.y * 255.0f + 0.5f), (uint8_t)(col.x * 255.0f + 0.5f));
+            }
+    }
+    for (const auto& fr : gpu.fragments) {
+        int ox, oy; tileOrigin(fr.cz, ox, oy);
+        for (int x = fr.minx; x <= fr.maxx; ++x) {
+            putPx(ox + x, oy + fr.miny, 30, 30, 30); putPx(ox + x, oy + fr.maxy, 30, 30, 30);
+        }
+        for (int y = fr.miny; y <= fr.maxy; ++y) {
+            putPx(ox + fr.minx, oy + y, 30, 30, 30); putPx(ox + fr.maxx, oy + y, 30, 30, 30);
+        }
+        putPx(ox + fr.cx, oy + fr.cy, 255, 255, 255);
+        putPx(ox + fr.cx - 1, oy + fr.cy, 255, 255, 255);
+        putPx(ox + fr.cx + 1, oy + fr.cy, 255, 255, 255);
+        putPx(ox + fr.cx, oy + fr.cy - 1, 255, 255, 255);
+        putPx(ox + fr.cx, oy + fr.cy + 1, 255, 255, 255);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — %u fragments (centroids+AABBs) over the cell mosaic\n",
+                outPath, imgW, imgH, gpu.fragCount);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase showcase (Slice FPX1,
 // the BEACHHEAD of FLAGSHIP #6). On Metal this runs the CPU INTEGRATOR, NOT a GPU compute dispatch.
 // fpx_integrate.comp is int64/Vulkan-only (glslc can't parse int64); Metal runs the CPU
@@ -38136,6 +38421,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-cells") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_cells.png";
             try { return RunFractCellsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fract-fragments <out.png>: render the Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION
+        // showcase (Slice FR2, the 2nd slice of FLAGSHIP #14). The FR1 lattice (32x32x16) + the fixed seed
+        // set feed FOUR pure-int32 MSL-NATIVE passes (fract_emit_count/scan/emit + fract_reduce — a TRUE
+        // GPU pass on Metal): the GR2/FL2 count->scan->emit CSR over cellId + a per-fragment reduce ->
+        // ReadBuffer reads the fragment array + CSR + remap, PROVEN BIT-EXACT vs the CPU
+        // fract.h::ExtractFragments reference (memcmp, no tol — the same GPU==CPU proof the Vulkan
+        // --fract-fragments-shot runs). The image golden marks each fragment's centroid + AABB over the
+        // FR1 cell mosaic, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/fract_fragments.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fract-fragments") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fract_fragments.png";
+            try { return RunFractFragmentsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer
