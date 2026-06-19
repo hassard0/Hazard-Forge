@@ -455,6 +455,7 @@ int main(int argc, char** argv) {
     const char* fractCellsShotPath = nullptr; // --fract-cells-shot <out.bmp> (Slice FR1: GPU Deterministic Rigid-Body Fracture CELL PRE-FRACTURE / VORONOI DECOMPOSITION, pure-int32 nearest-seed compute over a lattice, GPU==CPU cellId bit-exact MSL-native, Voronoi cell-mosaic Z-slice viz)
     const char* fractFragmentsShotPath = nullptr; // --fract-fragments-shot <out.bmp> (Slice FR2: GPU Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION, pure-int32 count->scan->emit CSR over FR1 cellId + per-fragment reduce, GPU==CPU fragment array+CSR+remap bit-exact MSL-native, fragment centroids/bounds over the cell mosaic)
     const char* fractStepShotPath = nullptr; // --fract-step-shot <out.bmp> (Slice FR4: GPU Deterministic Rigid-Body Fracture THE FRACTURE STEP — released fragments fall. FR1 classify + FR2 extract + BuildFractBonds + a HARD ApplyImpactBreak + CountFractPieces (host) -> SpawnFractWorld releases the broken pieces as fpx::FxBody rubble (one body per fragment, pos=centroid·worldCellSize, radius=boundRadius·worldCellSize, invMass from FR2; the LARGEST piece STATIC anchor, others DYNAMIC; the impacted body seeded with impactDir·impactSpeed) -> K=120 StepFracture ticks drive the EXISTING shaders/fpx_solve.comp ONCE per tick (host-rebuilding the FPX2 pair list each tick from the current positions — the realistic per-tick re-broadphase; angVel=0 keeps orient identity so fpx_solve.comp's IntegrateStep == StepFracture's IntegrateBodyFull byte-for-byte) -> the final body world memcmp'd vs the CPU fract.h::StepFractureSteps (the GPU==CPU make-or-break). int64 -> fpx_solve.comp is Vulkan-only; the Metal --fract-step runs the CPU StepFractureSteps. PROOFS: GPU==CPU bit-exact, determinism, break-and-fall (hard: D>0 chunks fell + settled, anchor unchanged; soft: D==0 static no-op), no body buried (all rest pos.y-radius>=groundY). The image golden is a pure-integer side-view of the settled bodies coloured by piece id (the anchor distinct). NO new shader (hf_gen_msl UNCHANGED), NO lockstep (FR5), NO lit render (FR6); FR1/FR2/FR3 code+shaders + their goldens + fpx.h UNCHANGED (FR4 additive))
+    const char* fractLockstepShotPath = nullptr; // --fract-lockstep-shot <out.bmp> (Slice FR5: Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK — the NETCODE HEADLINE of FLAGSHIP #14, the FPX5/GR5/CG5/GF5 twin. PURE-CPU harness over the FR4 fracture step (StepFracture): the FR4 broken-and-spawned fpx::FxWorld rubble (the 32x32x16 lattice classified + extracted + bonded + a HARD impact -> SpawnFractWorld) fed a scripted shove stream that kicks a couple of dislodged chunks at a few ticks; authority==replica BIT-IDENTICAL inputs-only + RunFractRollback corrects a misprediction to authority BIT-EXACT (mispredict diverged before rollback) + two-run determinism + a snapshot round-trip. Reuses fpx's FPX5 machinery VERBATIM (fpx::FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld) — the per-tick step is fract::StepFracture instead of fpx's StepWorld; the three thin harness functions (SimFractTick/RunFractLockstep/RunFractRollback) are the fpx::SimTick/RunLockstep/RunRollback twins. The final rubble is rendered via the FR4 fract_step render path REUSED VERBATIM (the settled bodies as discs at their bit-exact pos>>kFrac coloured by piece id, the anchor distinct), bit-identical Vulkan-Windows == Metal-Mac by construction. NO GPU dispatch, NO new shader, NO new RHI; FR1-FR4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple*.h + engine/physics/ UNTOUCHED (FR5 is additive — only the harness + the showcase))
     const char* fractBreakShotPath = nullptr; // --fract-break-shot <out.bmp> (Slice FR3: GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK — THE NEW PHYSICS, host-built bond graph + int64 Jacobi load-diffusion break (Vulkan-only fract_break.comp) -> GPU per-bond {loadAccum,severed} memcmp'd vs CPU ApplyImpactBreak, fragments coloured by cluster/piece id with severed bonds marked red)
     const char* mcCountShotPath = nullptr; // --mc-count-shot <out.bmp> (Slice MC2: GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT — 256-case kTriTable lookup + InterlockedAdd grand total, integer compute over an SDF VoxelField, GPU==CPU counts+total bit-exact, count-grid Z-slice debug-viz)
     const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
@@ -2330,6 +2331,15 @@ int main(int argc, char** argv) {
     // (host-rebuilt FPX2 pairs) -> the final body set memcmp'd vs the CPU StepFractureSteps. NO new shader.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fract-step-shot") == 0) { fractStepShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice FR5: --fract-lockstep-shot <out.bmp> (Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK —
+    // the NETCODE HEADLINE). PURE CPU (no GPU dispatch): the FR4 broken-and-spawned world + a shove stream
+    // run through RunFractLockstep (authority + replica) + RunFractRollback, asserting authority==replica +
+    // rollback-corrects-to-authority BIT-EXACT, then rendering the final rubble via the FR4 fract_step render
+    // path. Its OWN loop (the FR1-FR4 standalone-loop pattern — NOT the big else-if ladder, the C1061 limit).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--fract-lockstep-shot") == 0) { fractLockstepShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -16243,6 +16253,207 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — %u fragments (%u dynamic) settled in %u pieces over %d "
                                 "ticks\n", fractStepShotPath, imgW, imgH, F, kDynamic, kPieces, kSteps);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractStepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK proof (--fract-lockstep-shot <out.bmp>,
+        // Slice FR5, the NETCODE HEADLINE of FLAGSHIP #14, the FPX5/GR5/CG5/GF5 twin). PURE CPU — NO GPU
+        // dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the IDENTICAL CPU harness
+        // (fract.h::RunFractLockstep/RunFractRollback) so the converged rubble-state golden is bit-identical
+        // cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence). MAXIMAL
+        // REUSE: the fracture world IS an fpx::FxWorld (FR4's SpawnFractWorld output), so FR5 reuses fpx's FPX5
+        // command + snapshot machinery VERBATIM (fpx::FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld) and
+        // changes ONLY the per-tick step to fract::StepFracture. Builds the FR4 broken-and-spawned world (the
+        // init) + a shove stream (kick a couple of dislodged chunks at a few ticks), runs RunFractLockstep
+        // twice (authority + replica) + RunFractRollback once; asserts authority==replica + rollback==authority
+        // + mispredicted!=authority BIT-EXACT; renders the final rubble via the FR4 fract_step render path.
+        if (fractLockstepShotPath) {
+            using math::Vec3;
+            namespace fract = hf::sim::fract;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The fixed source lattice + seed set (== the FR4 --fract-step-shot config, verbatim).
+            const int kNx = 32, kNy = 32, kNz = 16;
+            fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+            const std::vector<fract::FractSeed> seeds = {
+                { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+                {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+                {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+                {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+            };
+            const int kM = (int)seeds.size();
+
+            // ---- FR1+FR2+bonds+break on the HOST (== the FR4 --fract-step-shot host path, verbatim). ----
+            fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+            fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+            const uint32_t F = (uint32_t)frags.fragments.size();
+            const int kBreakIters = 4;
+            const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);
+            fract::BreakImpact hardImpact{0u, kHardImpulse};
+            fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+            std::vector<uint8_t> severed;
+            fract::ApplyImpactBreak(bonds, frags, hardImpact, kBreakIters, severed);
+            std::vector<uint32_t> clusters;
+            const uint32_t kPieces = fract::CountFractPieces(frags, bonds, severed, &clusters);
+
+            // ---- FR4 spawn config (== --fract-step-shot). The lockstep runs FEWER ticks than the FR4 settle:
+            // the lockstep PROOF is the bit-identity + the rollback, not a long settle. ----
+            const fract::fx kGravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fract::fx kDt = fpx::kOne / 60;
+            const int kSolveIters = 8;
+            fract::FractStepConfig cfg;
+            cfg.worldCellSize = fpx::kOne / 4;
+            cfg.gravity = fract::FxVec3{0, kGravY, 0};
+            cfg.groundY = 0;
+            cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+            cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+
+            const uint32_t anchorPiece = fract::FractAnchorPiece(frags, clusters);
+            const fpx::FxWorld init =
+                fract::SpawnFractWorld(frags, bonds, severed, clusters, hardImpact, cfg);
+            const int kBodyCount = (int)init.bodies.size();
+            uint32_t kDynamic = 0;
+            for (const auto& b : init.bodies) if (b.flags & fpx::kFlagDynamic) ++kDynamic;
+
+            // Pick the FIRST dynamic body — the shove stream targets it ("kick a falling chunk").
+            uint32_t kickBody = 0u;
+            for (uint32_t i = 0; i < (uint32_t)init.bodies.size(); ++i)
+                if (init.bodies[i].flags & fpx::kFlagDynamic) { kickBody = i; break; }
+
+            const int kTicks = 90;            // a modest lockstep settle (the PROOF, not the FR4 K=120 settle)
+            const int kMispredictTick = 20;   // a WRONG strong shove arrives here; the rollback must correct it
+
+            // The scripted authoritative shove stream: kick the falling chunk + spin it at a few ticks.
+            const std::vector<fpx::FxCommand> authStream = {
+                fpx::FxCommand{4,  fpx::kCmdImpulse,   kickBody, fpx::FxVec3{(fract::fx)(3 * (int)fpx::kOne), 0, 0}},
+                fpx::FxCommand{8,  fpx::kCmdSetAngVel, kickBody, fpx::FxVec3{0, fpx::kOne, 0}},
+                fpx::FxCommand{14, fpx::kCmdImpulse,   kickBody, fpx::FxVec3{0, 0, (fract::fx)(2 * (int)fpx::kOne)}},
+            };
+            const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+            // The MISPREDICTED stream: the auth stream + a WRONG strong shove at mispredictTick.
+            std::vector<fpx::FxCommand> mispredictStream = authStream;
+            mispredictStream.push_back(fpx::FxCommand{(uint32_t)kMispredictTick, fpx::kCmdImpulse, kickBody,
+                                                      fpx::FxVec3{(fract::fx)(40 * (int)fpx::kOne), 0, 0}});
+
+            auto worldEqual = [&](const fpx::FxWorld& a, const fpx::FxWorld& b) {
+                return a.bodies.size() == b.bodies.size() &&
+                       std::memcmp(a.bodies.data(), b.bodies.data(),
+                                   a.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+                       a.gravity.x == b.gravity.x && a.gravity.y == b.gravity.y &&
+                       a.gravity.z == b.gravity.z && a.groundY == b.groundY;
+            };
+
+            // === The harness (PURE CPU, NO GPU dispatch) ===
+            const fpx::FxWorld authority  = fract::RunFractLockstep(init, authStream, kTicks, kDt, kSolveIters);
+            const fpx::FxWorld replica    = fract::RunFractLockstep(init, authStream, kTicks, kDt, kSolveIters);
+            const fpx::FxWorld rolledBack =
+                fract::RunFractRollback(init, authStream, mispredictStream, kTicks, kMispredictTick, kDt, kSolveIters);
+
+            // PROOF (1) LOCKSTEP: replica (fed INPUTS ONLY) == authority BIT-IDENTICAL.
+            if (!worldEqual(authority, replica)) {
+                std::fprintf(stderr, "FATAL: fract-lockstep authority != replica (inputs-only re-sim diverged "
+                             "— a float/nondeterminism crept into the fracture step?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-lockstep: {bodies:%d, dynamic:%u, ticks:%d} authority==replica BIT-IDENTICAL\n",
+                        kBodyCount, kDynamic, kTicks);
+
+            // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT.
+            if (!worldEqual(rolledBack, authority)) {
+                std::fprintf(stderr, "FATAL: fract-lockstep rollback != authority (the rollback did NOT correct "
+                             "the misprediction to the authoritative rubble state)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-lockstep rollback: corrected==authority BIT-EXACT\n");
+
+            // PROOF (3) the misprediction was REAL: the speculative (pre-rollback) state DIFFERED from authority.
+            const fpx::FxWorld mispredicted =
+                fract::RunFractLockstep(init, mispredictStream, kTicks, kDt, kSolveIters);
+            if (worldEqual(mispredicted, authority)) {
+                std::fprintf(stderr, "FATAL: fract-lockstep mispredicted state == authority (the misprediction "
+                             "was a no-op — the rollback proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+            // PROOF (4) DETERMINISM: two runs of the final state -> byte-identical (+ snapshot round-trip).
+            const fpx::FxWorld authority2 = fract::RunFractLockstep(init, authStream, kTicks, kDt, kSolveIters);
+            if (!worldEqual(authority2, authority)) {
+                std::fprintf(stderr, "FATAL: fract-lockstep two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            {
+                fpx::FxWorld w = fract::RunFractLockstep(init, authStream, kMispredictTick, kDt, kSolveIters);
+                const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+                fract::SimFractTick(w, authStream, (uint32_t)kMispredictTick, kDt, kSolveIters);   // mutate
+                fpx::RestoreWorld(w, snap);
+                if (!worldEqual(w, snap)) {
+                    std::fprintf(stderr, "FATAL: fract-lockstep snapshot round-trip != original\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("fract-lockstep determinism: two runs BYTE-IDENTICAL\n");
+            std::printf("fract-lockstep: {bodies:%d, dynamic:%u, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                        kBodyCount, kDynamic, kTicks, kCommandCount, kMispredictTick);
+
+            // --- Golden: the FR4 fract_step render path REUSED VERBATIM — a PURE-INTEGER 2D side-view of the
+            // converged rubble (authority==replica==rolledBack, so the single converged state IS the viz). Each
+            // body is a disc at its bit-exact (pos.x>>kFrac, pos.y>>kFrac), coloured by its piece/cluster id
+            // (the anchor distinct, neutral grey). CPU-coloured from the integers -> identical both backends. ---
+            const int kPxPerUnit = 60;
+            const int kMargin = 28;
+            const int kWorldW = 10;
+            const int kWorldH = 9;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, uint8_t bl, uint8_t gr, uint8_t rd) {
+                if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+                uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+                d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+            };
+            auto worldToPx = [&](fpx::fx px, fpx::fx py, int& ix, int& iy) {
+                const int64_t sx = ((int64_t)px * kPxPerUnit) >> fpx::kFrac;
+                const int64_t sy = ((int64_t)py * kPxPerUnit) >> fpx::kFrac;
+                ix = kMargin + (int)sx;
+                iy = (int)imgH - kMargin - (int)sy;
+            };
+            {
+                int gx0, gy0; worldToPx(0, cfg.groundY, gx0, gy0);
+                for (int x = 0; x < (int)imgW; ++x) {
+                    if (gy0 < 0 || gy0 >= (int)imgH) break;
+                    uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+                    d[0] = 90; d[1] = 90; d[2] = 90; d[3] = 255;
+                }
+            }
+            for (int i = 0; i < kBodyCount; ++i) {
+                const fpx::FxBody& gb = rolledBack.bodies[(size_t)i];
+                int cx, cy; worldToPx(gb.pos.x, gb.pos.y, cx, cy);
+                int rpx = (int)(((int64_t)gb.radius * kPxPerUnit) >> fpx::kFrac);
+                if (rpx < 2) rpx = 2; if (rpx > 40) rpx = 40;
+                const bool isAnchor = !(gb.flags & fpx::kFlagDynamic);
+                Vec3 col = isAnchor ? Vec3{0.45f, 0.45f, 0.5f}
+                                    : ((i < (int)clusters.size()) ? vg::hashColor(clusters[(size_t)i])
+                                                                  : Vec3{0.7f, 0.7f, 0.7f});
+                const uint8_t rd = (uint8_t)(col.x * 255.0f + 0.5f);
+                const uint8_t gr = (uint8_t)(col.y * 255.0f + 0.5f);
+                const uint8_t bl = (uint8_t)(col.z * 255.0f + 0.5f);
+                for (int dy = -rpx; dy <= rpx; ++dy)
+                    for (int dx = -rpx; dx <= rpx; ++dx)
+                        if (dx * dx + dy * dy <= rpx * rpx) putPx(cx + dx, cy + dy, bl, gr, rd);
+            }
+            bool ok = WriteBMP(fractLockstepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — fract lockstep+rollback converged rubble (%u fragments, "
+                                "%u dynamic, %u pieces, %d ticks)\n",
+                                fractLockstepShotPath, imgW, imgH, F, kDynamic, kPieces, kTicks);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractLockstepShotPath);
+            (void)anchorPiece;
             device->WaitIdle();
             return ok ? 0 : 1;
         }
