@@ -384,6 +384,8 @@ int main() {
             bool sawFractLockstepFeature = false;
             // Slice FR6: the deterministic-fract-render capability is advertised.
             bool sawFractRenderFeature = false;
+            // Slice JT1: the deterministic-joint-ball capability is advertised.
+            bool sawJointBallFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -536,6 +538,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-fract-step") sawFractStepFeature = true;
                     if (AsString(el->value) == "deterministic-fract-lockstep") sawFractLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-fract-render") sawFractRenderFeature = true;
+                    if (AsString(el->value) == "deterministic-joint-ball") sawJointBallFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -672,6 +675,7 @@ int main() {
         check(sawFractStepFeature, "engine.features includes deterministic-fract-step");
         check(sawFractLockstepFeature, "engine.features includes deterministic-fract-lockstep");
         check(sawFractRenderFeature, "engine.features includes deterministic-fract-render");
+        check(sawJointBallFeature, "engine.features includes deterministic-joint-ball");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -894,6 +898,8 @@ int main() {
         bool sawFractLockstepShot = false;
         // Slice FR6: the --fract-render-shot showcase flag is listed in the showcase manifest.
         bool sawFractRenderShot = false;
+        // Slice JT1: the --joint-ball-shot showcase flag is listed in the showcase manifest.
+        bool sawJointBallShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1067,6 +1073,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--fract-step-shot") sawFractStepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fract-lockstep-shot") sawFractLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fract-render-shot") sawFractRenderShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--joint-ball-shot") sawJointBallShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-contact-shot") sawGrainContactShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-friction-shot") sawGrainFrictionShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-lockstep-shot") sawGrainLockstepShot = true;
@@ -1205,6 +1212,7 @@ int main() {
         check(sawFractStepShot, "showcases manifest includes --fract-step-shot");
         check(sawFractLockstepShot, "showcases manifest includes --fract-lockstep-shot");
         check(sawFractRenderShot, "showcases manifest includes --fract-render-shot");
+        check(sawJointBallShot, "showcases manifest includes --joint-ball-shot");
         check(sawGrainContactShot, "showcases manifest includes --grain-contact-shot");
         check(sawGrainFrictionShot, "showcases manifest includes --grain-friction-shot");
         check(sawGrainLockstepShot, "showcases manifest includes --grain-lockstep-shot");
