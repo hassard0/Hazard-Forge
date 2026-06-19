@@ -370,6 +370,8 @@ int main() {
             bool sawCgfStepFeature = false;
             // Slice GF5: the deterministic-cgf-lockstep capability is advertised.
             bool sawCgfLockstepFeature = false;
+            // Slice GF6: the deterministic-cgf-render capability is advertised.
+            bool sawCgfRenderFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -515,6 +517,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-cgf-displace") sawCgfDisplaceFeature = true;
                     if (AsString(el->value) == "deterministic-cgf-step") sawCgfStepFeature = true;
                     if (AsString(el->value) == "deterministic-cgf-lockstep") sawCgfLockstepFeature = true;
+                    if (AsString(el->value) == "deterministic-cgf-render") sawCgfRenderFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -644,6 +647,7 @@ int main() {
         check(sawCgfDisplaceFeature, "engine.features includes deterministic-cgf-displace");
         check(sawCgfStepFeature, "engine.features includes deterministic-cgf-step");
         check(sawCgfLockstepFeature, "engine.features includes deterministic-cgf-lockstep");
+        check(sawCgfRenderFeature, "engine.features includes deterministic-cgf-render");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -852,6 +856,8 @@ int main() {
         bool sawCgfDisplaceShot = false;
         // Slice GF4: the --cgf-step-shot showcase flag is listed in the showcase manifest.
         bool sawCgfStepShot = false;
+        // Slice GF6: the --cgf-render-shot showcase flag is listed in the showcase manifest.
+        bool sawCgfRenderShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1018,6 +1024,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--cgf-buoyancy-shot") sawCgfBuoyancyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cgf-displace-shot") sawCgfDisplaceShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--cgf-step-shot") sawCgfStepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--cgf-render-shot") sawCgfRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-contact-shot") sawGrainContactShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-friction-shot") sawGrainFrictionShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-lockstep-shot") sawGrainLockstepShot = true;
@@ -1149,6 +1156,7 @@ int main() {
         check(sawCgfBuoyancyShot, "showcases manifest includes --cgf-buoyancy-shot");
         check(sawCgfDisplaceShot, "showcases manifest includes --cgf-displace-shot");
         check(sawCgfStepShot, "showcases manifest includes --cgf-step-shot");
+        check(sawCgfRenderShot, "showcases manifest includes --cgf-render-shot");
         check(sawGrainContactShot, "showcases manifest includes --grain-contact-shot");
         check(sawGrainFrictionShot, "showcases manifest includes --grain-friction-shot");
         check(sawGrainLockstepShot, "showcases manifest includes --grain-lockstep-shot");
