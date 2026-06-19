@@ -809,6 +809,73 @@ int main() {
               "RunCGFRollback: the mispredicted state DIFFERED (a real divergence was fixed)");
     }
 
+    // ===== Slice GF6 — CGFToRenderInstances: the lit-3D render bridge (grains-then-fluid combined) =========
+    // The render-only float bridge (the GR6 + FL6 bridges VERBATIM): one SMALL sphere per grain FOLLOWED BY
+    // one SMALL sphere per fluid particle. The bit-exact sim is untouched; this is the ONLY float crossing.
+    {
+        const float kGrainRadius = 0.32f;
+        const float kFluidRadius = 0.28f;
+
+        // A hand-laid two-pool world (no sim needed — the bridge is a pure function of the positions).
+        cgf::CGFWorld w; w.h = h;
+        w.grains = {GrainAt(0, 1, 0), GrainAt(2, 1, 0), GrainAt(4, 1, 0)};   // 3 grains
+        w.fluid  = {FluidAt(0, 3, 0), FluidAt(2, 3, 0)};                     // 2 fluid
+        const uint32_t kG = (uint32_t)w.grains.size();
+        const uint32_t kF = (uint32_t)w.fluid.size();
+
+        const std::vector<math::Mat4> inst = cgf::CGFToRenderInstances(w, kGrainRadius, kFluidRadius);
+
+        // ---- instance count == grains + fluid ---------------------------------------------------------------
+        check(inst.size() == (size_t)(kG + kF), "CGFToRenderInstances: instance count == grains + fluid");
+
+        // ---- the first G matrices are the GR6 grain transforms (grains FIRST) --------------------------------
+        const std::vector<math::Mat4> gRef = grain::GrainToRenderInstances(w.grains, kGrainRadius);
+        bool grainsFirst = (gRef.size() == kG);
+        for (uint32_t i = 0; i < kG && grainsFirst; ++i)
+            if (std::memcmp(inst[i].m, gRef[i].m, sizeof(float) * 16) != 0) grainsFirst = false;
+        check(grainsFirst, "CGFToRenderInstances: first G are the GR6 grain transforms (translate*scale)");
+
+        // ---- the next F matrices are the FL6 fluid transforms (fluid SECOND) ---------------------------------
+        const std::vector<math::Mat4> fRef = fluid::FluidToRenderInstances(w.fluid, kFluidRadius);
+        bool fluidSecond = (fRef.size() == kF);
+        for (uint32_t i = 0; i < kF && fluidSecond; ++i)
+            if (std::memcmp(inst[kG + i].m, fRef[i].m, sizeof(float) * 16) != 0) fluidSecond = false;
+        check(fluidSecond, "CGFToRenderInstances: next F are the FL6 fluid transforms (translate*scale)");
+
+        // ---- a spot-check of a KNOWN grain/fluid pos -> its translate(pos/kOne)*scale matrix ------------------
+        // grain 2 at (4,1,0): col-major translate in m[12..14] == (4,1,0); scale on the diagonal == grainRadius.
+        const math::Mat4& g2 = inst[2];
+        check(g2.m[12] == 4.0f && g2.m[13] == 1.0f && g2.m[14] == 0.0f,
+              "CGFToRenderInstances: grain 2 translated to (4,1,0)");
+        check(g2.m[0] == kGrainRadius && g2.m[5] == kGrainRadius && g2.m[10] == kGrainRadius,
+              "CGFToRenderInstances: grain 2 scaled by grainRadius");
+        // fluid 1 at (2,3,0): the (kG+1)th instance; translate == (2,3,0); scale == fluidRadius.
+        const math::Mat4& f1 = inst[kG + 1];
+        check(f1.m[12] == 2.0f && f1.m[13] == 3.0f && f1.m[14] == 0.0f,
+              "CGFToRenderInstances: fluid 1 translated to (2,3,0)");
+        check(f1.m[0] == kFluidRadius && f1.m[5] == kFluidRadius && f1.m[10] == kFluidRadius,
+              "CGFToRenderInstances: fluid 1 scaled by fluidRadius");
+
+        // ---- determinism: two builds of the SAME world -> byte-identical transforms --------------------------
+        const std::vector<math::Mat4> inst2 = cgf::CGFToRenderInstances(w, kGrainRadius, kFluidRadius);
+        bool same = (inst.size() == inst2.size());
+        for (size_t i = 0; i < inst.size() && same; ++i)
+            if (std::memcmp(inst[i].m, inst2[i].m, sizeof(float) * 16) != 0) same = false;
+        check(same, "CGFToRenderInstances: two builds byte-identical (pure function of the integer state)");
+
+        // ---- empty world -> empty output (the no-op) ---------------------------------------------------------
+        cgf::CGFWorld empty; empty.h = h;
+        check(cgf::CGFToRenderInstances(empty, kGrainRadius, kFluidRadius).empty(),
+              "CGFToRenderInstances: empty world -> empty output (no-op)");
+        // one-empty-pool: grains-only -> G instances; fluid-only -> F instances.
+        cgf::CGFWorld grainOnly; grainOnly.h = h; grainOnly.grains = w.grains;
+        check(cgf::CGFToRenderInstances(grainOnly, kGrainRadius, kFluidRadius).size() == (size_t)kG,
+              "CGFToRenderInstances: grain-only -> G instances");
+        cgf::CGFWorld fluidOnly; fluidOnly.h = h; fluidOnly.fluid = w.fluid;
+        check(cgf::CGFToRenderInstances(fluidOnly, kGrainRadius, kFluidRadius).size() == (size_t)kF,
+              "CGFToRenderInstances: fluid-only -> F instances");
+    }
+
     if (g_fail == 0) std::printf("cgf_test: ALL PASS\n");
     else             std::printf("cgf_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

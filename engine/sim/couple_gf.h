@@ -883,5 +883,38 @@ inline CGFWorld RunCGFRollback(const CGFWorld& init, const fluid::FluidKernel& k
     return world;
 }
 
+// ===== Slice GF6 — LIT 3D RENDER CAPSTONE (the money-shot — COMPLETES FLAGSHIP #13) ====================
+// The SIXTH and FINAL slice RENDERS the bit-exact coupled state as a lit 3D scene — a warm sand bed of small
+// lit spheres with cyan fluid droplets pooled around/through it (WET SAND / MUD). The GF1-GF5 sim above stays
+// strict integer/bit-exact; here — and ONLY here — we cross to float to build the per-instance render
+// transforms for the rasterizer. This is the documented FLOAT visresolve-bar (the FPX6/FL6/GR6/CP6/CG6
+// precedent): the SIM is bit-exact, the final raster/shade is float (cross-vendor ~the engine baseline, NOT
+// held to the integer zero-diff bar). The DIRECT TWIN of couple_grain.h::CGrainToRenderInstances over the
+// grain+fluid sim (two PARTICLE pools, both small spheres distinguished by the caller's per-draw COLOR).
+//
+// CGFToRenderInstances builds a COMBINED instance set DIRECTLY from the bit-exact CGFWorld state — one SMALL
+// sphere per grain::GrainParticle (via grain::GrainToRenderInstances: translate(pos/kOne) * scale(grainRadius),
+// the GR6 render bridge VERBATIM) FOLLOWED BY one SMALL sphere (droplet) per fluid::FluidParticle (via
+// fluid::FluidToRenderInstances: translate(pos/kOne) * scale(fluidRadius), the FL6 render bridge VERBATIM). The
+// grains come FIRST (like CG6 puts bodies first), so the caller can split the combined set into the two
+// COLORED draws — the warm sand grains, then the cyan fluid droplets (NO per-instance color, NO new shader; the
+// caller issues two instanced draws through the SAME existing lit pipeline with a per-draw material color). The
+// instance count is grains.size() + fluid.size(). Pure deterministic host float (no RNG, no clock). The
+// provenance: every grain transform derives from GrainParticle::pos + every fluid transform from
+// FluidParticle::pos (the settled output of StepCGF). Empty world (no grains + no fluid) -> empty output (the
+// empty no-op: the cleared base scene). Render-only, NO sim mutation — this is the ONLY float crossing of the
+// whole flagship.
+inline std::vector<math::Mat4> CGFToRenderInstances(const CGFWorld& world, float grainRadius, float fluidRadius) {
+    std::vector<math::Mat4> out;
+    out.reserve(world.grains.size() + world.fluid.size());
+    // The grains FIRST (the warm sand spheres, the GR6 bridge — translate(pos/kOne) * scale(grainRadius)).
+    const std::vector<math::Mat4> grainMats = grain::GrainToRenderInstances(world.grains, grainRadius);
+    out.insert(out.end(), grainMats.begin(), grainMats.end());
+    // Then the fluid (the cyan droplet spheres, the FL6 bridge — translate(pos/kOne) * scale(fluidRadius)).
+    const std::vector<math::Mat4> fluidMats = fluid::FluidToRenderInstances(world.fluid, fluidRadius);
+    out.insert(out.end(), fluidMats.begin(), fluidMats.end());
+    return out;
+}
+
 }  // namespace cgf
 }  // namespace hf::sim
