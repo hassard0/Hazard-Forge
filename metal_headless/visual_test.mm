@@ -23814,6 +23814,194 @@ static int RunJointStepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice JT4 — Deterministic Articulated-Body Ragdoll SKELETON->RAGDOLL BIND showcase (--joint-ragdoll)
+// THE PILLAR-BRIDGE. The bind (float->Q16.16, joint::RagdollFromSkeleton) + the palette read-back
+// (Q16.16->float, joint::PoseToPalette) are HOST conversions; the COLLAPSE is the bit-exact JT3
+// StepArticulatedContacts (int64 -> the joint + fpx shaders are Vulkan-only; on Metal glslc can't parse
+// int64, so --joint-ragdoll runs the CPU joint::StepArticulatedContactsSteps — the EXACT bit-exact
+// reference the Vulkan --joint-ragdoll-shot GPU==CPU memcmp compares against, byte-identical by
+// construction). This builds the SAME synthetic ~9-joint humanoid skeleton + bind config as the Vulkan
+// --joint-ragdoll-shot, collapses it K=240 steps, and CPU-colors the SAME integer side-view -> the golden
+// is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). New golden
+// tests/golden/metal/joint_ragdoll.png (Mac-baked by the controller); two runs DIFF 0.0000. NO GPU
+// compute (int64 -> CPU on Metal), NO new shader, NO new RHI. CAVEAT: bones are capsule-as-SPHERE proxies.
+static int RunJointRagdollShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+    namespace anim = hf::anim;
+
+    // The deterministic collapse budget (== the Vulkan --joint-ragdoll-shot config + the joint_test JT4 case).
+    const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const joint::fx kDt = joint::kOne / 60;
+    const int kSteps = 240;
+    const int kIters = 20;
+    const int kSolveIters = 8;
+    const joint::fx kGroundY = 0;
+
+    // Build the synthetic ~9-joint humanoid anim::Skeleton (IDENTICAL to the Vulkan --joint-ragdoll-shot).
+    auto buildHumanoid = []() {
+        anim::Skeleton s;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        s.joints.push_back(J(-1, 0.0f,  5.0f, 0.0f));  // 0 pelvis (root)
+        s.joints.push_back(J(0,  0.0f,  1.0f, 0.0f));  // 1 spine
+        s.joints.push_back(J(1,  0.0f,  1.0f, 0.0f));  // 2 head
+        s.joints.push_back(J(1, -0.7f,  0.6f, 0.0f));  // 3 L upper arm
+        s.joints.push_back(J(3, -0.7f,  0.0f, 0.0f));  // 4 L fore arm
+        s.joints.push_back(J(1,  0.7f,  0.6f, 0.0f));  // 5 R upper arm
+        s.joints.push_back(J(5,  0.7f,  0.0f, 0.0f));  // 6 R fore arm
+        s.joints.push_back(J(0, -0.4f, -1.0f, 0.0f));  // 7 L leg
+        s.joints.push_back(J(0,  0.4f, -1.0f, 0.0f));  // 8 R leg
+        const size_t n = s.joints.size();
+        std::vector<math::Mat4> global(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(s.joints[j].t, s.joints[j].r, s.joints[j].s);
+            const int p = s.joints[j].parent;
+            global[j] = (p >= 0) ? (global[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) s.joints[j].inverseBind = global[j].Inverse();
+        return s;
+    };
+    const anim::Skeleton skel = buildHumanoid();
+    const int kBodyCount = (int)skel.joints.size();
+
+    joint::RagdollConfig cfg;
+    cfg.worldScale = joint::kOne;
+    cfg.boneRadius = joint::kOne * 30 / 100;
+    cfg.invMass    = joint::kOne;
+    cfg.coneCos    = -joint::kOne;
+    cfg.coneSin    = 0;
+    cfg.gravity    = joint::FxVec3{0, kGravY, 0};
+    cfg.groundY    = kGroundY;
+    cfg.rootStatic = true;
+
+    const joint::Ragdoll bind = joint::RagdollFromSkeleton(skel, cfg);
+    const joint::FxWorld world = bind.world;
+    const std::vector<joint::FxJoint> joints = bind.joints;
+    const std::vector<joint::FxAngularLimit> limits = bind.limits;
+    const uint32_t kJointCount = (uint32_t)joints.size();
+    const uint32_t kLimitCount = (uint32_t)limits.size();
+
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+
+    // CPU collapse (K steps) — the Metal showcase body array, byte-identical to the Vulkan GPU result.
+    joint::FxWorld cpuWorld = world;
+    joint::StepArticulatedContactsSteps(cpuWorld, joints, limits, kDt, kIters, kSolveIters, kSteps);
+    const std::vector<FxBodyGpu> gpuBodies = packBodies(cpuWorld.bodies);
+
+    std::printf("joint-ragdoll: {bones:%d, joints:%u, limits:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU joint::StepArticulatedContacts, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kJointCount, kLimitCount, kSteps);
+
+    joint::FxWorld cpuWorld2 = world;
+    joint::StepArticulatedContactsSteps(cpuWorld2, joints, limits, kDt, kIters, kSolveIters, kSteps);
+    const std::vector<FxBodyGpu> gpuBodies2 = packBodies(cpuWorld2.bodies);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("joint-ragdoll: two solves differ (nondeterministic)");
+    std::printf("joint-ragdoll determinism: two runs BYTE-IDENTICAL\n");
+
+    // the ragdoll collapsed + the bones held.
+    const joint::Ragdoll cpuBound{cpuWorld, joints, limits};
+    const joint::RagdollState st = joint::MeasureRagdoll(skel, cpuBound);
+    const joint::RagdollState bindSt = joint::MeasureRagdoll(skel, bind);
+    {
+        const joint::fx kGapBand = joint::kOne;
+        const joint::fx kBuryTol = -(joint::kOne / 16);
+        if (!(st.maxAnchorGap < kGapBand && st.meanBodyY < bindSt.meanBodyY && st.minBottom >= kBuryTol))
+            return fail("joint-ragdoll: did not collapse (gap/slump/bottom out of band)");
+        std::printf("joint-ragdoll collapse: {maxAnchorGap:%d within band, slumped:true, rested:true}\n",
+                    st.maxAnchorGap);
+    }
+
+    // palette provenance: PoseToPalette is a pure function of the bit-exact body state.
+    {
+        const std::vector<math::Mat4> palette = joint::PoseToPalette(skel, cpuWorld);
+        const std::vector<math::Mat4> paletteRebuild = joint::PoseToPalette(skel, cpuWorld);
+        if (!(palette.size() == (size_t)kBodyCount && paletteRebuild.size() == palette.size() &&
+              std::memcmp(palette.data(), paletteRebuild.data(), palette.size() * sizeof(math::Mat4)) == 0))
+            return fail("joint-ragdoll: palette provenance failed");
+        std::printf("joint-ragdoll palette: {entries:%zu} == rebuild from bit-exact pose\n", palette.size());
+    }
+
+    // --- Golden: a PURE-INTEGER 2D side-view of the collapsed ragdoll (IDENTICAL to the Vulkan
+    // --joint-ragdoll-shot by construction). ---
+    const int kPxPerUnit = 56, kMargin = 60;
+    const int kWorldW = 8, kWorldH = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 14; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, const Vec3& col) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        d[3] = 255;
+    };
+    auto worldToPx = [&](joint::fx wx, joint::fx wy, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)wx * kPxPerUnit) >> joint::kFrac;
+        const int64_t sy = ((int64_t)wy * kPxPerUnit) >> joint::kFrac;
+        ix = (int)imgW / 2 + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s)
+            putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+    };
+    { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+      for (int x = 0; x < (int)imgW; ++x) {
+          if (gy0 < 0 || gy0 >= (int)imgH) break;
+          uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+          d[0] = 80; d[1] = 80; d[2] = 80; d[3] = 255;
+      } }
+    for (uint32_t e = 0; e < kJointCount; ++e) {
+        const joint::FxVec3 pa = joint::WorldAnchor(cpuWorld.bodies[joints[e].bodyA], joints[e].anchorA);
+        const joint::FxVec3 pb = joint::WorldAnchor(cpuWorld.bodies[joints[e].bodyB], joints[e].anchorB);
+        int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.55f});
+    }
+    const int radPx = (int)(((int64_t)cfg.boneRadius * kPxPerUnit) >> joint::kFrac);
+    for (int i = 0; i < kBodyCount; ++i) {
+        int cx, cy; worldToPx(cpuWorld.bodies[(size_t)i].pos.x, cpuWorld.bodies[(size_t)i].pos.y, cx, cy);
+        const Vec3 col = (cpuWorld.bodies[(size_t)i].flags & fpx::kFlagDynamic)
+                             ? vg::hashColor((uint32_t)(i + 1)) : Vec3{1.0f, 1.0f, 1.0f};
+        for (int yy = -radPx; yy <= radPx; ++yy)
+            for (int xx = -radPx; xx <= radPx; ++xx)
+                if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — collapsed ragdoll side-view (%d bones, %u joints, slumped)\n",
+                outPath, imgW, imgH, kBodyCount, kJointCount);
+    return 0;
+}
+
 // ===== Slice CL3 — Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER showcase (--cloth-solve) =====
 // (the MAKE-OR-BREAK of FLAGSHIP #8). Like CL1's --cloth-integrate (and UNLIKE the int32 CL2 --cloth-edges /
 // FPX2 broadphase), the PBD solve is int64 (fxdiv/FxISqrt in SolveDistanceConstraint — the SAME form as
@@ -40489,6 +40677,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--joint-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_joint_step.png";
             try { return RunJointStepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --joint-ragdoll <out.png>: render the Deterministic Articulated-Body Ragdoll SKELETON->RAGDOLL BIND
+        // showcase (Slice JT4, the 4th slice of FLAGSHIP #15 — THE PILLAR-BRIDGE). A synthetic ~9-joint
+        // humanoid anim::Skeleton is bound to a ragdoll (joint::RagdollFromSkeleton: bone->FxBody,
+        // edge->ball+cone) then collapsed K=240 StepArticulatedContacts steps into a slumped pose; the pose
+        // reads back as a joint palette (joint::PoseToPalette). The bind + palette are HOST float crossings;
+        // the COLLAPSE is the bit-exact JT3 sim. On Metal the joint/fpx shaders are int64/Vulkan-only, so this
+        // runs the CPU joint::StepArticulatedContacts — the EXACT bit-exact reference the Vulkan
+        // --joint-ragdoll-shot GPU==CPU memcmp compares against, byte-identical by construction. The image
+        // golden is a PURE-INTEGER collapsed-ragdoll side-view. New golden tests/golden/metal/joint_ragdoll.png.
+        if (argc > 1 && std::strcmp(argv[1], "--joint-ragdoll") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_joint_ragdoll.png";
+            try { return RunJointRagdollShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cloth-collide <out.png>: render the Deterministic GPU Cloth INTEGER COLLISION showcase (Slice
