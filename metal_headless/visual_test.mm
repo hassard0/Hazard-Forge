@@ -23407,6 +23407,215 @@ static int RunJointBallShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice JT2 — Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase (--joint-hinge) ======
+// THE NEW-PHYSICS BEAT of FLAGSHIP #15. The angular solve (SolveAngularLimit's swing-twist + cone clamp +
+// nlerp) is int64 (the quaternion fxmul/fxdiv/FxISqrt), so shaders/joint_angular_solve.comp is VULKAN-ONLY
+// (glslc can't parse int64 in HLSL) and is NOT in this dir's hf_gen_msl list; on Metal the --joint-hinge
+// showcase runs the CPU joint::StepArticulated — the EXACT bit-exact reference the Vulkan --joint-hinge-shot
+// GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION (the joint_ball_solve.comp / cloth_solve.comp convention). So this builds the SAME swinging-
+// door scene (a pinned frame + a door, a ball joint at the hinge + a HINGE FxAngularLimit about Y, the door
+// seeded a twist + a small off-axis angVel), runs joint::StepArticulated K steps over it, and CPU-colors the
+// SAME integer top-down view as the Vulkan --joint-hinge-shot -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/joint_hinge.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU
+// compute (int64 -> CPU on Metal), NO new RHI. CAVEAT: a deterministic PROXY (nlerp residual), not analytic
+// constraint mechanics (the GR4-repose caveat shape).
+static int RunJointHingeShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic swinging-door scene (== the Vulkan --joint-hinge-shot config).
+    const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const joint::fx kDt = joint::kOne / 60;
+    const int kBodyCount = 2;
+    const int kSteps = 120;
+    const int kIters = 16;
+    const joint::fx kGroundY = (joint::fx)(-100 * (int)joint::kOne);
+    const joint::fx kDoorHalf = joint::kOne;
+    const joint::FxVec3 kHingeAxis{0, joint::kOne, 0};
+    const int hingeX = 6, hingeY = 12;
+
+    joint::FxWorld world;
+    world.gravity = joint::FxVec3{0, kGravY, 0};
+    world.groundY = kGroundY;
+    auto makeBody = [&](int gxUnits, int gyUnits, joint::fx offX, bool pinned,
+                        const joint::FxVec3& angVel) {
+        fpx::FxBody b;
+        b.pos = joint::FxVec3{(joint::fx)(gxUnits * (int)joint::kOne) + offX,
+                              (joint::fx)(gyUnits * (int)joint::kOne), 0};
+        b.vel = joint::FxVec3{0, 0, 0};
+        b.invMass = pinned ? 0 : joint::kOne;
+        b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+        b.radius  = 0;
+        b.orient  = fpx::FxQuat{0, 0, 0, joint::kOne};
+        b.angVel  = angVel;
+        return b;
+    };
+    const joint::fx kTwistRate   = (joint::fx)(joint::kOne * 3 / 2);
+    const joint::fx kOffAxisRate = (joint::fx)(joint::kOne * 3 / 4);
+    const joint::FxVec3 kDoorAngVel{kOffAxisRate, kTwistRate, 0};
+    world.bodies.push_back(makeBody(hingeX, hingeY, 0, /*pinned=*/true, joint::FxVec3{0, 0, 0}));
+    world.bodies.push_back(makeBody(hingeX, hingeY, kDoorHalf, /*pinned=*/false, kDoorAngVel));
+
+    std::vector<joint::FxJoint> joints;
+    {
+        joint::FxJoint j;
+        j.bodyA = 0; j.bodyB = 1;
+        j.anchorA = joint::FxVec3{0, 0, 0};
+        j.anchorB = joint::FxVec3{-kDoorHalf, 0, 0};
+        j.kind = joint::kJointBall;
+        joints.push_back(j);
+    }
+    const uint32_t kJointCount = (uint32_t)joints.size();
+
+    auto makeLimit = [&](joint::fx cosHalf, joint::fx sinHalf) {
+        joint::FxAngularLimit lim;
+        lim.bodyA = 0; lim.bodyB = 1;
+        lim.axis = kHingeAxis;
+        lim.cosHalfLimit = cosHalf;
+        lim.sinHalfLimit = sinHalf;
+        lim.kind = joint::kAngularHinge;
+        return lim;
+    };
+    std::vector<joint::FxAngularLimit> limits = {makeLimit(joint::kOne, 0)};
+    const uint32_t kLimitCount = (uint32_t)limits.size();
+
+    // std430 FxBody mirror (== the Vulkan --joint-hinge-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+    const std::vector<FxBodyGpu> bodiesInit = packBodies(world.bodies);
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). solveEnabled=false
+    // -> bodies UNCHANGED (the no-op path). Returns the settled world + its packed bodies.
+    auto runSolve = [&](bool solveEnabled, joint::FxWorld& outWorld, std::vector<FxBodyGpu>& outBodies) {
+        outWorld = world;
+        if (solveEnabled) joint::StepArticulatedSteps(outWorld, joints, limits, kDt, kIters, kSteps);
+        outBodies = packBodies(outWorld.bodies);
+    };
+
+    // CPU solve (enabled, K steps) — the Metal showcase body array.
+    joint::FxWorld cpuWorld;
+    std::vector<FxBodyGpu> gpuBodies;
+    runSolve(true, cpuWorld, gpuBodies);
+
+    std::printf("joint-hinge: {bodies:%d, joints:%u, limits:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU joint::StepArticulated, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kJointCount, kLimitCount, kSteps);
+
+    // two-run determinism.
+    joint::FxWorld cpuWorld2; std::vector<FxBodyGpu> gpuBodies2;
+    runSolve(true, cpuWorld2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("joint-hinge: two solves differ (nondeterministic)");
+    std::printf("joint-hinge determinism: two runs BYTE-IDENTICAL\n");
+
+    // the hinge HOLDS its axis: off-axis swing within the cone AND the door swung about the hinge.
+    {
+        const joint::fx swingCos = joint::SwingAngleCos(cpuWorld, limits[0]);
+        const joint::fx kBand = joint::kOne / 64;
+        const bool offAxisWithinCone = swingCos >= (joint::kOne - kBand);
+        const fpx::FxQuat qA = cpuWorld.bodies[0].orient;
+        const fpx::FxQuat qB = cpuWorld.bodies[1].orient;
+        const fpx::FxQuat qrel = joint::FxQuatMul(joint::QConj(qA), qB);
+        const joint::fx absRelW = qrel.w < 0 ? -qrel.w : qrel.w;
+        const bool swungAboutAxis = absRelW < (joint::kOne - joint::kOne / 16);
+        if (!offAxisWithinCone || !swungAboutAxis) return fail("joint-hinge: axis not held (swung/off-axis)");
+        std::printf("joint-hinge axis: {swungAboutAxis:true, offAxisWithinCone:true}\n");
+    }
+
+    // the FREE control swings off-axis: a no-limit control (cosHalfLimit=-kOne) flops off-axis.
+    {
+        std::vector<joint::FxAngularLimit> freeLimits = {makeLimit(-(joint::fx)joint::kOne, 0)};
+        joint::FxWorld freeWorld = world;
+        joint::StepArticulatedSteps(freeWorld, joints, freeLimits, kDt, kIters, kSteps);
+        const joint::fx freeSwingCos = joint::SwingAngleCos(freeWorld, limits[0]);
+        const joint::fx kBand = joint::kOne / 64;
+        if (!(freeSwingCos < (joint::kOne - kBand)))
+            return fail("joint-hinge: control did not flop off-axis (limit doing nothing)");
+        std::printf("joint-hinge control: free door flops off-axis (limit does the work)\n");
+    }
+
+    // empty / no-op: solveEnabled=false -> bodies UNCHANGED.
+    joint::FxWorld disabledWorld; std::vector<FxBodyGpu> disabledBodies;
+    runSolve(false, disabledWorld, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("joint-hinge: solveEnabled=false changed the bodies");
+
+    // --- Golden: a PURE-INTEGER TOP-DOWN view of the swinging door (IDENTICAL to the Vulkan
+    // --joint-hinge-shot by construction). ---
+    const int kPxPerUnit = 36, kMargin = 30;
+    const int kWorldW = 8, kWorldH = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 12; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](joint::fx wx, joint::fx wz, int& ix, int& iy) {
+        const int cx = (int)imgW / 2, cy = (int)imgH / 2;
+        ix = cx + (int)(((int64_t)(wx - (joint::fx)(hingeX * (int)joint::kOne)) * kPxPerUnit) >> joint::kFrac);
+        iy = cy + (int)(((int64_t)wz * kPxPerUnit) >> joint::kFrac);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    {
+        const fpx::FxBody& frame = cpuWorld.bodies[0];
+        const fpx::FxBody& door  = cpuWorld.bodies[1];
+        int hx, hy; worldToPx(frame.pos.x, frame.pos.z, hx, hy);
+        const joint::FxVec3 farLocal{kDoorHalf, 0, 0};
+        const joint::FxVec3 farEdge = joint::WorldAnchor(door, farLocal);
+        int fx2, fy2; worldToPx(farEdge.x, farEdge.z, fx2, fy2);
+        drawLine(hx, hy, fx2, fy2, Vec3{0.85f, 0.7f, 0.3f});
+        int dx2, dy2; worldToPx(door.pos.x, door.pos.z, dx2, dy2);
+        for (int yy = -2; yy <= 2; ++yy)
+            for (int xx = -2; xx <= 2; ++xx)
+                if (xx * xx + yy * yy <= 4) putPx(dx2 + xx, dy2 + yy, vg::hashColor(2u));
+        for (int yy = -3; yy <= 3; ++yy)
+            for (int xx = -3; xx <= 3; ++xx)
+                if (xx * xx + yy * yy <= 9) putPx(hx + xx, hy + yy, Vec3{1.0f, 1.0f, 1.0f});
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — hinge swinging-door top-down view (%d bodies, %u joints, %u limits)\n",
+                outPath, imgW, imgH, kBodyCount, kJointCount, kLimitCount);
+    return 0;
+}
+
 // ===== Slice CL3 — Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER showcase (--cloth-solve) =====
 // (the MAKE-OR-BREAK of FLAGSHIP #8). Like CL1's --cloth-integrate (and UNLIKE the int32 CL2 --cloth-edges /
 // FPX2 broadphase), the PBD solve is int64 (fxdiv/FxISqrt in SolveDistanceConstraint — the SAME form as
@@ -40055,6 +40264,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--joint-ball") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_joint_ball.png";
             try { return RunJointBallShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --joint-hinge <out.png>: render the Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase
+        // (Slice JT2, THE NEW-PHYSICS BEAT of FLAGSHIP #15). On Metal this runs the CPU solver:
+        // joint_angular_solve.comp is int64/Vulkan-only (glslc can't parse the quaternion fxmul/fxdiv/FxISqrt
+        // int64), so Metal runs the CPU joint::StepArticulated over a swinging door (a pinned frame + a door,
+        // a ball joint at the hinge + a HINGE FxAngularLimit about Y) -> the door swings about the hinge but
+        // is held in its plane — the EXACT bit-exact reference the Vulkan --joint-hinge-shot GPU==CPU memcmp
+        // compares against; solveEnabled=false -> bodies unchanged; two runs byte-identical. The image golden
+        // is a PURE-INTEGER top-down door view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/joint_hinge.png.
+        if (argc > 1 && std::strcmp(argv[1], "--joint-hinge") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_joint_hinge.png";
+            try { return RunJointHingeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cloth-collide <out.png>: render the Deterministic GPU Cloth INTEGER COLLISION showcase (Slice

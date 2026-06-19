@@ -490,6 +490,7 @@ int main(int argc, char** argv) {
     const char* clothEdgesShotPath = nullptr; // --cloth-edges-shot <out.bmp> (Slice CL2: Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD — the CL1 24x24 rest sheet's structural+shear+bend distance constraints meshed by INT32 count->scan->emit (cloth_edge_count/scan/emit.comp), GPU==CPU constraint list bit-exact vs cloth.h::BuildConstraints, integer lattice-graph viz color-coded by edge kind)
     const char* clothSolveShotPath = nullptr; // --cloth-solve-shot <out.bmp> (Slice CL3: Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER, the MAKE-OR-BREAK of FLAGSHIP #8 — the CL1 24x24 sheet (top corners pinned) draped ~60 steps x 8 iters by StepCloth (integrate + Gauss-Seidel SolveDistanceConstraint passes) on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepCloth, integer side-view of the COHESIVE drape; int64 -> Vulkan-only, Metal runs CPU StepCloth)
     const char* jointBallShotPath = nullptr; // --joint-ball-shot <out.bmp> (Slice JT1: Deterministic Articulated-Body Ragdoll JOINT GRAPH + BALL-JOINT CONSTRAINT, the BEACHHEAD of FLAGSHIP #15 — a HANGING CHAIN (a pinned invMass-0 root + ~8 dynamic links, each ball-jointed to its parent at the link ends) settled K StepJointWorld steps under gravity by one GPU thread (shaders/joint_ball_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel ball passes [SolveBallJoint = cloth::SolveDistanceConstraint restLen-0 over the WORLD anchors, the correction translating the body centres — the JT1 translation-only split] -> ground clamp), GPU==CPU body array bit-exact vs joint.h::StepJointWorld, integer 2D side-view of the connected hanging/swinging chain; int64 -> joint_ball_solve.comp is Vulkan-only, Metal runs CPU StepJointWorld)
+    const char* jointHingeShotPath = nullptr; // --joint-hinge-shot <out.bmp> (Slice JT2: Deterministic Articulated-Body Ragdoll ANGULAR LIMITS (hinge + cone), THE NEW-PHYSICS BEAT of FLAGSHIP #15 — a SWINGING DOOR (a pinned invMass-0 frame body + a door body, joined by a FxJoint ball at the hinge AND a FxAngularLimit HINGE about the vertical axis); seed an impulse -> the door swings about the hinge but is held in its plane (no off-axis flop). Settle K StepArticulated steps by one GPU thread (shaders/joint_angular_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel {SolveBallJoint then SolveAngularLimit = swing-twist + host-cos cone clamp + nlerp inverse-mass apply, projecting qrel=qA⁻¹·qB back into the cone/hinge} -> ground clamp), GPU==CPU body array bit-exact vs joint.h::StepArticulated, integer 2D view of the door swung about the hinge; int64 -> joint_angular_solve.comp is Vulkan-only, Metal runs CPU StepArticulated. CAVEAT: a deterministic PROXY (nlerp residual), not analytic constraint mechanics)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -1002,6 +1003,20 @@ int main(int argc, char** argv) {
         // cl1/cl2/cl3/fpx/fract shots.
         if (std::strcmp(argv[i], "--joint-ball-shot") == 0 && i + 1 < argc) {
             jointBallShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice JT2: --joint-hinge-shot <out.bmp> — the Deterministic Articulated-Body Ragdoll ANGULAR LIMITS
+        // (hinge + cone), THE NEW-PHYSICS BEAT of FLAGSHIP #15. A SWINGING DOOR: a pinned (invMass 0) frame
+        // body + a door body, joined by a FxJoint (ball, at the hinge) AND a FxAngularLimit (HINGE about the
+        // vertical axis). Seed an impulse -> the door swings about the hinge but is held in its plane.
+        // StepArticulated K steps x iters Gauss-Seidel passes (each {SolveBallJoint then SolveAngularLimit}).
+        // One GPU thread runs the K-step StepArticulated (copied VERBATIM from joint.h), GPU==CPU body array
+        // bit-exact vs joint.h::StepArticulated. int64 -> joint_angular_solve.comp is Vulkan-only; Metal
+        // --joint-hinge runs the CPU StepArticulated. NO new RHI. Handled as a STANDALONE branch (not in the
+        // --shot else-if chain) to avoid MSVC's C1061, like the cl1/cl2/cl3/fpx/joint-ball shots.
+        if (std::strcmp(argv[i], "--joint-hinge-shot") == 0 && i + 1 < argc) {
+            jointHingeShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -26825,6 +26840,359 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — ball-joint hanging chain side-view (%d bodies, %u joints)\n",
                                 jointBallShotPath, imgW, imgH, kBodyCount, kJointCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", jointBallShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Articulated-Body Ragdoll ANGULAR LIMITS (--joint-hinge-shot <out.bmp>, Slice JT2,
+        // THE NEW-PHYSICS BEAT of FLAGSHIP #15). A SWINGING DOOR: a pinned (invMass 0) FRAME body at the hinge
+        // + a DOOR body whose centre is offset along +X from the hinge, joined by a FxJoint (ball, pinning the
+        // door's near edge to the frame at the hinge line) AND a FxAngularLimit (HINGE about the vertical Y
+        // axis — the door may TWIST about Y [swing about the hinge] but the off-axis SWING [tilting out of the
+        // horizontal hinge plane] is clamped back to identity). The door is seeded an angVel with a TWIST
+        // component about Y (it swings) PLUS a small OFF-AXIS component about X (which the hinge suppresses).
+        // Settle K StepArticulated steps (each: IntegrateBodyFull all -> iters Gauss-Seidel {SolveBallJoint
+        // then SolveAngularLimit} -> ground clamp) by a SINGLE-THREAD compute (joint_angular_solve.comp). The
+        // CPU joint.h::StepArticulated over the SAME scene must match the GPU body array BIT-EXACT (memcmp,
+        // NO tol — the GPU==CPU make-or-break). int64 quaternion math -> joint_angular_solve.comp is
+        // VULKAN-ONLY (Metal --joint-hinge runs the CPU StepArticulated). NO new RHI. CAVEAT: the swing-twist
+        // + host-cos clamp + nlerp apply is a DETERMINISTIC PROXY for an angular limit (a nlerp residual),
+        // not analytic constraint mechanics (the GR4-repose caveat shape).
+        if (jointHingeShotPath) {
+            using math::Vec3;
+            namespace joint = hf::sim::joint;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The deterministic swinging-door scene (== the Metal --joint-hinge config).
+            const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+            const joint::fx kDt = joint::kOne / 60;
+            const int kBodyCount = 2;                    // body 0 = pinned frame, body 1 = door
+            const int kSteps = 120;                      // settle the door swing
+            const int kIters = 16;                       // Gauss-Seidel passes per step (ball + angular)
+            const joint::fx kGroundY = (joint::fx)(-100 * (int)joint::kOne); // far below -> focus the swing
+            const joint::fx kDoorHalf = joint::kOne;     // the door centre is 1.0 unit out along +X from the hinge
+
+            // The hinge axis (vertical, body-local on the frame). HINGE: cosHalfLimit = kOne, sinHalfLimit = 0.
+            const joint::FxVec3 kHingeAxis{0, joint::kOne, 0};   // +Y (UNIT)
+            const int hingeX = 6, hingeY = 12;
+
+            // Build the world: a pinned frame at (hingeX, hingeY), a dynamic door centred +1 along X. NO
+            // gravity on the swing axis (gravity is straight down; the door pivots about the vertical hinge in
+            // the horizontal plane), so the angVel seed drives the swing deterministically.
+            joint::FxWorld world;
+            world.gravity = joint::FxVec3{0, kGravY, 0};
+            world.groundY = kGroundY;
+            auto makeBody = [&](int gxUnits, int gyUnits, joint::fx offX, bool pinned,
+                                const joint::FxVec3& angVel) {
+                fpx::FxBody b;
+                b.pos = joint::FxVec3{(joint::fx)(gxUnits * (int)joint::kOne) + offX,
+                                      (joint::fx)(gyUnits * (int)joint::kOne), 0};
+                b.vel = joint::FxVec3{0, 0, 0};
+                b.invMass = pinned ? 0 : joint::kOne;
+                b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+                b.radius  = 0;
+                b.orient  = fpx::FxQuat{0, 0, 0, joint::kOne};
+                b.angVel  = angVel;
+                return b;
+            };
+            // The door's seed angVel: a TWIST about Y (the desired hinge swing) + a small OFF-AXIS about X
+            // (the off-plane flop the hinge must suppress). Q16.16 radians/sec.
+            const joint::fx kTwistRate  = (joint::fx)(joint::kOne * 3 / 2);   // ~1.5 rad/s about Y (swing)
+            const joint::fx kOffAxisRate = (joint::fx)(joint::kOne * 3 / 4);  // ~0.75 rad/s about X (off-plane)
+            const joint::FxVec3 kDoorAngVel{kOffAxisRate, kTwistRate, 0};
+            world.bodies.push_back(makeBody(hingeX, hingeY, 0, /*pinned=*/true, joint::FxVec3{0, 0, 0}));
+            world.bodies.push_back(makeBody(hingeX, hingeY, kDoorHalf, /*pinned=*/false, kDoorAngVel));
+
+            // The ball joint: anchorA on the frame = the hinge point (frame centre IS the hinge); anchorB on
+            // the door = its NEAR edge (-kDoorHalf along X) -> the two world anchors coincide at the hinge.
+            std::vector<joint::FxJoint> joints;
+            {
+                joint::FxJoint j;
+                j.bodyA = 0; j.bodyB = 1;
+                j.anchorA = joint::FxVec3{0, 0, 0};               // frame centre == hinge
+                j.anchorB = joint::FxVec3{-kDoorHalf, 0, 0};      // door's near (hinge) edge
+                j.kind = joint::kJointBall;
+                joints.push_back(j);
+            }
+            const uint32_t kJointCount = (uint32_t)joints.size();
+
+            // The angular limit: a HINGE about Y (cosHalfLimit = kOne -> swing forced to identity).
+            auto makeLimit = [&](joint::fx cosHalf, joint::fx sinHalf) {
+                joint::FxAngularLimit lim;
+                lim.bodyA = 0; lim.bodyB = 1;
+                lim.axis = kHingeAxis;
+                lim.cosHalfLimit = cosHalf;
+                lim.sinHalfLimit = sinHalf;
+                lim.kind = joint::kAngularHinge;
+                return lim;
+            };
+            std::vector<joint::FxAngularLimit> limits = {makeLimit(joint::kOne, 0)};
+            const uint32_t kLimitCount = (uint32_t)limits.size();
+
+            // std430 FxBody mirror (matches joint_angular_solve.comp FxBody): 16 x int32 (64 bytes).
+            struct FxBodyGpu {
+                int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+                int32_t ox, oy, oz, ow, ax, ay, az;
+            };
+            static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+            static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout (16 x int32)");
+            auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+                std::vector<FxBodyGpu> out(bs.size());
+                for (size_t i = 0; i < bs.size(); ++i) {
+                    const fpx::FxBody& b = bs[i];
+                    out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                                       b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                                       b.angVel.x, b.angVel.y, b.angVel.z};
+                }
+                return out;
+            };
+            const std::vector<FxBodyGpu> bodiesInit = packBodies(world.bodies);
+
+            auto makeBodiesBuf = [&]() {
+                rhi::BufferDesc d;
+                d.size = bodiesInit.size() * sizeof(FxBodyGpu);
+                d.initialData = bodiesInit.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // std430 FxJoint mirror (matches joint_angular_solve.comp FxJoint): 10 x int32 (40 bytes).
+            struct FxJointGpu { uint32_t bodyA, bodyB; int32_t aax, aay, aaz, abx, aby, abz; uint32_t kind; int32_t limit; };
+            static_assert(sizeof(FxJointGpu) == 40, "FxJointGpu std430 layout");
+            static_assert(sizeof(joint::FxJoint) == 40, "FxJoint std430 layout (10 x int32)");
+            std::vector<FxJointGpu> jointsInit;
+            for (uint32_t e = 0; e < kJointCount; ++e) {
+                const joint::FxJoint& j = joints[e];
+                jointsInit.push_back(FxJointGpu{j.bodyA, j.bodyB, j.anchorA.x, j.anchorA.y, j.anchorA.z,
+                                                j.anchorB.x, j.anchorB.y, j.anchorB.z, j.kind, j.limit});
+            }
+            rhi::BufferDesc jDesc;
+            jDesc.size = jointsInit.size() * sizeof(FxJointGpu);
+            jDesc.initialData = jointsInit.data();
+            jDesc.usage = rhi::BufferUsage::Storage;
+            auto jointsBuf = device->CreateBuffer(jDesc);
+
+            // std430 FxAngularLimit mirror (matches joint_angular_solve.comp FxAngularLimit): 8 x int32 (32 bytes).
+            struct FxAngularLimitGpu { uint32_t bodyA, bodyB; int32_t axx, axy, axz, cosHalf, sinHalf; uint32_t kind; };
+            static_assert(sizeof(FxAngularLimitGpu) == 32, "FxAngularLimitGpu std430 layout");
+            static_assert(sizeof(joint::FxAngularLimit) == 32, "FxAngularLimit std430 layout (8 x int32)");
+            auto makeLimitsBuf = [&](const std::vector<joint::FxAngularLimit>& lims) {
+                std::vector<FxAngularLimitGpu> init;
+                for (const joint::FxAngularLimit& l : lims)
+                    init.push_back(FxAngularLimitGpu{l.bodyA, l.bodyB, l.axis.x, l.axis.y, l.axis.z,
+                                                     l.cosHalfLimit, l.sinHalfLimit, l.kind});
+                rhi::BufferDesc d;
+                d.size = init.size() * sizeof(FxAngularLimitGpu);
+                d.initialData = init.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Params (matches joint_angular_solve.comp JointAngularParams std430): int4 grav {gx,gy,gz,dt} +
+            // int4 cfg {groundY, bodyCount, jointCount, steps} + int4 cfg2 {iters, limitCount, solveEnabled, _}.
+            struct JointAngularParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(JointAngularParams) == 48, "JointAngularParams std430 layout");
+            auto makeParams = [&](int32_t solveEnabled, uint32_t limitCount) {
+                JointAngularParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = kGroundY; p.cfg[1] = kBodyCount; p.cfg[2] = (int32_t)kJointCount; p.cfg[3] = kSteps;
+                p.cfg2[0] = kIters; p.cfg2[1] = (int32_t)limitCount; p.cfg2[2] = solveEnabled; p.cfg2[3] = 0;
+                return p;
+            };
+
+            // Compute pipeline: 4 storage buffers (bodies, joints, limits, params); SINGLE thread.
+            auto angCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/joint_angular_solve.comp.hlsl.spv");
+            auto angCs = device->CreateShaderModule({std::span<const uint32_t>(angCsWords)});
+            rhi::ComputePipelineDesc angCdesc;
+            angCdesc.compute = angCs.get();
+            angCdesc.storageBufferCount = 4;
+            angCdesc.pushConstantSize = 0;
+            angCdesc.threadsPerGroupX = 1;
+            auto angCompute = device->CreateComputePipeline(angCdesc);
+
+            // Run the solve compute over a fresh bodies buffer + the given limits + params, read back gBodies.
+            auto runSolve = [&](int32_t solveEnabled, const std::vector<joint::FxAngularLimit>& lims,
+                                std::vector<FxBodyGpu>& outBodies) {
+                auto bodiesBuf = makeBodiesBuf();
+                auto limitsBuf = makeLimitsBuf(lims);
+                JointAngularParams params = makeParams(solveEnabled, (uint32_t)lims.size());
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(JointAngularParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("joint_angular_solve", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*angCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*jointsBuf, 1);
+                        cmd.BindStorageBuffer(*limitsBuf, 2);
+                        cmd.BindStorageBuffer(*paramsBuf, 3);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                outBodies.assign((size_t)kBodyCount, FxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(),
+                                   outBodies.size() * sizeof(FxBodyGpu), 0);
+            };
+
+            // === GPU solve (enabled, K steps, the HINGE limit) ===
+            std::vector<FxBodyGpu> gpuBodies;
+            runSolve(1, limits, gpuBodies);
+
+            // === CPU reference: StepArticulated K times over the SAME scene ===
+            joint::FxWorld cpuWorld = world;
+            joint::StepArticulatedSteps(cpuWorld, joints, limits, kDt, kIters, kSteps);
+            std::vector<FxBodyGpu> cpuBodies = packBodies(cpuWorld.bodies);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K steps (integer memcmp, NO tol) — the MAKE-OR-BREAK.
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: joint-hinge GPU body array != CPU StepArticulated "
+                             "(a float/overflow/order divergence crept into the angular solver?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("joint-hinge: {bodies:%d, joints:%u, limits:%u, steps:%d} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kJointCount, kLimitCount, kSteps);
+
+            // PROOF (2) determinism: two full runs byte-identical.
+            std::vector<FxBodyGpu> gpuBodies2;
+            runSolve(1, limits, gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: joint-hinge two dispatches differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("joint-hinge determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) the hinge HOLDS its axis: after settling the door's off-axis SWING is within the cone
+            // (swing.w >= cosHalfLimit within an LSB band -> the door did NOT flop off the hinge plane), AND
+            // the door actually ROTATED about the hinge axis (the twist is non-trivial -> it swung). The swing
+            // .w == cos(half off-axis angle); the twist .w drops below kOne when the door turns about Y.
+            {
+                const joint::fx swingCos = joint::SwingAngleCos(cpuWorld, limits[0]);
+                // A small Q16.16 band below kOne (the nlerp residual leaves swing.w just under cosHalfLimit).
+                const joint::fx kBand = joint::kOne / 64;   // ~0.0156 -> swing.w >= kOne - band == in-plane
+                const bool offAxisWithinCone = swingCos >= (joint::kOne - kBand);
+                // The door swung about Y: the door's relative orientation about the hinge axis is non-trivial.
+                // qrel.w == cos(half total angle); a swung door has |qrel.w| clearly < kOne. Compute qrel.w.
+                const fpx::FxQuat qA = cpuWorld.bodies[0].orient;
+                const fpx::FxQuat qB = cpuWorld.bodies[1].orient;
+                const fpx::FxQuat qrel = joint::FxQuatMul(joint::QConj(qA), qB);
+                const joint::fx absRelW = qrel.w < 0 ? -qrel.w : qrel.w;
+                const bool swungAboutAxis = absRelW < (joint::kOne - joint::kOne / 16);  // turned a real amount
+                if (!offAxisWithinCone || !swungAboutAxis) {
+                    std::fprintf(stderr, "FATAL: joint-hinge axis failed (swingCos=%d cosHalf=%d, qrelW=%d) "
+                                 "swungAboutAxis=%d offAxisWithinCone=%d\n",
+                                 swingCos, limits[0].cosHalfLimit, qrel.w, (int)swungAboutAxis,
+                                 (int)offAxisWithinCone);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("joint-hinge axis: {swungAboutAxis:true, offAxisWithinCone:true}\n");
+            }
+
+            // PROOF (4) the FREE control swings off-axis: a NO-LIMIT control (cosHalfLimit = -kOne, a 180°
+            // cone -> never clamps) lets the door flop off-axis (its off-axis swing EXCEEDS the hinge band),
+            // proving the limit does the work.
+            {
+                std::vector<joint::FxAngularLimit> freeLimits = {makeLimit(-(joint::fx)joint::kOne, 0)};
+                joint::FxWorld freeWorld = world;
+                joint::StepArticulatedSteps(freeWorld, joints, freeLimits, kDt, kIters, kSteps);
+                // Measure the free door's off-axis swing against the SAME hinge axis (the hinge-held limit).
+                const joint::fx freeSwingCos = joint::SwingAngleCos(freeWorld, limits[0]);
+                const joint::fx kBand = joint::kOne / 64;
+                const bool freeFlops = freeSwingCos < (joint::kOne - kBand);   // off-plane (the limit's work)
+                if (!freeFlops) {
+                    std::fprintf(stderr, "FATAL: joint-hinge control did NOT flop off-axis "
+                                 "(freeSwingCos=%d — the limit may be doing nothing)\n", freeSwingCos);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("joint-hinge control: free door flops off-axis (limit does the work)\n");
+            }
+
+            // The disabled-path no-op: solveEnabled=false -> bodies UNCHANGED (byte-identical to the upload).
+            std::vector<FxBodyGpu> disabledBodies;
+            runSolve(0, limits, disabledBodies);
+            if (disabledBodies.size() != bodiesInit.size() ||
+                std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                            bodiesInit.size() * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: joint-hinge solveEnabled=false changed the bodies\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Golden: a PURE-INTEGER TOP-DOWN view of the swinging door. The hinge plane is the X-Z plane
+            // (looking down the +Y hinge axis); the door's FAR edge (door centre + FxRotate(orient, +X half))
+            // is projected to (x, z) so the door's SWING about the vertical hinge reads as the far edge
+            // sweeping in the X-Z plane, while the hinge (frame) stays a fixed white marker. CPU-colored from
+            // the read-back integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 36;
+            const int kMargin = 30;
+            const int kWorldW = 8, kWorldH = 8;   // the X-Z top-down extent (door swings within ~1 unit radius)
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 10; bgra[p * 4 + 1] = 8; bgra[p * 4 + 2] = 12; bgra[p * 4 + 3] = 255;
+            }
+            // Top-down: world X -> screen X, world Z -> screen Y (centered on the hinge X, Z=0).
+            auto worldToPx = [&](joint::fx wx, joint::fx wz, int& ix, int& iy) {
+                const int cx = (int)imgW / 2, cy = (int)imgH / 2;
+                ix = cx + (int)(((int64_t)(wx - (joint::fx)(hingeX * (int)joint::kOne)) * kPxPerUnit) >> joint::kFrac);
+                iy = cy + (int)(((int64_t)wz * kPxPerUnit) >> joint::kFrac);
+            };
+            auto putPx = [&](int ix, int iy, const Vec3& col) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            };
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int n = adx > ady ? adx : ady;
+                if (n == 0) { putPx(x0, y0, col); return; }
+                for (int s = 0; s <= n; ++s) {
+                    int ix = x0 + (int)((int64_t)dx * s / n);
+                    int iy = y0 + (int)((int64_t)dy * s / n);
+                    putPx(ix, iy, col);
+                }
+            };
+            // The door as a segment from the hinge (frame centre) to the door's FAR edge in the X-Z plane.
+            {
+                const fpx::FxBody& frame = cpuWorld.bodies[0];
+                const fpx::FxBody& door  = cpuWorld.bodies[1];
+                int hx, hy; worldToPx(frame.pos.x, frame.pos.z, hx, hy);
+                // The door's far edge = door.pos + FxRotate(door.orient, +X half) (the leaf end of the door).
+                const joint::FxVec3 farLocal{kDoorHalf, 0, 0};
+                const joint::FxVec3 farEdge = joint::WorldAnchor(door, farLocal);
+                int fx2, fy2; worldToPx(farEdge.x, farEdge.z, fx2, fy2);
+                drawLine(hx, hy, fx2, fy2, Vec3{0.85f, 0.7f, 0.3f});   // the swung door leaf
+                // Mark the door centre (a disc).
+                int dx2, dy2; worldToPx(door.pos.x, door.pos.z, dx2, dy2);
+                for (int yy = -2; yy <= 2; ++yy)
+                    for (int xx = -2; xx <= 2; ++xx)
+                        if (xx * xx + yy * yy <= 4) putPx(dx2 + xx, dy2 + yy, vg::hashColor(2u));
+                // The pinned hinge (white).
+                for (int yy = -3; yy <= 3; ++yy)
+                    for (int xx = -3; xx <= 3; ++xx)
+                        if (xx * xx + yy * yy <= 9) putPx(hx + xx, hy + yy, Vec3{1.0f, 1.0f, 1.0f});
+            }
+            bool ok = WriteBMP(jointHingeShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — hinge swinging-door top-down view (%d bodies, %u joints, %u limits)\n",
+                                jointHingeShotPath, imgW, imgH, kBodyCount, kJointCount, kLimitCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", jointHingeShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
