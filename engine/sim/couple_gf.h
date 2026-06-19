@@ -476,5 +476,122 @@ inline WetDry MeasureWetDry(const CGFWorld& world) {
     return out;
 }
 
+// ===== Slice GF3 — CONTACT REACTION / DISPLACEMENT (grain->fluid, Newton's 3rd law to GF2) ============
+// THE SECOND HALF of FLAGSHIP #13's two-way exchange: the grains now push BACK on the fluid. Each fluid
+// particle INSIDE a grain is projected out to the grain surface (the sand DISPLACES the fluid — the fluid
+// sits ON / seeps AROUND the bed, not inside the grain volumes) AND receives the equal-opposite DRAG-REACTION
+// impulse (the grain imparts its momentum to the surrounding fluid). Completes the two-way exchange (GF2
+// fluid->grain buoyancy, GF3 grain->fluid displacement). The CG3 ApplyBodyToGrains / CP3 ApplyBodyToFluid twin,
+// per-FLUID-particle over its GF1 fgNeighbors grain list, and the positional push is LITERALLY the grain.h
+// CollideGrainSphere sphere-projection with each GRAIN as the sphere (surf = g.radius; fluid particles are
+// points, so NO grain-radius+particle-radius — just g.radius).
+//
+// THE MIRROR OF GF2 (per-FLUID over the grain set): GF2's buoyancy was per-GRAIN (over its gfNeighbors fluid
+// list). GF3's displacement is the mirror — ONE thread per FLUID PARTICLE, each fluid particle iterates its GF1
+// fgNeighbors grain list (fixed order), and for each grain that CONTAINS it accumulates the surface-snap push
+// into a SEPARATE dp[] (JACOBI) + applies the drag-reaction velocity impulse. Each fluid particle writes ONLY
+// its own dp/vel -> per-fluid-disjoint, race-free, NO atomics, [numthreads(64,1,1)] MULTI-THREAD, NO TDR (the
+// GR3/CG3/CP3 win; the EXACT shape of grain.h::CollideGrainSpheres, grain as the sphere). int64
+// (FxLength/FxNormalize/fxmul) -> cgf_displace.comp is VULKAN-SPIR-V-ONLY + the Metal --cgf-displace showcase
+// runs THIS CPU ApplyGrainsToFluid (byte-identical by construction, the GF2/CG3 split). The GF1 cross-query
+// passes stay int32 MSL-native.
+
+using fpx::FxLength;       // read-only: the int64 length (FxISqrt of the sum of squares)
+
+// kDragReaction: the grain->fluid drag-reaction coefficient (the GF2 kDrag partner — the equal-opposite of the
+// grain's GF2 drag, now imparting the grain's momentum to the fluid). Host-snapped Q16.16 (~1.5, the CG3/CP3
+// kDragReaction value). The showcase + the CPU reference + the GPU shader share THIS exact constant.
+inline constexpr fx kDragReaction = (fx)(1.5 * (double)kOne + 0.5);   // 98304 (Q16.16, ~1.5 reaction drag)
+
+// ApplyGrainsToFluid(world, neighbors): the per-fluid-particle projection-out-of-grains + drag reaction (the GR3
+// CollideGrainSphere mold over the grain set + a Jacobi dp[]). For each fluid particle p (skip STATIC), over
+// each of its GF1 grain neighbours g (fgNeighbors[fgStart[p]..fgStart[p+1]), the FIXED GF1 emit order), with
+// d = p.pos − g.pos, dist = FxLength(d), surf = g.radius: if dist < surf (the fluid particle is INSIDE the grain)
+// accumulate the surface-snap push into a SEPARATE dp[] buffer
+//   dp_p += FxAdd(g.pos, FxScale(FxNormalize(d), surf)) − p.pos    // snap to the grain surface (== g.radius)
+// (dist==0 -> the FxNormalize +Y fallback — EXACTLY grain.h::CollideGrainSphere's snap with the grain as the
+// sphere) AND apply the drag-reaction velocity impulse per axis
+//   p.vel += fxmul(kDragReaction, (g.vel − p.vel)) · dt           // toward the grain velocity
+// then apply p.pos += dp_p for ALL fluid particles after (JACOBI — each fluid particle reads the iteration-start
+// grain state, NOT the in-progress positions). STATIC fluid particles (kFlagStatic / boundary) -> dp 0, vel
+// untouched. int64 (FxLength/FxNormalize/fxmul). cgf_displace.comp copies THIS body VERBATIM (one thread per
+// fluid particle). Deterministic (the fixed fgNeighbors order, fixed op order) -> bit-identical to the GPU
+// memcmp + two-run byte-identical.
+inline void ApplyGrainsToFluid(CGFWorld& world, const CGFNeighbors& neighbors) {
+    const uint32_t fluidCount = (uint32_t)world.fluid.size();
+    const fx dt = world.dt;
+    std::vector<FxVec3> dp((size_t)fluidCount, FxVec3{0, 0, 0});   // the Jacobi double-buffer (per-fluid Δp)
+    for (uint32_t i = 0; i < fluidCount; ++i) {
+        fluid::FluidParticle& p = world.fluid[(size_t)i];
+        if (p.flags & fluid::kFlagStatic) continue;       // boundary fluid -> dp 0, vel untouched
+        const uint32_t s0 = neighbors.fgStart[(size_t)i];
+        const uint32_t s1 = neighbors.fgStart[(size_t)i + 1u];
+        FxVec3 accum{0, 0, 0};
+        for (uint32_t s = s0; s < s1; ++s) {
+            const grain::GrainParticle& g = world.grains[(size_t)neighbors.fgNeighbors[(size_t)s]];
+            const FxVec3 d = FxSub(p.pos, g.pos);         // fluid relative to the grain centre (outward)
+            const fx dist = FxLength(d);
+            const fx surf = g.radius;                     // the grain exclusion radius (fluid particles are points)
+            if (dist >= surf) continue;                   // outside the grain sphere -> no push
+            // (1) POSITIONAL DISPLACEMENT: snap the fluid particle to the grain surface (the sand parts the fluid).
+            const FxVec3 nrm = FxNormalize(d);            // outward normal (dist==0 -> {0,kOne,0} fallback)
+            const FxVec3 surfPt = FxAdd(g.pos, FxScale(nrm, surf));   // the surface point along the normal
+            accum = FxAdd(accum, FxSub(surfPt, p.pos));   // into the Jacobi dp[] (the CollideGrainSphere push)
+            // (2) DRAG REACTION: the grain imparts momentum to the fluid (the equal-opposite of GF2's drag).
+            const FxVec3 dv = FxSub(g.vel, p.vel);        // toward the grain velocity
+            p.vel.x += fpx::fxmul(fpx::fxmul(kDragReaction, dv.x), dt);
+            p.vel.y += fpx::fxmul(fpx::fxmul(kDragReaction, dv.y), dt);
+            p.vel.z += fpx::fxmul(fpx::fxmul(kDragReaction, dv.z), dt);
+        }
+        dp[(size_t)i] = accum;
+    }
+    // Apply pos += dp for all fluid particles (Jacobi — disjoint per-fluid writes, race-free).
+    for (uint32_t i = 0; i < fluidCount; ++i) {
+        if (world.fluid[(size_t)i].flags & fluid::kFlagStatic) continue;
+        world.fluid[(size_t)i].pos = FxAdd(world.fluid[(size_t)i].pos, dp[(size_t)i]);
+    }
+}
+
+// MeasureFluidGrainPenetration(world): the honest no-penetration metric (the FL4/GR3/CG3 caveat) — over every
+// fluid / grain pair, sum/max the fluid-into-grain penetration pen = g.radius − |p.pos − g.pos| > 0. Returns
+// {peak, summed} in Q16.16 (int64 accumulator). DETERMINISTIC + bit-exact. The showcase's "fluid parted" proof
+// compares this BEFORE vs AFTER ApplyGrainsToFluid (penAfter < penBefore — the FL4/GR3 honesty: relieved, NOT
+// zero; Jacobi single-projection so a fluid particle inside MULTIPLE grains leaves a deterministic-but-nonzero
+// residual). Static fluid particles are counted (they CAN sit inside a grain; GF3 does not move them, so their
+// penetration is part of the honest residual).
+struct FluidGrainPenetration { int64_t peak = 0; int64_t summed = 0; };
+inline FluidGrainPenetration MeasureFluidGrainPenetration(const CGFWorld& world) {
+    FluidGrainPenetration out;
+    for (const fluid::FluidParticle& p : world.fluid)
+        for (const grain::GrainParticle& g : world.grains) {
+            const fx pen = g.radius - FxLength(FxSub(p.pos, g.pos));
+            if (pen > 0) { out.summed += (int64_t)pen; if ((int64_t)pen > out.peak) out.peak = (int64_t)pen; }
+        }
+    return out;
+}
+
+// CountDisplacedFluid(world): the deterministic count of fluid particles INSIDE at least one grain (dist <
+// g.radius) — the "displaced > 0" coverage stat for the showcase proof. Static fluid ARE counted (they sit
+// inside a grain too). Pure int64 compare -> bit-exact CPU<->GPU.
+inline uint32_t CountDisplacedFluid(const CGFWorld& world) {
+    uint32_t c = 0;
+    for (const fluid::FluidParticle& p : world.fluid) {
+        bool inside = false;
+        for (const grain::GrainParticle& g : world.grains)
+            if (FxLength(FxSub(p.pos, g.pos)) < g.radius) { inside = true; break; }
+        if (inside) ++c;
+    }
+    return c;
+}
+
+// StepCGFDisplace(world): ONE grain->fluid displacement pass (the showcase / GPU driver mirror). Re-query the
+// GF1 cross-lists from the CURRENT state (BuildCGFNeighbors) -> ApplyGrainsToFluid. The GPU runs the SAME
+// sequence (the int32 GF1 query passes + the int64 cgf_displace.comp). Pure integer -> two runs byte-identical,
+// cross-backend identical.
+inline void StepCGFDisplace(CGFWorld& world) {
+    const CGFNeighbors nbr = BuildCGFNeighbors(world);
+    ApplyGrainsToFluid(world, nbr);
+}
+
 }  // namespace cgf
 }  // namespace hf::sim

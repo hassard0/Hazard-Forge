@@ -454,6 +454,148 @@ int main() {
         check(match, "buoy: per-grain result is grain-order-independent");
     }
 
+    // ===== Slice GF3 — CONTACT REACTION / DISPLACEMENT (grain->fluid, Newton's 3rd law to GF2) ============
+
+    // ---- ApplyGrainsToFluid: a fluid particle inside a grain -> snapped to the grain surface + drag reaction --
+    {
+        // A grain of radius 0.25 at the origin, MOVING +X. A fluid particle 0.1 above it (inside the 0.25
+        // exclusion radius) must be pushed OUT to the surface (|p − g.pos| == g.radius within an LSB) and gain
+        // velocity toward the grain (drag reaction). dt = 1.0 for clean math.
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g = GrainAt(0, 0, 0);
+        g.radius = kOne / 4;                              // 0.25 exclusion radius
+        g.vel = fpx::FxVec3{2 * (int)kOne, 0, 0};         // grain moving +2 in x
+        w.grains = {g};
+        fluid::FluidParticle f = FluidAt(0, 0, 0);
+        f.pos.y = kOne / 10;                              // 0.1 above the grain centre -> inside (0.1 < 0.25)
+        f.prev = f.pos;
+        w.fluid = {f};
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        check(nbr.fgStart[1] - nbr.fgStart[0] == 1u, "displace: fluid has the grain as a neighbour");
+
+        cgf::CGFWorld w2 = w;
+        cgf::ApplyGrainsToFluid(w2, nbr);
+        // The fluid centre should now sit on the grain surface: |p − g.pos| == g.radius within an LSB band.
+        const fpx::FxVec3 dd = fpx::FxSub(w2.fluid[0].pos, w.grains[0].pos);
+        const fx dist = fpx::FxLength(dd);
+        fx err = dist - (kOne / 4); if (err < 0) err = -err;
+        check(err <= 4, "displace: fluid snapped to the grain surface (|p-g| == g.radius within an LSB)");
+        // The fluid gained +X velocity toward the moving grain (drag reaction = fxmul(kDragReaction, (2-0))·dt).
+        const fx expectDragX = fpx::fxmul(fpx::fxmul(cgf::kDragReaction, 2 * (int)kOne), kOne);
+        check(w2.fluid[0].vel.x == expectDragX, "displace: exact Q16.16 drag-reaction vel toward the grain (+X)");
+        check(w2.fluid[0].vel.x > 0, "displace: fluid dragged toward the grain velocity");
+    }
+
+    // ---- A fluid particle OUTSIDE the grain (beyond g.radius) -> untouched --------------------------------
+    {
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g = GrainAt(0, 0, 0); g.radius = kOne / 4; g.vel = fpx::FxVec3{2 * (int)kOne, 0, 0};
+        w.grains = {g};
+        fluid::FluidParticle f = FluidAt(0, 0, 0);
+        f.pos.y = kOne / 2;                              // 0.5 above (> 0.25 -> OUTSIDE the grain), still a GF1 nbr
+        f.prev = f.pos;
+        w.fluid = {f};
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        const fpx::FxVec3 posBefore = w.fluid[0].pos;
+        cgf::ApplyGrainsToFluid(w, nbr);
+        check(std::memcmp(&w.fluid[0].pos, &posBefore, sizeof(fpx::FxVec3)) == 0,
+              "displace: fluid outside the grain is positionally untouched");
+        check(w.fluid[0].vel.x == 0 && w.fluid[0].vel.y == 0 && w.fluid[0].vel.z == 0,
+              "displace: fluid outside the grain keeps its velocity (no drag)");
+    }
+
+    // ---- A STATIC fluid particle inside a grain -> untouched (dp 0, vel held) -----------------------------
+    {
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g = GrainAt(0, 0, 0); g.radius = kOne / 4; g.vel = fpx::FxVec3{2 * (int)kOne, 0, 0};
+        w.grains = {g};
+        fluid::FluidParticle f = FluidAt(0, 0, 0); f.pos.y = kOne / 10; f.prev = f.pos;
+        f.flags = fluid::kFlagStatic;                   // boundary fluid -> never moves
+        w.fluid = {f};
+        const fpx::FxVec3 posBefore = w.fluid[0].pos;
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        cgf::ApplyGrainsToFluid(w, nbr);
+        check(std::memcmp(&w.fluid[0].pos, &posBefore, sizeof(fpx::FxVec3)) == 0,
+              "displace: static fluid positionally untouched");
+        check(w.fluid[0].vel.x == 0 && w.fluid[0].vel.y == 0 && w.fluid[0].vel.z == 0,
+              "displace: static fluid vel untouched");
+    }
+
+    // ---- Two grains, fixed-order projection (a fluid particle inside both) --------------------------------
+    {
+        // Two grains straddling a fluid particle on x. The fluid iterates its fgNeighbors grain list in the
+        // FIXED GF1 emit order; the Jacobi sum of both surface-snap pushes is deterministic. We pin determinism
+        // + that the result differs from a single-grain push (both contribute).
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g0 = GrainAt(0, 0, 0); g0.radius = kOne / 4;
+        grain::GrainParticle g1; g1 = GrainAt(0, 0, 0); g1.radius = kOne / 4; g1.pos.x = kOne / 4;  // 0.25 over on x
+        w.grains = {g0, g1};
+        fluid::FluidParticle f = FluidAt(0, 0, 0); f.pos.x = kOne / 8; f.prev = f.pos;  // 0.125, inside BOTH
+        w.fluid = {f};
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        check(nbr.fgStart[1] - nbr.fgStart[0] == 2u, "displace: fluid gathers BOTH grains");
+        cgf::CGFWorld wA = w; cgf::ApplyGrainsToFluid(wA, nbr);
+        cgf::CGFWorld wB = w; cgf::ApplyGrainsToFluid(wB, nbr);
+        check(std::memcmp(&wA.fluid[0], &wB.fluid[0], sizeof(fluid::FluidParticle)) == 0,
+              "displace: two grains, two runs byte-identical (fixed-order Jacobi sum)");
+    }
+
+    // ---- MeasureFluidGrainPenetration on a known overlap + CountDisplacedFluid -----------------------------
+    {
+        // A grain radius 0.25 at the origin; a fluid particle 0.1 above -> penetration = 0.25 − 0.1 = 0.15.
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g = GrainAt(0, 0, 0); g.radius = kOne / 4;
+        w.grains = {g};
+        fluid::FluidParticle f = FluidAt(0, 0, 0); f.pos.y = kOne / 10; f.prev = f.pos;
+        w.fluid = {f};
+        const cgf::FluidGrainPenetration pen = cgf::MeasureFluidGrainPenetration(w);
+        const fx expectPen = (kOne / 4) - (kOne / 10);   // 0.15 (the fluid IS a point, dist == 0.1)
+        fx perr = (fx)pen.summed - expectPen; if (perr < 0) perr = -perr;
+        check(perr <= 4, "displace: penetration == g.radius − dist within an LSB (0.15)");
+        check(cgf::CountDisplacedFluid(w) == 1u, "displace: 1 fluid particle inside the grain (displaced)");
+
+        // The displacement RELIEVES the penetration (penAfter < penBefore — the FL4/GR3 honesty).
+        const cgf::FluidGrainPenetration before = cgf::MeasureFluidGrainPenetration(w);
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        cgf::CGFWorld wd = w; cgf::ApplyGrainsToFluid(wd, nbr);
+        const cgf::FluidGrainPenetration after = cgf::MeasureFluidGrainPenetration(wd);
+        check(after.summed < before.summed, "displace: penAfter < penBefore (the fluid parted from the sand)");
+    }
+
+    // ---- A fluid particle CLEAR of all grains -> ApplyGrainsToFluid is a no-op -----------------------------
+    {
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g = GrainAt(0, 0, 0); g.radius = kOne / 4;
+        w.grains = {g};
+        fluid::FluidParticle f = FluidAt(20, 0, 0); f.prev = f.pos;   // far away -> no grain neighbours
+        w.fluid = {f};
+        const fluid::FluidParticle before = w.fluid[0];
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        cgf::ApplyGrainsToFluid(w, nbr);
+        check(std::memcmp(&w.fluid[0], &before, sizeof(fluid::FluidParticle)) == 0,
+              "displace: fluid clear of the grains is unchanged (no-op)");
+    }
+
+    // ---- Fluid-order independence: shuffling the fluid array gives the SAME per-fluid result --------------
+    {
+        cgf::CGFWorld w; w.h = h; w.dt = kOne;
+        grain::GrainParticle g = GrainAt(0, 0, 0); g.radius = kOne / 4; g.vel = fpx::FxVec3{kOne, 0, 0};
+        w.grains = {g};
+        fluid::FluidParticle f0 = FluidAt(0, 0, 0); f0.pos.y = kOne / 10; f0.prev = f0.pos;   // inside
+        fluid::FluidParticle f1 = FluidAt(0, 0, 0); f1.pos.x = kOne / 10; f1.prev = f1.pos;   // inside
+        w.fluid = {f0, f1};
+        cgf::CGFWorld wRev = w; std::reverse(wRev.fluid.begin(), wRev.fluid.end());
+        const cgf::CGFNeighbors nbr = cgf::BuildCGFNeighbors(w);
+        const cgf::CGFNeighbors nbrRev = cgf::BuildCGFNeighbors(wRev);
+        cgf::ApplyGrainsToFluid(w, nbr);
+        cgf::ApplyGrainsToFluid(wRev, nbrRev);
+        bool match = true;
+        for (size_t i = 0; i < w.fluid.size(); ++i)
+            if (std::memcmp(&w.fluid[i], &wRev.fluid[w.fluid.size() - 1 - i], sizeof(fluid::FluidParticle)) != 0)
+                match = false;
+        check(match, "displace: per-fluid result is fluid-order-independent (Jacobi)");
+    }
+
     if (g_fail == 0) std::printf("cgf_test: ALL PASS\n");
     else             std::printf("cgf_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
