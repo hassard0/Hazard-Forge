@@ -24191,6 +24191,166 @@ static int RunVehicleTractionShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VH5 — Deterministic Vehicle Physics LOCKSTEP + ROLLBACK showcase (--vehicle-lockstep) ======
+// THE NETCODE HEADLINE of FLAGSHIP #16 (the FPX5/FR5/GR5/CG5/JT5 twin). VH5 is PURE CPU — both the Vulkan
+// --vehicle-lockstep-shot and this Metal --vehicle-lockstep run the IDENTICAL RunVehicleLockstep/
+// RunVehicleRollback C++ (NO GPU compute dispatch), so the converged-car render is bit-identical cross-
+// backend BY CONSTRUCTION (the strict zero-differing-pixel bar — that cross-platform bit-identity IS the
+// lockstep evidence). Build the SAME car + scripted drive+steer authStream, run RunVehicleLockstep
+// (authority==replica) + RunVehicleRollback (a mispredicted steer at one tick, rolled back to a
+// VehicleSnapshot that carries the bodies AND the 4 STEERED HINGE AXES — the VH twist), and CPU-color the
+// SAME integer side-view as the Vulkan path. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/vehicle_lockstep.png (Mac-baked by the controller); two runs DIFF 0.0000. NO GPU
+// compute, NO new shader/RHI.
+static int RunVehicleLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vehicle = hf::sim::vehicle;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic vehicle lockstep scene (== the Vulkan --vehicle-lockstep-shot config + vehicle_test).
+    const vehicle::fx kDt = vehicle::kOne / 60;
+    const int kTicks = 40;
+    const int kIters = 16;
+    const int kSolveIters = 8;
+    const int kDivergeTick = 12;
+    vehicle::VehicleConfig cfg;                       // the documented defaults
+    const vehicle::Vehicle vehInit = vehicle::VehicleFromConfig(cfg);
+    const int kBodyCount = (int)vehInit.world.bodies.size();   // 5
+    const vehicle::fx kGroundY = cfg.groundY;
+
+    // The scripted drive+steer authStream (IDENTICAL to the Vulkan --vehicle-lockstep-shot).
+    std::vector<vehicle::FxCommand> authStream;
+    for (int t = 0; t < kTicks; ++t) {
+        vehicle::FxCommand d2; d2.tick = (uint32_t)t; d2.kind = vehicle::kCmdDriveTorque;
+        d2.bodyId = vehInit.wheelIndex[2]; d2.arg = vehicle::FxVec3{vehicle::kOne, 0, 0};
+        authStream.push_back(d2);
+        vehicle::FxCommand d3; d3.tick = (uint32_t)t; d3.kind = vehicle::kCmdDriveTorque;
+        d3.bodyId = vehInit.wheelIndex[3]; d3.arg = vehicle::FxVec3{vehicle::kOne, 0, 0};
+        authStream.push_back(d3);
+    }
+    auto steerCmd = [](uint32_t tick, uint32_t target, vehicle::fx angle) {
+        vehicle::FxCommand c; c.tick = tick; c.kind = vehicle::kCmdSteer; c.bodyId = target;
+        c.arg = vehicle::FxVec3{angle, 0, 0}; return c;
+    };
+    authStream.push_back(steerCmd(4u, 0u, vehicle::kOne / 4));
+    authStream.push_back(steerCmd(9u, 0u, vehicle::kOne / 4));
+
+    auto vehEqual = [&](const vehicle::Vehicle& a, const vehicle::Vehicle& b) {
+        if (a.world.bodies.size() != b.world.bodies.size()) return false;
+        if (std::memcmp(a.world.bodies.data(), b.world.bodies.data(),
+                        a.world.bodies.size() * sizeof(fpx::FxBody)) != 0) return false;
+        if (a.hinges.size() != b.hinges.size()) return false;
+        for (size_t i = 0; i < a.hinges.size(); ++i) {
+            const vehicle::FxVec3& xa = a.hinges[i].axis; const vehicle::FxVec3& xb = b.hinges[i].axis;
+            if (xa.x != xb.x || xa.y != xb.y || xa.z != xb.z) return false;
+        }
+        return true;
+    };
+
+    // LOCKSTEP: authority==replica BIT-IDENTICAL (inputs only).
+    const vehicle::Vehicle authority =
+        vehicle::RunVehicleLockstep(cfg, vehInit, authStream, kTicks, kDt, kIters, kSolveIters);
+    const vehicle::Vehicle replica =
+        vehicle::RunVehicleLockstep(cfg, vehInit, authStream, kTicks, kDt, kIters, kSolveIters);
+    if (!vehEqual(authority, replica)) return fail("vehicle-lockstep: authority != replica");
+    std::printf("vehicle-lockstep: {bodies:%d, ticks:%d} authority==replica BIT-IDENTICAL\n",
+                kBodyCount, kTicks);
+
+    // ROLLBACK: a mispredicted strong steer at divergeTick, rolled back to the snapshot.
+    std::vector<vehicle::FxCommand> mispredictStream = authStream;
+    mispredictStream.push_back(steerCmd((uint32_t)kDivergeTick, 0u, vehicle::kOne));
+    const vehicle::Vehicle rolledBack =
+        vehicle::RunVehicleRollback(cfg, vehInit, authStream, mispredictStream, kDivergeTick,
+                                    kDivergeTick, kTicks, kDt, kIters, kSolveIters);
+    const vehicle::Vehicle mispredicted =
+        vehicle::RunVehicleLockstep(cfg, vehInit, mispredictStream, kTicks, kDt, kIters, kSolveIters);
+    if (!vehEqual(rolledBack, authority)) return fail("vehicle-lockstep: rollback corrected != authority");
+    std::printf("vehicle-lockstep rollback: corrected==authority BIT-EXACT\n");
+    if (vehEqual(mispredicted, authority)) return fail("vehicle-lockstep: mispredict did NOT diverge");
+    std::printf("vehicle-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+    // determinism: a second full lockstep run byte-identical.
+    const vehicle::Vehicle authority2 =
+        vehicle::RunVehicleLockstep(cfg, vehInit, authStream, kTicks, kDt, kIters, kSolveIters);
+    if (!vehEqual(authority, authority2)) return fail("vehicle-lockstep: two runs differ");
+    std::printf("vehicle-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: a PURE-INTEGER 2D SIDE-VIEW of the converged car (IDENTICAL to the Vulkan path by construction).
+    const vehicle::Vehicle& cpuVeh = authority;
+    const int kPxPerUnit = 40;
+    const int kMargin = 30;
+    const int kWorldW = 12;
+    const int kWorldH = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, const Vec3& col) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        d[3] = 255;
+    };
+    auto worldToPx = [&](vehicle::fx wx, vehicle::fx wy, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)(wx + (vehicle::fx)((kWorldW / 4) * (int)vehicle::kOne)) * kPxPerUnit) >> vehicle::kFrac;
+        const int64_t sy = ((int64_t)wy * kPxPerUnit) >> vehicle::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s)
+            putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+    };
+    { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+      for (int x = 0; x < (int)imgW; ++x) {
+          if (gy0 < 0 || gy0 >= (int)imgH) break;
+          uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+          d[0] = 70; d[1] = 70; d[2] = 70; d[3] = 255;
+      } }
+    {
+        const fpx::FxBody& c = cpuVeh.world.bodies[(size_t)cpuVeh.chassisIndex];
+        int x0, y0, x1, y1;
+        worldToPx(c.pos.x - cfg.chassisHalfX, c.pos.y + cfg.chassisHalfY, x0, y0);
+        worldToPx(c.pos.x + cfg.chassisHalfX, c.pos.y - cfg.chassisHalfY, x1, y1);
+        const Vec3 chassisCol{0.85f, 0.7f, 0.3f};
+        for (int yy = (y0 < y1 ? y0 : y1); yy <= (y0 < y1 ? y1 : y0); ++yy)
+            for (int xx = (x0 < x1 ? x0 : x1); xx <= (x0 < x1 ? x1 : x0); ++xx)
+                putPx(xx, yy, chassisCol);
+    }
+    const int visibleCorner[2] = {0, 2};
+    for (int vi = 0; vi < 2; ++vi) {
+        const vehicle::FxSpringJoint& j = cpuVeh.springs[(size_t)visibleCorner[vi]];
+        const fpx::FxBody& ba = cpuVeh.world.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuVeh.world.bodies[(size_t)j.bodyB];
+        const vehicle::FxVec3 pa = vehicle::WorldAnchor(ba, j.anchorA);
+        const vehicle::FxVec3 pb = vehicle::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.6f, 0.85f, 0.95f});
+    }
+    const int radPx = (int)(((int64_t)cfg.wheelRadius * kPxPerUnit) >> vehicle::kFrac);
+    for (int vi = 0; vi < 2; ++vi) {
+        const fpx::FxBody& w = cpuVeh.world.bodies[(size_t)cpuVeh.wheelIndex[visibleCorner[vi]]];
+        int cx, cy; worldToPx(w.pos.x, w.pos.y, cx, cy);
+        const Vec3 col = vg::hashColor((uint32_t)(visibleCorner[vi] + 2));
+        for (int yy = -radPx; yy <= radPx; ++yy)
+            for (int xx = -radPx; xx <= radPx; ++xx)
+                if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vehicle lockstep side-view (%d bodies, %d ticks)\n",
+                outPath, imgW, imgH, kBodyCount, kTicks);
+    return 0;
+}
+
 // ===== Slice JT2 — Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase (--joint-hinge) ======
 // THE NEW-PHYSICS BEAT of FLAGSHIP #15. The angular solve (SolveAngularLimit's swing-twist + cone clamp +
 // nlerp) is int64 (the quaternion fxmul/fxdiv/FxISqrt), so shaders/joint_angular_solve.comp is VULKAN-ONLY
@@ -41989,6 +42149,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vehicle-traction") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vehicle_traction.png";
             try { return RunVehicleTractionShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vehicle-lockstep <out.png>: render the Deterministic Vehicle Physics LOCKSTEP + ROLLBACK showcase
+        // (Slice VH5, THE NETCODE HEADLINE of FLAGSHIP #16). PURE CPU on BOTH backends — this runs the IDENTICAL
+        // RunVehicleLockstep/RunVehicleRollback C++ as the Vulkan --vehicle-lockstep-shot (NO GPU compute), so
+        // the converged-car golden is bit-identical cross-backend BY CONSTRUCTION. Builds the SAME car + scripted
+        // drive+steer authStream, proves authority==replica + rollback==authority (the snapshot carries the
+        // STEERED HINGE AXES), and CPU-colors the SAME integer side-view. Proof lines match the Vulkan side
+        // EXACTLY; two runs byte-identical. New golden tests/golden/metal/vehicle_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--vehicle-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vehicle_lockstep.png";
+            try { return RunVehicleLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --joint-hinge <out.png>: render the Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase
