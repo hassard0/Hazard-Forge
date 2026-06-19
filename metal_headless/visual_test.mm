@@ -96,6 +96,7 @@
 #include "sim/couple_gf.h"           // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
 #include "sim/fract.h"               // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
+#include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -23407,6 +23408,216 @@ static int RunJointBallShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
+// (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
+// (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal
+// the --vehicle-spring showcase runs the CPU vehicle::StepSpringWorld — the EXACT bit-exact reference the
+// Vulkan --vehicle-spring-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical
+// to the Vulkan GPU result BY CONSTRUCTION (the joint_ball_solve.comp / cloth_solve.comp convention), while
+// the Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic spring scene (a pinned
+// invMass-0 anchor + a dynamic body hung below by a FxSpringJoint, started DISPLACED from restLen, gravity
+// -9.8 host-snapped) — IDENTICAL scene constants to the Vulkan --vehicle-spring-shot — runs
+// vehicle::StepSpringWorldSteps K=600 x iters=16 over it -> the body oscillates on the spring and DAMPS to
+// rest at ~restLen, and CPU-colors the SAME integer side-view as the Vulkan --vehicle-spring-shot -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/vehicle_spring.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000. NO GPU compute (int64 -> CPU on Metal), NO new RHI. CAVEAT: spring
+// stiffness ∝ iterations (a stiff spring sags within a deterministic-but-nonzero band; deterministic +
+// bit-identical is the headline).
+static int RunVehicleSpringShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace vehicle = hf::sim::vehicle;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic spring scene (== the Vulkan --vehicle-spring-shot config). gravity -9.8 host-snapped.
+    const vehicle::fx kGravY = (vehicle::fx)(-9.8 * (double)vehicle::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const vehicle::fx kDt = vehicle::kOne / 60;
+    const int kBodyCount = 2;                   // 1 pinned anchor + 1 dynamic body
+    const int kSteps = 600;                     // settle the bob to rest
+    const int kIters = 16;                       // Gauss-Seidel spring passes per step
+    const vehicle::fx kGroundY = (vehicle::fx)(-100 * (int)vehicle::kOne); // far below -> focus the bob
+    const vehicle::fx kRest = 4 * (int)vehicle::kOne;                       // rest length 4.0
+    const vehicle::fx kStiff = vehicle::kOne / 4;                           // soft (0.25) per-iter restore
+    const vehicle::fx kDamp = vehicle::kOne / 4;                            // 0.25 normal-velocity damping
+    const int anchorX = 9, anchorY = 20;
+    const int startY = 8;                       // the dynamic body starts at y=8 (length 12 >> restLen 4)
+
+    auto makeBody = [&](int gx, int gy, bool pinned) {
+        fpx::FxBody b;
+        b.pos = vehicle::FxVec3{(vehicle::fx)(gx * (int)vehicle::kOne),
+                                (vehicle::fx)(gy * (int)vehicle::kOne), 0};
+        b.vel = vehicle::FxVec3{0, 0, 0};
+        b.invMass = pinned ? 0 : vehicle::kOne;
+        b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+        b.radius  = 0;
+        b.orient  = fpx::FxQuat{0, 0, 0, vehicle::kOne};
+        b.angVel  = vehicle::FxVec3{0, 0, 0};
+        return b;
+    };
+    vehicle::FxWorld world;
+    world.gravity = vehicle::FxVec3{0, kGravY, 0};
+    world.groundY = kGroundY;
+    world.bodies.push_back(makeBody(anchorX, anchorY, true));   // body 0 = pinned anchor
+    world.bodies.push_back(makeBody(anchorX, startY, false));   // body 1 = dynamic, displaced below
+
+    // One spring tying the anchor (body 0) to the dynamic body (body 1), centre-to-centre, restLen R.
+    std::vector<vehicle::FxSpringJoint> springs;
+    {
+        vehicle::FxSpringJoint j;
+        j.bodyA = 0; j.bodyB = 1;
+        j.anchorA = vehicle::FxVec3{0, 0, 0};
+        j.anchorB = vehicle::FxVec3{0, 0, 0};
+        j.restLen = kRest;
+        j.stiffness = kStiff;
+        j.damping = kDamp;
+        springs.push_back(j);
+    }
+    const uint32_t kSpringCount = (uint32_t)springs.size();
+
+    // std430 FxBody mirror (== the Vulkan --vehicle-spring-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+    const std::vector<FxBodyGpu> bodiesInit = packBodies(world.bodies);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --vehicle-spring-shot).
+    const int kPxPerUnit = 24, kMargin = 24;
+    const int kWorldW = 18, kWorldH = 24;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). solveEnabled=false
+    // -> bodies UNCHANGED (the no-op path). Returns the settled world + its packed bodies.
+    auto runSolve = [&](bool solveEnabled, vehicle::FxWorld& outWorld, std::vector<FxBodyGpu>& outBodies) {
+        outWorld = world;
+        if (solveEnabled) vehicle::StepSpringWorldSteps(outWorld, springs, kDt, kIters, kSteps);
+        outBodies = packBodies(outWorld.bodies);
+    };
+
+    // CPU solve (enabled, K steps) — the Metal showcase body array.
+    vehicle::FxWorld cpuWorld;
+    std::vector<FxBodyGpu> gpuBodies;
+    runSolve(true, cpuWorld, gpuBodies);
+
+    // GPU==CPU is N/A on the Metal CPU path: this body array IS the CPU StepSpringWorld reference the Vulkan
+    // --vehicle-spring-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("vehicle-spring: {bodies:%d, springs:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU vehicle::StepSpringWorld, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kSpringCount, kSteps);
+
+    // two-run determinism.
+    vehicle::FxWorld cpuWorld2; std::vector<FxBodyGpu> gpuBodies2;
+    runSolve(true, cpuWorld2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("vehicle-spring: two solves differ (nondeterministic)");
+    std::printf("vehicle-spring determinism: two runs BYTE-IDENTICAL\n");
+
+    // the spring RESTORES + DAMPS: after settling, |len-restLen| within a small band AND the body is at rest.
+    {
+        const vehicle::fx len = vehicle::SpringLength(cpuWorld, springs[0]);
+        const vehicle::fx band = vehicle::kOne / 2;   // 0.5 world units
+        const vehicle::fx speed = fpx::FxLength(cpuWorld.bodies[1].vel);
+        const vehicle::fx kRestThresh = vehicle::kOne / 8;   // at-rest speed threshold
+        const bool atRest = speed < kRestThresh;
+        const vehicle::fx d = (len - kRest < 0 ? kRest - len : len - kRest);
+        if (d >= band || !atRest) return fail("vehicle-spring: not settled (len/restLen/atRest out of band)");
+        std::printf("vehicle-spring settled: {len:%d, restLen:%d, atRest:true}\n", len, kRest);
+    }
+
+    // the DAMPER does the work: a damping=0 CONTROL keeps OSCILLATING (end speed NOT below the rest band).
+    {
+        vehicle::FxWorld ctrlWorld = world;
+        std::vector<vehicle::FxSpringJoint> ctrlSprings = springs;
+        ctrlSprings[0].damping = 0;   // NO damping
+        vehicle::StepSpringWorldSteps(ctrlWorld, ctrlSprings, kDt, kIters, kSteps);
+        const vehicle::fx ctrlSpeed = fpx::FxLength(ctrlWorld.bodies[1].vel);
+        const vehicle::fx kRestThresh = vehicle::kOne / 8;
+        if (ctrlSpeed < kRestThresh)
+            return fail("vehicle-spring: control (damping=0) came to rest (the damper isn't doing the work)");
+        std::printf("vehicle-spring control: {damping0:oscillating}\n");
+    }
+
+    // empty / no-op: solveEnabled=false -> bodies UNCHANGED.
+    vehicle::FxWorld disabledWorld; std::vector<FxBodyGpu> disabledBodies;
+    runSolve(false, disabledWorld, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("vehicle-spring: solveEnabled=false changed the bodies");
+
+    // --- Golden: a PURE-INTEGER side-view of the body hung on the spring (IDENTICAL to the Vulkan
+    // --vehicle-spring-shot by construction). The anchor (pinned, white) at top, the spring as a segment down
+    // to the dynamic body (a disc at its bit-exact pos>>kFrac). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    // The spring: a segment between the two bodies' world anchors (the coil).
+    for (const vehicle::FxSpringJoint& j : springs) {
+        const fpx::FxBody& ba = cpuWorld.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuWorld.bodies[(size_t)j.bodyB];
+        const vehicle::FxVec3 pa = vehicle::WorldAnchor(ba, j.anchorA);
+        const vehicle::FxVec3 pb = vehicle::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by;
+        worldToPx(pa.x >> vehicle::kFrac, pa.y >> vehicle::kFrac, ax, ay);
+        worldToPx(pb.x >> vehicle::kFrac, pb.y >> vehicle::kFrac, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.85f, 0.7f, 0.3f});
+    }
+    // The bodies: the pinned anchor white, the dynamic body hashColor'd.
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = gpuBodies[(size_t)i].px >> vehicle::kFrac;
+        const int wy = gpuBodies[(size_t)i].py >> vehicle::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        const bool pinned = (gpuBodies[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+        const Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i + 1u);
+        for (int dy = -3; dy <= 3; ++dy)
+            for (int dx = -3; dx <= 3; ++dx)
+                if (dx * dx + dy * dy <= 9) putPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — suspension spring side-view (%d bodies, %u springs)\n",
+                outPath, imgW, imgH, kBodyCount, kSpringCount);
+    return 0;
+}
+
 // ===== Slice JT2 — Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase (--joint-hinge) ======
 // THE NEW-PHYSICS BEAT of FLAGSHIP #15. The angular solve (SolveAngularLimit's swing-twist + cone clamp +
 // nlerp) is int64 (the quaternion fxmul/fxdiv/FxISqrt), so shaders/joint_angular_solve.comp is VULKAN-ONLY
@@ -41151,6 +41362,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--joint-ball") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_joint_ball.png";
             try { return RunJointBallShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vehicle-spring <out.png>: render the Deterministic Vehicle Physics SUSPENSION SPRING JOINT
+        // showcase (Slice VH1, the BEACHHEAD of FLAGSHIP #16). On Metal this runs the CPU solver:
+        // vehicle_spring_solve.comp is int64/Vulkan-only (glslc can't parse the FxLength/FxNormalize/FxDot/
+        // fxmul/fxdiv int64), so Metal runs the CPU vehicle::StepSpringWorld over a body bobbing on a spring
+        // (a pinned invMass-0 anchor + a dynamic body hung below by a FxSpringJoint, started displaced from
+        // restLen) -> the body oscillates and DAMPS to rest at ~restLen — the EXACT bit-exact reference the
+        // Vulkan --vehicle-spring-shot GPU==CPU memcmp compares against; solveEnabled=false -> bodies
+        // unchanged; two runs byte-identical. The image golden is a PURE-INTEGER spring side-view, identical to
+        // the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/vehicle_spring.png.
+        if (argc > 1 && std::strcmp(argv[1], "--vehicle-spring") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vehicle_spring.png";
+            try { return RunVehicleSpringShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --joint-hinge <out.png>: render the Deterministic Articulated-Body Ragdoll ANGULAR LIMITS showcase
