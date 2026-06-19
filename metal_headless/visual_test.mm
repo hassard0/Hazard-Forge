@@ -20143,6 +20143,175 @@ static int RunCgfStepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GF5 — Deterministic Grain<->Fluid Coupling LOCKSTEP + ROLLBACK showcase (--cgf-lockstep) =======
+// The netcode HEADLINE of FLAGSHIP #13 over TWO PARTICLE POOLS (the CG5/CP5/GR5/FL5 twin). PURE CPU: the harness
+// runs the IDENTICAL CPU code (engine/sim/couple_gf.h::RunCGFLockstep/RunCGFRollback) on Vulkan-Windows AND
+// Metal-Mac, so the converged coupled-state golden is bit-identical cross-backend BY CONSTRUCTION (that cross-
+// platform bit-identity IS the lockstep evidence). The TWO-POOL twist: the snapshot covers BOTH the grains AND
+// the fluid, and replica==authority memcmps BOTH; the ONE difference from CG5 is the FluidKernel threaded
+// through every Sim/Run entry (GF4's StepCGF takes the kernel). Builds the SAME GF4 wet-sand scene + command
+// streams as the Vulkan --cgf-lockstep-shot, runs authority=RunCGFLockstep + replica=RunCGFLockstep +
+// rolledBack=RunCGFRollback, asserts the four proofs, renders the converged state via the GF4 cgf_step render
+// path VERBATIM -> bit-identical cross-backend. New golden tests/golden/metal/cgf_lockstep.png (baked on the
+// Mac by the controller); two runs DIFF 0.0000. NO GPU compute, NO new shader, NO new RHI.
+static int RunCgfLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace cgf   = hf::sim::cgf;
+    namespace grain = hf::sim::grain;
+    namespace fluid = hf::sim::fluid;
+    namespace fpx   = hf::sim::fpx;
+
+    // The scene (== the Vulkan --cgf-lockstep-shot config, the GF4 wet-sand scene). -9.8 host-snapped.
+    const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const grain::fx kDt = grain::kOne / 60;
+    const grain::fx kGroundY = 0;
+    const grain::FxVec3 kGravity{0, kGravY, 0};
+    const grain::fx kRadius = grain::kOne / 4;
+    const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5
+    const int kBins = fluid::kKernelBins;
+    const grain::fx kEpsilon = grain::kOne / 100;
+    const int kIters = 3;
+    const int kTicks = 40;
+    const int kMispredictTick = 12;
+
+    grain::GrainBlock gblock;
+    gblock.W = 8; gblock.H = 3; gblock.D = 6;
+    gblock.spacing = grain::kOne / 2;
+    gblock.radius = kRadius;
+    gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+    std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+    grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+    grain::fx kBedTop = bed[0].pos.y;
+    for (const grain::GrainParticle& g : bed) if (g.pos.y > kBedTop) kBedTop = g.pos.y;
+
+    const grain::fx kSeedOverlap = grain::kOne / 8;
+    fluid::FluidBlock fblock;
+    fblock.W = 8; fblock.H = 2; fblock.D = 6;
+    fblock.spacing = grain::kOne / 2;
+    fblock.origin = grain::FxVec3{0, kBedTop - kSeedOverlap, 0};
+    std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+    cgf::CGFWorld init;
+    init.grains = bed; init.fluid = fluidP; init.h = kH;
+    init.gravity = kGravity; init.dt = kDt; init.groundY = kGroundY;
+    const int kGrainCount = (int)init.grains.size();
+    const int kFluidCount = (int)init.fluid.size();
+
+    fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, grain::kOne, kBins, kEpsilon);
+    {
+        const fluid::FluidGrid pg = fluid::MakeGrid(init.fluid, kH);
+        const fluid::FluidCellTable pt = fluid::BuildCellTable(init.fluid, pg);
+        const fluid::FluidNeighborList pl = fluid::BuildNeighborList(init.fluid, pg, pt, kH);
+        std::vector<fluid::fx> probeRho;
+        fluid::ComputeDensity(init.fluid, pl, kernel, probeRho);
+        kernel = fluid::BuildKernelTable(kH, fluid::MeanDensity(probeRho), kBins, kEpsilon);
+    }
+
+    const uint32_t kGrainWindIdx = (uint32_t)(kGrainCount / 2);
+    const uint32_t kFluidPushIdx = (uint32_t)(kFluidCount / 2);
+    const std::vector<cgf::CGFCommand> authStream = {
+        cgf::CGFCommand{6,  cgf::kCmdGrainWind, kGrainWindIdx, fpx::FxVec3{(fpx::fx)(grain::kOne * 4), 0, 0}},
+        cgf::CGFCommand{10, cgf::kCmdFluidPush, kFluidPushIdx, fpx::FxVec3{0, 0, (fpx::fx)(grain::kOne * 3)}},
+        cgf::CGFCommand{20, cgf::kCmdGrainWind, kGrainWindIdx, fpx::FxVec3{0, (fpx::fx)(grain::kOne * 2), 0}},
+        cgf::CGFCommand{16, cgf::kCmdFluidPush, kFluidPushIdx, fpx::FxVec3{(fpx::fx)(grain::kOne * 3), 0, 0}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<cgf::CGFCommand> mispredictStream = authStream;
+    mispredictStream.push_back(cgf::CGFCommand{(uint32_t)kMispredictTick, cgf::kCmdGrainWind, kGrainWindIdx,
+                                               fpx::FxVec3{(fpx::fx)(grain::kOne * 40), 0, 0}});
+
+    const cgf::CGFWorld authority  = cgf::RunCGFLockstep(init, kernel, authStream, kTicks, kDt, kIters);
+    const cgf::CGFWorld replica    = cgf::RunCGFLockstep(init, kernel, authStream, kTicks, kDt, kIters);
+    const cgf::CGFWorld rolledBack =
+        cgf::RunCGFRollback(init, kernel, authStream, mispredictStream, kTicks, kMispredictTick, kDt, kIters);
+
+    auto coupledEqual = [&](const cgf::CGFWorld& a, const cgf::CGFWorld& b) {
+        return a.grains.size() == b.grains.size() && a.fluid.size() == b.fluid.size() &&
+               std::memcmp(a.grains.data(), b.grains.data(),
+                           a.grains.size() * sizeof(grain::GrainParticle)) == 0 &&
+               std::memcmp(a.fluid.data(), b.fluid.data(), a.fluid.size() * sizeof(fluid::FluidParticle)) == 0;
+    };
+
+    if (!coupledEqual(authority, replica))
+        return fail("cgf-lockstep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("cgf-lockstep: {grains:%d, fluid:%d, ticks:%d} authority==replica BIT-IDENTICAL\n",
+                kGrainCount, kFluidCount, kTicks);
+
+    if (!coupledEqual(rolledBack, authority))
+        return fail("cgf-lockstep: rollback != authority (misprediction not corrected)");
+    std::printf("cgf-lockstep rollback: corrected==authority BIT-EXACT (BOTH pools)\n");
+
+    const cgf::CGFWorld mispredicted =
+        cgf::RunCGFLockstep(init, kernel, mispredictStream, kTicks, kDt, kIters);
+    if (coupledEqual(mispredicted, authority))
+        return fail("cgf-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("cgf-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+    const cgf::CGFWorld authority2 = cgf::RunCGFLockstep(init, kernel, authStream, kTicks, kDt, kIters);
+    if (!coupledEqual(authority2, authority))
+        return fail("cgf-lockstep: two runs differ (nondeterministic)");
+    {
+        cgf::CGFWorld w = cgf::RunCGFLockstep(init, kernel, authStream, kMispredictTick, kDt, kIters);
+        const cgf::CGFSnapshot snap = cgf::SnapshotCGF(w);
+        cgf::SimCGFTick(w, kernel, authStream, (uint32_t)kMispredictTick, kDt, kIters);
+        cgf::RestoreCGF(w, snap);
+        const bool roundTrip =
+            w.grains.size() == snap.grains.size() && w.fluid.size() == snap.fluid.size() &&
+            std::memcmp(w.grains.data(), snap.grains.data(), w.grains.size() * sizeof(grain::GrainParticle)) == 0 &&
+            std::memcmp(w.fluid.data(), snap.fluid.data(), w.fluid.size() * sizeof(fluid::FluidParticle)) == 0;
+        if (!roundTrip) return fail("cgf-lockstep: snapshot round-trip != original (grains/fluid)");
+    }
+    std::printf("cgf-lockstep determinism: two runs BYTE-IDENTICAL\n");
+    std::printf("cgf-lockstep: {grains:%d, fluid:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                kGrainCount, kFluidCount, kTicks, kCommandCount, kMispredictTick);
+
+    // --- Golden: the GF4 cgf_step render path VERBATIM over the converged `authority` state (IDENTICAL to the
+    // Vulkan --cgf-lockstep-shot by construction; the wet/dry tan grain bed with the cyan fluid pooled on it). ---
+    const cgf::CGFNeighbors goldenNbr = cgf::BuildCGFNeighbors(authority);
+    const int kPxPerUnit = 24, kImgMargin = 18;
+    const int kWorldLoX = -7, kWorldW = 18;
+    const int kWorldLoY = -1, kWorldH = 5;
+    const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+        const int64_t loX = (int64_t)kWorldLoX << grain::kFrac, loY = (int64_t)kWorldLoY << grain::kFrac;
+        cx = kImgMargin + (int)(((int64_t)wxFx - loX) * kPxPerUnit >> grain::kFrac);
+        cy = (int)imgH - kImgMargin - (int)(((int64_t)wyFx - loY) * kPxPerUnit >> grain::kFrac);
+    };
+    auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    };
+    for (int i = 0; i < kGrainCount; ++i) {
+        const uint32_t cnt = goldenNbr.gfStart[(size_t)i + 1] - goldenNbr.gfStart[(size_t)i];
+        int cx, cy; toPx(authority.grains[(size_t)i].pos.x, authority.grains[(size_t)i].pos.y, cx, cy);
+        const Vec3 col = (cnt > 0u) ? Vec3{0.85f, 0.62f, 0.30f} : Vec3{0.46f, 0.32f, 0.17f};
+        plot(cx, cy, col, 2);
+    }
+    for (int i = 0; i < kFluidCount; ++i) {
+        int cx, cy; toPx(authority.fluid[(size_t)i].pos.x, authority.fluid[(size_t)i].pos.y, cx, cy);
+        plot(cx, cy, Vec3{0.22f, 0.64f, 0.97f}, 2);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — cgf lockstep+rollback converged state (wet sand: %d grains, %d fluid)\n",
+                outPath, imgW, imgH, kGrainCount, kFluidCount);
+    return 0;
+}
+
 // ===== Slice CG2 — Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG showcase (--cgrain-support) ====
 // (the CRUX of FLAGSHIP #12, the FIRST momentum exchange, the CP2 buoyancy twin with contact-support physics).
 // Like --couple-buoyancy / --grain-contact, the CG2 support/drag math is int64 (FxLength/FxNormalize via FxISqrt
@@ -37587,6 +37756,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--cgf-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_cgf_step.png";
             try { return RunCgfStepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --cgf-lockstep <out.png>: render the Deterministic Grain<->Fluid Coupling LOCKSTEP + ROLLBACK showcase
+        // (Slice GF5, the netcode HEADLINE of FLAGSHIP #13 over TWO PARTICLE POOLS, the CG5/CP5/GR5/FL5 twin).
+        // PURE CPU: the harness runs the IDENTICAL CPU code (cgf::RunCGFLockstep/RunCGFRollback) on Metal-Mac
+        // that the Vulkan --cgf-lockstep-shot runs on Windows -> the converged coupled-state golden is bit-
+        // identical cross-backend BY CONSTRUCTION. The snapshot covers BOTH the grains AND the fluid; the
+        // FluidKernel is threaded through every Sim/Run entry. New golden tests/golden/metal/cgf_lockstep.png;
+        // two runs DIFF 0.0000. NO GPU compute, NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--cgf-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_cgf_lockstep.png";
+            try { return RunCgfLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cgrain-support <out.png>: render the Deterministic Rigid<->Grain Coupling CONTACT SUPPORT + DRAG

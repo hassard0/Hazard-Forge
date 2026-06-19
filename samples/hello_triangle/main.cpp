@@ -485,6 +485,7 @@ int main(int argc, char** argv) {
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
     const char* fluidLockstepShotPath = nullptr; // --fluid-lockstep-shot <out.bmp> (Slice FL5: Deterministic GPU Fluid LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #9 — PURE-CPU harness over the FL1-FL4 fluid (the FPX5/CL5 twin): a dam-break fluid block fed a scripted wind/push command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-fluid-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
+    const char* cgfLockstepShotPath = nullptr; // --cgf-lockstep-shot <out.bmp> (Slice GF5: Deterministic Grain<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the netcode HEADLINE of FLAGSHIP #13 over TWO PARTICLE POOLS — PURE-CPU harness over the GF4 coupled step StepCGF (the CG5/CP5/GR5/FL5 twin, a lockstep over a coupled grain+fluid system): the GF4 wet-sand scene (a settled grain bed + a fluid sheet pooling on it) fed a scripted command stream that WINDS the sand (kCmdGrainWind) + JETS the fluid (kCmdFluidPush); authority==replica BIT-IDENTICAL inputs-only across BOTH the grain AND the fluid pools + rollback corrects a misprediction to authority BIT-EXACT (mispredicted diverged before rollback); the snapshot covers BOTH pools; the kernel is threaded through every Sim/Run entry (GF4's StepCGF takes a FluidKernel); converged coupled-state golden bit-identical cross-backend (the GF4 cgf_step render path reused VERBATIM); NO GPU dispatch, NO new shader, NO new RHI; GF1-GF4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h/couple_grain.h + engine/physics/ UNTOUCHED)
     const char* cgrainLockstepShotPath = nullptr; // --cgrain-lockstep-shot <out.bmp> (Slice CG5: Deterministic Rigid<->Grain Coupling LOCKSTEP + ROLLBACK proof, the MULTI-BODY netcode HEADLINE of FLAGSHIP #12 — PURE-CPU harness over the CG1-CG4 coupled step StepCGrain (the CP5/GR5 twin, a MULTI-BODY lockstep over a coupled rigid+granular system): a SMALL/FAST static-basin coupled scene (a modest dynamic sand bed + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the sand (kCmdGrainWind); authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the grains + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the grains vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CG1-CG4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple.h + engine/physics/ UNTOUCHED)
     const char* coupleRenderShotPath = nullptr;  // --couple-render-shot <out.bmp> (Slice CP6: Deterministic Rigid<->Fluid Coupling LIT 3D RENDER capstone, COMPLETES FLAGSHIP #11 — the CP1-CP5 coupled sim (a denser confined pool + a dynamic FxBody barrel, host-side StepCoupleSteps, the sim bit-exact) settled to the body floating at the waterline -> couple.h::CoupleToRenderInstances (one LARGE-sphere model matrix per body via fpx::FxBodyTransform + one SMALL-sphere per fluid particle via fluid::FluidToRenderInstances, render-only float) -> rendered as lit 3D INSTANCED SPHERES (the barrel among the droplets) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --fluid-render-shot/--grain-render-shot/--fpx-render-shot; NO new shader/RHI). Renders only the DYNAMIC fluid + the body (static wall particles dropped — a containment detail). FLOAT visresolve bar (the FPX6/FL6/GR6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CP1-CP5 bit-exact integer coupled sim (provenance exact))
     const char* cgrainRenderShotPath = nullptr;  // --cgrain-render-shot <out.bmp> (Slice CG6: Deterministic Rigid<->Grain Coupling LIT 3D RENDER capstone, COMPLETES FLAGSHIP #12 — the CG1-CG5 coupled sim (a static-grain basin confining a dynamic sand bed + a dynamic FxBody, host-side StepCGrainSteps, the sim bit-exact) settled to the body half-buried in the bed -> couple_grain.h::CGrainToRenderInstances (one LARGE-sphere model matrix per body via fpx::FxBodyTransform + one SMALL-sphere per DYNAMIC grain via grain::GrainToRenderInstances, render-only float) -> rendered as lit 3D INSTANCED SPHERES (the body among the sand grains) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, scene::InstanceTransformLayout, the FrameData UBO, sky + shadow + post — REUSED VERBATIM from --couple-render-shot/--grain-render-shot/--fpx-render-shot; NO new shader/RHI). Renders only the DYNAMIC grains + the body (static basin-wall grains dropped — a containment detail). FLOAT visresolve bar (the FPX6/FL6/GR6/CP6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. The SIM feeding the render is the CG1-CG5 bit-exact integer coupled sim (provenance exact))
@@ -851,6 +852,19 @@ int main(int argc, char** argv) {
         // branch (not in the --shot else-if chain) to avoid MSVC's nested-block parse limit (the CP5/GR5 lesson).
         if (std::strcmp(argv[i], "--cgrain-lockstep-shot") == 0 && i + 1 < argc) {
             cgrainLockstepShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice GF5: --cgf-lockstep-shot <out.bmp> — the Deterministic Grain<->Fluid Coupling LOCKSTEP +
+        // ROLLBACK proof (the netcode HEADLINE of FLAGSHIP #13 over TWO PARTICLE POOLS, the CG5/CP5/GR5/FL5
+        // twin). PURE CPU: runs the couple_gf.h lockstep/rollback harness (RunCGFLockstep authority + replica,
+        // RunCGFRollback) over the GF4 wet-sand scene + a scripted command stream that WINDS the sand + JETS
+        // the fluid, asserts authority==replica + rollback-corrects-to-authority BIT-EXACT across BOTH the
+        // grain AND the fluid pools, renders the converged state via the GF4 cgf_step render path. NO GPU
+        // dispatch, NO new shader, NO new RHI. STANDALONE branch (not in the --shot else-if chain) to avoid
+        // MSVC's nested-block parse limit (the CG5/CP5/GR5 lesson).
+        if (std::strcmp(argv[i], "--cgf-lockstep-shot") == 0 && i + 1 < argc) {
+            cgfLockstepShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -23389,6 +23403,211 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — couple lockstep+rollback converged state (%d water px)\n",
                                 coupleLockstepShotPath, imgW, imgH, waterPx);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", coupleLockstepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Grain<->Fluid Coupling LOCKSTEP + ROLLBACK proof (--cgf-lockstep-shot <out.bmp>,
+        // Slice GF5, the netcode HEADLINE of FLAGSHIP #13 over TWO PARTICLE POOLS, the CG5/CP5/GR5/FL5 twin).
+        // PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both Vulkan-Windows and Metal-Mac run the
+        // IDENTICAL CPU harness (couple_gf.h::RunCGFLockstep/RunCGFRollback) so the converged coupled-state
+        // golden is bit-identical cross-backend BY CONSTRUCTION. The TWO-POOL twist: the snapshot covers BOTH
+        // the grains AND the fluid, and replica==authority memcmps BOTH. The ONE difference from CG5 is the
+        // FluidKernel threaded through every Sim/Run entry (GF4's StepCGF takes the kernel, built once). Builds
+        // the GF4 wet-sand scene (a settled grain bed + a fluid sheet pooling on it, iters=3) + a scripted
+        // authStream that WINDS the sand (kCmdGrainWind) + JETS the fluid (kCmdFluidPush) so BOTH pools are
+        // perturbed to a NON-TRIVIAL converged state; runs authority/replica/rolledBack; asserts
+        // authority==replica + rollback-corrects-to-authority BIT-EXACT (grains AND fluid) + mispredicted!=
+        // authority + determinism; renders the converged state via the GF4 cgf_step render path VERBATIM.
+        // STANDALONE branch (C1061 avoidance, the CG5 lesson).
+        if (cgfLockstepShotPath) {
+            using math::Vec3;
+            namespace cgf   = hf::sim::cgf;
+            namespace grain = hf::sim::grain;
+            namespace fluid = hf::sim::fluid;
+            namespace fpx   = hf::sim::fpx;
+
+            // The scene (== the GF4 --cgf-step config, the wet-sand scene). -9.8 host-snapped.
+            const grain::fx kGravY = (grain::fx)(-9.8 * (double)grain::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const grain::fx kDt = grain::kOne / 60;
+            const grain::fx kGroundY = 0;
+            const grain::FxVec3 kGravity{0, kGravY, 0};
+            const grain::fx kRadius = grain::kOne / 4;
+            const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5
+            const int kBins = fluid::kKernelBins;
+            const grain::fx kEpsilon = grain::kOne / 100;
+            const int kIters = 3;
+            const int kTicks = 40;            // the lockstep ticks (MODEST — the harness runs StepCGF sequences)
+            const int kMispredictTick = 12;   // a WRONG strong sand gust arrives here; the rollback corrects it
+
+            // A packed 8x3x6 = 144 grain bed, settled by GR4 friction (== the GF4 scene).
+            grain::GrainBlock gblock;
+            gblock.W = 8; gblock.H = 3; gblock.D = 6;
+            gblock.spacing = grain::kOne / 2;
+            gblock.radius = kRadius;
+            gblock.origin = grain::FxVec3{0, (grain::fx)(2 * (int)grain::kOne), 0};
+            std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
+            grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
+
+            grain::fx kBedTop = bed[0].pos.y;
+            for (const grain::GrainParticle& g : bed) if (g.pos.y > kBedTop) kBedTop = g.pos.y;
+
+            const grain::fx kSeedOverlap = grain::kOne / 8;
+            fluid::FluidBlock fblock;
+            fblock.W = 8; fblock.H = 2; fblock.D = 6;                   // 96 fluid particles
+            fblock.spacing = grain::kOne / 2;
+            fblock.origin = grain::FxVec3{0, kBedTop - kSeedOverlap, 0};
+            std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
+
+            cgf::CGFWorld init;
+            init.grains = bed; init.fluid = fluidP; init.h = kH;
+            init.gravity = kGravity; init.dt = kDt; init.groundY = kGroundY;
+            const int kGrainCount = (int)init.grains.size();
+            const int kFluidCount = (int)init.fluid.size();
+
+            // The kernel: ρ0 = the mean density of the packed initial fluid lattice (the FL4 probe recipe).
+            fluid::FluidKernel kernel = fluid::BuildKernelTable(kH, grain::kOne, kBins, kEpsilon);
+            {
+                const fluid::FluidGrid pg = fluid::MakeGrid(init.fluid, kH);
+                const fluid::FluidCellTable pt = fluid::BuildCellTable(init.fluid, pg);
+                const fluid::FluidNeighborList pl = fluid::BuildNeighborList(init.fluid, pg, pt, kH);
+                std::vector<fluid::fx> probeRho;
+                fluid::ComputeDensity(init.fluid, pl, kernel, probeRho);
+                kernel = fluid::BuildKernelTable(kH, fluid::MeanDensity(probeRho), kBins, kEpsilon);
+            }
+
+            // The scripted authoritative command stream: WIND the sand + JET the fluid so BOTH pools are
+            // perturbed to a NON-TRIVIAL converged state.
+            const uint32_t kGrainWindIdx = (uint32_t)(kGrainCount / 2);
+            const uint32_t kFluidPushIdx = (uint32_t)(kFluidCount / 2);
+            const std::vector<cgf::CGFCommand> authStream = {
+                cgf::CGFCommand{6,  cgf::kCmdGrainWind, kGrainWindIdx, fpx::FxVec3{(fpx::fx)(grain::kOne * 4), 0, 0}},
+                cgf::CGFCommand{10, cgf::kCmdFluidPush, kFluidPushIdx, fpx::FxVec3{0, 0, (fpx::fx)(grain::kOne * 3)}},
+                cgf::CGFCommand{20, cgf::kCmdGrainWind, kGrainWindIdx, fpx::FxVec3{0, (fpx::fx)(grain::kOne * 2), 0}},
+                cgf::CGFCommand{16, cgf::kCmdFluidPush, kFluidPushIdx, fpx::FxVec3{(fpx::fx)(grain::kOne * 3), 0, 0}},
+            };
+            const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+            // The MISPREDICTED stream: the auth stream + a WRONG strong sand gust at mispredictTick.
+            std::vector<cgf::CGFCommand> mispredictStream = authStream;
+            mispredictStream.push_back(cgf::CGFCommand{(uint32_t)kMispredictTick, cgf::kCmdGrainWind,
+                                                       kGrainWindIdx, fpx::FxVec3{(fpx::fx)(grain::kOne * 40), 0, 0}});
+
+            // === The harness ===
+            const cgf::CGFWorld authority  = cgf::RunCGFLockstep(init, kernel, authStream, kTicks, kDt, kIters);
+            const cgf::CGFWorld replica    = cgf::RunCGFLockstep(init, kernel, authStream, kTicks, kDt, kIters);
+            const cgf::CGFWorld rolledBack =
+                cgf::RunCGFRollback(init, kernel, authStream, mispredictStream, kTicks, kMispredictTick, kDt, kIters);
+
+            auto coupledEqual = [&](const cgf::CGFWorld& a, const cgf::CGFWorld& b) {
+                return a.grains.size() == b.grains.size() && a.fluid.size() == b.fluid.size() &&
+                       std::memcmp(a.grains.data(), b.grains.data(),
+                                   a.grains.size() * sizeof(grain::GrainParticle)) == 0 &&
+                       std::memcmp(a.fluid.data(), b.fluid.data(),
+                                   a.fluid.size() * sizeof(fluid::FluidParticle)) == 0;
+            };
+
+            // PROOF (1) LOCKSTEP: replica (fed INPUTS ONLY) == authority BIT-IDENTICAL across BOTH pools.
+            if (!coupledEqual(authority, replica)) {
+                std::fprintf(stderr, "FATAL: cgf-lockstep authority != replica (inputs-only re-sim diverged — "
+                             "a float/nondeterminism crept into the fixed-point coupled sim?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgf-lockstep: {grains:%d, fluid:%d, ticks:%d} authority==replica BIT-IDENTICAL\n",
+                        kGrainCount, kFluidCount, kTicks);
+
+            // PROOF (2) ROLLBACK: rolledBack == authority BIT-EXACT (BOTH pools).
+            if (!coupledEqual(rolledBack, authority)) {
+                std::fprintf(stderr, "FATAL: cgf-lockstep rollback != authority (the rollback did NOT correct "
+                             "the misprediction to the authoritative coupled state)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgf-lockstep rollback: corrected==authority BIT-EXACT (BOTH pools)\n");
+
+            // PROOF (3) the misprediction was real: the speculative (pre-rollback) state DIFFERED from authority.
+            const cgf::CGFWorld mispredicted =
+                cgf::RunCGFLockstep(init, kernel, mispredictStream, kTicks, kDt, kIters);
+            if (coupledEqual(mispredicted, authority)) {
+                std::fprintf(stderr, "FATAL: cgf-lockstep mispredicted state == authority (the misprediction "
+                             "was a no-op — the rollback proof is vacuous)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("cgf-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+            // PROOF (4) determinism: two lockstep runs identical (the render below reads `authority`).
+            const cgf::CGFWorld authority2 = cgf::RunCGFLockstep(init, kernel, authStream, kTicks, kDt, kIters);
+            if (!coupledEqual(authority2, authority)) {
+                std::fprintf(stderr, "FATAL: cgf-lockstep two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            // Snapshot round-trip (RestoreCGF(SnapshotCGF(w)) == w, BOTH pools).
+            {
+                cgf::CGFWorld w = cgf::RunCGFLockstep(init, kernel, authStream, kMispredictTick, kDt, kIters);
+                const cgf::CGFSnapshot snap = cgf::SnapshotCGF(w);
+                cgf::SimCGFTick(w, kernel, authStream, (uint32_t)kMispredictTick, kDt, kIters);   // mutate
+                cgf::RestoreCGF(w, snap);
+                const bool roundTrip =
+                    w.grains.size() == snap.grains.size() && w.fluid.size() == snap.fluid.size() &&
+                    std::memcmp(w.grains.data(), snap.grains.data(),
+                                w.grains.size() * sizeof(grain::GrainParticle)) == 0 &&
+                    std::memcmp(w.fluid.data(), snap.fluid.data(),
+                                w.fluid.size() * sizeof(fluid::FluidParticle)) == 0;
+                if (!roundTrip) {
+                    std::fprintf(stderr, "FATAL: cgf-lockstep snapshot round-trip != original (grains/fluid)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("cgf-lockstep determinism: two runs BYTE-IDENTICAL\n");
+            std::printf("cgf-lockstep: {grains:%d, fluid:%d, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                        kGrainCount, kFluidCount, kTicks, kCommandCount, kMispredictTick);
+
+            // --- Golden: the GF4 cgf_step render path VERBATIM over the converged `authority` state (a wet-sand
+            // side view; authority==replica==rolledBack so the single converged state IS the viz). The wet/dry
+            // classification: a grain with >0 fluid neighbours (gfStart count) is WET (warm/bright), else DRY
+            // (dim brown); the fluid is drawn last (cyan), on top. CPU-colored -> identical both backends by
+            // construction (the strict zero-differing-pixel bar). ---
+            const cgf::CGFNeighbors goldenNbr = cgf::BuildCGFNeighbors(authority);
+            const int kPxPerUnit = 24, kImgMargin = 18;
+            const int kWorldLoX = -7, kWorldW = 18;
+            const int kWorldLoY = -1, kWorldH = 5;
+            const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
+                const int64_t loX = (int64_t)kWorldLoX << grain::kFrac, loY = (int64_t)kWorldLoY << grain::kFrac;
+                cx = kImgMargin + (int)(((int64_t)wxFx - loX) * kPxPerUnit >> grain::kFrac);
+                cy = (int)imgH - kImgMargin - (int)(((int64_t)wyFx - loY) * kPxPerUnit >> grain::kFrac);
+            };
+            auto plot = [&](int cx, int cy, const Vec3& col, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                        dst[3] = 255;
+                    }
+            };
+            for (int i = 0; i < kGrainCount; ++i) {
+                const uint32_t cnt = goldenNbr.gfStart[(size_t)i + 1] - goldenNbr.gfStart[(size_t)i];
+                int cx, cy; toPx(authority.grains[(size_t)i].pos.x, authority.grains[(size_t)i].pos.y, cx, cy);
+                const Vec3 col = (cnt > 0u) ? Vec3{0.85f, 0.62f, 0.30f}   // WET sand (buoyed, saturated)
+                                            : Vec3{0.46f, 0.32f, 0.17f};  // DRY sand (packed)
+                plot(cx, cy, col, 2);
+            }
+            for (int i = 0; i < kFluidCount; ++i) {
+                int cx, cy; toPx(authority.fluid[(size_t)i].pos.x, authority.fluid[(size_t)i].pos.y, cx, cy);
+                plot(cx, cy, Vec3{0.22f, 0.64f, 0.97f}, 2);
+            }
+            bool ok = WriteBMP(cgfLockstepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — cgf lockstep+rollback converged state (wet sand: %d grains, "
+                                "%d fluid)\n", cgfLockstepShotPath, imgW, imgH, kGrainCount, kFluidCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", cgfLockstepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
