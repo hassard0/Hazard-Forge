@@ -248,6 +248,25 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # cell set is bit-exact GPU==CPU + cross-backend by construction. Behind --fract-cells only; existing
 # shaders + goldens untouched.
 hf_gen_msl(fract_classify.comp   fract_classify.comp.hlsl   comp fract_classify_main)
+# Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — turns each non-empty FR1
+# Voronoi cell into a FRAGMENT RECORD (integer centroid, AABB, boundRadiusSq/boundRadius, volume, cellId,
+# invMass) via the GR2/FL2 count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment
+# reduction. fract_emit_count (ONE thread per lattice SAMPLE: InterlockedAdd into its cell's counter — the
+# order-independent sum), fract_emit_scan ([numthreads(1,1,1)] exclusive prefix-sum + the CL2/MC3
+# stream-compaction -> fragStart + cellToFragment + fragmentToCell + fragCount), fract_emit_emit
+# (SINGLE-THREAD ascending-sample scatter into fragSamples — single-thread for the within-cell ascending
+# order, the GR2/FL2 emit crux), fract_reduce (ONE thread per FRAGMENT: reduce its CSR slice in ascending
+# sample order -> the FractFragment record, per-fragment disjoint, NO atomics). ALL PURE INT32 (centroid
+# sums of small lattice coords, per-axis min/max, squared dists < ~3.1M fit int32, a truncating int divide,
+# an int32 binary ISqrt32, a pure-integer kOne/volume invMass — NO int64, NO float, NO Q16.16 world
+# scaling) -> the default MSL gen suffices (NO --msl-version 20200, the fract_classify/mc_classify lesson),
+# a TRUE GPU pass on both backends. The fragment array + CSR + remap are bit-exact GPU==CPU + cross-backend
+# by construction. Behind --fract-fragments only; FR1 fract_classify + every existing shader + goldens
+# untouched.
+hf_gen_msl(fract_emit_count.comp fract_emit_count.comp.hlsl comp fract_emit_count_main)
+hf_gen_msl(fract_emit_scan.comp  fract_emit_scan.comp.hlsl  comp fract_emit_scan_main)
+hf_gen_msl(fract_emit_emit.comp  fract_emit_emit.comp.hlsl  comp fract_emit_emit_main)
+hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_main)
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): fpx_integrate.comp
 # runs the Q16.16 semi-implicit-Euler INTEGRATOR — ONE thread per body runs `steps` iterations of
 # (vel += gravity*dt; pos += vel*dt; ground floor-clamp) on its OWN body, the fxmul ((int64)a*b >> 16) +

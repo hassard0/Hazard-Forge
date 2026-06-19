@@ -465,6 +465,19 @@ hf_compile_shaders(
     # coords -> max d2 ~3.1M fits int32, NO int64) over an SSBO + ReadBuffer -> bit-exact GPU==CPU cell
     # set + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/fract_classify.comp.hlsl:cs"
+    # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — the GR2/FL2
+    # count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment reduction. PURE
+    # INT32 -> MSL-native, a TRUE GPU pass on both backends. fract_emit_count (ONE thread per sample:
+    # InterlockedAdd into its cell's counter), fract_emit_scan ([numthreads(1,1,1)] exclusive prefix-sum
+    # + the CL2/MC3 stream-compaction -> fragStart/cellToFragment/fragmentToCell/fragCount),
+    # fract_emit_emit (SINGLE-THREAD ascending-sample scatter into fragSamples — single-thread for the
+    # within-cell ascending order), fract_reduce (ONE thread per FRAGMENT: reduce its CSR slice ->
+    # centroid/AABB/boundRadiusSq/boundRadius/volume/cellId/invMass, per-fragment disjoint, NO atomics).
+    # Bit-exact GPU==CPU vs fract.h::ExtractFragments (memcmp, NO tol). NO new RHI; FR1 shaders untouched.
+    "shaders/fract_emit_count.comp.hlsl:cs"
+    "shaders/fract_emit_scan.comp.hlsl:cs"
+    "shaders/fract_emit_emit.comp.hlsl:cs"
+    "shaders/fract_reduce.comp.hlsl:cs"
     # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6):
     # fpx_integrate.comp runs the Q16.16 semi-implicit-Euler INTEGRATOR — ONE thread per body runs
     # `steps` iterations of (vel += gravity*dt; pos += vel*dt; ground floor-clamp) on its OWN body, the
