@@ -320,4 +320,239 @@ inline void ExtractFragments(const FractField& field, const FractCells& cells, i
     }
 }
 
+// ====================================================================================================
+// Slice FR3 — BONDED-CLUSTER BREAK MODEL (THE NEW PHYSICS — the GR4-friction-equivalent beat). Additive
+// over FR1+FR2 (all code above is byte-unchanged). FR1 made the cells, FR2 the fragments; FR3 BONDS
+// adjacent fragments into a welded aggregate (shared-face adjacency over the lattice), then BREAKS the
+// bonds an impact OVER-STRESSES (a deterministic Jacobi load-diffusion proxy + a strength-scaled Q16.16
+// threshold) -> a deterministic SEVERED-BOND SET + a connected-component PIECE COUNT. Emergent crack
+// propagation along the pre-fractured cell boundaries.
+//
+// THE HEADLINE + THE HONEST CAVEAT (state both): the severed-bond SET + the piece count are
+// EXACT-DETERMINISTIC and bit-identical CPU<->Vulkan<->Metal (the strong claim). The crack PATTERN (which
+// specific bonds break) is EMERGENT / WITHIN-BAND — it depends on the proxy load-diffusion model + the
+// tuned kBreakThreshold, NOT an analytic fracture-mechanics solution (the GR4-angle-of-repose caveat
+// shape). The claim is determinism + replayability, NOT physical-fracture accuracy. The Jacobi
+// single-relaxation load field after K iters is a deterministic approximation (more iters -> more
+// diffusion); K is host-fixed for a bounded, deterministic result.
+//
+// THE INT64 SPLIT (the FPX1/GR3/CL3 precedent): the load-diffusion math is int64 (fxmul/fxdiv of Q16.16
+// loads), so shaders/fract_break.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT
+// in the Metal hf_gen_msl list; the Metal --fract-break showcase runs THIS CPU ApplyImpactBreak
+// (byte-identical by construction). The bond-graph BUILD (BuildFractBonds) is PURE INT32; it is host-built
+// in the showcase (the GPU-PROVEN pass is the int64 break — fract_break.comp memcmp's the severed flags +
+// per-bond loadAccum). CountFractPieces is PURE INT32 (a stat + the viz cluster colouring).
+//
+// SEAM DISCIPLINE: unchanged from FR1/FR2 — ZERO backend symbols, header-only. The int64 break math uses
+// fpx.h's fxmul/fxdiv (already #included read-only).
+
+// Re-export the int64 fixed-point ops (read-only) for the FR3 break math.
+using fpx::fxmul;
+using fpx::fxdiv;
+
+// ----- (A) The bond graph (shared-face adjacency over the lattice — pure int32, deterministic) -------
+// FractBond: a WELD between two ADJACENT fragments (fragA < fragB, the canonical ascending pair).
+//   faceArea  = the count of shared lattice faces between the two fragments' cells (the bond's contact
+//               STRENGTH — a large flush interface resists more).
+//   midpoint  = the integer mean of the two fragment centroids in lattice coords promoted to Q16.16
+//               (carried for the severed-bond viz; render-only, NOT in the bit-exact break math).
+//   loadAccum = the Q16.16 diffused load on this bond after the K break iters (the field the break reads).
+struct FractBond {
+    uint32_t fragA = 0, fragB = 0;     // canonical ascending fragment-index endpoints (fragA < fragB)
+    int32_t  faceArea = 0;             // shared lattice-face count (the bond strength) — pure int32
+    FxVec3   midpoint{};               // Q16.16 mean of the two centroids (viz-only)
+    int64_t  loadAccum = 0;            // Q16.16 diffused load after K iters (the break reads this)
+};
+
+// FractBonds: the ascending-(fragA,fragB) bond list + the fragment count it spans.
+struct FractBonds {
+    std::vector<FractBond> bonds;      // ascending by (fragA, fragB)
+    uint32_t fragmentCount = 0;        // == fragments.size() (the cluster-label universe)
+};
+
+// BuildFractBonds(field, cells, fragments, out): the +x/+y/+z face-crossing scan -> a dense M×M
+// upper-triangle faceArea accumulate (M = fragmentCount, small) -> the ascending-(a,b) bond list.
+//   For every lattice sample s, for its +x/+y/+z face-neighbour n (each shared face counted ONCE):
+//     a = cellToFragment[ cells.cellId[s] ];  b = cellToFragment[ cells.cellId[n] ];
+//     if a==kNoFragment || b==kNoFragment -> skip (a sample of an empty/dominated cell — no fragment);
+//     if a==b -> skip (same fragment — not a bond, an interior face);
+//     else ++faceArea[min(a,b)][max(a,b)]  (the canonical ordered pair).
+//   The bond list = the non-zero upper-triangle entries enumerated in ascending (a,b) order; the midpoint
+//   is the Q16.16 mean of the two fragment centroids. PURE INT32 (lattice coords + counts) + a fixed-order
+//   scan -> deterministic, no hashing (the navmesh.h canonical-pair/ascending-order discipline, the 3D
+//   voxel-face twin). loadAccum starts 0.
+inline void BuildFractBonds(const FractField& field, const FractCells& cells,
+                            const FractFragments& fragments, FractBonds& out) {
+    const uint32_t M = (uint32_t)fragments.fragments.size();
+    out.fragmentCount = M;
+    out.bonds.clear();
+    if (M == 0u) return;
+
+    // Dense M×M upper-triangle faceArea accumulator (M small — e.g. <=24; tiny, fixed-order, no hashing).
+    std::vector<int32_t> area((size_t)M * (size_t)M, 0);
+    auto At = [&](uint32_t a, uint32_t b) -> int32_t& { return area[(size_t)a * (size_t)M + (size_t)b]; };
+
+    auto fragOf = [&](int sx, int sy, int sz) -> uint32_t {
+        const int idx = SampleIndex(field, sx, sy, sz);
+        const uint32_t c = cells.cellId[(size_t)idx];
+        if (c >= (uint32_t)fragments.cellToFragment.size()) return kNoFragment;
+        return fragments.cellToFragment[(size_t)c];
+    };
+
+    for (int z = 0; z < field.nz; ++z)
+        for (int y = 0; y < field.ny; ++y)
+            for (int x = 0; x < field.nx; ++x) {
+                const uint32_t a = fragOf(x, y, z);
+                if (a == kNoFragment) continue;
+                // +x / +y / +z face-neighbours only (each shared face counted exactly once).
+                const int nbr[3][3] = {{x + 1, y, z}, {x, y + 1, z}, {x, y, z + 1}};
+                const bool inb[3] = {x + 1 < field.nx, y + 1 < field.ny, z + 1 < field.nz};
+                for (int d = 0; d < 3; ++d) {
+                    if (!inb[d]) continue;
+                    const uint32_t b = fragOf(nbr[d][0], nbr[d][1], nbr[d][2]);
+                    if (b == kNoFragment || a == b) continue;
+                    const uint32_t lo = a < b ? a : b;
+                    const uint32_t hi = a < b ? b : a;
+                    ++At(lo, hi);
+                }
+            }
+
+    // Enumerate the non-zero upper-triangle entries in ascending (a,b) order -> the bond list.
+    for (uint32_t a = 0; a < M; ++a)
+        for (uint32_t b = a + 1u; b < M; ++b) {
+            const int32_t fa = At(a, b);
+            if (fa <= 0) continue;
+            FractBond bond;
+            bond.fragA = a; bond.fragB = b;
+            bond.faceArea = fa;
+            const FractFragment& A = fragments.fragments[(size_t)a];
+            const FractFragment& B = fragments.fragments[(size_t)b];
+            // Q16.16 mean of the two integer centroids ((ca+cb)/2 * kOne; viz-only).
+            bond.midpoint = FxVec3{ (A.cx + B.cx) * (fpx::kOne / 2),
+                                    (A.cy + B.cy) * (fpx::kOne / 2),
+                                    (A.cz + B.cz) * (fpx::kOne / 2) };
+            bond.loadAccum = 0;
+            out.bonds.push_back(bond);
+        }
+}
+
+// ----- (B) The break model (int64 Jacobi load-diffusion + strength-scaled threshold) ----------------
+// BreakImpact: a host-supplied impact = a FRAGMENT index + a Q16.16 impulse magnitude (the injected load).
+struct BreakImpact {
+    uint32_t fragment = 0;             // the fragment the impact lands on
+    fx       impulse  = 0;             // Q16.16 load magnitude injected at that fragment
+};
+
+// kBreakThreshold: the host-snapped Q16.16 break coefficient. A bond SEVERS iff its diffused loadAccum
+// exceeds fxmul(kBreakThreshold, faceArea<<kFrac) — i.e. the per-unit-face break load. Documented choice:
+// kBreakThreshold = 0.5 in Q16.16 (kOne/2 = 32768). Tuned so a HARD impact (the showcase's strong impulse)
+// over-stresses a coherent subset of bonds near the impact (S>0, P>1 pieces) while a ZERO/sub-threshold
+// impact severs nothing (S==0, P==1 intact) — the threshold-gated control. This is a TUNED proxy
+// coefficient (the GR4-kFriction/CP2-kBuoy caveat), NOT a material constant.
+inline constexpr fx kBreakThreshold = fpx::kOne / 2;   // 0.5 in Q16.16 (32768)
+
+// ApplyImpactBreak(bonds, fragments, impact, K): the deterministic break.
+//   (1) Inject impact.impulse as the per-fragment load at impact.fragment (load[other]=0).
+//   (2) K JACOBI load-diffusion iters: read iteration-START per-fragment load, write a SEPARATE next-load
+//       buffer, then apply. Each INTACT bond transmits a strength-weighted share of the load DIFFERENTIAL
+//       between its two fragments toward the lower-loaded fragment (load flows downhill), and the bond
+//       ACCUMULATES the transmitted magnitude into loadAccum. Read-start / write-separate / apply == the
+//       FL4/GR3 Jacobi discipline -> race-free, multi-thread, NO TDR (fract_break.comp copies this body).
+//   (3) After K iters, a bond SEVERS iff loadAccum > fxmul(kBreakThreshold, faceArea<<kFrac).
+// Writes bonds[].loadAccum (so the GPU memcmp covers the diffused field) and returns the per-bond severed
+// flag (0/1) parallel to bonds.bonds + the severed count. int64 throughout (the load is Q16.16). A
+// no-impact / tiny / sub-threshold impulse -> 0 severed (the welded body is intact). Deterministic — the
+// fixed bond order + the read-start/write-separate buffers make two runs byte-identical.
+inline uint32_t ApplyImpactBreak(FractBonds& bonds, const FractFragments& fragments,
+                                 const BreakImpact& impact, int K,
+                                 std::vector<uint8_t>& severedOut) {
+    (void)fragments;   // the fragment count comes from bonds.fragmentCount; the param keeps the spec'd
+                       // signature ApplyImpactBreak(bonds, fragments, impact, K) for FR4 to read centroids.
+    const uint32_t M = bonds.fragmentCount;
+    const size_t B = bonds.bonds.size();
+    severedOut.assign(B, 0u);
+    for (auto& bd : bonds.bonds) bd.loadAccum = 0;
+    if (M == 0u || B == 0u) return 0u;
+
+    // (1) Inject the impact load at its fragment (Q16.16). All others start at 0.
+    std::vector<int64_t> load((size_t)M, 0);
+    if (impact.fragment < M) load[(size_t)impact.fragment] = (int64_t)impact.impulse;
+
+    // The per-bond transmission coefficient kFlow (Q16.16): a fraction of the differential moves per iter.
+    // 0.25 (kOne/4) — a stable under-relaxation so the deterministic diffusion does not oscillate.
+    const int64_t kFlow = (int64_t)(fpx::kOne / 4);   // 0.25 in Q16.16
+
+    // (2) K Jacobi diffusion iterations (read-start / write-separate / apply).
+    for (int it = 0; it < K; ++it) {
+        std::vector<int64_t> delta((size_t)M, 0);   // SEPARATE next-iter accumulator (the Jacobi buffer)
+        for (size_t bi = 0; bi < B; ++bi) {
+            FractBond& bd = bonds.bonds[bi];
+            const int64_t la = load[(size_t)bd.fragA];
+            const int64_t lb = load[(size_t)bd.fragB];
+            const int64_t diff = la - lb;            // load differential across the bond (signed)
+            const int64_t mag  = diff < 0 ? -diff : diff;  // |differential|
+            // Transmitted share: conduct kFlow*mag of the differential per iter (a stable under-relaxed
+            // diffusion). A stronger (larger-face) bond is made to RESIST via the strength-scaled
+            // THRESHOLD (step 3, which scales WITH faceArea), so the conduction itself stays a simple
+            // deterministic int64 proxy. The flow moves toward the lower-loaded fragment.
+            const int64_t transmit = (kFlow * mag) >> fpx::kFrac;   // Q16.16 fxmul(kFlow, mag)
+            // Accumulate the magnitude carried by this bond (monotone — the total stress it has borne).
+            bd.loadAccum += transmit;
+            // Diffuse: move `transmit` from the higher- to the lower-loaded fragment in the next buffer.
+            if (diff > 0) { delta[(size_t)bd.fragA] -= transmit; delta[(size_t)bd.fragB] += transmit; }
+            else if (diff < 0) { delta[(size_t)bd.fragA] += transmit; delta[(size_t)bd.fragB] -= transmit; }
+        }
+        for (uint32_t f = 0; f < M; ++f) load[(size_t)f] += delta[(size_t)f];
+    }
+
+    // (3) Sever iff loadAccum > the strength-scaled threshold fxmul(kBreakThreshold, faceArea<<kFrac).
+    uint32_t severed = 0u;
+    for (size_t bi = 0; bi < B; ++bi) {
+        const FractBond& bd = bonds.bonds[bi];
+        const int64_t thresh = (int64_t)fxmul(kBreakThreshold, (fx)((int64_t)bd.faceArea << fpx::kFrac));
+        if (bd.loadAccum > thresh) { severedOut[bi] = 1u; ++severed; }
+    }
+    return severed;
+}
+
+// ----- (C) The pieces (connected components over the SURVIVING bonds — pure int32, a stat + the viz) --
+// CountFractPieces(fragments, bonds, severed): label-propagate fragments into connected clusters over the
+// bonds that DID NOT sever (a deterministic iterate-to-fixpoint min-label propagation — pure int32). The
+// cluster count = the number of rigid PIECES the impact produced. 1 = intact; >1 = broken. Fills clusterId
+// (one label per fragment) when provided. Deterministic (fixed bond order + min-label propagation).
+inline uint32_t CountFractPieces(const FractFragments& fragments, const FractBonds& bonds,
+                                 const std::vector<uint8_t>& severed,
+                                 std::vector<uint32_t>* clusterIdOut = nullptr) {
+    const uint32_t M = (uint32_t)fragments.fragments.size();
+    if (M == 0u) { if (clusterIdOut) clusterIdOut->clear(); return 0u; }
+
+    std::vector<uint32_t> label((size_t)M);
+    for (uint32_t f = 0; f < M; ++f) label[(size_t)f] = f;   // each fragment its own label initially
+
+    // Iterate to fixpoint: each SURVIVING bond pulls both endpoints to the min of their labels.
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t bi = 0; bi < bonds.bonds.size(); ++bi) {
+            if (bi < severed.size() && severed[bi]) continue;   // a severed bond no longer connects
+            const FractBond& bd = bonds.bonds[bi];
+            uint32_t& la = label[(size_t)bd.fragA];
+            uint32_t& lb = label[(size_t)bd.fragB];
+            const uint32_t m = la < lb ? la : lb;
+            if (la != m) { la = m; changed = true; }
+            if (lb != m) { lb = m; changed = true; }
+        }
+    }
+
+    // Count distinct labels = the cluster/piece count.
+    std::vector<uint8_t> seen((size_t)M, 0u);
+    uint32_t pieces = 0u;
+    for (uint32_t f = 0; f < M; ++f) {
+        const uint32_t r = label[(size_t)f];
+        if (!seen[(size_t)r]) { seen[(size_t)r] = 1u; ++pieces; }
+    }
+    if (clusterIdOut) *clusterIdOut = label;   // the per-fragment cluster label (the viz colour key)
+    return pieces;
+}
+
 }  // namespace hf::sim::fract

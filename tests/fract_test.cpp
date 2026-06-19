@@ -24,6 +24,7 @@
 
 using namespace hf;
 namespace fract = hf::sim::fract;
+namespace fpx = hf::sim::fpx;   // FR3 break impulses are Q16.16 (fpx::kOne scale)
 
 static int g_fail = 0;
 static void check(bool cond, const char* what) {
@@ -306,6 +307,175 @@ int main() {
             && (a.fragments.empty() || std::memcmp(a.fragments.data(), b.fragments.data(),
                     a.fragments.size() * sizeof(fract::FractFragment)) == 0);
         check(same, "FR2 determinism: two ExtractFragments BYTE-IDENTICAL");
+    }
+
+    // ================= FR3: BuildFractBonds — a 2-cell field -> exactly 1 bond, faceArea == shared ====
+    {
+        // A 2x1x1 field split x=0 -> cell 0, x=1 -> cell 1 (seeds at the two ends). The shared face is the
+        // single x=0|x=1 boundary -> faceArea 1, ascending (0,1).
+        fract::FractField f; f.nx = 2; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 2, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        check(bonds.fragmentCount == 2u, "FR3 2-cell: fragmentCount == 2");
+        check(bonds.bonds.size() == 1u, "FR3 2-cell: exactly 1 bond");
+        check(bonds.bonds[0].fragA == 0u && bonds.bonds[0].fragB == 1u, "FR3 2-cell: ascending (0,1)");
+        check(bonds.bonds[0].faceArea == 1, "FR3 2-cell: faceArea == shared face count (1)");
+    }
+
+    // ================= FR3: a wider shared interface -> faceArea == the shared sample count ============
+    {
+        // A 2x3x1 field, seeds at x=0 and x=1: cell 0 = column x=0 (3 samples), cell 1 = column x=1 (3).
+        // They share 3 +x faces -> faceArea 3.
+        fract::FractField f; f.nx = 2; f.ny = 3; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 1, 0}, {1, 1, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 2, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        check(bonds.bonds.size() == 1u, "FR3 wide: 1 bond");
+        check(bonds.bonds[0].faceArea == 3, "FR3 wide: faceArea == 3 (the shared interface samples)");
+    }
+
+    // ================= FR3: a 3-cell line -> 2 bonds (0-1, 1-2), non-adjacent -> no bond ==============
+    {
+        // A 3x1x1 line, seeds at x=0,1,2: cells 0,1,2 left-to-right. Bonds: (0,1) and (1,2); NO (0,2).
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        check(bonds.bonds.size() == 2u, "FR3 line: 2 bonds (0-1, 1-2)");
+        check(bonds.bonds[0].fragA == 0u && bonds.bonds[0].fragB == 1u, "FR3 line: bond[0] == (0,1)");
+        check(bonds.bonds[1].fragA == 1u && bonds.bonds[1].fragB == 2u, "FR3 line: bond[1] == (1,2)");
+        bool no02 = true;
+        for (const auto& b : bonds.bonds) if (b.fragA == 0u && b.fragB == 2u) no02 = false;
+        check(no02, "FR3 line: NO bond between the non-adjacent end cells (0,2)");
+    }
+
+    // ================= FR3: ApplyImpactBreak — a hard impact severs >=1 bond, zero impact severs none ==
+    {
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+
+        // Hard impact at fragment 0 -> diffuses -> severs the bond(s) it over-stresses.
+        std::vector<uint8_t> sevHard;
+        fract::BreakImpact hard{0u, (fract::fx)(200 * (int)fpx::kOne)};   // a big Q16.16 impulse
+        uint32_t sHard = fract::ApplyImpactBreak(bonds, frags, hard, 8, sevHard);
+        check(sHard >= 1u, "FR3 break: a HARD impact severs >= 1 bond");
+
+        // Zero impact -> nothing diffuses -> nothing severs (the welded body is intact).
+        std::vector<uint8_t> sevZero;
+        fract::BreakImpact zero{0u, 0};
+        uint32_t sZero = fract::ApplyImpactBreak(bonds, frags, zero, 8, sevZero);
+        check(sZero == 0u, "FR3 break: a ZERO impact severs nothing");
+        for (auto bd : bonds.bonds) (void)bd;
+    }
+
+    // ================= FR3: the threshold scales with faceArea (a stronger bond survives) =============
+    {
+        // Two bonds carrying the SAME load but with DIFFERENT faceArea: the higher-faceArea bond has a
+        // higher break threshold, so for a load between the two thresholds the weak bond severs + the
+        // strong one survives. Construct directly to control faceArea precisely.
+        fract::FractFragments frags;   // 3 dummy fragments (only the count matters to the break)
+        frags.fragments.resize(3);
+        fract::FractBonds bonds; bonds.fragmentCount = 3u;
+        fract::FractBond b0; b0.fragA = 0; b0.fragB = 1; b0.faceArea = 1;   // weak bond
+        fract::FractBond b1; b1.fragA = 1; b1.fragB = 2; b1.faceArea = 64;  // strong bond
+        bonds.bonds = {b0, b1};
+
+        std::vector<uint8_t> sev;
+        // A hard impact at fragment 0 pushes load across both; the weak bond (area 1) should sever before
+        // the strong bond (area 64) under the strength-scaled threshold.
+        fract::BreakImpact hard{0u, (fract::fx)(500 * (int)fpx::kOne)};
+        fract::ApplyImpactBreak(bonds, frags, hard, 12, sev);
+        check(sev.size() == 2u, "FR3 strength: two severed flags");
+        // The weak bond is at least as likely to sever as the strong one (strength-scaled threshold):
+        // if the strong bond severs, the weak one must too.
+        check(!(sev[1] == 1u && sev[0] == 0u),
+              "FR3 strength: the stronger (larger-face) bond never severs while the weaker survives");
+    }
+
+    // ================= FR3: ApplyImpactBreak determinism (two runs byte-identical) =====================
+    {
+        fract::FractField f; f.nx = 16; f.ny = 12; f.nz = 8;
+        std::vector<fract::FractSeed> seeds = {
+            {2, 2, 1}, {13, 3, 2}, {3, 9, 5}, {12, 10, 6}, {8, 6, 3},
+            {5, 1, 6}, {10, 7, 1}, {1, 5, 3},
+        };
+        const int M = (int)seeds.size();
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bondsA = {}, bondsB = {};
+        fract::BuildFractBonds(f, cells, frags, bondsA);
+        fract::BuildFractBonds(f, cells, frags, bondsB);
+        fract::BreakImpact imp{0u, (fract::fx)(80 * (int)fpx::kOne)};
+        std::vector<uint8_t> sevA, sevB;
+        uint32_t sA = fract::ApplyImpactBreak(bondsA, frags, imp, 10, sevA);
+        uint32_t sB = fract::ApplyImpactBreak(bondsB, frags, imp, 10, sevB);
+        check(sA == sB && sevA == sevB, "FR3 break determinism: severed count + flags BYTE-IDENTICAL");
+        bool loadSame = bondsA.bonds.size() == bondsB.bonds.size();
+        for (size_t i = 0; loadSame && i < bondsA.bonds.size(); ++i)
+            if (bondsA.bonds[i].loadAccum != bondsB.bonds[i].loadAccum) loadSame = false;
+        check(loadSame, "FR3 break determinism: per-bond loadAccum BYTE-IDENTICAL");
+    }
+
+    // ================= FR3: CountFractPieces — intact graph -> 1, a severed bridge -> 2 ===============
+    {
+        // A 3-cell line: 2 bonds. Intact -> 1 piece. Sever the (1,2) bond -> 2 pieces ({0,1} and {2}).
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+
+        std::vector<uint8_t> none(bonds.bonds.size(), 0u);
+        std::vector<uint32_t> clusterIntact;
+        uint32_t pIntact = fract::CountFractPieces(frags, bonds, none, &clusterIntact);
+        check(pIntact == 1u, "FR3 pieces: an intact graph -> 1 piece");
+        check(clusterIntact.size() == 3u, "FR3 pieces: a cluster label per fragment");
+        check(clusterIntact[0] == clusterIntact[1] && clusterIntact[1] == clusterIntact[2],
+              "FR3 pieces: intact -> all fragments share one cluster label");
+
+        // Sever the (1,2) bond (index 1 in the ascending list) -> {0,1} and {2}.
+        std::vector<uint8_t> sev(bonds.bonds.size(), 0u);
+        sev[1] = 1u;
+        uint32_t pBroken = fract::CountFractPieces(frags, bonds, sev, nullptr);
+        check(pBroken == 2u, "FR3 pieces: one severed bridge -> 2 pieces");
+
+        // Sever BOTH bonds -> 3 isolated fragments -> 3 pieces.
+        std::vector<uint8_t> all(bonds.bonds.size(), 1u);
+        uint32_t pAll = fract::CountFractPieces(frags, bonds, all, nullptr);
+        check(pAll == 3u, "FR3 pieces: all bonds severed -> 3 isolated pieces");
+    }
+
+    // ================= FR3: severed subset of bonds (the crack-follows-cell-boundaries proof) =========
+    {
+        // Every severed flag corresponds to a real bond connecting two ADJACENT fragments (trivially true
+        // by construction, but pin: |severed| <= |bonds| and indices align).
+        fract::FractField f; f.nx = 10; f.ny = 10; f.nz = 4;
+        std::vector<fract::FractSeed> seeds = {
+            {2, 2, 1}, {7, 2, 2}, {2, 7, 1}, {7, 7, 2}, {5, 5, 3}, {1, 5, 0},
+        };
+        const int M = (int)seeds.size();
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        fract::BreakImpact imp{0u, (fract::fx)(150 * (int)fpx::kOne)};
+        std::vector<uint8_t> sev;
+        uint32_t s = fract::ApplyImpactBreak(bonds, frags, imp, 10, sev);
+        check(sev.size() == bonds.bonds.size(), "FR3 cracks: one severed flag per bond");
+        uint32_t counted = 0; bool allAdjacent = true;
+        for (size_t i = 0; i < sev.size(); ++i) if (sev[i]) {
+            ++counted;
+            if (bonds.bonds[i].fragA >= (uint32_t)M || bonds.bonds[i].fragB >= (uint32_t)M)
+                allAdjacent = false;
+        }
+        check(counted == s, "FR3 cracks: severed count matches the flag sum");
+        check(allAdjacent, "FR3 cracks: every severed bond connects two valid (adjacent) fragments");
     }
 
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
