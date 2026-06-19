@@ -638,6 +638,99 @@ int main() {
               "StepArticulatedContacts: the chain hung below the pinned root");
     }
 
+    // ================= Slice JT4: RagdollFromSkeleton / PoseToPalette / collapse =================
+    // Build a small deterministic skeleton (root + spine + 2 children) and check the bind + read-back.
+    {
+        namespace anim = hf::anim;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        anim::Skeleton skel;
+        skel.joints.push_back(J(-1, 0.0f, 5.0f, 0.0f));  // 0 root
+        skel.joints.push_back(J(0,  0.0f, 1.0f, 0.0f));  // 1 spine
+        skel.joints.push_back(J(1, -0.5f, 0.5f, 0.0f));  // 2 L child
+        skel.joints.push_back(J(1,  0.5f, 0.5f, 0.0f));  // 3 R child
+        const size_t n = skel.joints.size();
+        // inverseBind = inverse(bindGlobal) so the bind-pose palette is ~identity.
+        std::vector<math::Mat4> g(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(skel.joints[j].t, skel.joints[j].r, skel.joints[j].s);
+            const int p = skel.joints[j].parent;
+            g[j] = (p >= 0) ? (g[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) skel.joints[j].inverseBind = g[j].Inverse();
+
+        joint::RagdollConfig cfg;
+        cfg.worldScale = joint::kOne;
+        // boneRadius = 1.0 here so FxBodyTransform's scale(radius) factor is identity -> at the bind pose
+        // FxBodyTransform(body)·inverseBind == bindGlobal·inverseBind == identity (the palette spot-check
+        // below is exact within the float->fixed->float snap; the showcase uses a smaller proxy radius).
+        cfg.boneRadius = joint::kOne;
+        cfg.invMass = joint::kOne;
+        cfg.coneCos = -joint::kOne;
+        cfg.coneSin = 0;
+        cfg.gravity = joint::FxVec3{0, (joint::fx)(-9.8 * (double)joint::kOne - 0.5), 0};
+        cfg.groundY = 0;
+        cfg.rootStatic = true;
+
+        joint::Ragdoll rag = joint::RagdollFromSkeleton(skel, cfg);
+        // body count == joint count.
+        check(rag.world.bodies.size() == n, "RagdollFromSkeleton: body count == joint count");
+        // one ball joint + one cone limit per non-root edge (== joints - roots == n - 1 here).
+        check(rag.joints.size() == n - 1, "RagdollFromSkeleton: one ball joint per non-root edge");
+        check(rag.limits.size() == n - 1, "RagdollFromSkeleton: one cone limit per non-root edge");
+        // root invMass matches rootStatic (pinned -> invMass 0, no dynamic flag).
+        check(rag.world.bodies[0].invMass == 0 && !(rag.world.bodies[0].flags & fpx::kFlagDynamic),
+              "RagdollFromSkeleton: rootStatic -> root pinned (invMass 0)");
+        // a child is dynamic.
+        check(rag.world.bodies[1].invMass == joint::kOne &&
+              (rag.world.bodies[1].flags & fpx::kFlagDynamic),
+              "RagdollFromSkeleton: non-root body dynamic");
+        // a body's bind pos == the skeleton's bind global translation·worldScale (spot-check joint 1: the
+        // spine global translation is (0, 6, 0) -> (0, 6·kOne, 0)).
+        check(rag.world.bodies[1].pos.x == 0 &&
+              rag.world.bodies[1].pos.y == (joint::fx)(6 * (int)joint::kOne) &&
+              rag.world.bodies[1].pos.z == 0,
+              "RagdollFromSkeleton: body bind pos == bind global translation·worldScale (spine)");
+
+        // PoseToPalette count == joints; at the UNCOLLAPSED bind pose the palette ≈ identity (bindGlobal·
+        // inverseBind == I, within the float->fixed->float snap tolerance).
+        std::vector<math::Mat4> pal = joint::PoseToPalette(skel, rag.world);
+        check(pal.size() == n, "PoseToPalette: count == joints");
+        bool nearIdentity = true;
+        for (size_t j = 0; j < n; ++j)
+            for (int e = 0; e < 16; ++e) {
+                const float want = (e % 5 == 0) ? 1.0f : 0.0f;   // identity diagonal
+                if (std::fabs(pal[j].m[e] - want) > 0.02f) nearIdentity = false;
+            }
+        check(nearIdentity, "PoseToPalette: bind-pose palette ≈ identity (bindGlobal·inverseBind)");
+
+        // The collapse (use the realistic small proxy radius — the showcase config — so the bones fall and
+        // slump rather than resting high as big spheres). Rebind with a 0.30 bone radius.
+        joint::RagdollConfig cfg2 = cfg;
+        cfg2.boneRadius = joint::kOne * 30 / 100;
+        joint::Ragdoll rag2 = joint::RagdollFromSkeleton(skel, cfg2);
+        const joint::fx dt = joint::kOne / 60;
+        joint::FxWorld a = rag2.world, b = rag2.world;
+        joint::StepArticulatedContactsSteps(a, rag2.joints, rag2.limits, dt, 16, 6, 200);
+        joint::StepArticulatedContactsSteps(b, rag2.joints, rag2.limits, dt, 16, 6, 200);
+        const bool same = a.bodies.size() == b.bodies.size() &&
+                          std::memcmp(a.bodies.data(), b.bodies.data(),
+                                      a.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "RagdollFromSkeleton collapse: two runs BYTE-IDENTICAL");
+        // The ragdoll collapsed: the mean body pos.y dropped from the bind pose.
+        joint::Ragdoll settled{a, rag2.joints, rag2.limits};
+        const joint::RagdollState st = joint::MeasureRagdoll(skel, settled);
+        const joint::RagdollState bindSt = joint::MeasureRagdoll(skel, rag2);
+        check(st.meanBodyY < bindSt.meanBodyY, "RagdollFromSkeleton: collapsed below the bind pose");
+        check(st.minBottom >= -(joint::kOne / 16), "RagdollFromSkeleton: no bone buried below ground");
+        check(st.maxAnchorGap < joint::kOne, "RagdollFromSkeleton: bones stayed connected (gap within band)");
+        // The root (pinned) is unchanged after the collapse.
+        check(a.bodies[0].pos.y == rag2.world.bodies[0].pos.y,
+              "RagdollFromSkeleton: pinned root holds exactly through the collapse");
+    }
+
     if (g_fail == 0) std::printf("joint_test: ALL PASS\n");
     else std::printf("joint_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

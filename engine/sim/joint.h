@@ -44,6 +44,10 @@
 
 #include "sim/fpx.h"   // read-only: fx / fxmul / fxdiv / FxVec3 / FxAdd / FxSub / FxScale / FxLength /
                        // FxNormalize / FxRotate / FxBody / FxWorld / IntegrateBodyFull / kOne / kFlagDynamic
+#include "anim/skeleton.h"  // Slice JT4 (read-only): anim::Skeleton / anim::Joint {parent, inverseBind, t, r, s}
+#include "math/math.h"      // Slice JT4 (read-only): math::Mat4 / math::Quat / math::Vec3 / FromTRS — the
+                            // host float bind globals + the palette product. NO circular include: skeleton.h
+                            // + math.h only pull math (no sim), and fpx.h already includes math.h.
 
 namespace hf::sim {
 namespace joint {
@@ -466,6 +470,203 @@ inline ArticulatedState MeasureArticulated(const FxWorld& world, const std::vect
     std::vector<fpx::FxPair> pairs;
     fpx::BuildPairs(world, off, pairs);
     st.residualOverlaps = fpx::CountResidualOverlaps(world, std::span<const fpx::FxPair>(pairs));
+    return st;
+}
+
+// ====================================================================================================
+// Slice JT4 — SKELETON->RAGDOLL BIND: THE PILLAR-BRIDGE (the physics moat meets the anim pillar).
+// JT1-JT3 built a generic jointed mechanism; JT4 maps an anim::Skeleton onto it — each bone becomes an
+// fpx::FxBody, each parent-child edge a FxJoint (ball) + FxAngularLimit (cone) — so the float animation
+// skeleton becomes a bit-exact RAGDOLL that collapses under gravity into a settled pose, and the pose
+// reads back as a joint palette (for the JT6 skinning path). NO new shader: the bind (float->Q16.16) +
+// the palette read-back (Q16.16->float) are HOST conversions; the COLLAPSE sim is the bit-exact JT3
+// StepArticulatedContacts (that integer sim is the GPU==CPU + cross-vendor-zero claim — the golden
+// renders the collapsed INTEGER body positions). ADDITIVE — JT1/JT2/JT3 stay byte-FROZEN.
+//
+// THE THREE PIECES (all host-float for the bind/read-back; the collapse is the JT3 integer driver):
+//   (1) RagdollFromSkeleton(skeleton, cfg): the float->Q16.16 bind. Forward-accumulate each joint's
+//       model-space bind global (global[j] = (parent<0?I:global[parent])·TRS(t,r,s) over the topological
+//       order — the SAME single forward pass anim::PaletteFromLocalPose uses, MIRRORED) for translation,
+//       AND the global ROTATION quaternion (gq[j] = (parent<0?jr:gq[parent]·jr), float Hamilton product).
+//       One fpx::FxBody per joint (pos = global translation·worldScale snapped to Q16.16, orient = gq[j]
+//       -> FxQuat, radius = cfg.boneRadius, invMass = root? cfg.rootStatic-gated : cfg.invMass), and per
+//       NON-ROOT edge a FxJoint (ball, anchors = the child joint's bind pos in each body's LOCAL frame via
+//       FxRotate(QConj(orient), worldJointPos − bodyPos)) + a FxAngularLimit (cone from cfg).
+//   (2) The collapse: StepArticulatedContactsSteps (JT3, VERBATIM) — bit-exact integer SIM.
+//   (3) PoseToPalette(skeleton, world): the Q16.16->float read-back. palette[j] =
+//       FxBodyTransform(body[j]) · skeleton.joints[j].inverseBind (the standard global·inverseBind matrix).
+//
+// HONEST CAVEATS (documented): bones are capsule-as-SPHERE proxies (the fpx sphere-contact caveat — a
+// contact does not spin a body; angVel comes only from the integrate). The bind/read-back float crossings
+// are DETERMINISTIC (no RNG/clock) but are NOT part of the bit-exact loop — they are render-only-adjacent
+// (the FPX6/FL6 host-float-bridge shape). The bind assumes ~unit joint scale for the orientation chain
+// (the rotation quaternion ignores TRS scale/shear; translation honours the full TRS Mat4 forward pass).
+
+// ----- The host quaternion helpers JT4 needs (float, deterministic; do NOT modify math.h) -------------
+// QuatMulF(a,b): the float Hamilton product a·b (the global-rotation forward accumulate, mirroring the
+// Mat4 global[j]=global[parent]·local[j] for the rotation component).
+inline math::Quat QuatMulF(const math::Quat& a, const math::Quat& b) {
+    return math::Quat{
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z};
+}
+
+// ----- RagdollConfig: the bind recipe (host constants — the documented single float crossing at bind) --
+// worldScale  : Q16.16 scale applied to the skeleton's model-space translations (skeleton units -> world).
+// boneRadius  : the capsule-as-sphere proxy radius (Q16.16) for every bone body.
+// invMass     : the dynamic bone inverse mass (Q16.16); the root is invMass 0 iff rootStatic.
+// coneCos/Sin : cos(θ/2)/sin(θ/2) HOST constants for each edge's FxAngularLimit cone (the JT2 convention;
+//               free = -kOne/0). gravity/groundY seed the FxWorld for the collapse.
+// rootStatic  : pin the root body (invMass 0) — a pinned-root ragdoll dangles; a free root collapses fully.
+struct RagdollConfig {
+    fx       worldScale = kOne;            // skeleton-unit -> world scale
+    fx       boneRadius = kOne / 4;        // 0.25 capsule-as-sphere proxy radius
+    fx       invMass    = kOne;            // dynamic bone inverse mass
+    fx       coneCos    = -kOne;           // cos(θ/2): default a 180° free cone (never clamps)
+    fx       coneSin    = 0;               // sin(θ/2)
+    FxVec3   gravity{0, (fx)(-9 * (int)kOne - kOne * 8 / 10), 0};  // (0, -9.8, 0) Q16.16
+    fx       groundY    = 0;               // the floor the ragdoll collapses onto
+    bool     rootStatic = true;            // pin the root (dangle) vs free (full collapse)
+};
+
+// ----- Ragdoll: the bound articulation (an FxWorld + its joint/limit graph) ----------------------------
+struct Ragdoll {
+    fpx::FxWorld                world;     // one FxBody per skeleton joint (skeleton order)
+    std::vector<FxJoint>        joints;    // one ball joint per non-root edge
+    std::vector<FxAngularLimit> limits;    // one cone limit per non-root edge (parallel to `joints`)
+};
+
+// ----- RagdollFromSkeleton: the float->Q16.16 bind (host, outside the bit-exact loop) ------------------
+// Builds the Ragdoll from the skeleton's bind pose. Mirrors anim::PaletteFromLocalPose's single forward
+// pass for translation (global[j] = global[parent]·FromTRS(t,r,s)) and accumulates the global rotation
+// quaternion in parallel. One body per joint; per non-root edge a ball joint pinning the child's bind
+// pivot (its global translation) to the parent + a cone angular limit. Pure deterministic host float.
+inline Ragdoll RagdollFromSkeleton(const anim::Skeleton& skeleton, const RagdollConfig& cfg) {
+    Ragdoll rag;
+    const size_t n = skeleton.joints.size();
+
+    // (1) the bind globals: translation via the Mat4 forward pass (mirroring anim), rotation via the
+    //     float quaternion forward accumulate (both topologically valid — parent precedes child).
+    std::vector<math::Mat4> global(n);
+    std::vector<math::Quat> gquat(n);
+    for (size_t j = 0; j < n; ++j) {
+        const anim::Joint& jt = skeleton.joints[j];
+        const math::Mat4 local = math::FromTRS(jt.t, jt.r, jt.s);
+        const int parent = jt.parent;
+        global[j] = (parent >= 0) ? (global[(size_t)parent] * local) : local;
+        gquat[j]  = (parent >= 0) ? QuatMulF(gquat[(size_t)parent], jt.r) : jt.r;
+    }
+
+    // The Q16.16 world position of joint j (its global translation · worldScale).
+    auto worldPos = [&](size_t j) -> FxVec3 {
+        return FxVec3{(fx)((int64_t)(global[j].m[12] * (float)kOne) * (int64_t)cfg.worldScale / (int64_t)kOne),
+                      (fx)((int64_t)(global[j].m[13] * (float)kOne) * (int64_t)cfg.worldScale / (int64_t)kOne),
+                      (fx)((int64_t)(global[j].m[14] * (float)kOne) * (int64_t)cfg.worldScale / (int64_t)kOne)};
+    };
+    // The Q16.16 orientation FxQuat of joint j (its global rotation quaternion, normalized in float).
+    auto worldOrient = [&](size_t j) -> FxQuat {
+        const math::Quat q = math::Normalize(gquat[j]);
+        return FxQuatNormalize(FxQuat{(fx)(q.x * (float)kOne), (fx)(q.y * (float)kOne),
+                                      (fx)(q.z * (float)kOne), (fx)(q.w * (float)kOne)});
+    };
+
+    // (2) one body per joint.
+    rag.world.gravity = cfg.gravity;
+    rag.world.groundY = cfg.groundY;
+    rag.world.bodies.resize(n);
+    for (size_t j = 0; j < n; ++j) {
+        FxBody b;
+        b.pos = worldPos(j);
+        b.vel = FxVec3{0, 0, 0};
+        const bool isRoot = (skeleton.joints[j].parent < 0);
+        const bool pinned = isRoot && cfg.rootStatic;
+        b.invMass = pinned ? 0 : cfg.invMass;
+        b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+        b.radius  = cfg.boneRadius;
+        b.orient  = worldOrient(j);
+        b.angVel  = FxVec3{0, 0, 0};
+        rag.world.bodies[j] = b;
+    }
+
+    // (3) per non-root edge: a ball joint (pin the child's bind pivot = its global translation) + a cone.
+    for (size_t j = 0; j < n; ++j) {
+        const int parent = skeleton.joints[j].parent;
+        if (parent < 0) continue;                       // root: no incoming edge
+        const FxVec3 jointWorld = worldPos(j);          // the child joint's bind pivot in world space
+        const FxBody& pa = rag.world.bodies[(size_t)parent];
+        const FxBody& pb = rag.world.bodies[j];
+        // anchor in each body's LOCAL frame: FxRotate(QConj(orient), worldJointPos − bodyPos).
+        FxJoint e;
+        e.bodyA = (uint32_t)parent;
+        e.bodyB = (uint32_t)j;
+        e.anchorA = FxRotate(QConj(pa.orient), FxSub(jointWorld, pa.pos));
+        e.anchorB = FxRotate(QConj(pb.orient), FxSub(jointWorld, pb.pos));
+        e.kind = kJointBall;
+        rag.joints.push_back(e);
+        // the cone limit: axis = the bone's bind direction (child − parent) in the PARENT's local frame.
+        const FxVec3 boneWorld = FxSub(pb.pos, pa.pos);
+        FxVec3 axisLocal = FxRotate(QConj(pa.orient), boneWorld);
+        const fx alen = FxLength(axisLocal);
+        axisLocal = (alen != 0) ? FxNormalize(axisLocal) : FxVec3{0, kOne, 0};  // degenerate -> +Y
+        FxAngularLimit lim;
+        lim.bodyA = (uint32_t)parent;
+        lim.bodyB = (uint32_t)j;
+        lim.axis = axisLocal;
+        lim.cosHalfLimit = cfg.coneCos;
+        lim.sinHalfLimit = cfg.coneSin;
+        lim.kind = kAngularCone;
+        rag.limits.push_back(lim);
+    }
+    return rag;
+}
+
+// ----- PoseToPalette: the Q16.16->float read-back (host; the standard skinning palette) ----------------
+// For each joint j, palette[j] = FxBodyTransform(body[j]) · skeleton.joints[j].inverseBind — the body's
+// current world transform (the FPX6 Q16.16->float bridge) times the joint's inverse-bind matrix. A pure
+// deterministic function of the bit-exact body state (the provenance proof: rebuild from the settled world
+// reproduces the palette byte-for-byte). One Mat4 per joint, in skeleton order.
+inline std::vector<math::Mat4> PoseToPalette(const anim::Skeleton& skeleton, const fpx::FxWorld& world) {
+    const size_t n = skeleton.joints.size();
+    std::vector<math::Mat4> palette(n);
+    for (size_t j = 0; j < n; ++j) {
+        const math::Mat4 bodyGlobal = (j < world.bodies.size())
+                                          ? fpx::FxBodyTransform(world.bodies[j])
+                                          : math::Mat4::Identity();
+        palette[j] = bodyGlobal * skeleton.joints[j].inverseBind;
+    }
+    return palette;
+}
+
+// ----- RagdollState + MeasureRagdoll: the honest ragdoll-collapse metrics (deterministic) --------------
+// maxAnchorGap : the max world-anchor gap over the ragdoll's joints (bones stayed CONNECTED — small).
+// meanBodyY    : the mean pos.y over ALL bodies (the collapsed/settle line; drops from the bind pose).
+// minBottom    : the lowest (pos.y − radius) over dynamic bodies (>= groundY -> nothing buried).
+// bones/edges  : the body count (== joint count) + the joint/limit edge count.
+struct RagdollState {
+    fx       maxAnchorGap = 0;
+    fx       meanBodyY    = 0;
+    fx       minBottom    = 0;
+    uint32_t bones = 0;
+    uint32_t edges = 0;
+};
+
+inline RagdollState MeasureRagdoll(const anim::Skeleton& /*skeleton*/, const Ragdoll& rag) {
+    RagdollState st;
+    st.maxAnchorGap = MaxAnchorGap(rag.world, rag.joints);
+    st.bones = (uint32_t)rag.world.bodies.size();
+    st.edges = (uint32_t)rag.joints.size();
+    int64_t sumY = 0;
+    bool haveBottom = false;
+    for (const FxBody& b : rag.world.bodies) {
+        sumY += (int64_t)b.pos.y;
+        if (b.flags & fpx::kFlagDynamic) {
+            const fx bottom = b.pos.y - b.radius;
+            if (!haveBottom || bottom < st.minBottom) { st.minBottom = bottom; haveBottom = true; }
+        }
+    }
+    st.meanBodyY = st.bones > 0u ? (fx)(sumY / (int64_t)st.bones) : 0;
     return st;
 }
 
