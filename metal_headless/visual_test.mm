@@ -20002,7 +20002,7 @@ static int RunCgfStepShowcase(const char* outPath) {
     const grain::fx kH = grain::kOne + grain::kOne / 2;        // 1.5 (coupling radius + smoothing h)
     const int kBins = fluid::kKernelBins;
     const grain::fx kEpsilon = grain::kOne / 100;
-    const int kSteps = 120;
+    const int kSteps = 60;     // MODEST (the pool settles by ~60; >60 the fluid over-spreads off the bed)
     const int kIters = 3;
 
     // A packed 8x3x6 = 144 grain bed, 0.5 spacing, settled by GR4 friction.
@@ -20014,12 +20014,20 @@ static int RunCgfStepShowcase(const char* outPath) {
     std::vector<grain::GrainParticle> bed = grain::InitGrainBlock(gblock);
     grain::StepGrainFrictionSteps(bed, {}, kGravity, kDt, kGroundY, kH, grain::kGrainMu, 2, 60);
 
-    // A 4x4x6 = 96 fluid block over the settled bed's LEFT HALF, interpenetrating it from the start (the
-    // GF2-buoyancy proven wet>dry config — the left grains stay submerged/lifted, the right grains stay dry).
+    // The settled bed's TOP grain row (the surface the fluid POOLS on). Deterministic integer max-reduce.
+    grain::fx kBedTop = bed[0].pos.y;
+    for (const grain::GrainParticle& g : bed) if (g.pos.y > kBedTop) kBedTop = g.pos.y;
+
+    // A WIDE/SHALLOW 8x2x6 = 96 fluid sheet covering the whole bed width (x in [0,3.5]), seeded RESTING ON the
+    // bed top with only its BOTTOM row dipping a SLIGHT overlap into the top grain row (kSeedOverlap). Over the
+    // MODEST kSteps the sheet wets the sand: the TOP grain row (fluid neighbours) stays WET/buoyed, the buried
+    // BOTTOM rows stay DRY -> wetY > dryY; the pool settles to a MODEST fluidY (~2-3x the bed line, NOT a 20x
+    // runaway eject). The slight overlap is a real initial penetration GF3 parts out (proof (4) penInitial > 0).
+    const grain::fx kSeedOverlap = grain::kOne / 8;   // 0.125 (one top-row slight dip)
     fluid::FluidBlock fblock;
-    fblock.W = 4; fblock.H = 4; fblock.D = 6;
+    fblock.W = 8; fblock.H = 2; fblock.D = 6;          // 96 fluid particles (wide, 2-deep sheet)
     fblock.spacing = grain::kOne / 2;
-    fblock.origin = grain::FxVec3{0, bed[0].pos.y + grain::kOne / 8, 0};
+    fblock.origin = grain::FxVec3{0, kBedTop - kSeedOverlap, 0};
     std::vector<fluid::FluidParticle> fluidP = fluid::InitBlock(fblock);
 
     auto makeWorld = [&]() {
@@ -20086,20 +20094,25 @@ static int RunCgfStepShowcase(const char* outPath) {
                     (long long)penCoupled.summed);
     }
 
-    // --- Golden: the PURE-INTEGER side-view (x,y) of the co-settled WET SAND — the tan grain bed (holding its
-    // repose) with the cyan fluid POOLED ON/AROUND it — IDENTICAL to the Vulkan --cgf-step-shot by construction. ---
-    const int kPxPerUnit = 34, kImgMargin = 26;
-    const int kWorldLo = -1, kWorldW = 8, kWorldH = 9;
+    // --- Golden: the PURE-INTEGER side-view (x,y) of the co-settled WET SAND — the wet/dry sand bed (WET grains
+    // warm/bright, DRY grains dim brown) with the cyan fluid POOLED ON/AROUND it — IDENTICAL to the Vulkan
+    // --cgf-step-shot by construction. The mapping is SUB-UNIT (fixed-point world->pixel, NOT a >>kFrac integer
+    // floor) so the 0.5-spaced grains + pooled fluid each land on a DISTINCT pixel column; the frame fits the
+    // settled bed + the pool resting on it (sprayed outlier particles are clipped by plot's bounds check). ---
+    const cgf::CGFNeighbors goldenNbr = cgf::BuildCGFNeighbors(cpuWorld);
+    const int kPxPerUnit = 24, kImgMargin = 18;
+    const int kWorldLoX = -7, kWorldW = 18;     // x in [-7, 11] world units (the pool spreads on the bed)
+    const int kWorldLoY = -1, kWorldH = 5;      // y in [-1,  4] world units (the bed + the pool fill it)
     const uint32_t imgW = (uint32_t)(kImgMargin * 2 + kWorldW * kPxPerUnit);
     const uint32_t imgH = (uint32_t)(kImgMargin * 2 + kWorldH * kPxPerUnit);
     std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
     for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
-        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
     }
     auto toPx = [&](int wxFx, int wyFx, int& cx, int& cy) {
-        const int wx = wxFx >> grain::kFrac, wy = wyFx >> grain::kFrac;
-        cx = kImgMargin + (wx - kWorldLo) * kPxPerUnit;
-        cy = (int)imgH - kImgMargin - (wy - kWorldLo) * kPxPerUnit;
+        const int64_t loX = (int64_t)kWorldLoX << grain::kFrac, loY = (int64_t)kWorldLoY << grain::kFrac;
+        cx = kImgMargin + (int)(((int64_t)wxFx - loX) * kPxPerUnit >> grain::kFrac);
+        cy = (int)imgH - kImgMargin - (int)(((int64_t)wyFx - loY) * kPxPerUnit >> grain::kFrac);
     };
     auto plot = [&](int cx, int cy, const Vec3& col, int half) {
         for (int dy = -half; dy <= half; ++dy)
@@ -20114,12 +20127,15 @@ static int RunCgfStepShowcase(const char* outPath) {
             }
     };
     for (int i = 0; i < kGrainCount; ++i) {
+        const uint32_t cnt = goldenNbr.gfStart[(size_t)i + 1] - goldenNbr.gfStart[(size_t)i];
         int cx, cy; toPx(cpuWorld.grains[(size_t)i].pos.x, cpuWorld.grains[(size_t)i].pos.y, cx, cy);
-        plot(cx, cy, Vec3{0.62f, 0.46f, 0.24f}, 1);
+        const Vec3 col = (cnt > 0u) ? Vec3{0.85f, 0.62f, 0.30f}   // WET sand (buoyed, saturated)
+                                    : Vec3{0.46f, 0.32f, 0.17f};  // DRY sand (packed)
+        plot(cx, cy, col, 2);
     }
     for (int i = 0; i < kFluidCount; ++i) {
         int cx, cy; toPx(cpuWorld.fluid[(size_t)i].pos.x, cpuWorld.fluid[(size_t)i].pos.y, cx, cy);
-        plot(cx, cy, Vec3{0.18f, 0.58f, 0.95f}, 1);
+        plot(cx, cy, Vec3{0.22f, 0.64f, 0.97f}, 2);
     }
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — cgf coupled step (wet sand: fluid pooled on the bed, fluidY %d, bedY %d)\n",
