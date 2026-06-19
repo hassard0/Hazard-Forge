@@ -238,6 +238,16 @@ hf_gen_msl(vt_cachegen.comp      vt_cachegen.comp.hlsl      comp vt_cachegen_mai
 # --msl-version 20200 needed). The case set is bit-exact GPU==CPU + cross-backend by construction.
 # Behind --mc-classify only; existing shaders + goldens untouched.
 hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_main)
+# Deterministic Rigid-Body Fracture Slice 1 (Slice FR1, the BEACHHEAD of FLAGSHIP #14): fract_classify.comp
+# partitions a source-volume integer LATTICE into N fragment CELLS — ONE thread per lattice SAMPLE
+# decomposes its flat id -> (x,y,z), runs the nearest-seed loop (bestId = argmin_k dx*dx+dy*dy+dz*dz over
+# the M host seeds, STRICTLY-less lowest-index tie-break) copied VERBATIM from engine/sim/fract.h, writing
+# gCells[sample]=bestId (an order-independent per-sample integer write, no atomics). classifyEnabled=0 ->
+# writes 0. PURE INT32 (small lattice coords -> max d2 ~3.1M fits int32, NO int64) -> the default MSL gen
+# suffices (NO --msl-version 20200 needed, the mc_classify lesson), a TRUE GPU pass on both backends. The
+# cell set is bit-exact GPU==CPU + cross-backend by construction. Behind --fract-cells only; existing
+# shaders + goldens untouched.
+hf_gen_msl(fract_classify.comp   fract_classify.comp.hlsl   comp fract_classify_main)
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): fpx_integrate.comp
 # runs the Q16.16 semi-implicit-Euler INTEGRATOR — ONE thread per body runs `steps` iterations of
 # (vel += gravity*dt; pos += vel*dt; ground floor-clamp) on its OWN body, the fxmul ((int64)a*b >> 16) +

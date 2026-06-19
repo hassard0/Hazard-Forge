@@ -590,6 +590,16 @@ hf_add_pure_test(swraster_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(mc_test)
 
+# Deterministic Rigid-Body Fracture Slice 1 (Slice FR1, the BEACHHEAD of FLAGSHIP #14): the per-sample
+# NEAREST-SEED CELL classification integer core (engine/sim/fract.h) the GPU
+# shaders/fract_classify.comp.hlsl copies VERBATIM + proves bit-identical. Pins the SampleIndex layout
+# ((z*ny+y)*nx+x dense+monotone) + SampleCount, NearestSeed (pure int32 squared distance, on-seed d2==0,
+# the STRICTLY-less lowest-index tie-break at the exact integer bisector, 3D), ClassifyFractCells over a
+# 1-seed field (all cellId 0) + a 2-seed bisector split + on-seed samples, partition completeness (every
+# sample assigned, all cellId in [0,M), per-cell counts sum == sampleCount), and determinism (two
+# classifies byte-identical). Pure C++ (hf_core), ASan-eligible. fract.h #includes sim/fpx.h read-only.
+hf_add_pure_test(fract_test)
+
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
 # fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
 # shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products
