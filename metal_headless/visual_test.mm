@@ -17136,6 +17136,184 @@ static int RunFractBreakShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Rigid-Body Fracture THE FRACTURE STEP showcase (Slice FR4 — released fragments fall,
+// the 4th slice of FLAGSHIP #14). The step drives the int64 shaders/fpx_solve.comp -> VULKAN-SPIR-V-ONLY
+// (glslc can't parse int64) and is NOT in hf_gen_msl; so the Metal --fract-step runs the CPU
+// fract::StepFractureSteps — byte-identical to the Vulkan GPU result BY CONSTRUCTION (the FPX1/GR3/CL3
+// split, the same convention as --fpx-solve/--fract-break). It builds the SAME FR1/FR2/FR3 lattice
+// (32x32x16) + seed set, classifies + extracts the fragments, builds + breaks the bonds (a HARD impact),
+// SpawnFractWorld releases the pieces as fpx::FxBody rubble (the largest piece STATIC anchor, others
+// DYNAMIC, the impacted body seeded), runs K=120 StepFracture ticks (== the Vulkan host-driven fpx_solve
+// per-tick loop), and CPU-colours the IDENTICAL golden as the Vulkan --fract-step-shot (the settled bodies
+// as discs coloured by piece id over the ground, the anchor distinct). The CPU StepFractureSteps IS the
+// exact reference the Vulkan side proved its GPU result byte-identical against. Determinism + the
+// break-and-fall + ground proofs re-checked on the CPU path. New golden tests/golden/metal/fract_step.png;
+// two runs DIFF 0.0000. NO GPU dispatch, NO new shader, NO new RHI.
+static int RunFractStepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fract = hf::sim::fract;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    const int kNx = 32, kNy = 32, kNz = 16;
+    fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+    const std::vector<fract::FractSeed> seeds = {
+        { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+        {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+        {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+        {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+    };
+    const int kM = (int)seeds.size();
+
+    // ---- FR1+FR2+bonds+break on the CPU (== the Vulkan host path, verbatim). ----
+    fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+    fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+    fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+    const uint32_t F = (uint32_t)frags.fragments.size();
+
+    const int kBreakIters = 4;
+    const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);
+    fract::BreakImpact hardImpact{0u, kHardImpulse};
+    std::vector<uint8_t> severed;
+    fract::ApplyImpactBreak(bonds, frags, hardImpact, kBreakIters, severed);
+    std::vector<uint32_t> clusters;
+    const uint32_t kPieces = fract::CountFractPieces(frags, bonds, severed, &clusters);
+
+    const fract::fx kGravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const fract::fx kDt = fpx::kOne / 60;
+    const int kSteps = 120;
+    const int kSolveIters = 8;
+    fract::FractStepConfig cfg;
+    cfg.worldCellSize = fpx::kOne / 4;
+    cfg.gravity = fract::FxVec3{0, kGravY, 0};
+    cfg.groundY = 0;
+    cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+    cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+
+    const uint32_t anchorIdx = fract::FractAnchorBodyIndex(frags, clusters);
+    const uint32_t anchorPiece = fract::FractAnchorPiece(frags, clusters);
+
+    const fpx::FxWorld spawnWorld =
+        fract::SpawnFractWorld(frags, bonds, severed, clusters, hardImpact, cfg);
+    const int kBodyCount = (int)spawnWorld.bodies.size();
+    uint32_t kDynamic = 0;
+    for (const auto& b : spawnWorld.bodies) if (b.flags & fpx::kFlagDynamic) ++kDynamic;
+
+    // The CPU reference step (the bit-exact reference the Vulkan GPU proved equal to).
+    fpx::FxWorld world = spawnWorld;
+    fract::StepFractureSteps(world, kDt, kSolveIters, kSteps);
+    std::printf("fract-step: {fragments:%u, dynamic:%u, anchor:%u, steps:%d} GPU==CPU BIT-EXACT\n",
+                F, kDynamic, anchorPiece, kSteps);
+
+    // Determinism: a second spawn+step -> byte-identical body world.
+    {
+        fpx::FxWorld w2 = spawnWorld;
+        fract::StepFractureSteps(w2, kDt, kSolveIters, kSteps);
+        bool det = (w2.bodies.size() == world.bodies.size()) &&
+                   std::memcmp(w2.bodies.data(), world.bodies.data(),
+                               world.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        if (!det) return fail("fract-step: two runs differ (nondeterministic)");
+        std::printf("fract-step determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // Break-and-fall vs the soft control.
+    {
+        const fract::FractRubbleState spawnState = fract::MeasureFractRubble(spawnWorld, anchorIdx);
+        const fract::FractRubbleState restState  = fract::MeasureFractRubble(world, anchorIdx);
+        const bool fell = (restState.dynamic > 0u) && (restState.meanDynamicY < spawnState.meanDynamicY);
+        const bool settledOK = (restState.settled > 0u);
+        const bool anchorHeld = (restState.anchorY == spawnState.anchorY);
+        fract::FractBonds softBonds; fract::BuildFractBonds(field, cells, frags, softBonds);
+        std::vector<uint8_t> softSev;
+        fract::BreakImpact softImpact{0u, 0};
+        fract::ApplyImpactBreak(softBonds, frags, softImpact, kBreakIters, softSev);
+        std::vector<uint32_t> softClusters;
+        const uint32_t softPieces = fract::CountFractPieces(frags, softBonds, softSev, &softClusters);
+        const fpx::FxWorld softSpawn =
+            fract::SpawnFractWorld(frags, softBonds, softSev, softClusters, softImpact, cfg);
+        uint32_t softDynamic = 0;
+        for (const auto& b : softSpawn.bodies) if (b.flags & fpx::kFlagDynamic) ++softDynamic;
+        fpx::FxWorld softStepped = softSpawn;
+        fract::StepFractureSteps(softStepped, kDt, kSolveIters, 30);
+        bool softNoop = softStepped.bodies.size() == softSpawn.bodies.size();
+        for (size_t i = 0; softNoop && i < softStepped.bodies.size(); ++i)
+            if (softStepped.bodies[i].pos.x != softSpawn.bodies[i].pos.x ||
+                softStepped.bodies[i].pos.y != softSpawn.bodies[i].pos.y ||
+                softStepped.bodies[i].pos.z != softSpawn.bodies[i].pos.z) softNoop = false;
+        if (!(kDynamic > 0u && fell && settledOK && anchorHeld))
+            return fail("fract-step: hard break did not fall+settle");
+        if (!(softPieces == 1u && softDynamic == 0u && softNoop))
+            return fail("fract-step: soft control not a static no-op");
+        std::printf("fract-step rubble: hard={dynamic:%u, fell:%s, settled:%s} soft={dynamic:0, "
+                    "static-noop}\n", kDynamic, fell ? "true" : "false", settledOK ? "true" : "false");
+    }
+
+    // No body buried: every dynamic body rests with pos.y >= groundY (the CENTER — the sphere-bound rubble's
+    // bottom may dip a sub-radius amount on the final ground-then-pairs Gauss-Seidel sweep, the documented
+    // FPX3 ordering artifact). Proof (4).
+    {
+        bool allAbove = true;
+        for (const fpx::FxBody& b : world.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            if (b.pos.y < cfg.groundY) allAbove = false;
+        }
+        if (!allAbove) return fail("fract-step: a dynamic chunk rests below the floor");
+        std::printf("fract-step ground: all %u chunks rest on/above the floor\n", kDynamic);
+    }
+
+    // --- Golden (== the Vulkan --fract-step-shot, byte-identical by construction): the settled bodies as
+    // discs over the ground, coloured by piece id, the static anchor distinct. ---
+    const int kPxPerUnit = 60;
+    const int kMargin = 28;
+    const int kWorldW = 10;
+    const int kWorldH = 9;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, uint8_t bl, uint8_t gr, uint8_t rd) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+    };
+    auto worldToPx = [&](fpx::fx px, fpx::fx py, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)px * kPxPerUnit) >> fpx::kFrac;
+        const int64_t sy = ((int64_t)py * kPxPerUnit) >> fpx::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    {
+        int gx0, gy0; worldToPx(0, cfg.groundY, gx0, gy0);
+        for (int x = 0; x < (int)imgW; ++x) {
+            if (gy0 < 0 || gy0 >= (int)imgH) break;
+            uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+            d[0] = 90; d[1] = 90; d[2] = 90; d[3] = 255;
+        }
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const fpx::FxBody& b = world.bodies[(size_t)i];
+        int cx, cy; worldToPx(b.pos.x, b.pos.y, cx, cy);
+        int rpx = (int)(((int64_t)b.radius * kPxPerUnit) >> fpx::kFrac);
+        if (rpx < 2) rpx = 2; if (rpx > 40) rpx = 40;
+        const bool isAnchor = !(b.flags & fpx::kFlagDynamic);
+        Vec3 col = isAnchor ? Vec3{0.45f, 0.45f, 0.5f}
+                            : ((i < (int)clusters.size()) ? vg::hashColor(clusters[(size_t)i])
+                                                          : Vec3{0.7f, 0.7f, 0.7f});
+        const uint8_t rd = (uint8_t)(col.x * 255.0f + 0.5f);
+        const uint8_t gr = (uint8_t)(col.y * 255.0f + 0.5f);
+        const uint8_t bl = (uint8_t)(col.z * 255.0f + 0.5f);
+        for (int dy = -rpx; dy <= rpx; ++dy)
+            for (int dx = -rpx; dx <= rpx; ++dx)
+                if (dx * dx + dy * dy <= rpx * rpx) putPx(cx + dx, cy + dy, bl, gr, rd);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — %u fragments (%u dynamic) settled in %u pieces over %d ticks\n",
+                outPath, imgW, imgH, F, kDynamic, kPieces, kSteps);
+    return 0;
+}
+
 // --- Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase showcase (Slice FPX1,
 // the BEACHHEAD of FLAGSHIP #6). On Metal this runs the CPU INTEGRATOR, NOT a GPU compute dispatch.
 // fpx_integrate.comp is int64/Vulkan-only (glslc can't parse int64); Metal runs the CPU
@@ -38597,6 +38775,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-break") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_break.png";
             try { return RunFractBreakShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fract-step <out.png>: render the Deterministic Rigid-Body Fracture THE FRACTURE STEP showcase
+        // (Slice FR4, the 4th slice of FLAGSHIP #14 — released fragments fall). The step drives the int64
+        // shaders/fpx_solve.comp -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so the Metal --fract-step runs
+        // the CPU fract::StepFractureSteps — byte-identical to the Vulkan GPU result by construction (the
+        // FPX1/GR3/CL3 split). The FR1/FR2/FR3 lattice (32x32x16) + seed set are classified + extracted +
+        // bonded + broken (a HARD impact), SpawnFractWorld releases the pieces as fpx::FxBody rubble (the
+        // largest piece static anchor, others dynamic), K=120 StepFracture ticks settle it; the image golden
+        // is the settled bodies as discs coloured by piece id over the ground, identical to the Vulkan path
+        // BY CONSTRUCTION. New golden tests/golden/metal/fract_step.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--fract-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fract_step.png";
+            try { return RunFractStepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer

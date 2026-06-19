@@ -454,6 +454,7 @@ int main(int argc, char** argv) {
     const char* mcClassifyShotPath = nullptr; // --mc-classify-shot <out.bmp> (Slice MC1: GPU Isosurface Meshing per-cell MARCHING-CUBES CASE CLASSIFICATION, integer compute over an SDF VoxelField, GPU==CPU case-set bit-exact, case-index Z-slice debug-viz)
     const char* fractCellsShotPath = nullptr; // --fract-cells-shot <out.bmp> (Slice FR1: GPU Deterministic Rigid-Body Fracture CELL PRE-FRACTURE / VORONOI DECOMPOSITION, pure-int32 nearest-seed compute over a lattice, GPU==CPU cellId bit-exact MSL-native, Voronoi cell-mosaic Z-slice viz)
     const char* fractFragmentsShotPath = nullptr; // --fract-fragments-shot <out.bmp> (Slice FR2: GPU Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION, pure-int32 count->scan->emit CSR over FR1 cellId + per-fragment reduce, GPU==CPU fragment array+CSR+remap bit-exact MSL-native, fragment centroids/bounds over the cell mosaic)
+    const char* fractStepShotPath = nullptr; // --fract-step-shot <out.bmp> (Slice FR4: GPU Deterministic Rigid-Body Fracture THE FRACTURE STEP — released fragments fall. FR1 classify + FR2 extract + BuildFractBonds + a HARD ApplyImpactBreak + CountFractPieces (host) -> SpawnFractWorld releases the broken pieces as fpx::FxBody rubble (one body per fragment, pos=centroid·worldCellSize, radius=boundRadius·worldCellSize, invMass from FR2; the LARGEST piece STATIC anchor, others DYNAMIC; the impacted body seeded with impactDir·impactSpeed) -> K=120 StepFracture ticks drive the EXISTING shaders/fpx_solve.comp ONCE per tick (host-rebuilding the FPX2 pair list each tick from the current positions — the realistic per-tick re-broadphase; angVel=0 keeps orient identity so fpx_solve.comp's IntegrateStep == StepFracture's IntegrateBodyFull byte-for-byte) -> the final body world memcmp'd vs the CPU fract.h::StepFractureSteps (the GPU==CPU make-or-break). int64 -> fpx_solve.comp is Vulkan-only; the Metal --fract-step runs the CPU StepFractureSteps. PROOFS: GPU==CPU bit-exact, determinism, break-and-fall (hard: D>0 chunks fell + settled, anchor unchanged; soft: D==0 static no-op), no body buried (all rest pos.y-radius>=groundY). The image golden is a pure-integer side-view of the settled bodies coloured by piece id (the anchor distinct). NO new shader (hf_gen_msl UNCHANGED), NO lockstep (FR5), NO lit render (FR6); FR1/FR2/FR3 code+shaders + their goldens + fpx.h UNCHANGED (FR4 additive))
     const char* fractBreakShotPath = nullptr; // --fract-break-shot <out.bmp> (Slice FR3: GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK — THE NEW PHYSICS, host-built bond graph + int64 Jacobi load-diffusion break (Vulkan-only fract_break.comp) -> GPU per-bond {loadAccum,severed} memcmp'd vs CPU ApplyImpactBreak, fragments coloured by cluster/piece id with severed bonds marked red)
     const char* mcCountShotPath = nullptr; // --mc-count-shot <out.bmp> (Slice MC2: GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT — 256-case kTriTable lookup + InterlockedAdd grand total, integer compute over an SDF VoxelField, GPU==CPU counts+total bit-exact, count-grid Z-slice debug-viz)
     const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
@@ -2319,6 +2320,16 @@ int main(int argc, char** argv) {
     // fract.h::ApplyImpactBreak. int64 -> Vulkan-only; the Metal --fract-break runs the CPU reference.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fract-break-shot") == 0) { fractBreakShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice FR4: --fract-step-shot <out.bmp> (GPU Deterministic Rigid-Body Fracture THE FRACTURE STEP —
+    // released fragments fall). Its OWN loop (the FR1-FR3 standalone-loop pattern — NOT the big else-if
+    // ladder, the C1061 nested-block limit). The FR1 lattice+seeds -> FR1 classify + FR2 extract +
+    // BuildFractBonds + a HARD ApplyImpactBreak + CountFractPieces (host) -> SpawnFractWorld releases the
+    // pieces as fpx::FxBody rubble -> K StepFracture ticks driving the EXISTING fpx_solve.comp per tick
+    // (host-rebuilt FPX2 pairs) -> the final body set memcmp'd vs the CPU StepFractureSteps. NO new shader.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--fract-step-shot") == 0) { fractStepShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -15908,6 +15919,330 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — %u fragments in %u pieces, %u severed bonds (red)\n",
                                 fractBreakShotPath, imgW, imgH, F, gpuPieces, gpuSevered);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractBreakShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- GPU Deterministic Rigid-Body Fracture THE FRACTURE STEP — released fragments fall
+        // (--fract-step-shot <out.bmp>, Slice FR4, the 4th slice of FLAGSHIP #14). FR1 classifies the
+        // 32x32x16 lattice + fixed seed set; FR2 extracts the fragments; FR3 BONDS them + a host-fixed HARD
+        // impact BREAKS the over-stressed bonds -> the severed-bond SET + the piece clusters (all host, pure
+        // int32 + int64). FR4 then SpawnFractWorld releases the pieces as world-unit fpx::FxBody rubble (one
+        // body per fragment, the LARGEST piece STATIC anchor, others DYNAMIC, the impacted body seeded with
+        // an impact velocity), and K=120 StepFracture ticks settle the rubble. NO new shader: StepFracture
+        // mirrors fpx_solve.comp's per-step body EXACTLY, so this drives the EXISTING shaders/fpx_solve.comp
+        // ONCE per tick (host-rebuilding the FPX2 pair list each tick from the current positions). The
+        // fragments spawn angVel=0 + identity orient, and IntegrateOrientation with angVel=0 leaves identity
+        // EXACTLY, so fpx_solve.comp's IntegrateStep is byte-identical to StepFracture's IntegrateBodyFull on
+        // these bodies. ReadBuffer reads the final body world PROVEN BIT-EXACT vs the CPU StepFractureSteps
+        // (memcmp, NO tol — the make-or-break). int64 -> fpx_solve.comp is Vulkan-only; the Metal --fract-step
+        // runs the CPU reference. NO new RHI; FR1/FR2/FR3 code + shaders + goldens + fpx.h UNCHANGED.
+        if (fractStepShotPath) {
+            using math::Vec3;
+            namespace fract = hf::sim::fract;
+            namespace fpx = hf::sim::fpx;
+            namespace vg = hf::render::vg;
+
+            // The fixed source lattice + seed set (== the FR1/FR2/FR3 config, verbatim).
+            const int kNx = 32, kNy = 32, kNz = 16;
+            fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+            const std::vector<fract::FractSeed> seeds = {
+                { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+                {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+                {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+                {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+            };
+            const int kM = (int)seeds.size();
+
+            // ---- FR1+FR2+bonds+break on the HOST (pure int32/int64, deterministic; == --fract-break-shot). ----
+            fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+            fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+            fract::FractBonds bonds; fract::BuildFractBonds(field, cells, frags, bonds);
+            const uint32_t F = (uint32_t)frags.fragments.size();
+
+            const int kBreakIters = 4;
+            const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);   // == the FR3 hard impact
+            fract::BreakImpact hardImpact{0u, kHardImpulse};
+            fract::FractBonds breakBonds; fract::BuildFractBonds(field, cells, frags, breakBonds);
+            std::vector<uint8_t> severed;
+            fract::ApplyImpactBreak(breakBonds, frags, hardImpact, kBreakIters, severed);
+            std::vector<uint32_t> clusters;
+            const uint32_t kPieces = fract::CountFractPieces(frags, breakBonds, severed, &clusters);
+
+            // ---- FR4 spawn config (host-fixed Q16.16). worldCellSize 0.25 -> the 32-cell lattice spans ~8
+            // world units; gravity -9.8 host-snapped; groundY 0; a downward+sideways impact on fragment 0. ----
+            const fract::fx kGravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fract::fx kDt = fpx::kOne / 60;
+            const int kSteps = 120;
+            const int kSolveIters = 8;
+            fract::FractStepConfig cfg;
+            cfg.worldCellSize = fpx::kOne / 4;     // 0.25 world units per lattice cell
+            cfg.gravity = fract::FxVec3{0, kGravY, 0};
+            cfg.groundY = 0;
+            cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};   // down + sideways
+            cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);            // 4 units/s kick
+
+            const uint32_t anchorIdx = fract::FractAnchorBodyIndex(frags, clusters);
+            const uint32_t anchorPiece = fract::FractAnchorPiece(frags, clusters);
+
+            // The spawned rubble world (the SAME world both the GPU driver and the CPU reference step).
+            const fpx::FxWorld spawnWorld =
+                fract::SpawnFractWorld(frags, breakBonds, severed, clusters, hardImpact, cfg);
+            const int kBodyCount = (int)spawnWorld.bodies.size();
+            uint32_t kDynamic = 0;
+            for (const auto& b : spawnWorld.bodies) if (b.flags & fpx::kFlagDynamic) ++kDynamic;
+
+            // std430 FpxBody mirror (== shaders/fpx_solve.comp FpxBody): 9 x int32 (36 bytes). FR4's bodies
+            // carry orient/angVel but those are identity/zero and fpx_solve.comp does NOT touch them, so the
+            // FPX2/FPX3 9-int32 pack is sufficient (the orient/angVel stay at their spawn values — identity).
+            struct FpxBodyGpu { int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius; };
+            static_assert(sizeof(FpxBodyGpu) == 36, "FpxBodyGpu std430 layout");
+            auto packBodies = [&](const fpx::FxWorld& w) {
+                std::vector<FpxBodyGpu> out((size_t)w.bodies.size());
+                for (size_t i = 0; i < w.bodies.size(); ++i) {
+                    const fpx::FxBody& b = w.bodies[i];
+                    out[i] = FpxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z,
+                                        b.invMass, b.flags, b.radius};
+                }
+                return out;
+            };
+
+            struct FxPairGpu { uint32_t i, j; };
+            static_assert(sizeof(FxPairGpu) == 8, "FxPairGpu std430 layout");
+            // FpxParams (== fpx_solve.comp): grav {gx,gy,gz,dt}; cfg {groundY,bodyCount,pairCount,steps};
+            // cfg2 {solveIters, solveEnabled, _, _}. We drive ONE tick per dispatch (steps=1), re-broadphasing
+            // on the host between dispatches (a fresh pair buffer per tick).
+            struct FpxParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(FpxParams) == 48, "FpxParams std430 layout");
+
+            auto fpxCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/fpx_solve.comp.hlsl.spv");
+            auto fpxCs = device->CreateShaderModule({std::span<const uint32_t>(fpxCsWords)});
+            rhi::ComputePipelineDesc fpxCdesc;
+            fpxCdesc.compute = fpxCs.get(); fpxCdesc.storageBufferCount = 3; fpxCdesc.threadsPerGroupX = 1;
+            auto fpxCompute = device->CreateComputePipeline(fpxCdesc);
+
+            auto mkBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data;
+                d.usage = rhi::BufferUsage::Storage; return device->CreateBuffer(d);
+            };
+
+            // runGpu: the full host-driven K-step driver over the GPU fpx_solve.comp. To match StepFracture's
+            // EXACT order (integrate -> re-broadphase from the INTEGRATED positions -> solve), each tick runs
+            // TWO dispatches of the EXISTING fpx_solve.comp: (1) the INTEGRATE pass (dt=real, solveIters=0 ->
+            // pass A IntegrateStep+floor-clamp only, ZERO solve sweeps) -> read back the integrated bodies ->
+            // host-rebuild the FPX2 pair list from THOSE positions; (2) the SOLVE pass (dt=0 -> pass A does NO
+            // translation [fxmul by 0] + the idempotent floor clamp, then K SolveContacts sweeps). Composed,
+            // this is byte-identical to StepFracture (integrate+clamp, then [idempotent-clamp + SolveContacts]).
+            auto buildBw = [&](const std::vector<FpxBodyGpu>& cur) {
+                fpx::FxWorld bw; bw.gravity = cfg.gravity; bw.groundY = cfg.groundY;
+                bw.bodies.resize((size_t)kBodyCount);
+                for (int i = 0; i < kBodyCount; ++i) {
+                    const FpxBodyGpu& g = cur[(size_t)i];
+                    fpx::FxBody b; b.pos = {g.px, g.py, g.pz}; b.vel = {g.vx, g.vy, g.vz};
+                    b.invMass = g.invMass; b.flags = g.flags; b.radius = g.radius;
+                    b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+                    bw.bodies[(size_t)i] = b;
+                }
+                return bw;
+            };
+            auto dispatchSolve = [&](rhi::IBuffer& bodiesBuf, rhi::IBuffer& pairsBuf,
+                                     rhi::IBuffer& paramsBuf) {
+                render::RenderGraph g; render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("fract_step", {}, {rgSwap}, [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BindComputePipeline(*fpxCompute);
+                    cmd.BindStorageBuffer(bodiesBuf, 0);
+                    cmd.BindStorageBuffer(pairsBuf, 1);
+                    cmd.BindStorageBuffer(paramsBuf, 2);
+                    cmd.DispatchCompute(1);
+                    cmd.ComputeToVertexBarrier();
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.EndRenderPass();
+                });
+                g.Execute(*device); device->WaitIdle();
+            };
+            auto runGpu = [&](std::vector<FpxBodyGpu>& outBodies) {
+                std::vector<FpxBodyGpu> bodiesInit = packBodies(spawnWorld);
+                auto bodiesBuf = mkBuf(bodiesInit.data(), bodiesInit.size() * sizeof(FpxBodyGpu));
+                // A 1-entry placeholder pair buffer for the integrate-only pass (pairCount=0 -> no pairs).
+                std::vector<FxPairGpu> noPairs(1, FxPairGpu{0u, 0u});
+                auto noPairsBuf = mkBuf(noPairs.data(), noPairs.size() * sizeof(FxPairGpu));
+                for (int step = 0; step < kSteps; ++step) {
+                    // (1) INTEGRATE pass: dt=real, solveIters=0 (pass A only, no solve sweeps).
+                    FpxParams pi{};
+                    pi.grav[0] = 0; pi.grav[1] = kGravY; pi.grav[2] = 0; pi.grav[3] = kDt;
+                    pi.cfg[0] = cfg.groundY; pi.cfg[1] = kBodyCount; pi.cfg[2] = 0; pi.cfg[3] = 1;
+                    pi.cfg2[0] = 0; pi.cfg2[1] = 1; pi.cfg2[2] = 0; pi.cfg2[3] = 0;
+                    auto piBuf = mkBuf(&pi, sizeof(FpxParams));
+                    dispatchSolve(*bodiesBuf, *noPairsBuf, *piBuf);
+
+                    // (host) read the INTEGRATED bodies + rebuild the FPX2 candidate pairs from them.
+                    std::vector<FpxBodyGpu> cur((size_t)kBodyCount);
+                    device->ReadBuffer(*bodiesBuf, cur.data(), cur.size() * sizeof(FpxBodyGpu), 0);
+                    fpx::FxWorld bw = buildBw(cur);
+                    std::vector<uint32_t> off; std::vector<fpx::FxPair> pairs;
+                    fpx::BuildPairs(bw, off, pairs);
+                    const uint32_t pc = (uint32_t)pairs.size();
+                    std::vector<FxPairGpu> pairsInit((size_t)(pc > 0u ? pc : 1u), FxPairGpu{0u, 0u});
+                    for (uint32_t p = 0; p < pc; ++p) pairsInit[p] = FxPairGpu{pairs[p].i, pairs[p].j};
+                    auto pairsBuf = mkBuf(pairsInit.data(), pairsInit.size() * sizeof(FxPairGpu));
+
+                    // (2) SOLVE pass: dt=0 (no translation; idempotent floor clamp) + K SolveContacts sweeps.
+                    FpxParams ps{};
+                    ps.grav[0] = 0; ps.grav[1] = kGravY; ps.grav[2] = 0; ps.grav[3] = 0;   // dt=0
+                    ps.cfg[0] = cfg.groundY; ps.cfg[1] = kBodyCount; ps.cfg[2] = (int32_t)pc; ps.cfg[3] = 1;
+                    ps.cfg2[0] = kSolveIters; ps.cfg2[1] = 1; ps.cfg2[2] = 0; ps.cfg2[3] = 0;
+                    auto psBuf = mkBuf(&ps, sizeof(FpxParams));
+                    dispatchSolve(*bodiesBuf, *pairsBuf, *psBuf);
+                }
+                outBodies.assign((size_t)kBodyCount, FpxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FpxBodyGpu), 0);
+            };
+
+            // === GPU drive (K ticks) ===
+            std::vector<FpxBodyGpu> gpuBodies;
+            runGpu(gpuBodies);
+
+            // === CPU reference: StepFractureSteps K times over the SAME spawned world. ===
+            fpx::FxWorld cpuWorld = spawnWorld;
+            fract::StepFractureSteps(cpuWorld, kDt, kSolveIters, kSteps);
+            const std::vector<FpxBodyGpu> cpuBodies = packBodies(cpuWorld);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K fracture ticks (integer memcmp, NO tol).
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fract-step GPU body world != CPU StepFractureSteps "
+                             "(a float/non-verbatim crept into the fracture step?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-step: {fragments:%u, dynamic:%u, anchor:%u, steps:%d} GPU==CPU BIT-EXACT\n",
+                        F, kDynamic, anchorPiece, kSteps);
+
+            // PROOF (2) determinism: a second full GPU drive byte-identical.
+            std::vector<FpxBodyGpu> gpuBodies2;
+            runGpu(gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FpxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: fract-step two GPU drives differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-step determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) break-and-fall vs the soft control. The HARD break: D>0 dynamic chunks that FELL
+            // (mean dynamic pos.y dropped from the spawn line) AND settled at/above ground; the anchor
+            // (static) UNCHANGED. The SOFT control (a ZERO impact -> 0 severed -> 1 piece -> ALL anchor) ->
+            // D==0, a static no-op (nothing falls).
+            const fract::FractRubbleState spawnState = fract::MeasureFractRubble(spawnWorld, anchorIdx);
+            const fract::FractRubbleState restState  = fract::MeasureFractRubble(cpuWorld, anchorIdx);
+            const bool fell = (restState.dynamic > 0u) && (restState.meanDynamicY < spawnState.meanDynamicY);
+            const bool settledOK = (restState.settled > 0u);
+            const bool anchorHeld = (restState.anchorY == spawnState.anchorY);
+            // The soft control: rebuild the break with a ZERO impact -> intact -> all-anchor spawn.
+            fract::FractBonds softBonds; fract::BuildFractBonds(field, cells, frags, softBonds);
+            std::vector<uint8_t> softSev;
+            fract::BreakImpact softImpact{0u, 0};
+            fract::ApplyImpactBreak(softBonds, frags, softImpact, kBreakIters, softSev);
+            std::vector<uint32_t> softClusters;
+            const uint32_t softPieces = fract::CountFractPieces(frags, softBonds, softSev, &softClusters);
+            const fpx::FxWorld softSpawn =
+                fract::SpawnFractWorld(frags, softBonds, softSev, softClusters, softImpact, cfg);
+            uint32_t softDynamic = 0;
+            for (const auto& b : softSpawn.bodies) if (b.flags & fpx::kFlagDynamic) ++softDynamic;
+            fpx::FxWorld softStepped = softSpawn;
+            fract::StepFractureSteps(softStepped, kDt, kSolveIters, 30);
+            bool softNoop = softStepped.bodies.size() == softSpawn.bodies.size();
+            for (size_t i = 0; softNoop && i < softStepped.bodies.size(); ++i)
+                if (softStepped.bodies[i].pos.x != softSpawn.bodies[i].pos.x ||
+                    softStepped.bodies[i].pos.y != softSpawn.bodies[i].pos.y ||
+                    softStepped.bodies[i].pos.z != softSpawn.bodies[i].pos.z) softNoop = false;
+            if (!(kDynamic > 0u && fell && settledOK && anchorHeld)) {
+                std::fprintf(stderr, "FATAL: fract-step hard break did not fall+settle (dynamic=%u fell=%d "
+                             "settled=%d anchorHeld=%d)\n", kDynamic, (int)fell, (int)settledOK,
+                             (int)anchorHeld);
+                device->WaitIdle(); return 1;
+            }
+            if (!(softPieces == 1u && softDynamic == 0u && softNoop)) {
+                std::fprintf(stderr, "FATAL: fract-step soft control not a static no-op (pieces=%u dynamic=%u "
+                             "noop=%d)\n", softPieces, softDynamic, (int)softNoop);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-step rubble: hard={dynamic:%u, fell:%s, settled:%s} soft={dynamic:0, "
+                        "static-noop}\n", kDynamic, fell ? "true" : "false", settledOK ? "true" : "false");
+
+            // PROOF (4) no body buried: every dynamic body rests with pos.y >= groundY (the ground clamp
+            // held). The CENTER, not the bottom: the sphere-bound rubble's bottom may dip a sub-radius amount
+            // on the final Gauss-Seidel sweep where pairs resolve AFTER the ground (the documented FPX3
+            // ground-then-pairs ordering artifact). Use the GPU result (== CPU, proven).
+            uint32_t aboveGround = 0;
+            bool allAbove = true;
+            for (int i = 0; i < kBodyCount; ++i) {
+                if (!(gpuBodies[(size_t)i].flags & fpx::kFlagDynamic)) continue;
+                if (gpuBodies[(size_t)i].py >= cfg.groundY) ++aboveGround;
+                else allAbove = false;
+            }
+            if (!allAbove) {
+                std::fprintf(stderr, "FATAL: fract-step a dynamic chunk rests BELOW the floor "
+                             "(%u/%u above)\n", aboveGround, kDynamic);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-step ground: all %u chunks rest on/above the floor\n", kDynamic);
+
+            // --- Golden: a PURE-INTEGER 2D side-view (X right, Y up; Z dropped). Each body is a disc at its
+            // bit-exact (pos.x>>kFrac, pos.y>>kFrac), coloured by its piece/cluster id (the anchor distinct,
+            // drawn in a neutral grey). CPU-coloured from the read-back integers -> identical both backends. ---
+            const int kPxPerUnit = 60;
+            const int kMargin = 28;
+            const int kWorldW = 10;   // x spans ~0..8 world units (32 cells · 0.25) + headroom
+            const int kWorldH = 9;    // y spans 0..~8 + headroom
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 11; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto putPx = [&](int x, int y, uint8_t bl, uint8_t gr, uint8_t rd) {
+                if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+                uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+                d[0] = bl; d[1] = gr; d[2] = rd; d[3] = 255;
+            };
+            auto worldToPx = [&](fpx::fx px, fpx::fx py, int& ix, int& iy) {
+                // Q16.16 world -> pixel (integer scale; round-to-nearest via +half).
+                const int64_t sx = ((int64_t)px * kPxPerUnit) >> fpx::kFrac;
+                const int64_t sy = ((int64_t)py * kPxPerUnit) >> fpx::kFrac;
+                ix = kMargin + (int)sx;
+                iy = (int)imgH - kMargin - (int)sy;
+            };
+            // The groundY line (y == groundY).
+            {
+                int gx0, gy0; worldToPx(0, cfg.groundY, gx0, gy0);
+                for (int x = 0; x < (int)imgW; ++x) {
+                    if (gy0 < 0 || gy0 >= (int)imgH) break;
+                    uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+                    d[0] = 90; d[1] = 90; d[2] = 90; d[3] = 255;
+                }
+            }
+            // Each body as a filled disc of radius (boundRadius·cellSize)>>kFrac pixels, coloured by piece id.
+            for (int i = 0; i < kBodyCount; ++i) {
+                const FpxBodyGpu& gb = gpuBodies[(size_t)i];
+                int cx, cy; worldToPx(gb.px, gb.py, cx, cy);
+                int rpx = (int)(((int64_t)gb.radius * kPxPerUnit) >> fpx::kFrac);
+                if (rpx < 2) rpx = 2; if (rpx > 40) rpx = 40;
+                const bool isAnchor = !(gb.flags & fpx::kFlagDynamic);
+                Vec3 col = isAnchor ? Vec3{0.45f, 0.45f, 0.5f}
+                                    : ((i < (int)clusters.size()) ? vg::hashColor(clusters[(size_t)i])
+                                                                  : Vec3{0.7f, 0.7f, 0.7f});
+                const uint8_t rd = (uint8_t)(col.x * 255.0f + 0.5f);
+                const uint8_t gr = (uint8_t)(col.y * 255.0f + 0.5f);
+                const uint8_t bl = (uint8_t)(col.z * 255.0f + 0.5f);
+                for (int dy = -rpx; dy <= rpx; ++dy)
+                    for (int dx = -rpx; dx <= rpx; ++dx)
+                        if (dx * dx + dy * dy <= rpx * rpx) putPx(cx + dx, cy + dy, bl, gr, rd);
+            }
+            bool ok = WriteBMP(fractStepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — %u fragments (%u dynamic) settled in %u pieces over %d "
+                                "ticks\n", fractStepShotPath, imgW, imgH, F, kDynamic, kPieces, kSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractStepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
