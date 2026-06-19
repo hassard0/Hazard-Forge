@@ -24002,6 +24002,206 @@ static int RunJointRagdollShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice JT5 — Deterministic Articulated-Body Ragdoll LOCKSTEP + ROLLBACK showcase (--joint-lockstep) ==
+// The NETCODE HEADLINE of FLAGSHIP #15 (the FPX5/FR5/GR5/CG5 twin). PURE CPU: the harness runs the IDENTICAL
+// CPU code (engine/sim/joint.h::RunRagdollLockstep/RunRagdollRollback) on Vulkan-Windows AND Metal-Mac, so
+// the converged ragdoll-state golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform
+// bit-identity IS the lockstep evidence). MAXIMAL REUSE: the ragdoll world IS an fpx::FxWorld (JT4's
+// RagdollFromSkeleton output), so JT5 reuses fpx's FPX5 command + snapshot machinery VERBATIM
+// (fpx::FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld) and changes ONLY the per-tick step to
+// joint::StepArticulatedContacts (threading the CONSTANT joints + angularLimits). Builds the SAME JT4
+// synthetic-humanoid ragdoll (free root -> full collapse) + impact stream as the Vulkan
+// --joint-lockstep-shot, runs authority=RunRagdollLockstep + replica=RunRagdollLockstep + rolledBack=
+// RunRagdollRollback, asserts the four proofs, CPU-colors the SAME converged-collapse side-view golden (the
+// JT4 joint_ragdoll render path reused VERBATIM) -> bit-identical cross-backend. New golden
+// tests/golden/metal/joint_lockstep.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU
+// compute, NO new shader, NO new RHI.
+static int RunJointLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+    namespace anim = hf::anim;
+
+    const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const joint::fx kDt = joint::kOne / 60;
+    const int kIters = 20;
+    const int kSolveIters = 8;
+    const joint::fx kGroundY = 0;
+
+    // Build the synthetic ~9-joint humanoid anim::Skeleton (IDENTICAL to the Vulkan --joint-lockstep-shot).
+    auto buildHumanoid = []() {
+        anim::Skeleton s;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        s.joints.push_back(J(-1, 0.0f,  5.0f, 0.0f));  // 0 pelvis (root)
+        s.joints.push_back(J(0,  0.0f,  1.0f, 0.0f));  // 1 spine
+        s.joints.push_back(J(1,  0.0f,  1.0f, 0.0f));  // 2 head
+        s.joints.push_back(J(1, -0.7f,  0.6f, 0.0f));  // 3 L upper arm
+        s.joints.push_back(J(3, -0.7f,  0.0f, 0.0f));  // 4 L fore arm
+        s.joints.push_back(J(1,  0.7f,  0.6f, 0.0f));  // 5 R upper arm
+        s.joints.push_back(J(5,  0.7f,  0.0f, 0.0f));  // 6 R fore arm
+        s.joints.push_back(J(0, -0.4f, -1.0f, 0.0f));  // 7 L leg
+        s.joints.push_back(J(0,  0.4f, -1.0f, 0.0f));  // 8 R leg
+        const size_t n = s.joints.size();
+        std::vector<math::Mat4> global(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(s.joints[j].t, s.joints[j].r, s.joints[j].s);
+            const int p = s.joints[j].parent;
+            global[j] = (p >= 0) ? (global[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) s.joints[j].inverseBind = global[j].Inverse();
+        return s;
+    };
+    const anim::Skeleton skel = buildHumanoid();
+    const int kBodyCount = (int)skel.joints.size();
+
+    joint::RagdollConfig cfg;
+    cfg.worldScale = joint::kOne;
+    cfg.boneRadius = joint::kOne * 30 / 100;
+    cfg.invMass    = joint::kOne;
+    cfg.coneCos    = -joint::kOne;
+    cfg.coneSin    = 0;
+    cfg.gravity    = joint::FxVec3{0, kGravY, 0};
+    cfg.groundY    = kGroundY;
+    cfg.rootStatic = false;                    // FREE root -> full collapse (impacts do visible work)
+
+    const joint::Ragdoll bind = joint::RagdollFromSkeleton(skel, cfg);
+    const joint::FxWorld init = bind.world;
+    const std::vector<joint::FxJoint> joints = bind.joints;          // CONSTANT topology
+    const std::vector<joint::FxAngularLimit> limits = bind.limits;   // CONSTANT topology
+    const uint32_t kJointCount = (uint32_t)joints.size();
+
+    uint32_t kPunchA = 2u;   // head
+    uint32_t kPunchB = 4u;   // L fore arm
+    if (kPunchA >= (uint32_t)kBodyCount) kPunchA = 0u;
+    if (kPunchB >= (uint32_t)kBodyCount) kPunchB = 0u;
+
+    const int kTicks = 90;
+    const int kMispredictTick = 20;
+
+    const std::vector<fpx::FxCommand> authStream = {
+        fpx::FxCommand{4,  fpx::kCmdImpulse,   kPunchA, fpx::FxVec3{(joint::fx)(3 * (int)joint::kOne), 0, 0}},
+        fpx::FxCommand{8,  fpx::kCmdSetAngVel, kPunchA, fpx::FxVec3{0, joint::kOne, 0}},
+        fpx::FxCommand{14, fpx::kCmdImpulse,   kPunchB, fpx::FxVec3{0, 0, (joint::fx)(2 * (int)joint::kOne)}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+
+    std::vector<fpx::FxCommand> mispredictStream = authStream;
+    mispredictStream.push_back(fpx::FxCommand{(uint32_t)kMispredictTick, fpx::kCmdImpulse, kPunchA,
+                                              fpx::FxVec3{(joint::fx)(40 * (int)joint::kOne), 0, 0}});
+
+    auto worldEqual = [&](const fpx::FxWorld& a, const fpx::FxWorld& b) {
+        return a.bodies.size() == b.bodies.size() &&
+               std::memcmp(a.bodies.data(), b.bodies.data(),
+                           a.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+               a.gravity.x == b.gravity.x && a.gravity.y == b.gravity.y &&
+               a.gravity.z == b.gravity.z && a.groundY == b.groundY;
+    };
+
+    const fpx::FxWorld authority =
+        joint::RunRagdollLockstep(init, joints, limits, authStream, kTicks, kDt, kIters, kSolveIters);
+    const fpx::FxWorld replica =
+        joint::RunRagdollLockstep(init, joints, limits, authStream, kTicks, kDt, kIters, kSolveIters);
+    const fpx::FxWorld rolledBack =
+        joint::RunRagdollRollback(init, joints, limits, authStream, mispredictStream, kTicks,
+                                  kMispredictTick, kDt, kIters, kSolveIters);
+
+    if (!worldEqual(authority, replica))
+        return fail("joint-lockstep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("joint-lockstep: {bones:%d, joints:%u, ticks:%d} authority==replica BIT-IDENTICAL\n",
+                kBodyCount, kJointCount, kTicks);
+
+    if (!worldEqual(rolledBack, authority))
+        return fail("joint-lockstep: rollback != authority (misprediction not corrected)");
+    std::printf("joint-lockstep rollback: corrected==authority BIT-EXACT\n");
+
+    const fpx::FxWorld mispredicted =
+        joint::RunRagdollLockstep(init, joints, limits, mispredictStream, kTicks, kDt, kIters, kSolveIters);
+    if (worldEqual(mispredicted, authority))
+        return fail("joint-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("joint-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+    const fpx::FxWorld authority2 =
+        joint::RunRagdollLockstep(init, joints, limits, authStream, kTicks, kDt, kIters, kSolveIters);
+    if (!worldEqual(authority2, authority))
+        return fail("joint-lockstep: two runs differ (nondeterministic)");
+    {
+        fpx::FxWorld w = joint::RunRagdollLockstep(init, joints, limits, authStream, kMispredictTick,
+                                                   kDt, kIters, kSolveIters);
+        const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+        joint::SimRagdollTick(w, joints, limits, authStream, (uint32_t)kMispredictTick, kDt, kIters,
+                              kSolveIters);
+        fpx::RestoreWorld(w, snap);
+        if (!worldEqual(w, snap)) return fail("joint-lockstep: snapshot round-trip != original");
+    }
+    std::printf("joint-lockstep determinism: two runs BYTE-IDENTICAL\n");
+    std::printf("joint-lockstep: {bones:%d, joints:%u, ticks:%d, commands:%u, mispredict-tick:%d}\n",
+                kBodyCount, kJointCount, kTicks, kCommandCount, kMispredictTick);
+
+    // --- Golden: the JT4 joint_ragdoll render path REUSED VERBATIM (IDENTICAL to the Vulkan
+    // --joint-lockstep-shot by construction): the converged collapsed ragdoll as discs over the ground,
+    // skeleton edges grey, the root white. ---
+    const fpx::FxWorld& finalWorld = rolledBack;
+    const int kPxPerUnit = 56, kMargin = 60;
+    const int kWorldW = 8, kWorldH = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 14; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, const Vec3& col) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        d[3] = 255;
+    };
+    auto worldToPx = [&](joint::fx wx, joint::fx wy, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)wx * kPxPerUnit) >> joint::kFrac;
+        const int64_t sy = ((int64_t)wy * kPxPerUnit) >> joint::kFrac;
+        ix = (int)imgW / 2 + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s)
+            putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+    };
+    { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+      for (int x = 0; x < (int)imgW; ++x) {
+          if (gy0 < 0 || gy0 >= (int)imgH) break;
+          uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+          d[0] = 80; d[1] = 80; d[2] = 80; d[3] = 255;
+      } }
+    for (uint32_t e = 0; e < kJointCount; ++e) {
+        const joint::FxVec3 pa = joint::WorldAnchor(finalWorld.bodies[joints[e].bodyA], joints[e].anchorA);
+        const joint::FxVec3 pb = joint::WorldAnchor(finalWorld.bodies[joints[e].bodyB], joints[e].anchorB);
+        int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.55f});
+    }
+    const int radPx = (int)(((int64_t)cfg.boneRadius * kPxPerUnit) >> joint::kFrac);
+    for (int i = 0; i < kBodyCount; ++i) {
+        int cx, cy; worldToPx(finalWorld.bodies[(size_t)i].pos.x, finalWorld.bodies[(size_t)i].pos.y, cx, cy);
+        const Vec3 col = (finalWorld.bodies[(size_t)i].flags & fpx::kFlagDynamic)
+                             ? vg::hashColor((uint32_t)(i + 1)) : Vec3{1.0f, 1.0f, 1.0f};
+        for (int yy = -radPx; yy <= radPx; ++yy)
+            for (int xx = -radPx; xx <= radPx; ++xx)
+                if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ragdoll lockstep+rollback converged collapse (%d bones, %u joints, "
+                "%d ticks)\n", outPath, imgW, imgH, kBodyCount, kJointCount, kTicks);
+    return 0;
+}
+
 // ===== Slice CL3 — Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER showcase (--cloth-solve) =====
 // (the MAKE-OR-BREAK of FLAGSHIP #8). Like CL1's --cloth-integrate (and UNLIKE the int32 CL2 --cloth-edges /
 // FPX2 broadphase), the PBD solve is int64 (fxdiv/FxISqrt in SolveDistanceConstraint — the SAME form as
@@ -40691,6 +40891,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--joint-ragdoll") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_joint_ragdoll.png";
             try { return RunJointRagdollShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --joint-lockstep <out.png>: render the Deterministic Articulated-Body Ragdoll LOCKSTEP + ROLLBACK
+        // showcase (Slice JT5, the NETCODE HEADLINE of FLAGSHIP #15, the FPX5/FR5/GR5/CG5 twin). PURE CPU:
+        // the IDENTICAL harness (joint.h::RunRagdollLockstep/RunRagdollRollback) that the Vulkan
+        // --joint-lockstep-shot runs on Windows -> the converged ragdoll-state golden is bit-identical
+        // cross-backend (MAXIMAL REUSE of fpx's FPX5 command + snapshot machinery; the per-tick step is
+        // joint::StepArticulatedContacts). New golden tests/golden/metal/joint_lockstep.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--joint-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_joint_lockstep.png";
+            try { return RunJointLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cloth-collide <out.png>: render the Deterministic GPU Cloth INTEGER COLLISION showcase (Slice
