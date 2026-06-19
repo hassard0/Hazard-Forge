@@ -853,6 +853,75 @@ int main() {
         }
     }
 
+    // ================= Slice JT6: the ragdoll palette drives the skinned render (the PILLAR-BRIDGE) =======
+    // JT6 renders the Fox SKINNED through the existing lit_skinned pipeline, fed the COLLAPSED ragdoll's
+    // joint palette (PoseToPalette) instead of an anim clip. The render is GPU/visual (proven by the golden
+    // + provenance); these pure-CPU cases pin the palette contract the showcase relies on: (a) the palette
+    // count == the joint count; (b) the COLLAPSED-pose palette DIFFERS from the bind-pose palette (the
+    // physics actually posed the mesh — the JT6 proof (3)); (c) the palette is deterministic (two collapses
+    // from the same bind -> identical palette). worldScale==boneRadius==1 so the bind palette is ~identity.
+    {
+        namespace anim = hf::anim;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        anim::Skeleton skel;
+        skel.joints.push_back(J(-1, 0.0f, 5.0f, 0.0f));  // 0 root (pinned)
+        skel.joints.push_back(J(0,  0.0f, 1.0f, 0.0f));  // 1 spine
+        skel.joints.push_back(J(1,  0.0f, 1.0f, 0.0f));  // 2 head
+        skel.joints.push_back(J(1, -0.6f, 0.4f, 0.0f));  // 3 L arm
+        skel.joints.push_back(J(1,  0.6f, 0.4f, 0.0f));  // 4 R arm
+        const size_t n = skel.joints.size();
+        std::vector<math::Mat4> g(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(skel.joints[j].t, skel.joints[j].r, skel.joints[j].s);
+            const int p = skel.joints[j].parent;
+            g[j] = (p >= 0) ? (g[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) skel.joints[j].inverseBind = g[j].Inverse();
+
+        joint::RagdollConfig cfg;
+        cfg.worldScale = joint::kOne;
+        cfg.boneRadius = joint::kOne;        // == worldScale: bind palette ~identity (the showcase recipe)
+        cfg.invMass    = joint::kOne;
+        cfg.coneCos    = (joint::fx)(0.9063f * (float)joint::kOne);   // cos(25 deg) tight cone
+        cfg.coneSin    = (joint::fx)(0.4226f * (float)joint::kOne);
+        cfg.gravity    = joint::FxVec3{0, (joint::fx)(-9.8 * (double)joint::kOne - 0.5), 0};
+        cfg.groundY    = 0;
+        cfg.rootStatic = true;
+
+        const joint::Ragdoll bind = joint::RagdollFromSkeleton(skel, cfg);
+        const std::vector<math::Mat4> bindPalette = joint::PoseToPalette(skel, bind.world);
+        // RagdollToPalette (the thin JT6 alias) == PoseToPalette over the bind world, byte-for-byte.
+        const std::vector<math::Mat4> aliasPalette = joint::RagdollToPalette(skel, bind);
+        check(aliasPalette.size() == bindPalette.size() &&
+              std::memcmp(aliasPalette.data(), bindPalette.data(), bindPalette.size() * sizeof(math::Mat4)) == 0,
+              "JT6 RagdollToPalette: == PoseToPalette(skeleton, ragdoll.world)");
+
+        // (a) the palette count == the joint count.
+        check(bindPalette.size() == n, "JT6 palette: count == joint count");
+
+        // Collapse a SHORT settle (the showcase recipe) -> the posed palette.
+        const joint::fx dt = joint::kOne / 60;
+        joint::FxWorld a = bind.world, b = bind.world;
+        joint::StepArticulatedContactsSteps(a, bind.joints, bind.limits, dt, 16, 6, 90);
+        joint::StepArticulatedContactsSteps(b, bind.joints, bind.limits, dt, 16, 6, 90);
+        const std::vector<math::Mat4> palA = joint::PoseToPalette(skel, a);
+        const std::vector<math::Mat4> palB = joint::PoseToPalette(skel, b);
+
+        // (c) the palette is deterministic (two collapses from the same bind -> identical palette).
+        check(palA.size() == palB.size() &&
+              std::memcmp(palA.data(), palB.data(), palA.size() * sizeof(math::Mat4)) == 0,
+              "JT6 palette: two collapses -> BYTE-IDENTICAL palette");
+
+        // (b) the COLLAPSED palette DIFFERS from the bind-pose palette (the physics posed the mesh).
+        bool posed = false;
+        for (size_t j = 0; j < n && !posed; ++j)
+            if (std::memcmp(palA[j].m, bindPalette[j].m, sizeof(float) * 16) != 0) posed = true;
+        check(posed, "JT6 palette: collapsed palette != bind palette (ragdoll posed the mesh)");
+    }
+
     if (g_fail == 0) std::printf("joint_test: ALL PASS\n");
     else std::printf("joint_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

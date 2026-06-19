@@ -639,6 +639,21 @@ inline std::vector<math::Mat4> PoseToPalette(const anim::Skeleton& skeleton, con
     return palette;
 }
 
+// ====================================================================================================
+// Slice JT6 — LIT 3D SKINNED RENDER CAPSTONE (the PILLAR-BRIDGE money-shot; COMPLETES FLAGSHIP #15). The
+// bit-exact ragdoll pose drives the EXISTING GPU skinned render: RagdollFromSkeleton -> collapse (JT3
+// StepArticulatedContacts) -> the pose reads back as a joint palette -> the SAME lit_skinned pipeline the
+// anim FSM uses renders the character POSED BY PHYSICS. NO new shader, NO new RHI; the ONLY float crossing
+// is the JT4 PoseToPalette read-back. JT6 is purely additive — JT1-JT5 stay byte-frozen.
+//
+// RagdollToPalette: a thin convenience that names the JT6 bridge — the settled ragdoll's joint palette,
+// flattened for the skinning pipeline IS exactly PoseToPalette(skeleton, ragdoll.world) (the std::vector
+// <math::Mat4> the showcase copies into the fixed-size JointPalette UBO in skeleton order). It exists only
+// to spell out the bridge at the call site; the showcase may call PoseToPalette directly with no change.
+inline std::vector<math::Mat4> RagdollToPalette(const anim::Skeleton& skeleton, const Ragdoll& ragdoll) {
+    return PoseToPalette(skeleton, ragdoll.world);
+}
+
 // ----- RagdollState + MeasureRagdoll: the honest ragdoll-collapse metrics (deterministic) --------------
 // maxAnchorGap : the max world-anchor gap over the ragdoll's joints (bones stayed CONNECTED — small).
 // meanBodyY    : the mean pos.y over ALL bodies (the collapsed/settle line; drops from the bind pose).

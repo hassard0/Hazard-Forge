@@ -494,6 +494,7 @@ int main(int argc, char** argv) {
     const char* jointStepShotPath = nullptr; // --joint-step-shot <out.bmp> (Slice JT3: Deterministic Articulated-Body Ragdoll ARTICULATED MULTI-BODY STEP — the joints-meet-contacts tick that makes a coherent MECHANISM. An 8-link chain (a pinned invMass-0 root + 8 dynamic sphere-radius links, ball-jointed end-to-end) draped diagonally onto the ground falls + self-collides + rests as a draped pile. Each tick = StepArticulatedContacts: IntegrateBodyFull all -> K Gauss-Seidel {all SolveBallJoint | all SolveAngularLimit} -> BuildPairs ONCE (FPX2 broadphase) -> fpx::StepWorld(dt=0, solveIters) {ground + FPX3 sphere contacts}. NO new shader: the GPU driver drives the EXISTING joint_angular_solve.comp (steps=1,iters=K, groundY sentinel far below so its floor-clamp is dead) for the integrate+joint passes, host-rebuilds the FPX2 pairs from the post-joint positions, then drives the EXISTING fpx_solve.comp (dt=0, real groundY) for the ground+contacts -> the SAME ops as the CPU StepArticulatedContacts -> GPU body world memcmp'd BIT-EXACT. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) settled+joints-held (maxAnchorGap within band, rested at/above ground); (4) contacts did work (residual overlaps below bound + a no-contact control buries the links). int64 -> the joint/fpx shaders are Vulkan-only; Metal --joint-step runs the CPU StepArticulatedContacts. CAVEAT: FPX3 SolveContacts is sphere-sphere + no inertia tensor (links collide as spheres, contacts don't spin bodies — the fract FR4/fpx caveat). NO new shader/RHI; JT1/JT2 + their shaders + goldens + fpx.h/grain.h/fluid.h/cloth.h/couple*.h/fract.h + engine/physics UNCHANGED (JT3 additive))
     const char* jointRagdollShotPath = nullptr; // --joint-ragdoll-shot <out.bmp> (Slice JT4: Deterministic Articulated-Body Ragdoll SKELETON->RAGDOLL BIND, the PILLAR-BRIDGE of FLAGSHIP #15 — maps a synthetic ~9-joint humanoid anim::Skeleton onto the JT1-JT3 joint system: each bone -> an fpx::FxBody, each parent-child edge -> a FxJoint (ball) + FxAngularLimit (cone) via joint::RagdollFromSkeleton (the host float->Q16.16 bind), so the float anim skeleton becomes a bit-exact RAGDOLL that collapses under gravity into a slumped pose; the pose reads back as a joint palette via joint::PoseToPalette (Q16.16->float). NO new shader: the bind + the palette read-back are HOST conversions; the COLLAPSE is the bit-exact JT3 StepArticulatedContactsSteps. Vulkan: the GPU multi-pass collapse (the JT3 driver) -> memcmp vs the CPU StepArticulatedContactsSteps; Metal: the CPU reference. The golden renders the collapsed INTEGER body positions (2D side view: bodies as discs, skeleton edges as segments). PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) collapse (maxAnchorGap within band, slumped, rested); (4) palette provenance (PoseToPalette rebuild == the showcase palette). int64 -> the joint/fpx shaders are Vulkan-only; Metal --joint-ragdoll runs the CPU path. CAVEAT: bones are capsule-as-SPHERE proxies; the bind/read-back float crossings are deterministic but outside the bit-exact loop. NO new shader/RHI; JT1/JT2/JT3 + anim + their goldens UNCHANGED (JT4 additive — only the bind + read-back + showcase))
     const char* jointLockstepShotPath = nullptr; // --joint-lockstep-shot <out.bmp> (Slice JT5: Deterministic Articulated-Body Ragdoll LOCKSTEP + ROLLBACK — the NETCODE HEADLINE of FLAGSHIP #15, the FPX5/FR5/GR5/CG5 twin. PURE-CPU harness over the JT3 articulated step (StepArticulatedContacts): the JT4 synthetic-humanoid ragdoll (RagdollFromSkeleton, free root so it collapses fully) is the init + a scripted impact stream that punches a couple of bones at a few ticks; authority==replica BIT-IDENTICAL inputs-only + RunRagdollRollback corrects a misprediction to authority BIT-EXACT (mispredict diverged before rollback) + two-run determinism. Reuses fpx's FPX5 machinery VERBATIM (fpx::FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld) — the per-tick step is joint::StepArticulatedContacts (threading the CONSTANT joints + angularLimits) instead of fpx's StepWorld; the three thin harness functions (SimRagdollTick/RunRagdollLockstep/RunRagdollRollback) are the fpx::SimTick/RunLockstep/RunRollback twins. The final collapsed ragdoll is rendered via the JT4 joint_ragdoll render path REUSED VERBATIM (bodies as discs at their bit-exact pos>>kFrac + skeleton edges as segments), bit-identical Vulkan-Windows == Metal-Mac by construction. NO GPU dispatch, NO new shader, NO new RHI; JT1-JT4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple*.h/fract.h + engine/physics/ UNTOUCHED (JT5 is additive — only the harness + the showcase))
+    const char* jointRenderShotPath = nullptr; // --joint-render-shot <out.bmp> (Slice JT6: Deterministic Articulated-Body Ragdoll LIT 3D SKINNED RENDER CAPSTONE — the PILLAR-BRIDGE money-shot COMPLETING FLAGSHIP #15 (the FIFTEENTH flagship). The bit-exact ragdoll pose drives the EXISTING GPU skinned render: load the Fox skeleton -> joint::RagdollFromSkeleton (the JT4 float->Q16.16 bind, pinned root so the fox SAGS into a coherent slumped pose) -> joint::StepArticulatedContactsSteps K SHORT steps (the bit-exact JT3 collapse) -> joint::PoseToPalette (the ONE float crossing, the JT4 Q16.16->float read-back) -> dev.SetJointPalette -> render the Fox SKINNED + lit + shadowed through the EXISTING lit_skinned/shadow_skinned pipelines (the --skinning-shot/--anim-fsm-shot path REUSED VERBATIM — camera/light/shadow/sky/post unchanged); the ONLY swap is the palette SOURCE (ragdoll pose vs anim clip), so the Fox is POSED BY PHYSICS. FLOAT visresolve-bar (the FPX6/FR6 precedent): the golden is Metal-baked, the gate is Metal-determinism (two renders BYTE-IDENTICAL) + provenance (the palette IS a pure function of the bit-exact ragdoll state) + a coherent posed-character image; cross-vendor ~the float skinned-render baseline. PROOFS: palette provenance/count, two-run BYTE-IDENTICAL, ragdoll palette != bind palette (physics posed the mesh). STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader (hf_gen_msl UNCHANGED), NO new RHI; JT1-JT5 joint.h code + shaders + engine/anim/ + their goldens UNCHANGED (JT6 additive — only a thin RagdollToPalette alias + the showcase))
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -2420,6 +2421,16 @@ int main(int argc, char** argv) {
     // — NOT the big else-if ladder, the C1061 nested-block limit). NO new shader, NO new RHI.
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fract-render-shot") == 0) { fractRenderShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice JT6: --joint-render-shot <out.bmp> (Deterministic Articulated-Body Ragdoll LIT 3D SKINNED RENDER
+    // CAPSTONE — the PILLAR-BRIDGE money-shot COMPLETING FLAGSHIP #15). The bit-exact ragdoll pose drives the
+    // EXISTING Fox skinned render: RagdollFromSkeleton -> StepArticulatedContactsSteps K short steps ->
+    // PoseToPalette -> SetJointPalette -> the SAME lit_skinned draw. FLOAT visresolve-bar. Its OWN loop (the
+    // FR1-FR6/JT5 standalone-loop pattern — NOT the big else-if ladder, the C1061 nested-block limit). NO new
+    // shader (reuses lit_skinned/shadow_skinned), NO new RHI.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--joint-render-shot") == 0) { jointRenderShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -16754,6 +16765,359 @@ int main(int argc, char** argv) {
                                 "(%u bodies, %u anchor, %u chunks)\n",
                                 fractRenderShotPath, cw, ch2, kBodies, kAnchor, kDynamic);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // === Slice JT6 — Deterministic Articulated-Body Ragdoll LIT 3D SKINNED RENDER CAPSTONE
+        // (--joint-render-shot <out.bmp>) — the PILLAR-BRIDGE money-shot COMPLETING FLAGSHIP #15. The
+        // bit-exact ragdoll pose drives the EXISTING Fox skinned render. THE APPROACH (swap the palette
+        // SOURCE of the --skinning-shot path): load the Fox skeleton -> joint::RagdollFromSkeleton (the JT4
+        // float->Q16.16 bind; PINNED root + worldScale==boneRadius==1 so the bind palette is ~identity and
+        // the fox renders correctly at bind, then SAGS into a coherent slumped pose under a SHORT collapse)
+        // -> joint::StepArticulatedContactsSteps K steps (the bit-exact JT3 collapse) -> joint::PoseToPalette
+        // (the ONE float crossing, the JT4 Q16.16->float read-back) -> dev.SetJointPalette -> the SAME
+        // lit_skinned/shadow_skinned draw the anim FSM uses. Everything else (camera/light/shadow/sky/post)
+        // is the --skinning-shot setup REUSED VERBATIM. FLOAT visresolve-bar. NO new shader, NO new RHI. ===
+        if (jointRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace joint = hf::sim::joint;
+            namespace fpx   = hf::sim::fpx;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- The EXISTING skinned + shadow + sky + post pipelines (the --skinning-shot wiring VERBATIM). ---
+            auto skVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_skinned.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto skVs  = device->CreateShaderModule({std::span<const uint32_t>(skVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc skDesc;
+            skDesc.vertex = skVs.get(); skDesc.fragment = litFs.get();
+            skDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skDesc.colorFormat = device->Swapchain().ColorFormat();
+            skDesc.depthTest = true; skDesc.usesFrameUniforms = true;
+            skDesc.usesTexture = true; skDesc.usesJointPalette = true;
+            skDesc.pushConstantSize = sizeof(float) * 20;
+            auto skinnedPipeline = device->CreateGraphicsPipeline(skDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto skShadowWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_skinned.vert.hlsl.spv");
+            auto shadowFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto skShadowVs = device->CreateShaderModule({std::span<const uint32_t>(skShadowWords)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsWords)});
+            rhi::GraphicsPipelineDesc skShDesc;
+            skShDesc.vertex = skShadowVs.get(); skShDesc.fragment = shadowFs.get();
+            skShDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skShDesc.depthTest = true; skShDesc.depthOnly = true;
+            skShDesc.usesFrameUniforms = true; skShDesc.usesJointPalette = true;
+            skShDesc.pushConstantSize = sizeof(float) * 16;
+            auto skinnedShadowPipeline = device->CreateGraphicsPipeline(skShDesc);
+
+            auto staticShadowWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShadowVs = device->CreateShaderModule({std::span<const uint32_t>(staticShadowWords)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true; stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+
+            // === Load the Fox + RAGDOLL-IZE its skeleton (the SAME scene the Metal --joint-render builds, so
+            // the palette is byte-identical cross-backend by construction). The collapse is the bit-exact JT3
+            // integer sim; the bind + the read-back are deterministic host float crossings (the JT4 shape). ===
+            hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
+            const anim::Skeleton& skel = fox.skeleton;
+            const uint32_t kBones = (uint32_t)skel.joints.size();
+
+            // The Fox skeleton's bind-pose model-space Y extent (to ground the collapse just under the feet so
+            // the fox SAGS rather than free-falls). Forward-accumulate the bind globals (the JT4 single pass).
+            float minY = 1e30f, maxY = -1e30f;
+            {
+                std::vector<Mat4> g(kBones);
+                for (uint32_t j = 0; j < kBones; ++j) {
+                    const Mat4 local = math::FromTRS(skel.joints[j].t, skel.joints[j].r, skel.joints[j].s);
+                    const int p = skel.joints[j].parent;
+                    g[j] = (p >= 0) ? (g[(size_t)p] * local) : local;
+                    const float y = g[j].m[13];
+                    if (y < minY) minY = y; if (y > maxY) maxY = y;
+                }
+            }
+
+            // The collapse recipe (worldScale == boneRadius == 1 so FxBodyTransform(body)·inverseBind is
+            // ~identity at the bind pose -> the fox renders correctly at bind; a TIGHT cone keeps joints from
+            // hyperextending; a PINNED root + a SHORT settle make the fox SAG into a coherent slumped pose
+            // rather than shatter/faceplant — the GF6/FR6 coherence discipline). gravity host-snapped -9.8.
+            const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const joint::fx kDt = joint::kOne / 60;
+            const int kSteps = 90;          // SHORT settle -> a coherent sag (NOT a full free-root collapse)
+            const int kIters = 16;
+            const int kSolveIters = 6;
+            // cone half-angle ~50 deg (cos/sin of 25 deg) -> joints flex but do NOT hyperextend (legible fox).
+            const joint::fx kConeCos = (joint::fx)(0.9063f * (float)joint::kOne);   // cos(25 deg)
+            const joint::fx kConeSin = (joint::fx)(0.4226f * (float)joint::kOne);   // sin(25 deg)
+
+            joint::RagdollConfig cfg;
+            cfg.worldScale = joint::kOne;
+            cfg.boneRadius = joint::kOne;                 // == worldScale: bind palette ~identity (legible fox)
+            cfg.invMass    = joint::kOne;
+            cfg.coneCos    = kConeCos;
+            cfg.coneSin    = kConeSin;
+            cfg.gravity    = joint::FxVec3{0, kGravY, 0};
+            // Ground just below the feet (the lowest bind joint) so the fox sags onto it, not into a void.
+            cfg.groundY    = (joint::fx)((minY - 0.5f) * (float)joint::kOne);
+            cfg.rootStatic = true;                        // pin the root -> the fox DRAPES from its anchor
+
+            const joint::Ragdoll bind = joint::RagdollFromSkeleton(skel, cfg);
+
+            // The bind-pose palette (the reference the JT6 proof (3) shows the collapse DIFFERS from).
+            const std::vector<Mat4> bindPalette = joint::PoseToPalette(skel, bind.world);
+
+            // The bit-exact collapse (K short steps) -> the settled ragdoll pose.
+            joint::FxWorld posedWorld = bind.world;
+            joint::StepArticulatedContactsSteps(posedWorld, bind.joints, bind.limits,
+                                                kDt, kIters, kSolveIters, kSteps);
+
+            // The ragdoll palette (the JT4 read-back — the ONE float crossing; the SAME layout the skinning
+            // pipeline expects). joint::RagdollToPalette is the thin JT6 alias for PoseToPalette over the world.
+            const std::vector<Mat4> palette = joint::PoseToPalette(skel, posedWorld);
+            const uint32_t kPaletteCount = (uint32_t)palette.size();
+
+            // Pad to 64 identity matrices for the fixed-size JointPalette UBO (the --skinning-shot layout).
+            std::vector<float> paletteData(64 * 16);
+            for (int j = 0; j < 64; ++j) {
+                Mat4 mm = (j < (int)palette.size()) ? palette[j] : Mat4::Identity();
+                for (int k = 0; k < 16; ++k) paletteData[j * 16 + k] = mm.m[k];
+            }
+
+            // Place the fox: the SAME ground-aligned uniform-scale recipe as --skinning-shot (the ragdoll only
+            // changed the palette; the model placement is unchanged so the framing matches the anim showcase).
+            float foxH = fox.bbMax[1] - fox.bbMin[1];
+            float scaleS = (foxH > 1e-4f) ? (2.5f / foxH) : 0.05f;
+            float cx = 0.5f * (fox.bbMin[0] + fox.bbMax[0]);
+            float cz = 0.5f * (fox.bbMin[2] + fox.bbMax[2]);
+            Mat4 foxModel = Mat4::Translate({-cx * scaleS, -fox.bbMin[1] * scaleS, -cz * scaleS})
+                          * Mat4::Scale({scaleS, scaleS, scaleS});
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+            // Camera + light + sky (the --skinning-shot frame data VERBATIM).
+            const Vec3 eye{3.5f, 2.6f, 4.5f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 0.98f; fd.lightColor[1] = 0.95f; fd.lightColor[2] = 0.88f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 25.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.BindPipeline(*skinnedShadowPipeline);
+                    cmd.PushConstants(foxModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(fox.mesh.vertices());
+                    cmd.BindIndexBuffer(fox.mesh.indices());
+                    cmd.DrawIndexed(fox.mesh.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    cmd.BindPipeline(*skinnedPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = foxModel.m[k];
+                        pc[16] = fox.metallic; pc[17] = fox.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*fox.baseColor, *flatNormal);
+                        cmd.BindVertexBuffer(fox.mesh.vertices());
+                        cmd.BindIndexBuffer(fox.mesh.indices());
+                        cmd.DrawIndexed(fox.mesh.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!device->GetCapturedPixels(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOFS (fail loudly; the exact lines from the spec §Proofs) ===
+            // (1) palette provenance: the palette fed to the skinning pipeline == PoseToPalette rebuilt from
+            //     the settled ragdoll world (the float palette is a pure function of the bit-exact body
+            //     state), count == the Fox joint count.
+            {
+                const std::vector<Mat4> rebuild = joint::PoseToPalette(skel, posedWorld);
+                bool identical = (rebuild.size() == palette.size() && palette.size() == (size_t)kBones);
+                for (size_t k = 0; k < palette.size() && identical; ++k)
+                    if (std::memcmp(palette[k].m, rebuild[k].m, sizeof(float) * 16) != 0) identical = false;
+                if (!identical) {
+                    std::fprintf(stderr, "FATAL: joint-render palette != rebuild (palette not a pure "
+                                         "function of the bit-exact ragdoll state)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("joint-render: {bones:%u, joints:%u, palette:%u} from bit-exact ragdoll pose\n",
+                        kBones, (uint32_t)bind.joints.size(), kPaletteCount);
+
+            // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+            if (!device->GetCapturedPixels(px2, cw2, ch3)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (2nd render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (px.size() != px2.size() || std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                std::fprintf(stderr, "FATAL: joint-render two runs DIFFER (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("joint-render determinism: two runs BYTE-IDENTICAL\n");
+
+            // (3) the pose IS the ragdoll (not the bind/anim): the rendered palette DIFFERS from the bind-pose
+            //     palette (the ragdoll actually posed the fox — it collapsed).
+            {
+                bool differs = (bindPalette.size() == palette.size());
+                bool anyDiff = false;
+                for (size_t k = 0; k < palette.size() && differs; ++k)
+                    if (std::memcmp(palette[k].m, bindPalette[k].m, sizeof(float) * 16) != 0) anyDiff = true;
+                if (!differs || !anyDiff) {
+                    std::fprintf(stderr, "FATAL: joint-render ragdoll palette == bind palette (the collapse "
+                                         "did not pose the mesh)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("joint-render posed: ragdoll palette != bind palette (physics posed the mesh)\n");
+
+            // coverage / coherence: shaded > 0 and not uniform (a recognizable lit posed character).
+            {
+                uint32_t shaded = 0;
+                for (size_t p = 0; p + 3 < px.size(); p += 4) {
+                    const int b = px[p + 0], g = px[p + 1], r = px[p + 2];
+                    if (b + g + r > 60) ++shaded;
+                }
+                if (shaded == 0) {
+                    std::fprintf(stderr, "FATAL: joint-render coverage 0 (nothing shaded)\n");
+                    device->WaitIdle(); return 1;
+                }
+                if (shaded == (uint32_t)(px.size() / 4)) {
+                    std::fprintf(stderr, "FATAL: joint-render uniform image (no coherent scene)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            bool ok = WriteBMP(jointRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — deterministic ragdoll-posed Fox lit 3D skinned render "
+                                "(%u bones, %u palette)\n",
+                                jointRenderShotPath, cw, ch2, kBones, kPaletteCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", jointRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
