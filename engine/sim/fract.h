@@ -872,4 +872,48 @@ inline fpx::FxWorld RunFractRollback(const fpx::FxWorld& init, const std::vector
     return w;
 }
 
+// ====================================================================================================
+// Slice FR6 — LIT 3D RENDER CAPSTONE (the money-shot — COMPLETES FLAGSHIP #14). Additive over FR1-FR5 (ALL
+// code above is byte-unchanged). FR4 made the rubble FALL + settle into the bit-exact fpx::FxWorld; FR6
+// renders that settled rubble as a LIT 3D scene — the shattered object's chunks scattered as lit stone
+// spheres around the held anchor — through the EXISTING instanced-lit pipeline. The FR1-FR5 sim stays
+// strict-integer/bit-exact; here — and ONLY here — we cross to FLOAT to build the per-body render
+// transforms (the documented FLOAT visresolve-bar, the FPX6/CG6/GF6 precedent). NO new shader, NO new RHI.
+//
+// THE APPROACH (the FPX6/CG6/GF6 capstone twin): FractToRenderInstances(world, …) returns one math::Mat4
+// per body built DIRECTLY from the settled FxWorld via fpx::FxBodyTransform (REUSED VERBATIM, fpx.h:627 —
+// translate(pos/kOne) * rotate(orient) * scale(radius), the ONE float crossing of the whole flagship), in
+// body index order (the FR4 spawn order). A parallel isDynamic[] flag is filled (from the body's
+// kFlagDynamic flag) so the showcase can split the draw — the STATIC anchor (held stone) vs the DYNAMIC
+// dislodged chunks (warmer rubble) — into two colored draws through the SAME existing instanced-lit
+// pipeline (the per-draw albedo-TEXTURE material trick; NO per-instance color, NO new shader). Empty world
+// -> empty output. Pure deterministic host float (no RNG, no clock), render-only, NO sim mutation. The
+// provenance: every transform derives from FxBody::pos + FxBody::orient (+ radius), the settled output of
+// the bit-exact StepFracture. The DIRECT TWIN of fpx::FxBodyTransform-based render (FPX6) over the
+// fracture world, and of couple_grain.h::CGrainToRenderInstances over the body set.
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only. FR6 only ADDS the render bridge; the
+// bit-exact FR1-FR5 sim is untouched. It calls fpx::FxBodyTransform (already #included read-only) — it does
+// NOT re-implement it. NO new shader, NO new RHI.
+
+// FractToRenderInstances(world, isDynamicOut): one math::Mat4 per body via fpx::FxBodyTransform (REUSED
+// VERBATIM — the body's bit-exact integer pos/orient/radius -> a float model matrix), in body index order.
+// When `isDynamicOut` is non-null it is filled parallel to the output: isDynamicOut[i] = 1 iff body i carries
+// kFlagDynamic (a dislodged chunk), 0 for the static anchor — so the caller can split the anchor vs the
+// chunks into two colored draws. Empty world -> empty output (the empty no-op: zero instances -> the cleared
+// base scene). Pure deterministic host float, render-only, NO sim mutation. The ONLY float crossing of the
+// whole flagship (the FPX6/CG6/GF6 bridge).
+inline std::vector<math::Mat4> FractToRenderInstances(const fpx::FxWorld& world,
+                                                      std::vector<uint8_t>* isDynamicOut = nullptr) {
+    std::vector<math::Mat4> out;
+    out.reserve(world.bodies.size());
+    if (isDynamicOut) { isDynamicOut->clear(); isDynamicOut->reserve(world.bodies.size()); }
+    for (const fpx::FxBody& b : world.bodies) {
+        out.push_back(fpx::FxBodyTransform(b));   // the ONE float crossing — the FPX6 bridge VERBATIM
+        if (isDynamicOut)
+            isDynamicOut->push_back((b.flags & fpx::kFlagDynamic) ? (uint8_t)1u : (uint8_t)0u);
+    }
+    return out;
+}
+
 }  // namespace hf::sim::fract

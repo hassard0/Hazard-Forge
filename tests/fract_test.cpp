@@ -818,6 +818,84 @@ int main() {
         }
     }
 
+    // ================= FR6: the FLOAT render bridge over the settled fracture rubble =====================
+    // FractToRenderInstances builds one math::Mat4 per body via fpx::FxBodyTransform (the ONE float crossing,
+    // REUSED VERBATIM), in body order, with a parallel isDynamic[] split. Pure CPU (no device). Pins: the
+    // instance count == bodies.size(); a known body's matrix == fpx::FxBodyTransform(b) (translation ==
+    // pos/kOne); empty world -> empty; the anchor/dynamic split count matches the world's static/dynamic bodies.
+    {
+        // Build a small broken-and-spawned fracture world (the FR4/FR5 scene shape, deterministic).
+        const int M = 8;
+        fract::FractField f; f.nx = 8; f.ny = 8; f.nz = 4;
+        std::vector<fract::FractSeed> seeds = {
+            {1, 1, 1}, {6, 1, 1}, {1, 6, 1}, {6, 6, 1},
+            {3, 3, 2}, {4, 4, 1}, {2, 5, 2}, {5, 2, 2},
+        };
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        fract::BreakImpact imp{0u, (fract::fx)(1000 * (int)fpx::kOne)};   // a HARD break
+        std::vector<uint8_t> sev;
+        fract::ApplyImpactBreak(bonds, frags, imp, 4, sev);
+        std::vector<uint32_t> clusters;
+        fract::CountFractPieces(frags, bonds, sev, &clusters);
+        const fract::fx gravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne / 4;
+        cfg.gravity = fract::FxVec3{0, gravY, 0};
+        cfg.groundY = 0;
+        cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+        cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+        fpx::FxWorld world = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+        fract::StepFractureSteps(world, fpx::kOne / 60, 8, 60);   // settle the rubble
+
+        // (1) instance count == bodies.size(); the split flags are parallel.
+        std::vector<uint8_t> isDyn;
+        const std::vector<math::Mat4> mats = fract::FractToRenderInstances(world, &isDyn);
+        check(mats.size() == world.bodies.size(), "FR6 render: instance count == bodies.size()");
+        check(isDyn.size() == world.bodies.size(), "FR6 render: isDynamic[] parallel to bodies");
+
+        // (2) a known body's matrix == fpx::FxBodyTransform(b); translation == pos/kOne (the provenance).
+        bool allMatch = true, transOk = true;
+        for (size_t i = 0; i < world.bodies.size(); ++i) {
+            const math::Mat4 ref = fpx::FxBodyTransform(world.bodies[i]);
+            if (std::memcmp(mats[i].m, ref.m, sizeof(float) * 16) != 0) allMatch = false;
+            const float ex = (float)world.bodies[i].pos.x / (float)fpx::kOne;
+            const float ey = (float)world.bodies[i].pos.y / (float)fpx::kOne;
+            const float ez = (float)world.bodies[i].pos.z / (float)fpx::kOne;
+            // Column-major mat4: translation in m[12],m[13],m[14].
+            if (mats[i].m[12] != ex || mats[i].m[13] != ey || mats[i].m[14] != ez) transOk = false;
+        }
+        check(allMatch, "FR6 render: every instance == fpx::FxBodyTransform(b) (the FPX6 bridge VERBATIM)");
+        check(transOk, "FR6 render: instance translation == pos/kOne (provenance from the bit-exact state)");
+
+        // (3) the anchor/dynamic split count matches the world's static/dynamic bodies.
+        uint32_t dynBodies = 0, dynFlags = 0, anchorBodies = 0, anchorFlags = 0;
+        for (size_t i = 0; i < world.bodies.size(); ++i) {
+            if (world.bodies[i].flags & fpx::kFlagDynamic) ++dynBodies; else ++anchorBodies;
+            if (isDyn[i]) ++dynFlags; else ++anchorFlags;
+        }
+        check(dynFlags == dynBodies, "FR6 render: dynamic split count == #kFlagDynamic bodies");
+        check(anchorFlags == anchorBodies, "FR6 render: anchor split count == #static bodies");
+        check(dynBodies > 0u && anchorBodies > 0u,
+              "FR6 render: the broken scene has both an anchor AND dislodged chunks");
+
+        // (4) provenance: a rebuild from the SAME settled world -> byte-identical matrices (pure function).
+        const std::vector<math::Mat4> rebuild = fract::FractToRenderInstances(world, nullptr);
+        bool identical = (rebuild.size() == mats.size());
+        for (size_t i = 0; i < mats.size() && identical; ++i)
+            if (std::memcmp(mats[i].m, rebuild[i].m, sizeof(float) * 16) != 0) identical = false;
+        check(identical, "FR6 render: instances == rebuild (the float transform is a pure function)");
+
+        // (5) empty world -> empty output (the no-op).
+        {
+            fpx::FxWorld empty;
+            std::vector<uint8_t> emptyFlags;
+            const std::vector<math::Mat4> emptyMats = fract::FractToRenderInstances(empty, &emptyFlags);
+            check(emptyMats.empty() && emptyFlags.empty(), "FR6 render: empty world -> empty output");
+        }
+    }
+
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
     else std::printf("fract_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;
