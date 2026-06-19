@@ -23616,6 +23616,204 @@ static int RunJointHingeShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice JT3 — Deterministic Articulated-Body Ragdoll ARTICULATED MULTI-BODY STEP showcase (--joint-step)
+// The joints-meet-contacts tick. StepArticulatedContacts (integrate + K {ball | angular} + BuildPairs once +
+// fpx::StepWorld(dt=0) contacts) is int64 (the joint + fpx fxmul/fxdiv/FxISqrt), so the GPU driver composes
+// the VULKAN-ONLY joint_angular_solve.comp + fpx_solve.comp; on Metal (glslc can't parse int64) the
+// --joint-step showcase runs the CPU joint::StepArticulatedContacts — the EXACT bit-exact reference the
+// Vulkan --joint-step-shot GPU==CPU memcmp compares against -> the Metal result is byte-identical to the
+// Vulkan GPU result BY CONSTRUCTION (the joint_ball_solve / cloth_solve convention). This builds the SAME
+// 8-link draped-chain scene as the Vulkan --joint-step-shot, runs joint::StepArticulatedContactsSteps K=300
+// steps over it, and CPU-colors the SAME integer side-view -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side. New golden
+// tests/golden/metal/joint_step.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU
+// compute (int64 -> CPU on Metal), NO new shader, NO new RHI. CAVEAT: FPX3 SolveContacts is sphere-sphere +
+// no inertia tensor (links collide as spheres, contacts don't spin bodies — the fract FR4 / fpx caveat).
+static int RunJointStepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic draped-chain scene (== the Vulkan --joint-step-shot config + the joint_test JT3 case).
+    const joint::fx kGravY = (joint::fx)(-9.8 * (double)joint::kOne + (-9.8 < 0 ? -0.5 : 0.5)); // round
+    const joint::fx kDt = joint::kOne / 60;
+    const int kLinks = 8;
+    const int kBodyCount = kLinks + 1;            // + the pinned root = 9 bodies
+    const int kSteps = 300;
+    const int kIters = 24;
+    const int kSolveIters = 8;
+    const joint::fx kGroundY = 0;
+    const joint::fx kRad = joint::kOne * 2 / 5;   // 0.40 sphere radius
+    const joint::fx kAnchor = joint::kOne * 35 / 100;  // 0.35 anchor offset along the diagonal link
+    const joint::fx kStep = joint::kOne * 7 / 10;      // 0.70 per-link diagonal layout step (+x, -y)
+
+    auto buildWorld = [&]() {
+        joint::FxWorld world;
+        world.gravity = joint::FxVec3{0, kGravY, 0};
+        world.groundY = kGroundY;
+        fpx::FxBody root;
+        root.pos = joint::FxVec3{0, (joint::fx)(6 * (int)joint::kOne), 0};
+        root.vel = joint::FxVec3{0, 0, 0};
+        root.invMass = 0;
+        root.flags = 0u;
+        root.radius = kRad;
+        root.orient = fpx::FxQuat{0, 0, 0, joint::kOne};
+        root.angVel = joint::FxVec3{0, 0, 0};
+        world.bodies.push_back(root);
+        joint::fx px = 0, py = (joint::fx)(6 * (int)joint::kOne);
+        for (int i = 1; i <= kLinks; ++i) {
+            px += kStep; py -= kStep;
+            fpx::FxBody b;
+            b.pos = joint::FxVec3{px, py, 0};
+            b.vel = joint::FxVec3{0, 0, 0};
+            b.invMass = joint::kOne;
+            b.flags = fpx::kFlagDynamic;
+            b.radius = kRad;
+            b.orient = fpx::FxQuat{0, 0, 0, joint::kOne};
+            b.angVel = joint::FxVec3{0, 0, 0};
+            world.bodies.push_back(b);
+        }
+        return world;
+    };
+    const joint::FxWorld world = buildWorld();
+
+    std::vector<joint::FxJoint> joints;
+    for (uint32_t k = 0; k + 1 < (uint32_t)kBodyCount; ++k) {
+        joint::FxJoint j;
+        j.bodyA = k; j.bodyB = k + 1;
+        j.anchorA = joint::FxVec3{kAnchor, -kAnchor, 0};
+        j.anchorB = joint::FxVec3{-kAnchor, kAnchor, 0};
+        j.kind = joint::kJointBall;
+        joints.push_back(j);
+    }
+    const uint32_t kJointCount = (uint32_t)joints.size();
+    std::vector<joint::FxAngularLimit> limits;   // no angular limits in the draped-chain scene
+    const uint32_t kLimitCount = (uint32_t)limits.size();
+
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+
+    // CPU solve (K steps) — the Metal showcase body array, byte-identical to the Vulkan GPU result.
+    joint::FxWorld cpuWorld = world;
+    joint::StepArticulatedContactsSteps(cpuWorld, joints, limits, kDt, kIters, kSolveIters, kSteps);
+    const std::vector<FxBodyGpu> gpuBodies = packBodies(cpuWorld.bodies);
+
+    std::printf("joint-step: {bodies:%d, joints:%u, limits:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU joint::StepArticulatedContacts, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kJointCount, kLimitCount, kSteps);
+
+    // two-run determinism.
+    joint::FxWorld cpuWorld2 = world;
+    joint::StepArticulatedContactsSteps(cpuWorld2, joints, limits, kDt, kIters, kSolveIters, kSteps);
+    const std::vector<FxBodyGpu> gpuBodies2 = packBodies(cpuWorld2.bodies);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("joint-step: two solves differ (nondeterministic)");
+    std::printf("joint-step determinism: two runs BYTE-IDENTICAL\n");
+
+    // the mechanism settled + the joints held.
+    const joint::ArticulatedState st = joint::MeasureArticulated(cpuWorld, joints);
+    {
+        const joint::fx kGapBand = joint::kOne / 2;
+        const joint::fx kBuryTol = -(joint::kOne / 16);
+        if (!(st.maxAnchorGap < kGapBand && st.minDynamicBottom >= kBuryTol))
+            return fail("joint-step: did not settle (gap/bottom out of band)");
+        std::printf("joint-step settled: {maxAnchorGap:%d within band, rested:true}\n", st.maxAnchorGap);
+    }
+
+    // contacts did the work: residual overlaps below the bound AND a no-contact control buries the links.
+    {
+        joint::FxWorld noContacts = world;
+        joint::StepArticulatedSteps(noContacts, joints, limits, kDt, kIters, kSteps);
+        joint::fx ncMinBottom = (joint::fx)(1 << 30);
+        for (const fpx::FxBody& b : noContacts.bodies) {
+            if (!(b.flags & fpx::kFlagDynamic)) continue;
+            const joint::fx bottom = b.pos.y - b.radius;
+            if (bottom < ncMinBottom) ncMinBottom = bottom;
+        }
+        if (!(st.residualOverlaps <= 2u && ncMinBottom < -(joint::kOne / 8)))
+            return fail("joint-step: contacts did not do the work (overlap/control)");
+        std::printf("joint-step contacts: {residualOverlaps:%u} (links non-penetrating)\n",
+                    st.residualOverlaps);
+    }
+
+    // --- Golden: a PURE-INTEGER 2D side-view of the settled draped chain (IDENTICAL to the Vulkan
+    // --joint-step-shot by construction). ---
+    const int kPxPerUnit = 56, kMargin = 28;
+    const int kWorldW = 8, kWorldH = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 14; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int x, int y, const Vec3& col) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        d[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        d[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        d[3] = 255;
+    };
+    auto worldToPx = [&](joint::fx wx, joint::fx wy, int& ix, int& iy) {
+        const int64_t sx = ((int64_t)wx * kPxPerUnit) >> joint::kFrac;
+        const int64_t sy = ((int64_t)wy * kPxPerUnit) >> joint::kFrac;
+        ix = kMargin + (int)sx;
+        iy = (int)imgH - kMargin - (int)sy;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s)
+            putPx(x0 + (int)((int64_t)dx * s / n), y0 + (int)((int64_t)dy * s / n), col);
+    };
+    // The ground line (y == groundY).
+    { int gx0, gy0; worldToPx(0, kGroundY, gx0, gy0);
+      for (int x = 0; x < (int)imgW; ++x) {
+          if (gy0 < 0 || gy0 >= (int)imgH) break;
+          uint8_t* d = &bgra[((size_t)gy0 * imgW + x) * 4];
+          d[0] = 80; d[1] = 80; d[2] = 80; d[3] = 255;
+      } }
+    // The joint segments (grey) between the connected world anchors.
+    for (uint32_t e = 0; e < kJointCount; ++e) {
+        const joint::FxVec3 pa = joint::WorldAnchor(cpuWorld.bodies[joints[e].bodyA], joints[e].anchorA);
+        const joint::FxVec3 pb = joint::WorldAnchor(cpuWorld.bodies[joints[e].bodyB], joints[e].anchorB);
+        int ax, ay, bx, by; worldToPx(pa.x, pa.y, ax, ay); worldToPx(pb.x, pb.y, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.55f});
+    }
+    // Each body as a filled disc of its radius (in pixels), coloured by body id (root white).
+    const int radPx = (int)(((int64_t)kRad * kPxPerUnit) >> joint::kFrac);
+    for (int i = 0; i < kBodyCount; ++i) {
+        int cx, cy; worldToPx(cpuWorld.bodies[(size_t)i].pos.x, cpuWorld.bodies[(size_t)i].pos.y, cx, cy);
+        const Vec3 col = (cpuWorld.bodies[(size_t)i].flags & fpx::kFlagDynamic)
+                             ? vg::hashColor((uint32_t)(i + 1)) : Vec3{1.0f, 1.0f, 1.0f};
+        for (int yy = -radPx; yy <= radPx; ++yy)
+            for (int xx = -radPx; xx <= radPx; ++xx)
+                if (xx * xx + yy * yy <= radPx * radPx) putPx(cx + xx, cy + yy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — articulated draped chain side-view (%d bodies, %u joints, settled)\n",
+                outPath, imgW, imgH, kBodyCount, kJointCount);
+    return 0;
+}
+
 // ===== Slice CL3 — Deterministic GPU Cloth PBD DISTANCE-CONSTRAINT SOLVER showcase (--cloth-solve) =====
 // (the MAKE-OR-BREAK of FLAGSHIP #8). Like CL1's --cloth-integrate (and UNLIKE the int32 CL2 --cloth-edges /
 // FPX2 broadphase), the PBD solve is int64 (fxdiv/FxISqrt in SolveDistanceConstraint — the SAME form as
@@ -40278,6 +40476,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--joint-hinge") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_joint_hinge.png";
             try { return RunJointHingeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --joint-step <out.png>: render the Deterministic Articulated-Body Ragdoll ARTICULATED MULTI-BODY
+        // STEP showcase (Slice JT3, the 3rd slice of FLAGSHIP #15). On Metal this runs the CPU solver: the
+        // joint + fpx contact shaders are int64/Vulkan-only (glslc can't parse the int64), so Metal runs the
+        // CPU joint::StepArticulatedContacts over an 8-link draped chain (a pinned root + 8 dynamic sphere
+        // links, ball-jointed end-to-end) dropped onto the ground -> the chain falls, self-collides + rests as
+        // a coherent draped mechanism — the EXACT bit-exact reference the Vulkan --joint-step-shot GPU==CPU
+        // memcmp compares against; two runs byte-identical. The image golden is a PURE-INTEGER chain side-view,
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/joint_step.png.
+        if (argc > 1 && std::strcmp(argv[1], "--joint-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_joint_step.png";
+            try { return RunJointStepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cloth-collide <out.png>: render the Deterministic GPU Cloth INTEGER COLLISION showcase (Slice
