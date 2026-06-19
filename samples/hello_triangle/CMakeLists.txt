@@ -869,6 +869,21 @@ hf_compile_shaders(
     # by construction, the cloth_solve.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/joint_ball_solve.comp.hlsl:cs"
+    # Deterministic Articulated-Body Ragdoll Slice 2 (Slice JT2, THE NEW-PHYSICS BEAT of FLAGSHIP #15): the
+    # ANGULAR LIMIT (hinge + cone). joint_angular_solve.comp runs `steps` iterations of StepArticulated =
+    # IntegrateBodyFull each body (the FPX4 6-DOF integrate) then `iters` Gauss-Seidel passes EACH doing
+    # {all SolveBallJoint (the JT1 positional ball) then all SolveAngularLimit (the JT2 swing-twist + host-cos
+    # cone clamp + nlerp inverse-mass apply, projecting qrel = qA⁻¹·qB back into the cone/hinge)} then a
+    # ground floor-clamp — copied VERBATIM from engine/sim/joint.h::StepArticulated/SolveAngularLimit. The
+    # cone limit is supplied as HOST cos/sin constants (cosHalfLimit/sinHalfLimit) so the SIM does ZERO
+    # runtime acos/sin; the apply is NLERP (component lerp + FxQuatNormalize), NOT slerp. The whole step is
+    # SEQUENTIAL (Gauss-Seidel, order-dependent) -> a SINGLE THREAD ([numthreads(1,1,1)], the
+    # joint_ball_solve.comp mirror) -> bit-exact GPU==CPU + cross-backend, NO atomics. solveEnabled=0 ->
+    # bodies UNCHANGED. Like joint_ball_solve.comp this is int64 (the quaternion fxmul/fxdiv/FxISqrt) ->
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal
+    # --joint-hinge showcase runs the CPU joint::StepArticulated (byte-identical by construction). NO new RHI;
+    # existing shaders + goldens untouched (joint_ball_solve.comp + JT1's FxJoint/SolveBallJoint frozen).
+    "shaders/joint_angular_solve.comp.hlsl:cs"
     # CL4 COLLISION. cloth_collide.comp FOLDS the CL3 PBD step (integrate + Gauss-Seidel constraint passes +
     # ground floor-clamp, copied VERBATIM from cloth_solve.comp/cloth.h) AND per-step COLLISION (project each
     # non-pinned particle out of a small STATIC set of SPHERE colliders along the outward normal, then a

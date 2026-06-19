@@ -62,6 +62,8 @@ using fpx::FxScale;
 using fpx::FxLength;
 using fpx::FxNormalize;
 using fpx::FxRotate;
+using fpx::FxQuatMul;        // Slice JT2: the Hamilton product (the swing-twist recompose + qrel)
+using fpx::FxQuatNormalize;  // Slice JT2: the int64 quaternion normalize (the nlerp + re-synth)
 inline constexpr int kFrac = fpx::kFrac;      // Q16.16 fractional bits (MUST match the shader)
 inline constexpr fx  kOne  = fpx::kOne;       // 1.0 in Q16.16 (65536)
 
@@ -191,6 +193,164 @@ inline void StepJointWorldSteps(FxWorld& world, const std::vector<FxJoint>& join
                                 int steps) {
     for (int s = 0; s < steps; ++s)
         StepJointWorld(world, joints, dt, iters);
+}
+
+// ====================================================================================================
+// Slice JT2 — ANGULAR LIMITS (hinge + cone): THE NEW-PHYSICS BEAT (the GR4-friction-equivalent).
+// After the JT1 positional ball projection holds the anchors coincident, JT2 projects the RELATIVE
+// orientation qrel = qA⁻¹·qB back into the joint's allowed cone/hinge via a quaternion SWING-TWIST
+// decomposition + a host-cos CONE CLAMP — a quaternion analog of the GR4 Coulomb-cone clamp (clamp the
+// off-axis rotation into a cone). A HINGE holds its axis (cone angle 0 -> swing forced to identity, only
+// twist about `axis`); a CONE limits the swing to a host half-angle. INTEGER-bit-exact, int64 ->
+// joint_angular_solve.comp Vulkan-only + the Metal showcase runs THIS CPU reference (the FPX4/CL3 split).
+// Single-thread Gauss-Seidel. ADDITIVE — JT1's FxJoint/SolveBallJoint/StepJointWorld stay byte-frozen;
+// FxAngularLimit is a SEPARATE record (a ragdoll edge carries BOTH a FxJoint and a FxAngularLimit).
+//
+// THE INTEGER-CLEAN DESIGN (ZERO runtime transcendentals): the cone half-angle is supplied as HOST
+// CONSTANTS cosHalfLimit = cos(θ/2) + sinHalfLimit = sin(θ/2) (the caller computes them once in float at
+// scene build; the SIM does ZERO acos/sin/cos). A HINGE is cosHalfLimit = kOne, sinHalfLimit = 0 (cone
+// angle 0 -> swing forced to identity). A FREE control is cosHalfLimit = -kOne (a 180° cone -> never
+// clamps). The swing re-synthesis at the limit is FxNormalize (int64 FxISqrt) + fxmul; the inverse-mass
+// apply is NLERP (component lerp + FxQuatNormalize — the integer-friendly small-angle slerp approximation,
+// the cloth/PBD precedent, NOT a slerp/quaternion-power). All int64 -> joint_angular_solve.comp copies
+// SolveAngularLimit VERBATIM (Vulkan-only; glslc can't parse int64 in HLSL -> NOT in hf_gen_msl).
+//
+// HONEST CAVEAT (the GR4-angle-of-repose caveat shape): the swing-twist + host-cos clamp + nlerp apply is
+// a DETERMINISTIC PROXY for an angular limit — exact-deterministic + bit-identical cross-backend (the
+// headline), but NOT an analytic constraint-mechanics solution. The nlerp small-angle apply leaves a
+// deterministic-but-nonzero residual (more Gauss-Seidel iters -> tighter); a within-band limit, not exact.
+
+inline constexpr uint32_t kAngularHinge = 0u;  // cone limit 0 -> swing forced to identity (only twist about axis)
+inline constexpr uint32_t kAngularCone  = 1u;  // swing limited to the cone half-angle (cosHalfLimit/sinHalfLimit)
+
+// ----- The angular-limit record (the std430 GPU mirror; SEPARATE from FxJoint — JT1 frozen) -----------
+// An FxAngularLimit limits the RELATIVE orientation of bodyB in bodyA's frame about a body-local `axis`
+// (the hinge/cone axis, a UNIT vector in A's local frame). cosHalfLimit/sinHalfLimit are HOST-snapped
+// Q16.16 constants (= cos(θ/2)/sin(θ/2); hinge = kOne/0; free = -kOne/0). kind selects hinge vs cone.
+// std430-packable as plain int32s: bodyA, bodyB (2 x uint32) + axis.xyz (3 x int32) + cosHalfLimit +
+// sinHalfLimit (2 x int32) + kind (uint32) = 8 x 4-byte = 32 bytes, NO padding holes (memcmp-able; the
+// GPU FxAngularLimit mirror).
+struct FxAngularLimit {
+    uint32_t bodyA = 0;            // index of the first body (the frame body — A's frame defines `axis`)
+    uint32_t bodyB = 0;            // index of the second body (the limited body)
+    FxVec3   axis;                // UNIT body-local hinge/cone axis on bodyA
+    fx       cosHalfLimit = kOne; // cos(θ/2) host constant (hinge=kOne, free=-kOne)
+    fx       sinHalfLimit = 0;    // sin(θ/2) host constant (hinge=0)
+    uint32_t kind = kAngularHinge;
+};
+
+// ----- The quaternion helpers JT2 adds in joint.h (do NOT modify fpx.h) -------------------------------
+// QConj(q): the conjugate {-x,-y,-z,w} (the inverse of a UNIT quaternion). Pure negate, no int64.
+inline FxQuat QConj(const FxQuat& q) { return FxQuat{-q.x, -q.y, -q.z, q.w}; }
+
+// FxDot(a,b): the Q16.16 dot product of two 3-vectors (int64 fxmul terms, the FxLength discipline).
+inline fx FxDot(const FxVec3& a, const FxVec3& b) {
+    return fxmul(a.x, b.x) + fxmul(a.y, b.y) + fxmul(a.z, b.z);
+}
+
+// QNlerp(p, q, t): the component-wise normalized lerp p + t*(q - p) (NOT normalized here — the caller
+// FxQuatNormalize's the result). The integer-friendly small-angle slerp approximation (the cloth/PBD
+// precedent), each term an int64 fxmul. t in [0,kOne]; t=0 -> p, t=kOne -> q.
+inline FxQuat QNlerp(const FxQuat& p, const FxQuat& q, fx t) {
+    return FxQuat{p.x + fxmul(q.x - p.x, t), p.y + fxmul(q.y - p.y, t),
+                  p.z + fxmul(q.z - p.z, t), p.w + fxmul(q.w - p.w, t)};
+}
+
+// ----- SolveAngularLimit: project ONE angular limit (the swing-twist + cone clamp + nlerp apply) -------
+// VERBATIM the spec's swing-twist + host-cos cone clamp + inverse-mass nlerp apply (joint_angular_solve.comp
+// copies THIS body). Reads the JT1-projected positions read-only; writes only the two bodies' orient. A
+// pinned body (invMass 0 -> share 0) is NOT rotated. int64 (FxQuatMul/FxQuatNormalize/FxNormalize/fxdiv).
+inline void SolveAngularLimit(FxWorld& world, const FxAngularLimit& lim) {
+    const size_t n = world.bodies.size();
+    if (lim.bodyA >= (uint32_t)n || lim.bodyB >= (uint32_t)n) return;   // out-of-range -> skip
+    FxBody& a = world.bodies[(size_t)lim.bodyA];
+    FxBody& b = world.bodies[(size_t)lim.bodyB];
+    const fx wsum = a.invMass + b.invMass;
+    if (wsum == 0) return;                              // both pinned -> skip
+
+    const FxQuat qA = a.orient;
+    const FxQuat qB = b.orient;
+    const FxQuat qrel = FxQuatMul(QConj(qA), qB);       // B's orientation in A's frame
+
+    // --- swing-twist decomposition about `axis` (the hinge/cone axis, body-local on A) ---
+    const FxVec3 qrelXyz{qrel.x, qrel.y, qrel.z};
+    const fx proj = FxDot(qrelXyz, lim.axis);           // qrel's rotation component along the axis
+    FxQuat twist = FxQuatNormalize(
+        FxQuat{fxmul(lim.axis.x, proj), fxmul(lim.axis.y, proj), fxmul(lim.axis.z, proj), qrel.w});
+    FxQuat swing = FxQuatMul(qrel, QConj(twist));       // the off-axis part (qrel = swing * twist)
+
+    // --- cone clamp the SWING (host cos/sin limit, NO acos) ---
+    if (swing.w < lim.cosHalfLimit) {                   // swing half-angle exceeds the cone -> clamp
+        const FxVec3 sxyz{swing.x, swing.y, swing.z};
+        const fx slen = FxLength(sxyz);
+        if (slen != 0) {                                // degenerate (swing≈identity) -> skip the re-synth
+            const FxVec3 nhat = FxNormalize(sxyz);      // the swing rotation axis
+            swing = FxQuat{fxmul(lim.sinHalfLimit, nhat.x), fxmul(lim.sinHalfLimit, nhat.y),
+                           fxmul(lim.sinHalfLimit, nhat.z), lim.cosHalfLimit};   // re-synth at the limit
+        }
+    }                                                   // hinge: cosHalfLimit=kOne -> always clamps -> identity
+    const FxQuat qrelClamped = FxQuatNormalize(FxQuatMul(swing, twist));   // recompose
+
+    // --- the correction targets + the nlerp inverse-mass apply (NO slerp) ---
+    const FxQuat qBtarget = FxQuatMul(qA, qrelClamped);           // qB such that qA⁻¹·qB == qrelClamped
+    const FxQuat qAtarget = FxQuatMul(qB, QConj(qrelClamped));    // qA such that qA⁻¹·qB == qrelClamped
+    const fx wA = fxdiv(a.invMass, wsum);
+    const fx wB = fxdiv(b.invMass, wsum);
+    b.orient = FxQuatNormalize(QNlerp(qB, qBtarget, wB));         // a pinned body (w 0) is NOT rotated
+    a.orient = FxQuatNormalize(QNlerp(qA, qAtarget, wA));
+}
+
+// ----- SwingAngleCos: the swing .w (== cos(half-angle)) of one limit — the "within the cone" metric -----
+// A held limit keeps this >= cosHalfLimit within an LSB band (the swing did NOT exceed the cone). For a
+// hinge (cosHalfLimit=kOne) a held hinge drives this toward kOne (the door stayed in the hinge plane).
+// Pure integer (the same swing-twist decompose as SolveAngularLimit, no clamp/apply). int64.
+inline fx SwingAngleCos(const FxWorld& world, const FxAngularLimit& lim) {
+    const size_t n = world.bodies.size();
+    if (lim.bodyA >= (uint32_t)n || lim.bodyB >= (uint32_t)n) return kOne;
+    const FxQuat qA = world.bodies[(size_t)lim.bodyA].orient;
+    const FxQuat qB = world.bodies[(size_t)lim.bodyB].orient;
+    const FxQuat qrel = FxQuatMul(QConj(qA), qB);
+    const FxVec3 qrelXyz{qrel.x, qrel.y, qrel.z};
+    const fx proj = FxDot(qrelXyz, lim.axis);
+    const FxQuat twist = FxQuatNormalize(
+        FxQuat{fxmul(lim.axis.x, proj), fxmul(lim.axis.y, proj), fxmul(lim.axis.z, proj), qrel.w});
+    const FxQuat swing = FxQuatMul(qrel, QConj(twist));
+    return swing.w;   // cos(half swing angle); >= cosHalfLimit means within the cone
+}
+
+// ----- StepArticulated: one full articulated step (JT1 ball + JT2 angular interleaved Gauss-Seidel) ----
+// The StepJointWorld mold extended with the angular pass: (1) IntegrateBodyFull each body (FPX4 6-DOF) ->
+// (2) K Gauss-Seidel passes EACH doing {all SolveBallJoint in FIXED order, then all SolveAngularLimit in
+// FIXED order} -> (3) ground floor clamp. Each pass interleaves the positional (translate) + angular
+// (rotate) projection; SEQUENTIAL single-thread (order-dependent — the cloth/JT1 discipline). Pure integer,
+// fixed op order -> two-run bit-identical AND bit-exact GPU==CPU. joint_angular_solve.comp runs the angular
+// pass (the ball pass reuses joint_ball_solve.comp's body); the showcase driver dispatches per pass.
+inline void StepArticulated(FxWorld& world, const std::vector<FxJoint>& joints,
+                            const std::vector<FxAngularLimit>& angularLimits, fx dt, int iters) {
+    const size_t n = world.bodies.size();
+    // (1) integrate one step (6-DOF: translation gated by kFlagDynamic, orientation for every body).
+    for (size_t i = 0; i < n; ++i)
+        fpx::IntegrateBodyFull(world.bodies[i], world.gravity, dt);
+    // (2) `iters` Gauss-Seidel passes: all ball joints (position), then all angular limits (orientation).
+    for (int it = 0; it < iters; ++it) {
+        for (size_t e = 0; e < joints.size(); ++e)
+            SolveBallJoint(world, joints[e]);
+        for (size_t e = 0; e < angularLimits.size(); ++e)
+            SolveAngularLimit(world, angularLimits[e]);
+    }
+    // (3) ground floor clamp AFTER the constraint passes (a joint may have pulled a body below ground).
+    for (size_t i = 0; i < n; ++i) {
+        FxBody& b = world.bodies[i];
+        if ((b.flags & fpx::kFlagDynamic) && b.pos.y < world.groundY) b.pos.y = world.groundY;
+    }
+}
+
+// ----- StepArticulatedSteps: run K full articulated steps (the showcase / GPU K-step driver) -----------
+inline void StepArticulatedSteps(FxWorld& world, const std::vector<FxJoint>& joints,
+                                 const std::vector<FxAngularLimit>& angularLimits, fx dt, int iters,
+                                 int steps) {
+    for (int s = 0; s < steps; ++s)
+        StepArticulated(world, joints, angularLimits, dt, iters);
 }
 
 }  // namespace joint
