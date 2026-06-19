@@ -778,4 +778,98 @@ inline uint32_t FractAnchorBodyIndex(const FractFragments& fragments,
     return 0xFFFFFFFFu;
 }
 
+// ====================================================================================================
+// Slice FR5 — LOCKSTEP + ROLLBACK over the fracture rubble dynamics (THE NETCODE HEADLINE — PURE CPU).
+// Additive over FR1-FR4 (ALL code above is byte-unchanged). FR4 made the rubble FALL + settle; FR5 proves
+// that settle is true cross-platform LOCKSTEP + ROLLBACK: a peer fed the INPUT command stream ALONE re-
+// derives the authority's exact destroyed/settled state bit-for-bit (every dislodged chunk's tumble + the
+// settled pile), and a mispredicted input is corrected by rolling back to a saved snapshot + re-simulating.
+// UE5's float Chaos fracture cannot replay a break bit-for-bit; this can.
+//
+// THE APPROACH — MAXIMAL REUSE (the lowest-risk slice): the fracture world IS an fpx::FxWorld (FR4's
+// SpawnFractWorld output). fpx already ships the bit-exact FPX5 lockstep/rollback machinery over FxWorld —
+// fpx::FxCommand (an input impulse/spin on a body), fpx::ApplyCommand, fpx::SnapshotWorld (deep-copy the
+// world), fpx::RestoreWorld. FR5 REUSES ALL of it VERBATIM and changes ONE thing: the per-tick step is
+// fract::StepFracture (FR4) instead of fpx's StepWorld+IntegrateOrientation. So FR5 is a THIN harness:
+// SimFractTick is the fpx::SimTick twin with StepFracture substituted; RunFractLockstep/RunFractRollback
+// mirror fpx::RunLockstep/RunRollback's control flow EXACTLY but call SimFractTick. Pure integer, fixed op
+// order -> bit-identical on every peer/platform (and cross-backend by StepFracture's proven bit-exactness).
+//
+// WHAT IS REPLAYED (the break is in the init; the SETTLE is replayed): the DESTRUCTION = the break (FR3) +
+// the spawn (FR4 SpawnFractWorld). That break is itself deterministic + bit-reproducible (a fixed impact ->
+// a fixed severed set -> a fixed dynamic/static body assignment), so the `init` FxWorld two peers start from
+// is identical by construction. FR5 replays the RUBBLE DYNAMICS — every dislodged chunk's fall, collision,
+// tumble, and settle — from the input shove stream, bit-for-bit. The bond/severed state is fixed after the
+// initial break (it lives in the init's body flags), so it does not change during the settle. (Driving a
+// FURTHER break mid-replay from a stream command is a documented extension; FR5 replays the post-break
+// settle, the faithful version that matches FPX5/GR5/CG5/GF5.) The command is a body shove (kCmdImpulse) /
+// spin (kCmdSetAngVel) on a dislodged chunk — "kick a falling chunk", re-simulated identically on two peers.
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only, PURE CPU. NO new shader, NO new RHI. FR5
+// only ADDS the three harness functions; it reuses fpx.h's FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld
+// (already #included read-only) — it does NOT re-implement them.
+
+// Re-export the fpx FPX5 command + snapshot primitives (read-only — REUSED VERBATIM, not re-implemented).
+using fpx::FxCommand;
+using fpx::kCmdImpulse;
+using fpx::kCmdSetAngVel;
+using fpx::ApplyCommand;
+using fpx::SnapshotWorld;
+using fpx::RestoreWorld;
+
+// SimFractTick(world, stream, tick, dt, solveIters): the deterministic per-tick step (the fpx::SimTick twin
+// with StepFracture substituted for StepWorld+IntegrateOrientation). (1) apply ALL `stream` commands whose
+// .tick == `tick`, in ARRAY ORDER (the deterministic input-order contract — the same order on every peer/
+// platform) via fpx::ApplyCommand; (2) StepFracture(world, dt, solveIters) — the FR4 tick (IntegrateBodyFull
+// + the FPX1 floor clamp -> per-tick re-broadphase -> the FPX3 SolveContacts), reused VERBATIM. Pure
+// integer, fixed order -> bit-identical on every peer/platform. (No new command type — reuses fpx::FxCommand.)
+inline void SimFractTick(fpx::FxWorld& w, const std::vector<fpx::FxCommand>& stream, uint32_t tick, fx dt,
+                         int solveIters) {
+    for (const fpx::FxCommand& c : stream)
+        if (c.tick == tick) fpx::ApplyCommand(w, c);
+    StepFracture(w, dt, solveIters);
+}
+
+// RunFractLockstep(init, stream, ticks, dt, solveIters): THE peer entry point (the fpx::RunLockstep control
+// flow over SimFractTick). Run `ticks` SimFractTicks from a COPY of `init`, applying the command stream ->
+// the final rubble world. authority = RunFractLockstep(init, stream, N); replica = RunFractLockstep(init,
+// stream, N) from the SAME init + stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism
+// (the lockstep proof memcmps them).
+inline fpx::FxWorld RunFractLockstep(const fpx::FxWorld& init, const std::vector<fpx::FxCommand>& stream,
+                                     int ticks, fx dt, int solveIters) {
+    fpx::FxWorld w = init;
+    for (int t = 0; t < ticks; ++t)
+        SimFractTick(w, stream, (uint32_t)t, dt, solveIters);
+    return w;
+}
+
+// RunFractRollback(init, authStream, mispredictStream, ticks, mispredictTick, dt, solveIters): the rollback
+// harness (the fpx::RunRollback control flow over SimFractTick). (1) run ticks 0..mispredictTick from `init`
+// applying authStream; (2) SAVE a snapshot AT mispredictTick (fpx::SnapshotWorld — the FxWorld deep-copy);
+// (2b) speculatively advance <=3 ticks with the MISPREDICTED stream (the wrong input — the client prediction
+// that diverges); (3) ROLLBACK — fpx::RestoreWorld to the snapshot + RE-SIMULATE mispredictTick..ticks with
+// the CORRECT authStream -> the corrected final world. The proof asserts this == RunFractLockstep(init,
+// authStream, ticks) (rollback corrected the misprediction EXACTLY) AND that the speculative pre-rollback
+// state DIFFERED from authority (a real divergence was fixed). Reuses fpx::SnapshotWorld/RestoreWorld VERBATIM.
+inline fpx::FxWorld RunFractRollback(const fpx::FxWorld& init, const std::vector<fpx::FxCommand>& authStream,
+                                     const std::vector<fpx::FxCommand>& mispredictStream, int ticks,
+                                     int mispredictTick, fx dt, int solveIters) {
+    fpx::FxWorld w = init;
+    // (1) advance 0..mispredictTick with the authoritative stream.
+    for (int t = 0; t < mispredictTick; ++t)
+        SimFractTick(w, authStream, (uint32_t)t, dt, solveIters);
+    // (2) SAVE the snapshot at mispredictTick (the rollback restore point).
+    const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (bounded to the remaining ticks).
+    int specTicks = ticks - mispredictTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimFractTick(w, mispredictStream, (uint32_t)(mispredictTick + s), dt, solveIters);
+    // (3) ROLLBACK: restore the snapshot + re-simulate mispredictTick..ticks with the CORRECT authStream.
+    fpx::RestoreWorld(w, snap);
+    for (int t = mispredictTick; t < ticks; ++t)
+        SimFractTick(w, authStream, (uint32_t)t, dt, solveIters);
+    return w;
+}
+
 }  // namespace hf::sim::fract

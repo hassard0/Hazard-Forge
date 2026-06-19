@@ -706,6 +706,118 @@ int main() {
         check(allAbove, "FR4 rubble: every dynamic chunk's center rests on/above the floor (clamp held)");
     }
 
+    // ================= FR5: the lockstep/rollback harness over the fracture rubble dynamics =============
+    // Builds a SMALL broken-and-spawned world (the FR4 spawn) + a shove stream, and pins: SimFractTick
+    // advances deterministically; RunFractLockstep authority==replica BIT-EXACT (inputs only);
+    // RunFractRollback == RunFractLockstep(auth) AND mispredicted != authority; a shove changes a chunk's
+    // trajectory (the stream does work); fpx::SnapshotWorld/RestoreWorld round-trip is bit-exact. The
+    // harness reuses fpx's command + snapshot functions VERBATIM (the FR5 design).
+    {
+        // A small fixed scene (an 8x8x4 lattice + a few seeds — enough fragments for a multi-piece break,
+        // small enough to step many ticks cheaply).
+        fract::FractField f; f.nx = 8; f.ny = 8; f.nz = 4;
+        std::vector<fract::FractSeed> seeds = {
+            {1, 1, 1}, {6, 1, 2}, {1, 6, 1}, {6, 6, 2}, {3, 3, 1}, {4, 4, 2},
+        };
+        const int M = (int)seeds.size();
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        fract::BreakImpact imp{0u, (fract::fx)(1000 * (int)fpx::kOne)};   // a HARD break
+        std::vector<uint8_t> sev;
+        fract::ApplyImpactBreak(bonds, frags, imp, 4, sev);
+        std::vector<uint32_t> clusters;
+        const uint32_t pieces = fract::CountFractPieces(frags, bonds, sev, &clusters);
+        check(pieces > 1u, "FR5 scene: the hard break yields >1 piece (some dynamic rubble)");
+
+        const fract::fx gravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne / 4;
+        cfg.gravity = fract::FxVec3{0, gravY, 0};
+        cfg.groundY = 0;
+        cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+        cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+        const fpx::FxWorld init = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+
+        // Pick the FIRST dynamic body — the shove stream targets it ("kick a falling chunk").
+        uint32_t kickBody = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < (uint32_t)init.bodies.size(); ++i)
+            if (init.bodies[i].flags & fpx::kFlagDynamic) { kickBody = i; break; }
+        check(kickBody != 0xFFFFFFFFu, "FR5 scene: at least one dynamic chunk to kick");
+
+        const fract::fx dt = fpx::kOne / 60;
+        const int kIters = 6;
+        const int kTicks = 30;
+        const int kMispredictTick = 8;
+
+        // The scripted authoritative shove stream: kick the falling chunk sideways + spin it at a few ticks.
+        const std::vector<fpx::FxCommand> authStream = {
+            fpx::FxCommand{2,  fpx::kCmdImpulse,   kickBody, fpx::FxVec3{(fract::fx)(3 * (int)fpx::kOne), 0, 0}},
+            fpx::FxCommand{5,  fpx::kCmdSetAngVel, kickBody, fpx::FxVec3{0, fpx::kOne, 0}},
+            fpx::FxCommand{10, fpx::kCmdImpulse,   kickBody, fpx::FxVec3{0, 0, (fract::fx)(2 * (int)fpx::kOne)}},
+        };
+
+        auto worldEqual = [&](const fpx::FxWorld& a, const fpx::FxWorld& b) {
+            return a.bodies.size() == b.bodies.size() &&
+                   std::memcmp(a.bodies.data(), b.bodies.data(),
+                               a.bodies.size() * sizeof(fpx::FxBody)) == 0 &&
+                   a.gravity.x == b.gravity.x && a.gravity.y == b.gravity.y &&
+                   a.gravity.z == b.gravity.z && a.groundY == b.groundY;
+        };
+
+        // SimFractTick advances the world deterministically: over a single tick the dynamic chunk's state
+        // CHANGES (it integrates under gravity / the spawn impact velocity), and two ticks from the same
+        // start are byte-identical (the per-tick determinism the lockstep proof builds on).
+        {
+            fpx::FxWorld w0 = init;
+            fract::SimFractTick(w0, authStream, 0u, dt, kIters);
+            const bool moved = w0.bodies[kickBody].pos.x != init.bodies[kickBody].pos.x ||
+                               w0.bodies[kickBody].pos.y != init.bodies[kickBody].pos.y ||
+                               w0.bodies[kickBody].pos.z != init.bodies[kickBody].pos.z ||
+                               w0.bodies[kickBody].vel.y != init.bodies[kickBody].vel.y;
+            check(moved, "FR5 SimFractTick: a dynamic chunk's state advances over one tick");
+            fpx::FxWorld w1 = init;
+            fract::SimFractTick(w1, authStream, 0u, dt, kIters);
+            check(worldEqual(w0, w1), "FR5 SimFractTick: two ticks from the same start are BIT-IDENTICAL");
+        }
+
+        // LOCKSTEP: authority == replica BIT-EXACT (two runs from the SAME init+stream, inputs only).
+        const fpx::FxWorld authority = fract::RunFractLockstep(init, authStream, kTicks, dt, kIters);
+        const fpx::FxWorld replica   = fract::RunFractLockstep(init, authStream, kTicks, dt, kIters);
+        check(worldEqual(authority, replica),
+              "FR5 lockstep: authority == replica BIT-EXACT (inputs-only re-sim)");
+
+        // The MISPREDICTED stream: authStream + a WRONG strong shove at mispredictTick.
+        std::vector<fpx::FxCommand> mispredictStream = authStream;
+        mispredictStream.push_back(fpx::FxCommand{(uint32_t)kMispredictTick, fpx::kCmdImpulse, kickBody,
+                                                  fpx::FxVec3{(fract::fx)(40 * (int)fpx::kOne), 0, 0}});
+
+        // ROLLBACK: rolledBack == authority BIT-EXACT, AND the mispredicted run DIFFERED (a real divergence).
+        const fpx::FxWorld rolledBack =
+            fract::RunFractRollback(init, authStream, mispredictStream, kTicks, kMispredictTick, dt, kIters);
+        const fpx::FxWorld mispredicted = fract::RunFractLockstep(init, mispredictStream, kTicks, dt, kIters);
+        check(worldEqual(rolledBack, authority),
+              "FR5 rollback: corrected == authority BIT-EXACT");
+        check(!worldEqual(mispredicted, authority),
+              "FR5 rollback: the mispredicted state DIFFERED from authority (non-vacuous proof)");
+
+        // MOTION: the shove stream did non-trivial work (authority chunk pos != the no-command baseline).
+        const std::vector<fpx::FxCommand> noStream;
+        const fpx::FxWorld noInput = fract::RunFractLockstep(init, noStream, kTicks, dt, kIters);
+        const bool moved = authority.bodies[kickBody].pos.x != noInput.bodies[kickBody].pos.x ||
+                           authority.bodies[kickBody].pos.z != noInput.bodies[kickBody].pos.z;
+        check(moved, "FR5 motion: the shove stream changed a chunk's trajectory (the stream does work)");
+
+        // SNAPSHOT round-trip: RestoreWorld(SnapshotWorld(w)) == w byte-for-byte (reused fpx VERBATIM).
+        {
+            fpx::FxWorld w = fract::RunFractLockstep(init, authStream, kMispredictTick, dt, kIters);
+            const fpx::FxWorld snap = fpx::SnapshotWorld(w);
+            fract::SimFractTick(w, authStream, (uint32_t)kMispredictTick, dt, kIters);   // mutate
+            fpx::RestoreWorld(w, snap);
+            check(worldEqual(w, snap), "FR5 snapshot: SnapshotWorld/RestoreWorld round-trip BIT-EXACT");
+        }
+    }
+
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
     else std::printf("fract_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;
