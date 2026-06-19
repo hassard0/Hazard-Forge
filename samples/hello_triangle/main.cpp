@@ -456,6 +456,7 @@ int main(int argc, char** argv) {
     const char* fractFragmentsShotPath = nullptr; // --fract-fragments-shot <out.bmp> (Slice FR2: GPU Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION, pure-int32 count->scan->emit CSR over FR1 cellId + per-fragment reduce, GPU==CPU fragment array+CSR+remap bit-exact MSL-native, fragment centroids/bounds over the cell mosaic)
     const char* fractStepShotPath = nullptr; // --fract-step-shot <out.bmp> (Slice FR4: GPU Deterministic Rigid-Body Fracture THE FRACTURE STEP — released fragments fall. FR1 classify + FR2 extract + BuildFractBonds + a HARD ApplyImpactBreak + CountFractPieces (host) -> SpawnFractWorld releases the broken pieces as fpx::FxBody rubble (one body per fragment, pos=centroid·worldCellSize, radius=boundRadius·worldCellSize, invMass from FR2; the LARGEST piece STATIC anchor, others DYNAMIC; the impacted body seeded with impactDir·impactSpeed) -> K=120 StepFracture ticks drive the EXISTING shaders/fpx_solve.comp ONCE per tick (host-rebuilding the FPX2 pair list each tick from the current positions — the realistic per-tick re-broadphase; angVel=0 keeps orient identity so fpx_solve.comp's IntegrateStep == StepFracture's IntegrateBodyFull byte-for-byte) -> the final body world memcmp'd vs the CPU fract.h::StepFractureSteps (the GPU==CPU make-or-break). int64 -> fpx_solve.comp is Vulkan-only; the Metal --fract-step runs the CPU StepFractureSteps. PROOFS: GPU==CPU bit-exact, determinism, break-and-fall (hard: D>0 chunks fell + settled, anchor unchanged; soft: D==0 static no-op), no body buried (all rest pos.y-radius>=groundY). The image golden is a pure-integer side-view of the settled bodies coloured by piece id (the anchor distinct). NO new shader (hf_gen_msl UNCHANGED), NO lockstep (FR5), NO lit render (FR6); FR1/FR2/FR3 code+shaders + their goldens + fpx.h UNCHANGED (FR4 additive))
     const char* fractLockstepShotPath = nullptr; // --fract-lockstep-shot <out.bmp> (Slice FR5: Deterministic Rigid-Body Fracture LOCKSTEP + ROLLBACK — the NETCODE HEADLINE of FLAGSHIP #14, the FPX5/GR5/CG5/GF5 twin. PURE-CPU harness over the FR4 fracture step (StepFracture): the FR4 broken-and-spawned fpx::FxWorld rubble (the 32x32x16 lattice classified + extracted + bonded + a HARD impact -> SpawnFractWorld) fed a scripted shove stream that kicks a couple of dislodged chunks at a few ticks; authority==replica BIT-IDENTICAL inputs-only + RunFractRollback corrects a misprediction to authority BIT-EXACT (mispredict diverged before rollback) + two-run determinism + a snapshot round-trip. Reuses fpx's FPX5 machinery VERBATIM (fpx::FxCommand/ApplyCommand/SnapshotWorld/RestoreWorld) — the per-tick step is fract::StepFracture instead of fpx's StepWorld; the three thin harness functions (SimFractTick/RunFractLockstep/RunFractRollback) are the fpx::SimTick/RunLockstep/RunRollback twins. The final rubble is rendered via the FR4 fract_step render path REUSED VERBATIM (the settled bodies as discs at their bit-exact pos>>kFrac coloured by piece id, the anchor distinct), bit-identical Vulkan-Windows == Metal-Mac by construction. NO GPU dispatch, NO new shader, NO new RHI; FR1-FR4 + their shaders/goldens UNCHANGED, fpx.h/grain.h/fluid.h/cloth.h/couple*.h + engine/physics/ UNTOUCHED (FR5 is additive — only the harness + the showcase))
+    const char* fractRenderShotPath = nullptr; // --fract-render-shot <out.bmp> (Slice FR6: Deterministic Rigid-Body Fracture LIT 3D RENDER CAPSTONE — the money-shot COMPLETING FLAGSHIP #14. Settles the FR4 fracture scene (SpawnFractWorld -> K StepFracture ticks, the sim stays pure integer) to the bit-exact rubble, then builds one FLOAT model matrix per body via fract::FractToRenderInstances (fpx::FxBodyTransform REUSED VERBATIM — the ONE host float crossing, render-only) with a parallel isDynamic[] split, and renders the held anchor (STONE) + the dislodged chunks (warmer RUBBLE) as TWO instanced draws through the EXISTING instanced-lit pipeline (lit_instanced.vert + lit.frag, sky + shadow + post — REUSED VERBATIM from --cgf-render-shot/--fpx-render-shot; NO new shader/RHI), MATTE (roughness 1.0) so the stone does not mirror the sky IBL into iridescence. FLOAT visresolve-bar (the FPX6/CG6/GF6 precedent): the golden is Metal-baked, the gate is Metal-determinism + provenance; cross-vendor ~the float baseline. PROOFS: instance provenance/count, two-run BYTE-IDENTICAL, instances==rebuild. STANDALONE arg-parse loop (the FR1 C1061 lesson). FR1-FR5 + fpx.h/grain.h/fluid.h/cloth.h/couple*.h + all shaders UNCHANGED (FR6 additive — only the render bridge + the showcase))
     const char* fractBreakShotPath = nullptr; // --fract-break-shot <out.bmp> (Slice FR3: GPU Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK — THE NEW PHYSICS, host-built bond graph + int64 Jacobi load-diffusion break (Vulkan-only fract_break.comp) -> GPU per-bond {loadAccum,severed} memcmp'd vs CPU ApplyImpactBreak, fragments coloured by cluster/piece id with severed bonds marked red)
     const char* mcCountShotPath = nullptr; // --mc-count-shot <out.bmp> (Slice MC2: GPU Isosurface Meshing per-cell MARCHING-CUBES TRIANGLE COUNT — 256-case kTriTable lookup + InterlockedAdd grand total, integer compute over an SDF VoxelField, GPU==CPU counts+total bit-exact, count-grid Z-slice debug-viz)
     const char* mcEmitShotPath = nullptr; // --mc-emit-shot <out.bmp> (Slice MC3: GPU Isosurface Meshing prefix-sum compaction + triangle EMISSION — single-thread exclusive scan of the per-cell counts + one-thread-per-cell emit of edge-MIDPOINT vertices (integer half-units) + identity indices, integer compute over an SDF VoxelField, GPU==CPU vertex+index buffers bit-exact, 2D orthographic mesh-projection debug-viz)
@@ -2340,6 +2341,15 @@ int main(int argc, char** argv) {
     // path. Its OWN loop (the FR1-FR4 standalone-loop pattern — NOT the big else-if ladder, the C1061 limit).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--fract-lockstep-shot") == 0) { fractLockstepShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice FR6: --fract-render-shot <out.bmp> (Deterministic Rigid-Body Fracture LIT 3D RENDER CAPSTONE —
+    // the money-shot COMPLETING FLAGSHIP #14). Settles the FR4 fracture scene then renders the bit-exact
+    // settled rubble (the held anchor + the dislodged chunks) as lit 3D instanced stone spheres through the
+    // EXISTING instanced-lit pipeline. FLOAT visresolve-bar. Its OWN loop (the FR1-FR5 standalone-loop pattern
+    // — NOT the big else-if ladder, the C1061 nested-block limit). NO new shader, NO new RHI.
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--fract-render-shot") == 0) { fractRenderShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -16253,6 +16263,427 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — %u fragments (%u dynamic) settled in %u pieces over %d "
                                 "ticks\n", fractStepShotPath, imgW, imgH, F, kDynamic, kPieces, kSteps);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractStepShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Rigid-Body Fracture LIT 3D RENDER CAPSTONE (--fract-render-shot <out.bmp>, Slice
+        // FR6, the money-shot COMPLETING FLAGSHIP #14 — the FOURTEENTH flagship). Settles the bit-exact FR1-FR5
+        // fracture scene (the FR4 config VERBATIM — SpawnFractWorld -> K StepFracture ticks, the sim stays pure
+        // integer) to the rubble, builds one FLOAT model matrix per body via fract::FractToRenderInstances
+        // (fpx::FxBodyTransform REUSED VERBATIM — the body's bit-exact pos/orient/radius -> a float matrix, the
+        // ONLY float crossing of the whole flagship; render-only, the bit-exact sim untouched) with a parallel
+        // isDynamic[] split, and renders the held ANCHOR (static, held-STONE colour) + the dislodged CHUNKS
+        // (dynamic, warmer RUBBLE colour) as TWO instanced draws through the EXISTING instanced-lit pipeline
+        // (lit_instanced.vert + lit.frag, sky + shadow + post — REUSED VERBATIM from --cgf-render-shot /
+        // --fpx-render-shot; NO new shader/RHI) over the ground from a fixed 3/4 camera + directional light. THE
+        // GF6 LESSON: distinguish the two materials via per-draw solid albedo TEXTURES + roughness 1.0 (MATTE) so
+        // the stone does NOT mirror the sky IBL into iridescence. FLOAT visresolve-bar (Metal-baked golden). NO
+        // new shader, NO new RHI. STANDALONE branch.
+        if (fractRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace fract = hf::sim::fract;
+            namespace fpx   = hf::sim::fpx;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // === The bit-exact FR1-FR5 fracture sim -> the settled rubble (the input; deterministic, shared with
+            // the Metal --fract-render by construction via the SAME FR4 scene). THE SCENE (== --fract-step-shot /
+            // Metal --fract-step): the 32x32x16 lattice + the fixed 16-seed set classified (FR1) + extracted (FR2)
+            // + bonded + a HARD impact broken (FR3) -> SpawnFractWorld releases the broken pieces as fpx::FxBody
+            // rubble (the LARGEST piece STATIC anchor, others DYNAMIC, the impacted body seeded) -> K=120
+            // StepFracture ticks settle the dislodged chunks into a pile while the anchor holds. Pure integer. ===
+            const int kNx = 32, kNy = 32, kNz = 16;
+            fract::FractField field; field.nx = kNx; field.ny = kNy; field.nz = kNz;
+            const std::vector<fract::FractSeed> seeds = {
+                { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+                {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+                {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+                {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+            };
+            const int kM = (int)seeds.size();
+            fract::FractCells cells; fract::ClassifyFractCells(field, seeds, cells);
+            fract::FractFragments frags; fract::ExtractFragments(field, cells, kM, frags);
+            const int kBreakIters = 4;
+            const fract::fx kHardImpulse = (fract::fx)(1000 * (int)fpx::kOne);
+            fract::BreakImpact hardImpact{0u, kHardImpulse};
+            fract::FractBonds breakBonds; fract::BuildFractBonds(field, cells, frags, breakBonds);
+            std::vector<uint8_t> severed;
+            fract::ApplyImpactBreak(breakBonds, frags, hardImpact, kBreakIters, severed);
+            std::vector<uint32_t> clusters;
+            fract::CountFractPieces(frags, breakBonds, severed, &clusters);
+
+            const fract::fx kGravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const fract::fx kDt = fpx::kOne / 60;
+            const int kSteps = 120;
+            const int kSolveIters = 8;
+            fract::FractStepConfig cfg;
+            cfg.worldCellSize = fpx::kOne / 4;     // 0.25 world units per lattice cell (the FR4 scale)
+            cfg.gravity = fract::FxVec3{0, kGravY, 0};
+            cfg.groundY = 0;
+            cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};
+            cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+
+            fpx::FxWorld world =
+                fract::SpawnFractWorld(frags, breakBonds, severed, clusters, hardImpact, cfg);
+            fract::StepFractureSteps(world, kDt, kSolveIters, kSteps);   // settle the rubble (pure integer)
+            const uint32_t kBodies = (uint32_t)world.bodies.size();
+
+            // The instance set (one FLOAT matrix per body via fpx::FxBodyTransform — the ONE float crossing,
+            // render-only) + the parallel anchor/chunk split. The bodies' radii (boundRadius·worldCellSize) carry
+            // the real chunk size, so FxBodyTransform's scale already gives a coherent rubble pile of stones.
+            std::vector<uint8_t> isDynamic;
+            const std::vector<Mat4> mats = fract::FractToRenderInstances(world, &isDynamic);
+            std::vector<scene::InstanceData> anchorInstances;   // static held base (held stone)
+            std::vector<scene::InstanceData> chunkInstances;    // dislodged rubble (warmer stone)
+            for (size_t i = 0; i < mats.size(); ++i) {
+                scene::InstanceData inst;
+                for (int k = 0; k < 16; ++k) inst.model[k] = mats[i].m[k];
+                if (isDynamic[i]) chunkInstances.push_back(inst); else anchorInstances.push_back(inst);
+            }
+            // The COMBINED set (anchor-then-chunk) feeds the single shadow draw.
+            std::vector<scene::InstanceData> allInstances;
+            allInstances.reserve(mats.size());
+            allInstances.insert(allInstances.end(), anchorInstances.begin(), anchorInstances.end());
+            allInstances.insert(allInstances.end(), chunkInstances.begin(), chunkInstances.end());
+            const uint32_t kAnchor   = (uint32_t)anchorInstances.size();
+            const uint32_t kDynamic  = (uint32_t)chunkInstances.size();
+            const uint32_t kInstanceCount = (uint32_t)allInstances.size();
+
+            // === Reuse the EXISTING instanced-lit pipeline (the --cgf-render-shot / --fpx-render-shot wiring). ===
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get();
+            instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = device->Swapchain().ColorFormat();
+            instDesc.depthTest = true;
+            instDesc.usesFrameUniforms = true;
+            instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto instShWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_instanced.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto instShVs = device->CreateShaderModule({std::span<const uint32_t>(instShWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc instShDesc;
+            instShDesc.vertex = instShVs.get();
+            instShDesc.fragment = shadowFs.get();
+            instShDesc.vertexLayout = scene::MeshVertexLayout();
+            instShDesc.instanceLayout = scene::InstanceTransformLayout();
+            instShDesc.depthTest = true;
+            instShDesc.depthOnly = true;
+            instShDesc.usesFrameUniforms = true;
+            instShDesc.pushConstantSize = 0;
+            auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get();
+            stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true;
+            stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground: a solid muted dark floor (NOT the blue-tinted checkerboard, whose white checks mirror the
+            // blue sky IBL and read as an iridescent slab). A neutral slate floor lets the stone rubble read.
+            const uint8_t groundPx[4] = {110, 88, 64, 255};   // muted warm rock floor (warm so it does not read blue)
+            auto groundTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            // The anchor vs chunks are distinguished by per-draw ALBEDO TEXTURE (the existing lit pipeline's
+            // albedo is gTex * meshVertexColor — the per-draw `material` push constant is metallic/roughness
+            // ONLY, NOT a color; so a solid stone texture for the anchor draw + a solid warmer-stone texture for
+            // the chunk draw colors the two draws WITHOUT a new shader/per-instance color, using only
+            // CreateTexture + BindMaterial). Bright base values pre-compensate the sphere mesh's cool
+            // {0.85,0.85,0.9} vertex tint, so the rubble reads as broken rock (NOT GF6's sand/cyan).
+            // The lit.frag adds a BLUE sky-tinted ambient (albedo·SkyColor(N)·0.15) + a 0.04 IBL-Fresnel
+            // floor of the blue zenith even at roughness 1.0, so a muted/neutral albedo reads BLUE (the GF6
+            // lesson). Use HEAVILY-SATURATED WARM stone values (like GF6's 255,150,30 sand) so the warm
+            // diffuse albedo dominates the blue ambient -> the rubble reads as broken WARM ROCK, not blue.
+            const uint8_t anchorPx[4] = {255, 175,  70, 255};   // warm sandstone base (GF6-saturation warm)
+            const uint8_t chunkPx[4]  = {255, 125,  35, 255};   // hotter ochre RUBBLE (the freshly-broken stone)
+            auto anchorTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, anchorPx, sizeof(anchorPx)});
+            auto chunkTex  = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, chunkPx,  sizeof(chunkPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            // TWO instance buffers (anchor / chunks) so each colored draw binds its own buffer from instance 0
+            // (the robust two-draw path — no firstInstance arithmetic). The combined buffer feeds the shadow draw.
+            std::unique_ptr<rhi::IBuffer> allBuffer;     // combined (shadow pass)
+            std::unique_ptr<rhi::IBuffer> anchorBuffer;  // anchor only (stone draw)
+            std::unique_ptr<rhi::IBuffer> chunkBuffer;   // chunks only (rubble draw)
+            if (kInstanceCount > 0) {
+                rhi::BufferDesc d;
+                d.size = (uint64_t)allInstances.size() * sizeof(scene::InstanceData);
+                d.initialData = allInstances.data();
+                d.usage = rhi::BufferUsage::Vertex;
+                allBuffer = device->CreateBuffer(d);
+            }
+            if (kAnchor > 0) {
+                rhi::BufferDesc d;
+                d.size = (uint64_t)anchorInstances.size() * sizeof(scene::InstanceData);
+                d.initialData = anchorInstances.data();
+                d.usage = rhi::BufferUsage::Vertex;
+                anchorBuffer = device->CreateBuffer(d);
+            }
+            if (kDynamic > 0) {
+                rhi::BufferDesc d;
+                d.size = (uint64_t)chunkInstances.size() * sizeof(scene::InstanceData);
+                d.initialData = chunkInstances.data();
+                d.usage = rhi::BufferUsage::Vertex;
+                chunkBuffer = device->CreateBuffer(d);
+            }
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // Fixed 3/4 hero camera + directional light reading the destroyed object. The rubble spans x,z in
+            // ~[0,8] (32 cells · 0.25); aim at the bed centre, a lower frontal angle so the held anchor AND the
+            // scattered chunks read. The light rakes FROM the camera side + overhead (lightDir ~ from +x,+y,+z)
+            // so the camera-facing surfaces are directly lit (NOT back-lit into the blue ambient) — the key to
+            // a warm-stone read (heeding the blue-ambient/GF6 lesson).
+            const Vec3 eye{13.0f, 4.5f, 11.0f};
+            const Vec3 center{4.0f, 1.6f, 4.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                // Light travels DOWN + toward -x,-z from the camera's upper-near side: -lightDir points back
+                // toward (+x,+y,+z), i.e. toward the camera-facing surfaces -> they are lit, not shadowed. A
+                // STRONG warm key (intensity > 1) washes out the blue sky-ambient on the self-shadowed
+                // crevices of the dense rubble so the whole pile reads as warm stone (the GF6 lesson).
+                fd.lightDir[0] = 0.15f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.35f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{0.15f, -0.8f, -0.35f});
+                Vec3 sc{4.0f, 2.0f, 4.0f};
+                Vec3 lightEye = sc - lightDir * 20.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-14.0f, 14.0f, -14.0f, 14.0f, 1.0f, 48.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instShadowPipeline);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*allBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;  // fully matte neutral floor
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instPipeline);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindIndexBuffer(sphere.indices());
+                        // metallic 0, roughness 1.0 (FULLY matte stone). At roughness==1 the IBL Fresnel rim term
+                        // collapses to F0 (0.04) — (1-roughness)=0 so the grazing-angle blue-sky reflection that
+                        // would make the rubble read as an iridescent sheen vanishes, leaving the matte stone
+                        // albedo to dominate (the GF6 iridescence-kill discipline).
+                        float stoneMat[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+                        // DRAW 1: the held ANCHOR — the cool held-stone albedo texture.
+                        if (kAnchor > 0) {
+                            cmd.PushConstants(stoneMat, sizeof(stoneMat));
+                            cmd.BindMaterial(*anchorTex, *flatNormal);
+                            cmd.BindInstanceBuffer(*anchorBuffer);
+                            cmd.DrawIndexedInstanced(sphere.indexCount(), kAnchor);
+                        }
+                        // DRAW 2: the dislodged CHUNKS — the warmer rubble albedo texture.
+                        if (kDynamic > 0) {
+                            cmd.PushConstants(stoneMat, sizeof(stoneMat));
+                            cmd.BindMaterial(*chunkTex, *flatNormal);
+                            cmd.BindInstanceBuffer(*chunkBuffer);
+                            cmd.DrawIndexedInstanced(sphere.indexCount(), kDynamic);
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!device->GetCapturedPixels(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOFS ===
+            auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+                uint32_t n = 0;
+                for (size_t p = 0; p + 3 < img.size(); p += 4) {
+                    const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+                    if (b + g + r > 60) ++n;   // above the near-black sky clear
+                }
+                return n;
+            };
+            const uint32_t shaded = countShaded(px);
+
+            // (1) instance provenance / count: instances == bodies, every transform from the settled FxWorld.
+            std::printf("fract-render: {bodies:%u, anchor:%u, dynamic:%u, instances:%u} from bit-exact rubble\n",
+                        kBodies, kAnchor, kDynamic, kInstanceCount);
+
+            // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+            if (!device->GetCapturedPixels(px2, cw2, ch3)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (2nd render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (px.size() != px2.size() || std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                std::fprintf(stderr, "FATAL: fract-render two runs DIFFER (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("fract-render determinism: two runs BYTE-IDENTICAL\n");
+
+            // (3) provenance check: rebuilding instances from the same settled world -> identical matrices (the
+            // float transform is a pure function of the integer body state).
+            {
+                const std::vector<Mat4> rebuild = fract::FractToRenderInstances(world, nullptr);
+                bool identical = (rebuild.size() == mats.size());
+                for (size_t k = 0; k < mats.size() && identical; ++k)
+                    if (std::memcmp(mats[k].m, rebuild[k].m, sizeof(float) * 16) != 0) identical = false;
+                if (!identical) {
+                    std::fprintf(stderr, "FATAL: fract-render instances != rebuild (transform not a pure "
+                                         "function of the state)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("fract-render provenance: instances == rebuild\n");
+
+            // coverage / coherence: shaded>0 and not uniform (a recognizable destroyed-object scene).
+            if (shaded == 0) {
+                std::fprintf(stderr, "FATAL: fract-render coverage 0 (nothing shaded)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (shaded == (uint32_t)(px.size() / 4)) {
+                std::fprintf(stderr, "FATAL: fract-render uniform image (no coherent scene)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // empty no-op: an empty world -> zero instances -> the cleared base scene.
+            {
+                fpx::FxWorld emptyWorld;
+                const std::vector<Mat4> emptyInst = fract::FractToRenderInstances(emptyWorld, nullptr);
+                if (!emptyInst.empty()) {
+                    std::fprintf(stderr, "FATAL: fract-render empty world not empty\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            bool ok = WriteBMP(fractRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — deterministic fracture rubble lit 3D render "
+                                "(%u bodies, %u anchor, %u chunks)\n",
+                                fractRenderShotPath, cw, ch2, kBodies, kAnchor, kDynamic);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
