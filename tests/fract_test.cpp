@@ -478,6 +478,234 @@ int main() {
         check(allAdjacent, "FR3 cracks: every severed bond connects two valid (adjacent) fragments");
     }
 
+    // ================= FR4: SpawnFractWorld — anchor is the largest piece (static), others dynamic ====
+    {
+        // A 3-cell line (3 fragments). Sever the (1,2) bond -> pieces {0,1} (2 frags) and {2} (1 frag).
+        // The anchor = the largest piece {0,1}; fragments 0,1 STATIC, fragment 2 DYNAMIC.
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        std::vector<uint8_t> sev(bonds.bonds.size(), 0u);
+        sev[1] = 1u;   // sever the (1,2) bond
+        std::vector<uint32_t> clusters;
+        uint32_t pieces = fract::CountFractPieces(frags, bonds, sev, &clusters);
+        check(pieces == 2u, "FR4 spawn: the break yields 2 pieces");
+
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne;            // 1 lattice cell == 1 world unit
+        cfg.gravity = fract::FxVec3{0, (fract::fx)(-9 * (int)fpx::kOne), 0};
+        cfg.groundY = (fract::fx)(-1000 * (int)fpx::kOne);
+        fract::BreakImpact imp{2u, 0};            // impact on fragment 2 (the dynamic chunk)
+        fpx::FxWorld w = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+        check(w.bodies.size() == 3u, "FR4 spawn: one body per fragment");
+
+        const uint32_t anchor = fract::FractAnchorPiece(frags, clusters);
+        int statics = 0, dyn = 0;
+        for (uint32_t i = 0; i < 3u; ++i) {
+            const bool isAnchor = (clusters[i] == anchor);
+            if (isAnchor) {
+                check(w.bodies[i].invMass == 0 && !(w.bodies[i].flags & fpx::kFlagDynamic),
+                      "FR4 spawn: anchor-piece fragment is STATIC (invMass 0, not dynamic)");
+                ++statics;
+            } else {
+                check((w.bodies[i].flags & fpx::kFlagDynamic) != 0u,
+                      "FR4 spawn: non-anchor fragment is DYNAMIC");
+                ++dyn;
+            }
+        }
+        check(statics == 2 && dyn == 1, "FR4 spawn: 2 anchor (static) + 1 dynamic chunk");
+
+        // World positions == centroid·worldCellSize (worldCellSize==kOne here -> pos == centroid<<kFrac).
+        bool posOK = true;
+        for (uint32_t i = 0; i < 3u; ++i) {
+            const fract::FractFragment& fr = frags.fragments[i];
+            if (w.bodies[i].pos.x != (fract::fx)(fr.cx * (int)fpx::kOne) ||
+                w.bodies[i].pos.y != (fract::fx)(fr.cy * (int)fpx::kOne) ||
+                w.bodies[i].pos.z != (fract::fx)(fr.cz * (int)fpx::kOne)) posOK = false;
+        }
+        check(posOK, "FR4 spawn: body pos == centroid·worldCellSize");
+    }
+
+    // ================= FR4: SpawnFractWorld — the impacted dynamic body is seeded with impact vel =====
+    {
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        std::vector<uint8_t> sev(bonds.bonds.size(), 0u); sev[1] = 1u;
+        std::vector<uint32_t> clusters;
+        fract::CountFractPieces(frags, bonds, sev, &clusters);
+
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne;
+        cfg.impactDir = fract::FxVec3{fpx::kOne, 0, 0};   // +X
+        cfg.impactSpeed = (fract::fx)(5 * (int)fpx::kOne); // 5 units/s
+        fract::BreakImpact imp{2u, 0};                    // fragment 2 is the dynamic chunk
+        fpx::FxWorld w = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+        check(w.bodies[2].vel.x == (fract::fx)(5 * (int)fpx::kOne) && w.bodies[2].vel.y == 0,
+              "FR4 spawn: impacted dynamic body seeded vel = impactDir·impactSpeed");
+        // A non-impacted dynamic body has zero initial vel.
+        // (fragment 2 is the only dynamic here; assert it is the seeded one — covered above.)
+    }
+
+    // ================= FR4: StepFracture — a dynamic body above ground FALLS then clamps at groundY ====
+    {
+        fpx::FxWorld w;
+        w.gravity = fract::FxVec3{0, (fract::fx)(-9 * (int)fpx::kOne), 0};
+        w.groundY = 0;
+        fpx::FxBody b;
+        b.pos = fract::FxVec3{0, (fract::fx)(10 * (int)fpx::kOne), 0};   // 10 units up
+        b.invMass = fpx::kOne; b.flags = fpx::kFlagDynamic;
+        b.radius = (fract::fx)(fpx::kOne / 2);                            // 0.5
+        b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+        w.bodies = {b};
+        const fract::fx dt = fpx::kOne / 60;
+        const fract::fx startY = w.bodies[0].pos.y;
+        fract::StepFracture(w, dt, 4);
+        check(w.bodies[0].pos.y < startY, "FR4 step: a dynamic body falls (pos.y decreases)");
+        fract::StepFractureSteps(w, dt, 8, 400);   // plenty of ticks to land
+        // The body's BOTTOM rests on/above the ground (ResolveGround clamps pos.y - radius >= groundY).
+        check(w.bodies[0].pos.y - w.bodies[0].radius >= w.groundY - (fpx::kOne / 1000),
+              "FR4 step: the fallen body rests on/above the floor (no body buried)");
+        // The orientation stayed identity (angVel==0 -> the 6-DOF integrate is a no-op on orient).
+        check(w.bodies[0].orient.x == 0 && w.bodies[0].orient.y == 0 && w.bodies[0].orient.z == 0 &&
+              w.bodies[0].orient.w == fpx::kOne,
+              "FR4 step: angVel==0 keeps orient identity EXACTLY");
+    }
+
+    // ================= FR4: StepFracture — a static anchor body NEVER moves =============================
+    {
+        fpx::FxWorld w;
+        w.gravity = fract::FxVec3{0, (fract::fx)(-9 * (int)fpx::kOne), 0};
+        w.groundY = 0;
+        fpx::FxBody s;
+        s.pos = fract::FxVec3{(fract::fx)(3 * (int)fpx::kOne), (fract::fx)(7 * (int)fpx::kOne), 0};
+        s.invMass = 0; s.flags = 0;   // static
+        s.radius = fpx::kOne;
+        s.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+        w.bodies = {s};
+        const fract::FxVec3 startPos = w.bodies[0].pos;
+        fract::StepFractureSteps(w, fpx::kOne / 60, 6, 120);
+        check(w.bodies[0].pos.x == startPos.x && w.bodies[0].pos.y == startPos.y &&
+              w.bodies[0].pos.z == startPos.z, "FR4 step: a static anchor never moves");
+    }
+
+    // ================= FR4: two dynamic bodies dropped together collide (end >= their radii apart) =====
+    {
+        fpx::FxWorld w;
+        w.gravity = fract::FxVec3{0, (fract::fx)(-9 * (int)fpx::kOne), 0};
+        w.groundY = 0;
+        const fract::fx r = (fract::fx)(fpx::kOne * 6 / 10);   // 0.6 radius -> diameter 1.2
+        auto mk = [&](int x, int y) {
+            fpx::FxBody b;
+            b.pos = fract::FxVec3{(fract::fx)(x * (int)fpx::kOne), (fract::fx)(y * (int)fpx::kOne), 0};
+            b.invMass = fpx::kOne; b.flags = fpx::kFlagDynamic; b.radius = r;
+            b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};
+            return b;
+        };
+        // Start overlapping horizontally (1 unit apart < 1.2 diameter) and let them settle.
+        w.bodies = {mk(0, 3), mk(1, 3)};
+        fract::StepFractureSteps(w, fpx::kOne / 60, 12, 400);
+        const fract::FxVec3 d = fpx::FxSub(w.bodies[1].pos, w.bodies[0].pos);
+        const fract::fx dist = fpx::FxLength(d);
+        // After settling the two bounding spheres are pushed apart to ~>= the sum of radii (within a small
+        // PBD residual band — the FPX3 positional solver is not exact, the documented within-band caveat).
+        check(dist >= (r + r) - (fpx::kOne / 8),
+              "FR4 step: two collided dynamic bodies end >= their radii apart (no interpenetration)");
+    }
+
+    // ================= FR4: a soft impact (1 piece -> all anchor) is a STATIC no-op =====================
+    {
+        // No severed bonds -> 1 piece -> every fragment is the anchor -> all bodies STATIC -> nothing falls.
+        fract::FractField f; f.nx = 3; f.ny = 1; f.nz = 1;
+        std::vector<fract::FractSeed> seeds = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, 3, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        std::vector<uint8_t> sev(bonds.bonds.size(), 0u);   // NOTHING severed (soft)
+        std::vector<uint32_t> clusters;
+        uint32_t pieces = fract::CountFractPieces(frags, bonds, sev, &clusters);
+        check(pieces == 1u, "FR4 soft: an intact body is 1 piece");
+
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne;
+        cfg.gravity = fract::FxVec3{0, (fract::fx)(-9 * (int)fpx::kOne), 0};
+        cfg.groundY = 0;
+        fract::BreakImpact imp{0u, 0};
+        fpx::FxWorld w = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+        int dyn = 0;
+        for (const auto& b : w.bodies) if (b.flags & fpx::kFlagDynamic) ++dyn;
+        check(dyn == 0, "FR4 soft: 1 piece -> every body is the anchor (0 dynamic)");
+        fpx::FxWorld before = w;
+        fract::StepFractureSteps(w, fpx::kOne / 60, 6, 60);
+        bool noop = w.bodies.size() == before.bodies.size();
+        for (size_t i = 0; noop && i < w.bodies.size(); ++i)
+            if (w.bodies[i].pos.x != before.bodies[i].pos.x ||
+                w.bodies[i].pos.y != before.bodies[i].pos.y ||
+                w.bodies[i].pos.z != before.bodies[i].pos.z) noop = false;
+        check(noop, "FR4 soft: the all-static world is a no-op (nothing moves)");
+    }
+
+    // ================= FR4: StepFracture determinism + break-and-fall (the showcase scene) =============
+    {
+        // The SAME scene the --fract-step-shot showcase drives (32x32x16, worldCellSize 0.25, K=120) so the
+        // CPU test pins the exact bit-exact reference + the break-and-fall contract.
+        fract::FractField f; f.nx = 32; f.ny = 32; f.nz = 16;
+        std::vector<fract::FractSeed> seeds = {
+            { 4,  5,  3}, {27,  6,  2}, { 6, 26,  4}, {25, 27,  3},
+            {16, 15,  8}, { 3, 14, 12}, {29, 18, 13}, {14,  3, 11},
+            {18, 29, 10}, { 9,  9,  6}, {22, 11,  9}, {11, 22,  7},
+            {24, 24, 12}, { 7, 18,  2}, {20,  7, 14}, {15, 28,  6},
+        };
+        const int M = (int)seeds.size();
+        fract::FractCells cells; fract::ClassifyFractCells(f, seeds, cells);
+        fract::FractFragments frags; fract::ExtractFragments(f, cells, M, frags);
+        fract::FractBonds bonds; fract::BuildFractBonds(f, cells, frags, bonds);
+        fract::BreakImpact imp{0u, (fract::fx)(1000 * (int)fpx::kOne)};
+        std::vector<uint8_t> sev;
+        fract::ApplyImpactBreak(bonds, frags, imp, 4, sev);
+        std::vector<uint32_t> clusters;
+        fract::CountFractPieces(frags, bonds, sev, &clusters);
+
+        const fract::fx gravY = (fract::fx)(-9.8 * (double)fpx::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        fract::FractStepConfig cfg;
+        cfg.worldCellSize = fpx::kOne / 4;                            // 0.25 world units per cell
+        cfg.gravity = fract::FxVec3{0, gravY, 0};
+        cfg.groundY = 0;
+        cfg.impactDir = fract::FxVec3{fpx::kOne / 2, -fpx::kOne, 0};   // down + sideways (chunks fall)
+        cfg.impactSpeed = (fract::fx)(4 * (int)fpx::kOne);
+        const int kSteps = 120, kIters = 8;
+
+        fpx::FxWorld a = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+        fpx::FxWorld b = a;
+        fract::StepFractureSteps(a, fpx::kOne / 60, kIters, kSteps);
+        fract::StepFractureSteps(b, fpx::kOne / 60, kIters, kSteps);
+        bool same = a.bodies.size() == b.bodies.size() &&
+                    std::memcmp(a.bodies.data(), b.bodies.data(),
+                                a.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "FR4 step determinism: two StepFractureSteps runs BYTE-IDENTICAL");
+
+        // A HARD break yields dynamic chunks that FELL (mean dynamic pos.y dropped from spawn) — the
+        // break-and-fall contract; the anchor (static) is unchanged.
+        const uint32_t anchorIdx = fract::FractAnchorBodyIndex(frags, clusters);
+        fpx::FxWorld spawn = fract::SpawnFractWorld(frags, bonds, sev, clusters, imp, cfg);
+        const fract::FractRubbleState s0 = fract::MeasureFractRubble(spawn, anchorIdx);
+        const fract::FractRubbleState s1 = fract::MeasureFractRubble(a, anchorIdx);
+        check(s1.dynamic > 0u, "FR4 rubble: a hard break has dynamic chunks");
+        check(s1.meanDynamicY < s0.meanDynamicY, "FR4 rubble: the dynamic chunks FELL (mean pos.y dropped)");
+        check(s1.anchorY == s0.anchorY, "FR4 rubble: the anchor (static) pos.y is UNCHANGED");
+        // Every dynamic chunk rests with its CENTER on/above the ground (the ground clamp held — proof (4);
+        // the sphere-bound rubble's bottom may dip a sub-radius amount on the final Gauss-Seidel sweep where
+        // pairs resolve AFTER the ground, the documented FPX3 ground-then-pairs ordering artifact).
+        bool allAbove = true;
+        for (const fpx::FxBody& bd : a.bodies)
+            if ((bd.flags & fpx::kFlagDynamic) && (bd.pos.y < cfg.groundY)) allAbove = false;
+        check(allAbove, "FR4 rubble: every dynamic chunk's center rests on/above the floor (clamp held)");
+    }
+
     if (g_fail == 0) std::printf("fract_test: ALL PASS\n");
     else std::printf("fract_test: %d FAIL\n", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -555,4 +555,227 @@ inline uint32_t CountFractPieces(const FractFragments& fragments, const FractBon
     return pieces;
 }
 
+// ====================================================================================================
+// Slice FR4 — THE FRACTURE STEP (released fragments fall). Additive over FR1+FR2+FR3 (ALL code above is
+// byte-unchanged). FR1 made the cells, FR2 the fragments, FR3 the break (the severed-bond SET + the piece
+// clusters). FR4 turns the break into MOVING RUBBLE: each fragment becomes an independent fpx::FxBody rigid
+// body in WORLD UNITS (Q16.16) — the dislodged pieces fall under gravity, collide as bounding spheres, and
+// settle into a coherent pile, while the LARGEST (anchor) piece holds STATIC. The object SHATTERS and the
+// chunks fall — bit-identical CPU<->Vulkan<->Metal. NO new shader: a host-driven multi-pass driver over the
+// EXISTING fpx.h rigid solver (the CP4/CG4/GF4 mold — IntegrateBodyFull + the FPX2 broadphase + the FPX3
+// SolveContacts + ResolveGround). This is where the FR1-FR3 integer-lattice world becomes a Q16.16
+// world-unit body set.
+//
+// THE GPU PROOF (NO new shader, the FPX1/GR3 split): StepFracture mirrors fpx_solve.comp's per-step body
+// EXACTLY (IntegrateBodyFull then SolveContacts), so the Vulkan --fract-step-shot drives the EXISTING
+// shaders/fpx_solve.comp over the fragment bodies (ONE dispatch per tick, host-rebuilding the FPX2 pair
+// list each tick from the current positions — the realistic per-tick re-broadphase), and memcmp's the final
+// body set vs the CPU StepFractureSteps. fpx_solve.comp is int64 -> Vulkan-only; the Metal --fract-step runs
+// the CPU StepFractureSteps (byte-identical by construction). The fragments spawn with angVel==0 + identity
+// orient, and IntegrateOrientation with angVel==0 leaves an identity quaternion EXACTLY (omega=0 -> dq=0 ->
+// orient unchanged -> FxQuatNormalize(identity)=identity), so IntegrateBodyFull is byte-identical to
+// fpx_solve.comp's IntegrateStep on these bodies — the GPU drives fpx_solve.comp with NO orientation pass and
+// stays bit-exact to the CPU IntegrateBodyFull reference (the spec's 6-DOF integrate is carried, dormant on
+// this scene, ready for spinning rubble in a later slice).
+//
+// HONEST SIMPLIFICATIONS (the documented first cut, both stated): (1) FPX3 SolveContacts is SPHERE-SPHERE
+// (no convex manifold), so each fragment collides as its BOUNDING SPHERE (fragment.boundRadius·cellSize) —
+// the rubble is a pile of ROUNDED chunks, NOT interlocking shards (the couple.h body-as-sphere precedent;
+// SAT/clipping + an inertia tensor + torque-from-contact does not exist in engine/sim and is the deferred
+// refinement). (2) The ANCHOR is the LARGEST piece (most fragments; lowest cluster-id tie-break) — a real
+// engine anchors the GROUND-attached piece. Both are deterministic, integer, within-band.
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only. FR4 only CALLS fpx.h (read-only).
+
+// ----- (A) The world-unit spawn config (host-fixed Q16.16 constants) --------------------------------
+// FractStepConfig carries the lattice->world up-conversion + the gravity/ground + the impact seed. ALL
+// host-fixed, pure integer. worldCellSize is the Q16.16 size of ONE lattice cell in world units (the ONLY
+// integer up-conversion FR4 introduces — worldPos = latticeCoord·worldCellSize via a single fxmul). impactDir
+// is a Q16.16 direction (need NOT be unit — the seeded vel is impactDir·impactSpeed component-wise scaled).
+struct FractStepConfig {
+    fx     worldCellSize = fpx::kOne;        // Q16.16 world size of one lattice cell (lattice->world scale)
+    FxVec3 gravity{};                        // Q16.16 acceleration (e.g. (0, -9.8, 0))
+    fx     groundY = 0;                      // Q16.16 ground plane height
+    FxVec3 impactDir{};                      // Q16.16 impact direction (vel = impactDir·impactSpeed)
+    fx     impactSpeed = 0;                  // Q16.16 impact speed magnitude (seeds the impacted body)
+};
+
+// ----- The anchor selection (the LARGEST piece; lowest cluster-id tie-break) ------------------------
+// FractAnchorPiece(fragments, clusters): the cluster LABEL of the largest piece = the piece owning the MOST
+// fragments (ties broken by the LOWEST cluster label — deterministic total order). That piece's fragments
+// become STATIC (the intact base); every other piece's fragments are DYNAMIC (the dislodged rubble). Pure
+// int32, fixed scan order. Returns 0xFFFFFFFF if there are no fragments (degenerate — no anchor).
+inline uint32_t FractAnchorPiece(const FractFragments& fragments, const std::vector<uint32_t>& clusters) {
+    const uint32_t M = (uint32_t)fragments.fragments.size();
+    if (M == 0u || (uint32_t)clusters.size() != M) return 0xFFFFFFFFu;
+    // Per-cluster fragment count, indexed by cluster LABEL (labels are in [0,M) from CountFractPieces'
+    // min-label propagation). A fixed ascending scan -> deterministic.
+    std::vector<uint32_t> count((size_t)M, 0u);
+    for (uint32_t f = 0; f < M; ++f) {
+        const uint32_t c = clusters[(size_t)f];
+        if (c < M) ++count[(size_t)c];
+    }
+    uint32_t bestLabel = 0xFFFFFFFFu;
+    uint32_t bestCount = 0u;
+    for (uint32_t c = 0; c < M; ++c) {
+        if (count[(size_t)c] == 0u) continue;              // not a live cluster root
+        // STRICTLY-greater keeps the FIRST (lowest-label) cluster on a tie -> deterministic tie-break.
+        if (count[(size_t)c] > bestCount) { bestCount = count[(size_t)c]; bestLabel = c; }
+    }
+    return bestLabel;
+}
+
+// ----- (B) SpawnFractWorld: one fpx::FxBody per fragment, anchor static, impact seeded ---------------
+// Builds an fpx::FxWorld from the FR2 fragments + the FR3 break (severed flags + the piece clusters). One
+// FxBody per fragment, ordered by ascending fragment index (the FR2 compact order):
+//   pos     = (cx,cy,cz)·worldCellSize           (the lattice centroid up-converted to Q16.16 world units)
+//   radius  = boundRadius·worldCellSize          (the bounding sphere in world units — the FPX3 collider)
+//   invMass = fragment.invMass                   (FR2's Q16.16 reciprocal of the voxel count)
+//   orient  = identity, angVel = 0               (no initial spin; the 6-DOF integrate is dormant here)
+// The ANCHOR rule: the LARGEST piece's fragments are STATIC (invMass=0, NOT kFlagDynamic — the intact base);
+// every OTHER fragment is DYNAMIC (kFlagDynamic). The IMPACTED fragment's body (impact.fragment) is seeded
+// with vel = impactDir·impactSpeed (component-wise fxmul) IF it is dynamic (an anchor fragment is never
+// kicked loose). `severed` is unused by the spawn itself (the clusters already encode the break) but is kept
+// in the signature for the spec'd call shape. Pure integer (fxmul by host constants). Empty fragments ->
+// empty world.
+inline fpx::FxWorld SpawnFractWorld(const FractFragments& fragments, const FractBonds& bonds,
+                                    const std::vector<uint8_t>& severed,
+                                    const std::vector<uint32_t>& clusters,
+                                    const BreakImpact& impact, const FractStepConfig& cfg) {
+    (void)bonds; (void)severed;   // the clusters already encode the connectivity result; kept per the spec.
+    fpx::FxWorld world;
+    world.gravity = cfg.gravity;
+    world.groundY = cfg.groundY;
+
+    const uint32_t M = (uint32_t)fragments.fragments.size();
+    if (M == 0u) return world;
+
+    const uint32_t anchor = FractAnchorPiece(fragments, clusters);
+    const bool haveClusters = ((uint32_t)clusters.size() == M);
+
+    world.bodies.reserve((size_t)M);
+    for (uint32_t f = 0; f < M; ++f) {
+        const FractFragment& fr = fragments.fragments[(size_t)f];
+        fpx::FxBody b;
+        // Lattice centroid -> Q16.16 world position. cx/cy/cz are small integers; promote to Q16.16 then
+        // fxmul by the cell size: world = (cx<<kFrac) * worldCellSize >> kFrac == cx · worldCellSize.
+        b.pos = FxVec3{ fpx::fxmul((fx)((int64_t)fr.cx << fpx::kFrac), cfg.worldCellSize),
+                        fpx::fxmul((fx)((int64_t)fr.cy << fpx::kFrac), cfg.worldCellSize),
+                        fpx::fxmul((fx)((int64_t)fr.cz << fpx::kFrac), cfg.worldCellSize) };
+        b.vel = FxVec3{0, 0, 0};
+        b.radius = fpx::fxmul((fx)((int64_t)fr.boundRadius << fpx::kFrac), cfg.worldCellSize);
+        b.invMass = fr.invMass;
+        b.orient = fpx::FxQuat{0, 0, 0, fpx::kOne};   // identity
+        b.angVel = FxVec3{0, 0, 0};
+
+        // The anchor rule: the largest piece's fragments are STATIC; all others DYNAMIC.
+        const bool isAnchor = haveClusters && (clusters[(size_t)f] == anchor) && (anchor != 0xFFFFFFFFu);
+        if (isAnchor) {
+            b.invMass = 0;          // static: infinite mass, never integrated
+            b.flags = 0;            // NOT dynamic
+        } else {
+            b.flags = fpx::kFlagDynamic;
+        }
+        world.bodies.push_back(b);
+    }
+
+    // Seed the impacted fragment's body with the impact velocity (only if it is a dynamic chunk).
+    if (impact.fragment < M) {
+        fpx::FxBody& hit = world.bodies[(size_t)impact.fragment];
+        if (hit.flags & fpx::kFlagDynamic) {
+            hit.vel = FxVec3{ fpx::fxmul(cfg.impactDir.x, cfg.impactSpeed),
+                              fpx::fxmul(cfg.impactDir.y, cfg.impactSpeed),
+                              fpx::fxmul(cfg.impactDir.z, cfg.impactSpeed) };
+        }
+    }
+    return world;
+}
+
+// ----- (C) StepFracture: ONE deterministic tick (the CP4/CG4/GF4 driver over fpx VERBATIM) ----------
+// Mirrors fpx_solve.comp's per-step body EXACTLY so the GPU --fract-step-shot can drive that shader (steps=1)
+// and stay bit-exact:
+//   (a) INTEGRATE each body via IntegrateBodyFull (the FPX4 6-DOF: gravity + linear + orientation tumble),
+//       then the FPX1 floor clamp (which IntegrateBodyFull omits — fpx_solve.comp's pass A does it) so the
+//       composition == fpx_solve.comp pass A (translate+clamp) + the identity-preserving orientation step.
+//   (b) BROADPHASE: CountPairs/BuildPairs rebuilt from the CURRENT positions (the realistic per-tick
+//       re-broadphase; the GPU host rebuilds the SAME deterministic list each tick).
+//   (c) SOLVE: SolveContacts(world, pairs, solveIters) — the FPX3 sphere-sphere non-penetration Gauss-Seidel
+//       (ground-then-pairs each sweep), reused VERBATIM.
+// Static bodies (the anchor) never move (IntegrateBodyFull gates translation on kFlagDynamic; ResolveGround
+// inside SolveContacts skips invMass==0). Pure integer, fixed op order -> two runs byte-identical AND the GPU
+// fpx_solve.comp result is byte-identical to this. Reuses fpx.h with ZERO modification.
+inline void StepFracture(fpx::FxWorld& world, fx dt, int solveIters) {
+    // (a) integrate (6-DOF) + the FPX1 floor clamp (== fpx_solve.comp pass A on these angVel==0 bodies).
+    for (fpx::FxBody& b : world.bodies) {
+        fpx::IntegrateBodyFull(b, world.gravity, dt);
+        if (b.flags & fpx::kFlagDynamic) {
+            if (b.pos.y < world.groundY) {
+                b.pos.y = world.groundY;
+                if (b.vel.y < 0) b.vel.y = 0;
+            }
+        }
+    }
+    // (b) re-broadphase from the current positions.
+    std::vector<uint32_t> offsets;
+    std::vector<fpx::FxPair> pairs;
+    fpx::BuildPairs(world, offsets, pairs);
+    // (c) the FPX3 sphere-sphere solve (ground-then-pairs, K sweeps).
+    fpx::SolveContacts(world, std::span<const fpx::FxPair>(pairs), solveIters);
+}
+
+// StepFractureSteps(world, dt, solveIters, steps): run K StepFracture ticks. The CPU reference the GPU
+// fpx_solve.comp per-tick driver memcmp's against. Pure integer -> two runs byte-identical, cross-backend
+// identical.
+inline void StepFractureSteps(fpx::FxWorld& world, fx dt, int solveIters, int steps) {
+    for (int s = 0; s < steps; ++s) StepFracture(world, dt, solveIters);
+}
+
+// ----- (D) MeasureFractRubble: the honest emergent-metrics helper (the CG4 MeasureCGrainState twin) -----
+// Deterministic Q16.16 stats over the settled world: the rest line of the dynamic chunks (mean pos.y), the
+// anchor body's pos.y, and the settled/airborne split. "settled" = a dynamic body whose bottom (pos.y -
+// radius) is within a small band of the ground (kRestBand) — resting on the floor/pile; "airborne" = the
+// rest. anchorIndex is the body index of the static anchor (or a sentinel >= bodies.size() if none) — its
+// pos.y is reported verbatim. Pure integer (a fixed-order sum + an integer mean).
+struct FractRubbleState {
+    fx       meanDynamicY = 0;   // Q16.16 mean pos.y over the DYNAMIC bodies (the rubble rest line)
+    fx       anchorY = 0;        // Q16.16 pos.y of the anchor body (unchanged from spawn — static)
+    uint32_t dynamic = 0;        // # dynamic bodies
+    uint32_t settled = 0;        // # dynamic bodies resting on/near the ground/pile
+    uint32_t airborne = 0;       // # dynamic bodies still above the rest band
+    fx       minDynamicY = 0;    // lowest dynamic pos.y (the pile floor)
+};
+inline FractRubbleState MeasureFractRubble(const fpx::FxWorld& world, uint32_t anchorIndex) {
+    FractRubbleState st;
+    const fx kRestBand = fpx::kOne;   // 1.0 world unit: a chunk within 1 unit of the floor counts as settled
+    int64_t sumY = 0;
+    fx minY = (fx)0x7FFFFFFF;
+    for (size_t i = 0; i < world.bodies.size(); ++i) {
+        const fpx::FxBody& b = world.bodies[i];
+        if (!(b.flags & fpx::kFlagDynamic)) continue;
+        ++st.dynamic;
+        sumY += (int64_t)b.pos.y;
+        if (b.pos.y < minY) minY = b.pos.y;
+        // settled iff the body's bottom is within kRestBand of the ground (rests on floor or on a chunk
+        // that is itself near the floor — a coherent low pile).
+        const fx bottom = b.pos.y - b.radius;
+        if (bottom <= world.groundY + kRestBand) ++st.settled; else ++st.airborne;
+    }
+    if (st.dynamic > 0u) { st.meanDynamicY = (fx)(sumY / (int64_t)st.dynamic); st.minDynamicY = minY; }
+    if (anchorIndex < (uint32_t)world.bodies.size()) st.anchorY = world.bodies[(size_t)anchorIndex].pos.y;
+    return st;
+}
+
+// FractAnchorBodyIndex(fragments, clusters): the BODY INDEX (== fragment index) of the FIRST fragment that
+// belongs to the anchor piece — the body whose pos.y MeasureFractRubble reports. Deterministic (ascending
+// scan). Returns bodies.size()-equivalent sentinel 0xFFFFFFFF if no anchor.
+inline uint32_t FractAnchorBodyIndex(const FractFragments& fragments,
+                                     const std::vector<uint32_t>& clusters) {
+    const uint32_t anchor = FractAnchorPiece(fragments, clusters);
+    if (anchor == 0xFFFFFFFFu) return 0xFFFFFFFFu;
+    const uint32_t M = (uint32_t)fragments.fragments.size();
+    for (uint32_t f = 0; f < M && (uint32_t)clusters.size() == M; ++f)
+        if (clusters[(size_t)f] == anchor) return f;
+    return 0xFFFFFFFFu;
+}
+
 }  // namespace hf::sim::fract
