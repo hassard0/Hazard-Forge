@@ -411,6 +411,133 @@ int main() {
               "StepFlock: two runs BYTE-IDENTICAL");
     }
 
+    // ===== Slice BD4: PATH-FOLLOWING THE A* CORRIDOR (THE NAV BRIDGE) =====
+    // What this PINS (the contracts boids_flock.comp's path term + the GPU==CPU memcmp build on):
+    //   * SteerPath: the force points along the corridor toward the NEXT waypoint ahead; an EMPTY path -> 0.
+    //   * StepFlockPath with a corridor moves the flock centroid toward the goal while keeping min-separation.
+    //   * EMPTY-path StepFlockPath == BD3 StepFlock byte-identical (the render-invariance equivalence contract).
+    //   * Two runs byte-identical.
+    {
+        // A FlockConfig with a path gain (the BD4 showcase shape: gentle flocking + a corridor-follow).
+        auto pathCfg = [&](boids::fx pathG) {
+            boids::FlockConfig c;
+            c.seekGain         = 0;            // free flocking (the corridor is the goal, not a point seek)
+            c.sepGain          = frac(1, 8);   // 0.125 weak separation
+            c.alignGain        = frac(1, 2);   // 0.5 alignment
+            c.cohGain          = frac(1, 2);   // 0.5 cohesion
+            c.perceptionRadius = wu(3);
+            c.maxForce         = wu(8);
+            c.maxSpeed         = wu(6);
+            c.target           = boids::FxVec3{0, 0, 0};
+            c.gravity          = boids::FxVec3{0, 0, 0};
+            c.pathGain         = pathG;
+            return c;
+        };
+
+        // ----- SteerPath: steers toward the NEXT waypoint ahead -----
+        {
+            boids::FlockConfig c = pathCfg(boids::kOne);   // pathGain 1.0 so the sign survives
+            // a 3-waypoint corridor along +x: (0,0,0)->(10,0,0)->(20,0,0).
+            boids::BoidsPath path;
+            path.waypoints = {boids::FxVec3{wu(0), 0, 0}, boids::FxVec3{wu(10), 0, 0},
+                              boids::FxVec3{wu(20), 0, 0}};
+            // an agent AT the first waypoint: nearest is wp0, target is wp1 (+x) -> +x force.
+            boids::Agent a0{boids::FxVec3{wu(0), 0, 0}, boids::FxVec3{0, 0, 0}};
+            boids::FxVec3 f0 = boids::SteerPath(a0, path, c);
+            check(f0.x > 0, "SteerPath: at wp0 steers toward wp1 (+x ahead)");
+            check(f0.y == 0 && f0.z == 0, "SteerPath: pure +x corridor -> only x force");
+            // an agent near the MIDDLE waypoint: nearest is wp1, target is wp2 (+x ahead) -> +x force.
+            boids::Agent a1{boids::FxVec3{wu(10), 0, 0}, boids::FxVec3{0, 0, 0}};
+            boids::FxVec3 f1 = boids::SteerPath(a1, path, c);
+            check(f1.x > 0, "SteerPath: at wp1 steers toward wp2 (+x ahead, corridor progress)");
+            // an agent AT the final waypoint: nearest is wp2, target clamps to wp2 -> zero force (arrived).
+            boids::Agent a2{boids::FxVec3{wu(20), 0, 0}, boids::FxVec3{0, 0, 0}};
+            boids::FxVec3 f2 = boids::SteerPath(a2, path, c);
+            check(f2.x == 0 && f2.y == 0 && f2.z == 0, "SteerPath: at the final waypoint -> zero (arrived)");
+            // EMPTY path -> zero force (no crash, the BD3 equivalence).
+            boids::BoidsPath empty;
+            boids::FxVec3 fe = boids::SteerPath(a0, empty, c);
+            check(fe.x == 0 && fe.y == 0 && fe.z == 0, "SteerPath: empty path -> zero force");
+            // pathGain 0 -> zero force regardless of the corridor (the render-invariant default).
+            boids::FlockConfig c0 = pathCfg(0);
+            boids::FxVec3 fz = boids::SteerPath(a0, path, c0);
+            check(fz.x == 0 && fz.y == 0 && fz.z == 0, "SteerPath: pathGain 0 -> zero force");
+        }
+
+        // ----- StepFlockPath: a flock follows the corridor toward the goal, keeps min-separation -----
+        {
+            boids::FlockConfig c = pathCfg(frac(1, 2));   // pathGain 0.5
+            const boids::fx dt = boids::kOne / 60;
+            // a corridor from the spawn area toward +x+z (the goal far from the start).
+            boids::BoidsPath path;
+            path.waypoints = {boids::FxVec3{wu(0), 0, wu(0)}, boids::FxVec3{wu(20), 0, wu(8)},
+                              boids::FxVec3{wu(40), 0, wu(16)}};
+            // a dense 8x8 flock spawned near the corridor START (within the radius-3 perception -> connected).
+            std::vector<boids::Agent> agents;
+            for (int gx = 0; gx < 8; ++gx)
+                for (int gz = 0; gz < 8; ++gz)
+                    agents.push_back(boids::Agent{boids::FxVec3{wu(gx * 2), 0, wu(gz * 2)},
+                                                  boids::FxVec3{0, 0, 0}});
+            boids::FlockPathStats before = boids::MeasureFlockPath(agents, c, path);
+            boids::StepFlockPathSteps(agents, c, path, dt, 300);
+            boids::FlockPathStats after = boids::MeasureFlockPath(agents, c, path);
+            // the crowd FOLLOWED the corridor: the flock centroid's L1 distance to the FINAL waypoint DROPPED.
+            check(after.centroidToGoal < before.centroidToGoal,
+                  "StepFlockPath: centroid->goal drops (the crowd followed the corridor)");
+            // it stayed a flock: min separation stays above a small floor (separation keeps spacing even while
+            // the whole crowd streams toward the SAME corridor — the agents pack but don't collapse to a point).
+            check(after.flock.minSep > 0, "StepFlockPath: minSep above zero (didn't collapse to a point)");
+        }
+
+        // ----- EQUIVALENCE: an EMPTY-path StepFlockPath == BD3 StepFlock byte-identical (render-invariance) ---
+        {
+            boids::FlockConfig c = pathCfg(boids::kOne);   // nonzero pathGain, but an EMPTY path -> path term 0
+            const boids::fx dt = boids::kOne / 60;
+            auto makeFlock = [&]() {
+                std::vector<boids::Agent> a;
+                for (int gx = 0; gx < 8; ++gx)
+                    for (int gz = 0; gz < 8; ++gz) {
+                        const boids::fx vx = ((gx + gz) & 1) ? frac(1, 2) : -frac(1, 2);
+                        const boids::fx vz = ((gx) & 1) ? -frac(1, 3) : frac(1, 3);
+                        a.push_back(boids::Agent{boids::FxVec3{wu(gx * 2), 0, wu(gz * 2)},
+                                                 boids::FxVec3{vx, 0, vz}});
+                    }
+                return a;
+            };
+            boids::BoidsPath empty;                         // no waypoints -> SteerPath == 0
+            std::vector<boids::Agent> agPath = makeFlock();
+            std::vector<boids::Agent> agBD3  = makeFlock();
+            boids::StepFlockPathSteps(agPath, c, empty, dt, 200);   // BD4 with an empty corridor
+            boids::StepFlockSteps(agBD3, c, dt, 200);               // BD3 StepFlock
+            check(agPath.size() == agBD3.size() &&
+                  std::memcmp(agPath.data(), agBD3.data(), agPath.size() * sizeof(boids::Agent)) == 0,
+                  "StepFlockPath: EMPTY path == BD3 StepFlock BYTE-IDENTICAL (render-invariance)");
+        }
+
+        // ----- two runs byte-identical (determinism) -----
+        {
+            boids::FlockConfig c = pathCfg(frac(1, 2));
+            const boids::fx dt = boids::kOne / 60;
+            boids::BoidsPath path;
+            path.waypoints = {boids::FxVec3{wu(0), 0, wu(0)}, boids::FxVec3{wu(20), 0, wu(10)},
+                              boids::FxVec3{wu(40), 0, wu(20)}};
+            auto makeFlock = [&]() {
+                std::vector<boids::Agent> a;
+                for (int gx = 0; gx < 6; ++gx)
+                    for (int gz = 0; gz < 6; ++gz)
+                        a.push_back(boids::Agent{boids::FxVec3{wu(gx * 2), 0, wu(gz * 2)},
+                                                 boids::FxVec3{frac(1, 4), 0, -frac(1, 4)}});
+                return a;
+            };
+            std::vector<boids::Agent> a1 = makeFlock(), a2 = makeFlock();
+            boids::StepFlockPathSteps(a1, c, path, dt, 200);
+            boids::StepFlockPathSteps(a2, c, path, dt, 200);
+            check(a1.size() == a2.size() &&
+                  std::memcmp(a1.data(), a2.data(), a1.size() * sizeof(boids::Agent)) == 0,
+                  "StepFlockPath: two runs BYTE-IDENTICAL");
+        }
+    }
+
     if (g_fail == 0) std::printf("boids_test: ALL PASS\n");
     else             std::printf("boids_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

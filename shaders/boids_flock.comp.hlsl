@@ -54,12 +54,20 @@ struct Agent {
 //   p0 : x=seekGain, y=sepGain, z=alignGain, w=cohGain   (all Q16.16)
 //   p1 : x=maxForce, y=maxSpeed, z=targetX,  w=targetY   (all Q16.16)
 //   p2 : x=targetZ,  y=gravityX, z=gravityY, w=gravityZ  (all Q16.16)
-//   p3 : x=dt, y=agentCount, z=stepEnabled, w=unused
+//   p3 : x=dt, y=agentCount, z=stepEnabled, w=pathCount  (Slice BD4: pathCount, 0 -> BD3 byte-identical)
+//   p4 : x=pathGain (Q16.16, the SteerPath arrive gain; only read when pathCount>0), y/z/w unused
 struct FlockParams {
     int4 p0;
     int4 p1;
     int4 p2;
     int4 p3;
+    int4 p4;
+};
+
+// std430 Waypoint mirror (engine/sim/boids.h::BoidsPath waypoint): Q16.16 (x,y,z). 3 x int32 = 12 bytes, but
+// std430-padded to int4 (16 bytes) for a clean structured-buffer stride. Slice BD4; only read when pathCount>0.
+struct Waypoint {
+    int4 p;   // p.xyz = the Q16.16 world waypoint; p.w = padding
 };
 
 [[vk::binding(0, 0)]] RWStructuredBuffer<Agent>       gAgentsIn     : register(u0);
@@ -67,6 +75,7 @@ struct FlockParams {
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint>        neighborStart : register(u2);
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint>        neighbors     : register(u3);
 [[vk::binding(4, 0)]] RWStructuredBuffer<FlockParams> gParams       : register(u4);
+[[vk::binding(5, 0)]] RWStructuredBuffer<Waypoint>    gWaypoints    : register(u5);   // Slice BD4 corridor
 
 // VERBATIM fpx.h::fxmul / boids.h fxmul — (a*b) >> kFrac with an int64 intermediate (arithmetic shift).
 int fxmul(int a, int b) {
@@ -97,6 +106,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     int dt          = gParams[0].p3.x;
     int agentCount  = gParams[0].p3.y;
     int stepEnabled = gParams[0].p3.z;
+    int pathCount   = gParams[0].p3.w;   // Slice BD4: 0 -> the path term is SKIPPED entirely (BD3 byte-identical)
+    int pathGain    = gParams[0].p4.x;   // Slice BD4: the SteerPath arrive gain (only read when pathCount>0)
 
     uint i = gid.x;
     if ((int)i >= agentCount) return;
@@ -135,6 +146,27 @@ void main(uint3 gid : SV_DispatchThreadID) {
         fx += fxmul(mpx - a.px, cohGain);
         fy += fxmul(mpy - a.py, cohGain);
         fz += fxmul(mpz - a.pz, cohGain);
+    }
+
+    // (a2) Slice BD4 — the PATH-FOLLOW term (the NAV bridge), VERBATIM boids.h::SteerPath. Gated by
+    // pathCount: when pathCount == 0 this whole block is SKIPPED -> the ops below are byte-for-byte BD3
+    // (the AC2 render-invariance contract — the controller re-verifies BD3's boids_flock golden). When
+    // pathCount > 0: find the index k of the NEAREST waypoint by integer L1 distance (ascending scan, strict-<
+    // tie-break -> lowest k), target = waypoints[min(k+1, last)], add FxScale(target - pos, pathGain).
+    if (pathCount > 0) {
+        int k = 0;
+        int wx0 = gWaypoints[0].p.x, wy0 = gWaypoints[0].p.y, wz0 = gWaypoints[0].p.z;
+        int best = abs(wx0 - a.px) + abs(wy0 - a.py) + abs(wz0 - a.pz);   // L1(wp0 - pos)
+        for (int j = 1; j < pathCount; ++j) {
+            int wjx = gWaypoints[j].p.x, wjy = gWaypoints[j].p.y, wjz = gWaypoints[j].p.z;
+            int d = abs(wjx - a.px) + abs(wjy - a.py) + abs(wjz - a.pz);
+            if (d < best) { best = d; k = j; }                            // strict < -> ties keep the LOWEST k
+        }
+        int tgt = (k + 1 < pathCount) ? (k + 1) : (pathCount - 1);        // the NEXT waypoint ahead (clamped)
+        int tx = gWaypoints[tgt].p.x, ty = gWaypoints[tgt].p.y, tz = gWaypoints[tgt].p.z;
+        fx += fxmul(tx - a.px, pathGain);
+        fy += fxmul(ty - a.py, pathGain);
+        fz += fxmul(tz - a.pz, pathGain);
     }
 
     // (b) the optional seek toward the shared target (un-normalized; skipped when seekGain == 0).

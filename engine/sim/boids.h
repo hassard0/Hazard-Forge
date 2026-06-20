@@ -457,6 +457,9 @@ struct FlockConfig {
     fx     maxSpeed         = 0;   // Q16.16 per-AXIS speed clamp
     FxVec3 target;                 // Q16.16 the optional shared seek target (only used if seekGain != 0)
     FxVec3 gravity;                // Q16.16 constant acceleration (default 0 — BD3 is planar flocking)
+    fx     pathGain         = 0;   // Slice BD4: Q16.16 gain on the corridor-follow (SteerPath) arrive force
+                                   //   (default 0 -> the path term is identically zero -> exactly BD3; only the
+                                   //   BD4 path showcase/tests set it. Render-invariant: pathGain 0 == BD3.)
 };
 
 // ----- AccumFlock(i, neighborList, agents, cfg): the 3 Reynolds rules over agent i's BD2 neighbor slice -------
@@ -593,6 +596,118 @@ inline FlockStats MeasureFlock(const std::vector<Agent>& agents, const FlockConf
             if (minSep < 0 || d < minSep) minSep = d;
         }
     s.minSep = (fx)(minSep < 0 ? 0 : minSep);
+    return s;
+}
+
+// ===== Slice BD4 — PATH-FOLLOWING THE A* CORRIDOR (THE NAV BRIDGE) =======================================
+// BD1-BD3 built a FREE-flocking crowd (steering -> neighbors -> the 3 Reynolds rules). BD4 is the COMPOSITION
+// HEADLINE — "crowds, not just boids": the flock FOLLOWS the bit-exact A* corridor from the NAV navmesh
+// flagship (#7). Each agent steers along the corridor toward the goal (a SteerArrive-to-waypoint term)
+// BLENDED with the BD3 flock, so the swarm STREAMS along the navmesh path while still cohering/aligning/
+// spacing. This pairs the engine's two integer pillars — nav A* + the crowd sim — both deterministic.
+// INTEGER-bit-exact. The path term extends the BD3 boids_flock.comp RENDER-INVARIANTLY (pathCount==0 -> BD3
+// byte-identical); NAV is reused read-only (byte-frozen). NO new RHI.
+//
+// BD4 is ADDITIVE: BD1-BD3 above are byte-FROZEN. BD4 APPENDS BoidsPath/SteerPath/StepFlockPath/
+// StepFlockPathSteps/MeasureFlockPath + adds pathGain to FlockConfig (a render-invariant default 0 — at 0 the
+// path term is identically zero AND an empty corridor returns zero, so StepFlockPath with an empty path ==
+// exactly BD3 StepFlock, the equivalence/render-invariance contract).
+
+// ----- BoidsPath: the A* corridor as Q16.16 world waypoints (built HOST-side from nav::FindPath) ----------
+// The corridor poly-id sequence (nav::FindPath) mapped through the poly centroids (the cx/cz arrays the
+// navmesh stores) into Q16.16 world points. The nav A* is bit-exact + the corridor is FIXED for the run; the
+// waypoint Q16.16 conversion is a host integer snap (the corridor poly centers are already integers). An
+// EMPTY path (no waypoints) -> SteerPath returns 0 -> StepFlockPath == BD3 StepFlock exactly.
+struct BoidsPath {
+    std::vector<FxVec3> waypoints;   // Q16.16 world points along the corridor (poly centroids, start->goal)
+};
+
+// ----- SteerPath(a, path, cfg): the corridor-follow steering (deterministic, STATELESS) ------------------
+// Recomputed each tick from the agent's position (NO per-agent path-state -> nothing to snapshot for BD5):
+// find the index k of the NEAREST waypoint (an integer L1 distance min-scan over the corridor — the corridor
+// is short), target = waypoints[min(k+1, last)] (the NEXT waypoint ahead — corridor progress; near the FINAL
+// waypoint it eases in), pathForce = FxScale(FxSub(target, a.pos), pathGain) (the un-normalized arrive/seek,
+// the BD1 SteerSeek shape). An EMPTY path (or pathGain==0) -> zero force. The L1 nearest scan uses the integer
+// L1() helper (|dx|+|dy|+|dz|, no int64/sqrt). The shader copies THIS body VERBATIM (gated by pathCount>0).
+inline FxVec3 SteerPath(const Agent& a, const BoidsPath& path, const FlockConfig& cfg) {
+    const int w = (int)path.waypoints.size();
+    if (w == 0) return FxVec3{0, 0, 0};            // empty corridor -> no path force (the BD3 equivalence)
+    // find the NEAREST waypoint by integer L1 distance (ascending index, strict-less tie-break -> lowest k).
+    int k = 0;
+    fx best = L1(FxSub(path.waypoints[0], a.pos));
+    for (int j = 1; j < w; ++j) {
+        const fx d = L1(FxSub(path.waypoints[(size_t)j], a.pos));
+        if (d < best) { best = d; k = j; }          // strict < -> ties keep the LOWEST index (deterministic)
+    }
+    const int tgt = (k + 1 < w) ? (k + 1) : (w - 1);   // the NEXT waypoint ahead (clamped to the last)
+    return FxScale(FxSub(path.waypoints[(size_t)tgt], a.pos), cfg.pathGain);
+}
+
+// ----- StepFlockPath(agents, cfg, path, dt): one FULL-FLOCK + PATH-FOLLOW tick (JACOBI) ------------------
+// = the BD3 StepFlock body with the path term added to the per-agent force: force = AccumFlock(i) +
+// SteerPath(i) + optional seek + gravity -> clamp -> integrate (JACOBI, frozen snapshot). When path.waypoints
+// is empty (or cfg.pathGain==0), SteerPath returns 0 -> EXACTLY BD3 StepFlock (the equivalence contract). The
+// path is recomputed each tick from the FROZEN positions (stateless), so the per-agent update stays
+// order-independent + GPU race-free + bit-exact GPU==CPU + two-run byte-identical.
+inline void StepFlockPath(std::vector<Agent>& agents, const FlockConfig& cfg, const BoidsPath& path, fx dt) {
+    const std::vector<Agent> prev = agents;                    // frozen snapshot (the Jacobi input)
+    // Rebuild the BD2 grid + cell table + neighbor list on the frozen positions (== the GPU per-tick rebuild).
+    const BoidsGrid grid = MakeBoidsGrid(prev, cfg.perceptionRadius);
+    const BoidsCellTable table = BuildBoidsCellTable(prev, grid);
+    const BoidsNeighborList list = BuildBoidsNeighborList(prev, grid, table, cfg.perceptionRadius);
+    const int n = (int)agents.size();
+    for (int i = 0; i < n; ++i) {
+        const Agent& a = prev[(size_t)i];                      // read the FROZEN state
+        // (a) the 3 Reynolds rules over the neighbor list.
+        FxVec3 force = AccumFlock(i, list, prev, cfg);
+        // (a2) the PATH-FOLLOW term (the NAV bridge): arrive toward the next corridor waypoint. Empty path or
+        //      pathGain==0 -> zero -> exactly BD3 StepFlock (the render-invariance contract).
+        force = FxAdd(force, SteerPath(a, path, cfg));
+        // (b) the optional seek toward the shared target (un-normalized; skipped when seekGain == 0).
+        if (cfg.seekGain != 0) force = FxAdd(force, FxScale(FxSub(cfg.target, a.pos), cfg.seekGain));
+        // (c) + gravity (a constant acceleration; 0 in the planar showcase).
+        force = FxAdd(force, cfg.gravity);
+        // (d) per-axis clamp the force (the axis-box magnitude limit).
+        force = ClampAxisVec(force, cfg.maxForce);
+        // (e) integrate velocity: vel += force * dt; then per-axis clamp to ±maxSpeed.
+        FxVec3 vel = FxAdd(a.vel, FxScale(force, dt));
+        vel = ClampAxisVec(vel, cfg.maxSpeed);
+        // (f) integrate position: pos += vel * dt.
+        const FxVec3 pos = FxAdd(a.pos, FxScale(vel, dt));
+        agents[(size_t)i].vel = vel;
+        agents[(size_t)i].pos = pos;
+    }
+}
+
+// StepFlockPathSteps(agents, cfg, path, dt, steps): run `steps` StepFlockPath ticks (the showcase settle loop).
+inline void StepFlockPathSteps(std::vector<Agent>& agents, const FlockConfig& cfg, const BoidsPath& path,
+                               fx dt, int steps) {
+    for (int s = 0; s < steps; ++s) StepFlockPath(agents, cfg, path, dt);
+}
+
+// ----- FlockPathStats: the BD3 flock stats + the "they reached the goal" stat ----------------------------
+// = FlockStats (meanSpeed/diag/alignment/minSep) PLUS centroidToGoal = the L1 distance from the flock CENTROID
+// (the integer mean position) to the FINAL corridor waypoint — DROPS as the crowd streams along the corridor
+// to the goal. Pure integer (L1, no sqrt/float). An empty path -> centroidToGoal 0 (no goal).
+struct FlockPathStats {
+    FlockStats flock;          // the BD3 stats (meanSpeed/diag/alignment/minSep)
+    fx         centroidToGoal = 0;   // L1 distance from the flock centroid to the FINAL waypoint
+};
+
+// MeasureFlockPath(agents, cfg, path): the BD3 MeasureFlock stats + the centroid->final-waypoint L1 distance.
+inline FlockPathStats MeasureFlockPath(const std::vector<Agent>& agents, const FlockConfig& cfg,
+                                       const BoidsPath& path) {
+    FlockPathStats s;
+    s.flock = MeasureFlock(agents, cfg);
+    const int n = (int)agents.size();
+    if (n == 0 || path.waypoints.empty()) return s;
+    // the flock centroid = the integer mean position (truncating divide by n, deterministic).
+    int64_t sx = 0, sy = 0, sz = 0;
+    for (int i = 0; i < n; ++i) {
+        sx += agents[(size_t)i].pos.x; sy += agents[(size_t)i].pos.y; sz += agents[(size_t)i].pos.z;
+    }
+    const FxVec3 centroid{(fx)(sx / n), (fx)(sy / n), (fx)(sz / n)};
+    s.centroidToGoal = L1(FxSub(centroid, path.waypoints.back()));
     return s;
 }
 

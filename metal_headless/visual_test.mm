@@ -18164,6 +18164,267 @@ static int RunBoidsFlockShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BD4 — Deterministic GPU Crowds PATH-FOLLOWING THE A* CORRIDOR (THE NAV BRIDGE) showcase
+// (--boids-path) (the 4th slice of FLAGSHIP #18). The COMPOSITION HEADLINE: a ~256-agent flock spawned at a
+// navmesh corridor START streams along the bit-exact nav::FindPath A* corridor to the goal while flocking. Like
+// BD3's --boids-flock (and UNLIKE the int32 BD2 grid passes), the flock-integrate + the SteerPath arrive term
+// are int64, so shaders/boids_flock.comp is VULKAN-SPIR-V-ONLY (NOT in this dir's hf_gen_msl) — on Metal the
+// --boids-path showcase runs the CPU boids::StepFlockPath, the EXACT bit-exact reference the Vulkan
+// --boids-path-shot GPU==CPU memcmp compares against -> the Metal agent array is byte-identical to the Vulkan
+// GPU result BY CONSTRUCTION. The corridor is built HOST-side from the --nav-path navmesh (engine/nav/navmesh.h)
+// + FindPath, the poly centroids -> a Q16.16 BoidsPath. The SAME pure-integer 2D top-down render (the corridor
+// polyline faint + the agents streaming) as the Vulkan --boids-path-shot -> the golden matches EXACTLY. New
+// golden tests/golden/metal/boids_path.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunBoidsPathShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace boids = hf::sim::boids;
+    namespace nav   = hf::nav;
+    namespace vg    = render::vg;
+
+    // === (1) Build the bit-exact integer navmesh + A* corridor HOST-side (the --nav-path 32x32 scene). ===
+    const int kNavW = 32, kNavH = 32;
+    nav::Heightfield hfld;
+    hfld.w = kNavW; hfld.h = kNavH;
+    hfld.bminX = 0; hfld.bminY = 0; hfld.bminZ = 0;
+    hfld.bmaxX = kNavW; hfld.bmaxY = 64; hfld.bmaxZ = kNavH;
+    hfld.cs = 1; hfld.ch = 1;
+    const int kNavCols = hfld.columnCount();
+    nav::WalkableConfig navCfg; navCfg.walkableHeight = 2; navCfg.walkableClimb = 1;
+    const int32_t kMaxError = 0;
+    std::vector<nav::NavTri> navTris = nav::MakeShowcaseTriangles(hfld);
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hfld, std::span<const nav::NavTri>(navTris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kNavCols);
+    for (int c = 0; c < kNavCols; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+    }
+    std::vector<uint32_t> navWalkable; std::vector<int32_t> navSurfaceY;
+    nav::FilterWalkableSpans(hfld, navCfg, mergedPerCol, navWalkable, navSurfaceY);
+    std::vector<uint32_t> navDist;
+    nav::BuildDistanceField(hfld, navCfg, navWalkable, navSurfaceY, navDist);
+    const uint32_t navMaxDist = nav::MaxDistOf(navDist);
+    std::vector<uint32_t> navRegion;
+    const uint32_t navRegionCount =
+        nav::BuildRegions(hfld, navCfg, navWalkable, navSurfaceY, navDist, navMaxDist, navRegion);
+    std::vector<nav::Contour> navContours;
+    nav::TraceContours(hfld, navRegion, navRegionCount, navContours);
+    for (auto& cc : navContours) {
+        std::vector<nav::ContourVertex> s; nav::SimplifyContour(cc.verts, kMaxError, s); cc.verts = s;
+    }
+    std::vector<nav::Poly> navPolys;
+    nav::BuildPolyMesh(navContours, navPolys);
+    std::vector<int32_t> navFlatVerts;
+    std::vector<uint32_t> navVOff((size_t)navRegionCount, 0u);
+    {
+        std::vector<int> contourOfRegion((size_t)navRegionCount + 1u, -1);
+        for (size_t ci = 0; ci < navContours.size(); ++ci)
+            contourOfRegion[(size_t)navContours[ci].region] = (int)ci;
+        uint32_t base = 0u;
+        for (uint32_t R = 1u; R <= navRegionCount; ++R) {
+            navVOff[(size_t)(R - 1u)] = base;
+            const int ci = contourOfRegion[(size_t)R];
+            if (ci < 0) continue;
+            const auto& vv = navContours[(size_t)ci].verts;
+            for (const auto& v : vv) { navFlatVerts.push_back(v.x); navFlatVerts.push_back(v.z); }
+            base += (uint32_t)vv.size();
+        }
+    }
+    const uint32_t kNavPolyCount = (uint32_t)navPolys.size();
+    std::vector<uint32_t> navPolyVertBase((size_t)kNavPolyCount, 0u);
+    for (uint32_t pi = 0; pi < kNavPolyCount; ++pi) {
+        const uint32_t R = navPolys[pi].region;
+        navPolyVertBase[pi] = (R >= 1u && R <= navRegionCount) ? navVOff[R - 1u] : 0u;
+    }
+    std::vector<int32_t> navCx, navCz;
+    nav::ComputePolyCentroids(navPolys, navFlatVerts, navPolyVertBase, navCx, navCz);
+    uint32_t navStart = 0u, navGoal = 0u;
+    nav::SelectStartGoal(navPolys, navCx, navCz, navStart, navGoal);
+    std::vector<uint32_t> corridor;
+    nav::FindPath(navPolys, navCx, navCz, navStart, navGoal, corridor);
+
+    // === (2) The corridor poly centroids -> a Q16.16 BoidsPath (corner-coords -> world units, 1:1). ===
+    boids::BoidsPath path;
+    for (uint32_t pid : corridor) {
+        if (pid >= (uint32_t)navCx.size()) continue;
+        path.waypoints.push_back(boids::FxVec3{navCx[pid] << boids::kFrac, 0, navCz[pid] << boids::kFrac});
+    }
+    if (path.waypoints.size() < 2) return fail("boids-path: nav corridor too short");
+    const int kWaypointCount = (int)path.waypoints.size();
+    const boids::FxVec3 kStartWp = path.waypoints.front();
+    const boids::FxVec3 kGoalWp  = path.waypoints.back();
+
+    // === (3) The flock config + the ~256-agent flock spawned at the corridor START. ===
+    const boids::fx kOne = boids::kOne;
+    auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+    const boids::fx kDt = kOne / 60;
+    const int kSteps = 300;
+    const int kGrid = 16;
+    const boids::fx kRadius = (boids::fx)(3 * (int)kOne);
+
+    boids::FlockConfig cfg;
+    cfg.seekGain         = 0;
+    cfg.sepGain          = frac(1, 8);
+    cfg.alignGain        = frac(1, 2);
+    cfg.cohGain          = frac(1, 2);
+    cfg.perceptionRadius = kRadius;
+    cfg.maxForce         = (boids::fx)(8 * (int)kOne);
+    cfg.maxSpeed         = (boids::fx)(6 * (int)kOne);
+    cfg.target           = boids::FxVec3{0, 0, 0};
+    cfg.gravity          = boids::FxVec3{0, 0, 0};
+    cfg.pathGain         = frac(1, 4);
+
+    auto makeFlock = [&]() {
+        std::vector<boids::Agent> a;
+        const boids::fx sx = kStartWp.x - (boids::fx)((kGrid / 2) * (int)kOne);
+        const boids::fx sz = kStartWp.z - (boids::fx)((kGrid / 2) * (int)kOne);
+        for (int gx = 0; gx < kGrid; ++gx)
+            for (int gz = 0; gz < kGrid; ++gz)
+                a.push_back(boids::Agent{
+                    boids::FxVec3{sx + (boids::fx)(gx * (int)kOne), 0, sz + (boids::fx)(gz * (int)kOne)},
+                    boids::FxVec3{0, 0, 0}});
+        return a;
+    };
+    const std::vector<boids::Agent> flock0 = makeFlock();
+    const int kAgentCount = (int)flock0.size();
+
+    struct AgentGpu { int32_t px, py, pz, vx, vy, vz; };
+    static_assert(sizeof(AgentGpu) == 24, "AgentGpu std430 layout");
+    static_assert(sizeof(boids::Agent) == 24, "Agent std430 layout");
+    auto packAgents = [&](const std::vector<boids::Agent>& ps) {
+        std::vector<AgentGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const boids::Agent& p = ps[i];
+            out[i] = AgentGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z};
+        }
+        return out;
+    };
+
+    // CPU path-flock (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    auto runFlock = [&](std::vector<AgentGpu>& outAgents) {
+        std::vector<boids::Agent> a = flock0;
+        boids::StepFlockPathSteps(a, cfg, path, kDt, kSteps);
+        outAgents = packAgents(a);
+    };
+
+    std::vector<AgentGpu> gpuAgents;
+    runFlock(gpuAgents);
+    std::printf("boids-path: {agents:%d, waypoints:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU boids::StepFlockPath, byte-identical to the Vulkan GPU result by construction]\n",
+                kAgentCount, kWaypointCount, kSteps);
+
+    // two-run determinism.
+    std::vector<AgentGpu> gpuAgents2;
+    runFlock(gpuAgents2);
+    if (gpuAgents.size() != gpuAgents2.size() ||
+        std::memcmp(gpuAgents.data(), gpuAgents2.data(), gpuAgents.size() * sizeof(AgentGpu)) != 0)
+        return fail("boids-path: two runs differ (nondeterministic)");
+    std::printf("boids-path determinism: two runs BYTE-IDENTICAL\n");
+
+    // reached the goal + flocked: the centroid->final-waypoint L1 distance DROPPED + min-sep above a floor.
+    std::vector<boids::Agent> gpuFlock((size_t)kAgentCount);
+    for (int i = 0; i < kAgentCount; ++i)
+        gpuFlock[(size_t)i] = boids::Agent{
+            boids::FxVec3{gpuAgents[(size_t)i].px, gpuAgents[(size_t)i].py, gpuAgents[(size_t)i].pz},
+            boids::FxVec3{gpuAgents[(size_t)i].vx, gpuAgents[(size_t)i].vy, gpuAgents[(size_t)i].vz}};
+    const boids::FlockPathStats startStats = boids::MeasureFlockPath(flock0, cfg, path);
+    const boids::FlockPathStats endStats   = boids::MeasureFlockPath(gpuFlock, cfg, path);
+    const boids::fx D0 = startStats.centroidToGoal;
+    const boids::fx D1 = endStats.centroidToGoal;
+    if (!((D1 < D0) && (endStats.flock.minSep > 0)))
+        return fail("boids-path: did not follow the corridor (D0/D1/minSep)");
+    std::printf("boids-path followed: {startToGoal:%d, endToGoal:%d, reached:true, flocked:true}\n", D0, D1);
+
+    // BD3 equivalence (render-invariance): an EMPTY-path StepFlockPath run == BD3 StepFlock byte-for-byte.
+    boids::BoidsPath emptyPath;
+    std::vector<boids::Agent> agEmpty = flock0, agBD3 = flock0;
+    boids::StepFlockPathSteps(agEmpty, cfg, emptyPath, kDt, kSteps);
+    boids::StepFlockSteps(agBD3, cfg, kDt, kSteps);
+    if (agEmpty.size() != agBD3.size() ||
+        std::memcmp(agEmpty.data(), agBD3.data(), agEmpty.size() * sizeof(boids::Agent)) != 0)
+        return fail("boids-path: empty-path StepFlockPath != BD3 StepFlock (render-invariance broken)");
+    std::printf("boids-path equiv: {emptyPath==BD3:true}\n");
+
+    // --- Golden: a PURE-INTEGER 2D top-down view (IDENTICAL to the Vulkan --boids-path-shot by construction):
+    // the A* corridor polyline faint underneath + start/goal markers + the agents streaming along it. ---
+    int wMinX = kStartWp.x >> boids::kFrac, wMaxX = wMinX;
+    int wMinZ = kStartWp.z >> boids::kFrac, wMaxZ = wMinZ;
+    auto extend = [&](int wx, int wz) {
+        if (wx < wMinX) wMinX = wx; if (wx > wMaxX) wMaxX = wx;
+        if (wz < wMinZ) wMinZ = wz; if (wz > wMaxZ) wMaxZ = wz;
+    };
+    for (int w = 0; w < kWaypointCount; ++w)
+        extend(path.waypoints[(size_t)w].x >> boids::kFrac, path.waypoints[(size_t)w].z >> boids::kFrac);
+    for (int i = 0; i < kAgentCount; ++i)
+        extend(gpuAgents[(size_t)i].px >> boids::kFrac, gpuAgents[(size_t)i].pz >> boids::kFrac);
+    const int kPxPerUnit = 12, kMargin = 24, kSlack = 4;
+    const int viewX0 = wMinX - kSlack, viewZ0 = wMinZ - kSlack;
+    const int kWorldW = (wMaxX - wMinX) + kSlack * 2 + 1;
+    const int kWorldH = (wMaxZ - wMinZ) + kSlack * 2 + 1;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+        ix = kMargin + (worldX - viewX0) * kPxPerUnit;
+        iy = kMargin + (worldZ - viewZ0) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+            }
+    };
+    auto lineSeg = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+        int err = adx - ady, x = x0, y = y0;
+        for (int step = 0; step < 4096; ++step) {
+            plot(x, y, r, g, b, 0);
+            if (x == x1 && y == y1) break;
+            int e2 = 2 * err;
+            if (e2 > -ady) { err -= ady; x += sx; }
+            if (e2 <  adx) { err += adx; y += sy; }
+        }
+    };
+    for (int w = 0; w + 1 < kWaypointCount; ++w) {
+        int ax, ay, bx, by;
+        worldToPx(path.waypoints[(size_t)w].x >> boids::kFrac,
+                  path.waypoints[(size_t)w].z >> boids::kFrac, ax, ay);
+        worldToPx(path.waypoints[(size_t)(w + 1)].x >> boids::kFrac,
+                  path.waypoints[(size_t)(w + 1)].z >> boids::kFrac, bx, by);
+        lineSeg(ax, ay, bx, by, 50, 60, 90);
+    }
+    { int sx, sy; worldToPx(kStartWp.x >> boids::kFrac, kStartWp.z >> boids::kFrac, sx, sy);
+      plot(sx, sy, 40, 200, 40, 3); }
+    { int gx, gy; worldToPx(kGoalWp.x >> boids::kFrac, kGoalWp.z >> boids::kFrac, gx, gy);
+      plot(gx, gy, 220, 40, 40, 3); }
+    for (int i = 0; i < kAgentCount; ++i) {
+        const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+        const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+        int cx, cy; worldToPx(wx, wz, cx, cy);
+        const int tipX = (gpuAgents[(size_t)i].px + gpuAgents[(size_t)i].vx) >> boids::kFrac;
+        const int tipZ = (gpuAgents[(size_t)i].pz + gpuAgents[(size_t)i].vz) >> boids::kFrac;
+        int tx, ty; worldToPx(tipX, tipZ, tx, ty);
+        lineSeg(cx, cy, tx, ty, 90, 110, 90);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+             (uint8_t)(col.z * 255.0f + 0.5f), 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — boids path-following A* corridor (%d waypoints, D %d->%d)\n",
+                outPath, imgW, imgH, kWaypointCount, D0, D1);
+    return 0;
+}
+
 static int RunGrainIntegrateShowcase(const char* outPath) {
     using math::Vec3;
     namespace grain = hf::sim::grain;
@@ -44117,6 +44378,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--boids-flock") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_boids_flock.png";
             try { return RunBoidsFlockShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --boids-path <out.png>: render the Deterministic GPU Crowds PATH-FOLLOWING THE A* CORRIDOR showcase
+        // (Slice BD4, the 4th slice of FLAGSHIP #18, THE NAV BRIDGE). A ~256-agent flock spawned at a navmesh
+        // corridor START streams along the bit-exact nav::FindPath A* corridor to the goal while flocking. The
+        // flock-integrate + the SteerPath arrive term are int64 -> boids_flock.comp is Vulkan-only (NOT in
+        // hf_gen_msl) while the BD2 grid passes stay MSL-native; on Metal this runs the CPU boids::StepFlockPath
+        // — the EXACT bit-exact reference the Vulkan --boids-path-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical. The corridor is built HOST-side from the --nav-path navmesh + FindPath, the poly
+        // centroids -> a Q16.16 BoidsPath. The image golden is a PURE-INTEGER 2D top-down view (the corridor
+        // polyline faint + the agents streaming), identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/boids_path.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--boids-path") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_boids_path.png";
+            try { return RunBoidsPathShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {
