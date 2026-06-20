@@ -533,6 +533,133 @@ int main() {
         }
     }
 
+    // ========================================================================================
+    // ============ Slice FC5 — LOCKSTEP + ROLLBACK (the netcode headline) =====================
+    // ========================================================================================
+    // SimFricTick (apply commands in fixed order + StepFrictionWorld) + RunFricLockstep
+    // (authority==replica from inputs alone) + RunFricRollback (corrected==authority AND the mispredict
+    // genuinely diverged) + determinism (two runs byte-identical). The friction world IS a convex::ConvexWorld,
+    // so FC5 REUSES the frozen CX5 command/snapshot helpers (convex::ConvexCommand/ApplyConvexCommands/
+    // SnapshotConvex/RestoreConvex/ConvexBodiesEqual) VERBATIM, swapping StepFrictionWorld for StepConvexWorld.
+    // PURE CPU, all orders PINNED -> bit-identical.
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        const fpx::FxQuat qI{0, 0, 0, kOne};
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = qI;
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+        // THE LOCKSTEP SCENE: the FC4 stack — a static floor + 3 dynamic flat-slab boxes — at angDamp=kOne
+        // (friction holds the tower). A small command stream knocks it; it re-settles under friction.
+        const convex::FxBox kFloor{convex::FxVec3{(fx)(8 * (int)kOne), kOne, (fx)(8 * (int)kOne)}};
+        const convex::FxBox kSlab{convex::FxVec3{(fx)(3 * (int)kOne) / 2, kOne / 2, (fx)(3 * (int)kOne) / 2}};
+        auto buildStack = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, (fx)(1 * (int)kOne) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, (fx)(2 * (int)kOne) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, (fx)(3 * (int)kOne) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            return w;
+        };
+        fric::FrictionStepConfig cfg;
+        cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.dt          = kOne / 60;
+        cfg.solveIters  = 20;
+        cfg.restitution = 0;
+        cfg.slop        = kOne / 64;
+        cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        cfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98 (LINEAR damping — settle the drop)
+        cfg.angDamp     = kOne;                            // OFF — friction holds the tower (the FC4 headline)
+        cfg.posIters    = 4;
+        cfg.mu          = kOne;                            // grippy contacts
+
+        // The scripted authoritative command stream: knock the stack with impulse/angVel perturbations at
+        // fixed early ticks (impulse = arg·invMass; statics unaffected). Body 3 is the TOP slab.
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{4u,  convex::kConvexCmdAddImpulse, 3u, FxVec3{(fx)(2 * (int)kOne), 0, 0}},
+            convex::ConvexCommand{8u,  convex::kConvexCmdSetAngVel,  2u, FxVec3{0, kOne, 0}},
+            convex::ConvexCommand{12u, convex::kConvexCmdAddImpulse, 1u, FxVec3{0, 0, kOne}},
+        };
+        const uint32_t kLsTicks = 120u;
+        const uint32_t kRollbackAt = 20u;
+
+        // ---------- SimFricTick / ApplyConvexCommands: impulse on a dynamic body, no-op on a static body.
+        {
+            convex::ConvexWorld w = buildStack();
+            const fpx::FxBody floorBefore = w.bodies[0];     // body 0 = static floor
+            const fpx::FxBody dynBefore   = w.bodies[1];     // body 1 = dynamic slab
+            std::vector<convex::ConvexCommand> cmds = {
+                convex::ConvexCommand{0u, convex::kConvexCmdAddImpulse, 0u, FxVec3{(fx)(5 * (int)kOne), 0, 0}},
+                convex::ConvexCommand{0u, convex::kConvexCmdAddImpulse, 1u, FxVec3{(fx)(3 * (int)kOne), 0, 0}},
+            };
+            convex::ApplyConvexCommands(w, cmds, 0u);   // (the helper SimFricTick calls, isolated here)
+            check(std::memcmp(&w.bodies[0], &floorBefore, sizeof(fpx::FxBody)) == 0,
+                  "FC5 ApplyConvexCommands -> impulse on a STATIC body is a no-op (invMass==0)");
+            check(w.bodies[1].vel.x == dynBefore.vel.x + fpx::fxmul((fx)(3 * (int)kOne), w.bodies[1].invMass),
+                  "FC5 ApplyConvexCommands -> impulse on a DYNAMIC body changes vel by arg*invMass");
+        }
+
+        // ---------- SnapshotConvex / RestoreConvex bit-exact round-trip (the rollback primitive).
+        {
+            convex::ConvexWorld w0 = buildStack();
+            for (uint32_t t = 0; t < 30u; ++t) fric::SimFricTick(w0, cfg, authStream, t);
+            const convex::ConvexSnapshot snap = convex::SnapshotConvex(w0, 30u);
+            convex::ConvexWorld w = w0;
+            fric::SimFricTick(w, cfg, authStream, 30u);   // diverge
+            convex::RestoreConvex(w, snap);
+            check(convex::ConvexBodiesEqual(w.bodies, w0.bodies),
+                  "FC5 RestoreConvex(SnapshotConvex) round-trips the friction world byte-for-byte");
+        }
+
+        // ---------- RunFricLockstep: authority == replica BIT-IDENTICAL (inputs only).
+        {
+            convex::ConvexWorld w0 = buildStack();
+            bool identical = false;
+            convex::ConvexWorld authority = fric::RunFricLockstep(w0, cfg, authStream, kLsTicks, &identical);
+            check(identical, "FC5 RunFricLockstep: authority == replica BIT-IDENTICAL (inputs only)");
+            // The converged stack is still a coherent ordered tower (knocked + re-settled under friction).
+            check(authority.bodies[1].pos.y < authority.bodies[2].pos.y &&
+                  authority.bodies[2].pos.y < authority.bodies[3].pos.y,
+                  "FC5 lockstep converged stack -> boxes still ordered ascending in y (re-settled)");
+            const fric::StackMeasure ms = fric::MeasureFrictionStack(authority);
+            check(ms.maxSpeed < kOne, "FC5 lockstep converged stack -> at rest after the perturbation");
+        }
+
+        // ---------- determinism: two RunFricLockstep runs byte-identical.
+        {
+            convex::ConvexWorld w0 = buildStack();
+            convex::ConvexWorld a = fric::RunFricLockstep(w0, cfg, authStream, kLsTicks);
+            convex::ConvexWorld b = fric::RunFricLockstep(w0, cfg, authStream, kLsTicks);
+            check(convex::ConvexBodiesEqual(a.bodies, b.bodies),
+                  "FC5 RunFricLockstep determinism: two runs BYTE-IDENTICAL");
+        }
+
+        // ---------- RunFricRollback: corrected==authority BIT-EXACT AND the mispredict genuinely diverged.
+        {
+            convex::ConvexWorld w0 = buildStack();
+            // The MISPREDICTED stream: the auth stream + a WRONG strong impulse at rollbackAt on the top slab.
+            std::vector<convex::ConvexCommand> mispredictStream = authStream;
+            mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 3u,
+                                                             FxVec3{(fx)(30 * (int)kOne), 0, 0}});
+            bool corrected = false, diverged = false;
+            convex::ConvexWorld rolledBack =
+                fric::RunFricRollback(w0, cfg, authStream, mispredictStream, kLsTicks, kRollbackAt,
+                                      &corrected, &diverged);
+            check(diverged, "FC5 RunFricRollback: the mispredicted intermediate genuinely DIVERGED (real)");
+            check(corrected, "FC5 RunFricRollback: corrected == authority BIT-EXACT");
+            // The corrected world equals the plain authority lockstep run byte-for-byte.
+            convex::ConvexWorld authority = fric::RunFricLockstep(w0, cfg, authStream, kLsTicks);
+            check(convex::ConvexBodiesEqual(rolledBack.bodies, authority.bodies),
+                  "FC5 RunFricRollback: rolledBack == RunFricLockstep(authStream) byte-for-byte");
+        }
+    }
+
     if (g_fail == 0) std::printf("fric_test: ALL PASS\n");
     else std::printf("fric_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

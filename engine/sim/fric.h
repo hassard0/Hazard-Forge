@@ -523,5 +523,116 @@ inline StackMeasure MeasureFrictionStack(const ConvexWorld& world) {
     return convex::MeasureStack(world);
 }
 
+// =========================================================================================================
+// Slice FC5 — LOCKSTEP + ROLLBACK (the netcode headline). APPENDED after MeasureFrictionStack (FC1-FC4's
+// lines above are BYTE-FROZEN). This is the CX5/FR5/CP5/GR5/CG5/GF5/AC5/VH5/JT5 twin for the friction-locked
+// contact sim. The FC4 step (StepFrictionWorld) is already fully deterministic (fixed orders, integer math),
+// so LOCKSTEP falls out: feed two independent ConvexWorld peers the SAME initial world + the SAME per-tick
+// command stream, step both K ticks with the friction tick, and they are BYTE-IDENTICAL. ROLLBACK: snapshot
+// the world at a tick, mis-simulate forward (a wrong/late command that genuinely diverges), then restore the
+// snapshot + re-sim the CORRECT command stream -> bit-identical to the authority. The moat sentence:
+// FRICTION CONTACTS that are lockstep-replayable — boxes that grip, slide, and stack with deterministic
+// Coulomb friction, re-derived bit-for-bit on two machines from inputs alone — UE5's float Chaos cannot.
+//
+// PURE CPU (NO new shader, NO new RHI). MAXIMAL REUSE: the friction world IS a convex::ConvexWorld (the SAME
+// type CX5's lockstep machinery operates on), so FC5 REUSES CX5's FROZEN command + snapshot/restore
+// infrastructure VERBATIM (convex::ConvexCommand / kConvexCmdAddImpulse / kConvexCmdSetAngVel /
+// ApplyConvexCommands / ConvexSnapshot / SnapshotConvex / RestoreConvex / ConvexBodiesEqual — defined in
+// convex.h, NOT redefined here) and only swaps the per-tick step from StepConvexWorld to StepFrictionWorld.
+// FC5's SimFricTick / RunFricLockstep / RunFricRollback mirror convex::SimConvexTick / RunConvexLockstep /
+// RunConvexRollback EXACTLY with that one swap. Both backends run the IDENTICAL CPU harness -> the converged
+// authority-world golden is bit-identical BY CONSTRUCTION (cross-vendor 0 px).
+
+// Pull the frozen CX5 command + snapshot machinery into this namespace (re-use, do NOT redefine).
+using convex::ConvexCommand;
+using convex::kConvexCmdAddImpulse;
+using convex::kConvexCmdSetAngVel;
+using convex::ApplyConvexCommands;
+using convex::ConvexSnapshot;
+using convex::SnapshotConvex;
+using convex::RestoreConvex;
+using convex::ConvexBodiesEqual;
+
+// ----- SimFricTick(world, cfg, commands, tick): ONE deterministic friction tick with its inputs ----------
+// (1) convex::ApplyConvexCommands(world, commands, tick) — this tick's perturbations, in FIXED array order,
+//     BEFORE the step so the impulse/spin integrates this tick (the frozen CX5 helper, reused VERBATIM);
+// (2) StepFrictionWorld(world, cfg) — the FC4 friction-locked tick (predict-integrate -> all-pairs friction
+//     Gauss-Seidel -> position de-penetration), reused VERBATIM. Pure integer, fixed order -> bit-identical
+// on every peer/platform. The SimConvexTick twin with StepConvexWorld swapped for StepFrictionWorld.
+inline void SimFricTick(ConvexWorld& world, const FrictionStepConfig& cfg,
+                        const std::vector<ConvexCommand>& commands, uint32_t tick) {
+    ApplyConvexCommands(world, commands, tick);
+    StepFrictionWorld(world, cfg);
+}
+
+// ----- RunFricLockstep(world0, cfg, commands, ticks, outIdentical): two peers converge from inputs alone --
+// THE peer entry point (the convex::RunConvexLockstep control flow over SimFricTick). Two independent peers
+// (authority + replica) BOTH start from `world0`, BOTH run SimFricTick for `ticks` with the SAME command
+// stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism. Sets *outIdentical (if non-null)
+// to whether the two final body vectors are byte-identical (the make-or-break lockstep proof) + returns the
+// converged AUTHORITY world (for the golden). The peer step order is PINNED.
+inline ConvexWorld RunFricLockstep(const ConvexWorld& world0, const FrictionStepConfig& cfg,
+                                   const std::vector<ConvexCommand>& commands, uint32_t ticks,
+                                   bool* outIdentical = nullptr) {
+    ConvexWorld authority = world0;   // a fresh copy
+    ConvexWorld replica   = world0;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimFricTick(authority, cfg, commands, t);
+        SimFricTick(replica,   cfg, commands, t);
+    }
+    if (outIdentical) *outIdentical = ConvexBodiesEqual(authority.bodies, replica.bodies);
+    return authority;
+}
+
+// ----- RunFricRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) ----------------
+// The rollback harness (the convex::RunConvexRollback control flow over SimFricTick).
+// (1) advance ticks 0..rollbackAt from `world0` applying authStream; (2) SAVE a ConvexSnapshot AT rollbackAt
+// (SnapshotConvex — the body world); (2b) speculatively advance a few ticks with the MISPREDICTED stream (a
+// WRONG/extra impulse — the client prediction that diverges), capturing that diverged intermediate;
+// (3) ROLLBACK — RestoreConvex to the snapshot + RE-SIMULATE rollbackAt..ticks with the CORRECT authStream ->
+// the corrected final world. Returns the corrected world; sets *outCorrectedEqAuthority (if non-null) to
+// whether it == RunFricLockstep(world0, cfg, authStream, ticks) byte-for-byte, and *outMispredictDiverged
+// (if non-null) to whether the speculative pre-rollback state DIFFERED from the authority at the same tick
+// (proving a REAL divergence was corrected, not a no-op). cfg + the streams are CONSTANT, NOT snapshotted.
+inline ConvexWorld RunFricRollback(const ConvexWorld& world0, const FrictionStepConfig& cfg,
+                                   const std::vector<ConvexCommand>& authStream,
+                                   const std::vector<ConvexCommand>& mispredictStream,
+                                   uint32_t ticks, uint32_t rollbackAt,
+                                   bool* outCorrectedEqAuthority = nullptr,
+                                   bool* outMispredictDiverged = nullptr) {
+    ConvexWorld w = world0;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimFricTick(w, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — just the body world).
+    const ConvexSnapshot snap = SnapshotConvex(w, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimFricTick(w, cfg, mispredictStream, rollbackAt + s);
+    ConvexWorld speculative = w;   // the diverged pre-rollback intermediate (for the "real divergence" proof)
+    // (3) ROLLBACK: restore the snapshot (the body world) + re-sim rollbackAt..ticks with the authStream.
+    RestoreConvex(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimFricTick(w, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        ConvexWorld authAtSpec = world0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimFricTick(authAtSpec, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !ConvexBodiesEqual(speculative.bodies, authAtSpec.bodies);
+        if (outCorrectedEqAuthority) {
+            const ConvexWorld authFinal = RunFricLockstep(world0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = ConvexBodiesEqual(w.bodies, authFinal.bodies);
+        }
+    }
+    return w;
+}
+
 }  // namespace fric
 }  // namespace hf::sim

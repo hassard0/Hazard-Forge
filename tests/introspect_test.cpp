@@ -452,6 +452,8 @@ int main() {
             bool sawFrictionSolveFeature = false;
             // Slice FC4: the deterministic-friction-step capability is advertised.
             bool sawFrictionStepFeature = false;
+            // Slice FC5: the deterministic-friction-lockstep capability is advertised.
+            bool sawFrictionLockstepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -638,6 +640,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-friction-points") sawFrictionPointsFeature = true;
                     if (AsString(el->value) == "deterministic-friction-solve") sawFrictionSolveFeature = true;
                     if (AsString(el->value) == "deterministic-friction-step") sawFrictionStepFeature = true;
+                    if (AsString(el->value) == "deterministic-friction-lockstep") sawFrictionLockstepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -808,6 +811,7 @@ int main() {
         check(sawFrictionPointsFeature, "engine.features includes deterministic-friction-points");
         check(sawFrictionSolveFeature, "engine.features includes deterministic-friction-solve");
         check(sawFrictionStepFeature, "engine.features includes deterministic-friction-step");
+        check(sawFrictionLockstepFeature, "engine.features includes deterministic-friction-lockstep");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
