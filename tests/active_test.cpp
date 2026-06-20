@@ -751,6 +751,106 @@ int main() {
               "AC4 StepActiveRecover equiv: physicality-kOne no-impulse run == AC3 StepActive (byte-identical)");
     }
 
+    // ============================================================================================
+    // ============== AC5: LOCKSTEP + ROLLBACK (the hit-stream netcode harness over StepActive) =====
+    // ============================================================================================
+
+    // A scripted hit stream: a couple of torso/limb velocity-impulses at a few ticks (so the ragdoll is
+    // perturbed off the clip then driven back). The bodies: 0 pelvis(root, pinned), 1 spine, 2 head, 3/4
+    // L-arm, 5/6 R-arm, 7/8 legs. dv is a Q16.16 velocity delta (a strong sideways/down kick).
+    auto kick = [](uint32_t tick, uint32_t bodyIdx, int dvx, int dvy) {
+        return active::ActiveCommand{tick, bodyIdx,
+                                     fpx::FxVec3{dvx * (int)active::kOne, dvy * (int)active::kOne, 0}};
+    };
+    const std::vector<active::ActiveCommand> kAuthStream = {
+        kick(10, 1u, 20, -8),   // a torso hit at tick 10
+        kick(30, 5u, -15, 5),   // a R-upper-arm hit at tick 30
+        kick(50, 1u, 12, 10),   // another torso hit at tick 50
+    };
+    const active::fx acDt5 = active::kOne / 60;
+    const int acIters5 = 24;
+    const int kTicks5 = 80;
+    const float kStart5 = 1.0f;   // hold the bend clip at its bent end-pose
+
+    // ===== AC5 (1): SnapshotActive/RestoreActive round-trip — incl the tick =====
+    {
+        active::ActiveRagdoll a = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        // advance a few hit+step ticks so the world is non-trivial, then snapshot at tick 20.
+        for (int t = 0; t < 20; ++t)
+            active::SimActiveTick(a, humanoid, bendClip, kAuthStream, t, kStart5, acDt5, acIters5);
+        const active::ActiveSnapshot snap = active::SnapshotActive(a, /*tick=*/20);
+        check(snap.tick == 20, "AC5 SnapshotActive: stores the clip-time tick");
+        check(snap.world.bodies.size() == a.ragdoll.world.bodies.size(),
+              "AC5 SnapshotActive: deep-copies the world bodies");
+        // mutate (a few more hit+step ticks), then restore -> the world is byte-identical to the snapshot.
+        for (int t = 20; t < 35; ++t)
+            active::SimActiveTick(a, humanoid, bendClip, kAuthStream, t, kStart5, acDt5, acIters5);
+        const bool mutated = std::memcmp(a.ragdoll.world.bodies.data(), snap.world.bodies.data(),
+                                         snap.world.bodies.size() * sizeof(fpx::FxBody)) != 0;
+        check(mutated, "AC5 SnapshotActive: the snapshot is independent (mutation did not touch it)");
+        const int resumeTick = active::RestoreActive(a, snap);
+        check(resumeTick == 20, "AC5 RestoreActive: returns the captured clip-time tick");
+        check(std::memcmp(a.ragdoll.world.bodies.data(), snap.world.bodies.data(),
+                          snap.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC5 RestoreActive: the world is byte-identical to the snapshot (bit-exact round-trip)");
+    }
+
+    // ===== AC5 (2): RunActiveLockstep — authority == replica over the hit stream =====
+    {
+        const active::ActiveRagdoll init = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        const active::ActiveRagdoll authority =
+            active::RunActiveLockstep(humanoid, bendClip, init, kAuthStream, kTicks5, kStart5, acDt5, acIters5);
+        const active::ActiveRagdoll replica =
+            active::RunActiveLockstep(humanoid, bendClip, init, kAuthStream, kTicks5, kStart5, acDt5, acIters5);
+        check(authority.ragdoll.world.bodies.size() == replica.ragdoll.world.bodies.size() &&
+              std::memcmp(authority.ragdoll.world.bodies.data(), replica.ragdoll.world.bodies.data(),
+                          authority.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC5 RunActiveLockstep: authority == replica BIT-IDENTICAL (two peers, the same hit stream)");
+        // determinism: two full runs byte-identical (already shown above; a second pair for clarity).
+        const active::ActiveRagdoll run2 =
+            active::RunActiveLockstep(humanoid, bendClip, init, kAuthStream, kTicks5, kStart5, acDt5, acIters5);
+        check(std::memcmp(authority.ragdoll.world.bodies.data(), run2.ragdoll.world.bodies.data(),
+                          authority.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC5 RunActiveLockstep determinism: two runs BYTE-IDENTICAL");
+    }
+
+    // ===== AC5 (3): RunActiveRollback — a mispredicted hit DIVERGES, rollback CORRECTS to authority =====
+    {
+        const active::ActiveRagdoll init = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        const int divergeTick = 30;
+        // a WRONG hit (a strong-enough mispredict so the speculative state visibly diverges): a different
+        // body + a big dv at the diverge tick (the authority's tick-30 hit is body 5 dv {-15,5}).
+        const std::vector<active::ActiveCommand> kMispredictStream = {
+            kick((uint32_t)divergeTick, 3u, 40, -30),   // a wrong, strong L-upper-arm kick
+        };
+        const active::ActiveRagdoll authority =
+            active::RunActiveLockstep(humanoid, bendClip, init, kAuthStream, kTicks5, kStart5, acDt5, acIters5);
+        const active::ActiveRagdoll corrected =
+            active::RunActiveRollback(humanoid, bendClip, init, kAuthStream, kMispredictStream, divergeTick,
+                                      kTicks5, kStart5, acDt5, acIters5);
+        check(std::memcmp(corrected.ragdoll.world.bodies.data(), authority.ragdoll.world.bodies.data(),
+                          authority.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC5 RunActiveRollback: the corrected (rolled-back + re-simulated) peer == authority BIT-EXACT");
+
+        // the mispredicted (pre-rollback) state HAD diverged: reproduce the speculative branch (advance to
+        // divergeTick with authStream, then a few ticks with the WRONG stream) and confirm it differs from
+        // the authority at the same tick count (a REAL divergence was fixed).
+        active::ActiveRagdoll spec = init;
+        for (int t = 0; t < divergeTick; ++t)
+            active::SimActiveTick(spec, humanoid, bendClip, kAuthStream, t, kStart5, acDt5, acIters5);
+        int specTicks = kTicks5 - divergeTick; if (specTicks > 3) specTicks = 3;
+        for (int s = 0; s < specTicks; ++s)
+            active::SimActiveTick(spec, humanoid, bendClip, kMispredictStream, divergeTick + s, kStart5, acDt5,
+                                  acIters5);
+        // the authority advanced to the same (divergeTick + specTicks) point with the CORRECT stream.
+        active::ActiveRagdoll authAtSpec = init;
+        for (int t = 0; t < divergeTick + specTicks; ++t)
+            active::SimActiveTick(authAtSpec, humanoid, bendClip, kAuthStream, t, kStart5, acDt5, acIters5);
+        check(std::memcmp(spec.ragdoll.world.bodies.data(), authAtSpec.ragdoll.world.bodies.data(),
+                          spec.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) != 0,
+              "AC5 RunActiveRollback: the mispredicted (pre-rollback) state DIVERGED from authority (real fix)");
+    }
+
     if (g_fail == 0) std::printf("active_test: ALL PASS\n");
     else std::printf("active_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

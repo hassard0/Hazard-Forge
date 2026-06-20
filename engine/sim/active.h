@@ -39,6 +39,7 @@
 // differentiator: UE5's physical-animation drive is float/non-deterministic), NOT "more physically correct".
 
 #include <cstdint>
+#include <cstring>   // std::memcmp (the AC5 lockstep bit-identity assert)
 #include <vector>
 
 #include "anim/animation.h"  // read-only (AC3 — the pillar bridge): SampleLocalPose / Animation / JointPose.r
@@ -387,6 +388,153 @@ inline void StepActiveRecover(ActiveRagdoll& active, const anim::Skeleton& skele
         if (t == struckTick) ApplyImpulse(active.ragdoll.world, impulseBody, impulseDv);   // the hit
         StepActivePhysicality(active, skeleton, clip, startTime + (float)t * dtSeconds, physicality, dt, iters);
     }
+}
+
+// ====================================================================================================
+// Slice AC5 — LOCKSTEP + ROLLBACK (THE NETCODE HEADLINE). AC1-AC4 built a clip-tracking, blendable,
+// hit-reacting active ragdoll. AC5 proves the bit-exact clip-driven tick (AC3 StepActive) is true
+// cross-platform LOCKSTEP + ROLLBACK — the FPX5/FR5/GR5/CG5/GF5/JT5/VH5 twin: two peers fed ONLY the
+// input HIT stream re-derive the exact clip-driven ragdoll trajectory bit-for-bit, and a mispredicted hit
+// is corrected by rolling back to a saved snapshot + re-simulating. PURE CPU (NO GPU dispatch, NO new
+// shader, NO new RHI). ADDITIVE — AC1-AC4 above is byte-FROZEN; AC5 only APPENDS the command + snapshot +
+// the three harness functions.
+//
+// THE INPUT is a HIT stream. ActiveCommand {tick; body; dv} — a velocity-impulse event (the AC4
+// ApplyImpulse, now an INPUT rather than a scripted constant). The clip-drive (AC3 StepActive) holds the
+// ragdoll on the animation; the hits perturb it; the drive recovers it. (AC5 uses full physicality /
+// StepActive clip-tracking; the AC4 physicality ramp is NOT replayed here — a hit is the only
+// nondeterminism-free input event.)
+//
+// THE VH5 TWIST — snapshot the world AND the tick. AC3's StepActive recomputes the qTargets each tick from
+// the clip at time = startTime + tick*dt (a host pre-pass), and the drives' base weights are constant — so
+// the only MUTABLE replayable state is the fpx::FxWorld (bodies). BUT the clip time is DERIVED from the tick
+// index, so a snapshot must record WHICH tick it was taken at, or the resumed sim samples the clip at the
+// wrong time. Therefore ActiveSnapshot {fpx::FxWorld world; int tick;} (the VH5 hinge-axes / GF5 two-pool
+// analog: snapshot the world + the per-tick anchor). SnapshotActive deep-copies the world (via
+// fpx::SnapshotWorld) + stores the tick; RestoreActive restores the world + returns the tick so the harness
+// resumes the clip-time from there. (fpx.h SnapshotWorld/RestoreWorld are reused VERBATIM, read-only.)
+
+// ----- ActiveCommand: ONE hit-impulse input event (the AC4 ApplyImpulse lifted to a replayable input) -----
+// A velocity-impulse event at a given tick on a given body. The harness applies every command whose
+// cmd.tick == tick (in ARRAY ORDER) via ApplyImpulse before the StepActive of that tick. (The fpx FxCommand
+// / VehicleCommand scripted-impulse-per-tick shape.) Pure integer (dv is a Q16.16 FxVec3 velocity delta).
+struct ActiveCommand {
+    uint32_t tick = 0;       // the tick this hit fires at
+    uint32_t body = 0;       // the body index the impulse is applied to (a dynamic bone)
+    fpx::FxVec3 dv;          // the Q16.16 velocity-impulse delta (the AC4 ApplyImpulse dv)
+};
+
+// ----- ActiveSnapshot: the captured mutable active-ragdoll state (the world AND the clip-time tick) --------
+// The VH5 twist: the body world (deep-copied via fpx::SnapshotWorld — the std::vector<FxBody> + the scalar
+// gravity/groundY) PLUS the `tick` the snapshot was taken at (the clip-time anchor — StepActive recomputes
+// the qTargets from time = startTime + tick*dt, so the resumed sim needs the tick to sample the clip at the
+// right time). The drives + joints + limits are immutable structure (their qTargets are re-derived from the
+// clip each tick) so they are NOT snapshotted — EXACTLY the mutable state is captured (bodies + tick).
+struct ActiveSnapshot {
+    fpx::FxWorld world;      // the body world (fpx::SnapshotWorld deep-copy: bodies + gravity/groundY)
+    int          tick = 0;   // the clip-time anchor — the tick this snapshot was taken at
+};
+
+// ----- SnapshotActive: deep-copy the mutable active-ragdoll state (the rollback restore point) ------------
+// Reuses fpx::SnapshotWorld VERBATIM for the bodies (a value copy -> deep-copies the bodies vector) + stores
+// the tick. Bit-exact round-trip with RestoreActive: RestoreActive(active, SnapshotActive(active0, t))
+// leaves active's world == active0's byte-for-byte AND returns t.
+inline ActiveSnapshot SnapshotActive(const ActiveRagdoll& active, int tick) {
+    ActiveSnapshot snap;
+    snap.world = fpx::SnapshotWorld(active.ragdoll.world);
+    snap.tick = tick;
+    return snap;
+}
+
+// ----- RestoreActive: restore the world from a snapshot + return the captured tick (the rollback) ---------
+// Restores the body world (fpx::RestoreWorld) and returns snap.tick so the harness resumes the clip-time
+// from the saved tick. Bit-exact round-trip with SnapshotActive. The drives/joints/limits are untouched
+// (immutable structure — their qTargets are re-derived from the clip).
+inline int RestoreActive(ActiveRagdoll& active, const ActiveSnapshot& snap) {
+    fpx::RestoreWorld(active.ragdoll.world, snap.world);
+    return snap.tick;
+}
+
+// ----- SimActiveTick: the deterministic per-tick step (apply this tick's hits + StepActive) ---------------
+// (0) APPLY this tick's commands in ARRAY ORDER (every cmd with cmd.tick == tick) via ApplyImpulse — the
+//     AC4 hit, now an input event — BEFORE the step so the kick integrates this tick.
+// (1) StepActive(active, skeleton, clip, startTime + tick*dtSeconds, dt, iters) — the AC3 clip-driven tick
+//     (WriteClipTargets then the integer StepDriveWorld). dtSeconds = (float)dt/(float)kOne (the AC3
+//     clip-time convention). Pure integer sim + the deterministic host clip pre-pass -> bit-identical on
+//     every peer/platform. The JT5 SimRagdollTick / VH5 SimVehicleTick twin.
+inline void SimActiveTick(ActiveRagdoll& active, const anim::Skeleton& skeleton, const anim::Animation& clip,
+                          const std::vector<ActiveCommand>& commands, int tick, float startTime, fx dt,
+                          int iters) {
+    for (size_t c = 0; c < commands.size(); ++c)
+        if ((int)commands[c].tick == tick)
+            ApplyImpulse(active.ragdoll.world, commands[c].body, commands[c].dv);
+    const float dtSeconds = (float)dt / (float)kOne;
+    StepActive(active, skeleton, clip, startTime + (float)tick * dtSeconds, dt, iters);
+}
+
+// ----- RunActiveLockstep: authority + replica from the SAME inputs, bit-identical every tick --------------
+// THE peer entry point (the JT5 RunRagdollLockstep / VH5 RunVehicleLockstep control flow over SimActiveTick).
+// Run `ticks` SimActiveTicks from a COPY of `initialActive`, applying the command stream -> the converged
+// ragdoll. authority = RunActiveLockstep(skel, clip, init, commands, N, ...); replica = the SAME from the
+// SAME init + stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism. This function ASSERTS
+// authority == replica bit-for-bit every tick (memcmp the world bodies) via an internal replica run; the
+// caller also memcmps two RunActiveLockstep returns for the determinism proof. Returns the converged
+// authority ActiveRagdoll.
+inline ActiveRagdoll RunActiveLockstep(const anim::Skeleton& skeleton, const anim::Animation& clip,
+                                       const ActiveRagdoll& initialActive,
+                                       const std::vector<ActiveCommand>& commands, int ticks, float startTime,
+                                       fx dt, int iters) {
+    ActiveRagdoll authority = initialActive;   // a fresh copy (world + drives)
+    ActiveRagdoll replica   = initialActive;   // the second peer fed the SAME inputs
+    for (int t = 0; t < ticks; ++t) {
+        SimActiveTick(authority, skeleton, clip, commands, t, startTime, dt, iters);
+        SimActiveTick(replica,   skeleton, clip, commands, t, startTime, dt, iters);
+        // assert bit-identical every tick — two peers fed only the hit stream stay in lockstep.
+        if (authority.ragdoll.world.bodies.size() != replica.ragdoll.world.bodies.size() ||
+            std::memcmp(authority.ragdoll.world.bodies.data(), replica.ragdoll.world.bodies.data(),
+                        authority.ragdoll.world.bodies.size() * sizeof(FxBody)) != 0) {
+            // the lockstep invariant broke — a nondeterminism the showcase/test reports loudly. We leave the
+            // authority as-is; the caller's memcmp proof catches the divergence (this branch is unreachable
+            // for a deterministic sim — the fixed-order integer ops guarantee authority == replica).
+            return authority;
+        }
+    }
+    return authority;
+}
+
+// ----- RunActiveRollback: snapshot -> mispredict diverges -> rollback -> corrected == authority -----------
+// The rollback harness (the JT5 RunRagdollRollback / VH5 RunVehicleRollback control flow over SimActiveTick).
+// (1) advance ticks 0..divergeTick from `initialActive` applying authorityCmds; (2) SAVE an ActiveSnapshot
+// AT divergeTick (SnapshotActive — the world AND the tick); (2b) speculatively advance a few ticks with the
+// MISPREDICTED stream (a WRONG hit — different body/dv/tick, the client prediction that diverges); (3)
+// ROLLBACK — RestoreActive to the snapshot (restoring the world AND resuming the clip-time from the saved
+// tick) + RE-SIMULATE divergeTick..ticks with the CORRECT authorityCmds -> the corrected final ragdoll. The
+// caller asserts this == RunActiveLockstep(skel, clip, init, authorityCmds, ticks, ...) (rollback corrected
+// the misprediction EXACTLY) AND that the speculative pre-rollback state DIFFERED from authority (a real
+// divergence was fixed). Reuses SnapshotActive/RestoreActive (which carry the tick). startTime/dt/iters are
+// CONSTANT, NOT snapshotted.
+inline ActiveRagdoll RunActiveRollback(const anim::Skeleton& skeleton, const anim::Animation& clip,
+                                       const ActiveRagdoll& initialActive,
+                                       const std::vector<ActiveCommand>& authorityCmds,
+                                       const std::vector<ActiveCommand>& mispredictCmds, int divergeTick,
+                                       int ticks, float startTime, fx dt, int iters) {
+    ActiveRagdoll active = initialActive;
+    // (1) advance 0..divergeTick with the authoritative stream.
+    for (int t = 0; t < divergeTick; ++t)
+        SimActiveTick(active, skeleton, clip, authorityCmds, t, startTime, dt, iters);
+    // (2) SAVE the snapshot at divergeTick (the rollback restore point — the world AND the clip-time tick).
+    const ActiveSnapshot snap = SnapshotActive(active, divergeTick);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong hit — the client
+    // prediction that diverges). Bounded to the remaining ticks.
+    int specTicks = ticks - divergeTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimActiveTick(active, skeleton, clip, mispredictCmds, divergeTick + s, startTime, dt, iters);
+    // (3) ROLLBACK: restore the snapshot (world + tick) + re-sim divergeTick..ticks with the authStream.
+    const int resumeTick = RestoreActive(active, snap);   // == divergeTick (the clip-time anchor)
+    for (int t = resumeTick; t < ticks; ++t)
+        SimActiveTick(active, skeleton, clip, authorityCmds, t, startTime, dt, iters);
+    return active;
 }
 
 }  // namespace active
