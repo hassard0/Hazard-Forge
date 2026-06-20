@@ -41,6 +41,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "anim/animation.h"  // read-only (AC3 — the pillar bridge): SampleLocalPose / Animation / JointPose.r
+#include "anim/skeleton.h"   // read-only (AC3): anim::Skeleton / anim::Joint (the source the ragdoll binds from)
 #include "sim/joint.h"  // read-only: FxJoint / SolveBallJoint / FxAngularLimit / SolveAngularLimit /
                         // QConj / QNlerp / FxDot / kJointBall / kAngularHinge / kAngularCone — the JT
                         // toolbox AC1's drive is built from (SolveAngularLimit's apply, verbatim).
@@ -203,6 +205,106 @@ inline void StepDriveWorldSteps(FxWorld& world, const std::vector<FxJoint>& join
                                 const std::vector<FxAngularDrive>& drives, fx dt, int iters, int steps) {
     for (int s = 0; s < steps; ++s)
         StepDriveWorld(world, joints, angularLimits, drives, dt, iters);
+}
+
+// ====================================================================================================
+// Slice AC3 — THE ANIM-TARGET STEP (THE PILLAR BRIDGE). AC1 built the angular drive-to-target primitive;
+// AC2 the per-joint blend weight. AC3 unites the anim pillar (engine/anim/) and the physics moat: each tick
+// SAMPLE an anim clip into its per-bone LOCAL rotations -> WRITE those into the joints' drive qTargets -> run
+// the AC1/AC2 integer drive step, so a JT4 ragdoll TRACKS an animation clip via physics torques while still
+// colliding/yielding. The clip-sample + the float->Q16.16 qTarget snap are a documented DETERMINISTIC FLOAT
+// crossing OUTSIDE the bit-exact loop (the JT4 bind shape) — computed HOST-side IDENTICALLY for the GPU and
+// CPU paths, so the only thing the GPU/CPU bit-exactly reproduce is the integer StepDriveWorld over those
+// shared qTargets (the AC1 contract, now with per-tick-varying targets). AC3 APPENDS — AC1/AC2 byte-frozen.
+// NO new shader (the drive solve is AC1's active_drive_solve.comp; the sample+snap is host C++), NO new RHI.
+
+// ----- FxQuatFromFloat: round-to-nearest float->Q16.16 quaternion snap (the JT4/BuildPileWorld idiom) -----
+// The drive's qTarget is a UNIT quaternion in Q16.16. SampleLocalPose returns a float math::Quat (the bone's
+// local rotation = qTarget); snap each component round-to-nearest, ties away from zero — the SAME host snap
+// convention RagdollFromSkeleton / fpx::BuildPileWorld use ((fx)(v*kOne + (v<0?-0.5:0.5))) so the AC3
+// targets and the JT4 bind agree. Pure host float, deterministic (no RNG/clock) -> bit-reproducible.
+inline FxQuat FxQuatFromFloat(const math::Quat& q) {
+    auto snap = [](double v) -> fx { return (fx)(v * (double)kOne + (v < 0 ? -0.5 : 0.5)); };
+    return FxQuat{snap(q.x), snap(q.y), snap(q.z), snap(q.w)};
+}
+
+// ----- ActiveRagdoll: a JT4 joint::Ragdoll + a parallel drive per non-root edge (the AC3 binding) ----------
+// `ragdoll` is the verbatim JT4 bind (one body per skeleton joint + one ball joint + one cone limit per
+// non-root edge); `drives` is ONE FxAngularDrive per `ragdoll.joints[e]` (same non-root-edge ordering),
+// driving that joint's relative orientation toward the clip-sampled target each tick. drives.size() ==
+// ragdoll.joints.size(). The child bone of edge e is ragdoll.joints[e].bodyB (RagdollFromSkeleton pushes one
+// edge per non-root joint j with bodyA=parent, bodyB=j — so joints[e].bodyB IS the skeleton joint index whose
+// LOCAL rotation is the qTarget for that edge). WriteClipTargets fills the qTargets; ActiveFromSkeleton builds.
+struct ActiveRagdoll {
+    joint::Ragdoll               ragdoll;   // the JT4 bodies + ball joints + cone limits (REUSED VERBATIM)
+    std::vector<FxAngularDrive>  drives;    // one drive per ragdoll.joints[e] (same non-root-edge order)
+};
+
+// ----- ActiveFromSkeleton: bind the ragdoll + one drive per non-root edge ------------------------------
+// Builds joint::RagdollFromSkeleton(skeleton, ragdollCfg) (the bodies + ball joints + cone limits — the host
+// float->Q16.16 bind), then a parallel drive per `ragdoll.joints[e]` with bodyA/bodyB = joints[e].bodyA/bodyB
+// (parent/child), the given per-iteration `stiffness`, and driveWeight = driveWeightFn(e) (AC2 — default kOne,
+// so callers can make some bones limp). qTarget is left identity; WriteClipTargets fills it each tick.
+// `driveWeightFn` is any callable e(size_t)->fx; the default (nullptr-equivalent) is kOne for every edge.
+template <typename DriveWeightFn>
+inline ActiveRagdoll ActiveFromSkeleton(const anim::Skeleton& skeleton, const joint::RagdollConfig& ragdollCfg,
+                                        fx stiffness, DriveWeightFn driveWeightFn) {
+    ActiveRagdoll act;
+    act.ragdoll = joint::RagdollFromSkeleton(skeleton, ragdollCfg);
+    act.drives.reserve(act.ragdoll.joints.size());
+    for (size_t e = 0; e < act.ragdoll.joints.size(); ++e) {
+        FxAngularDrive d;
+        d.bodyA = act.ragdoll.joints[e].bodyA;    // the parent body (the frame body — A's frame defines qTarget)
+        d.bodyB = act.ragdoll.joints[e].bodyB;    // the child body (the driven body); also the child bone index
+        d.qTarget = FxQuat{0, 0, 0, kOne};        // identity until WriteClipTargets fills it from the clip
+        d.stiffness = stiffness;
+        d.driveWeight = driveWeightFn(e);
+        act.drives.push_back(d);
+    }
+    return act;
+}
+// Overload: default driveWeight kOne for every edge (the all-active bind).
+inline ActiveRagdoll ActiveFromSkeleton(const anim::Skeleton& skeleton, const joint::RagdollConfig& ragdollCfg,
+                                        fx stiffness) {
+    return ActiveFromSkeleton(skeleton, ragdollCfg, stiffness, [](size_t) -> fx { return kOne; });
+}
+
+// ----- WriteClipTargets: THE FLOAT CROSSING — sample the clip + snap into the qTargets (host, deterministic)
+// pose = SampleLocalPose(skeleton, clip, time) (float; one local TRS per joint in skeleton order). For each
+// non-root edge e, active.drives[e].qTarget = FxQuatFromFloat(pose[childBoneOf(e)].r), where childBoneOf(e) ==
+// active.ragdoll.joints[e].bodyB (the SAME index RagdollFromSkeleton built joints[e] from) and JointPose.r is
+// EXACTLY the bone's local rotation in its parent's frame = the drive's relative-orientation target. The
+// snap is RNG/clock-free and `time` advances by a fixed dt -> the qTargets are bit-reproducible AND shared
+// identically by the GPU + CPU paths (only the integer StepDriveWorld over them is the GPU==CPU memcmp).
+inline void WriteClipTargets(ActiveRagdoll& active, const anim::Skeleton& skeleton,
+                             const anim::Animation& clip, float time) {
+    const std::vector<anim::JointPose> pose = anim::SampleLocalPose(skeleton, clip, time);
+    for (size_t e = 0; e < active.drives.size(); ++e) {
+        const uint32_t childBone = active.ragdoll.joints[e].bodyB;
+        if ((size_t)childBone < pose.size())
+            active.drives[e].qTarget = FxQuatFromFloat(pose[(size_t)childBone].r);
+    }
+}
+
+// ----- StepActive: one anim-tracking tick = WriteClipTargets then the AC1/AC2 integer drive step ---------
+// The per-tick host pre-pass (sample+snap the clip into the qTargets, OUTSIDE the bit-exact loop) then the
+// bit-exact integer StepDriveWorld over active.ragdoll.world/joints/limits + the freshly-written drives. The
+// GPU showcase runs the SAME host pre-pass (sample+snap+upload the drives) then the AC1 active_drive_solve.comp
+// for the integer step -> memcmp the GPU body world vs this CPU StepActive.
+inline void StepActive(ActiveRagdoll& active, const anim::Skeleton& skeleton, const anim::Animation& clip,
+                       float time, fx dt, int iters) {
+    WriteClipTargets(active, skeleton, clip, time);
+    StepDriveWorld(active.ragdoll.world, active.ragdoll.joints, active.ragdoll.limits, active.drives, dt, iters);
+}
+
+// ----- StepActiveSteps: run `steps` anim-tracking ticks advancing time = startTime + s*dt each step --------
+// Deterministic: the clip `time` advances by a fixed dt per step (the AC5 note: this time is per-tick state).
+inline void StepActiveSteps(ActiveRagdoll& active, const anim::Skeleton& skeleton, const anim::Animation& clip,
+                            fx dt, int iters, int steps, float startTime) {
+    // dt in seconds (float, for the clip time advance) = the Q16.16 dt back to float (render/clip-domain only).
+    const float dtSeconds = (float)dt / (float)kOne;
+    for (int s = 0; s < steps; ++s)
+        StepActive(active, skeleton, clip, startTime + (float)s * dtSeconds, dt, iters);
 }
 
 }  // namespace active

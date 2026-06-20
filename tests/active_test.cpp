@@ -418,6 +418,170 @@ int main() {
               "AC2 StepDriveWorld all-weight-kOne == AC1 all-driven (byte-identical — render-invariant)");
     }
 
+    // ============================================================================================
+    // ============== AC3: THE ANIM-TARGET STEP (THE PILLAR BRIDGE) — clip -> drive targets =========
+    // ============================================================================================
+
+    // Build a synthetic ~9-joint humanoid anim::Skeleton (the JT4 --joint-ragdoll-shot config; topologically
+    // sorted: 0 pelvis, 1 spine, 2 head, 3/4 L-arm, 5/6 R-arm, 7 L-leg, 8 R-leg).
+    auto buildHumanoid = []() {
+        hf::anim::Skeleton s;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            hf::anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        s.joints.push_back(J(-1, 0.0f,  5.0f, 0.0f));  // 0 pelvis (root)
+        s.joints.push_back(J(0,  0.0f,  1.0f, 0.0f));  // 1 spine
+        s.joints.push_back(J(1,  0.0f,  1.0f, 0.0f));  // 2 head
+        s.joints.push_back(J(1, -0.7f,  0.6f, 0.0f));  // 3 L upper arm
+        s.joints.push_back(J(3, -0.7f,  0.0f, 0.0f));  // 4 L fore arm
+        s.joints.push_back(J(1,  0.7f,  0.6f, 0.0f));  // 5 R upper arm
+        s.joints.push_back(J(5,  0.7f,  0.0f, 0.0f));  // 6 R fore arm
+        s.joints.push_back(J(0, -0.4f, -1.0f, 0.0f));  // 7 L leg
+        s.joints.push_back(J(0,  0.4f, -1.0f, 0.0f));  // 8 R leg
+        const size_t n = s.joints.size();
+        std::vector<math::Mat4> global(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(s.joints[j].t, s.joints[j].r, s.joints[j].s);
+            const int p = s.joints[j].parent;
+            global[j] = (p >= 0) ? (global[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) s.joints[j].inverseBind = global[j].Inverse();
+        return s;
+    };
+
+    // A synthetic "bend" clip: a Rotation channel on every non-root bone driving its LOCAL rotation to qZ90 at
+    // t=duration (Step from identity at t=0 to qZ90 at t=1 -> a distinctly NON-rest pose the ragdoll tracks).
+    auto buildBendClip = [&](const hf::anim::Skeleton& skel) {
+        hf::anim::Animation a;
+        a.name = "bend";
+        a.duration = 1.0f;
+        const float c = 0.70710678f;   // cos/sin 45 -> qZ90 = {0,0,c,c}
+        for (size_t j = 1; j < skel.joints.size(); ++j) {   // skip root (no incoming edge -> no drive)
+            hf::anim::Channel ch;
+            ch.jointIndex = (int)j;
+            ch.path = hf::anim::Channel::Path::Rotation;
+            ch.interp = hf::anim::Channel::Interp::Linear;
+            ch.times = {0.0f, 1.0f};
+            ch.values = {0, 0, 0, 1,   0, 0, c, c};   // identity at t=0, qZ90 at t=1 (xyzw per key)
+            a.channels.push_back(ch);
+        }
+        return a;
+    };
+
+    const hf::anim::Skeleton humanoid = buildHumanoid();
+    const hf::anim::Animation bendClip = buildBendClip(humanoid);
+
+    joint::RagdollConfig acCfg;
+    acCfg.worldScale = active::kOne;
+    acCfg.boneRadius = active::kOne * 30 / 100;
+    acCfg.invMass    = active::kOne;
+    acCfg.coneCos    = -active::kOne;     // 180-degree free cone (the drive does the work)
+    acCfg.coneSin    = 0;
+    acCfg.gravity    = fpx::FxVec3{0, kGravY, 0};
+    acCfg.groundY    = (active::fx)(-1000 * (int)active::kOne);   // far below -> focus the tracked pose
+    acCfg.rootStatic = true;              // pinned root so the ragdoll hangs from the pelvis
+
+    // ===== AC3 (1): FxQuatFromFloat round-trips a unit quat within an LSB band =====
+    {
+        const math::Quat qf{0.0f, 0.0f, 0.70710678f, 0.70710678f};
+        const fpx::FxQuat fq = active::FxQuatFromFloat(qf);
+        const active::fx band = active::kOne / 1024;   // a tight snap band (round-to-nearest)
+        check(fxabs(fq.z - kSqrtHalf) <= band && fxabs(fq.w - kSqrtHalf) <= band &&
+              fq.x == 0 && fq.y == 0,
+              "AC3 FxQuatFromFloat: round-to-nearest snap matches qZ90 within an LSB band");
+        // identity -> {0,0,0,kOne} exactly.
+        const fpx::FxQuat fi = active::FxQuatFromFloat(math::Quat{0, 0, 0, 1});
+        check(fi.x == 0 && fi.y == 0 && fi.z == 0 && fi.w == active::kOne,
+              "AC3 FxQuatFromFloat: identity snaps to {0,0,0,kOne} exactly");
+    }
+
+    // ===== AC3 (2): ActiveFromSkeleton builds one drive per non-root edge with the right parent/child =====
+    {
+        active::ActiveRagdoll act = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        // one drive per ragdoll joint (== non-root edge count == joint count - 1 root for this tree = 8).
+        check(act.drives.size() == act.ragdoll.joints.size(),
+              "AC3 ActiveFromSkeleton: one drive per non-root edge (parallel to ragdoll.joints)");
+        check(act.drives.size() == humanoid.joints.size() - 1,
+              "AC3 ActiveFromSkeleton: drive count == non-root edge count");
+        bool parentChildOk = true;
+        for (size_t e = 0; e < act.drives.size(); ++e) {
+            if (act.drives[e].bodyA != act.ragdoll.joints[e].bodyA ||
+                act.drives[e].bodyB != act.ragdoll.joints[e].bodyB) parentChildOk = false;
+            // the child bone == joints[e].bodyB, and its skeleton parent == joints[e].bodyA.
+            if ((int)humanoid.joints[(size_t)act.ragdoll.joints[e].bodyB].parent !=
+                (int)act.ragdoll.joints[e].bodyA) parentChildOk = false;
+        }
+        check(parentChildOk, "AC3 ActiveFromSkeleton: each drive's bodyA/bodyB == its joint's parent/child");
+        check(act.drives[0].stiffness == kDriveStiff && act.drives[0].driveWeight == active::kOne,
+              "AC3 ActiveFromSkeleton: drives carry the stiffness + default driveWeight kOne");
+    }
+
+    // ===== AC3 (3): WriteClipTargets sets each drive's qTarget to the snapped sampled bone rotation =====
+    {
+        active::ActiveRagdoll act = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        // at t=0 every channel is identity -> every qTarget snaps to identity.
+        active::WriteClipTargets(act, humanoid, bendClip, 0.0f);
+        bool allIdent = true;
+        for (const active::FxAngularDrive& d : act.drives)
+            if (!(d.qTarget.x == 0 && d.qTarget.y == 0 && d.qTarget.z == 0 && d.qTarget.w == active::kOne))
+                allIdent = false;
+        check(allIdent, "AC3 WriteClipTargets t=0: every qTarget is the rest (identity) rotation");
+        // at t=1 the clip rotates every non-root bone to qZ90 -> each qTarget == FxQuatFromFloat(sampled .r).
+        active::WriteClipTargets(act, humanoid, bendClip, 1.0f);
+        bool matchesSample = true;
+        const std::vector<hf::anim::JointPose> pose = hf::anim::SampleLocalPose(humanoid, bendClip, 1.0f);
+        for (size_t e = 0; e < act.drives.size(); ++e) {
+            const uint32_t childBone = act.ragdoll.joints[e].bodyB;
+            const fpx::FxQuat want = active::FxQuatFromFloat(pose[(size_t)childBone].r);
+            if (std::memcmp(&act.drives[e].qTarget, &want, sizeof(fpx::FxQuat)) != 0) matchesSample = false;
+        }
+        check(matchesSample, "AC3 WriteClipTargets t=1: qTarget == snap(SampleLocalPose[childBone].r)");
+        // the targets ADVANCE: t=0 != t=1 for the driven bones (the drive follows the animation).
+        check(act.drives[0].qTarget.z != 0, "AC3 WriteClipTargets: targets advance with clip time (t=1 != rest)");
+    }
+
+    // ===== AC3 (4): StepActive drives the ragdoll TOWARD the clip pose while a no-drive control collapses ===
+    {
+        active::ActiveRagdoll driven  = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::ActiveRagdoll control = active::ActiveFromSkeleton(humanoid, acCfg, /*stiffness=*/0);  // limp
+        const active::fx acDt = active::kOne / 60;
+        const int acIters = 24, acSteps = 240;
+        // Track the clip held at t=1 (the bent pose) for both (the control has stiffness 0 -> it just collapses).
+        active::StepActiveSteps(driven,  humanoid, bendClip, acDt, acIters, acSteps, /*startTime=*/1.0f);
+        active::StepActiveSteps(control, humanoid, bendClip, acDt, acIters, acSteps, /*startTime=*/1.0f);
+        // the driven ragdoll HELD the clip targets: mean DriveAngleCos within a band of kOne.
+        const active::fx kHoldBand = active::kOne / 4;   // a looser band — a full humanoid under gravity
+        int64_t sumCos = 0;
+        for (const active::FxAngularDrive& d : driven.drives) sumCos += (int64_t)active::DriveAngleCos(driven.ragdoll.world, d);
+        const active::fx meanCos = driven.drives.empty() ? active::kOne
+                                       : (active::fx)(sumCos / (int64_t)driven.drives.size());
+        check(meanCos > active::kOne - kHoldBand,
+              "AC3 StepActive: the driven ragdoll TRACKS the clip (mean DriveAngleCos within band)");
+        // the driven pose DIFFERS from the limp control by a margin (the drive posed it, the control collapsed).
+        active::fx maxDiff = 0;
+        for (size_t i = 0; i < driven.ragdoll.world.bodies.size(); ++i) {
+            const active::fx dx = driven.ragdoll.world.bodies[i].pos.x - control.ragdoll.world.bodies[i].pos.x;
+            const active::fx adx = dx < 0 ? -dx : dx;
+            if (adx > maxDiff) maxDiff = adx;
+        }
+        check(maxDiff > active::kOne / 2,
+              "AC3 StepActive: the driven pose differs from the limp control (posed, not limp)");
+    }
+
+    // ===== AC3 (5): StepActive is deterministic — two runs byte-identical =====
+    {
+        active::ActiveRagdoll a = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::ActiveRagdoll b = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        const active::fx acDt = active::kOne / 60;
+        active::StepActiveSteps(a, humanoid, bendClip, acDt, 24, 120, 1.0f);
+        active::StepActiveSteps(b, humanoid, bendClip, acDt, 24, 120, 1.0f);
+        const bool same = a.ragdoll.world.bodies.size() == b.ragdoll.world.bodies.size() &&
+                          std::memcmp(a.ragdoll.world.bodies.data(), b.ragdoll.world.bodies.data(),
+                                      a.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0;
+        check(same, "AC3 StepActive determinism: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("active_test: ALL PASS\n");
     else std::printf("active_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

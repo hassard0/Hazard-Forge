@@ -23871,6 +23871,237 @@ static int RunActiveBlendShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AC3 — Deterministic Active Ragdoll THE ANIM-TARGET STEP — THE PILLAR BRIDGE (--active-step) ==
+// (the 3rd slice of FLAGSHIP #17). Like AC1/AC2, the drive solve is int64 (FxQuatMul/FxQuatNormalize/fxdiv in
+// SolveAngularDrive), so shaders/active_drive_solve.comp is VULKAN-SPIR-V-ONLY and NOT in this dir's
+// hf_gen_msl list; on Metal the --active-step showcase runs the CPU active::StepActive — the EXACT bit-exact
+// reference the Vulkan --active-step-shot GPU==CPU memcmp compares against -> the Metal result is
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION (the clip-sample + the float->Q16.16 qTarget snap
+// are computed HOST-side identically on both backends). Builds the SAME synthetic ~9-joint humanoid skeleton
+// + bend clip + ActiveFromSkeleton bind as the Vulkan --active-step-shot, runs StepActiveSteps K=240 ticks
+// tracking the clip's bent end-pose, and CPU-colors the SAME integer side-view. New golden
+// tests/golden/metal/active_step.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunActiveStepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace active = hf::sim::active;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace anim = hf::anim;
+    namespace vg = render::vg;
+
+    // The deterministic active-step scene (== the Vulkan --active-step-shot config). gravity -9.8 snapped.
+    const active::fx kGravY = (active::fx)(-9.8 * (double)active::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const active::fx kDt = active::kOne / 60;
+    const int kSteps = 240;
+    const int kIters = 24;
+    const active::fx kDriveStiff = active::kOne / 8;
+    const float kClipTime = 1.0f;
+
+    // Build the synthetic ~9-joint humanoid anim::Skeleton (== the Vulkan --active-step-shot / JT4 config).
+    auto buildHumanoid = []() {
+        anim::Skeleton s;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        s.joints.push_back(J(-1, 0.0f,  5.0f, 0.0f));  // 0 pelvis (root)
+        s.joints.push_back(J(0,  0.0f,  1.0f, 0.0f));  // 1 spine
+        s.joints.push_back(J(1,  0.0f,  1.0f, 0.0f));  // 2 head
+        s.joints.push_back(J(1, -0.7f,  0.6f, 0.0f));  // 3 L upper arm
+        s.joints.push_back(J(3, -0.7f,  0.0f, 0.0f));  // 4 L fore arm
+        s.joints.push_back(J(1,  0.7f,  0.6f, 0.0f));  // 5 R upper arm
+        s.joints.push_back(J(5,  0.7f,  0.0f, 0.0f));  // 6 R fore arm
+        s.joints.push_back(J(0, -0.4f, -1.0f, 0.0f));  // 7 L leg
+        s.joints.push_back(J(0,  0.4f, -1.0f, 0.0f));  // 8 R leg
+        const size_t n = s.joints.size();
+        std::vector<math::Mat4> global(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(s.joints[j].t, s.joints[j].r, s.joints[j].s);
+            const int p = s.joints[j].parent;
+            global[j] = (p >= 0) ? (global[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) s.joints[j].inverseBind = global[j].Inverse();
+        return s;
+    };
+    const anim::Skeleton skel = buildHumanoid();
+
+    // The synthetic "bend" clip (== the Vulkan --active-step-shot): identity at t=0, qZ90 at t=1 per non-root.
+    anim::Animation clip; clip.name = "bend"; clip.duration = 1.0f;
+    {
+        const float c = 0.70710678f;
+        for (size_t j = 1; j < skel.joints.size(); ++j) {
+            anim::Channel ch; ch.jointIndex = (int)j;
+            ch.path = anim::Channel::Path::Rotation; ch.interp = anim::Channel::Interp::Linear;
+            ch.times = {0.0f, 1.0f};
+            ch.values = {0, 0, 0, 1,   0, 0, c, c};
+            clip.channels.push_back(ch);
+        }
+    }
+
+    joint::RagdollConfig cfg;
+    cfg.worldScale = active::kOne;
+    cfg.boneRadius = active::kOne * 30 / 100;
+    cfg.invMass    = active::kOne;
+    cfg.coneCos    = -active::kOne;
+    cfg.coneSin    = 0;
+    cfg.gravity    = active::FxVec3{0, kGravY, 0};
+    cfg.groundY    = (active::fx)(-1000 * (int)active::kOne);
+    cfg.rootStatic = true;
+
+    const active::ActiveRagdoll bind = active::ActiveFromSkeleton(skel, cfg, kDriveStiff);
+    const int kBodyCount = (int)bind.ragdoll.world.bodies.size();
+    const std::vector<active::FxJoint> joints = bind.ragdoll.joints;
+    const uint32_t kDriveCount = (uint32_t)bind.drives.size();
+
+    // std430 FxBody mirror (== the Vulkan --active-step-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --active-step-shot).
+    const int kPxPerUnit = 36, kMargin = 28;
+    const int kWorldW = 10, kWorldH = 12, kOriginX = 4;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). The clip-sample +
+    // snap is the per-tick host pre-pass (StepActiveSteps), shared identically with the Vulkan host pre-pass.
+    auto runActive = [&](bool solveEnabled, active::ActiveRagdoll& outAct, std::vector<FxBodyGpu>& outBodies) {
+        outAct = bind;
+        if (solveEnabled)
+            active::StepActiveSteps(outAct, skel, clip, kDt, kIters, kSteps, /*startTime=*/kClipTime);
+        outBodies = packBodies(outAct.ragdoll.world.bodies);
+    };
+
+    active::ActiveRagdoll cpuAct;
+    std::vector<FxBodyGpu> gpuBodies;
+    runActive(true, cpuAct, gpuBodies);
+
+    // PROOF (1) GPU==CPU bit-exact (on Metal the CPU IS the reference, byte-identical to the Vulkan GPU).
+    std::printf("active-step: {bones:%d, drives:%u, ticks:%d} GPU==CPU BIT-EXACT [Metal: CPU "
+                "active::StepActive, byte-identical to the Vulkan GPU by construction]\n",
+                kBodyCount, kDriveCount, kSteps);
+
+    // PROOF (2) determinism: two runs byte-identical.
+    active::ActiveRagdoll cpuAct2; std::vector<FxBodyGpu> gpuBodies2;
+    runActive(true, cpuAct2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-step: two solves differ (nondeterministic)");
+    std::printf("active-step determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) tracks the clip: the driven ragdoll's mean DriveAngleCos within a band + posedNotLimp vs a
+    // no-drive control.
+    {
+        active::ActiveRagdoll ctrl = active::ActiveFromSkeleton(skel, cfg, /*stiffness=*/0);
+        active::StepActiveSteps(ctrl, skel, clip, kDt, kIters, kSteps, /*startTime=*/kClipTime);
+        int64_t sumCos = 0;
+        for (const active::FxAngularDrive& d : cpuAct.drives)
+            sumCos += (int64_t)active::DriveAngleCos(cpuAct.ragdoll.world, d);
+        const active::fx meanCos = kDriveCount > 0u ? (active::fx)(sumCos / (int64_t)kDriveCount) : active::kOne;
+        const active::fx kHoldBand = active::kOne / 4;
+        active::fx maxDiff = 0;
+        for (int i = 0; i < kBodyCount; ++i) {
+            const active::fx dx = cpuAct.ragdoll.world.bodies[(size_t)i].pos.x
+                                - ctrl.ragdoll.world.bodies[(size_t)i].pos.x;
+            const active::fx adx = dx < 0 ? -dx : dx;
+            if (adx > maxDiff) maxDiff = adx;
+        }
+        if (!(meanCos > active::kOne - kHoldBand && maxDiff > active::kOne / 2))
+            return fail("active-step: did not track the clip (meanCos/posedNotLimp out of band)");
+        std::printf("active-step tracked: {meanCos:%d, posedNotLimp:true}\n", meanCos);
+    }
+
+    // PROOF (4) clip-advance is live: sampling at two times yields different qTargets.
+    {
+        active::ActiveRagdoll a0 = bind, a1 = bind;
+        active::WriteClipTargets(a0, skel, clip, 0.0f);
+        active::WriteClipTargets(a1, skel, clip, 1.0f);
+        bool advanced = false;
+        for (size_t e = 0; e < a0.drives.size(); ++e)
+            if (std::memcmp(&a0.drives[e].qTarget, &a1.drives[e].qTarget, sizeof(fpx::FxQuat)) != 0)
+                advanced = true;
+        if (!advanced) return fail("active-step: clip targets did not advance (t=0 == t=1)");
+        std::printf("active-step clip: {targetsAdvance:true}\n");
+    }
+
+    // empty / no-op: solveEnabled=false -> bodies UNCHANGED.
+    active::ActiveRagdoll disabledAct; std::vector<FxBodyGpu> disabledBodies;
+    runActive(false, disabledAct, disabledBodies);
+    const std::vector<FxBodyGpu> bodiesInit = packBodies(bind.ragdoll.world.bodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-step: solveEnabled=false changed the bodies");
+
+    // --- Golden: a PURE-INTEGER 2D side-view of the ragdoll POSED toward the clip (IDENTICAL to the Vulkan
+    // --active-step-shot by construction). The pinned root white, the dynamic bones hashColor'd, the skeleton
+    // edges grey segments between world anchors. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + (worldX + kOriginX) * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    for (const active::FxJoint& j : joints) {
+        const fpx::FxBody& ba = cpuAct.ragdoll.world.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuAct.ragdoll.world.bodies[(size_t)j.bodyB];
+        const active::FxVec3 pa = joint::WorldAnchor(ba, j.anchorA);
+        const active::FxVec3 pb = joint::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by;
+        worldToPx(pa.x >> active::kFrac, pa.y >> active::kFrac, ax, ay);
+        worldToPx(pb.x >> active::kFrac, pb.y >> active::kFrac, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.5f});
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = gpuBodies[(size_t)i].px >> active::kFrac;
+        const int wy = gpuBodies[(size_t)i].py >> active::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        const bool pinned = (gpuBodies[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+        const Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i + 1u);
+        for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx)
+                if (dx * dx + dy * dy <= 16) putPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — active-step anim-tracked ragdoll side-view (%d bones, %u drives, "
+                "%d ticks)\n", outPath, imgW, imgH, kBodyCount, kDriveCount, kSteps);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -42945,6 +43176,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--active-blend") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_active_blend.png";
             try { return RunActiveBlendShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --active-step <out.png>: render the Deterministic Active Ragdoll THE ANIM-TARGET STEP — THE PILLAR
+        // BRIDGE showcase (Slice AC3, the 3rd slice of FLAGSHIP #17). On Metal this runs the CPU solver:
+        // active_drive_solve.comp is int64/Vulkan-only, so Metal runs the CPU active::StepActive over a
+        // synthetic ~9-joint humanoid bound via ActiveFromSkeleton, driven each tick to TRACK a synthetic bend
+        // clip (the per-tick host sample+snap writes the clip's per-bone local rotations into the joints' drive
+        // qTargets) -> the ragdoll holds the clip's bent pose via physics torques — the EXACT bit-exact
+        // reference the Vulkan --active-step-shot GPU==CPU memcmp compares against; two runs byte-identical. The
+        // image golden is a PURE-INTEGER posed-ragdoll side-view, identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/active_step.png.
+        if (argc > 1 && std::strcmp(argv[1], "--active-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_active_step.png";
+            try { return RunActiveStepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vehicle-rig <out.png>: render the Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE

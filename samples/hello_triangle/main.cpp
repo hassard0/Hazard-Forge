@@ -499,6 +499,7 @@ int main(int argc, char** argv) {
     const char* jointRenderShotPath = nullptr; // --joint-render-shot <out.bmp> (Slice JT6: Deterministic Articulated-Body Ragdoll LIT 3D SKINNED RENDER CAPSTONE — the PILLAR-BRIDGE money-shot COMPLETING FLAGSHIP #15 (the FIFTEENTH flagship). The bit-exact ragdoll pose drives the EXISTING GPU skinned render: load the Fox skeleton -> joint::RagdollFromSkeleton (the JT4 float->Q16.16 bind, pinned root so the fox SAGS into a coherent slumped pose) -> joint::StepArticulatedContactsSteps K SHORT steps (the bit-exact JT3 collapse) -> joint::PoseToPalette (the ONE float crossing, the JT4 Q16.16->float read-back) -> dev.SetJointPalette -> render the Fox SKINNED + lit + shadowed through the EXISTING lit_skinned/shadow_skinned pipelines (the --skinning-shot/--anim-fsm-shot path REUSED VERBATIM — camera/light/shadow/sky/post unchanged); the ONLY swap is the palette SOURCE (ragdoll pose vs anim clip), so the Fox is POSED BY PHYSICS. FLOAT visresolve-bar (the FPX6/FR6 precedent): the golden is Metal-baked, the gate is Metal-determinism (two renders BYTE-IDENTICAL) + provenance (the palette IS a pure function of the bit-exact ragdoll state) + a coherent posed-character image; cross-vendor ~the float skinned-render baseline. PROOFS: palette provenance/count, two-run BYTE-IDENTICAL, ragdoll palette != bind palette (physics posed the mesh). STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader (hf_gen_msl UNCHANGED), NO new RHI; JT1-JT5 joint.h code + shaders + engine/anim/ + their goldens UNCHANGED (JT6 additive — only a thin RagdollToPalette alias + the showcase))
     const char* vehicleSpringShotPath = nullptr; // --vehicle-spring-shot <out.bmp> (Slice VH1: Deterministic Vehicle Physics SUSPENSION SPRING JOINT, the BEACHHEAD of FLAGSHIP #16 — a BODY BOBBING ON A SPRING (a pinned invMass-0 anchor + a dynamic body hung below by a FxSpringJoint, started displaced from restLen) settled K StepSpringWorld steps under gravity by one GPU thread (shaders/vehicle_spring_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel spring passes [SolveSpringJoint = cloth::SolveDistanceConstraint generalized to restLen != 0 + a stiffness scale + normal-velocity damping over the WORLD anchors, the inverse-mass split translating the body centres] -> ground clamp), GPU==CPU body array bit-exact vs vehicle.h::StepSpringWorld, integer 2D side-view of the body hung on the spring below the anchor, settled at rest; int64 -> vehicle_spring_solve.comp is Vulkan-only, Metal runs CPU StepSpringWorld)
     const char* activeDriveShotPath = nullptr; // --active-drive-shot <out.bmp> (Slice AC1: Deterministic Active Ragdoll / Physical-Animation Blending, the BEACHHEAD of FLAGSHIP #17, hf::sim::active — the ANGULAR POSE-DRIVE primitive. A 3-LINK CHAIN (a pinned invMass-0 root + 3 dynamic ball-jointed bodies) with an FxAngularDrive per joint whose qTarget bends it to an L-shape; settle K StepDriveWorld steps -> the chain is DRIVEN to + HOLDS the L-pose against gravity (vs a stiffness-0 control that hangs straight). One GPU thread runs the K-step StepDriveWorld (shaders/active_drive_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel {all SolveBallJoint | all SolveAngularLimit | all SolveAngularDrive} -> ground clamp, copied VERBATIM from active.h), GPU==CPU body array bit-exact vs active.h::StepDriveWorld. int64 quaternion math -> active_drive_solve.comp is Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) drove to + held the target (DriveAngleCos within band + bent from the straight-hang control); (4) a stiffness-0 control hangs straight. NO new RHI; the ONLY new shader is active_drive_solve.comp (int64, Vulkan-only — NOT in hf_gen_msl). STANDALONE arg-parse loop (the FR1 C1061 lesson))
+    const char* activeStepShotPath = nullptr; // --active-step-shot <out.bmp> (Slice AC3: Deterministic Active Ragdoll THE ANIM-TARGET STEP — THE PILLAR BRIDGE, the 3rd slice of FLAGSHIP #17, hf::sim::active. AC1 built the angular drive-to-target primitive; AC2 the per-joint blend weight; AC3 unites the anim pillar (engine/anim/) and the physics moat: each tick SAMPLE an anim clip into its per-bone LOCAL rotations -> WRITE those into the joints' drive qTargets -> run the AC1/AC2 integer drive step, so a JT4 ragdoll TRACKS an animation clip via physics torques while still colliding/yielding. A synthetic ~9-joint humanoid anim::Skeleton bound via active::ActiveFromSkeleton (RagdollFromSkeleton + one FxAngularDrive per non-root edge, qTarget identity), driven K StepActive ticks tracking a synthetic bend clip. The clip-sample + the float->Q16.16 qTarget snap (FxQuatFromFloat, round-to-nearest, the JT4 bind idiom) are a documented DETERMINISTIC FLOAT crossing OUTSIDE the bit-exact loop — computed HOST-side IDENTICALLY for the GPU + CPU paths, so the only thing the GPU/CPU bit-exactly reproduce is the integer StepDriveWorld over those shared qTargets (the AC1 contract, now with per-tick-varying targets). The GPU host-samples+snaps+uploads the per-tick drives then dispatches the AC1 active_drive_solve.comp per tick -> memcmp the GPU body world vs the CPU StepActive (NO tolerance — the GPU==CPU make-or-break). int64 quaternion math -> active_drive_solve.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --active-step runs the CPU StepActive. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) tracks the clip (mean DriveAngleCos within band + posedNotLimp vs a no-drive control); (4) clip-advance is live (sampling at two times -> different qTargets). NO new shader (the drive solve is AC1's; the sample+snap is host C++), NO new RHI. STANDALONE arg-parse loop (the FR1 C1061 lesson))
     const char* activeBlendShotPath = nullptr; // --active-blend-shot <out.bmp> (Slice AC2: Deterministic Active Ragdoll PER-JOINT BLEND WEIGHT — THE PARTIAL-RAGDOLL AXIS, the 2nd slice of FLAGSHIP #17, hf::sim::active. AC1 added the angular drive-to-target primitive; AC2 adds the per-joint physical blend weight — a per-drive driveWeight in [0,kOne] blending each joint between fully anim-driven (kOne — hold the target) and fully limp physics (0 — no drive). A LONGER CHAIN (a pinned invMass-0 root + 6 dynamic ball-jointed links, an "upper body" + a "lower body") with an FxAngularDrive per joint sharing one bent target pose but PER-JOINT driveWeight: the upper joints kOne (HOLD the bracing pose), the lower joints 0 (limp — HANG free); settle K StepDriveWorld steps -> the upper chain holds while the lower hangs (the partial ragdoll). One GPU thread runs the K-step StepDriveWorld (shaders/active_drive_solve.comp, now reading driveWeight at the AC1-reserved 32-byte-stride pad slot — the std430 stride UNCHANGED), GPU==CPU body array bit-exact vs active.h::StepDriveWorld. int64 quaternion math -> active_drive_solve.comp is Vulkan-only; Metal --active-blend runs the CPU StepDriveWorld. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) partial ragdoll (driven joints held + limp joints free/match pure-physics); (4) all-weight-kOne == AC1 all-driven (render-invariance). NO new RHI; NO new shader (active_drive_solve.comp gains ONLY the driveWeight read). STANDALONE arg-parse loop (the FR1 C1061 lesson))
     const char* vehicleRigShotPath = nullptr; // --vehicle-rig-shot <out.bmp> (Slice VH2: Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE, the 2nd slice of FLAGSHIP #16 — ASSEMBLE a car (1 chassis FxBody + 4 wheel FxBodies tied by 4 VH1 FxSpringJoints + 4 joint::FxAngularLimit hinges) via VehicleFromConfig + settle it K StepVehicleRig steps so the chassis floats at ride height + the 4 wheels rest on the ground, the suspension compressed. NO new shader: the GPU driver composes the EXISTING vehicle_spring_solve.comp (PHASE A: integrate + K spring passes, SENTINEL groundY) + joint_angular_solve.comp (PHASE B: dt=0, jointCount=0, K angular/hinge passes, SENTINEL groundY) in the locked order, then the HOST wheel ground clamp (PHASE C) -> the SAME ops as the CPU StepVehicleRig -> GPU body world memcmp'd BIT-EXACT. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) settled on its suspension (wheels on ground + chassis at ride height + springs compressed); (4) hinges hold the wheels in-plane. int64 -> both shaders Vulkan-only; Metal --vehicle-rig runs the CPU StepVehicleRig. NO new shader/RHI; VH1 + JT2's shaders + their goldens + fpx.h/joint.h/grain.h/fluid.h/cloth.h/couple*.h/fract.h + engine/physics UNCHANGED (VH2 additive))
     const char* vehicleStepShotPath = nullptr; // --vehicle-step-shot <out.bmp> (Slice VH3: Deterministic Vehicle Physics DRIVE + STEER COMMANDS + THE LOCKED VEHICLE TICK, the 3rd slice of FLAGSHIP #16 — build a car (VehicleFromConfig), feed a SCRIPTED command stream (kCmdDriveTorque on the rear wheels + a kCmdSteer on a front hinge) over K StepVehicle ticks. NO new shader: per tick the GPU applies the commands HOST-side, drives the EXISTING vehicle_spring_solve.comp + joint_angular_solve.comp (steps=1, iters=K, SENTINEL groundY) for integrate + K {spring | hinge}, host-rebuilds the FPX2 pair list, then drives fpx_solve.comp (dt=0, real groundY) for the FPX3 contacts -> memcmp GPU body world vs the CPU StepVehicle. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) drive moved the chassis forward + spun the driven wheels (a no-command control stays put); (4) steer re-aimed the front wheels (rears unchanged). int64 -> all shaders Vulkan-only; Metal --vehicle-step runs the CPU StepVehicle. STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader/RHI; VH1/VH2 + JT2/fpx shaders + their goldens + fpx.h/joint.h UNCHANGED (VH3 additive))
@@ -2477,6 +2478,17 @@ int main(int argc, char** argv) {
     // --active-blend runs the CPU StepDriveWorld. Its OWN loop (the FR1 C1061 standalone-loop pattern).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--active-blend-shot") == 0) { activeBlendShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice AC3: --active-step-shot <out.bmp> (Deterministic Active Ragdoll THE ANIM-TARGET STEP — THE PILLAR
+    // BRIDGE, the 3rd slice of FLAGSHIP #17). A synthetic ~9-joint humanoid anim::Skeleton bound via
+    // active::ActiveFromSkeleton, driven each tick to TRACK an anim clip (the per-tick host sample+snap writes
+    // the clip's per-bone local rotations into the joints' drive qTargets) over K StepActive ticks. The GPU
+    // host-samples+snaps+uploads the per-tick drives then dispatches the AC1 active_drive_solve.comp ->
+    // GPU body world bit-exact vs the CPU StepActive. int64 -> Vulkan-only; Metal --active-step runs the CPU
+    // StepActive. Its OWN loop (the FR1 C1061 standalone-loop pattern).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--active-step-shot") == 0) { activeStepShotPath = argv[i + 1]; break; }
     }
 
     // Slice VH2: --vehicle-rig-shot <out.bmp> (Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE,
@@ -28133,6 +28145,407 @@ int main(int argc, char** argv) {
                                 "drives, %u driven, %u limp)\n", activeBlendShotPath, imgW, imgH, kBodyCount,
                                 kDriveCount, drivenJoints, limpJoints);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", activeBlendShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic Active Ragdoll THE ANIM-TARGET STEP — THE PILLAR BRIDGE (--active-step-shot
+        // <out.bmp>, Slice AC3 of FLAGSHIP #17). A synthetic ~9-joint humanoid anim::Skeleton bound via
+        // active::ActiveFromSkeleton TRACKS a synthetic anim clip: each tick the HOST samples the clip into the
+        // per-bone local rotations + snaps them into the joints' drive qTargets (the documented FLOAT crossing,
+        // OUTSIDE the bit-exact loop), then the bit-exact integer drive step runs. The GPU runs the SAME host
+        // pre-pass (sample+snap+RE-UPLOAD the drives buffer per tick) then dispatches the AC1
+        // active_drive_solve.comp for ONE step -> the GPU body world is memcmp'd BIT-EXACT vs the CPU
+        // active::StepActive (the qTargets are host-shared each tick; the only thing reproduced is the integer
+        // StepDriveWorld). int64 -> active_drive_solve.comp is VULKAN-ONLY; Metal --active-step runs the CPU
+        // StepActive. NO new shader, NO new RHI. CAVEAT: the tracking is the AC1 soft-drive proxy (within the
+        // Gauss-Seidel residual), NOT a mass-correct motor; deterministic + cross-platform bit-identity is the
+        // headline (UE5's physical-animation drive is float/non-deterministic).
+        if (activeStepShotPath) {
+            using math::Vec3;
+            namespace active = hf::sim::active;
+            namespace joint = hf::sim::joint;
+            namespace fpx = hf::sim::fpx;
+            namespace anim = hf::anim;
+            namespace vg = hf::render::vg;
+
+            // The deterministic active-step scene (== the Metal --active-step config + the active_test AC3 case).
+            const active::fx kGravY = (active::fx)(-9.8 * (double)active::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const active::fx kDt = active::kOne / 60;
+            const int kSteps = 240;        // settle the ragdoll tracking the clip pose
+            const int kIters = 24;         // Gauss-Seidel passes per step
+            const active::fx kDriveStiff = active::kOne / 8;     // soft (0.125) per-iteration drive
+            const float kClipTime = 1.0f;  // hold the clip at its bent end-pose (a distinctly non-rest target)
+
+            // Build the synthetic ~9-joint humanoid anim::Skeleton (== the JT4 --joint-ragdoll-shot config).
+            auto buildHumanoid = []() {
+                anim::Skeleton s;
+                auto J = [](int parent, float tx, float ty, float tz) {
+                    anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+                    j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+                };
+                s.joints.push_back(J(-1, 0.0f,  5.0f, 0.0f));  // 0 pelvis (root)
+                s.joints.push_back(J(0,  0.0f,  1.0f, 0.0f));  // 1 spine
+                s.joints.push_back(J(1,  0.0f,  1.0f, 0.0f));  // 2 head
+                s.joints.push_back(J(1, -0.7f,  0.6f, 0.0f));  // 3 L upper arm
+                s.joints.push_back(J(3, -0.7f,  0.0f, 0.0f));  // 4 L fore arm
+                s.joints.push_back(J(1,  0.7f,  0.6f, 0.0f));  // 5 R upper arm
+                s.joints.push_back(J(5,  0.7f,  0.0f, 0.0f));  // 6 R fore arm
+                s.joints.push_back(J(0, -0.4f, -1.0f, 0.0f));  // 7 L leg
+                s.joints.push_back(J(0,  0.4f, -1.0f, 0.0f));  // 8 R leg
+                const size_t n = s.joints.size();
+                std::vector<math::Mat4> global(n);
+                for (size_t j = 0; j < n; ++j) {
+                    const math::Mat4 local = math::FromTRS(s.joints[j].t, s.joints[j].r, s.joints[j].s);
+                    const int p = s.joints[j].parent;
+                    global[j] = (p >= 0) ? (global[(size_t)p] * local) : local;
+                }
+                for (size_t j = 0; j < n; ++j) s.joints[j].inverseBind = global[j].Inverse();
+                return s;
+            };
+            const anim::Skeleton skel = buildHumanoid();
+
+            // A synthetic "bend" clip: a Rotation channel on every non-root bone driving its LOCAL rotation from
+            // identity (t=0) to qZ90 (t=1) -> a distinctly NON-rest pose the ragdoll tracks via physics torques.
+            auto buildBendClip = [&]() {
+                anim::Animation a; a.name = "bend"; a.duration = 1.0f;
+                const float c = 0.70710678f;   // cos/sin 45 -> qZ90 = {0,0,c,c}
+                for (size_t j = 1; j < skel.joints.size(); ++j) {
+                    anim::Channel ch; ch.jointIndex = (int)j;
+                    ch.path = anim::Channel::Path::Rotation; ch.interp = anim::Channel::Interp::Linear;
+                    ch.times = {0.0f, 1.0f};
+                    ch.values = {0, 0, 0, 1,   0, 0, c, c};   // identity at t=0, qZ90 at t=1 (xyzw per key)
+                    a.channels.push_back(ch);
+                }
+                return a;
+            };
+            const anim::Animation clip = buildBendClip();
+
+            // The bind config: a PINNED root (the pelvis anchors the ragdoll), 0.30 bone radii, a free cone (the
+            // drive does the work). worldScale 1.0; ground far below so the tracked pose fills the frame.
+            joint::RagdollConfig cfg;
+            cfg.worldScale = active::kOne;
+            cfg.boneRadius = active::kOne * 30 / 100;
+            cfg.invMass    = active::kOne;
+            cfg.coneCos    = -active::kOne;             // 180-degree free cone (never clamps)
+            cfg.coneSin    = 0;
+            cfg.gravity    = active::FxVec3{0, kGravY, 0};
+            cfg.groundY    = (active::fx)(-1000 * (int)active::kOne);
+            cfg.rootStatic = true;
+
+            // Build the active ragdoll (the bodies + ball joints + cone limits + one drive per non-root edge).
+            const active::ActiveRagdoll bind = active::ActiveFromSkeleton(skel, cfg, kDriveStiff);
+            const int kBodyCount = (int)bind.ragdoll.world.bodies.size();
+            const std::vector<active::FxJoint> joints = bind.ragdoll.joints;
+            const std::vector<active::FxAngularLimit> limits = bind.ragdoll.limits;
+            const uint32_t kJointCount = (uint32_t)joints.size();
+            const uint32_t kLimitCount = (uint32_t)limits.size();
+            const uint32_t kDriveCount = (uint32_t)bind.drives.size();
+
+            // std430 FxBody mirror (matches active_drive_solve.comp FxBody): 16 x int32 (64 bytes).
+            struct FxBodyGpu {
+                int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+                int32_t ox, oy, oz, ow, ax, ay, az;
+            };
+            static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+            static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout (16 x int32)");
+            auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+                std::vector<FxBodyGpu> out(bs.size());
+                for (size_t i = 0; i < bs.size(); ++i) {
+                    const fpx::FxBody& b = bs[i];
+                    out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                                       b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                                       b.angVel.x, b.angVel.y, b.angVel.z};
+                }
+                return out;
+            };
+            const std::vector<FxBodyGpu> bodiesInit = packBodies(bind.ragdoll.world.bodies);
+
+            // std430 FxJoint mirror (matches active_drive_solve.comp FxJoint): 10 x int32 (40 bytes).
+            struct FxJointGpu { uint32_t bodyA, bodyB; int32_t aax, aay, aaz, abx, aby, abz; uint32_t kind; int32_t limit; };
+            static_assert(sizeof(FxJointGpu) == 40, "FxJointGpu std430 layout");
+            static_assert(sizeof(joint::FxJoint) == 40, "FxJoint std430 layout (10 x int32)");
+            std::vector<FxJointGpu> jointsInit;
+            for (uint32_t e = 0; e < kJointCount; ++e) {
+                const joint::FxJoint& j = joints[e];
+                jointsInit.push_back(FxJointGpu{j.bodyA, j.bodyB, j.anchorA.x, j.anchorA.y, j.anchorA.z,
+                                                j.anchorB.x, j.anchorB.y, j.anchorB.z, j.kind, j.limit});
+            }
+            if (jointsInit.empty()) jointsInit.push_back(FxJointGpu{});
+
+            // std430 FxAngularLimit mirror (matches active_drive_solve.comp FxAngularLimit): 8 x int32 (32 B).
+            struct FxAngularLimitGpu { uint32_t bodyA, bodyB; int32_t axx, axy, axz, cosHalf, sinHalf; uint32_t kind; };
+            static_assert(sizeof(FxAngularLimitGpu) == 32, "FxAngularLimitGpu std430 layout");
+            static_assert(sizeof(joint::FxAngularLimit) == 32, "FxAngularLimit std430 layout (8 x int32)");
+            std::vector<FxAngularLimitGpu> limitsInit;
+            for (const joint::FxAngularLimit& l : limits)
+                limitsInit.push_back(FxAngularLimitGpu{l.bodyA, l.bodyB, l.axis.x, l.axis.y, l.axis.z,
+                                                       l.cosHalfLimit, l.sinHalfLimit, l.kind});
+            if (limitsInit.empty()) limitsInit.push_back(FxAngularLimitGpu{});
+
+            // std430 FxAngularDrive mirror (matches active_drive_solve.comp FxAngularDrive): 8 x int32 (32 B).
+            struct FxAngularDriveGpu { uint32_t bodyA, bodyB; int32_t qx, qy, qz, qw, stiffness, driveWeight; };
+            static_assert(sizeof(FxAngularDriveGpu) == 32, "FxAngularDriveGpu std430 layout");
+            auto packDrives = [&](const std::vector<active::FxAngularDrive>& ds) {
+                std::vector<FxAngularDriveGpu> out;
+                for (const active::FxAngularDrive& d : ds)
+                    out.push_back(FxAngularDriveGpu{d.bodyA, d.bodyB, d.qTarget.x, d.qTarget.y, d.qTarget.z,
+                                                    d.qTarget.w, d.stiffness, d.driveWeight});
+                if (out.empty()) out.push_back(FxAngularDriveGpu{});
+                return out;
+            };
+
+            // Params (matches active_drive_solve.comp ActiveDriveParams): int4 grav {gx,gy,gz,dt} + int4 cfg
+            // {groundY, bodyCount, jointCount, steps} + int4 cfg2 {iters, limitCount, driveCount, solveEnabled}.
+            struct ActiveDriveParams { int32_t grav[4]; int32_t cfg[4]; int32_t cfg2[4]; };
+            static_assert(sizeof(ActiveDriveParams) == 48, "ActiveDriveParams std430 layout");
+            auto makeParams = [&](int32_t solveEnabled, int32_t steps) {
+                ActiveDriveParams p{};
+                p.grav[0] = 0; p.grav[1] = kGravY; p.grav[2] = 0; p.grav[3] = kDt;
+                p.cfg[0] = bind.ragdoll.world.groundY; p.cfg[1] = kBodyCount;
+                p.cfg[2] = (int32_t)kJointCount; p.cfg[3] = steps;
+                p.cfg2[0] = kIters; p.cfg2[1] = (int32_t)kLimitCount; p.cfg2[2] = (int32_t)kDriveCount;
+                p.cfg2[3] = solveEnabled;
+                return p;
+            };
+
+            auto mkBuf = [&](const void* data, size_t bytes) {
+                rhi::BufferDesc d; d.size = bytes; d.initialData = data;
+                d.usage = rhi::BufferUsage::Storage; return device->CreateBuffer(d);
+            };
+            // joints/limits are FIXED across the run (read-only) — allocate once. The DRIVES buffer is re-uploaded
+            // PER TICK (the qTargets advance with the clip) — that is the AC3 pillar-bridge twist.
+            auto jointsBuf = mkBuf(jointsInit.data(), jointsInit.size() * sizeof(FxJointGpu));
+            auto limitsBuf = mkBuf(limitsInit.data(), limitsInit.size() * sizeof(FxAngularLimitGpu));
+
+            // Compute pipeline: 5 storage buffers (bodies, joints, limits, drives, params); SINGLE thread.
+            auto driveCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/active_drive_solve.comp.hlsl.spv");
+            auto driveCs = device->CreateShaderModule({std::span<const uint32_t>(driveCsWords)});
+            rhi::ComputePipelineDesc driveCdesc;
+            driveCdesc.compute = driveCs.get();
+            driveCdesc.storageBufferCount = 5;
+            driveCdesc.pushConstantSize = 0;
+            driveCdesc.threadsPerGroupX = 1;
+            auto driveCompute = device->CreateComputePipeline(driveCdesc);
+
+            // The float clip time advance (Q16.16 dt -> seconds, render/clip-domain only, OUTSIDE the bit-exact
+            // loop). Holding kClipTime each tick (the bent end-pose); the clip advance is proven live below.
+            const float dtSeconds = (float)kDt / (float)active::kOne;
+
+            // Run the K-tick ACTIVE STEP on the GPU: per tick, HOST sample+snap the clip into a fresh drives
+            // vector + RE-UPLOAD it, then dispatch the AC1 shader for ONE step over the persistent bodies buffer.
+            auto runActive = [&](int32_t solveEnabled, std::vector<FxBodyGpu>& outBodies) {
+                auto bodiesBuf = mkBuf(bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu));
+                active::ActiveRagdoll act = bind;   // a fresh copy of the bound ragdoll (drives + world)
+                for (int s = 0; s < kSteps; ++s) {
+                    const float t = kClipTime + (float)s * dtSeconds;
+                    active::WriteClipTargets(act, skel, clip, t);    // the host pre-pass (sample+snap)
+                    const std::vector<FxAngularDriveGpu> drivesTick = packDrives(act.drives);
+                    auto drivesBuf = mkBuf(drivesTick.data(), drivesTick.size() * sizeof(FxAngularDriveGpu));
+                    ActiveDriveParams params = makeParams(solveEnabled, /*steps=*/1);
+                    auto paramsBuf = mkBuf(&params, sizeof(ActiveDriveParams));
+                    render::RenderGraph g;
+                    render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                    g.AddPass("active_step_solve", {}, {rgSwap},
+                        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*driveCompute);
+                            cmd.BindStorageBuffer(*bodiesBuf, 0);
+                            cmd.BindStorageBuffer(*jointsBuf, 1);
+                            cmd.BindStorageBuffer(*limitsBuf, 2);
+                            cmd.BindStorageBuffer(*drivesBuf, 3);
+                            cmd.BindStorageBuffer(*paramsBuf, 4);
+                            cmd.DispatchCompute(1);
+                            cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.EndRenderPass();
+                        });
+                    g.Execute(*device);
+                    device->WaitIdle();
+                }
+                outBodies.assign((size_t)kBodyCount, FxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, outBodies.data(), outBodies.size() * sizeof(FxBodyGpu), 0);
+            };
+
+            // === GPU active step (enabled, K ticks) ===
+            std::vector<FxBodyGpu> gpuBodies;
+            runActive(1, gpuBodies);
+
+            // === CPU reference: active::StepActiveSteps K ticks over a fresh copy of the SAME bound ragdoll ===
+            active::ActiveRagdoll cpuAct = bind;
+            active::StepActiveSteps(cpuAct, skel, clip, kDt, kIters, kSteps, /*startTime=*/kClipTime);
+            std::vector<FxBodyGpu> cpuBodies = packBodies(cpuAct.ragdoll.world.bodies);
+
+            // PROOF (1) GPU==CPU bodies BIT-EXACT after K active-step ticks (integer memcmp, NO tol).
+            if (gpuBodies.size() != cpuBodies.size() ||
+                std::memcmp(gpuBodies.data(), cpuBodies.data(),
+                            (size_t)kBodyCount * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: active-step GPU body array != CPU StepActive "
+                             "(a float/overflow/order divergence in the per-tick drive solve?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("active-step: {bones:%d, drives:%u, ticks:%d} GPU==CPU BIT-EXACT\n",
+                        kBodyCount, kDriveCount, kSteps);
+
+            // PROOF (2) determinism: two full GPU runs byte-identical.
+            std::vector<FxBodyGpu> gpuBodies2;
+            runActive(1, gpuBodies2);
+            if (gpuBodies.size() != gpuBodies2.size() ||
+                std::memcmp(gpuBodies.data(), gpuBodies2.data(),
+                            gpuBodies.size() * sizeof(FxBodyGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: active-step two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("active-step determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) tracks the clip: the driven ragdoll's mean DriveAngleCos to the clip targets is within a
+            // band (the pose is held toward the clip) AND the driven pose DIFFERS from a no-drive limp control.
+            {
+                // the no-drive control: the SAME bound ragdoll with stiffness 0 (it just collapses limp).
+                active::ActiveRagdoll ctrl = active::ActiveFromSkeleton(skel, cfg, /*stiffness=*/0);
+                active::StepActiveSteps(ctrl, skel, clip, kDt, kIters, kSteps, /*startTime=*/kClipTime);
+                int64_t sumCos = 0;
+                for (const active::FxAngularDrive& d : cpuAct.drives)
+                    sumCos += (int64_t)active::DriveAngleCos(cpuAct.ragdoll.world, d);
+                const active::fx meanCos = kDriveCount > 0u ? (active::fx)(sumCos / (int64_t)kDriveCount)
+                                                            : active::kOne;
+                const active::fx kHoldBand = active::kOne / 4;   // a full humanoid under gravity -> a looser band
+                active::fx maxDiff = 0;
+                for (int i = 0; i < kBodyCount; ++i) {
+                    const active::fx dx = cpuAct.ragdoll.world.bodies[(size_t)i].pos.x
+                                        - ctrl.ragdoll.world.bodies[(size_t)i].pos.x;
+                    const active::fx adx = dx < 0 ? -dx : dx;
+                    if (adx > maxDiff) maxDiff = adx;
+                }
+                const bool tracked = meanCos > active::kOne - kHoldBand;
+                const bool posedNotLimp = maxDiff > active::kOne / 2;
+                if (!(tracked && posedNotLimp)) {
+                    std::fprintf(stderr, "FATAL: active-step did not track the clip (meanCos=%d band=%d, "
+                                 "maxDiff=%d tracked=%d posed=%d)\n", meanCos, kHoldBand, maxDiff,
+                                 (int)tracked, (int)posedNotLimp);
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("active-step tracked: {meanCos:%d, posedNotLimp:true}\n", meanCos);
+            }
+
+            // PROOF (4) clip-advance is live: sampling the clip at two DIFFERENT times yields DIFFERENT qTargets
+            // (the drive follows the animation, not a fixed pose).
+            {
+                active::ActiveRagdoll a0 = bind, a1 = bind;
+                active::WriteClipTargets(a0, skel, clip, 0.0f);   // rest (identity targets)
+                active::WriteClipTargets(a1, skel, clip, 1.0f);   // the bent end-pose (qZ90 targets)
+                bool advanced = false;
+                for (size_t e = 0; e < a0.drives.size(); ++e)
+                    if (std::memcmp(&a0.drives[e].qTarget, &a1.drives[e].qTarget, sizeof(fpx::FxQuat)) != 0)
+                        advanced = true;
+                if (!advanced) {
+                    std::fprintf(stderr, "FATAL: active-step clip targets did NOT advance (t=0 == t=1)\n");
+                    device->WaitIdle(); return 1;
+                }
+                std::printf("active-step clip: {targetsAdvance:true}\n");
+            }
+
+            // The disabled-path no-op: solveEnabled=false -> bodies UNCHANGED (the integer step is skipped).
+            {
+                auto bodiesBuf = mkBuf(bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu));
+                active::ActiveRagdoll act = bind;
+                active::WriteClipTargets(act, skel, clip, kClipTime);
+                const std::vector<FxAngularDriveGpu> drivesTick = packDrives(act.drives);
+                auto drivesBuf = mkBuf(drivesTick.data(), drivesTick.size() * sizeof(FxAngularDriveGpu));
+                ActiveDriveParams params = makeParams(/*solveEnabled=*/0, /*steps=*/1);
+                auto paramsBuf = mkBuf(&params, sizeof(ActiveDriveParams));
+                render::RenderGraph g;
+                render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                g.AddPass("active_step_disabled", {}, {rgSwap},
+                    [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                        cmd.BindComputePipeline(*driveCompute);
+                        cmd.BindStorageBuffer(*bodiesBuf, 0);
+                        cmd.BindStorageBuffer(*jointsBuf, 1);
+                        cmd.BindStorageBuffer(*limitsBuf, 2);
+                        cmd.BindStorageBuffer(*drivesBuf, 3);
+                        cmd.BindStorageBuffer(*paramsBuf, 4);
+                        cmd.DispatchCompute(1);
+                        cmd.ComputeToVertexBarrier();
+                        cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                        cmd.EndRenderPass();
+                    });
+                g.Execute(*device);
+                device->WaitIdle();
+                std::vector<FxBodyGpu> disabledBodies((size_t)kBodyCount, FxBodyGpu{});
+                device->ReadBuffer(*bodiesBuf, disabledBodies.data(),
+                                   disabledBodies.size() * sizeof(FxBodyGpu), 0);
+                if (std::memcmp(disabledBodies.data(), bodiesInit.data(),
+                                bodiesInit.size() * sizeof(FxBodyGpu)) != 0) {
+                    std::fprintf(stderr, "FATAL: active-step solveEnabled=false changed the bodies\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            // --- Golden: a PURE-INTEGER 2D side-view of the ragdoll POSED toward the clip. The pinned root
+            // white, the dynamic bones hashColor'd at their bit-exact (pos.x>>kFrac, pos.y>>kFrac), the
+            // skeleton edges grey segments between connected world anchors. CPU-coloured from the read-back
+            // integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 36;
+            const int kMargin = 28;
+            const int kWorldW = 10;
+            const int kWorldH = 12;
+            const int kOriginX = 4;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+                ix = kMargin + (worldX + kOriginX) * kPxPerUnit;
+                iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+            };
+            auto putPx = [&](int ix, int iy, const Vec3& col) {
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            };
+            auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int n = adx > ady ? adx : ady;
+                if (n == 0) { putPx(x0, y0, col); return; }
+                for (int s = 0; s <= n; ++s) {
+                    int ix = x0 + (int)((int64_t)dx * s / n);
+                    int iy = y0 + (int)((int64_t)dy * s / n);
+                    putPx(ix, iy, col);
+                }
+            };
+            // The skeleton edges: grey segments between the connected world anchors (the posed bones).
+            for (const active::FxJoint& j : joints) {
+                const fpx::FxBody& ba = cpuAct.ragdoll.world.bodies[(size_t)j.bodyA];
+                const fpx::FxBody& bb = cpuAct.ragdoll.world.bodies[(size_t)j.bodyB];
+                const active::FxVec3 pa = joint::WorldAnchor(ba, j.anchorA);
+                const active::FxVec3 pb = joint::WorldAnchor(bb, j.anchorB);
+                int ax, ay, bx, by;
+                worldToPx(pa.x >> active::kFrac, pa.y >> active::kFrac, ax, ay);
+                worldToPx(pb.x >> active::kFrac, pb.y >> active::kFrac, bx, by);
+                drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.5f});
+            }
+            // The bones: the pinned root white, the dynamic bones hashColor'd, drawn from the bit-exact GPU
+            // positions (== the CPU positions by Proof 1).
+            for (int i = 0; i < kBodyCount; ++i) {
+                const int wx = gpuBodies[(size_t)i].px >> active::kFrac;
+                const int wy = gpuBodies[(size_t)i].py >> active::kFrac;
+                int cx, cy; worldToPx(wx, wy, cx, cy);
+                const bool pinned = (gpuBodies[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+                const Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i + 1u);
+                for (int dy = -4; dy <= 4; ++dy)
+                    for (int dx = -4; dx <= 4; ++dx)
+                        if (dx * dx + dy * dy <= 16) putPx(cx + dx, cy + dy, col);
+            }
+            bool ok = WriteBMP(activeStepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — active-step anim-tracked ragdoll side-view (%d bones, %u "
+                                "drives, %d ticks)\n", activeStepShotPath, imgW, imgH, kBodyCount, kDriveCount,
+                                kSteps);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", activeStepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
