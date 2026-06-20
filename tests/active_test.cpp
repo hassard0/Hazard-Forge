@@ -582,6 +582,175 @@ int main() {
         check(same, "AC3 StepActive determinism: two runs BYTE-IDENTICAL");
     }
 
+    // ============================================================================================
+    // ============== AC4: ACTIVE -> LIMP -> RECOVER (the global physicality knob + the hit) =========
+    // ============================================================================================
+
+    // ===== AC4 (1): PhysicalityAtTick boundaries are EXACT (kOne pre-struck, 0 in limp, ramp, kOne after) =
+    {
+        const int struckTick = 10, limpTicks = 5, recoverTicks = 8;
+        // before the hit -> kOne.
+        check(active::PhysicalityAtTick(0, struckTick, limpTicks, recoverTicks) == active::kOne,
+              "AC4 PhysicalityAtTick: tick 0 (pre-struck) == kOne");
+        check(active::PhysicalityAtTick(struckTick - 1, struckTick, limpTicks, recoverTicks) == active::kOne,
+              "AC4 PhysicalityAtTick: the tick before struckTick == kOne");
+        // the limp window [struckTick, struckTick+limpTicks) -> 0.
+        check(active::PhysicalityAtTick(struckTick, struckTick, limpTicks, recoverTicks) == 0,
+              "AC4 PhysicalityAtTick: struckTick (limp start) == 0");
+        check(active::PhysicalityAtTick(struckTick + limpTicks - 1, struckTick, limpTicks, recoverTicks) == 0,
+              "AC4 PhysicalityAtTick: the last limp tick == 0");
+        // the ramp window: first recover tick (r==0) == kOne/recoverTicks; last (r==recoverTicks-1) == kOne.
+        const int rampStart = struckTick + limpTicks;
+        check(active::PhysicalityAtTick(rampStart, struckTick, limpTicks, recoverTicks)
+                  == (active::fx)(((int64_t)active::kOne * 1) / (int64_t)recoverTicks),
+              "AC4 PhysicalityAtTick: the first recover tick == kOne/recoverTicks (ramp begins)");
+        check(active::PhysicalityAtTick(rampStart + recoverTicks - 1, struckTick, limpTicks, recoverTicks)
+                  == active::kOne,
+              "AC4 PhysicalityAtTick: the last recover tick == kOne (ramp reaches full)");
+        // the ramp is MONOTONIC NON-DECREASING across the window (a clean 0->kOne climb).
+        bool monotonic = true;
+        active::fx prev = -1;
+        for (int r = 0; r < recoverTicks; ++r) {
+            const active::fx p = active::PhysicalityAtTick(rampStart + r, struckTick, limpTicks, recoverTicks);
+            if (p < prev) monotonic = false;
+            prev = p;
+        }
+        check(monotonic, "AC4 PhysicalityAtTick: the recovery ramp is monotonic non-decreasing");
+        // past the ramp -> kOne (re-tracked).
+        check(active::PhysicalityAtTick(rampStart + recoverTicks, struckTick, limpTicks, recoverTicks)
+                  == active::kOne,
+              "AC4 PhysicalityAtTick: the tick after the ramp == kOne (re-tracked)");
+        check(active::PhysicalityAtTick(1000, struckTick, limpTicks, recoverTicks) == active::kOne,
+              "AC4 PhysicalityAtTick: far past the ramp == kOne");
+        // recoverTicks <= 0 -> snap straight to kOne after the limp window (no ramp).
+        check(active::PhysicalityAtTick(struckTick + limpTicks, struckTick, limpTicks, /*recoverTicks=*/0)
+                  == active::kOne,
+              "AC4 PhysicalityAtTick: recoverTicks 0 snaps to kOne right after the limp window");
+    }
+
+    // ===== AC4 (2): ApplyImpulse raises a dynamic body's vel; static / out-of-range is a no-op =====
+    {
+        active::FxWorld w;
+        w.gravity = fpx::FxVec3{0, 0, 0};
+        w.groundY = (active::fx)(-1000 * (int)active::kOne);
+        w.bodies = {body(0, 0, 0, active::kOne, ident()), body(0, 0, 0, 0, ident())};   // 0 dynamic, 1 static
+        const fpx::FxVec3 dv{active::kOne, 2 * active::kOne, -active::kOne};
+        active::ApplyImpulse(w, 0, dv);   // dynamic -> vel raised by dv
+        check(w.bodies[0].vel.x == dv.x && w.bodies[0].vel.y == dv.y && w.bodies[0].vel.z == dv.z,
+              "AC4 ApplyImpulse: a dynamic body's vel is raised by dv");
+        // a second kick ACCUMULATES (FxAdd).
+        active::ApplyImpulse(w, 0, dv);
+        check(w.bodies[0].vel.x == 2 * dv.x && w.bodies[0].vel.y == 2 * dv.y && w.bodies[0].vel.z == 2 * dv.z,
+              "AC4 ApplyImpulse: a second kick accumulates (FxAdd)");
+        // a STATIC body (invMass 0 -> no kFlagDynamic) is NOT kicked.
+        const fpx::FxVec3 v1before = w.bodies[1].vel;
+        active::ApplyImpulse(w, 1, dv);
+        check(w.bodies[1].vel.x == v1before.x && w.bodies[1].vel.y == v1before.y &&
+              w.bodies[1].vel.z == v1before.z,
+              "AC4 ApplyImpulse: a static body (no kFlagDynamic) is NOT kicked (no-op)");
+        // out-of-range -> no-op (no crash, no change).
+        const std::vector<fpx::FxBody> before = w.bodies;
+        active::ApplyImpulse(w, 99u, dv);
+        check(std::memcmp(w.bodies.data(), before.data(), before.size() * sizeof(fpx::FxBody)) == 0,
+              "AC4 ApplyImpulse: out-of-range index is a no-op");
+    }
+
+    // ===== AC4 (3): StepActivePhysicality at kOne == StepActive (byte-identical); at 0 == pure physics =====
+    {
+        const active::fx acDt = active::kOne / 60;
+        const int acIters = 24;
+        // physicality kOne == AC3 StepActive byte-for-byte (the equivalence contract: fxmul(w,kOne)==w).
+        active::ActiveRagdoll aFull = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::ActiveRagdoll aAc3  = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        for (int s = 0; s < 60; ++s) {
+            const float t = 1.0f + (float)s * ((float)acDt / (float)active::kOne);
+            active::StepActivePhysicality(aFull, humanoid, bendClip, t, active::kOne, acDt, acIters);
+            active::StepActive(aAc3, humanoid, bendClip, t, acDt, acIters);
+        }
+        check(aFull.ragdoll.world.bodies.size() == aAc3.ragdoll.world.bodies.size() &&
+              std::memcmp(aFull.ragdoll.world.bodies.data(), aAc3.ragdoll.world.bodies.data(),
+                          aFull.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC4 StepActivePhysicality physicality kOne == AC3 StepActive (byte-identical — equivalence)");
+        // physicality 0 == pure physics (no drive): a limp (stiffness-0 ActiveFromSkeleton) StepActive control
+        // collapses to the SAME bodies (the drive contributes nothing at physicality 0).
+        active::ActiveRagdoll aLimp  = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::ActiveRagdoll aZero  = active::ActiveFromSkeleton(humanoid, acCfg, /*stiffness=*/0);
+        for (int s = 0; s < 60; ++s) {
+            const float t = 1.0f + (float)s * ((float)acDt / (float)active::kOne);
+            active::StepActivePhysicality(aLimp, humanoid, bendClip, t, /*physicality=*/0, acDt, acIters);
+            active::StepActive(aZero, humanoid, bendClip, t, acDt, acIters);
+        }
+        check(std::memcmp(aLimp.ragdoll.world.bodies.data(), aZero.ragdoll.world.bodies.data(),
+                          aLimp.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC4 StepActivePhysicality physicality 0 == pure physics (a stiffness-0 limp control)");
+        // StepActivePhysicality does NOT overwrite the base drives (the scratch contract).
+        const active::fx w0 = aFull.drives.empty() ? active::kOne : aFull.drives[0].driveWeight;
+        check(w0 == active::kOne, "AC4 StepActivePhysicality: the base drives' driveWeight is NOT mutated (scratch)");
+    }
+
+    // ===== AC4 (4): StepActiveRecover — animCos high, struckCos < animCos, recoverCos > struckCos =====
+    {
+        const active::fx acDt = active::kOne / 60;
+        const int acIters = 24;
+        const int struckTick = 60, limpTicks = 40, recoverTicks = 80;
+        // a torso impulse (a sideways + upward kick on the spine body, index 1).
+        const fpx::FxVec3 impulse{6 * active::kOne, 4 * active::kOne, 0};
+        const uint32_t impulseBody = 1u;   // the spine
+
+        auto meanCosOf = [&](const active::ActiveRagdoll& a) -> active::fx {
+            int64_t sum = 0;
+            for (const active::FxAngularDrive& d : a.drives) sum += (int64_t)active::DriveAngleCos(a.ragdoll.world, d);
+            return a.drives.empty() ? active::kOne : (active::fx)(sum / (int64_t)a.drives.size());
+        };
+
+        // ANIM: settle the anim-tracked pose (physicality kOne throughout, no impulse) -> animCos high.
+        active::ActiveRagdoll anim = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        for (int s = 0; s < struckTick; ++s) {
+            const float t = 1.0f + (float)s * ((float)acDt / (float)active::kOne);
+            active::StepActivePhysicality(anim, humanoid, bendClip, t, active::kOne, acDt, acIters);
+        }
+        const active::fx animCos = meanCosOf(anim);
+
+        // STRUCK: run the SAME episode start through the END of the limp window -> struckCos LOW (left the clip).
+        active::ActiveRagdoll struck = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::StepActiveRecover(struck, humanoid, bendClip, acDt, acIters, struckTick, impulseBody, impulse,
+                                  limpTicks, recoverTicks, /*totalTicks=*/struckTick + limpTicks, /*startTime=*/1.0f);
+        const active::fx struckCos = meanCosOf(struck);
+
+        // RECOVER: run the FULL episode (through the recovery ramp) -> recoverCos back up (returned to the clip).
+        active::ActiveRagdoll recover = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::StepActiveRecover(recover, humanoid, bendClip, acDt, acIters, struckTick, impulseBody, impulse,
+                                  limpTicks, recoverTicks,
+                                  /*totalTicks=*/struckTick + limpTicks + recoverTicks + 60, /*startTime=*/1.0f);
+        const active::fx recoverCos = meanCosOf(recover);
+
+        check(animCos > active::kOne - active::kOne / 4, "AC4 StepActiveRecover: animCos high (tracks the clip)");
+        check(struckCos < animCos, "AC4 StepActiveRecover: struckCos < animCos (the hit knocked it off the pose)");
+        check(recoverCos > struckCos, "AC4 StepActiveRecover: recoverCos > struckCos (it recovered toward the clip)");
+
+        // determinism: two full StepActiveRecover runs byte-identical.
+        active::ActiveRagdoll r2 = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::StepActiveRecover(r2, humanoid, bendClip, acDt, acIters, struckTick, impulseBody, impulse,
+                                  limpTicks, recoverTicks,
+                                  /*totalTicks=*/struckTick + limpTicks + recoverTicks + 60, /*startTime=*/1.0f);
+        check(recover.ragdoll.world.bodies.size() == r2.ragdoll.world.bodies.size() &&
+              std::memcmp(recover.ragdoll.world.bodies.data(), r2.ragdoll.world.bodies.data(),
+                          recover.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC4 StepActiveRecover determinism: two runs BYTE-IDENTICAL");
+
+        // equivalence: a physicality-kOne-throughout, NO-impulse StepActiveRecover == the AC3 StepActive episode.
+        active::ActiveRagdoll eqRecover = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::StepActiveRecover(eqRecover, humanoid, bendClip, acDt, acIters, /*struckTick=*/-1, /*body=*/0u,
+                                  fpx::FxVec3{0, 0, 0}, /*limpTicks=*/0, /*recoverTicks=*/0,
+                                  /*totalTicks=*/120, /*startTime=*/1.0f);
+        active::ActiveRagdoll eqAc3 = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        active::StepActiveSteps(eqAc3, humanoid, bendClip, acDt, acIters, 120, /*startTime=*/1.0f);
+        check(eqRecover.ragdoll.world.bodies.size() == eqAc3.ragdoll.world.bodies.size() &&
+              std::memcmp(eqRecover.ragdoll.world.bodies.data(), eqAc3.ragdoll.world.bodies.data(),
+                          eqRecover.ragdoll.world.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC4 StepActiveRecover equiv: physicality-kOne no-impulse run == AC3 StepActive (byte-identical)");
+    }
+
     if (g_fail == 0) std::printf("active_test: ALL PASS\n");
     else std::printf("active_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -307,5 +307,87 @@ inline void StepActiveSteps(ActiveRagdoll& active, const anim::Skeleton& skeleto
         StepActive(active, skeleton, clip, startTime + (float)s * dtSeconds, dt, iters);
 }
 
+// ====================================================================================================
+// Slice AC4 — ACTIVE -> LIMP -> RECOVER (THE HEADLINE BEHAVIOR). AC1 built the angular drive; AC2 the
+// per-joint blend weight; AC3 the anim-clip tracking. AC4 adds THE MONEY BEHAVIOR: a GLOBAL physicality
+// knob in [0, kOne] that scales EVERY drive's weight (the UE5 physical-blend master alpha), an IMPULSE
+// (a host body-velocity kick — the hit), and a deterministic RECOVERY RAMP. The character ANIMATES
+// (physicality kOne, tracks the clip) -> GETS HIT (impulse + physicality drop -> goes LIMP, ragdoll wins)
+// -> RECOVERS (physicality ramps back -> returns to the clip pose). INTEGER-bit-exact. NO new shader, NO
+// new RHI (the drive solve is AC1's active_drive_solve.comp; physicality + impulse are host C++). AC4
+// APPENDS — AC1-AC3 byte-frozen.
+
+// ----- ApplyImpulse: a host body-velocity kick (the hit; the fpx/command idiom, fpx.h frozen) -----------
+// If `bodyIndex` is in range AND the body is dynamic (flags & kFlagDynamic), add `dv` to its velocity
+// (world.bodies[bodyIndex].vel = FxAdd(vel, dv)); otherwise a no-op (out-of-range OR a static/pinned body
+// is never kicked). Deterministic integer add (FxAdd is per-axis +) -> bit-reproducible CPU<->GPU. This is
+// a HOST mutation of the world state (the JT5/VH5/FR5 scripted-impulse-per-tick shape).
+inline void ApplyImpulse(FxWorld& world, uint32_t bodyIndex, const FxVec3& dv) {
+    if (bodyIndex >= (uint32_t)world.bodies.size()) return;            // out-of-range -> no-op
+    FxBody& b = world.bodies[(size_t)bodyIndex];
+    if (!(b.flags & fpx::kFlagDynamic)) return;                        // static/pinned -> never kicked
+    b.vel = fpx::FxAdd(b.vel, dv);                                     // the deterministic integer velocity kick
+}
+
+// ----- PhysicalityAtTick: the deterministic recovery ramp (pure integer, no float) ----------------------
+// The global physicality alpha as a function of the tick index. The EXACT tick boundaries:
+//   * tick <  struckTick                              -> kOne   (ACTIVE — fully anim-driven, tracks the clip)
+//   * struckTick <= tick < struckTick + limpTicks     -> 0      (LIMP — no drive, pure physics ragdoll)
+//   * the next `recoverTicks` ticks (struckTick+limpTicks <= tick < struckTick+limpTicks+recoverTicks):
+//         a LINEAR INTEGER ramp 0 -> kOne. Let r = tick - (struckTick + limpTicks) in [0, recoverTicks);
+//         physicality = (fx)((int64_t)kOne * (r + 1) / recoverTicks)  (a clamped linear interp: the FIRST
+//         recover tick (r==0) is kOne/recoverTicks (already partially active), the LAST (r==recoverTicks-1)
+//         is kOne — the ramp REACHES full physicality on the final recover tick). recoverTicks <= 0 -> snap
+//         straight to kOne (no ramp window).
+//   * tick >= struckTick + limpTicks + recoverTicks   -> kOne   (RE-TRACKED — fully anim-driven again)
+// Pure integer (int64 numerator avoids overflow, integer divide) -> bit-reproducible. No RNG/clock/float.
+inline fx PhysicalityAtTick(int tick, int struckTick, int limpTicks, int recoverTicks) {
+    if (tick < struckTick) return kOne;                               // before the hit -> active
+    const int sinceStruck = tick - struckTick;                        // >= 0
+    if (sinceStruck < limpTicks) return 0;                            // the limp window -> pure physics
+    if (recoverTicks <= 0) return kOne;                               // no ramp window -> snap to active
+    const int r = sinceStruck - limpTicks;                            // 0-based recover index, >= 0
+    if (r >= recoverTicks) return kOne;                               // past the ramp -> re-tracked
+    // a clamped linear integer ramp 0 -> kOne over recoverTicks ticks (reaches kOne on the last tick).
+    return (fx)(((int64_t)kOne * (int64_t)(r + 1)) / (int64_t)recoverTicks);
+}
+
+// ----- StepActivePhysicality: one tick = WriteClipTargets then the AC1/AC2 drive step with EVERY drive's
+// weight scaled by the global physicality (into a SCRATCH set — NO persistent mutation) --------------------
+// WriteClipTargets(active, skeleton, clip, time) (AC3 — fills the base qTargets) -> build a scratch copy of
+// active.drives with eff[e].driveWeight = fxmul(active.drives[e].driveWeight, physicality) -> StepDriveWorld
+// over the scratch drives. The base active.drives is NEVER overwritten (the scratch keeps AC1-AC3 records
+// frozen + avoids compounding mutation). At physicality == kOne, fxmul(w, kOne) == w -> eff == active.drives
+// -> byte-identical to the AC3 StepActive (the equivalence contract). At physicality == 0, every weight 0 ->
+// no correction -> pure physics (limp). Deterministic integer (the scale + the step are fixed-order int ops).
+inline void StepActivePhysicality(ActiveRagdoll& active, const anim::Skeleton& skeleton,
+                                  const anim::Animation& clip, float time, fx physicality, fx dt, int iters) {
+    WriteClipTargets(active, skeleton, clip, time);                   // AC3 host pre-pass (fills base qTargets)
+    std::vector<FxAngularDrive> eff = active.drives;                  // SCRATCH (base drives never overwritten)
+    for (size_t e = 0; e < eff.size(); ++e)
+        eff[e].driveWeight = fxmul(active.drives[e].driveWeight, physicality);   // scale every weight
+    StepDriveWorld(active.ragdoll.world, active.ragdoll.joints, active.ragdoll.limits, eff, dt, iters);
+}
+
+// ----- StepActiveRecover: the scripted active -> struck -> recover episode driver -----------------------
+// For each tick t in [0, totalTicks): physicality = PhysicalityAtTick(t, struckTick, limpTicks, recoverTicks);
+// if t == struckTick call ApplyImpulse(world, impulseBody, impulseDv) (the hit, BEFORE the step so the kick
+// integrates this tick); then StepActivePhysicality(active, skeleton, clip, startTime + t*dtSeconds,
+// physicality, dt, iters). dtSeconds = (float)dt / (float)kOne (the AC3 clip-time convention). Deterministic,
+// fixed order (physicality from the tick index, the impulse a scripted event at struckTick, the clip time
+// per-tick state). The GPU showcase runs this SAME host per-tick logic (physicality, impulse at struckTick,
+// the scratch-scaled drives, RE-UPLOAD) + the AC1 active_drive_solve.comp for one step -> the GPU body world
+// memcmp's bit-exact vs this CPU StepActiveRecover (only the integer StepDriveWorld is the memcmp).
+inline void StepActiveRecover(ActiveRagdoll& active, const anim::Skeleton& skeleton, const anim::Animation& clip,
+                              fx dt, int iters, int struckTick, uint32_t impulseBody, const FxVec3& impulseDv,
+                              int limpTicks, int recoverTicks, int totalTicks, float startTime) {
+    const float dtSeconds = (float)dt / (float)kOne;
+    for (int t = 0; t < totalTicks; ++t) {
+        const fx physicality = PhysicalityAtTick(t, struckTick, limpTicks, recoverTicks);
+        if (t == struckTick) ApplyImpulse(active.ragdoll.world, impulseBody, impulseDv);   // the hit
+        StepActivePhysicality(active, skeleton, clip, startTime + (float)t * dtSeconds, physicality, dt, iters);
+    }
+}
+
 }  // namespace active
 }  // namespace hf::sim
