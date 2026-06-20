@@ -100,6 +100,7 @@
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
 #include "sim/convex.h"              // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
+#include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -16706,6 +16707,287 @@ static int RunFractCellsShowcase(const char* outPath) {
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — fracture Voronoi cell mosaic (%d cells over %d samples)\n",
                 outPath, imgW, imgH, distinctCells, sampleCount);
+    return 0;
+}
+
+// --- Deterministic Persistent Contacts THE CONTACT FEATURE ID showcase (Slice PS1, the BEACHHEAD of
+// FLAGSHIP #21: DETERMINISTIC WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist). The TRUE
+// pass is identical on both backends because the contact KEY is PURE INT32 (compares + shifts + xors, NO
+// Q16.16 products, NO int64, NO float): UNLIKE the int64 contact MATH (convex_*/fric_* are Vulkan-SPIR-V-
+// only), shaders/persist_key.comp IS MSL-NATIVE (in hf_gen_msl) — so the Metal --persist-key runs the GPU
+// SHADER (NOT a CPU reference). The SAME CX2/FC2 fixed deterministic box-pair scene is run through the CPU
+// narrowphase (BoxSatStable -> BuildManifold) to produce the per-contact (bodyA, bodyB, sat.axisIndex,
+// pointIndex) inputs; one GPU thread per contact runs persist_key.comp.gen.metal (copies persist.h::
+// MakeContactKey + ContactKeyHash VERBATIM), ReadBuffer reads the GPU ContactKey[]+hash[], PROVEN BIT-EXACT
+// vs the CPU persist::MakeContactKey/ContactKeyHash (memcmp, NO tol — the same GPU==CPU proof the Vulkan
+// --persist-key-shot runs). The image golden is a PURE-INTEGER 2D top-down (XZ) view: the overlapping box
+// footprints (cool grey) + each contact point colored by ContactKeyHash, identical to the Vulkan path BY
+// CONSTRUCTION (same integer bits -> same RGB). New golden tests/golden/metal/persist_key.png; two runs
+// DIFF 0.0000. NO new RHI.
+static int RunPersistKeyShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    namespace persist = hf::sim::persist;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    // The fixed deterministic box-pair scene (IDENTICAL to the Vulkan --persist-key-shot / --convex-sat-shot).
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    auto qIdentity = []() { return fpx::FxQuat{0, 0, 0, convex::kOne}; };
+    auto qAboutX = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45}); };
+    auto qAboutZ = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45}); };
+    auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q) {
+        fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; return b;
+    };
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+    const convex::FxBox kBig{convex::FxVec3{fi(4), fi(4), fi(4)}};
+    std::vector<convex::SatPair> pairs;
+    auto addPair = [&](convex::SatPair p) { pairs.push_back(p); };
+    addPair({bodyAt(fi(-7), 0, fi(6), qIdentity()), kUnit, bodyAt(fi(-2), 0, fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(5), 0, fi(6), qIdentity()), kBig, bodyAt(fi(6), 0, fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-7), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(-5), 0, fi(2), qIdentity()), kUnit});
+    addPair({bodyAt(0, 0, fi(2), qAboutX()), kUnit, bodyAt(fi(1), fi(1), fi(3), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(4), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(8), fi(4), fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-7), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-11, 2), 0, fi(-2), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-2), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-1, 1), 0, fi(-2), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(3), 0, fi(-2), qAboutZ()), kUnit, bodyAt(fi(8), 0, fi(-2), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-6), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(-11, 2), 0, fi(-6), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(-1), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(1, 4), fh(5, 4), fh(-19, 4), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(4), 0, fi(-6), qIdentity()), kUnit, bodyAt(fi(7), 0, fi(-6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(8), 0, fi(0), qIdentity()), kBig, bodyAt(fi(8), 0, fh(3, 2), qIdentity()), kUnit});
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // CPU narrowphase -> the per-contact-point feature inputs (the SAME derivation as the Vulkan showcase).
+    struct ContactInput { uint32_t bodyA, bodyB, axisIndex, featureIndex; };
+    static_assert(sizeof(ContactInput) == 16, "ContactInput std430 layout");
+    std::vector<ContactInput> contacts;
+    std::vector<uint32_t> contactPair;
+    std::vector<convex::FxVec3> contactPos;
+    std::vector<convex::SatResult> contactSat;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        const convex::SatResult sat = convex::BoxSatStable(pairs[p].bodyA, pairs[p].boxA,
+                                                           pairs[p].bodyB, pairs[p].boxB);
+        if (!sat.overlap) continue;
+        const convex::ContactManifold m = convex::BuildManifold(pairs[p].bodyA, pairs[p].boxA,
+                                                                pairs[p].bodyB, pairs[p].boxB, sat);
+        for (uint32_t i = 0; i < m.count; ++i) {
+            contacts.push_back(ContactInput{2u * p, 2u * p + 1u, sat.axisIndex, i});
+            contactPair.push_back(p);
+            contactPos.push_back(m.points[i]);
+            contactSat.push_back(sat);
+        }
+    }
+    const uint32_t kContactCount = (uint32_t)contacts.size();
+    if (kContactCount == 0) return fail("persist-key: the box-pair scene produced NO contact points");
+
+    const int kPxPerUnit = 18, kMargin = 24;
+    const int kWorldHalf = 12;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    struct ContactKeyGpu { uint32_t bodyA, bodyB, axisIndex, featureIndex; };
+    static_assert(sizeof(ContactKeyGpu) == 16, "ContactKeyGpu std430 layout");
+    struct PersistParams { int32_t cfg[4]; };
+    static_assert(sizeof(PersistParams) == 16, "PersistParams std430 layout");
+
+    rhi::BufferDesc cDesc;
+    cDesc.size = contacts.size() * sizeof(ContactInput); cDesc.initialData = contacts.data();
+    cDesc.usage = rhi::BufferUsage::Storage;
+    auto contactsBuf = device->CreateBuffer(cDesc);
+
+    auto keyCs = loadMSL("persist_key.comp.gen.metal", "persist_key_main");
+    rhi::ComputePipelineDesc keyCd;
+    keyCd.compute = keyCs.get(); keyCd.storageBufferCount = 4; keyCd.threadsPerGroupX = 64;
+    auto keyCompute = device->CreateComputePipeline(keyCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+
+    auto runKeys = [&](std::vector<ContactKeyGpu>& outKeys, std::vector<uint32_t>& outHashes) {
+        std::vector<ContactKeyGpu> keysInit((size_t)kContactCount, ContactKeyGpu{});
+        rhi::BufferDesc kDesc;
+        kDesc.size = keysInit.size() * sizeof(ContactKeyGpu); kDesc.initialData = keysInit.data();
+        kDesc.usage = rhi::BufferUsage::Storage;
+        auto keysBuf = device->CreateBuffer(kDesc);
+        std::vector<uint32_t> hashesInit((size_t)kContactCount, 0u);
+        rhi::BufferDesc hDesc;
+        hDesc.size = hashesInit.size() * sizeof(uint32_t); hDesc.initialData = hashesInit.data();
+        hDesc.usage = rhi::BufferUsage::Storage;
+        auto hashesBuf = device->CreateBuffer(hDesc);
+        PersistParams params{}; params.cfg[0] = (int32_t)kContactCount; params.cfg[1] = 1;
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(PersistParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("persist_key", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*keyCompute);
+                cmd.BindStorageBuffer(*contactsBuf, 0);
+                cmd.BindStorageBuffer(*keysBuf, 1);
+                cmd.BindStorageBuffer(*hashesBuf, 2);
+                cmd.BindStorageBuffer(*paramsBuf, 3);
+                cmd.DispatchCompute((kContactCount + 63u) / 64u);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outKeys.assign((size_t)kContactCount, ContactKeyGpu{});
+        device->ReadBuffer(*keysBuf, outKeys.data(), outKeys.size() * sizeof(ContactKeyGpu), 0);
+        outHashes.assign((size_t)kContactCount, 0u);
+        device->ReadBuffer(*hashesBuf, outHashes.data(), outHashes.size() * sizeof(uint32_t), 0);
+    };
+
+    // === GPU keys (the MSL-native shader — a TRUE GPU pass, NOT a CPU reference) ===
+    std::vector<ContactKeyGpu> gpuKeys; std::vector<uint32_t> gpuHashes;
+    runKeys(gpuKeys, gpuHashes);
+
+    // === CPU reference: persist::MakeContactKey / ContactKeyHash over the SAME contacts ===
+    std::vector<ContactKeyGpu> cpuKeys((size_t)kContactCount);
+    std::vector<uint32_t> cpuHashes((size_t)kContactCount);
+    std::vector<persist::ContactKey> cpuKeyObjs((size_t)kContactCount);
+    for (uint32_t i = 0; i < kContactCount; ++i) {
+        const persist::ContactKey k = persist::MakeContactKey(contacts[i].bodyA, contacts[i].bodyB,
+                                                              contactSat[i], contacts[i].featureIndex);
+        cpuKeyObjs[i] = k;
+        cpuKeys[i] = ContactKeyGpu{k.bodyA, k.bodyB, k.axisIndex, k.featureIndex};
+        cpuHashes[i] = persist::ContactKeyHash(k);
+    }
+
+    bool bitExact = std::memcmp(gpuKeys.data(), cpuKeys.data(),
+                                (size_t)kContactCount * sizeof(ContactKeyGpu)) == 0
+                 && std::memcmp(gpuHashes.data(), cpuHashes.data(),
+                                (size_t)kContactCount * sizeof(uint32_t)) == 0;
+    if (!bitExact) return fail("persist-key: GPU ContactKey[]/hash[] != CPU MakeContactKey/ContactKeyHash");
+    const persist::KeyMeasure km = persist::MeasureKeys(cpuKeyObjs);
+    std::printf("persist-key: {pairs:%u, contacts:%u, distinctKeys:%u} GPU==CPU BIT-EXACT\n",
+                kPairCount, kContactCount, km.distinctKeys);
+
+    std::vector<ContactKeyGpu> gpuKeys2; std::vector<uint32_t> gpuHashes2;
+    runKeys(gpuKeys2, gpuHashes2);
+    bool det = std::memcmp(gpuKeys.data(), gpuKeys2.data(), gpuKeys.size() * sizeof(ContactKeyGpu)) == 0
+            && std::memcmp(gpuHashes.data(), gpuHashes2.data(), gpuHashes.size() * sizeof(uint32_t)) == 0;
+    if (!det) return fail("persist-key: two dispatches differ (nondeterministic)");
+    std::printf("persist-key determinism: two runs BYTE-IDENTICAL\n");
+
+    // Identity correctness (the same checks as the Vulkan showcase).
+    bool distinctDistinct = true;
+    for (uint32_t i = 0; i < kContactCount && distinctDistinct; ++i)
+        for (uint32_t j = i + 1; j < kContactCount; ++j) {
+            const bool sameFeature = contacts[i].bodyA == contacts[j].bodyA
+                && contacts[i].bodyB == contacts[j].bodyB
+                && contacts[i].axisIndex == contacts[j].axisIndex
+                && contacts[i].featureIndex == contacts[j].featureIndex;
+            if (persist::ContactKeysEqual(cpuKeyObjs[i], cpuKeyObjs[j]) != sameFeature)
+                { distinctDistinct = false; break; }
+        }
+    bool matchMatches = true;
+    for (uint32_t i = 0; i < kContactCount && matchMatches; ++i) {
+        const persist::ContactKey kNext = persist::MakeContactKey(
+            contacts[i].bodyA, contacts[i].bodyB, contactSat[i], contacts[i].featureIndex);
+        if (!persist::ContactKeysEqual(kNext, cpuKeyObjs[i])) matchMatches = false;
+    }
+    bool orderNormalized = true;
+    for (uint32_t i = 0; i < kContactCount && orderNormalized; ++i) {
+        const persist::ContactKey kSwap = persist::MakeContactKey(
+            contacts[i].bodyB, contacts[i].bodyA, contactSat[i], contacts[i].featureIndex);
+        if (!persist::ContactKeysEqual(kSwap, cpuKeyObjs[i])) orderNormalized = false;
+    }
+    if (!distinctDistinct || !matchMatches || !orderNormalized)
+        return fail("persist-key: identity wrong (distinctDistinct/matchMatches/orderNormalized)");
+    std::printf("persist-key identity: {distinctDistinct:true, matchMatches:true, orderNormalized:true}\n");
+
+    // --- Golden: the PURE-INTEGER 2D top-down (XZ) view (IDENTICAL to the Vulkan --persist-key-shot). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalf) * kPxPerUnit;
+        iy = kMargin + (gz + kWorldHalf) * kPxPerUnit;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawBox = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 az = axes[2];
+        const fx hx = box.halfExtents.x, hz = box.halfExtents.z;
+        fx cxs[4], czs[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sz[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sz[k] * fpx::fxmul(hz, az.x);
+            czs[k] = b.pos.z + sx[k] * fpx::fxmul(hx, ax.z) + sz[k] * fpx::fxmul(hz, az.z);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], czs[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], czs[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    const Vec3 grey{0.30f, 0.34f, 0.40f};
+    std::vector<bool> pairHasContact((size_t)kPairCount, false);
+    for (uint32_t c = 0; c < kContactCount; ++c) pairHasContact[contactPair[c]] = true;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        if (!pairHasContact[p]) continue;
+        drawBox(pairs[p].bodyA, pairs[p].boxA, grey);
+        drawBox(pairs[p].bodyB, pairs[p].boxB, grey);
+    }
+    auto hashColor = [&](uint32_t h) {
+        const float r = ((h >>  0) & 0xFFu) / 255.0f;
+        const float g = ((h >>  8) & 0xFFu) / 255.0f;
+        const float b = ((h >> 16) & 0xFFu) / 255.0f;
+        return Vec3{0.35f + 0.65f * r, 0.35f + 0.65f * g, 0.35f + 0.65f * b};
+    };
+    for (uint32_t c = 0; c < kContactCount; ++c) {
+        int cx, cy;
+        worldToPx(contactPos[c].x, contactPos[c].z, cx, cy);
+        const Vec3 col = hashColor(gpuHashes[c]);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+                putPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — contact-feature-ID key-color view (%u pairs, %u contacts)\n",
+                outPath, imgW, imgH, kPairCount, kContactCount);
     return 0;
 }
 
@@ -47299,6 +47581,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-fragments") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_fragments.png";
             try { return RunFractFragmentsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --persist-key <out.png>: render the Deterministic Persistent Contacts CONTACT FEATURE ID showcase
+        // (Slice PS1, the BEACHHEAD of FLAGSHIP #21). The CX2/FC2 box-pair scene -> CPU narrowphase -> per
+        // contact point a (bodyA, bodyB, sat, pointIndex) feeds shaders/persist_key.comp.gen.metal — a PURE-
+        // INT32 MSL-NATIVE shader (a TRUE GPU pass on Metal, NOT a CPU fallback): one thread per contact runs
+        // the order-normalized MakeContactKey + the fixed-mix ContactKeyHash. ReadBuffer reads the GPU
+        // ContactKey[]+hash[], PROVEN BIT-EXACT vs the CPU persist.h::MakeContactKey/ContactKeyHash (memcmp,
+        // no tol — the same GPU==CPU proof the Vulkan --persist-key-shot runs). The image golden is the box
+        // footprints + each contact point colored by ContactKeyHash, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/persist_key.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--persist-key") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_persist_key.png";
+            try { return RunPersistKeyShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-break <out.png>: render the Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK

@@ -387,6 +387,19 @@ hf_gen_msl(boids_cell_emit.comp      boids_cell_emit.comp.hlsl      comp boids_c
 hf_gen_msl(boids_neighbor_count.comp boids_neighbor_count.comp.hlsl comp boids_neighbor_count_main)
 hf_gen_msl(boids_neighbor_scan.comp  boids_neighbor_scan.comp.hlsl  comp boids_neighbor_scan_main)
 hf_gen_msl(boids_neighbor_emit.comp  boids_neighbor_emit.comp.hlsl  comp boids_neighbor_emit_main)
+# Deterministic Persistent Contacts Slice 1 (Slice PS1, the BEACHHEAD of FLAGSHIP #21: DETERMINISTIC
+# WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist): persist_key.comp is THE CONTACT FEATURE
+# ID pass — ONE thread per contact point runs the order-normalized integer key (bodyA<bodyB swap) + the fixed
+# (bodyA<<20)^(bodyB<<8)^(axisIndex<<4)^featureIndex packing + avalanche xor-shift hash, copying
+# engine/sim/persist.h::MakeContactKey + ContactKeyHash VERBATIM, writing its OWN ContactKey + hash per
+# contact. UNLIKE the int64 contact MATH (convex_*/fric_* — Vulkan-SPIR-V-only because glslc cannot parse
+# int64_t) the contact KEY is PURE INT32 (compares + shifts + xors, NO Q16.16 products, NO int64, NO float),
+# so the default MSL gen suffices (the fract_emit_count / boids_cell_count tier) — a TRUE GPU pass on Metal,
+# NOT a CPU fallback. The Metal --persist-key runs THIS shader; ReadBuffer reads the GPU ContactKey[]+hash[],
+# PROVEN BIT-EXACT vs the CPU persist.h::MakeContactKey/ContactKeyHash (the same proof the Vulkan
+# --persist-key-shot runs) -> cross-backend strict zero-differing-pixel. Behind --persist-key only; every
+# existing shader + golden untouched. NO new RHI; persist.h is a NEW additive sibling.
+hf_gen_msl(persist_key.comp         persist_key.comp.hlsl         comp persist_key_main)
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new

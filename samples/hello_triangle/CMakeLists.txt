@@ -1195,6 +1195,20 @@ hf_compile_shaders(
     # --fric-stack showcase runs the CPU StepFrictionWorldN instead (byte-identical by construction). Pure
     # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU + cross-backend, proven memcmp. NO new RHI.
     "shaders/fric_step.comp.hlsl:cs"
+    # Deterministic Persistent Contacts Slice 1 (Slice PS1, the BEACHHEAD of FLAGSHIP #21: DETERMINISTIC
+    # WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist): persist_key.comp is THE CONTACT
+    # FEATURE ID pass — ONE THREAD PER CONTACT POINT (per-contact INDEPENDENT, 64 threads/group, NO atomics)
+    # runs the order-normalized integer key (bodyA<bodyB swap) + the fixed (bodyA<<20)^(bodyB<<8)^(axisIndex
+    # <<4)^featureIndex packing + avalanche xor-shift hash, copying engine/sim/persist.h::MakeContactKey +
+    # ContactKeyHash VERBATIM, writing its OWN gKeys[contact] ContactKey + gHashes[contact] hash.
+    # keyEnabled=0 -> cleared key + hash 0. UNLIKE convex_*/fric_* (int64 -> Vulkan-only) the contact KEY is
+    # PURE INT32 (compares + shifts + xors, NO Q16.16 products, NO int64, NO float), so this shader IS MSL-gen'd
+    # (in the metal_headless hf_gen_msl list — the fract_emit_count / boids_cell_count tier) — a TRUE GPU pass on
+    # BOTH backends with strict zero-differing-pixel cross-vendor (the Metal --persist-key runs THIS shader, NOT
+    # a CPU reference). The Vulkan --persist-key-shot still memcmp's GPU ContactKey[]+hash[] BIT-EXACT vs the CPU
+    # MakeContactKey/ContactKeyHash. Pure integer SSBO compute + ReadBuffer. NO new RHI; existing shaders +
+    # goldens untouched. persist.h is a NEW additive sibling (#includes sim/fric.h read-only).
+    "shaders/persist_key.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

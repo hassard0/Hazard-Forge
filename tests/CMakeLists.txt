@@ -681,6 +681,18 @@ hf_add_pure_test(convex_test)
 # ASan-eligible.
 hf_add_pure_test(fric_test)
 
+# Deterministic Persistent Contacts Slice 1 (Slice PS1, the BEACHHEAD of FLAGSHIP #21: DETERMINISTIC
+# WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist): the PURE-INT32 CONTACT FEATURE ID core
+# (engine/sim/persist.h) the GPU shaders/persist_key.comp.hlsl copies VERBATIM + proves bit-identical.
+# persist.h #includes sim/fric.h read-only (transitively convex + fpx). PURE INT32 (compares + shifts + xors,
+# NO Q16.16 products) -> MSL-native, a TRUE GPU pass on both backends. Pins MakeContactKey order-normalization
+# (MakeContactKey(i,j,..) == MakeContactKey(j,i,..) — bodyA<bodyB always); distinct features (pair/axis/clip
+# corner) -> distinct keys; identical features -> equal keys + equal hash (the warm-start cache match); a
+# self-pair takes no swap; ContactKeyHash deterministic + collision-light over the showcase contact set;
+# MeasureKeys deterministic total/distinct summary collapsing duplicates; two runs byte-identical. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(persist_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
