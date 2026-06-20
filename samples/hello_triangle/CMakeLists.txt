@@ -1237,6 +1237,21 @@ hf_compile_shaders(
     # ReadBuffer -> bit-exact GPU==CPU + cross-backend, proven memcmp. NO new RHI; PS1/PS2 + existing shaders +
     # goldens untouched. persist.h is APPEND-only.
     "shaders/persist_warm.comp.hlsl:cs"
+    # Deterministic Persistent Contacts Slice 4 (Slice PS4): persist_sleep.comp is SLEEPING ISLANDS (THE NEW
+    # PHYSICS) — ONE thread ([numthreads(1,1,1)]) runs the WHOLE StepWarmSleepWorldN over the small body set: the
+    # PS3 warm step PLUS the per-body integer KineticEnergy = FxLength(vel)+FxLength(angVel), the fixed wake/sleep
+    # HYSTERESIS quietTicks update, the all-pairs BoxSatStable contact-adjacency + the fixed-order union-find-free
+    # ISLAND wakefulness propagation, the FREEZE of asleep bodies (vel/angVel zeroed -> exactly zero residual),
+    # and the SKIP of integrate + solve + de-pen for sleeping bodies/islands (the sleeping pairs keep their prior
+    # cache entries), K ticks, copying engine/sim/persist.h::StepWarmSleepWorld/StepWarmSleepWorldN VERBATIM.
+    # stepEnabled=0 -> bodies UNCHANGED + cleared sleep states. GPU final body world + per-body sleep states
+    # memcmp'd BIT-EXACT vs the CPU persist::StepWarmSleepWorldN. Like persist_warm.comp this is int64 (the
+    # inertia/quaternion Q16.16 products + the FxLength KE sqrt), so it is VULKAN-SPIR-V-ONLY (DXC compiles int64;
+    # glslc cannot) and is NOT MSL-gen'd — the Metal --persist-sleep / --persist-wake showcase runs the CPU
+    # StepWarmSleepWorldN instead (byte-identical by construction). Pure integer SSBO compute (4 buffers: bodies,
+    # boxes, params, sleep) + ReadBuffer -> bit-exact GPU==CPU + cross-backend, proven memcmp. NO new RHI;
+    # PS1/PS2/PS3 + existing shaders + goldens untouched. persist.h is APPEND-only.
+    "shaders/persist_sleep.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

@@ -459,6 +459,202 @@ int main() {
         }
     }
 
+    // =========================================================================================================
+    // Slice PS4 — DETERMINISTIC SLEEPING ISLANDS (THE NEW PHYSICS). A per-body INTEGER kinetic-energy
+    // accumulator + a fixed wake/sleep hysteresis + contact-graph island propagation, so a resting tower sleeps
+    // (exactly zero residual — asleep bodies don't integrate) and a thrown box wakes the WHOLE island
+    // atomically. The make-or-break: (a) a quiet body's quietTicks rises and it sleeps after sleepDelay; (b) a
+    // sleeping body skipped by the step does NOT move (zero drift); (c) an energetic body stays awake; (d) a
+    // wake-impulse on one sleeping body wakes its whole contact island (propagation); (e) a static floor does
+    // NOT keep the tower awake; (f) the hysteresis band prevents flicker; (g) two runs byte-identical.
+    {
+        const fpx::FxQuat qI{0, 0, 0, convex::kOne};
+        const convex::fx kOne = convex::kOne;
+        auto fi = [&](int v) { return (convex::fx)(v * (int)convex::kOne); };
+        const convex::fx kGravY = (convex::fx)(-9.8 * (double)kOne - 0.5);
+
+        auto makeBody = [&](convex::fx x, convex::fx y, convex::fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = qI;
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+        const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+        const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+        // The PS4 sleeping-tower scene: a static floor + 3 dynamic slabs stacked (the PS3 stack).
+        auto buildTower = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            return w;
+        };
+
+        persist::SleepConfig cfg;
+        cfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.warm.dt          = kOne / 60;
+        cfg.warm.solveIters  = 20;
+        cfg.warm.restitution = 0;
+        cfg.warm.slop        = kOne / 64;
+        cfg.warm.beta        = (convex::fx)((int64_t)4 * kOne / 10);    // 0.4
+        cfg.warm.linDamp     = (convex::fx)((int64_t)98 * kOne / 100);  // 0.98
+        cfg.warm.angDamp     = (convex::fx)((int64_t)90 * kOne / 100);  // 0.90 — bleed spurious spin so it rests
+        cfg.warm.posIters    = 4;
+        cfg.warm.mu          = kOne;
+        // The thresholds sit ABOVE the warm solver's resting jitter band (~0.3–0.7 unit/s) so the tower can go
+        // quiet, but well below a thrown box (~6 unit/s) so a real disturbance wakes the island. (See persist.h.)
+        cfg.sleepThreshold   = kOne;                       // ~1.0 unit/s — "quiet" (above the jitter band)
+        cfg.wakeThreshold    = (convex::fx)(2 * (int)kOne); // ~2.0 unit/s — the wake band top
+        cfg.sleepDelay       = 30;
+
+        // ================= KineticEnergy: zero at rest, positive when moving =================
+        {
+            fpx::FxBody at = makeBody(0, 0, 0, true);
+            check(persist::KineticEnergy(at) == 0, "PS4 KE: a body at rest has zero kinetic energy");
+            fpx::FxBody mv = makeBody(0, 0, 0, true);
+            mv.vel = {fi(2), 0, 0};
+            check(persist::KineticEnergy(mv) >= fi(2) - 4, "PS4 KE: a moving body has KE ~ its speed");
+            fpx::FxBody sp = makeBody(0, 0, 0, true);
+            sp.angVel = {0, fi(3), 0};
+            check(persist::KineticEnergy(sp) >= fi(3) - 4, "PS4 KE: angular motion contributes to KE");
+        }
+
+        // ================= a quiet body's quietTicks rises + it sleeps after sleepDelay =================
+        {
+            persist::SleepState s;
+            for (uint32_t t = 0; t < cfg.sleepDelay; ++t) {
+                check(s.quietTicks == t, "PS4 hysteresis: quietTicks rises by 1 per quiet tick");
+                persist::UpdateQuietTicks(s, 0, cfg);   // perfectly quiet
+            }
+            check(s.quietTicks >= cfg.sleepDelay, "PS4 hysteresis: quietTicks reaches sleepDelay");
+            // A single energetic tick (energy > wakeThreshold) resets quietTicks to 0 + clears asleep.
+            s.asleep = true;
+            persist::UpdateQuietTicks(s, cfg.wakeThreshold + fi(1), cfg);
+            check(s.quietTicks == 0 && !s.asleep, "PS4 hysteresis: an energetic tick resets + wakes the body");
+        }
+
+        // ================= the hysteresis BAND prevents flicker (no increment, no reset) =================
+        {
+            persist::SleepState s;
+            // Drive it quiet to near-sleep.
+            for (uint32_t t = 0; t < 10; ++t) persist::UpdateQuietTicks(s, 0, cfg);
+            const uint32_t held = s.quietTicks;
+            // An energy strictly INSIDE the band [sleepThreshold, wakeThreshold] holds quietTicks (no flicker).
+            const convex::fx mid = (cfg.sleepThreshold + cfg.wakeThreshold) / 2;
+            persist::UpdateQuietTicks(s, mid, cfg);
+            check(s.quietTicks == held, "PS4 band: an in-band energy neither increments nor resets quietTicks");
+            check(!s.asleep, "PS4 band: an in-band energy does not wake (asleep flag untouched)");
+        }
+
+        // ================= the warm tower goes to sleep (all asleep) at exactly zero residual =================
+        convex::ConvexWorld sleptW;   // captured for the wake test below
+        persist::PersistentCache sleptCache;
+        std::vector<persist::SleepState> sleptSleep;
+        {
+            sleptW = buildTower();
+            persist::StepWarmSleepWorldN(sleptW, sleptCache, sleptSleep, cfg, 300u);
+            const persist::SleepMeasure m = persist::MeasureSleep(sleptW, sleptSleep);
+            check(m.dynamicCount == 3, "PS4 sleep: 3 dynamic bodies in the tower");
+            check(m.asleepCount == 3, "PS4 sleep: the whole tower goes ASLEEP after settling");
+            check(m.awakeCount == 0, "PS4 sleep: no dynamic body remains awake");
+            check(m.maxSpeed == 0, "PS4 sleep: zero residual motion (asleep bodies don't move)");
+            // The tower is still a coherent stack (didn't collapse before sleeping).
+            const convex::fx y1 = sleptW.bodies[1].pos.y, y2 = sleptW.bodies[2].pos.y, y3 = sleptW.bodies[3].pos.y;
+            check(y1 < y2 && y2 < y3, "PS4 sleep: the tower rests STACKED (a coherent resting tower)");
+        }
+
+        // ================= a sleeping body skipped by the step does NOT move (zero drift) =================
+        {
+            // Step the already-asleep tower one more tick; asleep bodies must be byte-identical (zero drift).
+            convex::ConvexWorld w = sleptW;
+            persist::PersistentCache c = sleptCache;
+            std::vector<persist::SleepState> s = sleptSleep;
+            const convex::ConvexWorld before = w;
+            persist::StepWarmSleepWorld(w, c, s, cfg);
+            bool zeroDrift = true;
+            for (size_t i = 0; i < w.bodies.size(); ++i) {
+                if (!convex::IsDynamic(w.bodies[i])) continue;
+                if (s[i].asleep && std::memcmp(&w.bodies[i], &before.bodies[i], sizeof(fpx::FxBody)) != 0)
+                    zeroDrift = false;
+            }
+            check(zeroDrift, "PS4 zero-drift: stepping the asleep tower moves NO asleep body (byte-identical)");
+        }
+
+        // ================= an energetic body stays awake (does NOT sleep) =================
+        {
+            // A body whose KE stays ABOVE wakeThreshold every tick must NEVER accrue quietTicks → never sleeps.
+            persist::SleepState s;
+            const convex::fx energetic = cfg.wakeThreshold + fi(1);   // well above the wake band
+            for (uint32_t t = 0; t < cfg.sleepDelay * 3u; ++t)
+                persist::UpdateQuietTicks(s, energetic, cfg);
+            check(s.quietTicks == 0 && !s.asleep,
+                  "PS4 energetic: a body energetic every tick never accrues quietTicks (stays awake)");
+            // And a freshly-dropped (still-settling) tower has not yet completed sleepDelay quiet ticks.
+            convex::ConvexWorld w = buildTower();
+            persist::PersistentCache c;
+            std::vector<persist::SleepState> ss;
+            persist::StepWarmSleepWorldN(w, c, ss, cfg, cfg.sleepDelay - 1u);
+            const persist::SleepMeasure m = persist::MeasureSleep(w, ss);
+            check(m.asleepCount == 0, "PS4 energetic: a still-settling tower has NOT slept before sleepDelay");
+        }
+
+        // ================= a wake-impulse wakes the WHOLE contact island (propagation/atomicity) =========
+        {
+            convex::ConvexWorld w = sleptW;
+            persist::PersistentCache c = sleptCache;
+            std::vector<persist::SleepState> s = sleptSleep;
+            // Confirm the whole island is asleep first.
+            check(s[1].asleep && s[2].asleep && s[3].asleep, "PS4 wake: the island starts fully asleep");
+            // Wake ONLY the TOP body with a large impulse (a thrown box striking it). The propagation must wake
+            // the WHOLE contact-connected island (bodies 1,2,3 — the floor is static/inert, not an island-waker).
+            w.bodies[3].vel = {fi(6), 0, 0};   // a strong lateral kick on the top slab
+            persist::StepWarmSleepWorld(w, c, s, cfg);
+            check(!s[1].asleep && !s[2].asleep && !s[3].asleep,
+                  "PS4 island: a wake-impulse on ONE body wakes the WHOLE contact island (atomically)");
+            const persist::SleepMeasure m = persist::MeasureSleep(w, s);
+            check(m.awakeCount == 3 && m.asleepCount == 0, "PS4 island: every dynamic body in the island is awake");
+            check(m.maxSpeed > 0, "PS4 island: the woken island is moving (non-zero residual)");
+        }
+
+        // ================= a static floor does NOT keep the tower awake =================
+        {
+            // The tower slept (proven above) even though every dynamic body contacts the STATIC floor (directly
+            // or through the chain). If the static floor counted as an island-waker, the tower could never sleep.
+            // Re-assert via a minimal scene: one dynamic box resting on the static floor sleeps.
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            persist::PersistentCache c;
+            std::vector<persist::SleepState> s;
+            persist::StepWarmSleepWorldN(w, c, s, cfg, 200u);
+            check(s[1].asleep, "PS4 static-floor: a box resting on the STATIC floor sleeps (floor isn't a waker)");
+            check(persist::KineticEnergy(w.bodies[1]) == 0, "PS4 static-floor: the slept box has zero residual");
+        }
+
+        // ================= determinism: two sleeping runs byte-identical (bodies + sleep) =================
+        {
+            convex::ConvexWorld w1 = buildTower();
+            persist::PersistentCache c1; std::vector<persist::SleepState> s1;
+            persist::StepWarmSleepWorldN(w1, c1, s1, cfg, 200u);
+            convex::ConvexWorld w2 = buildTower();
+            persist::PersistentCache c2; std::vector<persist::SleepState> s2;
+            persist::StepWarmSleepWorldN(w2, c2, s2, cfg, 200u);
+            const bool sameBodies = std::memcmp(w1.bodies.data(), w2.bodies.data(),
+                                                w1.bodies.size() * sizeof(fpx::FxBody)) == 0;
+            check(sameBodies, "PS4 determinism: two sleeping runs BYTE-IDENTICAL bodies");
+            bool sameSleep = (s1.size() == s2.size());
+            for (size_t i = 0; sameSleep && i < s1.size(); ++i)
+                if (s1[i].quietTicks != s2[i].quietTicks || s1[i].asleep != s2[i].asleep ||
+                    s1[i].energy != s2[i].energy) sameSleep = false;
+            check(sameSleep, "PS4 determinism: two sleeping runs BYTE-IDENTICAL sleep states");
+        }
+    }
+
     if (g_fail == 0) std::printf("persist_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

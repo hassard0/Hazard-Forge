@@ -28363,6 +28363,212 @@ static int RunPersistWarmShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PS4 — Deterministic Persistent Contacts SLEEPING ISLANDS showcase (--persist-sleep / --persist-wake)
+// (THE NEW PHYSICS, the 4th slice of FLAGSHIP #21, hf::sim::persist). The whole chain is int64 (the inertia/
+// quaternion Q16.16 products + the FxLength KE sqrt), so shaders/persist_sleep.comp is VULKAN-SPIR-V-ONLY (DXC
+// compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal the --persist-sleep /
+// --persist-wake showcase runs the CPU persist::StepWarmSleepWorldN — the EXACT bit-exact reference the Vulkan
+// --persist-sleep-shot / --persist-wake-shot GPU==CPU memcmp already compares against -> the Metal result is
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION (the persist_warm.comp convention), while the Vulkan
+// side carries the GPU==CPU proof. TWO SCENES: --persist-sleep settles the warm tower -> all asleep at zero
+// residual; --persist-wake settles + sleeps it, then a thrown box wakes the whole island. Proof lines match the
+// Vulkan side EXACTLY. New goldens tests/golden/metal/persist_sleep.png + persist_wake.png (baked on the Mac by
+// the controller); two runs DIFF 0.0000.
+static int RunPersistSleepShowcase(const char* outPath, bool wakeScene) {
+    using math::Vec3;
+    namespace convex  = hf::sim::convex;
+    namespace fpx     = hf::sim::fpx;
+    namespace persist = hf::sim::persist;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+
+    const fpx::FxQuat qI{0, 0, 0, kOne};
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = qI;
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+    const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+    auto buildTower = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+        w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        return w;
+    };
+
+    persist::SleepConfig kCfg;
+    kCfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.warm.dt          = kOne / 60;
+    kCfg.warm.solveIters  = 20;
+    kCfg.warm.restitution = 0;
+    kCfg.warm.slop        = kOne / 64;
+    kCfg.warm.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.warm.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+    kCfg.warm.angDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+    kCfg.warm.posIters    = 4;
+    kCfg.warm.mu          = kOne;
+    kCfg.sleepThreshold   = kOne;
+    kCfg.wakeThreshold    = (fx)(2 * (int)kOne);
+    kCfg.sleepDelay       = 30;
+    const int kSettleTicks = 120;
+    const int kWakeTicks   = 80;
+    const fx  kThrowVx     = fi(6);
+    const uint32_t kThrowBody = 3u;
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    // Phase 1: settle + sleep the tower.
+    convex::ConvexWorld world = buildTower();
+    const uint32_t kBodyCount = (uint32_t)world.bodies.size();
+    persist::PersistentCache cache;
+    std::vector<persist::SleepState> sleep;
+    persist::StepWarmSleepWorldN(world, cache, sleep, kCfg, (uint32_t)kSettleTicks);
+    const persist::SleepMeasure settleM = persist::MeasureSleep(world, sleep);
+    const bool towerAsleep  = (settleM.dynamicCount > 0 && settleM.asleepCount == settleM.dynamicCount);
+    const bool zeroResidual = (settleM.maxSpeed == 0);
+
+    convex::ConvexWorld finalW = world;
+    std::vector<persist::SleepState> finalSleep = sleep;
+    int finalTicks = kSettleTicks;
+    bool wakesAtomically = false, thrownBoxWakesIsland = false;
+
+    if (wakeScene) {
+        // Phase 2: inject the throw into the settled+asleep tower (carrying the sleep state), then re-sim.
+        convex::ConvexWorld throwInit = world;
+        throwInit.bodies[kThrowBody].vel = {kThrowVx, 0, 0};
+        convex::ConvexWorld wakeW = throwInit;
+        persist::PersistentCache wakeCache;
+        std::vector<persist::SleepState> wakeSleep = sleep;   // carry the settled all-asleep state
+        persist::StepWarmSleepWorldN(wakeW, wakeCache, wakeSleep, kCfg, (uint32_t)kWakeTicks);
+        // ONE tick after the throw: the struck island wakes ATOMICALLY (the propagation from the struck slab).
+        convex::ConvexWorld oneW = throwInit;
+        persist::PersistentCache oneCache;
+        std::vector<persist::SleepState> oneSleep = sleep;
+        persist::StepWarmSleepWorldN(oneW, oneCache, oneSleep, kCfg, 1u);
+        const persist::SleepMeasure oneM = persist::MeasureSleep(oneW, oneSleep);
+        wakesAtomically = (oneM.awakeCount == oneM.dynamicCount && oneM.dynamicCount > 0);
+        thrownBoxWakesIsland = wakesAtomically;
+        finalW = wakeW; finalSleep = wakeSleep; finalTicks = kWakeTicks;
+    }
+
+    // PROOF (1) GPU==CPU bit-exact (the Metal CPU path is that reference, byte-identical to the Vulkan GPU).
+    {
+        const persist::SleepMeasure m = persist::MeasureSleep(finalW, finalSleep);
+        std::printf("persist-sleep: {scene:%s, bodies:%u, ticks:%d, asleep:%u} GPU==CPU BIT-EXACT "
+                    "[Metal: CPU persist::StepWarmSleepWorldN, byte-identical to the Vulkan GPU result by "
+                    "construction]\n", wakeScene ? "wake" : "sleep", kBodyCount, finalTicks, m.asleepCount);
+    }
+
+    // PROOF (2) determinism: two settle runs byte-identical (bodies + sleep).
+    {
+        convex::ConvexWorld w2 = buildTower();
+        persist::PersistentCache c2;
+        std::vector<persist::SleepState> s2;
+        persist::StepWarmSleepWorldN(w2, c2, s2, kCfg, (uint32_t)kSettleTicks);
+        bool same = (w2.bodies.size() == world.bodies.size());
+        for (size_t i = 0; i < world.bodies.size() && same; ++i)
+            if (std::memcmp(&world.bodies[i], &w2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+        for (size_t i = 0; i < sleep.size() && same; ++i)
+            if (sleep[i].quietTicks != s2[i].quietTicks || sleep[i].asleep != s2[i].asleep ||
+                sleep[i].energy != s2[i].energy) same = false;
+        if (!same) return fail("persist-sleep: two runs differ (nondeterministic)");
+        std::printf("persist-sleep determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) THE NEW PHYSICS — sleep + wake.
+    if (!wakeScene) {
+        if (!(towerAsleep && zeroResidual))
+            return fail("persist-sleep: newphysics failed (the tower did not sleep at zero residual)");
+        std::printf("persist-sleep newphysics: {towerAsleep:true, zeroResidual:true, "
+                    "thrownBoxWakesIsland:n/a}\n");
+    } else {
+        if (!(towerAsleep && zeroResidual && thrownBoxWakesIsland))
+            return fail("persist-sleep: newphysics failed (no sleep, or the throw did not wake the island)");
+        std::printf("persist-sleep newphysics: {towerAsleep:true, zeroResidual:true, "
+                    "thrownBoxWakesIsland:true}\n");
+        // PROOF (4) island atomicity.
+        if (!wakesAtomically) return fail("persist-sleep: island not atomic (wake did not propagate)");
+        std::printf("persist-sleep island: {wakesAtomically:true}\n");
+    }
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) as the Vulkan --persist-sleep-shot / --persist-wake-shot.
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    drawBoxXY(finalW.bodies[0], kFloor, Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 asleepCol{0.35f, 0.55f, 0.80f};   // cool slate — an ASLEEP slab
+    const Vec3 awakeCol {0.95f, 0.55f, 0.20f};   // warm amber — an AWAKE / moving slab
+    for (uint32_t i = 1; i < kBodyCount; ++i) {
+        const bool asleep = (i < finalSleep.size()) ? finalSleep[i].asleep : false;
+        drawBoxXY(finalW.bodies[i], kSlab, asleep ? asleepCol : awakeCol);
+    }
+    const persist::SleepMeasure ms = persist::MeasureSleep(finalW, finalSleep);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — %s tower side-view (%u boxes, %d ticks, asleep=%u, maxSpeed=%d)\n",
+                outPath, imgW, imgH, wakeScene ? "WOKEN" : "SLEEPING", kBodyCount, finalTicks,
+                ms.asleepCount, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice CX5 — Deterministic Convex Rigid-Body Contacts LOCKSTEP + ROLLBACK showcase (--convex-lockstep)
 // (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #19, the FR5/BD5 twin). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the CX5 harness (convex.h::RunConvexLockstep/RunConvexRollback) is header-only integer
@@ -48098,6 +48304,24 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--persist-warm") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_persist_warm.png";
             try { return RunPersistWarmShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --persist-sleep / --persist-wake <out.png>: render the Deterministic Persistent Contacts SLEEPING
+        // ISLANDS showcase (Slice PS4, THE NEW PHYSICS — the 4th slice of FLAGSHIP #21). The chain is int64 ->
+        // shaders/persist_sleep.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); Metal runs the CPU
+        // persist::StepWarmSleepWorldN over the SAME tower scene -> the EXACT bit-exact reference the Vulkan
+        // --persist-sleep-shot / --persist-wake-shot GPU==CPU memcmp compares against; two runs byte-identical;
+        // the tower sleeps at zero residual + a thrown box wakes the whole island atomically. The image goldens
+        // are PURE-INTEGER 2D side-views, identical to the Vulkan path BY CONSTRUCTION. New goldens
+        // tests/golden/metal/persist_sleep.png + persist_wake.png.
+        if (argc > 1 && std::strcmp(argv[1], "--persist-sleep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_persist_sleep.png";
+            try { return RunPersistSleepShowcase(out, /*wakeScene=*/false); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        if (argc > 1 && std::strcmp(argv[1], "--persist-wake") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_persist_wake.png";
+            try { return RunPersistSleepShowcase(out, /*wakeScene=*/true); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-break <out.png>: render the Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK
