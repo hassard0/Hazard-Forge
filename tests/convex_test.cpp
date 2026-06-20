@@ -611,6 +611,174 @@ int main() {
               "CX3 determinism: two ResolveContactPair runs BYTE-IDENTICAL");
     }
 
+    // ========================================================================================
+    // ================= Slice CX4 — THE FULL CONVEX STEP (a settling stack) ===================
+    // ========================================================================================
+    // ConvexWorld (parallel bodies/boxes arrays, some static) + StepConvexWorld (the 5-pass tick:
+    // predict-integrate -> all-pairs narrowphase -> impulse solve -> position de-penetration) +
+    // StepConvexWorldN + MeasureStack. The NEW bit vs CX3 is POSITION de-penetration so a box
+    // STACK settles on a static floor instead of sinking. PURE INTEGER, all orders PINNED.
+
+    // A helper: the deterministic gravity host-snap (== the showcase's, matches the fpx convention).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+
+    // A standard settling config: gravity down, dt 1/60, no bounce, slop 1/64, beta 0.4, 20 velocity solve
+    // sweeps + 4 position-de-pen sweeps + mild damping (linDamp 0.98, angDamp 0.5) — the damping bleeds off
+    // the spurious resting torque the non-accumulated Gauss-Seidel + fixed-point face manifold leave (the
+    // CX3-documented residual), so a 3-box tower SETTLES + rests coherently instead of slowly tipping.
+    auto makeStepCfg = [&]() {
+        convex::ConvexStepConfig c;
+        c.gravity = FxVec3{0, kGravY, 0};
+        c.dt = kOne / 60;
+        c.solveIters = 20;
+        c.restitution = 0;
+        c.slop = kOne / 64;
+        c.beta = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        c.linDamp = (fx)((int64_t)98 * kOne / 100);   // 0.98
+        c.angDamp = (fx)((int64_t)50 * kOne / 100);   // 0.5
+        c.posIters = 4;
+        return c;
+    };
+    // Build a body+box at a position with an orientation, dynamic or static.
+    auto makeWorldBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const convex::FxBox kUnitBox{FxVec3{kOne, kOne, kOne}};
+
+    // ================= CX4: a no-overlap free-fall step is a pure integrate (no contact) ============
+    {
+        // A single dynamic box high above a far-away static floor — no pair overlaps -> StepConvexWorld
+        // is just IntegrateBodyFull (gravity changes vel/pos; no de-penetration, no impulse).
+        convex::ConvexWorld w;
+        convex::FxBox floor{FxVec3{FromInt(8), kOne, FromInt(8)}};
+        w.bodies.push_back(makeWorldBody(0, 0, 0, false)); w.boxes.push_back(floor);     // floor (static, top y=1)
+        w.bodies.push_back(makeWorldBody(0, FromInt(10), 0, true)); w.boxes.push_back(kUnitBox); // far above
+        convex::ConvexStepConfig cfg = makeStepCfg();
+
+        // Reference: a lone IntegrateBodyFull on the dynamic body + the same per-tick damping (the step
+        // applies linDamp/angDamp post-integrate; with no contact that is the ONLY other effect).
+        fpx::FxBody refDyn = w.bodies[1];
+        fpx::IntegrateBodyFull(refDyn, cfg.gravity, cfg.dt);
+        refDyn.vel = fpx::FxScale(refDyn.vel, cfg.linDamp);
+        refDyn.angVel = fpx::FxScale(refDyn.angVel, cfg.angDamp);
+
+        convex::StepConvexWorld(w, cfg);
+        check(std::memcmp(&w.bodies[1], &refDyn, sizeof(fpx::FxBody)) == 0,
+              "CX4 no-overlap step == IntegrateBodyFull + damping (free fall, no contact)");
+        // The static floor never moved.
+        const fpx::FxBody floorRef = makeWorldBody(0, 0, 0, false);
+        check(std::memcmp(&w.bodies[0], &floorRef, sizeof(fpx::FxBody)) == 0,
+              "CX4 no-overlap step -> static floor unchanged");
+    }
+
+    // ================= CX4: static bodies NEVER move (over many ticks, even while loaded) ===========
+    {
+        // A static floor + a dynamic box dropped onto it. After many ticks the floor must be byte-identical.
+        convex::ConvexWorld w;
+        convex::FxBox floor{FxVec3{FromInt(8), kOne, FromInt(8)}};
+        w.bodies.push_back(makeWorldBody(0, 0, 0, false)); w.boxes.push_back(floor);
+        w.bodies.push_back(makeWorldBody(0, FromInt(3), 0, true)); w.boxes.push_back(kUnitBox);
+        const fpx::FxBody floorBefore = w.bodies[0];
+        convex::StepConvexWorldN(w, makeStepCfg(), 150);
+        check(std::memcmp(&w.bodies[0], &floorBefore, sizeof(fpx::FxBody)) == 0,
+              "CX4 static floor NEVER moves over 150 ticks (loaded by a resting box)");
+    }
+
+    // ================= CX4: a SINGLE box dropped on the floor RESTS ON the floor (does not sink) ====
+    {
+        // Floor top at y = 1 (floor center 0, halfY 1). A unit box (halfY 1) at rest must sit with its
+        // CENTER at y ~ floorTop + halfY = 2. We drop it from y=3 and step until it settles.
+        convex::ConvexWorld w;
+        convex::FxBox floor{FxVec3{FromInt(8), kOne, FromInt(8)}};
+        w.bodies.push_back(makeWorldBody(0, 0, 0, false)); w.boxes.push_back(floor);
+        w.bodies.push_back(makeWorldBody(0, FromInt(3), 0, true)); w.boxes.push_back(kUnitBox);
+        convex::StepConvexWorldN(w, makeStepCfg(), 240);
+
+        const fpx::FxBody& box = w.bodies[1];
+        const fx floorTop = w.bodies[0].pos.y + floor.halfExtents.y;   // 0 + 1 = 1
+        const fx boxBottom = box.pos.y - kUnitBox.halfExtents.y;       // center - halfY
+        // boxBottom should be ~ floorTop, within slop + a small integer epsilon (the position correction
+        // leaves the allowed penetration band). It must NOT have sunk through (boxBottom far below floorTop).
+        const fx eps = kOne / 16;
+        const fx slop = kOne / 64;
+        auto absfx = [](fx v) { return v < 0 ? -v : v; };
+        check(absfx(boxBottom - floorTop) < slop + eps,
+              "CX4 single box rests ON the floor (boxBottom ~ floorTop, did not sink)");
+        // At rest: the box's speed is small (it came to rest, not bouncing / falling).
+        const fx speed = fpx::FxLength(box.vel);
+        check(speed < kOne / 4, "CX4 single box at rest (small residual speed)");
+    }
+
+    // ================= CX4: a 3-box STACK settles ORDERED in y + non-interpenetrating ===============
+    {
+        // A static floor (top y=1) + 3 dynamic FLAT SLAB boxes (halfExtents 1.5 x 0.5 x 1.5 — wide + thin)
+        // dropped in a column near their rest centers with a small drop gap. Flat slabs make the Y face the
+        // UNAMBIGUOUS min-penetration axis (the wide X/Z faces overlap deeply, so an edge-cross can't tie the
+        // shallow Y), so the de-penetration normal stays cleanly +Y -> a coherent resting tower. Box height
+        // is 1 (2*halfY) -> rest centers ~ floorTop+0.5, +1.5, +2.5 = 1.5, 2.5, 3.5.
+        const convex::FxBox kSlab{FxVec3{FromInt(3) / 2, kOne / 2, FromInt(3) / 2}};   // 3 x 1 x 3 slab
+        convex::ConvexWorld w;
+        convex::FxBox floor{FxVec3{FromInt(8), kOne, FromInt(8)}};
+        w.bodies.push_back(makeWorldBody(0, 0, 0, false)); w.boxes.push_back(floor);
+        w.bodies.push_back(makeWorldBody(0, FromInt(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeWorldBody(0, FromInt(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeWorldBody(0, FromInt(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+
+        convex::StepConvexWorldN(w, makeStepCfg(), 360);
+
+        // Ordered in y: each box above the one below (a coherent tower, not collapsed into one blob).
+        check(w.bodies[1].pos.y < w.bodies[2].pos.y && w.bodies[2].pos.y < w.bodies[3].pos.y,
+              "CX4 stack -> boxes ordered ascending in y (a tower, not a blob)");
+        // Separated by ~the box height (1 unit, 2*halfY): consecutive centers differ by ~1 within a band.
+        const fx gap01 = w.bodies[2].pos.y - w.bodies[1].pos.y;
+        const fx gap12 = w.bodies[3].pos.y - w.bodies[2].pos.y;
+        const fx hi = FromInt(1) + kOne / 4;   // 1.25 upper band
+        const fx lo = FromInt(1) - kOne / 4;   // 0.75 lower band
+        check(gap01 > lo && gap01 < hi, "CX4 stack -> box0->box1 separated by ~1 box height");
+        check(gap12 > lo && gap12 < hi, "CX4 stack -> box1->box2 separated by ~1 box height");
+        // The bottom box rests on the floor.
+        const fx floorTop = w.bodies[0].pos.y + floor.halfExtents.y;
+        const fx bottomBoxBottom = w.bodies[1].pos.y - kSlab.halfExtents.y;
+        auto absfx = [](fx v) { return v < 0 ? -v : v; };
+        check(absfx(bottomBoxBottom - floorTop) < kOne / 8,
+              "CX4 stack -> bottom box rests on the floor");
+
+        // MeasureStack: deterministic rest + interpenetration metrics.
+        const convex::StackMeasure ms = convex::MeasureStack(w);
+        check(ms.dynamicCount == 3, "CX4 MeasureStack -> 3 dynamic bodies");
+        check(ms.maxSpeed < kOne / 2, "CX4 MeasureStack -> the stack is at rest (small max speed)");
+        // Non-interpenetration: the max pairwise penetration is within slop + an integer epsilon.
+        check(ms.maxPenetration < kOne / 16,
+              "CX4 MeasureStack -> no pair interpenetrates beyond slop (position correction held)");
+    }
+
+    // ================= CX4: StepConvexWorldN determinism (two runs byte-identical) ==================
+    {
+        auto buildStack = [&]() {
+            convex::ConvexWorld w;
+            convex::FxBox floor{FxVec3{FromInt(8), kOne, FromInt(8)}};
+            w.bodies.push_back(makeWorldBody(0, 0, 0, false)); w.boxes.push_back(floor);
+            w.bodies.push_back(makeWorldBody(0,          FromInt(3), 0, true)); w.boxes.push_back(kUnitBox);
+            w.bodies.push_back(makeWorldBody(kOne / 16,  FromInt(5), 0, true)); w.boxes.push_back(kUnitBox);
+            return w;
+        };
+        convex::ConvexWorld w1 = buildStack();
+        convex::ConvexWorld w2 = buildStack();
+        convex::StepConvexWorldN(w1, makeStepCfg(), 200);
+        convex::StepConvexWorldN(w2, makeStepCfg(), 200);
+        bool same = (w1.bodies.size() == w2.bodies.size());
+        for (size_t i = 0; i < w1.bodies.size() && same; ++i)
+            if (std::memcmp(&w1.bodies[i], &w2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+        check(same, "CX4 StepConvexWorldN determinism: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("convex_test: ALL PASS\n");
     else std::printf("convex_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

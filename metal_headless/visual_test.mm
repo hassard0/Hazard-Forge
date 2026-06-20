@@ -26693,6 +26693,170 @@ static int RunConvexTumbleShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CX4 — Deterministic Convex Rigid-Body Contacts THE FULL CONVEX STEP showcase (--convex-stack)
+// (the 4th slice of FLAGSHIP #19, a SETTLING STACK). Like CX1/CX2/CX3, the full step is int64 (the inertia
+// fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products), so shaders/convex_step.comp is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal
+// the --convex-stack showcase runs the CPU convex::StepConvexWorldN — the EXACT bit-exact reference the
+// Vulkan --convex-stack-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical
+// to the Vulkan GPU result BY CONSTRUCTION (the convex_solve.comp / fpx_solve.comp convention), while the
+// Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic scene (a static floor + 3
+// dynamic flat-slab boxes dropped near their rest centers), steps StepConvexWorldN K=300 ticks over it ->
+// a coherent resting tower, and CPU-colors the SAME 2D side-view as the Vulkan --convex-stack-shot -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/convex_stack.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000.
+static int RunConvexStackShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+
+    // The deterministic step config (== the Vulkan --convex-stack-shot + the convex_test makeStepCfg).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 20;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+    kCfg.angDamp     = (fx)((int64_t)50 * kOne / 100);  // 0.5
+    kCfg.posIters    = 4;
+    const int kTicks = 300;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+    const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+    auto buildStack = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+        w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        return w;
+    };
+    const uint32_t kBodyCount = 4u, kDynamic = 3u;
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    convex::ConvexWorld world = buildStack();
+    convex::StepConvexWorldN(world, kCfg, (uint32_t)kTicks);
+    std::printf("convex-stack: {bodies:%u, dynamic:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU convex::StepConvexWorldN, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kDynamic, kTicks);
+
+    convex::ConvexWorld world2 = buildStack();
+    convex::StepConvexWorldN(world2, kCfg, (uint32_t)kTicks);
+    bool same = true;
+    for (size_t i = 0; i < world.bodies.size() && same; ++i)
+        if (std::memcmp(&world.bodies[i], &world2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("convex-stack: two runs differ (nondeterministic)");
+    std::printf("convex-stack determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) settled: at rest + no interpenetration + stacked.
+    const convex::StackMeasure ms = convex::MeasureStack(world);
+    const bool atRest = (ms.maxSpeed < kOne / 2);
+    const bool noInterpen = (ms.maxPenetration < kOne / 16);
+    const fx y1 = world.bodies[1].pos.y, y2 = world.bodies[2].pos.y, y3 = world.bodies[3].pos.y;
+    const fx g01 = y2 - y1, g12 = y3 - y2;
+    const fx loBand = fi(1) - kOne / 4, hiBand = fi(1) + kOne / 4;
+    const bool stacked = (y1 < y2 && y2 < y3) &&
+                         (g01 > loBand && g01 < hiBand) && (g12 > loBand && g12 < hiBand);
+    if (!atRest || !noInterpen || !stacked)
+        return fail("convex-stack: NOT settled (the tower scattered / collapsed / sank)");
+    std::printf("convex-stack settled: {atRest:true, noInterpenetration:true, stacked:true}\n");
+
+    // PROOF (4) ground control: a single box dropped on the floor rests ON it.
+    convex::ConvexWorld g1;
+    g1.bodies.push_back(makeBody(0, 0, 0, false)); g1.boxes.push_back(kFloor);
+    g1.bodies.push_back(makeBody(0, fi(3), 0, true)); g1.boxes.push_back(kSlab);
+    convex::StepConvexWorldN(g1, kCfg, (uint32_t)kTicks);
+    const fx floorTop = g1.bodies[0].pos.y + kFloor.halfExtents.y;
+    const fx boxBottom = g1.bodies[1].pos.y - kSlab.halfExtents.y;
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    if (!(absfx(boxBottom - floorTop) < kOne / 8))
+        return fail("convex-stack: ground failed (the box did not rest on the floor)");
+    std::printf("convex-stack ground: {boxRestsOnFloor:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the settled stack as the Vulkan
+    // --convex-stack-shot (identical by construction). ---
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    drawBoxXY(world.bodies[0], kFloor, Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 slabCol[3] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.95f, 0.70f, 0.25f},
+                             Vec3{0.85f, 0.90f, 0.40f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawBoxXY(world.bodies[i], kSlab, slabCol[(i - 1) % 3]);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — settled convex stack side-view (%u boxes, %d ticks, maxSpeed=%d)\n",
+                outPath, imgW, imgH, kDynamic, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -46167,6 +46331,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-tumble") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_tumble.png";
             try { return RunConvexTumbleShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --convex-stack <out.png>: render the Deterministic Convex Rigid-Body Contacts THE FULL CONVEX STEP
+        // showcase (Slice CX4, a SETTLING STACK, the 4th slice of FLAGSHIP #19). On Metal this runs the CPU
+        // step: convex_step.comp is int64/Vulkan-only (glslc can't parse the inertia/impulse/quaternion int64),
+        // so Metal runs the CPU convex::StepConvexWorldN over the SAME scene (a static floor + 3 dynamic
+        // flat-slab boxes dropped near their rest centers, stepped K=300 ticks) -> the EXACT bit-exact
+        // reference the Vulkan --convex-stack-shot GPU==CPU memcmp compares against; two runs byte-identical;
+        // the tower settles (at rest + no interpenetration + stacked) + a single box rests on the floor. The
+        // image golden is a PURE-INTEGER 2D side-view of the settled tower, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/convex_stack.png.
+        if (argc > 1 && std::strcmp(argv[1], "--convex-stack") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_convex_stack.png";
+            try { return RunConvexStackShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

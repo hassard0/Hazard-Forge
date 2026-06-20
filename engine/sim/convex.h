@@ -708,5 +708,257 @@ inline void ResolveContactPair(FxBody& bodyA, const FxBox& boxA, FxBody& bodyB, 
     SolveManifoldImpulse(bodyA, bodyB, invIaW, invIbW, m, cfg.restitution, cfg.iters);
 }
 
+// =========================================================================================================
+// Slice CX4 — THE FULL CONVEX STEP (a settling stack). APPENDED after ResolveContactPair (CX1+CX2+CX3's
+// lines above are BYTE-FROZEN). ASSEMBLES BoxSat -> BuildManifold -> the box inertia tensors ->
+// SolveManifoldImpulse into the full per-tick WORLD step over a small set of boxes (some static), and ADDS
+// the one piece CX3 lacked: POSITION DE-PENETRATION (CX3 was velocity-only). The result: a STACK of boxes
+// on a static floor SETTLES into a coherent resting tower (boxes interlock + rest instead of sinking),
+// impossible in the sphere-sphere fpx solver. Deterministic integer multi-pass, every order PINNED:
+//   1. predict-integrate every DYNAMIC body (IntegrateBodyFull — vel+=g*dt, pos+=vel*dt, orient integrate);
+//   2. all-pairs narrowphase in the FIXED i<j order (skip static-static), collect overlapping manifolds;
+//   3. impulse solve — Gauss-Seidel: solveIters outer sweeps, each sweep iterates the pair list in fixed
+//      order applying ONE SolveManifoldImpulse sweep per pair (mutating bodies in place — later pairs see
+//      earlier updates); the world inverse inertias are recomputed ONCE per tick from the post-integrate
+//      orient (the common cheap choice — stays deterministic);
+//   4. position de-penetration (the NEW bit) — re-run BoxSat per pair (positions unchanged this sub-step,
+//      re-deriving keeps the depth current) and push the two bodies APART along the A->B-corrected normal
+//      by corrected = fxmul(max(0, penetration - slop), beta), split by inverse mass (both static -> skip;
+//      one static -> the dynamic takes all). LINEAR correction only (no positional angular correction).
+// All-pairs (NOT the FPX2 broadphase) — the CX4 scene is a SMALL stack (<= ~6 boxes); broadphase is a
+// scaling refinement, deferred + documented. Pure integer -> the convex_step.comp shader runs the WHOLE
+// StepConvexWorldN over the small body set single-thread, copying StepConvexWorld VERBATIM -> the GPU final
+// body world is byte-identical to the CPU reference (the GPU==CPU memcmp is the make-or-break).
+//
+// THE int64 REALITY (the CX1/CX2/CX3/FPX3 lesson): the whole chain is int64 (the inertia/impulse/SAT
+// products). DXC compiles int64 (Vulkan); glslc cannot. So convex_step.comp is VULKAN-SPIR-V-ONLY (NOT in
+// hf_gen_msl); the Metal --convex-stack runs THIS CPU StepConvexWorldN — byte-identical to the Vulkan GPU
+// result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU memcmp proof.
+
+// ----- ConvexWorld: a small set of oriented boxes, parallel bodies[i] <-> boxes[i] arrays ----------------
+// Some bodies are STATIC (invMass==0, e.g. the floor). The body carries pos/orient/vel/angVel/invMass/flags;
+// the box carries the half-extents. std430-packable as (FxBody 16 ints) + (FxBox 3 ints) per body.
+struct ConvexWorld {
+    std::vector<FxBody> bodies;
+    std::vector<FxBox>  boxes;
+};
+
+// ----- ConvexStepConfig: the full-step parameters (gravity + dt + solve iters + restitution + the position
+// de-penetration slop + beta). slop = the allowed penetration (~1/64 unit) + beta = the correction fraction
+// (~0.8 in Q16.16) reduce jitter -> the stack RESTS instead of sinking. All FIXED, deterministic.
+struct ConvexStepConfig {
+    FxVec3   gravity;            // Q16.16 acceleration (e.g. (0,-9.8,0) host-snapped)
+    fx       dt          = kOne / 60;
+    uint32_t solveIters  = 8;    // world-level Gauss-Seidel sweeps over the pair list
+    fx       restitution = 0;    // Q16.16 bounce factor (0 = fully inelastic — a resting stack)
+    fx       slop        = kOne / 64;   // allowed penetration before pushing apart (~0.0156 unit)
+    fx       beta        = (fx)((int64_t)8 * kOne / 10);   // 0.8 — the position-correction fraction
+    // Per-tick velocity retention (a deterministic drag, applied post-integrate). linDamp/angDamp are
+    // Q16.16 RETAIN factors in (0,kOne]: vel *= linDamp, angVel *= angDamp each tick (kOne == no damping).
+    // ANGULAR damping is the STABILITY KNOB for a resting stack: the non-accumulated Gauss-Seidel + the
+    // fixed-point 4-point face manifold leave a tiny per-tick RESIDUAL TORQUE (documented, the CX3 lesson —
+    // a symmetric multi-point patch is non-zero in fixed point), which integrates into a SPURIOUS spin that
+    // slowly tips + collapses the tower. A mild angular drag (~0.9 retain) bleeds that spurious spin off so
+    // the stack RESTS, with NO effect on the linear settling. Defensible (real solvers sleep/damp resting
+    // bodies); deterministic (a plain per-component fxmul). Default kOne == OFF (back-compat / opt-in).
+    fx       linDamp     = kOne;   // velocity retain per tick (kOne = none)
+    fx       angDamp     = kOne;   // angular-velocity retain per tick (kOne = none)
+    // Position de-penetration sweep count (the PBD "position iterations"). One pass cannot propagate the
+    // separation through a multi-box stack in a single tick (the bottom contact pushes the lower box up
+    // into the one above faster than a single de-pen sweep separates them); looping the de-pen pass in the
+    // FIXED i<j order lets the push propagate up the tower each tick -> a stable resting stack. Default 1
+    // (one pass — the spec's baseline). Deterministic (the same fixed order each sweep).
+    uint32_t posIters    = 1;
+};
+
+// ----- StackMeasure: the deterministic rest/interpenetration summary of a settled stack -----------------
+// maxSpeed       = the max FxLength(vel) over the DYNAMIC bodies (the rest test — a settled stack ~0);
+// maxPenetration = the max BoxSat penetration over all i<j pairs (the interpenetration test — a held stack
+//                  is within slop + epsilon); dynamicCount = the number of dynamic bodies. Pure integer.
+struct StackMeasure {
+    fx       maxSpeed       = 0;
+    fx       maxPenetration = 0;
+    uint32_t dynamicCount   = 0;
+};
+
+// IsDynamic(b): a body is integrated/movable iff it has a non-zero inverse mass AND the dynamic flag (the
+// step-1 predicate; matches IntegrateBodyFull's kFlagDynamic gate + the static invMass==0 convention).
+inline bool IsDynamic(const FxBody& b) {
+    return b.invMass != 0 && (b.flags & fpx::kFlagDynamic);
+}
+
+// The face-preference epsilon: in a RESTING stack two axis-aligned boxes touch face-to-face with a shallow
+// Y penetration, but the edge-edge cross axis FxCross(X,Z) ~ -Y normalizes to the SAME direction up to a
+// 1-LSB fixed-point drift — so the strict-< min-pen scan can pick that EDGE axis by a single LSB. The edge
+// axis carries tiny lateral (off-Y) components that, accumulated over many ticks of position correction,
+// drift + DESTABILIZE the stack (the boxes slowly walk off + collapse). The fix (a CX4-level post-filter,
+// CX1's BoxSat BYTE-FROZEN): when BoxSat returns an EDGE axis, prefer a FACE axis whose penetration is no
+// more than kFacePrefEps deeper — the face normal is a CLEAN FxRotate'd world axis (no edge-cross drift),
+// so the resting contact resolves stably. ~1/64 unit covers the LSB tie band without changing genuine
+// edge contacts (whose face penetration is FAR larger). Deterministic (same threshold CPU + GPU).
+inline constexpr fx kFacePrefEps = kOne / 64;   // face preferred if within this of the global min-pen
+
+// BoxSatStable(bodyA, boxA, bodyB, boxB): BoxSat (CX1, byte-frozen) + the face-preference post-filter. If
+// BoxSat reports overlap on an EDGE axis (axisIndex >= 6) but a FACE axis (0..5) penetrates within
+// kFacePrefEps of that edge penetration, the FACE result is returned instead (a clean, stable normal). The
+// 6 face-axis projections are RE-COMPUTED here (the SAME ProjectedRadius/FxDot/FxNormalize int64 ops as
+// BoxSat — additive CX4 code, NOT a CX1 modification), in the FIXED order (A's 3 then B's 3, lowest index
+// wins ties), so the result is bit-reproducible CPU<->Vulkan<->Metal. A separated pair -> {overlap=false}.
+inline SatResult BoxSatStable(const FxBody& bodyA, const FxBox& boxA,
+                              const FxBody& bodyB, const FxBox& boxB) {
+    const SatResult base = BoxSat(bodyA, boxA, bodyB, boxB);
+    if (!base.overlap || base.axisIndex < 6) return base;   // separated / already a face axis -> as-is
+
+    // Re-run ONLY the 6 face axes to find the shallowest face penetration (clean normals).
+    FxVec3 axA[3], axB[3];
+    BoxAxes(bodyA, axA);
+    BoxAxes(bodyB, axB);
+    const FxVec3 hA = boxA.halfExtents;
+    const FxVec3 hB = boxB.halfExtents;
+    const FxVec3 t = fpx::FxSub(bodyB.pos, bodyA.pos);
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+
+    bool found = false;
+    fx minPen = 0;
+    uint32_t minIndex = 0;
+    FxVec3 minAxis;
+    auto testFace = [&](const FxVec3& rawL, uint32_t index) {
+        const FxVec3 L = fpx::FxNormalize(rawL);
+        const fx rA = ProjectedRadius(L, axA, hA);
+        const fx rB = ProjectedRadius(L, axB, hB);
+        const fx s = absfx(FxDot(L, t));
+        const fx sum = rA + rB;
+        if (s > sum) return;                 // (shouldn't happen for an overlapping pair, but be safe)
+        const fx pen = sum - s;
+        if (!found || pen < minPen) {
+            found = true; minPen = pen; minIndex = index;
+            minAxis = (FxDot(L, t) < 0) ? FxVec3{-L.x, -L.y, -L.z} : L;
+        }
+    };
+    for (uint32_t i = 0; i < 3; ++i) testFace(axA[i], i);
+    for (uint32_t j = 0; j < 3; ++j) testFace(axB[j], 3 + j);
+
+    // Prefer the face only if it is within kFacePrefEps of the edge penetration (the LSB-tie band).
+    if (found && minPen <= base.penetration + kFacePrefEps) {
+        SatResult r;
+        r.overlap = true;
+        r.axisIndex = minIndex;
+        r.penetration = minPen;
+        r.axis = minAxis;
+        return r;
+    }
+    return base;
+}
+
+// ----- StepConvexWorld(world, cfg): ONE deterministic tick. The 5-pass step above, ALL orders PINNED. -----
+// The shader copies THIS body VERBATIM (with the BoxSat/BuildManifold/inertia/SolveManifoldImpulse it calls)
+// so the GPU final body world is byte-identical to the CPU.
+inline void StepConvexWorld(ConvexWorld& world, const ConvexStepConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // (1) Predict-integrate every dynamic body (static bodies untouched), then apply the per-tick velocity
+    // retention (the deterministic drag — angDamp is the resting-stack stability knob; kOne == no damping,
+    // the back-compat default). Fixed body order.
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // The world inverse inertias, recomputed ONCE per tick from the post-integrate orient (the common cheap
+    // choice; deterministic). Indexed by body. Statics get a zero matrix (FxBoxInvInertiaBody(.,0) -> 0).
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxVec3 invIbody = FxBoxInvInertiaBody(world.boxes[i], world.bodies[i].invMass);
+        invIW[i] = WorldInvInertia(world.bodies[i], invIbody);
+    }
+
+    // (3) Impulse solve — world-level Gauss-Seidel over the all-pairs list. For determinism we iterate the
+    // pairs in the FIXED i<j order EACH outer sweep and run ONE SolveManifoldImpulse sweep per pair. The
+    // manifold/SAT are re-derived per pair per sweep from the CURRENT positions (positions don't move in the
+    // velocity solve, but the bodies' vel/angVel do — re-deriving keeps the order pinned + the GPU-copy
+    // trivial). Skip static-static pairs (both invMass==0). The mutation is in place (later pairs see it).
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+                const SatResult sat = BoxSatStable(world.bodies[i], world.boxes[i],
+                                                   world.bodies[j], world.boxes[j]);
+                if (!sat.overlap) continue;
+                const ContactManifold m = BuildManifold(world.bodies[i], world.boxes[i],
+                                                        world.bodies[j], world.boxes[j], sat);
+                if (m.count == 0) continue;
+                SolveManifoldImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], m,
+                                     cfg.restitution, 1);   // ONE inner sweep — the outer loop is the GS
+            }
+        }
+    }
+
+    // (4) Position de-penetration (the NEW bit — what makes the stack REST not sink). posIters sweeps, each
+    // sweep over every overlapping pair in the FIXED i<j order, pushing the two bodies APART along the
+    // A->B-corrected normal by
+    //   corrected = fxmul(max(0, penetration - slop), beta)
+    // split by inverse mass: wi = fxdiv(invMassA, invMassA+invMassB), wj = kOne - wi (both static -> skip;
+    // one static -> the dynamic takes all). LINEAR only (no angular position correction). Re-run BoxSat for
+    // the current depth. Fixed order, in place (later pairs/sweeps see earlier pushes — the Gauss-Seidel
+    // de-pen; multiple sweeps propagate the separation up a multi-box tower each tick).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;   // both static -> skip
+                const SatResult sat = BoxSatStable(world.bodies[i], world.boxes[i],
+                                                   world.bodies[j], world.boxes[j]);
+                if (!sat.overlap) continue;
+                // The de-penetration normal: the SAT axis, SIGN-CORRECTED to point A->B (mirrors the impulse
+                // solver's sign rule), so +normal moves B away from A.
+                FxVec3 nrm = sat.axis;
+                if (FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                fx excess = sat.penetration - cfg.slop;
+                if (excess <= 0) continue;   // within the allowed band -> no push (the anti-jitter slop)
+                const fx corrected = fxmul(excess, cfg.beta);
+                const fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                const fx wj = kOne - wi;
+                // bodyA (i) moves -nrm*(corrected*wi); bodyB (j) moves +nrm*(corrected*wj).
+                const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+                world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+                world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+    // (5) Orientation was already integrated in step (1).
+}
+
+// ----- StepConvexWorldN(world, cfg, ticks): run `ticks` StepConvexWorld steps -> the stack settles. -------
+inline void StepConvexWorldN(ConvexWorld& world, const ConvexStepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepConvexWorld(world, cfg);
+}
+
+// ----- MeasureStack(world): the deterministic rest + interpenetration summary (pure integer, fixed order).
+inline StackMeasure MeasureStack(const ConvexWorld& world) {
+    StackMeasure ms;
+    const size_t n = world.bodies.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) {
+            ++ms.dynamicCount;
+            const fx sp = fpx::FxLength(world.bodies[i].vel);
+            if (sp > ms.maxSpeed) ms.maxSpeed = sp;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;
+            const SatResult sat = BoxSat(world.bodies[i], world.boxes[i],
+                                         world.bodies[j], world.boxes[j]);
+            if (sat.overlap && sat.penetration > ms.maxPenetration) ms.maxPenetration = sat.penetration;
+        }
+    }
+    return ms;
+}
+
 }  // namespace convex
 }  // namespace hf::sim

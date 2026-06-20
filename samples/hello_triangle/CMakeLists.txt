@@ -1131,6 +1131,19 @@ hf_compile_shaders(
     # ResolveContactPair instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer ->
     # bit-exact GPU==CPU resolved-body array + cross-backend, proven memcmp. NO new RHI. VELOCITY-ONLY.
     "shaders/convex_solve.comp.hlsl:cs"
+    # Deterministic Convex Rigid-Body Contacts Slice 4 (Slice CX4): convex_step.comp is THE FULL CONVEX STEP
+    # — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE StepConvexWorldN over the small body set (all-pairs
+    # over the few boxes): K ticks of predict-integrate -> all-pairs narrowphase -> world Gauss-Seidel
+    # impulse solve -> POSITION de-penetration (the NEW bit vs CX3's velocity-only), copying
+    # engine/sim/convex.h::StepConvexWorld/StepConvexWorldN VERBATIM (the SAME fixed body+pair orders, the
+    # SAME face-preferred BoxSatStable, the SAME split-by-invMass linear de-pen with slop+beta, the SAME
+    # per-tick damping). stepEnabled=0 -> bodies UNCHANGED. Like convex_solve.comp this is int64 (the
+    # inertia fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products), so it is VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --convex-stack runs the CPU
+    # StepConvexWorldN instead (byte-identical by construction). Single-thread because the world step is
+    # order-dependent (the Gauss-Seidel + in-place de-pen). Pure integer SSBO compute + ReadBuffer ->
+    # bit-exact GPU==CPU final body world + cross-backend, proven memcmp. NO new RHI. THE SETTLING STACK.
+    "shaders/convex_step.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table
