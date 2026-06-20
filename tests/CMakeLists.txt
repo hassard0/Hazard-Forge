@@ -658,6 +658,18 @@ hf_add_pure_test(boids_test)
 # (correct floor, not truncate-toward-zero). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(fpx_test)
 
+# Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
+# integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
+# copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/
+# FxNormalize/FxLength/FxISqrt) read-only. Pins FxDot/FxCross hand-computed (the right-hand basis x×y==z),
+# FxMat3 identity/diagonal/MulVec/transpose (the CX3 inertia-tensor type's CX1 helpers), and BoxSat (the
+# 15-axis box-box SAT): two clearly-separated boxes -> overlap=false; a box deeply inside another ->
+# overlap=true with a face-axis min-pen + penetration>0; a face-face touching pair the ~0-pen boundary; an
+# edge-edge skew pair picks an EDGE-CROSS axis (index >= 6); the min-pen strict-< tie-break keeps the LOWEST
+# index; two runs byte-identical; MeasureSat deterministic overlap-count + mean/min penetration. Pure C++
+# (hf_core), ASan-eligible. convex.h #includes sim/fpx.h read-only.
+hf_add_pure_test(convex_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

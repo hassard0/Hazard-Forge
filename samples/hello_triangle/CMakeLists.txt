@@ -1096,6 +1096,18 @@ hf_compile_shaders(
     # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/fpx_orient.comp.hlsl:cs"
+    # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19):
+    # convex_sat.comp is the box-box SEPARATING-AXIS TEST — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT,
+    # 64 threads/group, NO atomics) runs the 15-axis SAT (3 A-face normals + 3 B-face normals + 9 edge-edge
+    # crosses in a FIXED order), copying engine/sim/convex.h::BoxSat's body VERBATIM (the SAME FxRotate
+    # box-axes + FxNormalize/FxDot/FxCross int64 ops + the near-zero edge-cross skip + the strict-< min-pen
+    # lowest-index tie-break), writing its OWN gResults[pair] SatResult (overlap, axisIndex, penetration,
+    # axis-toward-B). satEnabled=0 -> cleared results. Like fpx_solve.comp / fpx_orient.comp this is int64
+    # (the FxDot/FxCross/FxNormalize/FxISqrt Q16.16 products), so it is VULKAN-SPIR-V-ONLY (DXC compiles
+    # int64; glslc cannot) and is NOT MSL-gen'd — the Metal --convex-sat showcase runs the CPU BoxSat
+    # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU
+    # SatResult array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/convex_sat.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

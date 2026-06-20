@@ -98,6 +98,7 @@
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
+#include "sim/convex.h"              // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -26115,6 +26116,188 @@ static int RunActiveLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CX1 — Deterministic Convex Rigid-Body Contacts THE BOX-BOX SAT showcase (--convex-sat) ======
+// (the BEACHHEAD of FLAGSHIP #19). Like FPX3's --fpx-solve / VH1's --vehicle-spring, the SAT is int64
+// (FxNormalize/FxISqrt + the FxDot/FxCross Q16.16 products), so shaders/convex_sat.comp is VULKAN-SPIR-V-
+// ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal the
+// --convex-sat showcase runs the CPU convex::BoxSat — the EXACT bit-exact reference the Vulkan
+// --convex-sat-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the
+// Vulkan GPU result BY CONSTRUCTION (the fpx_solve.comp / boids_steer.comp convention), while the Vulkan
+// side carries the GPU==CPU proof. So this builds the SAME deterministic 12-box-pair scene (separated /
+// deep face-face / edge-edge / touching) as the Vulkan --convex-sat-shot, runs convex::BoxSat over it, and
+// CPU-colors the SAME 2D top-down (XZ) view -> the golden is bit-identical cross-backend BY CONSTRUCTION
+// (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/convex_sat.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunConvexSatShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    // The fixed deterministic box-pair scene (== the Vulkan --convex-sat-shot config).
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;   // sin/cos 22.5° (a 45° rotation quaternion)
+    auto qIdentity = []() { return fpx::FxQuat{0, 0, 0, convex::kOne}; };
+    auto qAboutX = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45}); };
+    auto qAboutZ = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45}); };
+    auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q) {
+        fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; return b;
+    };
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    std::vector<convex::SatPair> pairs;
+    std::vector<bool> truthOverlap;
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+    const convex::FxBox kBig{convex::FxVec3{fi(4), fi(4), fi(4)}};
+    auto addPair = [&](convex::SatPair p, bool overlap) {
+        pairs.push_back(p); truthOverlap.push_back(overlap);
+    };
+    addPair({bodyAt(fi(-7), 0, fi(6), qIdentity()), kUnit, bodyAt(fi(-2), 0, fi(6), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(5), 0, fi(6), qIdentity()), kBig, bodyAt(fi(6), 0, fi(6), qIdentity()), kUnit}, true);
+    addPair({bodyAt(fi(-7), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(-5), 0, fi(2), qIdentity()), kUnit}, true);
+    addPair({bodyAt(0, 0, fi(2), qAboutX()), kUnit, bodyAt(fi(1), fi(1), fi(3), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(4), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(8), fi(4), fi(6), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(-7), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-11, 2), 0, fi(-2), qIdentity()), kUnit}, true);
+    addPair({bodyAt(fi(-2), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-1, 1), 0, fi(-2), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(3), 0, fi(-2), qAboutZ()), kUnit, bodyAt(fi(8), 0, fi(-2), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(-6), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(-11, 2), 0, fi(-6), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(-1), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(1, 4), fh(5, 4), fh(-19, 4), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(4), 0, fi(-6), qIdentity()), kUnit, bodyAt(fi(7), 0, fi(-6), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(8), 0, fi(0), qIdentity()), kBig, bodyAt(fi(8), 0, fh(3, 2), qIdentity()), kUnit}, true);
+
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // Packed SatResult (== the Vulkan --convex-sat-shot SatResultGpu): 6 x int32 (24 bytes).
+    struct SatResultGpu {
+        uint32_t overlap; uint32_t axisIndex; int32_t penetration; int32_t axisx, axisy, axisz;
+    };
+    static_assert(sizeof(SatResultGpu) == 24, "SatResultGpu std430 layout");
+    auto packResult = [&](const convex::SatResult& r) {
+        return SatResultGpu{r.overlap ? 1u : 0u, r.axisIndex, r.penetration, r.axis.x, r.axis.y, r.axis.z};
+    };
+
+    // CPU BoxSat (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    auto runSat = [&](std::vector<SatResultGpu>& out) {
+        out.assign((size_t)kPairCount, SatResultGpu{});
+        for (uint32_t i = 0; i < kPairCount; ++i)
+            out[i] = packResult(convex::BoxSat(pairs[i].bodyA, pairs[i].boxA,
+                                               pairs[i].bodyB, pairs[i].boxB));
+    };
+
+    std::vector<SatResultGpu> results;
+    runSat(results);
+    uint32_t overlapping = 0;
+    for (const SatResultGpu& r : results) if (r.overlap) ++overlapping;
+
+    // GPU==CPU is N/A on the Metal CPU path: this IS the CPU BoxSat reference the Vulkan --convex-sat-shot
+    // proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("convex-sat: {pairs:%u, overlapping:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU convex::BoxSat, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, overlapping);
+
+    // determinism: two runs byte-identical.
+    std::vector<SatResultGpu> results2;
+    runSat(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(SatResultGpu)) != 0)
+        return fail("convex-sat: two runs differ (nondeterministic)");
+    std::printf("convex-sat determinism: two runs BYTE-IDENTICAL\n");
+
+    // SAT correct: classification matches truth + every overlapping pair has penetration>=0.
+    bool matchesTruth = true, penNonNeg = true;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool ov = results[i].overlap != 0u;
+        if (ov != (bool)truthOverlap[i]) matchesTruth = false;
+        if (ov && results[i].penetration < 0) penNonNeg = false;
+    }
+    if (!matchesTruth || !penNonNeg) return fail("convex-sat: classification wrong");
+    std::printf("convex-sat correct: {matchesTruth:true, penNonNeg:true}\n");
+
+    // separation control: the far-apart pair (pair 0) reports overlap=false.
+    if (results[0].overlap != 0u) return fail("convex-sat: the far-apart pair reported overlap");
+    std::printf("convex-sat control: {farApart:separated}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view as the Vulkan --convex-sat-shot (identical by
+    // construction). Each box an oriented rectangle footprint at pos>>kFrac; overlapping HOT / separated
+    // COLD; the min-pen axis a short white segment from B's center. ---
+    const int kPxPerUnit = 18, kMargin = 24;
+    const int kWorldHalf = 12;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalf) * kPxPerUnit;
+        iy = kMargin + (gz + kWorldHalf) * kPxPerUnit;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawBox = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 az = axes[2];
+        const fx hx = box.halfExtents.x, hz = box.halfExtents.z;
+        fx cxs[4], czs[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sz[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sz[k] * fpx::fxmul(hz, az.x);
+            czs[k] = b.pos.z + sx[k] * fpx::fxmul(hx, ax.z) + sz[k] * fpx::fxmul(hz, az.z);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], czs[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], czs[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    const Vec3 hotA{1.0f, 0.55f, 0.25f}, hotB{1.0f, 0.78f, 0.40f};
+    const Vec3 coldA{0.30f, 0.55f, 0.95f}, coldB{0.50f, 0.72f, 1.0f};
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool ov = results[i].overlap != 0u;
+        drawBox(pairs[i].bodyA, pairs[i].boxA, ov ? hotA : coldA);
+        drawBox(pairs[i].bodyB, pairs[i].boxB, ov ? hotB : coldB);
+        if (ov) {
+            int bx, by;
+            worldToPx(pairs[i].bodyB.pos.x, pairs[i].bodyB.pos.z, bx, by);
+            const fx ax = results[i].axisx, az = results[i].axisz;
+            const int ex = bx + (int)((int64_t)(ax >> 10) * kPxPerUnit / (1 << 6));
+            const int ez = by + (int)((int64_t)(az >> 10) * kPxPerUnit / (1 << 6));
+            drawLine(bx, by, ex, ez, Vec3{1.0f, 1.0f, 1.0f});
+            putPx(bx, by, Vec3{1.0f, 1.0f, 1.0f});
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — box-box SAT top-down view (%u pairs, %u overlapping)\n",
+                outPath, imgW, imgH, kPairCount, overlapping);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -45548,6 +45731,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vehicle-spring") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vehicle_spring.png";
             try { return RunVehicleSpringShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --convex-sat <out.png>: render the Deterministic Convex Rigid-Body Contacts BOX-BOX SAT showcase
+        // (Slice CX1, the BEACHHEAD of FLAGSHIP #19). On Metal this runs the CPU SAT: convex_sat.comp is int64/
+        // Vulkan-only (glslc can't parse the FxNormalize/FxISqrt/FxDot/FxCross int64), so Metal runs the CPU
+        // convex::BoxSat over the SAME fixed 12-box-pair scene (separated / deep face-face / edge-edge /
+        // touching) -> the EXACT bit-exact reference the Vulkan --convex-sat-shot GPU==CPU memcmp compares
+        // against; two runs byte-identical; the classification matches truth. The image golden is a PURE-
+        // INTEGER 2D top-down SAT view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/convex_sat.png.
+        if (argc > 1 && std::strcmp(argv[1], "--convex-sat") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_convex_sat.png";
+            try { return RunConvexSatShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice
