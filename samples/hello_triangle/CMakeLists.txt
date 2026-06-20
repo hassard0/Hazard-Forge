@@ -1223,6 +1223,20 @@ hf_compile_shaders(
     # convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU inherited-impulse KeyedManifold
     # array + cross-backend, proven memcmp. NO new RHI; PS1 + existing shaders + goldens untouched.
     "shaders/persist_cache.comp.hlsl:cs"
+    # Deterministic Persistent Contacts Slice 3 (Slice PS3): persist_warm.comp is THE WARM-STARTED CONE SOLVER
+    # — ONE thread ([numthreads(1,1,1)]) runs the WHOLE StepWarmWorldN over the small body set (predict-integrate
+    # -> all-pairs BuildKeyedManifold + MatchCache (seed the accumulators from a per-tick persistent CACHE keyed
+    # by the PS1 ContactKey) + the ACCUMULATED SolveFrictionWarm (prime once + solveIters accumulated cone sweeps
+    # applying only the DELTA) -> POSITION de-penetration -> rebuild the cache for next tick, K ticks), copying
+    # engine/sim/persist.h::StepWarmWorld/StepWarmWorldN + SolveFrictionWarm VERBATIM. The warm cache persists
+    # across ticks so a resting stack converges tighter at fixed iterations. stepEnabled=0 -> bodies UNCHANGED.
+    # GPU final body world memcmp'd BIT-EXACT vs the CPU persist::StepWarmWorldN. Like fric_step.comp this is
+    # int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --persist-warm
+    # showcase runs the CPU StepWarmWorldN instead (byte-identical by construction). Pure integer SSBO compute +
+    # ReadBuffer -> bit-exact GPU==CPU + cross-backend, proven memcmp. NO new RHI; PS1/PS2 + existing shaders +
+    # goldens untouched. persist.h is APPEND-only.
+    "shaders/persist_warm.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

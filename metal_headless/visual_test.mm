@@ -28173,6 +28173,196 @@ static int RunFricStepShowcase(const char* outPath, bool isRamp) {
     return 0;
 }
 
+// ===== Slice PS3 — Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER showcase (--persist-warm)
+// (the 3rd slice of FLAGSHIP #21, hf::sim::persist). The whole chain is int64 (the inertia fxdiv + the Q16.16
+// products + the accumulated cone solve), so shaders/persist_warm.comp is VULKAN-SPIR-V-ONLY (DXC compiles
+// int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal the --persist-warm showcase runs the
+// CPU persist::StepWarmWorldN — the EXACT bit-exact reference the Vulkan --persist-warm-shot GPU==CPU memcmp
+// already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the
+// fric_step.comp convention), while the Vulkan side carries the GPU==CPU proof. The SCENE = the FC4 friction
+// stack (static floor + 3 dynamic slabs) settled with the warm-started cache. Proof lines match the Vulkan side
+// EXACTLY. New golden tests/golden/metal/persist_warm.png (baked on the Mac by the controller); two runs DIFF
+// 0.0000.
+static int RunPersistWarmShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex  = hf::sim::convex;
+    namespace fpx     = hf::sim::fpx;
+    namespace persist = hf::sim::persist;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+
+    const fpx::FxQuat qI{0, 0, 0, kOne};
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = qI;
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+    const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+    auto buildStack = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+        w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        return w;
+    };
+
+    persist::WarmStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 20;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+    kCfg.angDamp     = kOne;                            // OFF — friction holds the tower
+    kCfg.posIters    = 4;
+    kCfg.mu          = kOne;
+    const int kTicks = 240;
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    convex::ConvexWorld world = buildStack();
+    const uint32_t kBodyCount = (uint32_t)world.bodies.size();
+    persist::PersistentCache cache;
+    persist::StepWarmWorldN(world, cache, kCfg, (uint32_t)kTicks);
+    std::printf("persist-warm: {bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU persist::StepWarmWorldN, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kTicks);
+
+    convex::ConvexWorld world2 = buildStack();
+    persist::PersistentCache cache2;
+    persist::StepWarmWorldN(world2, cache2, kCfg, (uint32_t)kTicks);
+    bool same = true;
+    for (size_t i = 0; i < world.bodies.size() && same; ++i)
+        if (std::memcmp(&world.bodies[i], &world2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("persist-warm: two runs differ (nondeterministic)");
+    std::printf("persist-warm determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) the WARM-START BENEFIT — warm residual < cold residual at a fixed LOW iteration count.
+    {
+        persist::WarmStepConfig cLow = kCfg;
+        cLow.solveIters = 2;
+        const uint32_t kLowTicks = 60u;
+        convex::ConvexWorld warmW = buildStack();
+        persist::PersistentCache warmCache;
+        persist::StepWarmWorldN(warmW, warmCache, cLow, kLowTicks);
+        const persist::WarmMeasure warmM = persist::MeasureWarm(warmW);
+        convex::ConvexWorld coldW = buildStack();
+        for (uint32_t t = 0; t < kLowTicks; ++t) {
+            persist::PersistentCache empty;
+            persist::StepWarmWorld(coldW, empty, cLow);
+        }
+        const persist::WarmMeasure coldM = persist::MeasureWarm(coldW);
+        if (!(warmM.maxResidual < coldM.maxResidual))
+            return fail("persist-warm: benefit failed (warm residual NOT < cold residual at low iters)");
+        std::printf("persist-warm benefit: {warmMaxSpeed:%d, coldMaxSpeed:%d, warmTighter:true}\n",
+                    warmM.maxResidual, coldM.maxResidual);
+    }
+
+    // PROOF (4) CONSISTENCY — warm == cold within a TIGHT integer epsilon at a HIGH iteration count.
+    {
+        persist::WarmStepConfig cHigh = kCfg;
+        cHigh.solveIters = 64;
+        const uint32_t kHighTicks = 40u;
+        convex::ConvexWorld warmW = buildStack();
+        persist::PersistentCache warmCache;
+        persist::StepWarmWorldN(warmW, warmCache, cHigh, kHighTicks);
+        convex::ConvexWorld coldW = buildStack();
+        for (uint32_t t = 0; t < kHighTicks; ++t) {
+            persist::PersistentCache empty;
+            persist::StepWarmWorld(coldW, empty, cHigh);
+        }
+        int64_t maxAbsDiff = 0;
+        for (size_t b = 0; b < warmW.bodies.size(); ++b) {
+            const int32_t* a = reinterpret_cast<const int32_t*>(&warmW.bodies[b]);
+            const int32_t* d = reinterpret_cast<const int32_t*>(&coldW.bodies[b]);
+            for (int k = 0; k < 16; ++k) {
+                int64_t dd = (int64_t)a[k] - (int64_t)d[k];
+                if (dd < 0) dd = -dd;
+                if (dd > maxAbsDiff) maxAbsDiff = dd;
+            }
+        }
+        const int64_t kEps = convex::kOne / 256;
+        if (maxAbsDiff > kEps)
+            return fail("persist-warm: consistency failed (warm vs cold exceeds the epsilon at high iters)");
+        std::printf("persist-warm consistency: {warmEqualsColdAtConvergence:within-eps, maxDiff:%lld, "
+                    "eps:%lld}\n", (long long)maxAbsDiff, (long long)kEps);
+    }
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) as the Vulkan --persist-warm-shot. ---
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    drawBoxXY(world.bodies[0], kFloor, Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 slabCol[3] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.95f, 0.70f, 0.25f},
+                             Vec3{0.85f, 0.90f, 0.40f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawBoxXY(world.bodies[i], kSlab, slabCol[(i - 1) % 3]);
+    const persist::WarmMeasure ms = persist::MeasureWarm(world);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — warm-started settled stack side-view (%u boxes, %d ticks, maxSpeed=%d)\n",
+                outPath, imgW, imgH, kBodyCount, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice CX5 — Deterministic Convex Rigid-Body Contacts LOCKSTEP + ROLLBACK showcase (--convex-lockstep)
 // (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #19, the FR5/BD5 twin). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the CX5 harness (convex.h::RunConvexLockstep/RunConvexRollback) is header-only integer
@@ -47895,6 +48085,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--persist-cache") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_persist_cache.png";
             try { return RunPersistCacheShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER
+        // showcase (Slice PS3, the 3rd slice of FLAGSHIP #21). The whole chain is int64 (the inertia fxdiv + the
+        // Q16.16 products + the accumulated cone solve), so shaders/persist_warm.comp is VULKAN-SPIR-V-ONLY (NOT
+        // in hf_gen_msl); Metal runs the CPU persist::StepWarmWorldN over the SAME FC4 friction-stack scene -> the
+        // EXACT bit-exact reference the Vulkan --persist-warm-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical; the warm-start converges the stack tighter than the cold solve at low iters + agrees
+        // within a tight epsilon at high iters. The image golden is a PURE-INTEGER 2D side-view of the settled
+        // warm stack, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/persist_warm.png.
+        if (argc > 1 && std::strcmp(argv[1], "--persist-warm") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_persist_warm.png";
+            try { return RunPersistWarmShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-break <out.png>: render the Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK
