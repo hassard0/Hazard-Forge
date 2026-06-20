@@ -38111,6 +38111,297 @@ static int RunPersistRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GJ6 — Deterministic General Convex-Hull Contacts THE LIT 3D RENDER CAPSTONE (--gjk-render) =====
+// (the money-shot COMPLETING FLAGSHIP #22 — DETERMINISTIC GENERAL CONVEX-HULL CONTACTS via integer GJK + EPA,
+// hf::sim::gjk — the CX6/FR6/FC6/PS6 render-capstone twin). Mirrors the Vulkan --gjk-render-shot path EXACTLY:
+// builds the bit-exact GJ4 settle scene (a static FLOOR box-hull + a dropped TETRA + a dropped OCTA + a static
+// upright BOX wall + a WEDGE dropped beside the wall), CPU-settles via gjk::StepHullWorldN K=240 ticks to the
+// converged pile (host-side, pure integer — the SAME scene + config as the Vulkan path so the integer state is
+// byte-identical by construction), turns it into a FLOAT world-space TRIANGLE SOUP via gjk::HullToRenderInstances
+// (per-canonical-hull face meshes: tetra 4 / octa 8 / wedge 8 / box 12 tris, winding fixed OUTWARD; per-triangle
+// flat normals; per-hull-type matte colors — the ONE float crossing, render-only, out of the bit-exact integer
+// loop), and draws it LIT 3D as ONE NON-instanced mesh (identity model — the verts are already world-space)
+// through the EXISTING lit pipeline (lit.vert.gen.metal + lit.frag.gen.metal + shadow.vert.gen.metal — the
+// --fox/--helmet wiring; NO new shader/RHI) over the sky + shadow from a fixed 3/4 hero camera + directional
+// light. MATTE (metallic 0, roughness 1.0) so the polyhedra do NOT mirror the sky IBL into iridescence (the
+// GF6/FR6/JT6/PS6/CX6 trap). FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run)
+// + provenance (two HullToRenderInstances calls byte-equal). New golden tests/golden/metal/gjk_render.png. NO new
+// shader, NO RHI.
+static int RunGjkRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace gjk     = hf::sim::gjk;
+    namespace fpx     = hf::sim::fpx;
+    using gjk::fx; using gjk::kOne;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+    auto fdv = [&](double v) { return (fx)(v * (double)kOne + (v < 0 ? -0.5 : 0.5)); };
+
+    // === The bit-exact GJ4 settle scene -> the converged hull pile (the SAME config the gjk_test + the Vulkan
+    // --gjk-render-shot use; pure integer sim). ===
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 24;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = (fx)((int64_t)97 * kOne / 100);  // 0.97
+    kCfg.angDamp     = (fx)((int64_t)30 * kOne / 100);  // 0.3
+    kCfg.posIters    = 4;
+    const uint32_t kTicks = 240u;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    // THE SCENE (== the Vulkan --gjk-render-shot / --gjk-settle-shot scene): a static FLOOR (box half-extent 4) +
+    // a dropped TETRA + a dropped OCTA + a STATIC upright BOX wall + a WEDGE dropped beside the wall.
+    gjk::HullWorld world;
+    world.bodies.push_back(makeBody(0, 0, 0, false));             world.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));  // 0 floor
+    world.bodies.push_back(makeBody(fdv(-2.0), fdv(2.5), 0, true)); world.hulls.push_back(gjk::MakeTetra(kOne));            // 1 tetra
+    world.bodies.push_back(makeBody(0, fdv(2.5), 0, true));        world.hulls.push_back(gjk::MakeOcta(kOne));              // 2 octa
+    world.bodies.push_back(makeBody(fdv(2.6), fdv(2.0), 0, false)); world.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne)); // 3 box wall
+    world.bodies.push_back(makeBody(fdv(1.2), fdv(2.4), 0, true));  world.hulls.push_back(gjk::MakeWedge(kOne, kOne, kOne));// 4 wedge
+    const uint32_t kBodies = (uint32_t)world.bodies.size();
+    uint32_t kDynamic = 0;
+    for (const auto& b : world.bodies) if (convex::IsDynamic(b)) ++kDynamic;
+    gjk::StepHullWorldN(world, kCfg, kTicks);   // settle the pile (pure integer)
+
+    // The world-space FLOAT triangle soup — the ONE float crossing, render-only (OUT of the bit-exact integer
+    // loop). Per-hull face meshes -> per-vertex pos/normal/color, already in world space.
+    const gjk::HullRenderMesh soup = gjk::HullToRenderInstances(world);
+    const uint32_t kHulls = kBodies;            // every body meshed (canonical hulls)
+    const uint32_t kTris  = soup.triangles;
+
+    // Pack the soup into scene::Vertex (pos + color + uv + normal + tangent). The lit shader's albedo is
+    // gTex * vertexColor, so we bake the per-hull-type matte color into vertexColor + bind a white tex.
+    std::vector<scene::Vertex> verts;
+    verts.reserve(soup.verts.size());
+    for (const gjk::HullRenderVertex& hv : soup.verts) {
+        scene::Vertex v{};
+        v.pos[0] = hv.pos[0]; v.pos[1] = hv.pos[1]; v.pos[2] = hv.pos[2];
+        v.color[0] = hv.color[0]; v.color[1] = hv.color[1]; v.color[2] = hv.color[2];
+        v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+        v.normal[0] = hv.normal[0]; v.normal[1] = hv.normal[1]; v.normal[2] = hv.normal[2];
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        verts.push_back(v);
+    }
+    std::vector<uint32_t> indices(verts.size());
+    for (uint32_t k = 0; k < (uint32_t)verts.size(); ++k) indices[k] = k;   // soup -> flat index list
+    const uint32_t kIndexCount = (uint32_t)indices.size();
+
+    std::unique_ptr<rhi::IBuffer> soupVb, soupIb;
+    if (!verts.empty()) {
+        rhi::BufferDesc vd; vd.size = (uint64_t)verts.size() * sizeof(scene::Vertex);
+        vd.initialData = verts.data(); vd.usage = rhi::BufferUsage::Vertex;
+        soupVb = device->CreateBuffer(vd);
+        rhi::BufferDesc id; id.size = (uint64_t)indices.size() * sizeof(uint32_t);
+        id.initialData = indices.data(); id.usage = rhi::BufferUsage::Index;
+        soupIb = device->CreateBuffer(id);
+    }
+
+    // === Reuse the EXISTING NON-instanced lit pipeline (the lit.vert + lit.frag + shadow.vert wiring). ===
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;   // model(16) + material(metallic,rough,0,0)
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto staticShadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc stShDesc;
+    stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = nullptr;
+    stShDesc.vertexLayout = scene::MeshVertexLayout();
+    stShDesc.depthTest = true; stShDesc.depthOnly = true;
+    stShDesc.usesFrameUniforms = true; stShDesc.pushConstantSize = sizeof(float) * 16;   // model
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // A 1x1 white albedo + flat normal so albedo == the baked vertex color (the per-hull-type matte tint).
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto whiteTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    // A fixed 3/4 HERO camera aimed at the pile (== the Vulkan --gjk-render-shot camera/light) so the polyhedra
+    // FILL the frame; the light rakes from the upper-near side so camera-facing faces are lit (matte warm read,
+    // the GF6/FR6/VH6 lesson). Kept in lockstep with the Vulkan showcase.
+    const Vec3 eye{7.0f, 4.8f, 8.0f};
+    const Vec3 center{0.0f, 1.6f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = 0.3f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.5f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{0.3f, -0.8f, -0.5f});
+        Vec3 sc{0.0f, 1.5f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 20.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-10.0f, 10.0f, -10.0f, 10.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    // Identity model matrix (the soup verts are already in world space).
+    Mat4 identity = Mat4::Identity();
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            if (kIndexCount > 0) {
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(identity.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(*soupVb);
+                cmd.BindIndexBuffer(*soupIb);
+                cmd.DrawIndexed(kIndexCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            if (kIndexCount > 0) {
+                cmd.BindPipeline(*litPipeline);
+                // metallic 0, roughness 1.0 (FULLY matte) -> no iridescence (the GF6/FR6/JT6/PS6 lesson).
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = identity.m[k];
+                pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*whiteTex, *flatNormal);
+                cmd.BindVertexBuffer(*soupVb);
+                cmd.BindIndexBuffer(*soupIb);
+                cmd.DrawIndexed(kIndexCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // === PROOFS (== the Vulkan --gjk-render-shot proofs, same lines) ===
+    // (1) PROVENANCE: two HullToRenderInstances calls on the bit-exact world are BYTE-EQUAL.
+    {
+        const gjk::HullRenderMesh rebuild = gjk::HullToRenderInstances(world);
+        if (!gjk::HullRenderMeshEqual(soup, rebuild))
+            return fail("gjk-render provenance two-calls NOT byte-equal "
+                        "(render not a pure function of the bit-exact world)");
+    }
+    std::printf("gjk-render: {hulls:%u, tris:%u} provenance two-calls BYTE-EQUAL\n", kHulls, kTris);
+
+    // (2) the settled pile: every DYNAMIC hull rests ABOVE the floor top (y=1, the half-extent-1 floor).
+    bool restedPile = (kDynamic > 0);
+    for (size_t i = 0; i < world.bodies.size(); ++i) {
+        if (!convex::IsDynamic(world.bodies[i])) continue;
+        const float y = fpx::FxToFloat(world.bodies[i].pos.y);
+        if (!(y > 0.5f)) restedPile = false;   // above the floor (top y=1) within a settle margin
+    }
+    if (!restedPile)
+        return fail("gjk-render dynamic hulls did NOT rest above the floor");
+    std::printf("gjk-render: {dynamic:%u, restedPile:true}\n", kDynamic);
+
+    // (3) DETERMINISM: a SECOND frame is BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd render)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("gjk-render two runs DIFFER (nondeterministic)");
+    std::printf("gjk-render determinism: two runs BYTE-IDENTICAL\n");
+
+    // SHADED: the polyhedra actually rendered (a non-trivial non-black pixel count).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("gjk-render shaded: {nonBlackPixels:%u}\n", shaded);
+    const uint32_t kShadedFloor = 5000u;
+    if (shaded < kShadedFloor) return fail("gjk-render shaded below floor (blank/scrambled frame)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("gjk-render uniform image (no coherent scene)");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic general-hull lit 3D render "
+                "(%u hulls, %u tris, %u dynamic)\n",
+                outPath, cw, ch, kHulls, kTris, kDynamic);
+    return 0;
+}
+
 // --- Deterministic Grain<->Fluid Coupling LIT 3D RENDER CAPSTONE showcase (Slice GF6, the money-shot
 // COMPLETING FLAGSHIP #13 — the THIRTEENTH flagship). Mirrors the Vulkan --cgf-render-shot path EXACTLY: runs
 // the bit-exact GF1-GF5 coupled sim (the SAME GF4 wet-sand scene — a packed 8x3x6 grain bed pre-settled by GR4
@@ -50723,6 +51014,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--persist-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_persist_render.png";
             try { return RunPersistRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gjk-render <out.png>: render the Deterministic General Convex-Hull Contacts THE LIT 3D RENDER CAPSTONE
+        // showcase (Slice GJ6, the money-shot COMPLETING FLAGSHIP #22). Builds the bit-exact GJ4 settle scene (a
+        // static floor box-hull + a dropped tetra + a dropped octa + a static box wall + a wedge, StepHullWorldN
+        // K=240 ticks to the converged pile — the SAME scene + config as the Vulkan --gjk-render-shot so the
+        // integer state is byte-identical by construction), turns it into a FLOAT world-space TRIANGLE SOUP via
+        // gjk::HullToRenderInstances (per-canonical-hull face meshes; per-triangle flat normals; per-hull-type
+        // matte colors), and renders it LIT 3D as ONE non-instanced mesh (identity model — verts already in world
+        // space) through the EXISTING lit pipeline (lit.vert + lit.frag + shadow.vert — the --fox wiring; NO new
+        // shader/RHI), MATTE (roughness 1.0) to dodge the GF6/FR6/JT6/PS6/CX6 iridescence trap. FLOAT visresolve-
+        // bar: Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run) + provenance (two HullToRenderInstances
+        // calls byte-equal). New golden tests/golden/metal/gjk_render.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gjk-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gjk_render.png";
+            try { return RunGjkRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice
