@@ -26914,6 +26914,162 @@ static int RunFricPointsShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
+// (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
+// / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
+// Q16.16 products), so shaders/fric_solve.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is
+// NOT in this dir's hf_gen_msl list; on Metal the --fric-solve showcase runs the CPU
+// fric::ResolveContactFriction — the EXACT bit-exact reference the Vulkan --fric-solve-shot GPU==CPU memcmp
+// already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the
+// convex_solve.comp / fpx_solve.comp convention), while the Vulkan side carries the GPU==CPU proof. So this
+// builds the SAME deterministic friction-pair scene (a HIGH-mu dynamic box sliding on a static floor box ->
+// friction arrests the slide + imparts spin + a mu=0 CONTROL -> frictionless == CX3 ResolveContactPair), runs
+// ResolveContactFriction over it, and CPU-colors the SAME before/after slide diagnostic -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/fric_solve.png (baked on the Mac by the controller);
+// two runs DIFF 0.0000.
+static int RunFricSolveShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fric = hf::sim::fric;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    const fx kRestitution = 0;
+    const uint32_t kIters = 8;
+
+    auto makeFloor = [&]() {
+        fpx::FxBody A; A.pos = {0, 0, 0}; A.orient = fpx::FxQuat{0, 0, 0, kOne};
+        A.invMass = 0; A.flags = 0u; A.vel = {0, 0, 0}; A.angVel = {0, 0, 0};
+        return A;
+    };
+    auto makeSlider = [&]() {
+        fpx::FxBody B; B.pos = {0, fh(3, 2), 0}; B.orient = fpx::FxQuat{0, 0, 0, kOne};
+        B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+        B.vel = {fi(4), fi(-3), 0}; B.angVel = {0, 0, 0};
+        return B;
+    };
+    const convex::FxBox kFloor{convex::FxVec3{fi(4), kOne, kOne}};
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+
+    struct FricPairCpu { fpx::FxBody bodyA; convex::FxBox boxA; fpx::FxBody bodyB; convex::FxBox boxB; fx mu; };
+    std::vector<FricPairCpu> pairs;
+    pairs.push_back({makeFloor(), kFloor, makeSlider(), kUnit, /*mu*/kOne});   // pair 0: HIGH mu
+    pairs.push_back({makeFloor(), kFloor, makeSlider(), kUnit, /*mu*/0});      // pair 1: CONTROL mu=0
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+    const uint32_t kResultCount = kPairCount * 2u;
+
+    // The resolved bodies (TWO per pair). The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp
+    // compares against, so the proof line says GPU==CPU BIT-EXACT by construction.
+    std::vector<fpx::FxBody> resolved((size_t)kResultCount);
+    auto run = [&](std::vector<fpx::FxBody>& out) {
+        out.assign((size_t)kResultCount, fpx::FxBody{});
+        for (uint32_t i = 0; i < kPairCount; ++i) {
+            fpx::FxBody A = pairs[i].bodyA, B = pairs[i].bodyB;
+            const fric::FricSolveConfig cfg{kRestitution, pairs[i].mu, kIters};
+            fric::ResolveContactFriction(A, pairs[i].boxA, B, pairs[i].boxB, cfg);
+            out[i * 2 + 0] = A;
+            out[i * 2 + 1] = B;
+        }
+    };
+    run(resolved);
+
+    std::printf("fric-solve: {pairs:%u, resolved:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fric::ResolveContactFriction, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, kResultCount);
+
+    std::vector<fpx::FxBody> resolved2;
+    run(resolved2);
+    if (resolved.size() != resolved2.size() ||
+        std::memcmp(resolved.data(), resolved2.data(), resolved.size() * sizeof(fpx::FxBody)) != 0)
+        return fail("fric-solve: two runs differ (nondeterministic)");
+    std::printf("fric-solve determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) THE NEW PHYSICS — friction arrests the slide (high-mu pair).
+    const fpx::FxBody hiB = resolved[0 * 2 + 1];
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    const fx preTan  = absfx(pairs[0].bodyB.vel.x);
+    const fx postTan = absfx(hiB.vel.x);
+    const bool slideReduced = (postTan < preTan);
+    const bool frictionTorque = (hiB.angVel.x != pairs[0].bodyB.angVel.x ||
+                                 hiB.angVel.y != pairs[0].bodyB.angVel.y ||
+                                 hiB.angVel.z != pairs[0].bodyB.angVel.z);
+    if (!slideReduced || !frictionTorque)
+        return fail("fric-solve: newphysics failed (friction did not arrest the slide)");
+    std::printf("fric-solve newphysics: {slideReduced:true, frictionTorque:true}\n");
+
+    // PROOF (4) CONTROL — mu=0 is frictionless == CX3 (the mu=0 pair == convex::ResolveContactPair).
+    {
+        fpx::FxBody A = pairs[1].bodyA, B = pairs[1].bodyB;
+        const convex::ContactSolveConfig cfg{kRestitution, kIters};
+        convex::ResolveContactPair(A, pairs[1].boxA, B, pairs[1].boxB, cfg);
+        if (std::memcmp(&resolved[1 * 2 + 0], &A, sizeof(fpx::FxBody)) != 0 ||
+            std::memcmp(&resolved[1 * 2 + 1], &B, sizeof(fpx::FxBody)) != 0)
+            return fail("fric-solve: control failed (mu=0 != convex::ResolveContactPair)");
+    }
+    std::printf("fric-solve control: {muZeroEqualsFrictionless:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D before/after slide diagnostic as the Vulkan --fric-solve-shot
+    // (identical by construction). ---
+    const int kPxPerUnit = 30, kMargin = 28;
+    const int kCols = (int)kPairCount;
+    const int kCellW = 9, kCellH = 7;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kCols * kCellW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kCellH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawArrow = [&](int ox, int oy, fx vx, const Vec3& col) {
+        const int len = (int)(((int64_t)vx * kPxPerUnit) >> convex::kFrac);
+        const int ex = ox + len, ey = oy;
+        drawLine(ox, oy, ex, ey, col);
+        drawLine(ox, oy - 1, ex, ey - 1, col);
+        drawLine(ox, oy + 1, ex, ey + 1, col);
+        putPx(ex, ey - 1, col); putPx(ex, ey + 1, col); putPx(ex, ey, col);
+    };
+    const Vec3 colBefore{0.35f, 0.55f, 0.95f};
+    const Vec3 colAfter{1.0f, 0.62f, 0.22f};
+    const Vec3 colAxis{0.45f, 0.45f, 0.45f};
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const int cellOx = kMargin + (int)i * kCellW * kPxPerUnit + 1 * kPxPerUnit;
+        const int beforeOy = kMargin + 2 * kPxPerUnit;
+        const int afterOy  = kMargin + 4 * kPxPerUnit;
+        drawLine(cellOx, beforeOy, cellOx + 6 * kPxPerUnit, beforeOy, colAxis);
+        drawLine(cellOx, afterOy,  cellOx + 6 * kPxPerUnit, afterOy,  colAxis);
+        const fpx::FxBody rB = resolved[i * 2 + 1];
+        drawArrow(cellOx, beforeOy, pairs[i].bodyB.vel.x, colBefore);
+        drawArrow(cellOx, afterOy,  rB.vel.x,             colAfter);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — friction before/after slide diagnostic (%u pairs; "
+                "hi-mu preTan=%d postTan=%d, control mu=0)\n", outPath, imgW, imgH,
+                kPairCount, (int)preTan, (int)postTan);
+    return 0;
+}
+
 // ===== Slice CX3 — Deterministic Convex Rigid-Body Contacts THE ANGULAR CONTACT IMPULSE showcase
 // (--convex-tumble) (the 3rd slice of FLAGSHIP #19, THE NEW-PHYSICS BEAT). Like CX1's --convex-sat / CX2's
 // --convex-manifold, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16
@@ -47224,6 +47380,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-tumble") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_tumble.png";
             try { return RunConvexTumbleShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fric-solve <out.png>: render the Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE
+        // SOLVER showcase (Slice FC3, THE SOLVER, the 3rd slice of FLAGSHIP #20). On Metal this runs the CPU
+        // friction solve: fric_solve.comp is int64/Vulkan-only (glslc can't parse the inertia fxdiv + the
+        // FxDot/FxCross/FxMat3MulVec int64), so Metal runs the CPU fric::ResolveContactFriction over the SAME
+        // friction-pair scene (a HIGH-mu dynamic box sliding on a static floor box -> friction arrests the
+        // slide + imparts spin + a mu=0 CONTROL -> frictionless == CX3 ResolveContactPair) -> the EXACT
+        // bit-exact reference the Vulkan --fric-solve-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical; the slide is reduced under high mu, unchanged at mu=0. The image golden is a
+        // PURE-INTEGER 2D before/after slide diagnostic, identical to the Vulkan path BY CONSTRUCTION. New
+        // golden tests/golden/metal/fric_solve.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fric-solve") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fric_solve.png";
+            try { return RunFricSolveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-stack <out.png>: render the Deterministic Convex Rigid-Body Contacts THE FULL CONVEX STEP

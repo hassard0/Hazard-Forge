@@ -260,6 +260,127 @@ int main() {
         }
     }
 
+    // ================= FC3 — SolveFrictionImpulse / ResolveContactFriction (the cone-clamped solver) =====
+    // The SOLVER slice: a dynamic box pressed onto a static box with an incoming TANGENTIAL velocity. The
+    // Coulomb cone clamps the tangent impulse to +-mu*jn, applied to BOTH linear AND angular velocity ->
+    // the slide is REDUCED (high mu) and the contact drag imparts spin; mu=0 leaves the velocities exactly
+    // the CX3 frictionless (normal-only) result AND == convex::ResolveContactPair.
+    {
+        auto fi = [&](int v) { return (fx)(v * (int)kOne); };
+        auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)kOne / den); };
+        const fpx::FxQuat qI{0, 0, 0, kOne};
+        const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+        const convex::FxBox kFloor{convex::FxVec3{fi(4), kOne, kOne}};
+        // A dynamic body sliding on a static floor: static box A at origin (top face y=+1); dynamic unit box
+        // B centered at y=1.5 so it overlaps the floor top by 0.5, descending (vel.y<0 -> approaching normal)
+        // AND sliding in +x (the tangential velocity friction must arrest).
+        auto makeStaticFloor = [&]() {
+            fpx::FxBody A; A.pos = {0, 0, 0}; A.orient = qI; A.invMass = 0; A.flags = 0u; return A;
+        };
+        auto makeSlider = [&](fx velX) {
+            fpx::FxBody B; B.pos = {0, fh(3, 2), 0}; B.orient = qI;
+            B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+            B.vel = {velX, fi(-3), 0}; B.angVel = {0, 0, 0};
+            return B;
+        };
+
+        // ---- HIGH-mu: the slide is REDUCED + spin imparted (THE NEW PHYSICS) ----
+        {
+            const fric::FricSolveConfig cfg{/*restitution*/0, /*mu*/kOne, /*iters*/8};
+            fpx::FxBody A = makeStaticFloor();
+            fpx::FxBody B = makeSlider(fi(4));   // sliding fast in +x
+            const fx preTanSpeed = B.vel.x < 0 ? -B.vel.x : B.vel.x;
+            const fpx::FxVec3 preAng = B.angVel;
+            fric::ResolveContactFriction(A, kFloor, B, kUnit, cfg);
+            const fx postTanSpeed = B.vel.x < 0 ? -B.vel.x : B.vel.x;
+            check(postTanSpeed < preTanSpeed, "FC3 high-mu: tangential slide REDUCED");
+            const bool spun = (B.angVel.x != preAng.x || B.angVel.y != preAng.y || B.angVel.z != preAng.z);
+            check(spun, "FC3 high-mu: contact drag imparted spin (angVel changed)");
+        }
+
+        // ---- mu=0: the tangential velocity is UNCHANGED by friction AND the body == ResolveContactPair ----
+        {
+            const fric::FricSolveConfig cfgFric{/*restitution*/0, /*mu*/0, /*iters*/8};
+            const convex::ContactSolveConfig cfgCx{/*restitution*/0, /*iters*/8};
+            fpx::FxBody Af = makeStaticFloor(), Bf = makeSlider(fi(4));
+            fpx::FxBody Ac = makeStaticFloor(), Bc = makeSlider(fi(4));
+            const fx preTanX = Bf.vel.x;
+            fric::ResolveContactFriction(Af, kFloor, Bf, kUnit, cfgFric);
+            convex::ResolveContactPair(Ac, kFloor, Bc, kUnit, cfgCx);
+            // mu=0 -> the friction (tangent) solve applies zero tangent impulse -> tangential x velocity is
+            // exactly the pre-solve value (the normal impulse is along y, leaving x untouched).
+            check(Bf.vel.x == preTanX, "FC3 mu=0: tangential x velocity UNCHANGED");
+            // mu=0 -> the resolved body is BYTE-IDENTICAL to the CX3 frictionless ResolveContactPair.
+            check(std::memcmp(&Af, &Ac, sizeof(fpx::FxBody)) == 0, "FC3 mu=0: body A == ResolveContactPair");
+            check(std::memcmp(&Bf, &Bc, sizeof(fpx::FxBody)) == 0, "FC3 mu=0: body B == ResolveContactPair");
+        }
+
+        // ---- the friction impulse stays within the Coulomb cone (|jt| <= mu*jn per point) ----
+        {
+            const fx mu = fh(1, 2);   // mu = 0.5
+            const fric::FricSolveConfig cfg{/*restitution*/0, mu, /*iters*/8};
+            fpx::FxBody A = makeStaticFloor();
+            fpx::FxBody B = makeSlider(fi(4));
+            // Build the manifold + world inertias exactly as ResolveContactFriction does, then solve and
+            // inspect the stored accumulators.
+            const convex::SatResult sat = convex::BoxSatStable(A, kFloor, B, kUnit);
+            check(sat.overlap, "FC3 cone: the pair overlaps (precondition)");
+            fric::FrictionManifold fm = fric::BuildFrictionPoints(A, kFloor, B, kUnit);
+            check(fm.count >= 1u, "FC3 cone: at least one friction point");
+            const convex::FxVec3 invIaB = convex::FxBoxInvInertiaBody(kFloor, A.invMass);
+            const convex::FxVec3 invIbB = convex::FxBoxInvInertiaBody(kUnit, B.invMass);
+            const convex::FxMat3 invIaW = convex::WorldInvInertia(A, invIaB);
+            const convex::FxMat3 invIbW = convex::WorldInvInertia(B, invIbB);
+            fric::SolveFrictionImpulse(A, B, invIaW, invIbW, fm, cfg.restitution, cfg.mu, cfg.iters);
+            bool withinCone = true;
+            for (uint32_t k = 0; k < fm.count; ++k) {
+                const fric::FrictionPoint& fp = fm.pts[k];
+                const fx jn = fp.normalImpulse;
+                const fx cone = fpx::fxmul(mu, jn);   // +-mu*jn
+                if (Absfx(fp.tangentImpulse1) > cone || Absfx(fp.tangentImpulse2) > cone) withinCone = false;
+            }
+            check(withinCone, "FC3 cone: |jt| <= mu*jn for every friction point");
+        }
+
+        // ---- a SEPARATING contact (vn >= 0) applies NO impulse ----
+        {
+            const fric::FricSolveConfig cfg{/*restitution*/0, /*mu*/kOne, /*iters*/8};
+            fpx::FxBody A = makeStaticFloor();
+            fpx::FxBody B = makeSlider(fi(4));
+            B.vel = {fi(4), fi(3), 0};   // moving AWAY (vel.y > 0 -> separating normal velocity)
+            const fpx::FxBody before = B;
+            fric::ResolveContactFriction(A, kFloor, B, kUnit, cfg);
+            // vn >= 0 at every point -> the normal impulse is skipped -> jn==0 -> the cone collapses to 0 ->
+            // NO tangent impulse either -> the body is UNCHANGED.
+            check(std::memcmp(&B, &before, sizeof(fpx::FxBody)) == 0,
+                  "FC3 separating: vn>=0 applies no impulse (body unchanged)");
+        }
+
+        // ---- determinism: two ResolveContactFriction runs byte-identical ----
+        {
+            const fric::FricSolveConfig cfg{/*restitution*/0, /*mu*/kOne, /*iters*/8};
+            fpx::FxBody A1 = makeStaticFloor(), B1 = makeSlider(fi(4));
+            fpx::FxBody A2 = makeStaticFloor(), B2 = makeSlider(fi(4));
+            fric::ResolveContactFriction(A1, kFloor, B1, kUnit, cfg);
+            fric::ResolveContactFriction(A2, kFloor, B2, kUnit, cfg);
+            check(std::memcmp(&A1, &A2, sizeof(fpx::FxBody)) == 0 &&
+                  std::memcmp(&B1, &B2, sizeof(fpx::FxBody)) == 0,
+                  "FC3 determinism: two ResolveContactFriction runs byte-identical");
+        }
+
+        // ---- a separated pair (no overlap) -> ResolveContactFriction is a no-op ----
+        {
+            const fric::FricSolveConfig cfg{/*restitution*/0, /*mu*/kOne, /*iters*/8};
+            fpx::FxBody A; A.pos = {fi(-7), 0, fi(6)}; A.orient = qI; A.invMass = 0; A.flags = 0u;
+            fpx::FxBody B; B.pos = {fi(-2), 0, fi(6)}; B.orient = qI;
+            B.invMass = kOne; B.flags = fpx::kFlagDynamic; B.vel = {fi(4), 0, 0};
+            const fpx::FxBody before = B;
+            fric::ResolveContactFriction(A, kUnit, B, kUnit, cfg);
+            check(std::memcmp(&B, &before, sizeof(fpx::FxBody)) == 0,
+                  "FC3 separated: no-overlap pair leaves the body unchanged");
+        }
+    }
+
     if (g_fail == 0) std::printf("fric_test: ALL PASS\n");
     else std::printf("fric_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

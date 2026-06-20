@@ -1168,6 +1168,20 @@ hf_compile_shaders(
     # showcase runs the CPU BuildFrictionPoints instead (byte-identical by construction). Pure integer SSBO
     # compute + ReadBuffer -> bit-exact GPU==CPU FrictionManifold array + cross-backend, proven memcmp. NO new RHI.
     "shaders/fric_points.comp.hlsl:cs"
+    # Deterministic Contact Friction Slice 3 (Slice FC3): fric_solve.comp is THE CONE-CLAMPED TANGENT-IMPULSE
+    # SOLVER pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) runs
+    # BoxSatStable (the CX4 face-preference SAT) then BuildManifold (the CX2 manifold) then the FC1 tangent
+    # basis then the box inertia tensors then the combined NORMAL + cone-clamped TANGENT Gauss-Seidel impulse
+    # solve (the normal part reproduces convex_solve.comp's SolveManifoldImpulse VERBATIM so mu=0 == CX3; the
+    # tangent part clamps jt to +-mu*jn — the Coulomb cone — applied to linear+angular velocity), writing its
+    # OWN two resolved bodies. solveEnabled=0 -> bodies UNCHANGED. Copies engine/sim/convex.h::BoxSatStable/
+    # BuildManifold/FxBoxInvInertiaBody/WorldInvInertia + engine/sim/fric.h::MakeTangentBasis/
+    # SolveFrictionImpulse/ResolveContactFriction VERBATIM. Like convex_solve.comp / fric_points.comp this is
+    # int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16 products), so it is VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --fric-solve showcase runs the CPU
+    # ResolveContactFriction instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer
+    # -> bit-exact GPU==CPU resolved bodies + cross-backend, proven memcmp. NO new RHI.
+    "shaders/fric_solve.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

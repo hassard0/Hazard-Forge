@@ -247,5 +247,151 @@ inline FrictionPointMeasure MeasureFrictionPoints(const std::vector<convex::SatP
     return pm;
 }
 
+// =========================================================================================================
+// Slice FC3 — THE CONE-CLAMPED TANGENT-IMPULSE SOLVER (where friction BITES). APPENDED after
+// MeasureFrictionPoints (FC1/FC2's lines above are BYTE-FROZEN). FC1 built the tangent basis, FC2 the
+// per-contact FrictionPoint[] state. FC3 adds the COULOMB FRICTION CONE: a tangent impulse at each contact,
+// clamped to +-mu*jn (mu x the normal impulse), applied to BOTH linear AND angular velocity through the
+// inertia tensor — so a box sliding on a static box has its slide ARRESTED (static cone) / DECELERATED
+// (kinetic cone), and the contact drag produces TORQUE. INTEGER bit-exact, every order PINNED.
+//
+// The NORMAL part of SolveFrictionImpulse REPRODUCES convex::SolveManifoldImpulse (convex.h:651) EXACTLY —
+// same order, same int64 math — so mu=0 (zero friction cone) leaves a body BYTE-IDENTICAL to
+// convex::ResolveContactPair (the make-or-break control). We do NOT call/modify the frozen
+// SolveManifoldImpulse; we reproduce its normal body, then add the cone-clamped tangent sweep.
+//
+// THE int64 REALITY (the CX3/FC1 lesson): the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16 products
+// are int64. DXC compiles int64 (Vulkan); glslc cannot. So shaders/fric_solve.comp is VULKAN-SPIR-V-ONLY
+// (NOT in hf_gen_msl); the Metal --fric-solve runs the CPU ResolveContactFriction -> byte-identical to the
+// Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU memcmp proof. fric_solve.comp
+// copies ResolveContactFriction's body (and the BoxSatStable/BuildManifold/MakeTangentBasis/inertia/solve it
+// calls) VERBATIM, so the GPU resolved bodies are byte-identical to the CPU reference.
+
+// Pull the convex inertia + solve types FC3 uses (re-use, do NOT redefine).
+using convex::FxMat3;
+using convex::FxMat3MulVec;
+using convex::FxBoxInvInertiaBody;
+using convex::WorldInvInertia;
+using fpx::FxScale;
+using fpx::FxAdd;
+using fpx::fxmul;
+using fpx::fxdiv;
+
+// ----- FricSolveConfig: the friction-solve parameters (the CX3 ContactSolveConfig shape + mu) ------------
+// restitution = the Q16.16 bounce factor (0 = fully inelastic; the FC3 showcase uses 0); mu = the Q16.16
+// Coulomb friction coefficient (the cone half-angle: |jt| <= mu*jn; mu=0 -> frictionless == CX3); iters =
+// the Gauss-Seidel sweep count over the manifold points.
+struct FricSolveConfig {
+    fx       restitution = 0;   // Q16.16 bounce factor
+    fx       mu          = 0;   // Q16.16 Coulomb friction coefficient (0 = frictionless)
+    uint32_t iters       = 4;   // Gauss-Seidel sweeps over the friction points
+};
+
+// ----- SolveFrictionImpulse: the combined normal + cone-clamped tangent Gauss-Seidel over a FrictionManifold
+// Mutates bodyA/bodyB vel+angVel AND the fm accumulators. The Gauss-Seidel order is PINNED: `iters` sweeps;
+// each sweep iterates the friction points 0..count-1 in order; within a point: NORMAL first, then t1, then
+// t2; mutating vel/angVel IN PLACE (later points/tangents see the earlier updates). Per point:
+//   rA = p - bodyA.pos, rB = p - bodyB.pos (world lever arms); vpA = vA + wA x rA, vpB = vB + wB x rB.
+//   (NORMAL — the CX3 convex.h:662-689 form reproduced VERBATIM):
+//     vn = (vpB - vpA).n; if vn >= 0 SKIP (separating/resting -> jn := 0, the cone collapses, no tangent).
+//     kn = invMa + invMb + n.((Iinv_a*(rA x n)) x rA) + n.((Iinv_b*(rB x n)) x rB); if kn <= 0 skip.
+//     jn = -(kOne+restitution)*vn / kn, clamp jn >= 0; J = n*jn; apply (vA -= J*invMa; wA -= Iinv_a*(rA x J);
+//          vB += ...; wB += ...).
+//   (TANGENT — THE NEW PHYSICS — for t1 THEN t2, recomputing the contact-point velocities AFTER the normal
+//    apply, sequential-impulse): vt = (vpB - vpA).t; kt = invMa + invMb + t.((Iinv_a*(rA x t)) x rA) +
+//    t.((Iinv_b*(rB x t)) x rB) (the same form as kn with t for n); jt = -vt / kt; CLAMP to the Coulomb cone
+//    jt = clamp(jt, -mu*jn, +mu*jn) (mu x THIS sweep's jn — the coupled-iteration approximation); Jt = t*jt;
+//    apply (vA -= Jt*invMa; wA -= Iinv_a*(rA x Jt); vB += ...; wB += ...).
+//   Store the last jn into fp.normalImpulse, the last jt into fp.tangentImpulse1/2 (diagnostic warm hooks).
+// PURE INTEGER, FIXED order -> bit-identical CPU<->Vulkan<->Metal. The shader copies THIS body VERBATIM.
+inline void SolveFrictionImpulse(fpx::FxBody& bodyA, fpx::FxBody& bodyB,
+                                 const FxMat3& invIaW, const FxMat3& invIbW,
+                                 FrictionManifold& fm, fx restitution, fx mu, uint32_t iters) {
+    if (fm.count == 0) return;
+
+    const fx invMassA = bodyA.invMass;
+    const fx invMassB = bodyB.invMass;
+
+    for (uint32_t it = 0; it < iters; ++it) {
+        for (uint32_t pi = 0; pi < fm.count; ++pi) {
+            FrictionPoint& fp = fm.pts[pi];
+            const FxVec3 p  = fp.point;
+            const FxVec3 n  = fp.normal;   // already A->B (BuildFrictionPoints sign-corrected it ONCE)
+            const FxVec3 rA = fpx::FxSub(p, bodyA.pos);
+            const FxVec3 rB = fpx::FxSub(p, bodyB.pos);
+
+            // ---- NORMAL impulse (the CX3 SolveManifoldImpulse form reproduced VERBATIM) ----
+            const FxVec3 vpA0 = FxAdd(bodyA.vel, FxCross(bodyA.angVel, rA));
+            const FxVec3 vpB0 = FxAdd(bodyB.vel, FxCross(bodyB.angVel, rB));
+            const fx vn = FxDot(fpx::FxSub(vpB0, vpA0), n);
+            fx jn = 0;
+            if (vn < 0) {
+                const FxVec3 raxn = FxCross(rA, n);
+                const FxVec3 rbxn = FxCross(rB, n);
+                const fx angA = FxDot(n, FxCross(FxMat3MulVec(invIaW, raxn), rA));
+                const fx angB = FxDot(n, FxCross(FxMat3MulVec(invIbW, rbxn), rB));
+                const fx kn = invMassA + invMassB + angA + angB;
+                if (kn > 0) {
+                    jn = fxdiv(-fxmul(kOne + restitution, vn), kn);
+                    if (jn < 0) jn = 0;
+                    const FxVec3 J = FxScale(n, jn);
+                    bodyA.vel = fpx::FxSub(bodyA.vel, FxScale(J, invMassA));
+                    bodyA.angVel = fpx::FxSub(bodyA.angVel, FxMat3MulVec(invIaW, FxCross(rA, J)));
+                    bodyB.vel = FxAdd(bodyB.vel, FxScale(J, invMassB));
+                    bodyB.angVel = FxAdd(bodyB.angVel, FxMat3MulVec(invIbW, FxCross(rB, J)));
+                }
+            }
+            fp.normalImpulse = jn;
+
+            // ---- TANGENT friction impulses (THE NEW PHYSICS), t1 then t2, cone-clamped to +-mu*jn ----
+            const fx coneLo = -fxmul(mu, jn);   // -mu*jn
+            const fx coneHi =  fxmul(mu, jn);   // +mu*jn (jn >= 0 -> coneHi >= 0 >= coneLo)
+            const FxVec3 tangents[2] = {fp.t1, fp.t2};
+            fx jtOut[2] = {0, 0};
+            for (int ti = 0; ti < 2; ++ti) {
+                const FxVec3 t = tangents[ti];
+                // recompute the contact-point velocities AFTER the normal (and prior tangent) apply.
+                const FxVec3 vpA = FxAdd(bodyA.vel, FxCross(bodyA.angVel, rA));
+                const FxVec3 vpB = FxAdd(bodyB.vel, FxCross(bodyB.angVel, rB));
+                const fx vt = FxDot(fpx::FxSub(vpB, vpA), t);
+                const FxVec3 raxt = FxCross(rA, t);
+                const FxVec3 rbxt = FxCross(rB, t);
+                const fx angA = FxDot(t, FxCross(FxMat3MulVec(invIaW, raxt), rA));
+                const fx angB = FxDot(t, FxCross(FxMat3MulVec(invIbW, rbxt), rB));
+                const fx kt = invMassA + invMassB + angA + angB;
+                if (kt <= 0) { jtOut[ti] = 0; continue; }
+                fx jt = fxdiv(-vt, kt);
+                if (jt < coneLo) jt = coneLo;
+                else if (jt > coneHi) jt = coneHi;   // CLAMP to the Coulomb cone +-mu*jn
+                const FxVec3 Jt = FxScale(t, jt);
+                bodyA.vel = fpx::FxSub(bodyA.vel, FxScale(Jt, invMassA));
+                bodyA.angVel = fpx::FxSub(bodyA.angVel, FxMat3MulVec(invIaW, FxCross(rA, Jt)));
+                bodyB.vel = FxAdd(bodyB.vel, FxScale(Jt, invMassB));
+                bodyB.angVel = FxAdd(bodyB.angVel, FxMat3MulVec(invIbW, FxCross(rB, Jt)));
+                jtOut[ti] = jt;
+            }
+            fp.tangentImpulse1 = jtOut[0];
+            fp.tangentImpulse2 = jtOut[1];
+        }
+    }
+}
+
+// ----- ResolveContactFriction(bodyA, boxA, bodyB, boxB, cfg): one box-box pair end-to-end ----------------
+// BuildFrictionPoints (FC2: BoxSatStable -> BuildManifold -> the A->B basis) -> if count==0 return (no
+// overlap / degenerate) -> the world inertias (convex::FxBoxInvInertiaBody + WorldInvInertia, frozen) ->
+// SolveFrictionImpulse. VELOCITY-ONLY (NO position de-penetration — that is FC4). The shader copies THIS
+// body VERBATIM so the GPU resolved-body result is byte-identical to the CPU.
+inline void ResolveContactFriction(fpx::FxBody& bodyA, const FxBox& boxA,
+                                   fpx::FxBody& bodyB, const FxBox& boxB,
+                                   const FricSolveConfig& cfg) {
+    FrictionManifold fm = BuildFrictionPoints(bodyA, boxA, bodyB, boxB);
+    if (fm.count == 0) return;   // separated / degenerate -> no-op
+    const FxVec3 invIa = FxBoxInvInertiaBody(boxA, bodyA.invMass);
+    const FxVec3 invIb = FxBoxInvInertiaBody(boxB, bodyB.invMass);
+    const FxMat3 invIaW = WorldInvInertia(bodyA, invIa);
+    const FxMat3 invIbW = WorldInvInertia(bodyB, invIb);
+    SolveFrictionImpulse(bodyA, bodyB, invIaW, invIbW, fm, cfg.restitution, cfg.mu, cfg.iters);
+}
+
 }  // namespace fric
 }  // namespace hf::sim
