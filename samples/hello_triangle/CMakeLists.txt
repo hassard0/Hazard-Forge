@@ -903,6 +903,24 @@ hf_compile_shaders(
     # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing shaders
     # + goldens untouched (vehicle.h is the additive sibling; #includes joint.h + fpx.h read-only).
     "shaders/vehicle_spring_solve.comp.hlsl:cs"
+    # Deterministic Active Ragdoll Slice 1 (Slice AC1, the BEACHHEAD of FLAGSHIP #17: DETERMINISTIC ACTIVE
+    # RAGDOLL / PHYSICAL-ANIMATION BLENDING, hf::sim::active): the ANGULAR POSE-DRIVE primitive.
+    # active_drive_solve.comp runs `steps` iterations of StepDriveWorld = IntegrateBodyFull each body (the
+    # FPX4 6-DOF integrate) then `iters` Gauss-Seidel passes EACH doing {all SolveBallJoint (the JT1
+    # positional ball) then all SolveAngularLimit (the JT2 cone/hinge) then all SolveAngularDrive (the AC1
+    # NEW PRIMITIVE: drive qrel = qA⁻¹·qB toward a target quaternion by a stiffness fraction — SolveAngular
+    # Limit's inverse-mass nlerp apply with the cone clamp replaced by an nlerp-toward-target + a shortest-
+    # arc sign fix)} then a ground floor-clamp — copied VERBATIM from engine/sim/active.h::StepDriveWorld/
+    # SolveAngularDrive (which reuse joint.h + fpx.h). The drive strength is a stiffness in [0,kOne] (the VH1
+    # spring soft-constraint pattern lifted to orientation); stiffness 0 -> no drive, kOne -> snap to target.
+    # The whole step is SEQUENTIAL (Gauss-Seidel, order-dependent) -> a SINGLE THREAD ([numthreads(1,1,1)],
+    # the joint_angular_solve.comp mirror) -> bit-exact GPU==CPU + cross-backend, NO atomics. solveEnabled=0
+    # -> bodies UNCHANGED. Like joint_angular_solve.comp this is int64 (the quaternion fxmul/fxdiv/FxISqrt) ->
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal
+    # --active-drive showcase runs the CPU active::StepDriveWorld (byte-identical by construction). NO new RHI;
+    # existing shaders + goldens untouched (active.h is the additive sibling; #includes joint.h + fpx.h
+    # read-only). The ONLY new shader of the whole flagship.
+    "shaders/active_drive_solve.comp.hlsl:cs"
     # CL4 COLLISION. cloth_collide.comp FOLDS the CL3 PBD step (integrate + Gauss-Seidel constraint passes +
     # ground floor-clamp, copied VERBATIM from cloth_solve.comp/cloth.h) AND per-step COLLISION (project each
     # non-pinned particle out of a small STATIC set of SPHERE colliders along the outward normal, then a

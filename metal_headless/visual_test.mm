@@ -97,6 +97,7 @@
 #include "sim/fract.h"               // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
+#include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -23408,6 +23409,226 @@ static int RunJointBallShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AC1 — Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (--active-drive) ===========
+// (the BEACHHEAD of FLAGSHIP #17). Like VH1's --vehicle-spring / JT2's --joint-hinge, the drive solve is
+// int64 (FxQuatMul/FxQuatNormalize/fxdiv in SolveAngularDrive), so shaders/active_drive_solve.comp is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal
+// the --active-drive showcase runs the CPU active::StepDriveWorld — the EXACT bit-exact reference the Vulkan
+// --active-drive-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the
+// Vulkan GPU result BY CONSTRUCTION (the vehicle_spring_solve.comp / joint_angular_solve.comp convention),
+// while the Vulkan side carries the GPU==CPU proof. Builds the SAME deterministic 3-link-chain scene (a
+// pinned invMass-0 root + 3 dynamic ball-jointed bodies + an FxAngularDrive per joint whose qTarget bends
+// the chain into an L-shape, gravity -9.8 host-snapped) — IDENTICAL scene constants to the Vulkan
+// --active-drive-shot — runs active::StepDriveWorldSteps K=400 x iters=24 over it -> the chain is DRIVEN to
+// + HOLDS the L-pose, and CPU-colors the SAME integer side-view as the Vulkan --active-drive-shot -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/active_drive.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000. NO GPU compute (int64 -> CPU on Metal), NO new RHI. CAVEAT: the drive
+// is a stiffness-scaled nlerp toward target (a soft angular constraint), the held angle a deterministic
+// Gauss-Seidel residual; deterministic + bit-identical is the headline.
+static int RunActiveDriveShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace active = hf::sim::active;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic active-drive scene (== the Vulkan --active-drive-shot config). gravity -9.8 snapped.
+    const active::fx kGravY = (active::fx)(-9.8 * (double)active::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const active::fx kDt = active::kOne / 60;
+    const int kRoot = 1, kLinks = 3;
+    const int kBodyCount = kRoot + kLinks;        // 4 bodies
+    const int kSteps = 400;
+    const int kIters = 24;
+    const active::fx kGroundY = (active::fx)(-1000 * (int)active::kOne);
+    const active::fx kAnchor = active::kOne / 2;
+    const active::fx kSqrtHalf = (active::fx)(46341);   // 0.70710678 * 65536 (cos/sin 45)
+    const fpx::FxQuat qZ90{0, 0, kSqrtHalf, kSqrtHalf};
+    const active::fx kDriveStiff = active::kOne / 8;
+
+    auto makeBody = [&](int gx, int gy, bool pinned) {
+        fpx::FxBody b;
+        b.pos = active::FxVec3{(active::fx)(gx * (int)active::kOne), (active::fx)(gy * (int)active::kOne), 0};
+        b.vel = active::FxVec3{0, 0, 0};
+        b.invMass = pinned ? 0 : active::kOne;
+        b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+        b.radius  = 0;
+        b.orient  = fpx::FxQuat{0, 0, 0, active::kOne};
+        b.angVel  = active::FxVec3{0, 0, 0};
+        return b;
+    };
+    auto buildScene = [&](active::fx driveStiff, std::vector<active::FxJoint>& joints,
+                          std::vector<active::FxAngularDrive>& drives) {
+        active::FxWorld world;
+        world.gravity = active::FxVec3{0, kGravY, 0};
+        world.groundY = kGroundY;
+        world.bodies.push_back(makeBody(0, 6, true));
+        for (int i = 1; i < kBodyCount; ++i) world.bodies.push_back(makeBody(0, 6 - i, false));
+        joints.clear();
+        for (uint32_t k = 0; k + 1 < (uint32_t)kBodyCount; ++k) {
+            active::FxJoint j;
+            j.bodyA = k; j.bodyB = k + 1;
+            j.anchorA = active::FxVec3{0, -kAnchor, 0};
+            j.anchorB = active::FxVec3{0, kAnchor, 0};
+            j.kind = joint::kJointBall;
+            joints.push_back(j);
+        }
+        drives.clear();
+        for (uint32_t k = 0; k + 1 < (uint32_t)kBodyCount; ++k) {
+            active::FxAngularDrive d;
+            d.bodyA = k; d.bodyB = k + 1; d.qTarget = qZ90; d.stiffness = driveStiff;
+            drives.push_back(d);
+        }
+        return world;
+    };
+
+    std::vector<active::FxJoint> joints;
+    std::vector<active::FxAngularDrive> drives;
+    const active::FxWorld world = buildScene(kDriveStiff, joints, drives);
+    const std::vector<active::FxAngularLimit> limits;
+    const uint32_t kJointCount = (uint32_t)joints.size();
+    const uint32_t kDriveCount = (uint32_t)drives.size();
+
+    // std430 FxBody mirror (== the Vulkan --active-drive-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+    const std::vector<FxBodyGpu> bodiesInit = packBodies(world.bodies);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --active-drive-shot).
+    const int kPxPerUnit = 40, kMargin = 28;
+    const int kWorldW = 10, kWorldH = 10, kOriginX = 3;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). solveEnabled=false
+    // -> bodies UNCHANGED. Returns the settled world + its packed bodies.
+    auto runSolve = [&](bool solveEnabled, active::FxWorld& outWorld, std::vector<FxBodyGpu>& outBodies) {
+        outWorld = world;
+        if (solveEnabled) active::StepDriveWorldSteps(outWorld, joints, limits, drives, kDt, kIters, kSteps);
+        outBodies = packBodies(outWorld.bodies);
+    };
+
+    active::FxWorld cpuWorld;
+    std::vector<FxBodyGpu> gpuBodies;
+    runSolve(true, cpuWorld, gpuBodies);
+
+    std::printf("active-drive: {bodies:%d, joints:%u, drives:%u, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU active::StepDriveWorld, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kJointCount, kDriveCount, kSteps);
+
+    // two-run determinism.
+    active::FxWorld cpuWorld2; std::vector<FxBodyGpu> gpuBodies2;
+    runSolve(true, cpuWorld2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-drive: two solves differ (nondeterministic)");
+    std::printf("active-drive determinism: two runs BYTE-IDENTICAL\n");
+
+    // the chain DROVE TO + HELD the target: mean DriveAngleCos within a band of kOne AND the chain bent away
+    // from the stiffness-0 control.
+    std::vector<active::FxJoint> cJoints;
+    std::vector<active::FxAngularDrive> cDrives;
+    active::FxWorld ctrlWorld = buildScene(/*driveStiff=*/0, cJoints, cDrives);
+    active::StepDriveWorldSteps(ctrlWorld, cJoints, limits, cDrives, kDt, kIters, kSteps);
+    {
+        int64_t sumCos = 0;
+        for (const active::FxAngularDrive& d : drives) sumCos += (int64_t)active::DriveAngleCos(cpuWorld, d);
+        const active::fx meanCos = kDriveCount > 0u ? (active::fx)(sumCos / (int64_t)kDriveCount) : active::kOne;
+        const active::fx kHoldBand = active::kOne / 8;
+        const active::fx leafX = cpuWorld.bodies[(size_t)kBodyCount - 1].pos.x;
+        const active::fx ctrlLeafX = ctrlWorld.bodies[(size_t)kBodyCount - 1].pos.x;
+        const active::fx bend = (leafX - ctrlLeafX < 0 ? ctrlLeafX - leafX : leafX - ctrlLeafX);
+        if (!(meanCos > active::kOne - kHoldBand && bend > active::kOne / 2))
+            return fail("active-drive: did not hold the target (meanCos/bend out of band)");
+        std::printf("active-drive held: {meanCos:%d, bentFromRest:true}\n", meanCos);
+    }
+
+    // control: the stiffness-0 drive set leaves the chain hanging STRAIGHT down.
+    {
+        const active::fx ctrlLeafX = ctrlWorld.bodies[(size_t)kBodyCount - 1].pos.x;
+        const active::fx absX = ctrlLeafX < 0 ? -ctrlLeafX : ctrlLeafX;
+        if (absX >= active::kOne / 4)
+            return fail("active-drive: control (stiffness 0) did NOT hang straight (the drive isn't working)");
+        std::printf("active-drive control: {stiffness0:hangsStraight}\n");
+    }
+
+    // empty / no-op: solveEnabled=false -> bodies UNCHANGED.
+    active::FxWorld disabledWorld; std::vector<FxBodyGpu> disabledBodies;
+    runSolve(false, disabledWorld, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-drive: solveEnabled=false changed the bodies");
+
+    // --- Golden: a PURE-INTEGER side-view of the chain driven to the L-pose (IDENTICAL to the Vulkan
+    // --active-drive-shot by construction). The pinned root white, the dynamic links hashColor'd, the joints
+    // grey segments between world anchors. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + (worldX + kOriginX) * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    for (const active::FxJoint& j : joints) {
+        const fpx::FxBody& ba = cpuWorld.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuWorld.bodies[(size_t)j.bodyB];
+        const active::FxVec3 pa = joint::WorldAnchor(ba, j.anchorA);
+        const active::FxVec3 pb = joint::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by;
+        worldToPx(pa.x >> active::kFrac, pa.y >> active::kFrac, ax, ay);
+        worldToPx(pb.x >> active::kFrac, pb.y >> active::kFrac, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.5f});
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = gpuBodies[(size_t)i].px >> active::kFrac;
+        const int wy = gpuBodies[(size_t)i].py >> active::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        const bool pinned = (gpuBodies[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+        const Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i + 1u);
+        for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx)
+                if (dx * dx + dy * dy <= 16) putPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — active-drive L-pose side-view (%d bodies, %u drives)\n",
+                outPath, imgW, imgH, kBodyCount, kDriveCount);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -42454,6 +42675,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vehicle-spring") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vehicle_spring.png";
             try { return RunVehicleSpringShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice
+        // AC1, the BEACHHEAD of FLAGSHIP #17). On Metal this runs the CPU solver: active_drive_solve.comp is
+        // int64/Vulkan-only (glslc can't parse the FxQuatMul/FxQuatNormalize/fxdiv int64), so Metal runs the
+        // CPU active::StepDriveWorld over a 3-link chain (a pinned invMass-0 root + 3 dynamic ball-jointed
+        // bodies + an FxAngularDrive per joint whose qTarget bends the chain into an L-shape) -> the chain is
+        // DRIVEN to + HOLDS the L-pose — the EXACT bit-exact reference the Vulkan --active-drive-shot GPU==CPU
+        // memcmp compares against; solveEnabled=false -> bodies unchanged; two runs byte-identical. The image
+        // golden is a PURE-INTEGER L-pose side-view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/active_drive.png.
+        if (argc > 1 && std::strcmp(argv[1], "--active-drive") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_active_drive.png";
+            try { return RunActiveDriveShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vehicle-rig <out.png>: render the Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE

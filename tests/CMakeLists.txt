@@ -624,6 +624,18 @@ hf_add_pure_test(joint_test)
 # ASan-eligible. vehicle.h #includes sim/joint.h + sim/fpx.h read-only.
 hf_add_pure_test(vehicle_test)
 
+# Deterministic Active Ragdoll Slice 1 (Slice AC1, the BEACHHEAD of FLAGSHIP #17: DETERMINISTIC ACTIVE
+# RAGDOLL / PHYSICAL-ANIMATION BLENDING): the ANGULAR POSE-DRIVE primitive integer core (engine/sim/active.h)
+# the GPU shaders/active_drive_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the joint.h
+# toolbox (SolveAngularLimit's inverse-mass nlerp apply / QConj / QNlerp) + fpx.h (FxQuatMul/FxQuatNormalize/
+# IntegrateBodyFull) read-only. Pins SolveAngularDrive (stiffness kOne snaps qrel = qA⁻¹·qB to qTarget within
+# an LSB band; stiffness 0 leaves qrel unchanged; a pinned body is NOT rotated; the inverse-mass split
+# rotates the lighter body more; out-of-range / both-pinned skip) + DriveAngleCos (on-target kOne, off-target
+# below) + StepDriveWorld (a 3-link chain drives to + HOLDS the L-pose [DriveAngleCos near kOne]; the
+# stiffness-0 control hangs straight; two runs byte-identical). Pure C++ (hf_core), ASan-eligible. active.h
+# #includes sim/joint.h + sim/fpx.h read-only.
+hf_add_pure_test(active_test)
+
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
 # fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
 # shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products
