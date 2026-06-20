@@ -267,5 +267,312 @@ inline SatMeasure MeasureSat(const std::vector<SatPair>& pairs) {
     return m;
 }
 
+// =========================================================================================================
+// Slice CX2 — THE CONTACT MANIFOLD (clip the incident face -> 1-4 contact points). APPENDED after MeasureSat
+// (CX1's lines above are BYTE-FROZEN). Turns CX1's SAT min-pen axis into the actual SET of contact POINTS
+// (with per-point penetration depth) where the two boxes touch — the data CX3's angular impulse needs.
+// Deterministic integer Sutherland-Hodgman face clipping (face case, axisIndex 0..5) + the single
+// closest-point edge-edge contact (axisIndex 6..14). PURE INTEGER, every order PINNED -> bit-identical
+// CPU<->Vulkan<->Metal. int64 in the fxdiv/FxDot products -> shaders/convex_manifold.comp is Vulkan-only
+// (the convex_sat.comp / fpx_solve.comp split); the Metal --convex-manifold runs THIS CPU BuildManifold,
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU memcmp.
+//
+// HONEST SIMPLIFICATION (documented, in scope): the 4-point reduction keeps the DEEPEST point + the first 3
+// in CLIP ORDER (NOT the area-maximizing 4 a production solver would keep) — a deterministic first cut; the
+// area-maximizing reduction is a deferred CX-refinement. The face-clip contact point is the CLIPPED INCIDENT
+// VERTEX position itself (not projected onto the reference plane) — documented; its depth is the signed
+// distance below the reference face. Boxes ONLY (the CX1 box-box SAT, not general convex/GJK/EPA).
+//
+// ----- ContactManifold: 1-4 contact points + per-point depths + the contact normal --------------------
+// count   = the number of valid contact points (0 if separated, 1 for edge-edge, 1..4 for face). points and
+//           depths are filled 0..count, the rest left zero. normal = the reference face normal (face case) or
+//           the signed edge-cross axis (edge case), SIGNED from A toward B (the CX1 SatResult.axis convention
+//           — moving B by +normal separates the pair). std430-packable: count uint32 + 4 x FxVec3 (12 ints) +
+//           4 x fx depths + FxVec3 normal -> a fixed int32 layout the GPU ManifoldGpu mirrors.
+struct ContactManifold {
+    uint32_t count = 0;
+    FxVec3   points[4];
+    fx       depths[4] = {0, 0, 0, 0};
+    FxVec3   normal;
+};
+
+using fpx::kHalf;   // 0.5 in Q16.16 (the deterministic mid-segment fallback for parallel edges)
+
+// ClosestPointsOnSegments: the integer closest points of two segments (the edge-edge contact core). Segment
+// A is [pA - dA, pA + dA] (center pA, half-vector dA = axA[i]*hA[i]); segment B likewise. Returns the two
+// closest points cA, cB. The standard clamped-parametric solution (Ericson, "Real-Time Collision Detection")
+// in Q16.16: r = pA - pB; a = dA·dA*4 ... — we work with the FULL-LENGTH segment direction u = 2*dA, v = 2*dB
+// and base points s0 = pA - dA, s1 = pB - dB, params s,t in [0,kOne]. All fxdiv/FxDot are int64. PARALLEL
+// (denom ~0) -> clamp s=kHalf (the deterministic mid-segment fallback). Pure integer, fixed order.
+inline void ClosestPointsOnSegments(const FxVec3& pA, const FxVec3& dA,
+                                    const FxVec3& pB, const FxVec3& dB,
+                                    FxVec3& cAOut, FxVec3& cBOut) {
+    const FxVec3 s0{pA.x - dA.x, pA.y - dA.y, pA.z - dA.z};   // A segment base
+    const FxVec3 s1{pB.x - dB.x, pB.y - dB.y, pB.z - dB.z};   // B segment base
+    const FxVec3 u{dA.x * 2, dA.y * 2, dA.z * 2};             // A full direction (2*half)
+    const FxVec3 v{dB.x * 2, dB.y * 2, dB.z * 2};             // B full direction
+    const FxVec3 w{s0.x - s1.x, s0.y - s1.y, s0.z - s1.z};
+    const fx a = FxDot(u, u);   // >= 0
+    const fx b = FxDot(u, v);
+    const fx c = FxDot(v, v);   // >= 0
+    const fx d = FxDot(u, w);
+    const fx e = FxDot(v, w);
+    const fx denom = fxmul(a, c) - fxmul(b, b);   // >= 0 (Cauchy-Schwarz); ~0 -> parallel
+    fx s, tnum, tdenom;
+    if (denom > kEdgeEps) {
+        s = fxdiv(fxmul(b, e) - fxmul(c, d), denom);
+        if (s < 0) s = 0; else if (s > kOne) s = kOne;
+    } else {
+        s = kHalf;   // parallel: deterministic mid-segment of A
+    }
+    // t = (b*s + e) / c  (the closest point on B to A's chosen s), clamped to [0,1].
+    tnum = fxmul(b, s) + e;
+    tdenom = c;
+    fx tt;
+    if (tdenom > kEdgeEps) {
+        tt = fxdiv(tnum, tdenom);
+        if (tt < 0) tt = 0; else if (tt > kOne) tt = kOne;
+    } else {
+        tt = kHalf;
+    }
+    // Re-derive s from the clamped t for a tighter (still deterministic) closest pair: s = (b*t - d)/a.
+    if (a > kEdgeEps) {
+        fx s2 = fxdiv(fxmul(b, tt) - d, a);
+        if (s2 < 0) s2 = 0; else if (s2 > kOne) s2 = kOne;
+        s = s2;
+    }
+    cAOut = FxVec3{s0.x + fxmul(u.x, s), s0.y + fxmul(u.y, s), s0.z + fxmul(u.z, s)};
+    cBOut = FxVec3{s1.x + fxmul(v.x, tt), s1.y + fxmul(v.y, tt), s1.z + fxmul(v.z, tt)};
+}
+
+// FxAt(v, i): the i-th component (0=x,1=y,2=z) of an FxVec3 — a deterministic per-axis index accessor used
+// by the manifold (half-extent along a chosen local axis). Identical CPU/HLSL (a plain branch).
+inline fx FxAt(const FxVec3& v, uint32_t i) { return (i == 0) ? v.x : (i == 1) ? v.y : v.z; }
+
+// BuildManifold(bodyA, boxA, bodyB, boxB, satResult): the box-box contact manifold from CX1's SAT result.
+//
+// SEPARATED (!satResult.overlap) -> {count=0}.
+// FACE contact (axisIndex 0..5): reference/incident face clip (Sutherland-Hodgman).
+//   - reference box = the box that OWNS the axis (A if axisIndex<3 else B); reference normal n = that box's
+//     world face axis, SIGNED toward the incident box (the CX1 sign rule via FxDot(axis, ref->inc)).
+//   - reference face center = refPos + n*H (H = the ref half-extent along the owning axis); u,v = the OTHER
+//     two ref world axes (ascending local index), hu,hv their half-extents; the 4 ref-face corners in the
+//     FIXED order (+u+v),(-u+v),(-u-v),(+u-v).
+//   - incident face = the incident box's face whose signed world normal is MOST ANTI-PARALLEL to n (min
+//     FxDot); tie-break lowest local-axis index then + before -. Its 4 corners in the SAME fixed order.
+//   - Sutherland-Hodgman clip the incident 4-gon against the 4 ref-face SIDE planes in the FIXED order
+//     (+u,-u,+v,-v) (each inside test sgn*FxDot(axis,p-center) <= h; crossing edges emit fxdiv intersections
+//     in a PINNED iteration order).
+//   - keep clipped vertices with depth d = FxDot(n, faceCenter - vertex) >= 0 (below/inside the ref face);
+//     contact point = the vertex itself (documented), depth = d.
+//   - reduce to <=4: ALWAYS keep the deepest (max d, tie -> lowest clip-order index), then up to 3 more in
+//     clip order. normal = n.
+// EDGE-EDGE contact (axisIndex 6..14): ONE point = the midpoint of the closest points of edge A_i and
+//   edge B_j (i=(idx-6)/3, j=(idx-6)%3); depth = satResult.penetration; normal = satResult.axis. count=1.
+inline ContactManifold BuildManifold(const FxBody& bodyA, const FxBox& boxA,
+                                     const FxBody& bodyB, const FxBox& boxB,
+                                     const SatResult& sat) {
+    ContactManifold m;
+    if (!sat.overlap) return m;   // separated -> empty
+
+    FxVec3 axA[3], axB[3];
+    BoxAxes(bodyA, axA);
+    BoxAxes(bodyB, axB);
+    const FxVec3 hA = boxA.halfExtents;
+    const FxVec3 hB = boxB.halfExtents;
+
+    // ---------------- EDGE-EDGE case (axisIndex 6..14): the single closest-point contact ----------------
+    if (sat.axisIndex >= 6) {
+        const uint32_t e = sat.axisIndex - 6;     // 0..8
+        const uint32_t i = e / 3, j = e % 3;
+        const FxVec3 dA = FxVec3{fxmul(axA[i].x, FxAt(hA, i)), fxmul(axA[i].y, FxAt(hA, i)),
+                                 fxmul(axA[i].z, FxAt(hA, i))};
+        const FxVec3 dB = FxVec3{fxmul(axB[j].x, FxAt(hB, j)), fxmul(axB[j].y, FxAt(hB, j)),
+                                 fxmul(axB[j].z, FxAt(hB, j))};
+        FxVec3 cA, cB;
+        ClosestPointsOnSegments(bodyA.pos, dA, bodyB.pos, dB, cA, cB);
+        m.count = 1;
+        m.points[0] = FxVec3{(cA.x + cB.x) / 2, (cA.y + cB.y) / 2, (cA.z + cB.z) / 2};
+        m.depths[0] = sat.penetration;
+        m.normal = sat.axis;
+        return m;
+    }
+
+    // ---------------- FACE case (axisIndex 0..5): reference/incident face clip ----------------
+    const bool refIsA = sat.axisIndex < 3;
+    const uint32_t refIdx = refIsA ? sat.axisIndex : (sat.axisIndex - 3);   // owning local axis 0..2
+    const FxVec3* refAxes = refIsA ? axA : axB;
+    const FxVec3* incAxes = refIsA ? axB : axA;
+    const FxBody& refBody = refIsA ? bodyA : bodyB;
+    const FxBody& incBody = refIsA ? bodyB : bodyA;
+    const FxVec3& refH = refIsA ? hA : hB;
+    const FxVec3& incH = refIsA ? hB : hA;
+
+    // Reference normal n: the owning world face axis, signed from the reference box toward the incident box
+    // (EXACTLY the CX1 sign rule). tRefToInc = incCenter - refCenter.
+    const FxVec3 tRefToInc = fpx::FxSub(incBody.pos, refBody.pos);
+    FxVec3 n = refAxes[refIdx];
+    if (FxDot(n, tRefToInc) < 0) n = FxVec3{-n.x, -n.y, -n.z};
+    const fx Href = FxAt(refH, refIdx);
+
+    // The reference face center + its two in-plane axes u,v (the OTHER two ref axes, ascending local index)
+    // + half-extents hu,hv. Corner order FIXED: (+u+v),(-u+v),(-u-v),(+u-v).
+    uint32_t ui = (refIdx == 0) ? 1u : 0u;
+    uint32_t vi = (refIdx == 2) ? 1u : 2u;
+    // ensure ui<vi ascending (refIdx 0->{1,2}, 1->{0,2}, 2->{0,1})
+    if (refIdx == 1) { ui = 0u; vi = 2u; }
+    const FxVec3 u = refAxes[ui];
+    const FxVec3 v = refAxes[vi];
+    const fx hu = FxAt(refH, ui);
+    const fx hv = FxAt(refH, vi);
+    const FxVec3 faceCenter = FxVec3{refBody.pos.x + fxmul(n.x, Href),
+                                     refBody.pos.y + fxmul(n.y, Href),
+                                     refBody.pos.z + fxmul(n.z, Href)};
+
+    // Incident face: the incident box face whose SIGNED world normal is most ANTI-PARALLEL to n (min FxDot).
+    // Iterate the 3 inc axes, the + sign then the - sign; tie-break lowest axis index then + before -.
+    uint32_t bestK = 0; bool bestNeg = false; fx bestDot = 0; bool firstK = true;
+    for (uint32_t k = 0; k < 3; ++k) {
+        for (int sgn = 0; sgn < 2; ++sgn) {   // 0 = +axis, 1 = -axis (so + is considered before -)
+            const FxVec3 cand = (sgn == 0) ? incAxes[k]
+                                           : FxVec3{-incAxes[k].x, -incAxes[k].y, -incAxes[k].z};
+            const fx dt = FxDot(cand, n);
+            if (firstK || dt < bestDot) { bestDot = dt; bestK = k; bestNeg = (sgn == 1); firstK = false; }
+        }
+    }
+    // The incident face outward normal (the chosen most-anti-parallel signed axis) + center + in-plane axes.
+    const FxVec3 incN = bestNeg ? FxVec3{-incAxes[bestK].x, -incAxes[bestK].y, -incAxes[bestK].z}
+                                : incAxes[bestK];
+    const fx incHk = FxAt(incH, bestK);
+    const FxVec3 incFaceCenter = FxVec3{incBody.pos.x + fxmul(incN.x, incHk),
+                                        incBody.pos.y + fxmul(incN.y, incHk),
+                                        incBody.pos.z + fxmul(incN.z, incHk)};
+    uint32_t iui = (bestK == 0) ? 1u : 0u;
+    uint32_t ivi = (bestK == 2) ? 1u : 2u;
+    if (bestK == 1) { iui = 0u; ivi = 2u; }
+    const FxVec3 iu = incAxes[iui];
+    const FxVec3 iv = incAxes[ivi];
+    const fx ihu = FxAt(incH, iui);
+    const fx ihv = FxAt(incH, ivi);
+    // The 4 incident-face corners in the FIXED order (+iu+iv),(-iu+iv),(-iu-iv),(+iu-iv).
+    const int su[4] = {+1, -1, -1, +1};
+    const int sv[4] = {+1, +1, -1, -1};
+    FxVec3 poly[8];
+    int polyN = 0;
+    for (int k = 0; k < 4; ++k) {
+        poly[k] = FxVec3{incFaceCenter.x + su[k] * fxmul(iu.x, ihu) + sv[k] * fxmul(iv.x, ihv),
+                         incFaceCenter.y + su[k] * fxmul(iu.y, ihu) + sv[k] * fxmul(iv.y, ihv),
+                         incFaceCenter.z + su[k] * fxmul(iu.z, ihu) + sv[k] * fxmul(iv.z, ihv)};
+    }
+    polyN = 4;
+
+    // Sutherland-Hodgman clip against the 4 ref-face side planes in the FIXED order (+u,-u,+v,-v). Each
+    // plane is (axis a, half h, sign sgn): a vertex p is INSIDE iff f(p) = h - sgn*FxDot(a, p-faceCenter)
+    // >= 0. A crossing edge (prev,cur) emits the intersection at tparam = f(prev)/(f(prev)-f(cur)) (int64
+    // fxdiv) -> point = prev + tparam*(cur-prev). Iteration order PINNED (edge 0..n-1, prev=last).
+    struct Plane { FxVec3 a; fx h; int sgn; };
+    const Plane planes[4] = {{u, hu, +1}, {u, hu, -1}, {v, hv, +1}, {v, hv, -1}};
+    auto sdist = [&](const Plane& pl, const FxVec3& p) -> fx {
+        const FxVec3 rel = FxVec3{p.x - faceCenter.x, p.y - faceCenter.y, p.z - faceCenter.z};
+        const fx proj = FxDot(pl.a, rel);
+        return pl.h - (fx)(pl.sgn * proj);
+    };
+    for (int pl = 0; pl < 4; ++pl) {
+        FxVec3 out[8];
+        int outN = 0;
+        if (polyN == 0) break;
+        FxVec3 prev = poly[polyN - 1];
+        fx fprev = sdist(planes[pl], prev);
+        for (int k = 0; k < polyN; ++k) {
+            const FxVec3 cur = poly[k];
+            const fx fcur = sdist(planes[pl], cur);
+            const bool curIn = (fcur >= 0);
+            const bool prevIn = (fprev >= 0);
+            if (curIn) {
+                if (!prevIn) {
+                    // entering: emit the crossing point first, then cur.
+                    const fx denom = fprev - fcur;
+                    const fx tp = (denom != 0) ? fxdiv(fprev, denom) : 0;
+                    out[outN++] = FxVec3{prev.x + fxmul(cur.x - prev.x, tp),
+                                         prev.y + fxmul(cur.y - prev.y, tp),
+                                         prev.z + fxmul(cur.z - prev.z, tp)};
+                }
+                out[outN++] = cur;
+            } else if (prevIn) {
+                // leaving: emit the crossing point only.
+                const fx denom = fprev - fcur;
+                const fx tp = (denom != 0) ? fxdiv(fprev, denom) : 0;
+                out[outN++] = FxVec3{prev.x + fxmul(cur.x - prev.x, tp),
+                                     prev.y + fxmul(cur.y - prev.y, tp),
+                                     prev.z + fxmul(cur.z - prev.z, tp)};
+            }
+            prev = cur; fprev = fcur;
+        }
+        polyN = outN;
+        for (int k = 0; k < polyN; ++k) poly[k] = out[k];
+    }
+
+    // Keep the penetrating clipped vertices (depth d = FxDot(n, faceCenter - vertex) >= 0). Their world
+    // contact point = the vertex itself (documented choice); depth = d. 0..8 candidates in clip order.
+    FxVec3 candPts[8];
+    fx     candDepth[8];
+    int    candN = 0;
+    for (int k = 0; k < polyN; ++k) {
+        const FxVec3 rel = FxVec3{faceCenter.x - poly[k].x, faceCenter.y - poly[k].y,
+                                  faceCenter.z - poly[k].z};
+        const fx d = FxDot(n, rel);
+        if (d >= 0) { candPts[candN] = poly[k]; candDepth[candN] = d; ++candN; }
+    }
+
+    m.normal = n;
+    if (candN == 0) {
+        // No clipped vertex penetrates (a grazing/degenerate face contact) -> fall back to ONE point at the
+        // SAT-implied deepest incident-face corner. Keep count>=1 for an overlapping pair (the proof bar).
+        // Use incident-face corner 0 with depth = satResult.penetration (deterministic).
+        m.count = 1;
+        m.points[0] = poly[0 < polyN ? 0 : 0];   // first surviving vertex (or corner 0 if none survived)
+        if (polyN == 0) m.points[0] = incFaceCenter;
+        m.depths[0] = sat.penetration;
+        return m;
+    }
+
+    // Reduce to <=4: ALWAYS keep the DEEPEST (max depth, tie -> lowest clip-order index), then up to 3 MORE
+    // in clip order. Deterministic.
+    int deepest = 0;
+    for (int k = 1; k < candN; ++k) if (candDepth[k] > candDepth[deepest]) deepest = k;
+    m.points[0] = candPts[deepest];
+    m.depths[0] = candDepth[deepest];
+    uint32_t cnt = 1;
+    for (int k = 0; k < candN && cnt < 4; ++k) {
+        if (k == deepest) continue;
+        m.points[cnt] = candPts[k];
+        m.depths[cnt] = candDepth[k];
+        ++cnt;
+    }
+    m.count = cnt;
+    return m;
+}
+
+// ----- ManifoldMeasure: the deterministic summary of a set of pairs' manifolds -------------------------
+// pairs        = total pairs measured; withContact = pairs yielding a non-empty manifold (count>=1);
+// totalPoints  = the sum of all contact points over those manifolds. Pure integer, fixed order.
+struct ManifoldMeasure {
+    uint32_t pairs       = 0;
+    uint32_t withContact = 0;
+    uint32_t totalPoints = 0;
+};
+
+// MeasureManifold(pairs): BoxSat then BuildManifold over each pair, accumulate the deterministic summary.
+inline ManifoldMeasure MeasureManifold(const std::vector<SatPair>& pairs) {
+    ManifoldMeasure m;
+    m.pairs = (uint32_t)pairs.size();
+    for (const SatPair& p : pairs) {
+        const SatResult r = BoxSat(p.bodyA, p.boxA, p.bodyB, p.boxB);
+        const ContactManifold cm = BuildManifold(p.bodyA, p.boxA, p.bodyB, p.boxB, r);
+        if (cm.count > 0) { ++m.withContact; m.totalPoints += cm.count; }
+    }
+    return m;
+}
+
 }  // namespace convex
 }  // namespace hf::sim

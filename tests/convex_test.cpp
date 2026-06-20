@@ -271,6 +271,152 @@ int main() {
               "MeasureSat determinism: two runs BYTE-IDENTICAL");
     }
 
+    // ================= CX2 BuildManifold: a deep face-face stack -> a 4-point manifold ================
+    {
+        // Two unit boxes (halfExtents 1), axis-aligned, stacked on Y with the top one pushed DOWN into the
+        // bottom (centers 1.5 apart on y -> a deep face-face overlap of 0.5; the touching faces are the full
+        // 2x2 patch in XZ -> a 4-corner manifold). A is the lower box, B the upper.
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody a = MakeBoxBody(0, 0, 0);
+        fpx::FxBody b = MakeBoxBody(0, 0, 0);
+        b.pos = {0, kOne + kOne / 2, 0};   // 1.5 above -> overlap 0.5 on Y
+        convex::SatResult r = convex::BoxSat(a, unit, b, unit);
+        check(r.overlap, "CX2 face-stack -> overlap=true");
+        check(r.axisIndex < 6, "CX2 face-stack -> a FACE axis (index < 6)");
+        convex::ContactManifold m = convex::BuildManifold(a, unit, b, unit, r);
+        check(m.count == 4, "CX2 face-stack -> 4-point manifold (full face patch)");
+        bool allNonNeg = true;
+        for (uint32_t k = 0; k < m.count; ++k) if (m.depths[k] < 0) allNonNeg = false;
+        check(allNonNeg, "CX2 face-stack -> all depths >= 0");
+        // Every contact point lies inside BOTH boxes' slabs (within an integer epsilon): the projection onto
+        // each box axis is within halfExtent + eps. eps ~ a few LSB of fixed-point clip drift.
+        const fx eps = kOne / 64;
+        bool inside = true;
+        convex::FxVec3 axA[3], axB[3];
+        convex::BoxAxes(a, axA);
+        convex::BoxAxes(b, axB);
+        for (uint32_t k = 0; k < m.count; ++k) {
+            const convex::FxVec3 pa = fpx::FxSub(m.points[k], a.pos);
+            const convex::FxVec3 pb = fpx::FxSub(m.points[k], b.pos);
+            for (int ax = 0; ax < 3; ++ax) {
+                const fx da = convex::FxDot(pa, axA[ax]);
+                const fx db = convex::FxDot(pb, axB[ax]);
+                const fx ha = convex::FxAt(unit.halfExtents, (uint32_t)ax);
+                if (da > ha + eps || da < -(ha + eps)) inside = false;
+                if (db > ha + eps || db < -(ha + eps)) inside = false;
+            }
+        }
+        check(inside, "CX2 face-stack -> every contact point inside both boxes' slabs");
+        // The normal points from A (lower) toward B (upper): +Y.
+        check(m.normal.y > kOne - kOne / 100, "CX2 face-stack -> normal ~ +Y (A toward B)");
+    }
+
+    // ================= CX2 BuildManifold: a separated pair -> count 0 ================
+    {
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        convex::SatResult r = convex::BoxSat(MakeBoxBody(0, 0, 0), unit, MakeBoxBody(5, 0, 0), unit);
+        check(!r.overlap, "CX2 separated -> SAT overlap=false (precondition)");
+        convex::ContactManifold m = convex::BuildManifold(MakeBoxBody(0, 0, 0), unit,
+                                                          MakeBoxBody(5, 0, 0), unit, r);
+        check(m.count == 0, "CX2 separated -> manifold count == 0");
+    }
+
+    // ================= CX2 BuildManifold: an edge-edge overlap -> 1 point near the expected midpoint =====
+    {
+        // The CX1 skew-edge config: A tilted 45° about X, B tilted 45° about Z, diagonal offset -> the
+        // min-pen axis is an edge-cross (index >= 6); the manifold is ONE point at the segment midpoint.
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody ta = MakeBoxBody(0, 0, 0);
+        fpx::FxBody tb = MakeBoxBody(0, 0, 0);
+        ta.orient = fpx::FxQuatNormalize(fpx::FxQuat{(fx)25080, 0, 0, (fx)60547});       // 45° about X
+        tb.orient = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)25080, (fx)60547});       // 45° about Z
+        const fx off = kOne + kOne / 8;   // 1.125 diagonal (an edge-cross winner per the CX1 sweep)
+        tb.pos = {off, off, off};
+        convex::SatResult r = convex::BoxSat(ta, unit, tb, unit);
+        if (r.overlap && r.axisIndex >= 6) {
+            convex::ContactManifold m = convex::BuildManifold(ta, unit, tb, unit, r);
+            check(m.count == 1, "CX2 edge-edge -> 1-point manifold");
+            check(m.depths[0] == r.penetration, "CX2 edge-edge -> depth == SAT penetration");
+            // The contact point lies BETWEEN the two box centers (the segment midpoint is bounded by the
+            // centers + half-extents). A loose bound: |point - midOfCenters| within the box diagonal.
+            const convex::FxVec3 midC{(ta.pos.x + tb.pos.x) / 2, (ta.pos.y + tb.pos.y) / 2,
+                                      (ta.pos.z + tb.pos.z) / 2};
+            const fx dlen = fpx::FxLength(fpx::FxSub(m.points[0], midC));
+            check(dlen < FromInt(3), "CX2 edge-edge -> contact near the centers' midpoint");
+        } else {
+            check(false, "CX2 edge-edge -> the skew config produced an edge-cross overlap (precondition)");
+        }
+    }
+
+    // ================= CX2 BuildManifold: a touching face pair -> >= 1 point, ~0 depth ================
+    {
+        // Two unit boxes, centers exactly 2.0 apart on x -> faces touch at x=1 (the CX1 boundary case).
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        convex::SatResult r = convex::BoxSat(MakeBoxBody(0, 0, 0), unit, MakeBoxBody(2, 0, 0), unit);
+        check(r.overlap, "CX2 touching -> overlap=true (boundary)");
+        convex::ContactManifold m = convex::BuildManifold(MakeBoxBody(0, 0, 0), unit,
+                                                          MakeBoxBody(2, 0, 0), unit, r);
+        check(m.count >= 1, "CX2 touching -> at least 1 contact point");
+        bool nearZero = true;
+        for (uint32_t k = 0; k < m.count; ++k) if (m.depths[k] > kOne / 64) nearZero = false;
+        check(nearZero, "CX2 touching -> all depths ~ 0 (the boundary)");
+    }
+
+    // ================= CX2 BuildManifold: determinism (two runs byte-identical) ================
+    {
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody a = MakeBoxBody(0, 0, 0);
+        fpx::FxBody b = MakeBoxBody(0, 0, 0);
+        b.pos = {kOne / 2, kOne + kOne / 4, kOne / 3};   // an off-center deep face overlap
+        convex::SatResult r = convex::BoxSat(a, unit, b, unit);
+        convex::ContactManifold m1 = convex::BuildManifold(a, unit, b, unit, r);
+        convex::ContactManifold m2 = convex::BuildManifold(a, unit, b, unit, r);
+        bool same = (m1.count == m2.count);
+        for (uint32_t k = 0; k < m1.count && same; ++k) {
+            if (m1.points[k].x != m2.points[k].x || m1.points[k].y != m2.points[k].y ||
+                m1.points[k].z != m2.points[k].z || m1.depths[k] != m2.depths[k]) same = false;
+        }
+        if (m1.normal.x != m2.normal.x || m1.normal.y != m2.normal.y || m1.normal.z != m2.normal.z)
+            same = false;
+        check(same, "CX2 determinism: two BuildManifold runs BYTE-IDENTICAL");
+    }
+
+    // ================= CX2 BuildManifold: the reduction keeps the DEEPEST point ================
+    {
+        // A TILTED top box over a flat bottom box -> the clipped corners have DIFFERENT depths; m.points[0]
+        // (after the reduction) must be the deepest of the kept candidates. We verify points[0]'s depth is
+        // the MAX over the reported points (the reduction's invariant).
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody a = MakeBoxBody(0, 0, 0);
+        fpx::FxBody b = MakeBoxBody(0, 0, 0);
+        b.orient = fpx::FxQuatNormalize(fpx::FxQuat{(fx)8000, 0, 0, (fx)64000});  // a small tilt about X
+        b.pos = {0, kOne + kOne / 2, 0};   // pressed down into A
+        convex::SatResult r = convex::BoxSat(a, unit, b, unit);
+        convex::ContactManifold m = convex::BuildManifold(a, unit, b, unit, r);
+        check(m.count >= 1, "CX2 reduction -> at least 1 point");
+        bool deepestFirst = true;
+        for (uint32_t k = 1; k < m.count; ++k) if (m.depths[k] > m.depths[0]) deepestFirst = false;
+        check(deepestFirst, "CX2 reduction -> points[0] is the DEEPEST kept point");
+    }
+
+    // ================= CX2 MeasureManifold: deterministic summary over a mixed pair set ================
+    {
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        std::vector<convex::SatPair> pairs;
+        // Pair 0: deep face stack (4 points).
+        pairs.push_back({MakeBoxBody(0, 0, 0), unit, MakeBoxBody(0, 0, 0), unit});
+        pairs[0].bodyB.pos = {0, kOne + kOne / 2, 0};
+        // Pair 1: separated (no contact).
+        pairs.push_back({MakeBoxBody(0, 0, 0), unit, MakeBoxBody(5, 0, 0), unit});
+        convex::ManifoldMeasure m = convex::MeasureManifold(pairs);
+        check(m.pairs == 2, "CX2 MeasureManifold counts 2 pairs");
+        check(m.withContact == 1, "CX2 MeasureManifold counts 1 pair with contact");
+        check(m.totalPoints == 4, "CX2 MeasureManifold totalPoints == 4 (the face stack)");
+        convex::ManifoldMeasure m2 = convex::MeasureManifold(pairs);
+        check(std::memcmp(&m, &m2, sizeof(convex::ManifoldMeasure)) == 0,
+              "CX2 MeasureManifold determinism: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("convex_test: ALL PASS\n");
     else std::printf("convex_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

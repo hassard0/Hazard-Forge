@@ -1108,6 +1108,17 @@ hf_compile_shaders(
     # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU
     # SatResult array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/convex_sat.comp.hlsl:cs"
+    # Deterministic Convex Rigid-Body Contacts Slice 2 (Slice CX2): convex_manifold.comp is the box-box
+    # CONTACT MANIFOLD pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
+    # runs the 15-axis BoxSat then BuildManifold (the reference/incident face clip via Sutherland-Hodgman in
+    # a FIXED corner + plane order + the deepest+clip-order reduction, OR the edge-edge single closest-point
+    # contact), copying engine/sim/convex.h::BuildManifold + ClosestPointsOnSegments VERBATIM, writing its
+    # OWN gManifolds[pair] ManifoldGpu (count, 4 points, 4 depths, normal). manifoldEnabled=0 -> cleared.
+    # Like convex_sat.comp this is int64 (the FxDot/FxCross/FxNormalize/fxdiv Q16.16 products), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --convex-manifold
+    # showcase runs the CPU BuildManifold instead (byte-identical by construction). Pure integer SSBO compute
+    # + ReadBuffer -> bit-exact GPU==CPU ManifoldGpu array + cross-backend, proven memcmp. NO new RHI.
+    "shaders/convex_manifold.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

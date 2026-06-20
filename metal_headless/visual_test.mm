@@ -26298,6 +26298,227 @@ static int RunConvexSatShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CX2 — Deterministic Convex Rigid-Body Contacts THE CONTACT MANIFOLD showcase (--convex-manifold)
+// (the 2nd slice of FLAGSHIP #19). Like CX1's --convex-sat, the manifold clip is int64 (the fxdiv/FxDot/
+// FxCross Q16.16 products), so shaders/convex_manifold.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc
+// cannot) and is NOT in this dir's hf_gen_msl list; on Metal the --convex-manifold showcase runs the CPU
+// convex::BuildManifold — the EXACT bit-exact reference the Vulkan --convex-manifold-shot GPU==CPU memcmp
+// already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION
+// (the convex_sat.comp / fpx_solve.comp convention), while the Vulkan side carries the GPU==CPU proof. So this
+// builds the SAME deterministic 12-box-pair scene as CX1, runs BoxSat -> BuildManifold over it, and CPU-colors
+// the SAME 2D top-down (XZ) view + contact-point markers -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/convex_manifold.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunConvexManifoldShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    auto qIdentity = []() { return fpx::FxQuat{0, 0, 0, convex::kOne}; };
+    auto qAboutX = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45}); };
+    auto qAboutZ = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45}); };
+    auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q) {
+        fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; return b;
+    };
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    std::vector<convex::SatPair> pairs;
+    std::vector<bool> truthOverlap;
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+    const convex::FxBox kBig{convex::FxVec3{fi(4), fi(4), fi(4)}};
+    auto addPair = [&](convex::SatPair p, bool overlap) {
+        pairs.push_back(p); truthOverlap.push_back(overlap);
+    };
+    addPair({bodyAt(fi(-7), 0, fi(6), qIdentity()), kUnit, bodyAt(fi(-2), 0, fi(6), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(5), 0, fi(6), qIdentity()), kBig, bodyAt(fi(6), 0, fi(6), qIdentity()), kUnit}, true);
+    addPair({bodyAt(fi(-7), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(-5), 0, fi(2), qIdentity()), kUnit}, true);
+    addPair({bodyAt(0, 0, fi(2), qAboutX()), kUnit, bodyAt(fi(1), fi(1), fi(3), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(4), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(8), fi(4), fi(6), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(-7), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-11, 2), 0, fi(-2), qIdentity()), kUnit}, true);
+    addPair({bodyAt(fi(-2), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-1, 1), 0, fi(-2), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(3), 0, fi(-2), qAboutZ()), kUnit, bodyAt(fi(8), 0, fi(-2), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(-6), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(-11, 2), 0, fi(-6), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(-1), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(1, 4), fh(5, 4), fh(-19, 4), qAboutZ()), kUnit}, true);
+    addPair({bodyAt(fi(4), 0, fi(-6), qIdentity()), kUnit, bodyAt(fi(7), 0, fi(-6), qIdentity()), kUnit}, false);
+    addPair({bodyAt(fi(8), 0, fi(0), qIdentity()), kBig, bodyAt(fi(8), 0, fh(3, 2), qIdentity()), kUnit}, true);
+
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // Packed ManifoldGpu (== the Vulkan --convex-manifold-shot ManifoldGpu): 20 x int32 (80 bytes).
+    struct ManifoldGpu {
+        uint32_t count;
+        int32_t p0x, p0y, p0z, p1x, p1y, p1z, p2x, p2y, p2z, p3x, p3y, p3z;
+        int32_t d0, d1, d2, d3;
+        int32_t nx, ny, nz;
+    };
+    static_assert(sizeof(ManifoldGpu) == 80, "ManifoldGpu std430 layout");
+    auto packManifold = [&](const convex::ContactManifold& m) {
+        ManifoldGpu g{};
+        g.count = m.count;
+        g.p0x = m.points[0].x; g.p0y = m.points[0].y; g.p0z = m.points[0].z;
+        g.p1x = m.points[1].x; g.p1y = m.points[1].y; g.p1z = m.points[1].z;
+        g.p2x = m.points[2].x; g.p2y = m.points[2].y; g.p2z = m.points[2].z;
+        g.p3x = m.points[3].x; g.p3y = m.points[3].y; g.p3z = m.points[3].z;
+        g.d0 = m.depths[0]; g.d1 = m.depths[1]; g.d2 = m.depths[2]; g.d3 = m.depths[3];
+        g.nx = m.normal.x; g.ny = m.normal.y; g.nz = m.normal.z;
+        return g;
+    };
+
+    std::vector<convex::SatResult> sats((size_t)kPairCount);
+    auto run = [&](std::vector<ManifoldGpu>& out) {
+        out.assign((size_t)kPairCount, ManifoldGpu{});
+        for (uint32_t i = 0; i < kPairCount; ++i) {
+            sats[i] = convex::BoxSat(pairs[i].bodyA, pairs[i].boxA, pairs[i].bodyB, pairs[i].boxB);
+            out[i] = packManifold(convex::BuildManifold(pairs[i].bodyA, pairs[i].boxA,
+                                                        pairs[i].bodyB, pairs[i].boxB, sats[i]));
+        }
+    };
+
+    std::vector<ManifoldGpu> results;
+    run(results);
+    uint32_t withContact = 0, totalPoints = 0;
+    for (const ManifoldGpu& r : results) if (r.count) { ++withContact; totalPoints += r.count; }
+
+    std::printf("convex-manifold: {pairs:%u, withContact:%u, points:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU convex::BuildManifold, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, withContact, totalPoints);
+
+    std::vector<ManifoldGpu> results2;
+    run(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(ManifoldGpu)) != 0)
+        return fail("convex-manifold: two runs differ (nondeterministic)");
+    std::printf("convex-manifold determinism: two runs BYTE-IDENTICAL\n");
+
+    const fx eps = kOne / 16;
+    bool allOverlapHaveContact = true, pointsInsideBoxes = true, depthNonNeg = true;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool ov = sats[i].overlap;
+        if (ov && results[i].count == 0u) allOverlapHaveContact = false;
+        if (!ov && results[i].count != 0u) allOverlapHaveContact = false;
+        convex::FxVec3 axA[3], axB[3];
+        convex::BoxAxes(pairs[i].bodyA, axA);
+        convex::BoxAxes(pairs[i].bodyB, axB);
+        const int32_t* pts[4] = {&results[i].p0x, &results[i].p1x, &results[i].p2x, &results[i].p3x};
+        const int32_t depths[4] = {results[i].d0, results[i].d1, results[i].d2, results[i].d3};
+        for (uint32_t k = 0; k < results[i].count; ++k) {
+            const convex::FxVec3 pt{pts[k][0], pts[k][1], pts[k][2]};
+            if (depths[k] < 0) depthNonNeg = false;
+            const convex::FxVec3 pa = fpx::FxSub(pt, pairs[i].bodyA.pos);
+            const convex::FxVec3 pb = fpx::FxSub(pt, pairs[i].bodyB.pos);
+            for (int ax = 0; ax < 3; ++ax) {
+                const fx da = convex::FxDot(pa, axA[ax]);
+                const fx db = convex::FxDot(pb, axB[ax]);
+                const fx ha = convex::FxAt(pairs[i].boxA.halfExtents, (uint32_t)ax);
+                const fx hb = convex::FxAt(pairs[i].boxB.halfExtents, (uint32_t)ax);
+                if (da > ha + eps || da < -(ha + eps)) pointsInsideBoxes = false;
+                if (db > hb + eps || db < -(hb + eps)) pointsInsideBoxes = false;
+            }
+        }
+    }
+    if (!allOverlapHaveContact || !pointsInsideBoxes || !depthNonNeg)
+        return fail("convex-manifold: correctness failed");
+    std::printf("convex-manifold correct: {allOverlapHaveContact:true, pointsInsideBoxes:true, "
+                "depthNonNeg:true}\n");
+
+    if (results[11].count != 4u) return fail("convex-manifold: the deep face-face pair did not yield 4 points");
+    std::printf("convex-manifold control: {faceFace:4pts}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view as the Vulkan --convex-manifold-shot. ---
+    const int kPxPerUnit = 18, kMargin = 24;
+    const int kWorldHalf = 12;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalf) * kPxPerUnit;
+        iy = kMargin + (gz + kWorldHalf) * kPxPerUnit;
+    };
+    auto worldToPxF = [&](fx wx, fx wz, int& ix, int& iy) {
+        ix = kMargin + (int)(((int64_t)(wx + (kWorldHalf << convex::kFrac)) * kPxPerUnit) >> convex::kFrac);
+        iy = kMargin + (int)(((int64_t)(wz + (kWorldHalf << convex::kFrac)) * kPxPerUnit) >> convex::kFrac);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawBox = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 az = axes[2];
+        const fx hx = box.halfExtents.x, hz = box.halfExtents.z;
+        fx cxs[4], czs[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sz[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sz[k] * fpx::fxmul(hz, az.x);
+            czs[k] = b.pos.z + sx[k] * fpx::fxmul(hx, ax.z) + sz[k] * fpx::fxmul(hz, az.z);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], czs[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], czs[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    const Vec3 hotA{1.0f, 0.55f, 0.25f}, hotB{1.0f, 0.78f, 0.40f};
+    const Vec3 coldA{0.30f, 0.55f, 0.95f}, coldB{0.50f, 0.72f, 1.0f};
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool ov = results[i].count != 0u;
+        drawBox(pairs[i].bodyA, pairs[i].boxA, ov ? hotA : coldA);
+        drawBox(pairs[i].bodyB, pairs[i].boxB, ov ? hotB : coldB);
+        if (!ov) continue;
+        const int32_t* pts[4] = {&results[i].p0x, &results[i].p1x, &results[i].p2x, &results[i].p3x};
+        const int32_t depths[4] = {results[i].d0, results[i].d1, results[i].d2, results[i].d3};
+        int cx0 = 0, cy0 = 0;
+        for (uint32_t k = 0; k < results[i].count; ++k) {
+            const fx px = pts[k][0], pz = pts[k][2];
+            int mx, my;
+            worldToPxF(px, pz, mx, my);
+            if (k == 0) { cx0 = mx; cy0 = my; }
+            const float dn = (float)depths[k] / (float)(kOne / 2);
+            const float dd = dn < 0 ? 0 : (dn > 1 ? 1 : dn);
+            const Vec3 mc{0.2f + 0.8f * dd, 1.0f - 0.6f * dd, 0.3f + 0.7f * dd};
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox) putPx(mx + ox, my + oy, mc);
+        }
+        const fx nx = results[i].nx, nz = results[i].nz;
+        const int ex = cx0 + (int)((int64_t)(nx >> 10) * kPxPerUnit / (1 << 6));
+        const int ez = cy0 + (int)((int64_t)(nz >> 10) * kPxPerUnit / (1 << 6));
+        drawLine(cx0, cy0, ex, ez, Vec3{1.0f, 1.0f, 1.0f});
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — contact-manifold top-down view (%u pairs, %u with contact, %u points)\n",
+                outPath, imgW, imgH, kPairCount, withContact, totalPoints);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -45744,6 +45965,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-sat") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_sat.png";
             try { return RunConvexSatShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --convex-manifold <out.png>: render the Deterministic Convex Rigid-Body Contacts CONTACT MANIFOLD
+        // showcase (Slice CX2, the 2nd slice of FLAGSHIP #19). On Metal this runs the CPU manifold:
+        // convex_manifold.comp is int64/Vulkan-only (glslc can't parse the fxdiv/FxDot/FxCross int64), so Metal
+        // runs the CPU convex::BoxSat -> BuildManifold over the SAME fixed 12-box-pair scene -> the EXACT
+        // bit-exact reference the Vulkan --convex-manifold-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical; every overlapping pair yields >=1 contact point inside both boxes. The image golden
+        // is a PURE-INTEGER 2D top-down manifold view, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/convex_manifold.png.
+        if (argc > 1 && std::strcmp(argv[1], "--convex-manifold") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_convex_manifold.png";
+            try { return RunConvexManifoldShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice
