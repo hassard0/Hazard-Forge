@@ -960,5 +960,172 @@ inline StackMeasure MeasureStack(const ConvexWorld& world) {
     return ms;
 }
 
+// =========================================================================================================
+// Slice CX5 — LOCKSTEP + ROLLBACK (the netcode headline). APPENDED after MeasureStack (CX1-CX4's lines above
+// are BYTE-FROZEN). This is the FR5/BD5/CP5/GR5/CG5/GF5/AC5/VH5/JT5 twin for the convex contact sim. The CX4
+// step (StepConvexWorld) is already fully deterministic (fixed orders, integer math), so LOCKSTEP falls out:
+// feed two independent ConvexWorld peers the SAME initial world + the SAME per-tick command stream, step both
+// K ticks, and they are BYTE-IDENTICAL. ROLLBACK: snapshot the world at a tick, mis-simulate forward (a
+// wrong/late command that genuinely diverges), then restore the snapshot + re-sim with the CORRECT command
+// stream -> bit-identical to the authority. The moat sentence: ANGULAR-IMPULSE CONVEX rigid-body contacts
+// that are lockstep-replayable — UE5's float Chaos can never guarantee this.
+//
+// PURE CPU (NO new shader, NO new RHI). CX5 only ADDS the command + snapshot/restore + harness functions; it
+// wraps StepConvexWorld (CX4, byte-frozen). Both backends run the IDENTICAL harness -> the golden is
+// bit-identical BY CONSTRUCTION (cross-vendor 0 px). The command vocab mirrors the fpx FPX5 naming
+// (kCmdAddImpulse/kCmdSetAngVel/ApplyCommand) but is CONVEX-LOCAL over ConvexWorld (NOT the fpx FxWorld ones).
+
+#include <cstring>   // std::memcmp / std::memcpy (the byte-identical snapshot round-trip + the peer memcmp)
+
+// ----- ConvexCommand: ONE per-tick perturbation input event (the FR5 FxCommand / BD5 BoidsCommand twin) ---
+// A deterministic input applied BEFORE the StepConvexWorld of its `tick`. kind = kConvexCmdAddImpulse (an
+// impulse: body.vel += arg·body.invMass — statics unaffected since invMass==0) or kConvexCmdSetAngVel
+// (body.angVel = arg — a spin input). A std::vector<ConvexCommand> is the command STREAM, processed in ARRAY
+// ORDER each tick (the deterministic input-order contract — the same order on every peer/platform). Pure int.
+inline constexpr uint32_t kConvexCmdAddImpulse = 0u;   // body.vel += arg·body.invMass (an input impulse)
+inline constexpr uint32_t kConvexCmdSetAngVel  = 1u;   // body.angVel = arg (an input spin)
+
+struct ConvexCommand {
+    uint32_t tick   = 0;   // the tick this perturbation fires at (applied BEFORE the step)
+    uint32_t kind   = 0;   // kConvexCmdAddImpulse / kConvexCmdSetAngVel
+    uint32_t bodyId = 0;   // the target body index
+    FxVec3   arg;          // the Q16.16 payload (impulse delta-velocity / angular velocity)
+};
+
+// ----- ApplyConvexCommands(world, commands, tick): apply this tick's commands in FIXED array order ---------
+// Apply, in the commands' FIXED array order, every command whose .tick == `tick`. An out-of-range bodyId is a
+// no-op (the deterministic guard). kConvexCmdAddImpulse scales arg by the body's invMass (so it is a true
+// IMPULSE -> velocity change, and a STATIC body with invMass==0 is unaffected BY CONSTRUCTION). An unknown
+// kind is a no-op. Pure integer, fixed order -> bit-identical CPU<->Vulkan<->Metal.
+inline void ApplyConvexCommands(ConvexWorld& world, const std::vector<ConvexCommand>& commands, uint32_t tick) {
+    for (size_t c = 0; c < commands.size(); ++c) {
+        const ConvexCommand& cmd = commands[c];
+        if (cmd.tick != tick) continue;
+        if (cmd.bodyId >= (uint32_t)world.bodies.size()) continue;   // out-of-range -> no-op (deterministic)
+        FxBody& b = world.bodies[(size_t)cmd.bodyId];
+        if (cmd.kind == kConvexCmdAddImpulse) {
+            // an IMPULSE: dv = arg·invMass (statics with invMass==0 take nothing). Per-component fxmul.
+            b.vel = FxAdd(b.vel, FxScale(cmd.arg, b.invMass));
+        } else if (cmd.kind == kConvexCmdSetAngVel) {
+            b.angVel = cmd.arg;   // a spin input (overwrites — a body's commanded angular velocity)
+        }
+    }
+}
+
+// ----- SimConvexTick(world, cfg, commands, tick): ONE deterministic tick with its inputs ------------------
+// (1) ApplyConvexCommands(world, commands, tick) — this tick's perturbations, in array order, BEFORE the step
+//     so the impulse/spin integrates this tick; (2) StepConvexWorld(world, cfg) — the CX4 5-pass tick
+//     (predict-integrate -> all-pairs narrowphase -> world Gauss-Seidel impulse -> position de-penetration),
+//     reused VERBATIM. Pure integer, fixed order -> bit-identical on every peer/platform.
+inline void SimConvexTick(ConvexWorld& world, const ConvexStepConfig& cfg,
+                          const std::vector<ConvexCommand>& commands, uint32_t tick) {
+    ApplyConvexCommands(world, commands, tick);
+    StepConvexWorld(world, cfg);
+}
+
+// ----- ConvexSnapshot: the captured mutable world state at a tick (the rollback restore point) ------------
+// The ONLY mutable replayable state is the bodies vector (the `boxes` are immutable/shared half-extents, so
+// they are NOT snapshotted) + the tick. A deep-copy of std::vector<FxBody>. Bit-exact round-trip with
+// RestoreConvex: RestoreConvex(world, SnapshotConvex(world0, T)) leaves world.bodies == world0.bodies
+// byte-for-byte.
+struct ConvexSnapshot {
+    std::vector<FxBody> bodies;   // a deep-copy of the body world (vel/pos/orient/angVel/invMass/flags)
+    uint32_t            tick = 0; // the tick this snapshot was taken at (the rollback restore point)
+};
+
+// ----- SnapshotConvex(world, tick): deep-copy the body world (the rollback restore point) -----------------
+// A value copy -> deep-copies the body vector. Bit-exact round-trip with RestoreConvex.
+inline ConvexSnapshot SnapshotConvex(const ConvexWorld& world, uint32_t tick) {
+    ConvexSnapshot snap;
+    snap.bodies = world.bodies;   // deep copy
+    snap.tick   = tick;
+    return snap;
+}
+
+// ----- RestoreConvex(world, snap): restore the body world from a snapshot (the rollback) ------------------
+// Memberwise copy — restores vel/pos/orient/angVel exactly. Bit-exact round-trip with SnapshotConvex. The
+// `boxes` are immutable/shared, so they are left untouched.
+inline void RestoreConvex(ConvexWorld& world, const ConvexSnapshot& snap) {
+    world.bodies = snap.bodies;   // restore the deep-copied body world
+}
+
+// ----- ConvexBodiesEqual(a, b): byte-for-byte equality of two body vectors (the peer/rollback memcmp) -----
+// The make-or-break comparison the lockstep + rollback proofs build on (the FxBody is a flat POD -> a memcmp
+// over the whole vector is exact). Returns false on a size mismatch.
+inline bool ConvexBodiesEqual(const std::vector<FxBody>& a, const std::vector<FxBody>& b) {
+    if (a.size() != b.size()) return false;
+    if (a.empty()) return true;
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(FxBody)) == 0;
+}
+
+// ----- RunConvexLockstep(world0, cfg, commands, ticks): two peers converge from inputs alone --------------
+// THE peer entry point (the FR5 RunFractLockstep / BD5 RunBoidsLockstep control flow over SimConvexTick). Two
+// independent peers (authority + replica) BOTH start from `world0`, BOTH run SimConvexTick for `ticks` with
+// the SAME command stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism. Sets
+// *outIdentical (if non-null) to whether the two final body vectors are byte-identical (the make-or-break
+// lockstep proof) + returns the converged AUTHORITY world (for the golden). The peer step order is PINNED.
+inline ConvexWorld RunConvexLockstep(const ConvexWorld& world0, const ConvexStepConfig& cfg,
+                                     const std::vector<ConvexCommand>& commands, uint32_t ticks,
+                                     bool* outIdentical = nullptr) {
+    ConvexWorld authority = world0;   // a fresh copy
+    ConvexWorld replica   = world0;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimConvexTick(authority, cfg, commands, t);
+        SimConvexTick(replica,   cfg, commands, t);
+    }
+    if (outIdentical) *outIdentical = ConvexBodiesEqual(authority.bodies, replica.bodies);
+    return authority;
+}
+
+// ----- RunConvexRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) ---------------
+// The rollback harness (the FR5 RunFractRollback / BD5 RunBoidsRollback control flow over SimConvexTick).
+// (1) advance ticks 0..rollbackAt from `world0` applying authStream; (2) SAVE a ConvexSnapshot AT rollbackAt
+// (SnapshotConvex — the body world); (2b) speculatively advance a few ticks with the MISPREDICTED stream (a
+// WRONG/extra impulse — the client prediction that diverges), capturing that diverged intermediate;
+// (3) ROLLBACK — RestoreConvex to the snapshot + RE-SIMULATE rollbackAt..ticks with the CORRECT authStream ->
+// the corrected final world. Returns the corrected world; sets *outCorrectedEqAuthority (if non-null) to
+// whether it == RunConvexLockstep(world0, cfg, authStream, ticks) byte-for-byte, and *outMispredictDiverged
+// (if non-null) to whether the speculative pre-rollback state DIFFERED from the authority at the same tick
+// (proving a REAL divergence was corrected, not a no-op). cfg + the streams are CONSTANT, NOT snapshotted.
+inline ConvexWorld RunConvexRollback(const ConvexWorld& world0, const ConvexStepConfig& cfg,
+                                     const std::vector<ConvexCommand>& authStream,
+                                     const std::vector<ConvexCommand>& mispredictStream,
+                                     uint32_t ticks, uint32_t rollbackAt,
+                                     bool* outCorrectedEqAuthority = nullptr,
+                                     bool* outMispredictDiverged = nullptr) {
+    ConvexWorld w = world0;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimConvexTick(w, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — just the body world).
+    const ConvexSnapshot snap = SnapshotConvex(w, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimConvexTick(w, cfg, mispredictStream, rollbackAt + s);
+    ConvexWorld speculative = w;   // the diverged pre-rollback intermediate (for the "real divergence" proof)
+    // (3) ROLLBACK: restore the snapshot (the body world) + re-sim rollbackAt..ticks with the authStream.
+    RestoreConvex(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimConvexTick(w, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        ConvexWorld authAtSpec = world0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimConvexTick(authAtSpec, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !ConvexBodiesEqual(speculative.bodies, authAtSpec.bodies);
+        if (outCorrectedEqAuthority) {
+            const ConvexWorld authFinal = RunConvexLockstep(world0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = ConvexBodiesEqual(w.bodies, authFinal.bodies);
+        }
+    }
+    return w;
+}
+
 }  // namespace convex
 }  // namespace hf::sim

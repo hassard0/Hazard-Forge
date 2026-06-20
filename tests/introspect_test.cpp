@@ -440,6 +440,8 @@ int main() {
             bool sawConvexImpulseFeature = false;
             // Slice CX4: the deterministic-convex-step capability is advertised.
             bool sawConvexStepFeature = false;
+            // Slice CX5: the deterministic-convex-lockstep capability is advertised.
+            bool sawConvexLockstepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -620,6 +622,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-convex-manifold") sawConvexManifoldFeature = true;
                     if (AsString(el->value) == "deterministic-convex-impulse") sawConvexImpulseFeature = true;
                     if (AsString(el->value) == "deterministic-convex-step") sawConvexStepFeature = true;
+                    if (AsString(el->value) == "deterministic-convex-lockstep") sawConvexLockstepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -784,6 +787,7 @@ int main() {
         check(sawConvexManifoldFeature, "engine.features includes deterministic-convex-manifold");
         check(sawConvexImpulseFeature, "engine.features includes deterministic-convex-impulse");
         check(sawConvexStepFeature, "engine.features includes deterministic-convex-step");
+        check(sawConvexLockstepFeature, "engine.features includes deterministic-convex-lockstep");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -1062,6 +1066,8 @@ int main() {
         bool sawConvexTumbleShot = false;
         // Slice CX4: the --convex-stack-shot showcase flag is listed in the showcase manifest.
         bool sawConvexStackShot = false;
+        // Slice CX5: the --convex-lockstep-shot showcase flag is listed in the showcase manifest.
+        bool sawConvexLockstepShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1263,6 +1269,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--convex-manifold-shot") sawConvexManifoldShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--convex-tumble-shot") sawConvexTumbleShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--convex-stack-shot") sawConvexStackShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--convex-lockstep-shot") sawConvexLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-contact-shot") sawGrainContactShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-friction-shot") sawGrainFrictionShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--grain-lockstep-shot") sawGrainLockstepShot = true;
@@ -1429,6 +1436,7 @@ int main() {
         check(sawConvexManifoldShot, "showcases manifest includes --convex-manifold-shot");
         check(sawConvexTumbleShot, "showcases manifest includes --convex-tumble-shot");
         check(sawConvexStackShot, "showcases manifest includes --convex-stack-shot");
+        check(sawConvexLockstepShot, "showcases manifest includes --convex-lockstep-shot");
         check(sawGrainContactShot, "showcases manifest includes --grain-contact-shot");
         check(sawGrainFrictionShot, "showcases manifest includes --grain-friction-shot");
         check(sawGrainLockstepShot, "showcases manifest includes --grain-lockstep-shot");

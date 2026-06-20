@@ -26857,6 +26857,183 @@ static int RunConvexStackShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CX5 — Deterministic Convex Rigid-Body Contacts LOCKSTEP + ROLLBACK showcase (--convex-lockstep)
+// (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #19, the FR5/BD5 twin). PURE CPU — NO GPU compute, NO new
+// shader, NO new RHI; the CX5 harness (convex.h::RunConvexLockstep/RunConvexRollback) is header-only integer
+// math, so on Metal it runs the IDENTICAL CPU harness the Vulkan --convex-lockstep-shot runs on Windows ->
+// the converged authority-world golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform
+// bit-identity IS the lockstep evidence). MAXIMAL REUSE: the CX4 StepConvexWorld is reused VERBATIM; CX5 only
+// ADDS the command + snapshot/restore + harness. Builds the SAME CX4 stack scene + the SAME command stream as
+// the Vulkan --convex-lockstep-shot, runs RunConvexLockstep twice + RunConvexRollback once; asserts
+// authority==replica + rollback==authority + mispredicted!=authority BIT-EXACT; renders the converged
+// authority world via the CX4 2D side-view render path. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/convex_lockstep.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunConvexLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+
+    // The deterministic step config (== the Vulkan --convex-lockstep-shot + the convex_test makeStepCfg).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 20;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+    kCfg.angDamp     = (fx)((int64_t)50 * kOne / 100);  // 0.5
+    kCfg.posIters    = 4;
+    const uint32_t kTicks = 120u;
+    const uint32_t kRollbackAt = 20u;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+    const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+    auto buildStack = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+        w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        return w;
+    };
+    const convex::ConvexWorld kInit = buildStack();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The scripted authoritative command stream (== the Vulkan --convex-lockstep-shot, verbatim).
+    const std::vector<convex::ConvexCommand> authStream = {
+        convex::ConvexCommand{4u,  convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(2), 0, 0}},
+        convex::ConvexCommand{8u,  convex::kConvexCmdSetAngVel,  2u, convex::FxVec3{0, kOne, 0}},
+        convex::ConvexCommand{12u, convex::kConvexCmdAddImpulse, 1u, convex::FxVec3{0, 0, kOne}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+    std::vector<convex::ConvexCommand> mispredictStream = authStream;
+    mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 3u,
+                                                     convex::FxVec3{fi(30), 0, 0}});
+
+    // === The harness (PURE CPU) ===
+    bool lockstepIdentical = false;
+    const convex::ConvexWorld authority =
+        convex::RunConvexLockstep(kInit, kCfg, authStream, kTicks, &lockstepIdentical);
+    const convex::ConvexWorld replica = convex::RunConvexLockstep(kInit, kCfg, authStream, kTicks);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    const convex::ConvexWorld rolledBack =
+        convex::RunConvexRollback(kInit, kCfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                  &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP.
+    if (!lockstepIdentical || !convex::ConvexBodiesEqual(authority.bodies, replica.bodies))
+        return fail("convex-lockstep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("convex-lockstep: {bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL\n",
+                kBodyCount, kTicks, kCommandCount);
+
+    // PROOF (2) DETERMINISM (+ snapshot round-trip).
+    const convex::ConvexWorld authority2 = convex::RunConvexLockstep(kInit, kCfg, authStream, kTicks);
+    if (!convex::ConvexBodiesEqual(authority2.bodies, authority.bodies))
+        return fail("convex-lockstep: two runs differ (nondeterministic)");
+    {
+        convex::ConvexWorld w = convex::RunConvexLockstep(kInit, kCfg, authStream, kRollbackAt);
+        const convex::ConvexSnapshot snap = convex::SnapshotConvex(w, kRollbackAt);
+        convex::SimConvexTick(w, kCfg, authStream, kRollbackAt);
+        convex::RestoreConvex(w, snap);
+        if (!convex::ConvexBodiesEqual(w.bodies, snap.bodies))
+            return fail("convex-lockstep: snapshot round-trip != original");
+    }
+    std::printf("convex-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK.
+    if (!rollbackCorrected || !convex::ConvexBodiesEqual(rolledBack.bodies, authority.bodies))
+        return fail("convex-lockstep: rollback != authority (misprediction not corrected)");
+    std::printf("convex-lockstep rollback: corrected==authority BIT-EXACT\n");
+
+    // PROOF (4) mispredict real.
+    if (!mispredictDiverged)
+        return fail("convex-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("convex-lockstep mispredict: diverged before rollback (real divergence corrected)\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the converged authority world as the Vulkan
+    // --convex-lockstep-shot (identical by construction). ---
+    const convex::ConvexWorld& cw = authority;
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    drawBoxXY(cw.bodies[0], kFloor, Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 slabCol[3] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.95f, 0.70f, 0.25f},
+                             Vec3{0.85f, 0.90f, 0.40f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawBoxXY(cw.bodies[i], kSlab, slabCol[(i - 1) % 3]);
+
+    const convex::StackMeasure ms = convex::MeasureStack(cw);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — convex lockstep+rollback converged stack side-view "
+                "(%u boxes, %u ticks, maxSpeed=%d)\n", outPath, imgW, imgH, kBodyCount, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -46345,6 +46522,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_stack.png";
             try { return RunConvexStackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --convex-lockstep <out.png>: render the Deterministic Convex Rigid-Body Contacts LOCKSTEP + ROLLBACK
+        // showcase (Slice CX5, the NETCODE HEADLINE, the 5th slice of FLAGSHIP #19, the FR5/BD5 twin). PURE CPU
+        // — the CX5 harness (convex.h::RunConvexLockstep/RunConvexRollback) is header-only integer math, so on
+        // Metal it runs the IDENTICAL CPU harness the Vulkan --convex-lockstep-shot runs on Windows over the
+        // SAME CX4 stack scene + command stream -> the converged authority-world golden is bit-identical
+        // cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence). Asserts
+        // authority==replica + rollback==authority + mispredicted!=authority BIT-EXACT; two runs byte-identical.
+        // The image golden is a PURE-INTEGER 2D side-view of the converged tower, identical to the Vulkan path
+        // BY CONSTRUCTION. NO GPU compute, NO new shader, NO new RHI. New golden tests/golden/metal/convex_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--convex-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_convex_lockstep.png";
+            try { return RunConvexLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

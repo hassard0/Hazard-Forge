@@ -779,6 +779,127 @@ int main() {
         check(same, "CX4 StepConvexWorldN determinism: two runs BYTE-IDENTICAL");
     }
 
+    // ========================================================================================
+    // ============ Slice CX5 — LOCKSTEP + ROLLBACK (the netcode headline) =====================
+    // ========================================================================================
+    // ConvexCommand + ApplyConvexCommands (impulse scaled by invMass / set-angVel, statics no-op) +
+    // SimConvexTick + ConvexSnapshot/SnapshotConvex/RestoreConvex (bit-exact round-trip) +
+    // RunConvexLockstep (authority==replica from inputs alone) + RunConvexRollback (corrected==authority
+    // AND the mispredict genuinely diverged). PURE CPU, all orders PINNED -> bit-identical.
+
+    // The CX4 settling-stack scene (a static floor + 3 dynamic FLAT SLAB boxes) — the lockstep golden scene.
+    const convex::FxBox kSlabL{FxVec3{FromInt(3) / 2, kOne / 2, FromInt(3) / 2}};   // 3 x 1 x 3 slab
+    auto buildLockstepStack = [&]() {
+        convex::ConvexWorld w;
+        convex::FxBox floor{FxVec3{FromInt(8), kOne, FromInt(8)}};
+        w.bodies.push_back(makeWorldBody(0, 0, 0, false)); w.boxes.push_back(floor);
+        w.bodies.push_back(makeWorldBody(0, FromInt(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlabL);
+        w.bodies.push_back(makeWorldBody(0, FromInt(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlabL);
+        w.bodies.push_back(makeWorldBody(0, FromInt(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlabL);
+        return w;
+    };
+
+    // The scripted authoritative command stream: knock the stack with a couple of impulse/angVel
+    // perturbations at fixed early ticks, then it re-settles. Body 3 is the TOP slab (dynamic).
+    const std::vector<convex::ConvexCommand> authStream = {
+        convex::ConvexCommand{4u,  convex::kConvexCmdAddImpulse, 3u, FxVec3{FromInt(2), 0, 0}},
+        convex::ConvexCommand{8u,  convex::kConvexCmdSetAngVel,  2u, FxVec3{0, kOne, 0}},
+        convex::ConvexCommand{12u, convex::kConvexCmdAddImpulse, 1u, FxVec3{0, 0, kOne}},
+    };
+    const uint32_t kLsTicks = 120u;
+    const uint32_t kRollbackAt = 20u;
+
+    // ================= CX5: ApplyConvexCommands — impulse on a dynamic body, no-op on a static body ==
+    {
+        convex::ConvexWorld w = buildLockstepStack();
+        // body 0 is the STATIC floor; body 1 is a dynamic slab.
+        const fpx::FxBody floorBefore = w.bodies[0];
+        const fpx::FxBody dynBefore = w.bodies[1];
+        std::vector<convex::ConvexCommand> cmds = {
+            convex::ConvexCommand{0u, convex::kConvexCmdAddImpulse, 0u, FxVec3{FromInt(5), 0, 0}},  // -> static
+            convex::ConvexCommand{0u, convex::kConvexCmdAddImpulse, 1u, FxVec3{FromInt(3), 0, 0}},  // -> dynamic
+        };
+        convex::ApplyConvexCommands(w, cmds, 0u);
+        check(std::memcmp(&w.bodies[0], &floorBefore, sizeof(fpx::FxBody)) == 0,
+              "CX5 ApplyConvexCommands -> impulse on a STATIC body is a no-op (invMass==0)");
+        // dynamic body's vel.x changed by arg.x * invMass (invMass == kOne -> += arg.x).
+        check(w.bodies[1].vel.x == dynBefore.vel.x + fpx::fxmul(FromInt(3), w.bodies[1].invMass) &&
+              w.bodies[1].pos.x == dynBefore.pos.x,
+              "CX5 ApplyConvexCommands -> impulse on a DYNAMIC body changes vel by arg*invMass");
+        // set-angVel overwrites angVel; out-of-range bodyId is a no-op.
+        std::vector<convex::ConvexCommand> cmds2 = {
+            convex::ConvexCommand{0u, convex::kConvexCmdSetAngVel, 2u, FxVec3{0, kOne, 0}},
+            convex::ConvexCommand{0u, convex::kConvexCmdSetAngVel, 99u, FxVec3{kOne, kOne, kOne}},  // out of range
+        };
+        convex::ApplyConvexCommands(w, cmds2, 0u);
+        check(w.bodies[2].angVel.x == 0 && w.bodies[2].angVel.y == kOne && w.bodies[2].angVel.z == 0,
+              "CX5 ApplyConvexCommands -> set-angVel overwrites angVel (out-of-range bodyId no-op)");
+        // a command whose tick != the applied tick is skipped.
+        convex::ConvexWorld w2 = buildLockstepStack();
+        const fpx::FxBody b1 = w2.bodies[1];
+        convex::ApplyConvexCommands(w2, cmds, 5u);   // cmds are tick 0 -> none apply at tick 5
+        check(std::memcmp(&w2.bodies[1], &b1, sizeof(fpx::FxBody)) == 0,
+              "CX5 ApplyConvexCommands -> commands of a different tick are skipped");
+    }
+
+    // ================= CX5: SnapshotConvex / RestoreConvex bit-exact round-trip =====================
+    {
+        convex::ConvexWorld w0 = buildLockstepStack();
+        // advance a few ticks so the bodies have non-trivial vel/pos/orient/angVel.
+        for (uint32_t t = 0; t < 30u; ++t) convex::SimConvexTick(w0, makeStepCfg(), authStream, t);
+        const convex::ConvexSnapshot snap = convex::SnapshotConvex(w0, 30u);
+        check(snap.tick == 30u, "CX5 SnapshotConvex records the tick");
+        // mutate the world, then restore -> byte-identical to the snapshot moment.
+        convex::ConvexWorld w = w0;
+        convex::SimConvexTick(w, makeStepCfg(), authStream, 30u);   // diverge
+        convex::RestoreConvex(w, snap);
+        check(convex::ConvexBodiesEqual(w.bodies, w0.bodies),
+              "CX5 RestoreConvex(SnapshotConvex) round-trips the world byte-for-byte");
+    }
+
+    // ================= CX5: RunConvexLockstep — authority == replica BIT-IDENTICAL ==================
+    {
+        convex::ConvexWorld w0 = buildLockstepStack();
+        bool identical = false;
+        convex::ConvexWorld authority =
+            convex::RunConvexLockstep(w0, makeStepCfg(), authStream, kLsTicks, &identical);
+        check(identical, "CX5 RunConvexLockstep: authority == replica BIT-IDENTICAL (inputs only)");
+        // The converged stack is still a coherent ordered tower (the command stream knocked + it re-settled).
+        check(authority.bodies[1].pos.y < authority.bodies[2].pos.y &&
+              authority.bodies[2].pos.y < authority.bodies[3].pos.y,
+              "CX5 lockstep converged stack -> boxes still ordered ascending in y (re-settled)");
+        const convex::StackMeasure ms = convex::MeasureStack(authority);
+        check(ms.maxSpeed < kOne, "CX5 lockstep converged stack -> at rest after the perturbation");
+    }
+
+    // ================= CX5: determinism — two RunConvexLockstep runs byte-identical =================
+    {
+        convex::ConvexWorld w0 = buildLockstepStack();
+        convex::ConvexWorld a = convex::RunConvexLockstep(w0, makeStepCfg(), authStream, kLsTicks);
+        convex::ConvexWorld b = convex::RunConvexLockstep(w0, makeStepCfg(), authStream, kLsTicks);
+        check(convex::ConvexBodiesEqual(a.bodies, b.bodies),
+              "CX5 RunConvexLockstep determinism: two runs BYTE-IDENTICAL");
+    }
+
+    // ================= CX5: RunConvexRollback — corrected==authority AND mispredict diverged ========
+    {
+        convex::ConvexWorld w0 = buildLockstepStack();
+        // The MISPREDICTED stream: the auth stream + a WRONG strong impulse at rollbackAt on the top slab.
+        std::vector<convex::ConvexCommand> mispredictStream = authStream;
+        mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 3u,
+                                                         FxVec3{FromInt(30), 0, 0}});
+        bool corrected = false, diverged = false;
+        convex::ConvexWorld rolledBack =
+            convex::RunConvexRollback(w0, makeStepCfg(), authStream, mispredictStream, kLsTicks, kRollbackAt,
+                                      &corrected, &diverged);
+        check(diverged, "CX5 RunConvexRollback: the mispredicted intermediate genuinely DIVERGED (real)");
+        check(corrected, "CX5 RunConvexRollback: corrected == authority BIT-EXACT");
+        // The corrected world equals the plain authority lockstep run byte-for-byte.
+        convex::ConvexWorld authority = convex::RunConvexLockstep(w0, makeStepCfg(), authStream, kLsTicks);
+        check(convex::ConvexBodiesEqual(rolledBack.bodies, authority.bodies),
+              "CX5 RunConvexRollback: rolledBack == RunConvexLockstep(authStream) byte-for-byte");
+    }
+
     if (g_fail == 0) std::printf("convex_test: ALL PASS\n");
     else std::printf("convex_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
