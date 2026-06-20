@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <vector>
 #include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
@@ -898,6 +899,68 @@ int main() {
         convex::ConvexWorld authority = convex::RunConvexLockstep(w0, makeStepCfg(), authStream, kLsTicks);
         check(convex::ConvexBodiesEqual(rolledBack.bodies, authority.bodies),
               "CX5 RunConvexRollback: rolledBack == RunConvexLockstep(authStream) byte-for-byte");
+    }
+
+    // ================= CX6: ConvexToRenderInstances — the render-only FLOAT instance set ============
+    // A render-only FLOAT pure function of the bit-exact settled world: instance count == body count,
+    // the dynamic/static split is correct, each translation == fpx::FxBodyTransform(body) translation
+    // (the provenance), and two calls are byte-identical (the pure-function contract). No GPU here.
+    {
+        // Build + SETTLE the CX4 stack (the same scene the --convex-render-shot showcase renders).
+        convex::ConvexWorld w = buildLockstepStack();
+        convex::StepConvexWorldN(w, makeStepCfg(), 300u);
+
+        const convex::ConvexRenderInstances ri = convex::ConvexToRenderInstances(w);
+        const size_t kBodies  = w.bodies.size();
+        const size_t kDynamic = ri.boxes.size();
+        const size_t kStatic  = ri.floor.size();
+
+        // (1) instance count == body count (every body becomes exactly one cube).
+        check(kDynamic + kStatic == kBodies,
+              "CX6 ConvexToRenderInstances: instance count == body count (one cube per body)");
+        // (2) the dynamic/static split is correct: 1 static floor + 3 dynamic boxes.
+        size_t expectDyn = 0, expectStat = 0;
+        for (const auto& b : w.bodies) { if (convex::IsDynamic(b)) ++expectDyn; else ++expectStat; }
+        check(kDynamic == expectDyn && kStatic == expectStat,
+              "CX6 ConvexToRenderInstances: dynamic/static split matches IsDynamic");
+        check(kStatic == 1u && kDynamic == 3u,
+              "CX6 ConvexToRenderInstances: the CX4 stack -> 1 floor + 3 dynamic boxes");
+
+        // (3) provenance: each instance's TRANSLATION == fpx::FxBodyTransform(body) translation (column 3
+        // of the column-major Mat4 -> m[12],m[13],m[14]). Both derive from FxToFloat(pos) — byte-equal.
+        bool transOk = true;
+        size_t di = 0, si = 0;
+        for (const auto& b : w.bodies) {
+            const math::Mat4 ref = fpx::FxBodyTransform(b);
+            const math::Mat4& got = convex::IsDynamic(b) ? ri.boxes[di++] : ri.floor[si++];
+            if (std::memcmp(&got.m[12], &ref.m[12], sizeof(float) * 3) != 0) transOk = false;
+        }
+        check(transOk,
+              "CX6 ConvexToRenderInstances: each instance translation == FxBodyTransform(body) (provenance)");
+
+        // (4) pure function: two calls produce byte-identical matrices.
+        const convex::ConvexRenderInstances ri2 = convex::ConvexToRenderInstances(w);
+        bool pureOk = (ri2.floor.size() == ri.floor.size()) && (ri2.boxes.size() == ri.boxes.size());
+        for (size_t k = 0; k < ri.floor.size() && pureOk; ++k)
+            if (std::memcmp(ri.floor[k].m, ri2.floor[k].m, sizeof(float) * 16) != 0) pureOk = false;
+        for (size_t k = 0; k < ri.boxes.size() && pureOk; ++k)
+            if (std::memcmp(ri.boxes[k].m, ri2.boxes[k].m, sizeof(float) * 16) != 0) pureOk = false;
+        check(pureOk, "CX6 ConvexToRenderInstances: two calls BYTE-IDENTICAL (pure function)");
+
+        // (5) the dynamic boxes are scaled to their FULL extents (2*halfExtents): the slab is 3x1x3, so the
+        // model X/Z scale magnitude is 3 and the Y scale magnitude is 1 (the cube spans the box). Check the
+        // first dynamic box's basis-column lengths (settled boxes are ~axis-aligned, identity orient).
+        if (kDynamic > 0) {
+            auto colLen = [](const math::Mat4& m, int c) {
+                const float x = m.m[c * 4 + 0], y = m.m[c * 4 + 1], z = m.m[c * 4 + 2];
+                return std::sqrt(x * x + y * y + z * z);
+            };
+            const math::Mat4& m0 = ri.boxes[0];
+            const float sx = colLen(m0, 0), sy = colLen(m0, 1), sz = colLen(m0, 2);
+            check(std::fabs(sx - 3.0f) < 0.05f && std::fabs(sy - 1.0f) < 0.05f &&
+                  std::fabs(sz - 3.0f) < 0.05f,
+                  "CX6 ConvexToRenderInstances: dynamic box scaled to full extents 2*halfExtents (3x1x3)");
+        }
     }
 
     if (g_fail == 0) std::printf("convex_test: ALL PASS\n");

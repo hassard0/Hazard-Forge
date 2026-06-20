@@ -1127,5 +1127,75 @@ inline ConvexWorld RunConvexRollback(const ConvexWorld& world0, const ConvexStep
     return w;
 }
 
+// ====================================================================================================
+// Slice CX6 — LIT 3D INSTANCED RENDER CAPSTONE (THE MONEY-SHOT COMPLETING FLAGSHIP #19: DETERMINISTIC
+// CONVEX RIGID-BODY CONTACTS, hf::sim::convex). CX1-CX5 built + proved the deterministic, lockstep-
+// replayable box-box contact sim (SAT -> manifold -> angular impulse -> settling stack -> lockstep/
+// rollback). CX6 RENDERS the bit-exact settled stack as lit, shadowed 3D ORIENTED BOXES — the visual
+// payoff. The FR6/CP6/CG6/GF6/BD6/VH6 render-capstone twin: a render-only FLOAT helper through the
+// EXISTING cube-mesh instanced-lit pipeline, ZERO new render shader, ZERO new RHI. ADDITIVE: CX1-CX5's
+// code above is byte-FROZEN; CX6 only APPENDS this render-only helper (the integer sim is untouched).
+//
+// THE DESIGN CALL (the VH6 cube-mesh twin): ConvexToRenderInstances runs OUTSIDE the bit-exact integer
+// loop (render-only). EVERY body is an ORIENTED CUBE: for each body i the FLOAT model matrix is
+//   translate(FxToFloat(pos)) * rotate(normalize(orient)) * scale(2 * FxToFloat(box.halfExtents))
+// i.e. fpx::FxBodyTransform's translate+rotate (REUSED in spirit — the VH6/FR6 provenance call) composed
+// with the per-box NON-UNIFORM scale (full extents = 2*halfExtents) so a UNIT cube becomes the oriented
+// box. The per-instance ORIENT makes the box ROTATION visible (the convex money-shot — boxes you can SEE
+// are tilted, unlike the prior sphere capstones). The output is SPLIT: the STATIC floor (a distinct cool-
+// grey, large) vs the DYNAMIC boxes (warm matte amber) — two instance sets (the VH6 split-set shape) so
+// the showcase draws two colored instanced CUBE draws. **MATTE (the showcase sets metallic 0 / roughness
+// 1)** to DODGE THE GF6/BD6/FR6/JT6/VH6 IRIDESCENCE TRAP (a metallic/low-roughness material reads as blue
+// iridescence — the documented hard lesson; stay matte). ConvexToRenderInstances is a PURE FUNCTION of
+// the bit-exact ConvexWorld (two calls byte-equal — the provenance contract the showcase asserts).
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only. CX6 only ADDS the render bridge; the
+// bit-exact CX1-CX5 sim is untouched. It uses math::FromTRS + fpx::FxToFloat (already #included read-only
+// via fpx.h) — it does NOT re-implement them. NO new shader, NO new RHI.
+
+// ----- ConvexRenderInstances: the split FLOAT instance set (the render-only output) ---------------------
+// floor   : the static-floor box model matrices (FxBodyTransform pose x the floor's 2*halfExtents scale).
+// boxes   : the dynamic-box model matrices (FxBodyTransform pose x the box's 2*halfExtents scale).
+// Each math::Mat4 is column-major (== scene::InstanceData::model). The showcase draws `floor` with the
+// cube mesh (cool-grey matte) + `boxes` with the cube mesh (warm matte amber).
+struct ConvexRenderInstances {
+    std::vector<math::Mat4> floor;   // static floor box(es)
+    std::vector<math::Mat4> boxes;   // dynamic boxes (the resting tower)
+};
+
+// ----- ConvexBoxShapeTransform: the render-only T*R*S for one body with the box's full-extent scale ------
+// translate(pos/kOne) * rotate(normalize(orient/kOne)) * scale(2*halfExtents/kOne) — fpx::FxBodyTransform's
+// translation + rotation (REUSED in spirit, the VH6/FR6 precedent) with the box's NON-UNIFORM full-extent
+// scale (2*halfExtents) instead of the body's uniform radius, so a UNIT cube becomes the oriented box.
+// Pure deterministic host float (no RNG, no clock). The translation is byte-equal to fpx::FxBodyTransform(
+// b)'s translation (both are FxToFloat(pos)) — the provenance proof rests on this.
+inline math::Mat4 ConvexBoxShapeTransform(const FxBody& b, const FxBox& box) {
+    const math::Vec3 t{fpx::FxToFloat(b.pos.x), fpx::FxToFloat(b.pos.y), fpx::FxToFloat(b.pos.z)};
+    const math::Quat q = math::Normalize(math::Quat{
+        fpx::FxToFloat(b.orient.x), fpx::FxToFloat(b.orient.y),
+        fpx::FxToFloat(b.orient.z), fpx::FxToFloat(b.orient.w)});
+    // Full extents = 2 * half-extents (the unit cube spans [-1,1] -> scale by the half-extent gives [-h,h]).
+    const math::Vec3 shape{fpx::FxToFloat(box.halfExtents.x) * 2.0f,
+                           fpx::FxToFloat(box.halfExtents.y) * 2.0f,
+                           fpx::FxToFloat(box.halfExtents.z) * 2.0f};
+    return math::FromTRS(t, q, shape);
+}
+
+// ----- ConvexToRenderInstances: the bit-exact settled stack -> the split FLOAT instance set (render-only)
+// Builds the static-floor + dynamic-box CUBE instances (pose x the per-box 2*halfExtents scale) from the
+// bit-exact ConvexWorld. A PURE FUNCTION of `world`: two calls produce byte-equal matrices (the provenance
+// contract the showcase asserts). The ONE float crossing of the whole flagship (the VH6/FR6/JT6 bridge);
+// the bit-exact CX1-CX5 sim is NOT mutated. Dynamic bodies (IsDynamic) go in `boxes`, the rest in `floor`.
+inline ConvexRenderInstances ConvexToRenderInstances(const ConvexWorld& world) {
+    ConvexRenderInstances out;
+    const size_t n = world.bodies.size() < world.boxes.size() ? world.bodies.size() : world.boxes.size();
+    for (size_t i = 0; i < n; ++i) {
+        const math::Mat4 m = ConvexBoxShapeTransform(world.bodies[i], world.boxes[i]);
+        if (IsDynamic(world.bodies[i])) out.boxes.push_back(m);
+        else                            out.floor.push_back(m);
+    }
+    return out;
+}
+
 }  // namespace convex
 }  // namespace hf::sim
