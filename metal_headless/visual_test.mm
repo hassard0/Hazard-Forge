@@ -17989,6 +17989,181 @@ static int RunBoidsSteerShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BD3 — Deterministic GPU Crowds THE FULL FLOCK STEP showcase (--boids-flock) (the 3rd slice of
+// FLAGSHIP #18). Like BD1's --boids-steer (and UNLIKE the int32 BD2 grid passes), the flock-integrate is int64
+// (the gain*delta + force*dt + vel*dt fxmul + the integer-divide means), so shaders/boids_flock.comp is
+// VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) and is NOT in this dir's hf_gen_msl list — while the BD2
+// grid passes (boids_cell_*/boids_neighbor_*) STAY MSL-native (reused per tick). On Metal the --boids-flock
+// showcase runs the CPU boids::StepFlock — the EXACT bit-exact reference the Vulkan --boids-flock-shot GPU==CPU
+// memcmp already compares against -> the Metal agent array is byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION. The SAME 256-agent flock + the SAME config + the SAME pure-integer 2D top-down render (each
+// agent a dot at (pos.x>>kFrac, pos.z>>kFrac) + a short velocity tick) as the Vulkan --boids-flock-shot -> the
+// golden matches the Vulkan side EXACTLY. New golden tests/golden/metal/boids_flock.png (baked on the Mac by
+// the controller); two runs DIFF 0.0000.
+static int RunBoidsFlockShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace boids = hf::sim::boids;
+    namespace vg = render::vg;
+
+    // The deterministic flock recipe (== the Vulkan --boids-flock-shot config). All host-snapped Q16.16.
+    const boids::fx kOne = boids::kOne;
+    auto wu = [&](int u) { return (boids::fx)(u * (int)kOne); };
+    auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+    const boids::fx kDt = kOne / 60;
+    const int kSteps = 300;
+    const int kGrid = 16;                          // 16x16 = 256 agents
+    const boids::fx kRadius = wu(3);
+    const boids::fx kOrigin = wu(8);
+
+    boids::FlockConfig cfg;
+    cfg.seekGain         = 0;
+    cfg.sepGain          = frac(1, 8);
+    cfg.alignGain        = frac(1, 2);
+    cfg.cohGain          = kOne;
+    cfg.perceptionRadius = kRadius;
+    cfg.maxForce         = wu(8);
+    cfg.maxSpeed         = wu(6);
+    cfg.target           = boids::FxVec3{0, 0, 0};
+    cfg.gravity          = boids::FxVec3{0, 0, 0};
+
+    auto makeFlock = [&]() {
+        std::vector<boids::Agent> a;
+        for (int gx = 0; gx < kGrid; ++gx)
+            for (int gz = 0; gz < kGrid; ++gz) {
+                const boids::fx vx = ((gx + gz) & 1) ? frac(1, 2) : -frac(1, 2);
+                const boids::fx vz = ((gx) & 1) ? -frac(1, 3) : frac(1, 3);
+                a.push_back(boids::Agent{boids::FxVec3{kOrigin + wu(gx * 2), 0, kOrigin + wu(gz * 2)},
+                                         boids::FxVec3{vx, 0, vz}});
+            }
+        return a;
+    };
+    const std::vector<boids::Agent> flock0 = makeFlock();
+    const int kAgentCount = (int)flock0.size();
+
+    // std430 Agent mirror (== the Vulkan --boids-flock-shot AgentGpu): 6 x int32 (24 bytes).
+    struct AgentGpu { int32_t px, py, pz, vx, vy, vz; };
+    static_assert(sizeof(AgentGpu) == 24, "AgentGpu std430 layout");
+    static_assert(sizeof(boids::Agent) == 24, "Agent std430 layout");
+    auto packAgents = [&](const std::vector<boids::Agent>& ps) {
+        std::vector<AgentGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const boids::Agent& p = ps[i];
+            out[i] = AgentGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z};
+        }
+        return out;
+    };
+
+    // CPU flock (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    auto runFlock = [&](const boids::FlockConfig& c, std::vector<AgentGpu>& outAgents) {
+        std::vector<boids::Agent> a = flock0;
+        boids::StepFlockSteps(a, c, kDt, kSteps);
+        outAgents = packAgents(a);
+    };
+
+    std::vector<AgentGpu> gpuAgents;
+    runFlock(cfg, gpuAgents);
+
+    // This agent array IS the CPU StepFlock reference the Vulkan --boids-flock-shot proved the GPU shader
+    // bit-identical against -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. Print the proof line.
+    std::printf("boids-flock: {agents:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU boids::StepFlock, byte-identical to the Vulkan GPU result by construction]\n",
+                kAgentCount, kSteps);
+
+    // two-run determinism.
+    std::vector<AgentGpu> gpuAgents2;
+    runFlock(cfg, gpuAgents2);
+    if (gpuAgents.size() != gpuAgents2.size() ||
+        std::memcmp(gpuAgents.data(), gpuAgents2.data(), gpuAgents.size() * sizeof(AgentGpu)) != 0)
+        return fail("boids-flock: two runs differ (nondeterministic)");
+    std::printf("boids-flock determinism: two runs BYTE-IDENTICAL\n");
+
+    // the flock emerged: diagonal SHRANK + alignment ROSE + minSep above a floor.
+    std::vector<boids::Agent> gpuFlock((size_t)kAgentCount);
+    for (int i = 0; i < kAgentCount; ++i)
+        gpuFlock[(size_t)i] = boids::Agent{
+            boids::FxVec3{gpuAgents[(size_t)i].px, gpuAgents[(size_t)i].py, gpuAgents[(size_t)i].pz},
+            boids::FxVec3{gpuAgents[(size_t)i].vx, gpuAgents[(size_t)i].vy, gpuAgents[(size_t)i].vz}};
+    const boids::FlockStats before = boids::MeasureFlock(flock0, cfg);
+    const boids::FlockStats after  = boids::MeasureFlock(gpuFlock, cfg);
+    const boids::fx kSepFloor = boids::kOne / 8;
+    if (!((after.diag < before.diag) && (after.alignment > before.alignment) && (after.minSep > kSepFloor)))
+        return fail("boids-flock: did not emerge (diag/align/minSep)");
+    std::printf("boids-flock emerged: {diagShrank:true, aligned:%d, minSep:%d, flocked:true}\n",
+                after.alignment, after.minSep);
+
+    // control: an alignGain=cohGain=0 (separation only) flock stays looser (a larger diagonal).
+    boids::FlockConfig ctrl = cfg; ctrl.alignGain = 0; ctrl.cohGain = 0;
+    std::vector<boids::Agent> ctrlFlock = flock0;
+    boids::StepFlockSteps(ctrlFlock, ctrl, kDt, kSteps);
+    if (boids::MeasureFlock(ctrlFlock, ctrl).diag <= after.diag)
+        return fail("boids-flock: control flocked (sepOnly should stay looser)");
+    std::printf("boids-flock control: {sepOnly:notFlocked}\n");
+
+    // --- Golden: a PURE-INTEGER 2D top-down view (IDENTICAL to the Vulkan --boids-flock-shot by construction):
+    // each agent a dot at (pos.x>>kFrac, pos.z>>kFrac) + a short velocity tick showing the aligned heading.
+    const int kPxPerUnit = 14, kMargin = 24;
+    int wMinX = gpuAgents[0].px >> boids::kFrac, wMaxX = wMinX;
+    int wMinZ = gpuAgents[0].pz >> boids::kFrac, wMaxZ = wMinZ;
+    for (int i = 0; i < kAgentCount; ++i) {
+        const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+        const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+        if (wx < wMinX) wMinX = wx; if (wx > wMaxX) wMaxX = wx;
+        if (wz < wMinZ) wMinZ = wz; if (wz > wMaxZ) wMaxZ = wz;
+    }
+    const int kSlack = 4;
+    const int viewX0 = wMinX - kSlack, viewZ0 = wMinZ - kSlack;
+    const int kWorldW = (wMaxX - wMinX) + kSlack * 2 + 1;
+    const int kWorldH = (wMaxZ - wMinZ) + kSlack * 2 + 1;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+        ix = kMargin + (worldX - viewX0) * kPxPerUnit;
+        iy = kMargin + (worldZ - viewZ0) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+            }
+    };
+    auto lineSeg = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+        int err = adx - ady, x = x0, y = y0;
+        for (int step = 0; step < 64; ++step) {
+            plot(x, y, r, g, b, 0);
+            if (x == x1 && y == y1) break;
+            int e2 = 2 * err;
+            if (e2 > -ady) { err -= ady; x += sx; }
+            if (e2 <  adx) { err += adx; y += sy; }
+        }
+    };
+    for (int i = 0; i < kAgentCount; ++i) {
+        const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+        const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+        int cx, cy; worldToPx(wx, wz, cx, cy);
+        const int tipX = (gpuAgents[(size_t)i].px + gpuAgents[(size_t)i].vx) >> boids::kFrac;
+        const int tipZ = (gpuAgents[(size_t)i].pz + gpuAgents[(size_t)i].vz) >> boids::kFrac;
+        int tx, ty; worldToPx(tipX, tipZ, tx, ty);
+        lineSeg(cx, cy, tx, ty, 90, 110, 90);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+             (uint8_t)(col.z * 255.0f + 0.5f), 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — boids flock top-down (diag %d, align %d, minSep %d)\n",
+                outPath, imgW, imgH, after.diag, after.alignment, after.minSep);
+    return 0;
+}
+
 static int RunGrainIntegrateShowcase(const char* outPath) {
     using math::Vec3;
     namespace grain = hf::sim::grain;
@@ -43929,6 +44104,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--boids-neighbors") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_boids_neighbors.png";
             try { return RunBoidsNeighborsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --boids-flock <out.png>: render the Deterministic GPU Crowds THE FULL FLOCK STEP showcase (Slice BD3,
+        // the 3rd slice of FLAGSHIP #18). The flock-integrate is int64 -> boids_flock.comp is Vulkan-only (NOT in
+        // hf_gen_msl) while the BD2 grid passes stay MSL-native; on Metal this runs the CPU boids::StepFlock —
+        // the EXACT bit-exact reference the Vulkan --boids-flock-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical. The 3 Reynolds rules (separation + alignment + cohesion over the BD2 neighbor list,
+        // rebuilt each tick) cohere the flock into a recognizable swarm. The image golden is a PURE-INTEGER 2D
+        // top-down view (each agent a dot + a short velocity tick), identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/boids_flock.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--boids-flock") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_boids_flock.png";
+            try { return RunBoidsFlockShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {

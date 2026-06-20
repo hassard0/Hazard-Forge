@@ -473,6 +473,7 @@ int main(int argc, char** argv) {
     const char* boidsSteerShotPath = nullptr; // --boids-steer-shot <out.bmp> (Slice BD1: Deterministic GPU Crowds INTEGER STEERING, the BEACHHEAD of FLAGSHIP #18 — a ~36-agent cluster seeks a target offset to one side while separating, settled K StepBoids steps by one GPU thread per agent [JACOBI/ping-pong: read the frozen input buffer, brute-force all-pairs seek+separation, per-axis clamp force/speed, integrate, write the output buffer], GPU==CPU agent array bit-exact, integer 2D top-down debug-viz of the loose flock streaming toward the target)
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* boidsNeighborsShotPath = nullptr; // --boids-neighbors-shot <out.bmp> (Slice BD2: Deterministic GPU Crowds GRID-HASH NEIGHBOR LIST, the 2nd slice of FLAGSHIP #18 — a larger flock (~256-1024 agents spread over an area, settled K StepBoids steps) bucketed into a uniform spatial-hash grid at cell-size = the perception radius (BuildBoidsCellTable) + a per-agent 27-cell-stencil NEIGHBOR LIST (BuildBoidsNeighborList, per-axis |dx|<radius reject) via PURE-INT32 count->scan->emit (boids_cell_{count,scan,emit} + boids_neighbor_{count,scan,emit}.comp, MSL-native — a TRUE GPU pass on BOTH backends, unlike BD1's int64 boids_steer), GPU==CPU cell-table+neighbor-list bit-exact vs boids.h::BuildBoidsCellTable/BuildBoidsNeighborList, integer per-agent neighbor-count heat viz; NO flock step (BD3), NO new RHI; boids.h append-only over BD1)
+    const char* boidsFlockShotPath = nullptr; // --boids-flock-shot <out.bmp> (Slice BD3: Deterministic GPU Crowds THE FULL FLOCK STEP, the 3rd slice of FLAGSHIP #18 — a ~256-agent flock settled K StepFlock steps: per tick the GPU rebuilds the BD2 neighbor list (MSL-native boids_cell_*/boids_neighbor_* on the current positions, over a FIXED generously-sized grid) then runs the int64 boids_flock.comp — ONE thread per agent: the 3 Reynolds rules (separation Σ(pos_i-pos_j)*sepGain + alignment ((Σvel_j)/count-vel_i)*alignGain + cohesion ((Σpos_j)/count-pos_i)*cohGain; integer-divide means, count==0 guard) + optional seek + integrate, JACOBI ping-pong; boids_flock.comp is int64 Vulkan-only (NOT in hf_gen_msl) while the BD2 grid passes stay MSL-native. GPU==CPU agent array bit-exact vs boids.h::StepFlock (memcmp), integer 2D top-down flock viz (each agent a dot + a short velocity tick showing the aligned heading); NO path-following (BD4), NO new RHI; boids.h append-only over BD1/BD2)
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
     const char* cgrainQueryShotPath = nullptr; // --cgrain-query-shot <out.bmp> (Slice CG1: Deterministic Rigid<->Grain Coupling UNIFIED bodies+grains WORLD + BODY->GRAIN grid-hash QUERY, the BEACHHEAD of FLAGSHIP #12 — a poured grain bed (GR1 InitGrainBlock, settled with GR4 friction steps) + a few FxBody spheres placed partly buried. Build the GR2 grain grid + cell table (reused grain_cell_{count,scan,emit}) then the per-body grain QUERY via THREE pure-INT32 count->scan->emit passes (cgrain_body_{count,scan,emit}.comp, MSL-native): each body gathers the grains inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - g.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CG2/CG3). GPU=={cellStart,cellGrains,bodyStart,bodyGrains}==CPU couple_grain.h::GatherBodyGrains bit-exact (memcmp), per-body gathered-grain heat viz (buried bodies populated, clear bodies empty). NO momentum exchange (CG2 support/drag, CG3 displacement, CG4 step, CG5 lockstep, CG6 render), NO new RHI; couple_grain.h #includes fpx.h + grain.h read-only)
     const char* cgfQueryShotPath = nullptr; // --cgf-query-shot <out.bmp> (Slice GF1: Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL WORLD + SHARED-GRID CROSS QUERY, the BEACHHEAD of FLAGSHIP #13 — a settled grain bed (GR1 InitGrainBlock + GR4 friction) + an overlapping fluid block (FL1 InitBlock). Build ONE shared grid over BOTH pools' union AABB, bucket each pool into its own cell table (reused grain_cell_* + fluid_cell_* sized to the shared grid), then the two CROSS lists via SIX pure-INT32 count->scan->emit passes (cgf_gf_{count,scan,emit} grain->fluid + cgf_fg_{count,scan,emit} fluid->grain, MSL-native): each grain gathers the FLUID in its 27-cell stencil + each fluid the GRAINS in its 27-cell stencil, accepted iff the per-axis |query.axis - target.axis| < h box reject passes (the exact radial cull deferred to GF2/GF3). GPU=={grainCellTable,fluidCellTable,gfStart,gfNeighbors,fgStart,fgNeighbors}==CPU couple_gf.h::BuildCGFNeighbors bit-exact (memcmp), cross-pool neighbour heat viz (overlap populated, separated empty), the symmetry X==Y. NO momentum exchange (GF2-GF6), NO new RHI; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only)
@@ -727,6 +728,18 @@ int main(int argc, char** argv) {
         // branch (C1061 avoidance, like the grain-neighbors shot).
         if (std::strcmp(argv[i], "--boids-neighbors-shot") == 0 && i + 1 < argc) {
             boidsNeighborsShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice BD3: --boids-flock-shot <out.bmp> — the Deterministic GPU Crowds THE FULL FLOCK STEP (the 3rd
+        // slice of FLAGSHIP #18). A ~256-agent flock settled K StepFlock steps: per tick the GPU rebuilds the BD2
+        // neighbor list (the MSL-native boids_cell_*/boids_neighbor_* passes on the current positions, over a
+        // FIXED generously-sized grid) then runs the int64 boids_flock.comp (one thread per agent: the 3 Reynolds
+        // rules — separation + alignment + cohesion — over the neighbor list + integrate; JACOBI ping-pong),
+        // GPU==CPU agent array bit-exact vs boids.h::StepFlock, integer 2D top-down flock viz. STANDALONE branch
+        // (C1061 avoidance, like the boids-neighbors shot).
+        if (std::strcmp(argv[i], "--boids-flock-shot") == 0 && i + 1 < argc) {
+            boidsFlockShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -19301,6 +19314,420 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — boids neighbor-count heat (%u neighbors, maxPer %u)\n",
                                 boidsNeighborsShotPath, imgW, imgH, kTotalNeighbors, maxPer);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", boidsNeighborsShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Crowds THE FULL FLOCK STEP (--boids-flock-shot <out.bmp>, Slice BD3, the 3rd
+        // slice of FLAGSHIP #18). A ~256-agent flock (a dense 16x16 grid, 2-unit spacing, small per-agent jitter
+        // velocities) is settled K=300 StepFlock steps. Per tick the GPU REBUILDS the BD2 neighbor list on the
+        // CURRENT positions (the MSL-native boids_cell_count/scan/emit + boids_neighbor_count/scan/emit passes,
+        // REUSED — the flock moves) over a FIXED, generously-sized grid sized ONCE to contain the cohesion-
+        // bounded flock for ALL K ticks (constant gridDim -> constant GPU buffers -> the per-tick rebuild just
+        // re-buckets), then runs the int64 boids_flock.comp (ONE thread per agent: the 3 Reynolds rules over the
+        // neighbor list — separation + alignment + cohesion, integer-divide means — + integrate; JACOBI
+        // ping-pong: read gAgentsIn + the freshly-rebuilt neighbor list, write gAgentsOut). ReadBuffer reads the
+        // integer Q16.16 agent array; the CPU boids::StepFlockSteps over the SAME flock must match it BIT-EXACT
+        // (memcmp, NO tol). boids_flock.comp is int64 -> Vulkan-only; the BD2 grid passes stay MSL-native. The
+        // golden is a PURE-INTEGER 2D top-down view (each agent a dot + a short velocity tick). NO new RHI.
+        // STANDALONE branch (C1061 avoidance).
+        if (boidsFlockShotPath) {
+            using math::Vec3;
+            namespace boids = hf::sim::boids;
+            namespace vg = hf::render::vg;
+
+            // The deterministic flock recipe (== the Metal --boids-flock config). All host-snapped Q16.16. A
+            // dense 16x16 flock at 2-unit spacing -> a connected radius-3 neighbor graph; weak separation +
+            // strong cohesion + alignment -> the flock CLUSTERS (diagonal shrinks), ALIGNS, keeps spacing.
+            const boids::fx kOne = boids::kOne;
+            auto wu = [&](int u) { return (boids::fx)(u * (int)kOne); };
+            auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+            const boids::fx kDt = kOne / 60;
+            const int kSteps = 300;
+            const int kGrid = 16;                          // 16x16 = 256 agents
+            const boids::fx kRadius = wu(3);               // perception radius == the grid cell size
+            const boids::fx kOrigin = wu(8);               // a strictly-positive origin (keeps coords >= 0)
+
+            boids::FlockConfig cfg;
+            cfg.seekGain         = 0;                       // free flocking (no goal)
+            cfg.sepGain          = frac(1, 8);             // 0.125 weak separation (spacing without dispersing)
+            cfg.alignGain        = frac(1, 2);             // 0.5 alignment (toward the neighbors' mean heading)
+            cfg.cohGain          = kOne;                   // 1.0 cohesion (toward the neighbors' mean position)
+            cfg.perceptionRadius = kRadius;
+            cfg.maxForce         = wu(8);
+            cfg.maxSpeed         = wu(6);
+            cfg.target           = boids::FxVec3{0, 0, 0};
+            cfg.gravity          = boids::FxVec3{0, 0, 0};
+
+            // The initial flock: a kGrid x kGrid grid at 2-unit spacing, small deterministic jitter velocities
+            // (alternating signs so headings start DISORDERED -> alignment has work to do).
+            auto makeFlock = [&]() {
+                std::vector<boids::Agent> a;
+                for (int gx = 0; gx < kGrid; ++gx)
+                    for (int gz = 0; gz < kGrid; ++gz) {
+                        const boids::fx vx = ((gx + gz) & 1) ? frac(1, 2) : -frac(1, 2);
+                        const boids::fx vz = ((gx) & 1) ? -frac(1, 3) : frac(1, 3);
+                        a.push_back(boids::Agent{boids::FxVec3{kOrigin + wu(gx * 2), 0, kOrigin + wu(gz * 2)},
+                                                 boids::FxVec3{vx, 0, vz}});
+                    }
+                return a;
+            };
+            const std::vector<boids::Agent> flock0 = makeFlock();
+            const int kAgentCount = (int)flock0.size();
+
+            // === CPU reference: settle K steps + record the per-tick AABB so the GPU grid is sized ONCE to
+            // contain the flock for ALL ticks (the fixed-grid discipline; cohesion keeps it bounded). Also find
+            // the MAX per-tick neighbor total so the GPU neighbors[] buffer is allocated generously (constant). ===
+            boids::fx aabbMinX = flock0[0].pos.x, aabbMaxX = aabbMinX;
+            boids::fx aabbMinY = flock0[0].pos.y, aabbMaxY = aabbMinY;
+            boids::fx aabbMinZ = flock0[0].pos.z, aabbMaxZ = aabbMinZ;
+            uint32_t maxNeighborTotal = 0;
+            auto recordAabb = [&](const std::vector<boids::Agent>& ag) {
+                for (const boids::Agent& a : ag) {
+                    if (a.pos.x < aabbMinX) aabbMinX = a.pos.x; if (a.pos.x > aabbMaxX) aabbMaxX = a.pos.x;
+                    if (a.pos.y < aabbMinY) aabbMinY = a.pos.y; if (a.pos.y > aabbMaxY) aabbMaxY = a.pos.y;
+                    if (a.pos.z < aabbMinZ) aabbMinZ = a.pos.z; if (a.pos.z > aabbMaxZ) aabbMaxZ = a.pos.z;
+                }
+                const boids::BoidsGrid g = boids::MakeBoidsGrid(ag, kRadius);
+                const boids::BoidsCellTable t = boids::BuildBoidsCellTable(ag, g);
+                const boids::BoidsNeighborList l = boids::BuildBoidsNeighborList(ag, g, t, kRadius);
+                if ((uint32_t)l.neighbors.size() > maxNeighborTotal)
+                    maxNeighborTotal = (uint32_t)l.neighbors.size();
+            };
+            {
+                std::vector<boids::Agent> cpuTrace = flock0;
+                recordAabb(cpuTrace);                                   // tick 0 (the initial bound)
+                for (int s = 0; s < kSteps; ++s) {
+                    boids::StepFlock(cpuTrace, cfg, kDt);
+                    recordAabb(cpuTrace);
+                }
+            }
+            std::vector<boids::Agent> cpuFlock = flock0;
+            boids::StepFlockSteps(cpuFlock, cfg, kDt, kSteps);          // the final reference state
+
+            // The FIXED grid: cellMin = floor((aabbMin - pad)/radius), gridDim spans to (aabbMax + pad), padded
+            // generously so every agent stays inside [cellMin, cellMin+gridDim) for ALL K ticks (the BD2 grid-
+            // bounds discipline). The pad is several cells; cohesion keeps the flock well within it.
+            const int kPadCells = 4;
+            auto floorCell = [&](boids::fx v) { return boids::FloorDiv(v, kRadius); };
+            boids::BoidsGrid fixedGrid;
+            fixedGrid.cellSize = kRadius;
+            fixedGrid.cellMin = boids::FxCell{floorCell(aabbMinX) - kPadCells,
+                                              floorCell(aabbMinY) - kPadCells,
+                                              floorCell(aabbMinZ) - kPadCells};
+            const boids::FxCell hiCell{floorCell(aabbMaxX) + kPadCells,
+                                       floorCell(aabbMaxY) + kPadCells,
+                                       floorCell(aabbMaxZ) + kPadCells};
+            fixedGrid.gridDim = boids::FxCell{hiCell.x - fixedGrid.cellMin.x + 1,
+                                              hiCell.y - fixedGrid.cellMin.y + 1,
+                                              hiCell.z - fixedGrid.cellMin.z + 1};
+            const uint32_t kCellCount = boids::BoidsCellCount(fixedGrid);
+            const uint32_t kNeighAlloc = maxNeighborTotal > 0u ? maxNeighborTotal : 1u;
+
+            // std430 Agent mirror (matches shaders/boids_flock.comp Agent): 6 x int32 (24 bytes).
+            struct AgentGpu { int32_t px, py, pz, vx, vy, vz; };
+            static_assert(sizeof(AgentGpu) == 24, "AgentGpu std430 layout");
+            static_assert(sizeof(boids::Agent) == 24, "Agent std430 layout");
+            auto packAgents = [&](const std::vector<boids::Agent>& ps) {
+                std::vector<AgentGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const boids::Agent& p = ps[i];
+                    out[i] = AgentGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z};
+                }
+                return out;
+            };
+            const std::vector<AgentGpu> agentsInit = packAgents(flock0);
+
+            // std430 BoidsGridParams (matches the BD2 grid shaders): int4 grid {radius, cellMin.xyz} + int4 dim
+            // {gridDim.xyz, agentCount} + int4 cfg {cellCount, enabled, _, _}.
+            struct BoidsGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+            static_assert(sizeof(BoidsGridParams) == 48, "BoidsGridParams std430 layout");
+            BoidsGridParams gridParams{};
+            gridParams.grid[0] = kRadius; gridParams.grid[1] = fixedGrid.cellMin.x;
+            gridParams.grid[2] = fixedGrid.cellMin.y; gridParams.grid[3] = fixedGrid.cellMin.z;
+            gridParams.dim[0] = fixedGrid.gridDim.x; gridParams.dim[1] = fixedGrid.gridDim.y;
+            gridParams.dim[2] = fixedGrid.gridDim.z; gridParams.dim[3] = kAgentCount;
+            gridParams.cfg[0] = (int32_t)kCellCount; gridParams.cfg[1] = 1; gridParams.cfg[2] = 0;
+            gridParams.cfg[3] = 0;
+
+            // std430 FlockParams (matches boids_flock.comp FlockParams): 4 x int4 (64 bytes).
+            struct FlockParams { int32_t p0[4], p1[4], p2[4], p3[4]; };
+            static_assert(sizeof(FlockParams) == 64, "FlockParams std430 layout");
+            auto makeFlockParams = [&](const boids::FlockConfig& c, int32_t stepEnabled) {
+                FlockParams p{};
+                p.p0[0] = c.seekGain; p.p0[1] = c.sepGain; p.p0[2] = c.alignGain; p.p0[3] = c.cohGain;
+                p.p1[0] = c.maxForce; p.p1[1] = c.maxSpeed; p.p1[2] = c.target.x; p.p1[3] = c.target.y;
+                p.p2[0] = c.target.z; p.p2[1] = c.gravity.x; p.p2[2] = c.gravity.y; p.p2[3] = c.gravity.z;
+                p.p3[0] = kDt; p.p3[1] = kAgentCount; p.p3[2] = stepEnabled; p.p3[3] = 0;
+                return p;
+            };
+
+            auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+                rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+                d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+            auto makeAgentBuf = [&](const std::vector<AgentGpu>& data) {
+                rhi::BufferDesc d;
+                d.size = data.size() * sizeof(AgentGpu);
+                d.initialData = data.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // The BD2 grid pipelines (REUSED per tick to rebuild the list) + the new BD3 flock pipeline.
+            auto mkPipe = [&](const char* spv, uint32_t ssbo, uint32_t threads) {
+                auto words = LoadSpirv(std::string(HF_SHADER_DIR) + "/" + spv);
+                auto cs = device->CreateShaderModule({std::span<const uint32_t>(words)});
+                rhi::ComputePipelineDesc d;
+                d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+                auto pipe = device->CreateComputePipeline(d);
+                return std::make_pair(std::move(cs), std::move(pipe));
+            };
+            auto cellCountPipe = mkPipe("boids_cell_count.comp.hlsl.spv", 3, 64);
+            auto cellScanPipe  = mkPipe("boids_cell_scan.comp.hlsl.spv", 3, 1);
+            auto cellEmitPipe  = mkPipe("boids_cell_emit.comp.hlsl.spv", 5, 1);
+            auto nbrCountPipe  = mkPipe("boids_neighbor_count.comp.hlsl.spv", 5, 64);
+            auto nbrScanPipe   = mkPipe("boids_neighbor_scan.comp.hlsl.spv", 3, 1);
+            auto nbrEmitPipe   = mkPipe("boids_neighbor_emit.comp.hlsl.spv", 6, 64);
+            auto flockPipe     = mkPipe("boids_flock.comp.hlsl.spv", 5, 64);
+
+            const uint32_t kAgentGroups = ((uint32_t)kAgentCount + 63u) / 64u;
+
+            const std::vector<uint32_t> cellCountZero((size_t)kCellCount, 0u);
+            const std::vector<uint32_t> cellStartZero((size_t)kCellCount + 1u, 0u);
+            const std::vector<uint32_t> cellCursorZero((size_t)kCellCount, 0u);
+            const std::vector<uint32_t> cellAgentZero((size_t)kAgentCount, 0u);
+            const std::vector<uint32_t> perAgentZero((size_t)kAgentCount, 0u);
+            const std::vector<uint32_t> nbrStartZero((size_t)kAgentCount + 1u, 0u);
+            const std::vector<uint32_t> nbrZero((size_t)kNeighAlloc, 0u);
+
+            // Run K Jacobi ticks: per tick rebuild the BD2 list (clear the counts) then the int64 flock step,
+            // ping-ponging the agent buffers. Returns the agent array after K steps.
+            auto runFlock = [&](int32_t stepEnabled, int steps, std::vector<AgentGpu>& outAgents) {
+                auto bufA = makeAgentBuf(agentsInit);
+                auto bufB = makeAgentBuf(agentsInit);
+                // Persistent grid scratch buffers (re-cleared each tick via the per-tick fresh uploads below).
+                auto cellStartBuf = makeUintBuf(cellStartZero);
+                auto cellAgentBuf = makeUintBuf(cellAgentZero);
+                auto nbrStartBuf  = makeUintBuf(nbrStartZero);
+                auto nbrBuf       = makeUintBuf(nbrZero);
+                rhi::BufferDesc gpd; gpd.size = sizeof(BoidsGridParams); gpd.initialData = &gridParams;
+                gpd.usage = rhi::BufferUsage::Storage;
+                auto gridParamsBuf = device->CreateBuffer(gpd);
+                FlockParams fparams = makeFlockParams(cfg, stepEnabled);
+                rhi::BufferDesc fpd; fpd.size = sizeof(FlockParams); fpd.initialData = &fparams;
+                fpd.usage = rhi::BufferUsage::Storage;
+                auto flockParamsBuf = device->CreateBuffer(fpd);
+
+                rhi::IBuffer* in = bufA.get();
+                rhi::IBuffer* out = bufB.get();
+                for (int s = 0; s < steps; ++s) {
+                    // Fresh per-tick scratch (cleared counts/cursor — the cell-count atomic-add + the emit cursor
+                    // must start at 0 each tick, like the grain per-tick rebuild). cellCount/cursor are local to
+                    // the pass; cellStart/cellAgents/nbrStart/nbr are re-derived fully each tick.
+                    auto cellCountBuf = makeUintBuf(cellCountZero);
+                    auto cellCursorBuf = makeUintBuf(cellCursorZero);
+                    auto perAgentBuf = makeUintBuf(perAgentZero);
+                    rhi::IBuffer* curIn = in;
+                    rhi::IBuffer* curOut = out;
+                    render::RenderGraph g;
+                    render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                    g.AddPass("boids_flock", {}, {rgSwap},
+                        [&, curIn, curOut](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            // --- Rebuild the BD2 neighbor list on curIn's CURRENT positions (over the FIXED grid) ---
+                            cmd.BindComputePipeline(*cellCountPipe.second);
+                            cmd.BindStorageBuffer(*curIn, 0);
+                            cmd.BindStorageBuffer(*cellCountBuf, 1);
+                            cmd.BindStorageBuffer(*gridParamsBuf, 2);
+                            cmd.DispatchCompute(kAgentGroups);
+                            cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*cellScanPipe.second);
+                            cmd.BindStorageBuffer(*cellCountBuf, 0);
+                            cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*gridParamsBuf, 2);
+                            cmd.DispatchCompute(1);
+                            cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*cellEmitPipe.second);
+                            cmd.BindStorageBuffer(*curIn, 0);
+                            cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                            cmd.BindStorageBuffer(*cellAgentBuf, 3);
+                            cmd.BindStorageBuffer(*gridParamsBuf, 4);
+                            cmd.DispatchCompute(1);
+                            cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*nbrCountPipe.second);
+                            cmd.BindStorageBuffer(*curIn, 0);
+                            cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*cellAgentBuf, 2);
+                            cmd.BindStorageBuffer(*perAgentBuf, 3);
+                            cmd.BindStorageBuffer(*gridParamsBuf, 4);
+                            cmd.DispatchCompute(kAgentGroups);
+                            cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*nbrScanPipe.second);
+                            cmd.BindStorageBuffer(*perAgentBuf, 0);
+                            cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                            cmd.BindStorageBuffer(*gridParamsBuf, 2);
+                            cmd.DispatchCompute(1);
+                            cmd.ComputeToComputeBarrier();
+                            cmd.BindComputePipeline(*nbrEmitPipe.second);
+                            cmd.BindStorageBuffer(*curIn, 0);
+                            cmd.BindStorageBuffer(*cellStartBuf, 1);
+                            cmd.BindStorageBuffer(*cellAgentBuf, 2);
+                            cmd.BindStorageBuffer(*nbrStartBuf, 3);
+                            cmd.BindStorageBuffer(*nbrBuf, 4);
+                            cmd.BindStorageBuffer(*gridParamsBuf, 5);
+                            cmd.DispatchCompute(kAgentGroups);
+                            cmd.ComputeToComputeBarrier();
+                            // --- The int64 flock step: the 3 Reynolds rules over the rebuilt list + integrate ---
+                            cmd.BindComputePipeline(*flockPipe.second);
+                            cmd.BindStorageBuffer(*curIn, 0);
+                            cmd.BindStorageBuffer(*curOut, 1);
+                            cmd.BindStorageBuffer(*nbrStartBuf, 2);
+                            cmd.BindStorageBuffer(*nbrBuf, 3);
+                            cmd.BindStorageBuffer(*flockParamsBuf, 4);
+                            cmd.DispatchCompute(kAgentGroups);
+                            cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.EndRenderPass();
+                        });
+                    g.Execute(*device);
+                    device->WaitIdle();
+                    rhi::IBuffer* tmp = in; in = out; out = tmp;   // ping-pong: out becomes next in
+                }
+                outAgents.assign((size_t)kAgentCount, AgentGpu{});
+                device->ReadBuffer(*in, outAgents.data(), outAgents.size() * sizeof(AgentGpu), 0);
+            };
+
+            // === GPU flock (enabled, K steps, per-tick rebuild + ping-pong) ===
+            std::vector<AgentGpu> gpuAgents;
+            runFlock(1, kSteps, gpuAgents);
+
+            // PROOF (1) GPU==CPU agents BIT-EXACT after K steps (integer memcmp, NO tolerance).
+            const std::vector<AgentGpu> cpuAgents = packAgents(cpuFlock);
+            if (gpuAgents.size() != cpuAgents.size() ||
+                std::memcmp(gpuAgents.data(), cpuAgents.data(),
+                            (size_t)kAgentCount * sizeof(AgentGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: boids-flock GPU agent array != CPU StepFlock "
+                             "(a float crept into the fixed-point flock, an op-order/ping-pong/grid-rebuild bug?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-flock: {agents:%d, steps:%d} GPU==CPU BIT-EXACT\n", kAgentCount, kSteps);
+
+            // PROOF (2) two-run determinism byte-identical.
+            std::vector<AgentGpu> gpuAgents2;
+            runFlock(1, kSteps, gpuAgents2);
+            if (gpuAgents.size() != gpuAgents2.size() ||
+                std::memcmp(gpuAgents.data(), gpuAgents2.data(),
+                            gpuAgents.size() * sizeof(AgentGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: boids-flock two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-flock determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) the flock emerged: the bounding diagonal SHRANK (cohesion) AND the heading-alignment
+            // ROSE (alignment) AND the min separation stayed above a floor (separation). Measured on the
+            // bit-exact GPU result.
+            std::vector<boids::Agent> gpuFlock((size_t)kAgentCount);
+            for (int i = 0; i < kAgentCount; ++i)
+                gpuFlock[(size_t)i] = boids::Agent{
+                    boids::FxVec3{gpuAgents[(size_t)i].px, gpuAgents[(size_t)i].py, gpuAgents[(size_t)i].pz},
+                    boids::FxVec3{gpuAgents[(size_t)i].vx, gpuAgents[(size_t)i].vy, gpuAgents[(size_t)i].vz}};
+            const boids::FlockStats before = boids::MeasureFlock(flock0, cfg);
+            const boids::FlockStats after  = boids::MeasureFlock(gpuFlock, cfg);
+            const boids::fx kSepFloor = boids::kOne / 8;   // ~0.125 world-unit L1 floor
+            const bool diagShrank = after.diag < before.diag;
+            const bool aligned    = after.alignment > before.alignment;
+            const bool spaced     = after.minSep > kSepFloor;
+            if (!(diagShrank && aligned && spaced)) {
+                std::fprintf(stderr, "FATAL: boids-flock did not emerge (diag %d->%d, align %d->%d, minSep %d)\n",
+                             before.diag, after.diag, before.alignment, after.alignment, after.minSep);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-flock emerged: {diagShrank:true, aligned:%d, minSep:%d, flocked:true}\n",
+                        after.alignment, after.minSep);
+
+            // PROOF (4) the rules matter: an alignGain=cohGain=0 control (separation only) does NOT cohere — the
+            // flock stays looser (a larger bounding diagonal) than the full 3-rule flock.
+            boids::FlockConfig ctrl = cfg; ctrl.alignGain = 0; ctrl.cohGain = 0;
+            std::vector<boids::Agent> ctrlFlock = flock0;
+            boids::StepFlockSteps(ctrlFlock, ctrl, kDt, kSteps);
+            const boids::FlockStats ctrlStats = boids::MeasureFlock(ctrlFlock, ctrl);
+            if (ctrlStats.diag <= after.diag) {
+                std::fprintf(stderr, "FATAL: boids-flock control flocked (sepOnly diag %d <= full diag %d)\n",
+                             ctrlStats.diag, after.diag);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-flock control: {sepOnly:notFlocked}\n");
+
+            // --- Golden: a PURE-INTEGER 2D TOP-DOWN view. Each agent a dot at (pos.x>>kFrac, pos.z>>kFrac) + a
+            // short velocity TICK (a line from the dot toward pos + a scaled velocity) showing the aligned
+            // heading. CPU-colored from the read-back integers -> identical both backends by construction. ---
+            const int kPxPerUnit = 14;
+            const int kMargin = 24;
+            // The view spans the FINAL flock's tight cluster + slack; size from the agent extent in world units.
+            int wMinX = gpuAgents[0].px >> boids::kFrac, wMaxX = wMinX;
+            int wMinZ = gpuAgents[0].pz >> boids::kFrac, wMaxZ = wMinZ;
+            for (int i = 0; i < kAgentCount; ++i) {
+                const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+                const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+                if (wx < wMinX) wMinX = wx; if (wx > wMaxX) wMaxX = wx;
+                if (wz < wMinZ) wMinZ = wz; if (wz > wMaxZ) wMaxZ = wz;
+            }
+            const int kSlack = 4;
+            const int viewX0 = wMinX - kSlack, viewZ0 = wMinZ - kSlack;
+            const int kWorldW = (wMaxX - wMinX) + kSlack * 2 + 1;
+            const int kWorldH = (wMaxZ - wMinZ) + kSlack * 2 + 1;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+                ix = kMargin + (worldX - viewX0) * kPxPerUnit;
+                iy = kMargin + (worldZ - viewZ0) * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            // A simple integer line (the velocity tick) — Bresenham over pixels.
+            auto line = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int sx = dx < 0 ? -1 : 1, sy = dy < 0 ? -1 : 1;
+                int err = adx - ady, x = x0, y = y0;
+                for (int step = 0; step < 64; ++step) {
+                    plot(x, y, r, g, b, 0);
+                    if (x == x1 && y == y1) break;
+                    int e2 = 2 * err;
+                    if (e2 > -ady) { err -= ady; x += sx; }
+                    if (e2 <  adx) { err += adx; y += sy; }
+                }
+            };
+            for (int i = 0; i < kAgentCount; ++i) {
+                const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+                const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+                int cx, cy; worldToPx(wx, wz, cx, cy);
+                // the velocity tick: from the dot toward (pos + vel) projected, a few px long.
+                const int tipX = (gpuAgents[(size_t)i].px + gpuAgents[(size_t)i].vx) >> boids::kFrac;
+                const int tipZ = (gpuAgents[(size_t)i].pz + gpuAgents[(size_t)i].vz) >> boids::kFrac;
+                int tx, ty; worldToPx(tipX, tipZ, tx, ty);
+                line(cx, cy, tx, ty, 90, 110, 90);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+                     (uint8_t)(col.z * 255.0f + 0.5f), 1);
+            }
+            bool ok = WriteBMP(boidsFlockShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — boids flock top-down (diag %d, align %d, minSep %d)\n",
+                                boidsFlockShotPath, imgW, imgH, after.diag, after.alignment, after.minSep);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", boidsFlockShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

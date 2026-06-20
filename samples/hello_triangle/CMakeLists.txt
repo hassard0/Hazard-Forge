@@ -537,6 +537,21 @@ hf_compile_shaders(
     "shaders/boids_neighbor_count.comp.hlsl:cs"
     "shaders/boids_neighbor_scan.comp.hlsl:cs"
     "shaders/boids_neighbor_emit.comp.hlsl:cs"
+    # Deterministic GPU Crowds Slice 3 (Slice BD3, the 3rd slice of FLAGSHIP #18): boids_flock.comp runs THE
+    # FULL FLOCK STEP — ONE thread per AGENT accumulates the THREE Reynolds rules over agent i's BD2 NEIGHBOR
+    # LIST (separation Σ(pos_i-pos_j)*sepGain + alignment ((Σvel_j)/count - vel_i)*alignGain + cohesion
+    # ((Σpos_j)/count - pos_i)*cohGain; the means are INTEGER DIVIDES by the neighbor count, count==0 guard),
+    # adds the optional seek + gravity, per-axis clamps the force, integrates velocity (per-axis clamped) +
+    # position, and writes agent i into gAgentsOut — the 3 rules + means + clamps + integrate copied VERBATIM
+    # from engine/sim/boids.h::AccumFlock + StepFlock. JACOBI/PING-PONG (read gAgentsIn + the neighbor list
+    # built over THAT frozen snapshot / write gAgentsOut -> race-free, NO atomics; the host rebuilds the BD2
+    # neighbor list each tick on the new positions). Like boids_steer.comp this is int64 (the gain*delta +
+    # force*dt + vel*dt fxmul over Q16.16 overflows int32) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc
+    # cannot) -> NOT in the Metal hf_gen_msl list; the Metal --boids-flock showcase runs the CPU
+    # boids::StepFlock (byte-identical by construction), while the MSL-native BD2 grid passes stay a true GPU
+    # pass on both backends. Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU + cross-backend,
+    # proven memcmp. NO new RHI; BD1/BD2 shaders + goldens untouched (BD3 additive).
+    "shaders/boids_flock.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8: deterministic GPU cloth):
     # cloth_integrate.comp runs the Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per
     # particle runs `steps` iterations of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp)

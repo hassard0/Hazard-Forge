@@ -427,5 +427,174 @@ inline BoidsNeighborList BuildBoidsNeighborList(const std::vector<Agent>& agents
     return list;
 }
 
+// ===== Slice BD3 — THE FULL FLOCK STEP (SEPARATION + ALIGNMENT + COHESION over the BD2 neighbor list) =====
+// BD1 built the steering primitive (brute-force seek + separation); BD2 built the grid-hash neighbor list.
+// BD3 is the FULL FLOCK: over an agent's BD2 neighbor slice (neighborStart[i]..neighborStart[i+1]), accumulate
+// the THREE Reynolds rules — SEPARATION (steer away from crowding), ALIGNMENT (steer toward the neighbors'
+// mean heading), COHESION (steer toward the neighbors' mean position) — and integrate one deterministic tick.
+// A real flock emerges. INTEGER-bit-exact, JACOBI (frozen-snapshot), fixed op order -> GPU==CPU + two-run
+// byte-identical. The flock-step shader boids_flock.comp.hlsl is int64-Vulkan-only (the integrate fxmul, the
+// BD1/FPX1/GR1 lesson) over the MSL-native BD2 neighbor list; the BD2 grid passes stay in hf_gen_msl (reused
+// per tick to rebuild the list). BD3 APPENDS — BD1/BD2 are byte-frozen. NO new RHI.
+//
+// THE MEANS ARE INTEGER DIVIDES (the cross-backend crux): alignment + cohesion divide the neighbor velocity /
+// position SUM by the neighbor COUNT — an integer divide (truncate toward zero, the C++/HLSL/MSL `/` semantics,
+// identical on every vendor). count==0 -> NO align/coh term (the div-by-zero guard); separation is still an
+// accumulate (it sums per-neighbor away-deltas, zero if no neighbors). The shader copies THIS math VERBATIM.
+
+// ----- FlockConfig: the BD1 BoidsConfig tuning + the BD3 alignment/cohesion gains + the perception radius -----
+// = BoidsConfig (seek/sep/maxForce/maxSpeed/target/gravity) PLUS alignGain (the mean-heading pull), cohGain
+// (the mean-position pull), and perceptionRadius (the BD2 grid cell size == the sep/align/coh neighbor radius).
+// The flock's sep radius for AccumFlock IS the perception radius (the BD2 neighbor box), so sepRadius below is
+// unused by the flock path (kept for BoidsConfig reuse / the BD1 helpers); the flock uses perceptionRadius.
+struct FlockConfig {
+    fx     seekGain         = 0;   // Q16.16 gain on the optional (target - pos) seek force (0 => free flocking)
+    fx     sepGain          = 0;   // Q16.16 gain on the accumulated separation push (away from each neighbor)
+    fx     alignGain        = 0;   // Q16.16 gain on the alignment force (toward the neighbors' mean velocity)
+    fx     cohGain          = 0;   // Q16.16 gain on the cohesion force (toward the neighbors' mean position)
+    fx     perceptionRadius = 0;   // Q16.16 neighbor radius (the BD2 grid cell size; the sep/align/coh range)
+    fx     maxForce         = 0;   // Q16.16 per-AXIS force clamp (the axis-box magnitude limit, not radial)
+    fx     maxSpeed         = 0;   // Q16.16 per-AXIS speed clamp
+    FxVec3 target;                 // Q16.16 the optional shared seek target (only used if seekGain != 0)
+    FxVec3 gravity;                // Q16.16 constant acceleration (default 0 — BD3 is planar flocking)
+};
+
+// ----- AccumFlock(i, neighborList, agents, cfg): the 3 Reynolds rules over agent i's BD2 neighbor slice -------
+// Over the neighbor indices in [neighborStart[i], neighborStart[i+1]) (the BD2 list built on the SAME frozen
+// positions): accumulate the separation away-sum (Σ FxSub(pos_i, pos_j)), the neighbor velocity sum, and the
+// neighbor position sum, all in a FIXED ascending-slice order. Then:
+//   sep   = FxScale(Σ (pos_i - pos_j), sepGain)                              (away from crowding)
+//   align = FxScale((Σ vel_j)/count - vel_i, alignGain)   [count>0 only]     (toward the mean heading)
+//   coh   = FxScale((Σ pos_j)/count - pos_i, cohGain)     [count>0 only]     (toward the mean position)
+//   force = sep + align + coh
+// The means are INTEGER DIVIDES by count (deterministic truncation). count==0 -> sep only (no align/coh, no
+// div-by-zero). The sums are integer ADDS; FxScale's fxmul is int64 (-> the shader is Vulkan-only). The shader
+// copies THIS body VERBATIM. NOTE: the optional seek + gravity are added by StepFlock (not here), mirroring the
+// BD1 split (SteerSeek separate from StepBoids).
+inline FxVec3 AccumFlock(int i, const BoidsNeighborList& list, const std::vector<Agent>& agents,
+                         const FlockConfig& cfg) {
+    const Agent& a = agents[(size_t)i];
+    const uint32_t s0 = list.neighborStart[(size_t)i];
+    const uint32_t s1 = list.neighborStart[(size_t)i + 1u];
+    FxVec3 sepSum{0, 0, 0};   // Σ (pos_i - pos_j) — the raw away-direction accumulate
+    FxVec3 velSum{0, 0, 0};   // Σ vel_j           — for the alignment mean
+    FxVec3 posSum{0, 0, 0};   // Σ pos_j           — for the cohesion mean
+    int count = 0;
+    for (uint32_t s = s0; s < s1; ++s) {
+        const Agent& o = agents[(size_t)list.neighbors[(size_t)s]];
+        sepSum.x += a.pos.x - o.pos.x; sepSum.y += a.pos.y - o.pos.y; sepSum.z += a.pos.z - o.pos.z;
+        velSum.x += o.vel.x;           velSum.y += o.vel.y;           velSum.z += o.vel.z;
+        posSum.x += o.pos.x;           posSum.y += o.pos.y;           posSum.z += o.pos.z;
+        ++count;
+    }
+    // separation: scale the away-sum by sepGain (zero if no neighbors -> zero force).
+    FxVec3 force = FxScale(sepSum, cfg.sepGain);
+    if (count > 0) {
+        // alignment: (mean neighbor velocity) - own velocity, scaled by alignGain. Integer divide by count.
+        const FxVec3 meanVel{velSum.x / count, velSum.y / count, velSum.z / count};
+        const FxVec3 align = FxScale(FxSub(meanVel, a.vel), cfg.alignGain);
+        // cohesion: (mean neighbor position) - own position, scaled by cohGain. Integer divide by count.
+        const FxVec3 meanPos{posSum.x / count, posSum.y / count, posSum.z / count};
+        const FxVec3 coh = FxScale(FxSub(meanPos, a.pos), cfg.cohGain);
+        force = FxAdd(force, align);
+        force = FxAdd(force, coh);
+    }
+    return force;
+}
+
+// ----- StepFlock(agents, cfg, dt): one deterministic FULL-FLOCK tick (rebuild grid+neighbors -> JACOBI) ------
+// (1) Rebuild the BD2 neighbor engine on the CURRENT (frozen) positions: MakeBoidsGrid(agents, perceptionRadius)
+//     -> BuildBoidsCellTable -> BuildBoidsNeighborList (the BD2 functions, REUSED — the flock moves, so the grid
+//     is rebuilt every tick). (2) JACOBI per agent in FIXED index order over the FROZEN snapshot: force =
+//     AccumFlock(i) + optional seek (if seekGain != 0) + gravity; per-axis clamp force to ±maxForce; vel +=
+//     force*dt clamp ±maxSpeed; pos += vel*dt. Every agent reads the frozen snapshot (positions + the neighbor
+//     list built over it) and writes the next state -> order-independent + GPU race-free + bit-exact GPU==CPU.
+//     The optional seek mirrors BD1's SteerSeek (un-normalized desired*seekGain), added only when seekGain != 0.
+inline void StepFlock(std::vector<Agent>& agents, const FlockConfig& cfg, fx dt) {
+    const std::vector<Agent> prev = agents;                    // frozen snapshot (the Jacobi input)
+    // Rebuild the BD2 grid + cell table + neighbor list on the frozen positions (== the GPU per-tick rebuild).
+    const BoidsGrid grid = MakeBoidsGrid(prev, cfg.perceptionRadius);
+    const BoidsCellTable table = BuildBoidsCellTable(prev, grid);
+    const BoidsNeighborList list = BuildBoidsNeighborList(prev, grid, table, cfg.perceptionRadius);
+    const int n = (int)agents.size();
+    for (int i = 0; i < n; ++i) {
+        const Agent& a = prev[(size_t)i];                      // read the FROZEN state
+        // (a) the 3 Reynolds rules over the neighbor list.
+        FxVec3 force = AccumFlock(i, list, prev, cfg);
+        // (b) the optional seek toward the shared target (un-normalized; skipped when seekGain == 0).
+        if (cfg.seekGain != 0) force = FxAdd(force, FxScale(FxSub(cfg.target, a.pos), cfg.seekGain));
+        // (c) + gravity (a constant acceleration; 0 in the planar showcase).
+        force = FxAdd(force, cfg.gravity);
+        // (d) per-axis clamp the force (the axis-box magnitude limit).
+        force = ClampAxisVec(force, cfg.maxForce);
+        // (e) integrate velocity: vel += force * dt; then per-axis clamp to ±maxSpeed.
+        FxVec3 vel = FxAdd(a.vel, FxScale(force, dt));
+        vel = ClampAxisVec(vel, cfg.maxSpeed);
+        // (f) integrate position: pos += vel * dt.
+        const FxVec3 pos = FxAdd(a.pos, FxScale(vel, dt));
+        agents[(size_t)i].vel = vel;
+        agents[(size_t)i].pos = pos;
+    }
+}
+
+// StepFlockSteps(agents, cfg, dt, steps): run `steps` StepFlock ticks (the showcase settle loop).
+inline void StepFlockSteps(std::vector<Agent>& agents, const FlockConfig& cfg, fx dt, int steps) {
+    for (int s = 0; s < steps; ++s) StepFlock(agents, cfg, dt);
+}
+
+// ----- MeasureFlock: the deterministic FLOCK statistics (Q16.16 / integer) -------------------------------
+// meanSpeed   = mean L1 speed (|vx|+|vy|+|vz|), the "they're moving" stat (an integer L1 proxy, NO sqrt).
+// diag        = the flock's bounding-box L1 diagonal ((maxX-minX)+(maxY-minY)+(maxZ-minZ)) — COHESION pulls it
+//               IN, so it SHRINKS from the spread start (the "they clustered" stat). Pure integer.
+// alignment   = the mean per-axis heading-agreement: for each axis, sum the SIGNS of the velocities and take
+//               |sum|; the agreement is (|Σ sign(vx)| + |Σ sign(vy)| + |Σ sign(vz)|) (0..3N). A perfectly
+//               aligned flock (all velocities same sign per axis) -> ~3N; a random flock -> ~0. Returned as the
+//               per-agent-averaged Q16.16 fraction of N (so 0..3*kOne). The "they flock" stat — RISES as
+//               alignment aligns the headings. Pure integer (sign + add + a single divide), NO sqrt/float.
+// minSep      = the minimum L1 pairwise separation (the "they didn't collapse" stat — separation keeps it above
+//               a floor). All integer L1 metrics -> bit-exact + cross-platform identical.
+struct FlockStats {
+    fx meanSpeed = 0;   // mean L1 speed
+    fx diag      = 0;   // flock bounding-box L1 diagonal (shrinks under cohesion)
+    fx alignment = 0;   // mean heading-alignment in [0, 3*kOne] (rises under alignment)
+    fx minSep    = 0;   // minimum L1 pairwise separation (stays above a floor under separation)
+};
+
+inline int FxSign(fx v) { return v > 0 ? 1 : (v < 0 ? -1 : 0); }
+
+inline FlockStats MeasureFlock(const std::vector<Agent>& agents, const FlockConfig& /*cfg*/) {
+    FlockStats s;
+    const int n = (int)agents.size();
+    if (n == 0) return s;
+    int64_t speedSum = 0;
+    int64_t signX = 0, signY = 0, signZ = 0;
+    fx minX = agents[0].pos.x, maxX = minX;
+    fx minY = agents[0].pos.y, maxY = minY;
+    fx minZ = agents[0].pos.z, maxZ = minZ;
+    for (int i = 0; i < n; ++i) {
+        const Agent& a = agents[(size_t)i];
+        speedSum += L1(a.vel);
+        signX += FxSign(a.vel.x); signY += FxSign(a.vel.y); signZ += FxSign(a.vel.z);
+        if (a.pos.x < minX) minX = a.pos.x; if (a.pos.x > maxX) maxX = a.pos.x;
+        if (a.pos.y < minY) minY = a.pos.y; if (a.pos.y > maxY) maxY = a.pos.y;
+        if (a.pos.z < minZ) minZ = a.pos.z; if (a.pos.z > maxZ) maxZ = a.pos.z;
+    }
+    s.meanSpeed = (fx)(speedSum / n);
+    s.diag = (maxX - minX) + (maxY - minY) + (maxZ - minZ);
+    // heading-alignment: |Σ sign| per axis (0..N each), summed (0..3N), scaled to a Q16.16 fraction of N.
+    const int64_t agree = (signX < 0 ? -signX : signX) + (signY < 0 ? -signY : signY) +
+                          (signZ < 0 ? -signZ : signZ);
+    s.alignment = (fx)((agree * (int64_t)kOne) / n);   // 0 .. 3*kOne (mean per-axis agreement)
+    // min L1 pairwise separation over j>i (a single canonical orientation; deterministic).
+    int64_t minSep = -1;
+    for (int i = 0; i < n; ++i)
+        for (int j = i + 1; j < n; ++j) {
+            const int64_t d = L1(FxSub(agents[(size_t)i].pos, agents[(size_t)j].pos));
+            if (minSep < 0 || d < minSep) minSep = d;
+        }
+    s.minSep = (fx)(minSep < 0 ? 0 : minSep);
+    return s;
+}
+
 }  // namespace boids
 }  // namespace hf::sim

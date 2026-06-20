@@ -275,6 +275,142 @@ int main() {
         }
     }
 
+    // ===== Slice BD3: THE FULL FLOCK STEP (separation + alignment + cohesion over the BD2 neighbor list) =====
+    // What this PINS (the contracts boids_flock.comp + the GPU==CPU memcmp build on):
+    //   * AccumFlock: separation points AWAY from a near neighbor; alignment points toward the neighbors' mean
+    //     velocity; cohesion points toward the neighbors' mean position; zero-neighbors -> no crash, zero force.
+    //   * StepFlock: a spread flock COHERES (the bounding diagonal shrinks) + ALIGNS (heading-alignment rises)
+    //     while keeping min-separation above a floor; an alignGain=cohGain=0 (sep-only) control stays loose
+    //     (does NOT cohere); two runs byte-identical.
+
+    // A FlockConfig with the 3 gains + a perception radius (no seek -> free flocking). The recipe (perception
+    // radius 3, weak separation 0.125, strong cohesion) is the showcase config: a dense flock CLUSTERS (diagonal
+    // shrinks) + ALIGNS while weak separation keeps spacing above a floor — proven in the showcase + here.
+    auto flockCfg3 = [&](boids::fx alignG, boids::fx cohG) {
+        boids::FlockConfig c;
+        c.seekGain         = 0;            // free flocking (no goal)
+        c.sepGain          = frac(1, 8);   // 0.125 weak separation push (keeps spacing without dispersing)
+        c.alignGain        = alignG;
+        c.cohGain          = cohG;
+        c.perceptionRadius = wu(3);        // 3-unit neighbor radius (the BD2 cell size; > the 2-unit spacing)
+        c.maxForce         = wu(8);
+        c.maxSpeed         = wu(6);
+        c.target           = boids::FxVec3{0, 0, 0};
+        c.gravity          = boids::FxVec3{0, 0, 0};
+        return c;
+    };
+
+    // ===== AccumFlock: the 3 rules point the right way =====
+    {
+        // Build a tiny neighbor list by hand via the BD2 engine so AccumFlock reads a real slice.
+        // agent 0 at origin (zero vel); agent 1 a close +x neighbor MOVING +z with velocity +6.
+        std::vector<boids::Agent> ag = {
+            boids::Agent{boids::FxVec3{wu(0), 0, wu(0)}, boids::FxVec3{0, 0, 0}},
+            boids::Agent{boids::FxVec3{wu(2), 0, wu(0)}, boids::FxVec3{0, 0, wu(6)}},
+        };
+        const boids::fx radius = wu(4);
+        boids::BoidsGrid grid = boids::MakeBoidsGrid(ag, radius);
+        boids::BoidsCellTable tbl = boids::BuildBoidsCellTable(ag, grid);
+        boids::BoidsNeighborList lst = boids::BuildBoidsNeighborList(ag, grid, tbl, radius);
+
+        // separation only (align=coh=0): agent 0 pushed AWAY from the +x neighbor -> -x force.
+        boids::FlockConfig sepOnly = flockCfg3(0, 0);
+        boids::FxVec3 fsep = boids::AccumFlock(0, lst, ag, sepOnly);
+        check(fsep.x < 0, "AccumFlock: separation pushes -x (away from a +x neighbor)");
+        check(fsep.z == 0, "AccumFlock: separation has no z component (pure +x neighbor)");
+
+        // alignment only (sep=coh=0): agent 0 steered toward the neighbor's mean velocity (+z) -> +z force.
+        boids::FlockConfig alignOnly = flockCfg3(boids::kOne, 0); alignOnly.sepGain = 0;
+        boids::FxVec3 fal = boids::AccumFlock(0, lst, ag, alignOnly);
+        check(fal.z > 0, "AccumFlock: alignment steers toward the neighbors' mean velocity (+z)");
+
+        // cohesion only (sep=align=0): agent 0 steered toward the neighbor's mean position (+x) -> +x force.
+        boids::FlockConfig cohOnly = flockCfg3(0, boids::kOne); cohOnly.sepGain = 0;
+        boids::FxVec3 fco = boids::AccumFlock(0, lst, ag, cohOnly);
+        check(fco.x > 0, "AccumFlock: cohesion steers toward the neighbors' mean position (+x)");
+
+        // zero neighbors -> no crash, zero force (an isolated agent far away).
+        std::vector<boids::Agent> one = {boids::Agent{boids::FxVec3{wu(0), 0, wu(0)}, boids::FxVec3{0, 0, 0}}};
+        boids::BoidsGrid g1 = boids::MakeBoidsGrid(one, radius);
+        boids::BoidsCellTable t1 = boids::BuildBoidsCellTable(one, g1);
+        boids::BoidsNeighborList n1 = boids::BuildBoidsNeighborList(one, g1, t1, radius);
+        boids::FlockConfig full = flockCfg3(boids::kOne, boids::kOne);
+        boids::FxVec3 f0 = boids::AccumFlock(0, n1, one, full);
+        check(f0.x == 0 && f0.y == 0 && f0.z == 0, "AccumFlock: zero neighbors -> zero force (no div-by-zero)");
+    }
+
+    // ===== StepFlock: a spread flock coheres (diagonal shrinks) + aligns (alignment rises), min-sep floored ===
+    {
+        boids::FlockConfig c = flockCfg3(frac(1, 2), boids::kOne);   // align 0.5, coh 1.0
+        const boids::fx dt = boids::kOne / 60;
+        // A dense 8x8 flock at 2-unit spacing (within the radius-3 perception -> a connected neighbor graph),
+        // each given a small deterministic initial velocity so headings start DISORDERED (then alignment aligns).
+        std::vector<boids::Agent> agents;
+        for (int gx = 0; gx < 8; ++gx)
+            for (int gz = 0; gz < 8; ++gz) {
+                // a deterministic per-agent jitter velocity (alternating signs) so initial alignment is LOW.
+                const boids::fx vx = ((gx + gz) & 1) ? frac(1, 2) : -frac(1, 2);
+                const boids::fx vz = ((gx) & 1) ? -frac(1, 3) : frac(1, 3);
+                agents.push_back(boids::Agent{boids::FxVec3{wu(gx * 2), 0, wu(gz * 2)},
+                                              boids::FxVec3{vx, 0, vz}});
+            }
+        boids::FlockStats before = boids::MeasureFlock(agents, c);
+        boids::StepFlockSteps(agents, c, dt, 300);
+        boids::FlockStats after = boids::MeasureFlock(agents, c);
+
+        // cohesion pulled the flock together: the bounding diagonal SHRANK.
+        check(after.diag < before.diag, "StepFlock: bounding diagonal shrinks (cohesion clustered the flock)");
+        // alignment aligned the headings: the heading-alignment ROSE.
+        check(after.alignment > before.alignment, "StepFlock: heading-alignment rises (alignment aligned them)");
+        // separation kept spacing: min separation stays above a floor (didn't collapse to a point).
+        check(after.minSep > frac(1, 8), "StepFlock: minSep above a floor (separation kept spacing)");
+    }
+
+    // ===== StepFlock control: a sep-only flock (align=coh=0) does NOT cohere as tightly =====
+    {
+        const boids::fx dt = boids::kOne / 60;
+        auto makeFlock = [&]() {
+            std::vector<boids::Agent> a;
+            for (int gx = 0; gx < 8; ++gx)
+                for (int gz = 0; gz < 8; ++gz) {
+                    const boids::fx vx = ((gx + gz) & 1) ? frac(1, 2) : -frac(1, 2);
+                    const boids::fx vz = ((gx) & 1) ? -frac(1, 3) : frac(1, 3);
+                    a.push_back(boids::Agent{boids::FxVec3{wu(gx * 2), 0, wu(gz * 2)},
+                                             boids::FxVec3{vx, 0, vz}});
+                }
+            return a;
+        };
+        boids::FlockConfig full    = flockCfg3(frac(1, 2), boids::kOne);
+        boids::FlockConfig sepOnly = flockCfg3(0, 0);
+        std::vector<boids::Agent> agFull = makeFlock(), agSep = makeFlock();
+        boids::StepFlockSteps(agFull, full,    dt, 300);
+        boids::StepFlockSteps(agSep,  sepOnly, dt, 300);
+        boids::FlockStats sFull = boids::MeasureFlock(agFull, full);
+        boids::FlockStats sSep  = boids::MeasureFlock(agSep,  sepOnly);
+        // the full 3-rule flock coheres TIGHTER (smaller diagonal) than the sep-only control.
+        check(sFull.diag < sSep.diag, "StepFlock control: sep-only stays looser (3 rules cohere tighter)");
+    }
+
+    // ===== StepFlock two runs byte-identical (determinism) =====
+    {
+        boids::FlockConfig c = flockCfg3(frac(1, 2), boids::kOne);
+        const boids::fx dt = boids::kOne / 60;
+        auto makeFlock = [&]() {
+            std::vector<boids::Agent> a;
+            for (int gx = 0; gx < 6; ++gx)
+                for (int gz = 0; gz < 6; ++gz)
+                    a.push_back(boids::Agent{boids::FxVec3{wu(gx * 2), 0, wu(gz * 2)},
+                                             boids::FxVec3{frac(1, 4), 0, -frac(1, 4)}});
+            return a;
+        };
+        std::vector<boids::Agent> a1 = makeFlock(), a2 = makeFlock();
+        boids::StepFlockSteps(a1, c, dt, 200);
+        boids::StepFlockSteps(a2, c, dt, 200);
+        check(a1.size() == a2.size() &&
+              std::memcmp(a1.data(), a2.data(), a1.size() * sizeof(boids::Agent)) == 0,
+              "StepFlock: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("boids_test: ALL PASS\n");
     else             std::printf("boids_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
