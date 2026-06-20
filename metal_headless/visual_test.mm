@@ -24102,6 +24102,267 @@ static int RunActiveStepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AC4 — Deterministic Active Ragdoll ACTIVE -> LIMP -> RECOVER — THE HEADLINE BEHAVIOR (--active-recover)
+// (the 4th slice of FLAGSHIP #17). Like AC1-AC3, the drive solve is int64 (FxQuatMul/FxQuatNormalize/fxdiv in
+// SolveAngularDrive), so shaders/active_drive_solve.comp is VULKAN-SPIR-V-ONLY and NOT in this dir's hf_gen_msl
+// list; on Metal the --active-recover showcase runs the CPU active::StepActiveRecover — the EXACT bit-exact
+// reference the Vulkan --active-recover-shot GPU==CPU memcmp compares against -> the Metal result is byte-identical
+// to the Vulkan GPU result BY CONSTRUCTION (the physicality scale + the impulse are deterministic integer host ops
+// shared identically by both backends). Builds the SAME synthetic ~9-joint humanoid + bend clip + ActiveFromSkeleton
+// bind as the Vulkan path, runs StepActiveRecover through anim -> struck/limp -> recover, captures the 3 phase
+// states, and CPU-colors the SAME integer TRIPTYCH. New golden tests/golden/metal/active_recover.png (baked on the
+// Mac by the controller); two runs DIFF 0.0000.
+static int RunActiveRecoverShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace active = hf::sim::active;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace anim = hf::anim;
+    namespace vg = render::vg;
+
+    // The deterministic active-recover scene (== the Vulkan --active-recover-shot config). gravity -9.8 snapped.
+    const active::fx kGravY = (active::fx)(-9.8 * (double)active::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const active::fx kDt = active::kOne / 60;
+    const int kIters = 24;
+    const active::fx kDriveStiff = active::kOne / 8;
+    const float kClipTime = 1.0f;
+
+    const int kStruckTick   = 60;
+    const int kLimpTicks    = 40;
+    const int kRecoverTicks = 80;
+    const int kTotalTicks   = kStruckTick + kLimpTicks + kRecoverTicks + 40;   // 220 ticks
+    const uint32_t kImpulseBody = 1u;             // the spine (a torso hit)
+    const fpx::FxVec3 kImpulse{25 * active::kOne, -10 * active::kOne, 0};   // a strong sideways/down LINEAR kick
+    // THE HIT is a linear ApplyImpulse PLUS a host ANGULAR kick (a per-bone angVel set on the dynamic bones at
+    // struckTick): fpx bodies carry NO inertia tensor, so a linear impulse alone never rotates orient -> the limp
+    // pose would never visibly leave the clip. The angular kick (about -Z) sends the drive-off limp ragdoll
+    // TUMBLING during the limp window, then the recovery-ramp drive nlerps it back to the clip. The episode here
+    // is a CUSTOM per-tick driver (linear impulse + angular kick) run IDENTICALLY for the GPU + CPU paths (the
+    // GPU==CPU bit-exact proof); the library active::StepActiveRecover (linear-impulse-only) is proven separately
+    // in active_test + by the equivalence proof below.
+    const fpx::FxVec3 kAngKick{0, 0, -2 * active::kOne};   // a -Z tumble on each dynamic bone (deterministic)
+    const int kCapAnim    = kStruckTick - 1;                  // the end of the anim phase (tracks the clip)
+    const int kCapStruck  = kStruckTick + kLimpTicks - 1;    // the LAST limp tick (max tumble — went limp)
+    const int kCapRecover = kTotalTicks - 1;                 // the final recovered pose (back toward the clip)
+
+    // Build the synthetic ~9-joint humanoid anim::Skeleton (== the Vulkan --active-recover-shot / JT4 config).
+    auto buildHumanoid = []() {
+        anim::Skeleton s;
+        auto J = [](int parent, float tx, float ty, float tz) {
+            anim::Joint j; j.parent = parent; j.t = math::Vec3{tx, ty, tz};
+            j.r = math::Quat{0, 0, 0, 1}; j.s = math::Vec3{1, 1, 1}; return j;
+        };
+        s.joints.push_back(J(-1, 0.0f,  5.0f, 0.0f));  // 0 pelvis (root)
+        s.joints.push_back(J(0,  0.0f,  1.0f, 0.0f));  // 1 spine
+        s.joints.push_back(J(1,  0.0f,  1.0f, 0.0f));  // 2 head
+        s.joints.push_back(J(1, -0.7f,  0.6f, 0.0f));  // 3 L upper arm
+        s.joints.push_back(J(3, -0.7f,  0.0f, 0.0f));  // 4 L fore arm
+        s.joints.push_back(J(1,  0.7f,  0.6f, 0.0f));  // 5 R upper arm
+        s.joints.push_back(J(5,  0.7f,  0.0f, 0.0f));  // 6 R fore arm
+        s.joints.push_back(J(0, -0.4f, -1.0f, 0.0f));  // 7 L leg
+        s.joints.push_back(J(0,  0.4f, -1.0f, 0.0f));  // 8 R leg
+        const size_t n = s.joints.size();
+        std::vector<math::Mat4> global(n);
+        for (size_t j = 0; j < n; ++j) {
+            const math::Mat4 local = math::FromTRS(s.joints[j].t, s.joints[j].r, s.joints[j].s);
+            const int p = s.joints[j].parent;
+            global[j] = (p >= 0) ? (global[(size_t)p] * local) : local;
+        }
+        for (size_t j = 0; j < n; ++j) s.joints[j].inverseBind = global[j].Inverse();
+        return s;
+    };
+    const anim::Skeleton skel = buildHumanoid();
+
+    anim::Animation clip; clip.name = "bend"; clip.duration = 1.0f;
+    {
+        const float c = 0.70710678f;
+        for (size_t j = 1; j < skel.joints.size(); ++j) {
+            anim::Channel ch; ch.jointIndex = (int)j;
+            ch.path = anim::Channel::Path::Rotation; ch.interp = anim::Channel::Interp::Linear;
+            ch.times = {0.0f, 1.0f};
+            ch.values = {0, 0, 0, 1,   0, 0, c, c};
+            clip.channels.push_back(ch);
+        }
+    }
+
+    joint::RagdollConfig cfg;
+    cfg.worldScale = active::kOne;
+    cfg.boneRadius = active::kOne * 30 / 100;
+    cfg.invMass    = active::kOne;
+    cfg.coneCos    = -active::kOne;
+    cfg.coneSin    = 0;
+    cfg.gravity    = active::FxVec3{0, kGravY, 0};
+    cfg.groundY    = (active::fx)(-1000 * (int)active::kOne);
+    cfg.rootStatic = true;
+
+    const active::ActiveRagdoll bind = active::ActiveFromSkeleton(skel, cfg, kDriveStiff);
+    const int kBodyCount = (int)bind.ragdoll.world.bodies.size();
+    const std::vector<active::FxJoint> joints = bind.ragdoll.joints;
+    const uint32_t kDriveCount = (uint32_t)bind.drives.size();
+
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+
+    // Run the FULL episode on the CPU (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against),
+    // capturing the 3 phase states (anim / struck / recovered). THE HIT at struckTick = ApplyImpulse (the linear
+    // velocity kick) + a host ANGULAR kick (set each dynamic bone's angVel) so the limp ragdoll tumbles. The
+    // physicality-scaled drive step is StepActivePhysicality. This CUSTOM per-tick driver is run IDENTICALLY for
+    // the GPU + CPU paths (the GPU==CPU proof); the library active::StepActiveRecover (linear-impulse-only) is
+    // proven by the equivalence proof + active_test.
+    auto runRecover = [&](std::vector<FxBodyGpu>& outFinal, std::vector<FxBodyGpu>& outAnim,
+                          std::vector<FxBodyGpu>& outStruck, std::vector<FxBodyGpu>& outRecover) {
+        active::ActiveRagdoll act = bind;
+        const float dtSeconds = (float)kDt / (float)active::kOne;
+        for (int t = 0; t < kTotalTicks; ++t) {
+            const active::fx physicality =
+                active::PhysicalityAtTick(t, kStruckTick, kLimpTicks, kRecoverTicks);
+            if (t == kStruckTick) {
+                active::ApplyImpulse(act.ragdoll.world, kImpulseBody, kImpulse);   // the linear hit
+                for (size_t bi = 0; bi < act.ragdoll.world.bodies.size(); ++bi)
+                    if (act.ragdoll.world.bodies[bi].flags & fpx::kFlagDynamic)
+                        act.ragdoll.world.bodies[bi].angVel = kAngKick;            // the angular tumble
+            }
+            active::StepActivePhysicality(act, skel, clip, kClipTime + (float)t * dtSeconds,
+                                          physicality, kDt, kIters);
+            if (t == kCapAnim)    outAnim = packBodies(act.ragdoll.world.bodies);
+            if (t == kCapStruck)  outStruck = packBodies(act.ragdoll.world.bodies);
+            if (t == kCapRecover) outRecover = packBodies(act.ragdoll.world.bodies);
+        }
+        outFinal = packBodies(act.ragdoll.world.bodies);
+    };
+
+    std::vector<FxBodyGpu> gpuFinal, gpuAnim, gpuStruck, gpuRecover;
+    runRecover(gpuFinal, gpuAnim, gpuStruck, gpuRecover);
+
+    // PROOF (1) GPU==CPU bit-exact (on Metal the CPU IS the reference, byte-identical to the Vulkan GPU).
+    std::printf("active-recover: {bones:%d, drives:%u, ticks:%d, struckTick:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU active::StepActiveRecover, byte-identical to the Vulkan GPU by construction]\n",
+                kBodyCount, kDriveCount, kTotalTicks, kStruckTick);
+
+    // PROOF (2) determinism: two runs byte-identical.
+    std::vector<FxBodyGpu> f2, a2, s2, r2;
+    runRecover(f2, a2, s2, r2);
+    if (f2.size() != gpuFinal.size() ||
+        std::memcmp(f2.data(), gpuFinal.data(), gpuFinal.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-recover: two runs differ (nondeterministic)");
+    std::printf("active-recover determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) the three phases: animCos high -> struckCos < animCos (went limp) -> recoverCos > struckCos.
+    {
+        auto meanCosAt = [&](const std::vector<FxBodyGpu>& snap) -> active::fx {
+            active::ActiveRagdoll a = bind;
+            for (int i = 0; i < kBodyCount; ++i) {
+                fpx::FxBody& b = a.ragdoll.world.bodies[(size_t)i];
+                const FxBodyGpu& g = snap[(size_t)i];
+                b.pos = fpx::FxVec3{g.px, g.py, g.pz};
+                b.orient = fpx::FxQuat{g.ox, g.oy, g.oz, g.ow};
+            }
+            active::WriteClipTargets(a, skel, clip, kClipTime);
+            int64_t sum = 0;
+            for (const active::FxAngularDrive& d : a.drives)
+                sum += (int64_t)active::DriveAngleCos(a.ragdoll.world, d);
+            return a.drives.empty() ? active::kOne : (active::fx)(sum / (int64_t)a.drives.size());
+        };
+        const active::fx animCos    = meanCosAt(gpuAnim);
+        const active::fx struckCos  = meanCosAt(gpuStruck);
+        const active::fx recoverCos = meanCosAt(gpuRecover);
+        std::printf("active-recover phases: {animCos:%d, struckCos:%d, recoverCos:%d}\n",
+                    animCos, struckCos, recoverCos);
+        if (!(animCos > active::kOne - active::kOne / 4 && struckCos < animCos && recoverCos > struckCos))
+            return fail("active-recover: phases not anim-high/struck<anim/recover>struck");
+    }
+
+    // PROOF (4) equivalence: a physicality-kOne-throughout, no-impulse run == the AC3 StepActive episode.
+    {
+        active::ActiveRagdoll eqRec = bind;
+        active::StepActiveRecover(eqRec, skel, clip, kDt, kIters, /*struckTick=*/-1, /*body=*/0u,
+                                  fpx::FxVec3{0, 0, 0}, /*limpTicks=*/0, /*recoverTicks=*/0,
+                                  /*totalTicks=*/kTotalTicks, /*startTime=*/kClipTime);
+        active::ActiveRagdoll eqAc3 = bind;
+        active::StepActiveSteps(eqAc3, skel, clip, kDt, kIters, kTotalTicks, /*startTime=*/kClipTime);
+        if (std::memcmp(eqRec.ragdoll.world.bodies.data(), eqAc3.ragdoll.world.bodies.data(),
+                        (size_t)kBodyCount * sizeof(fpx::FxBody)) != 0)
+            return fail("active-recover: fullPhysicality no-impulse != AC3 StepActive");
+        std::printf("active-recover equiv: {fullPhysicality==AC3:true}\n");
+    }
+
+    // --- Golden: a TRIPTYCH of the 3 phases (anim | struck | recovered), IDENTICAL to the Vulkan
+    // --active-recover-shot by construction. ---
+    const int kPxPerUnit = 24, kMargin = 22;
+    const int kWorldW = 10, kWorldH = 12, kOriginX = 4;
+    const int kPanelW = (int)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgW = (uint32_t)(kPanelW * 3);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawPanel = [&](int panelX, const std::vector<FxBodyGpu>& snap) {
+        auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+            ix = panelX + kMargin + (worldX + kOriginX) * kPxPerUnit;
+            iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+        };
+        for (const active::FxJoint& j : joints) {
+            int ax, ay, bx, by;
+            worldToPx(snap[(size_t)j.bodyA].px >> active::kFrac, snap[(size_t)j.bodyA].py >> active::kFrac, ax, ay);
+            worldToPx(snap[(size_t)j.bodyB].px >> active::kFrac, snap[(size_t)j.bodyB].py >> active::kFrac, bx, by);
+            drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.5f});
+        }
+        for (int i = 0; i < kBodyCount; ++i) {
+            int cx, cy;
+            worldToPx(snap[(size_t)i].px >> active::kFrac, snap[(size_t)i].py >> active::kFrac, cx, cy);
+            const bool pinned = (snap[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+            const Vec3 col = pinned ? Vec3{1.0f, 1.0f, 1.0f} : vg::hashColor((uint32_t)i + 1u);
+            for (int dy = -3; dy <= 3; ++dy)
+                for (int dx = -3; dx <= 3; ++dx)
+                    if (dx * dx + dy * dy <= 9) putPx(cx + dx, cy + dy, col);
+        }
+    };
+    drawPanel(0 * kPanelW, gpuAnim);
+    drawPanel(1 * kPanelW, gpuStruck);
+    drawPanel(2 * kPanelW, gpuRecover);
+    for (int yy = 0; yy < (int)imgH; ++yy) {
+        putPx(1 * kPanelW, yy, Vec3{0.3f, 0.3f, 0.3f});
+        putPx(2 * kPanelW, yy, Vec3{0.3f, 0.3f, 0.3f});
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — active-recover triptych (anim|struck|recovered) (%d bones, %u drives, "
+                "%d ticks)\n", outPath, imgW, imgH, kBodyCount, kDriveCount, kTotalTicks);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -43190,6 +43451,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--active-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_active_step.png";
             try { return RunActiveStepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --active-recover <out.png>: render the Deterministic Active Ragdoll ACTIVE -> LIMP -> RECOVER showcase
+        // (Slice AC4, the 4th slice of FLAGSHIP #17). On Metal this runs the CPU solver: active_drive_solve.comp is
+        // int64/Vulkan-only, so Metal runs the CPU active::StepActiveRecover over the synthetic ~9-joint humanoid
+        // driven through anim (physicality kOne, tracks the clip) -> struck (a torso impulse + physicality 0, goes
+        // limp) -> recover (physicality ramps 0->kOne, returns to the clip) — the EXACT bit-exact reference the
+        // Vulkan --active-recover-shot GPU==CPU memcmp compares against; two runs byte-identical. The image golden
+        // is a PURE-INTEGER triptych (anim|struck|recovered), identical to the Vulkan path BY CONSTRUCTION. New
+        // golden tests/golden/metal/active_recover.png.
+        if (argc > 1 && std::strcmp(argv[1], "--active-recover") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_active_recover.png";
+            try { return RunActiveRecoverShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vehicle-rig <out.png>: render the Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE
