@@ -9,6 +9,10 @@
 //   * DriveAngleCos: kOne when qrel == qTarget; below kOne off-target.
 //   * StepDriveWorld: the 3-link chain drives to + HOLDS the L-pose (DriveAngleCos near kOne); the
 //     stiffness-0 control hangs straight down (no drive); two runs byte-identical.
+//   * AC2 driveWeight (the per-joint physical blend weight): driveWeight kOne == AC1 byte-identical orient
+//     (render-invariant), driveWeight 0 == pure-physics no-drive, an intermediate weight pulls partway; a
+//     mixed-weight StepDriveWorld HOLDS the driven joints + HANGS the limp ones (the partial ragdoll), two
+//     runs byte-identical; an all-weight-kOne step == the AC1 all-driven step (render-invariance).
 //
 // HONEST CAVEAT (the JT2/VH1 caveat shape): the drive is a stiffness-scaled NLERP toward target (a soft
 // angular constraint), NOT analytic motor mechanics; the held angle is a deterministic-but-nonzero
@@ -52,11 +56,19 @@ static fpx::FxBody body(int x, int y, int z, active::fx im, const fpx::FxQuat& q
 }
 static fpx::FxQuat ident() { return fpx::FxQuat{0, 0, 0, active::kOne}; }
 
-// A drive record (bodyA -> bodyB) toward qTarget at `stiffness`.
+// A drive record (bodyA -> bodyB) toward qTarget at `stiffness` (driveWeight defaults to kOne — AC1 behavior).
 static active::FxAngularDrive drive(uint32_t a, uint32_t b, const fpx::FxQuat& qTarget,
                                     active::fx stiffness) {
     active::FxAngularDrive d;
     d.bodyA = a; d.bodyB = b; d.qTarget = qTarget; d.stiffness = stiffness;
+    return d;
+}
+
+// AC2: a drive record with an explicit per-joint physical blend weight.
+static active::FxAngularDrive driveW(uint32_t a, uint32_t b, const fpx::FxQuat& qTarget,
+                                     active::fx stiffness, active::fx weight) {
+    active::FxAngularDrive d = drive(a, b, qTarget, stiffness);
+    d.driveWeight = weight;
     return d;
 }
 
@@ -68,9 +80,12 @@ int main() {
     const active::fx kSqrtHalf = (active::fx)(46341);   // 0.70710678 * 65536 rounded
     const fpx::FxQuat qZ90{0, 0, kSqrtHalf, kSqrtHalf};
 
-    // The std430 stride contract (the GPU mirror packs the 28-byte record into a 16-byte-aligned 32-byte
-    // stride). The C++ FxAngularDrive is the 28-byte logical record (no GPU-only pad).
-    check(sizeof(active::FxAngularDrive) == 28, "FxAngularDrive logical layout (7 x int32 = 28 bytes)");
+    // The std430 stride contract (AC2): the C++ FxAngularDrive is now the 32-byte logical record — the AC1
+    // 28-byte record + the AC2 driveWeight occupying the former GPU-mirror pad slot (the std430 stride was
+    // ALREADY 32 in AC1, so the GPU mirror stride is UNCHANGED — render-invariant for AC1).
+    check(sizeof(active::FxAngularDrive) == 32, "FxAngularDrive logical layout (8 x int32 = 32 bytes, AC2)");
+    // AC2: driveWeight DEFAULTS to kOne so AC1 call-sites are unchanged in behavior (the render-invariance).
+    check(active::FxAngularDrive{}.driveWeight == active::kOne, "FxAngularDrive.driveWeight defaults to kOne");
 
     // ================= SolveAngularDrive: stiffness kOne SNAPS qrel to qTarget (within a band) ===========
     {
@@ -268,6 +283,139 @@ int main() {
                           std::memcmp(a.bodies.data(), b.bodies.data(),
                                       a.bodies.size() * sizeof(fpx::FxBody)) == 0;
         check(same, "StepDriveWorld determinism: two runs BYTE-IDENTICAL");
+    }
+
+    // ============================================================================================
+    // ============================ AC2: per-joint physical blend weight ===========================
+    // ============================================================================================
+
+    // ===== AC2 (1): driveWeight == kOne is BYTE-IDENTICAL to AC1 (the render-invariance contract) =====
+    // A single SolveAngularDrive with an explicit driveWeight=kOne produces the EXACT same orient as the AC1
+    // drive (no driveWeight field set / default kOne) because fxmul(w, kOne) == w in Q16.16.
+    {
+        active::FxWorld wAc1, wW1;
+        wAc1.gravity = wW1.gravity = fpx::FxVec3{0, 0, 0};
+        wAc1.groundY = wW1.groundY = (active::fx)(-1000 * (int)active::kOne);
+        wAc1.bodies = {body(0, 0, 0, 0, ident()), body(0, 0, 0, active::kOne, ident())};
+        wW1.bodies  = {body(0, 0, 0, 0, ident()), body(0, 0, 0, active::kOne, ident())};
+        // AC1 path: a drive() with driveWeight DEFAULTED to kOne; AC2 path: driveW() with kOne EXPLICIT.
+        active::SolveAngularDrive(wAc1, drive(0, 1, qZ90, active::kOne / 4));
+        active::SolveAngularDrive(wW1, driveW(0, 1, qZ90, active::kOne / 4, active::kOne));
+        check(std::memcmp(wAc1.bodies.data(), wW1.bodies.data(),
+                          wAc1.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC2 SolveAngularDrive driveWeight kOne == AC1 (byte-identical orient — render-invariant)");
+    }
+
+    // ===== AC2 (2): driveWeight == 0 leaves the orient at the PURE-PHYSICS (no-drive) result =====
+    // weight 0 -> fxmul(w, 0) == 0 -> QNlerp(q, target, 0) == q -> no rotation. The bodies are byte-identical
+    // to BOTH the input (no drive applied) AND a stiffness-0 drive (the AC1 "no drive" no-op).
+    {
+        active::FxWorld w;
+        w.gravity = fpx::FxVec3{0, 0, 0};
+        w.groundY = (active::fx)(-1000 * (int)active::kOne);
+        w.bodies = {body(0, 0, 0, active::kOne, ident()), body(0, 0, 0, active::kOne, ident())};
+        const std::vector<fpx::FxBody> before = w.bodies;
+        active::SolveAngularDrive(w, driveW(0, 1, qZ90, active::kOne, /*weight=*/0));
+        check(std::memcmp(w.bodies.data(), before.data(), before.size() * sizeof(fpx::FxBody)) == 0,
+              "AC2 SolveAngularDrive driveWeight 0: orient UNCHANGED (pure physics — limp, no drive applied)");
+    }
+
+    // ===== AC2 (3): an intermediate driveWeight pulls PARTWAY (between limp and full) =====
+    // weight kOne/2 rotates LESS than weight kOne but MORE than weight 0 (still identity). Measure each
+    // dynamic body's drift from identity by |orient.z| (qZ90 is a +Z rotation).
+    {
+        auto driveOnce = [&](active::fx weight) {
+            active::FxWorld w;
+            w.gravity = fpx::FxVec3{0, 0, 0};
+            w.groundY = (active::fx)(-1000 * (int)active::kOne);
+            w.bodies = {body(0, 0, 0, 0, ident()), body(0, 0, 0, active::kOne, ident())};   // A pinned, B dynamic
+            active::SolveAngularDrive(w, driveW(0, 1, qZ90, active::kOne, weight));
+            return fxabs(w.bodies[1].orient.z);
+        };
+        const active::fx zFull = driveOnce(active::kOne);
+        const active::fx zHalf = driveOnce(active::kOne / 2);
+        const active::fx zZero = driveOnce(0);
+        check(zZero == 0, "AC2 driveWeight 0: the dynamic body did NOT rotate (|z| == 0)");
+        check(zHalf > zZero && zHalf < zFull,
+              "AC2 intermediate driveWeight pulls partway (0 < halfWeight rotation < fullWeight rotation)");
+    }
+
+    // ===== AC2 (4): StepDriveWorld with MIXED per-joint weights — driven joints HOLD, limp joints HANG =====
+    // A LONGER chain (an "upper body" + a "lower body"): the upper joints driveWeight=kOne (hold the bent
+    // pose), the lower joints driveWeight=0 (limp — hang free under gravity, matching a pure-physics chain).
+    {
+        const int kBC = 7;                 // 1 pinned root + 6 dynamic links
+        const int kUpper = 3;              // joints 0..2 are upper (driven, weight kOne)
+        // joints 3..5 are lower (limp, weight 0)
+        auto buildBlend = [&](std::vector<active::FxJoint>& js, std::vector<active::FxAngularDrive>& ds) {
+            active::FxWorld w;
+            w.gravity = fpx::FxVec3{0, kGravY, 0};
+            w.groundY = (active::fx)(-1000 * (int)active::kOne);
+            w.bodies.push_back(body(0, 8, 0, 0, ident()));                    // pinned root at (0,8)
+            for (int i = 1; i < kBC; ++i) w.bodies.push_back(body(0, 8 - i, 0, active::kOne, ident()));
+            js.clear(); ds.clear();
+            for (uint32_t k = 0; k + 1 < (uint32_t)kBC; ++k) {
+                active::FxJoint j;
+                j.bodyA = k; j.bodyB = k + 1;
+                j.anchorA = fpx::FxVec3{0, -kAnchor, 0};
+                j.anchorB = fpx::FxVec3{0, kAnchor, 0};
+                j.kind = joint::kJointBall;
+                js.push_back(j);
+                const active::fx weight = ((int)k < kUpper) ? active::kOne : 0;   // upper driven, lower limp
+                ds.push_back(driveW(k, k + 1, qZ90, kDriveStiff, weight));
+            }
+            return w;
+        };
+        std::vector<active::FxJoint> bj; std::vector<active::FxAngularDrive> bd;
+        active::FxWorld blend = buildBlend(bj, bd);
+        active::StepDriveWorldSteps(blend, bj, noLimits, bd, kDt, kIters, kSteps);
+
+        // The DRIVEN (upper, weight kOne) joints HELD their target within the hold band.
+        const active::fx kHoldBand = active::kOne / 8;
+        bool drivenHeld = true, limpFree = false;
+        for (size_t k = 0; k < bd.size(); ++k) {
+            const active::fx c = active::DriveAngleCos(blend, bd[k]);
+            if ((int)k < kUpper) { if (c < active::kOne - kHoldBand) drivenHeld = false; }
+            else                 { if (c < active::kOne - kHoldBand) limpFree = true; }   // a limp joint OFF target
+        }
+        check(drivenHeld, "AC2 StepDriveWorld mixed: the driven (weight kOne) joints HELD the target");
+        check(limpFree,   "AC2 StepDriveWorld mixed: a limp (weight 0) joint is OFF the target (hangs free)");
+
+        // The limp lower joints match a PURE-PHYSICS (all-weight-0) reference for those bodies: build the same
+        // chain with EVERY drive weight 0 and confirm the lower links land at the same orientation.
+        std::vector<active::FxJoint> pj; std::vector<active::FxAngularDrive> pd;
+        active::FxWorld phys = buildBlend(pj, pd);
+        for (auto& d : pd) d.driveWeight = 0;   // all limp -> pure physics
+        active::StepDriveWorldSteps(phys, pj, noLimits, pd, kDt, kIters, kSteps);
+        // The leaf (last) link is below the lower-limp region; under pure physics + a limp lower body it
+        // hangs lower (smaller X drift) than the fully-driven leaf would. Confirm the limp leaf hangs nearer
+        // straight-down than the upper driven links bent it.
+        check(fxabs(blend.bodies[kBC - 1].pos.x) < fxabs(blend.bodies[kUpper].pos.x),
+              "AC2 StepDriveWorld mixed: the limp leaf hangs nearer straight-down than the driven upper links");
+
+        // two runs byte-identical (determinism with mixed weights).
+        std::vector<active::FxJoint> bj2; std::vector<active::FxAngularDrive> bd2;
+        active::FxWorld blend2 = buildBlend(bj2, bd2);
+        active::StepDriveWorldSteps(blend2, bj2, noLimits, bd2, kDt, kIters, kSteps);
+        check(blend.bodies.size() == blend2.bodies.size() &&
+              std::memcmp(blend.bodies.data(), blend2.bodies.data(),
+                          blend.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC2 StepDriveWorld mixed-weight determinism: two runs BYTE-IDENTICAL");
+    }
+
+    // ===== AC2 (5): an all-driveWeight-kOne StepDriveWorld == the AC1 all-driven StepDriveWorld =====
+    // (the StepDriveWorld-level render-invariance proof: weight kOne everywhere == AC1.)
+    {
+        std::vector<active::FxJoint> j1, jW; std::vector<active::FxAngularDrive> d1, dW;
+        active::FxWorld wAc1 = buildScene(kDriveStiff, j1, d1);   // AC1: drives default driveWeight kOne
+        active::FxWorld wW1  = buildScene(kDriveStiff, jW, dW);
+        for (auto& d : dW) d.driveWeight = active::kOne;          // AC2: kOne EXPLICIT
+        active::StepDriveWorldSteps(wAc1, j1, noLimits, d1, kDt, kIters, kSteps);
+        active::StepDriveWorldSteps(wW1,  jW, noLimits, dW, kDt, kIters, kSteps);
+        check(wAc1.bodies.size() == wW1.bodies.size() &&
+              std::memcmp(wAc1.bodies.data(), wW1.bodies.data(),
+                          wAc1.bodies.size() * sizeof(fpx::FxBody)) == 0,
+              "AC2 StepDriveWorld all-weight-kOne == AC1 all-driven (byte-identical — render-invariant)");
     }
 
     if (g_fail == 0) std::printf("active_test: ALL PASS\n");

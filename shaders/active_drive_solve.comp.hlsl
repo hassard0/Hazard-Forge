@@ -10,7 +10,8 @@
 // The whole step is inherently SEQUENTIAL (each joint/drive reads the bodies earlier ones THIS pass already
 // moved/rotated) -> one thread -> bit-exact GPU==CPU + cross-backend, NO atomics, NO race. The fxmul/fxdiv/
 // FxISqrt/FxLength/FxNormalize + FxRotate + the quaternion ops + IntegrateBodyFull + the ball projection +
-// the angular limit + the angular DRIVE + floor clamp are copied VERBATIM from engine/sim/active.h +
+// the angular limit + the angular DRIVE (with the AC2 driveWeight blend scale) + floor clamp are copied
+// VERBATIM from engine/sim/active.h +
 // engine/sim/joint.h (SolveBallJoint / SolveAngularLimit / SolveAngularDrive / StepDriveWorld) so
 // tests/active_test.cpp + the GPU pass exercise the EXACT integer ops -> a divergence is exactly what the
 // host GPU==CPU memcmp catches.
@@ -35,8 +36,8 @@
 //                40 bytes), READ.
 //   b2 gLimits : the FxAngularLimit list (bodyA, bodyB, axis.xyz, cosHalfLimit, sinHalfLimit, kind — std430
 //                ints, 32 bytes), READ.
-//   b3 gDrives : the FxAngularDrive list (bodyA, bodyB, qTarget.xyzw, stiffness, _pad — std430 ints,
-//                32 bytes), READ.
+//   b3 gDrives : the FxAngularDrive list (bodyA, bodyB, qTarget.xyzw, stiffness, driveWeight — std430 ints,
+//                32 bytes; AC2 driveWeight repurposes the AC1 stride pad — same 32-byte stride), READ.
 //   b4 gParams : { gravity.xyz, dt, groundY, bodyCount, jointCount, steps, iters, limitCount, driveCount,
 //                  solveEnabled }, READ.
 
@@ -83,7 +84,8 @@ struct FxAngularDrive {
     uint bodyA, bodyB;        // body indices
     int  qx, qy, qz, qw;      // qTarget (UNIT target relative orientation qA⁻¹·qB)
     int  stiffness;           // Q16.16 per-iteration nlerp fraction in [0,kOne]
-    int  _pad;                // 16-byte-aligned 32-byte stride pad
+    int  driveWeight;         // AC2: Q16.16 physical blend alpha in [0,kOne] (kOne -> active/AC1, 0 -> limp);
+                              //      repurposes the AC1 32-byte-stride pad slot (the std430 stride is UNCHANGED)
 };
 
 // Params (std430). Mirrors the C++ upload struct.
@@ -272,18 +274,23 @@ void SolveAngularDrive(int di, int bodyCount) {
 
     int wA = fxdiv(a.invMass, wsum);
     int wB = fxdiv(b.invMass, wsum);
-    // qB = FxQuatNormalize(QNlerp(qB, qBtarget, wB)).
-    int nbx = b.ox + fxmul(btx - b.ox, wB);
-    int nby = b.oy + fxmul(bty - b.oy, wB);
-    int nbz = b.oz + fxmul(btz - b.oz, wB);
-    int nbw = b.ow + fxmul(btw - b.ow, wB);
+    // AC2: scale each apply share by the per-joint physical blend weight (kOne -> the full AC1 correction
+    // [fxmul(w,kOne)==w, render-invariant]; 0 -> QNlerp(q,target,0)==q -> no rotation -> pure physics/limp).
+    int weight = gDrives[di].driveWeight;
+    int sA = fxmul(wA, weight);
+    int sB = fxmul(wB, weight);
+    // qB = FxQuatNormalize(QNlerp(qB, qBtarget, sB)).
+    int nbx = b.ox + fxmul(btx - b.ox, sB);
+    int nby = b.oy + fxmul(bty - b.oy, sB);
+    int nbz = b.oz + fxmul(btz - b.oz, sB);
+    int nbw = b.ow + fxmul(btw - b.ow, sB);
     FxQuatNormalize(nbx, nby, nbz, nbw);
     b.ox = nbx; b.oy = nby; b.oz = nbz; b.ow = nbw;
-    // qA = FxQuatNormalize(QNlerp(qA, qAtarget, wA)).
-    int nax = a.ox + fxmul(atx - a.ox, wA);
-    int nay = a.oy + fxmul(aty - a.oy, wA);
-    int naz = a.oz + fxmul(atz - a.oz, wA);
-    int naw = a.ow + fxmul(atw - a.ow, wA);
+    // qA = FxQuatNormalize(QNlerp(qA, qAtarget, sA)).
+    int nax = a.ox + fxmul(atx - a.ox, sA);
+    int nay = a.oy + fxmul(aty - a.oy, sA);
+    int naz = a.oz + fxmul(atz - a.oz, sA);
+    int naw = a.ow + fxmul(atw - a.ow, sA);
     FxQuatNormalize(nax, nay, naz, naw);
     a.ox = nax; a.oy = nay; a.oz = naz; a.ow = naw;
 

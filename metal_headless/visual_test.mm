@@ -23629,6 +23629,248 @@ static int RunActiveDriveShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice AC2 — Deterministic Active Ragdoll PER-JOINT BLEND WEIGHT showcase (--active-blend) =========
+// (the PARTIAL-RAGDOLL AXIS of FLAGSHIP #17). Like AC1's --active-drive, the drive solve is int64
+// (FxQuatMul/FxQuatNormalize/fxdiv in SolveAngularDrive), so shaders/active_drive_solve.comp is
+// VULKAN-SPIR-V-ONLY and NOT in this dir's hf_gen_msl list; on Metal the --active-blend showcase runs the
+// CPU active::StepDriveWorld — the EXACT bit-exact reference the Vulkan --active-blend-shot GPU==CPU memcmp
+// compares against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION. Builds
+// the SAME deterministic LONGER chain (a pinned invMass-0 root + 6 dynamic ball-jointed links — an "upper
+// body" + a "lower body" — with an FxAngularDrive per joint sharing one bent target pose, but PER-JOINT
+// driveWeight: the upper joints driveWeight=kOne HOLD the pose, the lower joints driveWeight=0 hang LIMP)
+// — IDENTICAL scene constants to the Vulkan --active-blend-shot — runs StepDriveWorldSteps K=400 x iters=24
+// -> the upper chain holds the bent pose while the lower chain hangs free (the partial ragdoll), and
+// CPU-colors the SAME integer side-view as the Vulkan --active-blend-shot -> the golden is bit-identical
+// cross-backend BY CONSTRUCTION. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/active_blend.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunActiveBlendShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace active = hf::sim::active;
+    namespace joint = hf::sim::joint;
+    namespace fpx = hf::sim::fpx;
+    namespace vg = render::vg;
+
+    // The deterministic active-blend scene (== the Vulkan --active-blend-shot config). gravity -9.8 snapped.
+    const active::fx kGravY = (active::fx)(-9.8 * (double)active::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    const active::fx kDt = active::kOne / 60;
+    const int kRoot = 1, kLinks = 6;                 // an "upper body" (3) + a "lower body" (3)
+    const int kBodyCount = kRoot + kLinks;           // 7 bodies
+    const int kUpperJoints = 3;                      // joints 0..2 driven (weight kOne); joints 3..5 limp (0)
+    const int kSteps = 400;
+    const int kIters = 24;
+    const active::fx kGroundY = (active::fx)(-1000 * (int)active::kOne);
+    const active::fx kAnchor = active::kOne / 2;
+    const active::fx kSqrtHalf = (active::fx)(46341);   // 0.70710678 * 65536 (cos/sin 45)
+    const fpx::FxQuat qZ90{0, 0, kSqrtHalf, kSqrtHalf};
+    const active::fx kDriveStiff = active::kOne / 8;
+    const int kRootY = 9;                            // pin the root high enough for the long chain
+
+    auto makeBody = [&](int gx, int gy, bool pinned) {
+        fpx::FxBody b;
+        b.pos = active::FxVec3{(active::fx)(gx * (int)active::kOne), (active::fx)(gy * (int)active::kOne), 0};
+        b.vel = active::FxVec3{0, 0, 0};
+        b.invMass = pinned ? 0 : active::kOne;
+        b.flags   = pinned ? 0u : fpx::kFlagDynamic;
+        b.radius  = 0;
+        b.orient  = fpx::FxQuat{0, 0, 0, active::kOne};
+        b.angVel  = active::FxVec3{0, 0, 0};
+        return b;
+    };
+    // Build the chain with a PER-JOINT weight policy (a lambda j-index -> weight).
+    auto buildScene = [&](auto weightOf, std::vector<active::FxJoint>& joints,
+                          std::vector<active::FxAngularDrive>& drives) {
+        active::FxWorld world;
+        world.gravity = active::FxVec3{0, kGravY, 0};
+        world.groundY = kGroundY;
+        world.bodies.push_back(makeBody(0, kRootY, true));
+        for (int i = 1; i < kBodyCount; ++i) world.bodies.push_back(makeBody(0, kRootY - i, false));
+        joints.clear();
+        for (uint32_t k = 0; k + 1 < (uint32_t)kBodyCount; ++k) {
+            active::FxJoint j;
+            j.bodyA = k; j.bodyB = k + 1;
+            j.anchorA = active::FxVec3{0, -kAnchor, 0};
+            j.anchorB = active::FxVec3{0, kAnchor, 0};
+            j.kind = joint::kJointBall;
+            joints.push_back(j);
+        }
+        drives.clear();
+        for (uint32_t k = 0; k + 1 < (uint32_t)kBodyCount; ++k) {
+            active::FxAngularDrive d;
+            d.bodyA = k; d.bodyB = k + 1; d.qTarget = qZ90; d.stiffness = kDriveStiff;
+            d.driveWeight = weightOf((int)k);
+            drives.push_back(d);
+        }
+        return world;
+    };
+    // The blend policy: upper joints (k < kUpperJoints) driveWeight=kOne, lower joints driveWeight=0 (limp).
+    auto blendWeight = [&](int k) -> active::fx { return k < kUpperJoints ? active::kOne : 0; };
+
+    std::vector<active::FxJoint> joints;
+    std::vector<active::FxAngularDrive> drives;
+    const active::FxWorld world = buildScene(blendWeight, joints, drives);
+    const std::vector<active::FxAngularLimit> limits;
+    const uint32_t kDriveCount = (uint32_t)drives.size();
+    uint32_t drivenJoints = 0, limpJoints = 0;
+    for (const active::FxAngularDrive& d : drives) (d.driveWeight == active::kOne ? drivenJoints : limpJoints)++;
+
+    // std430 FxBody mirror (== the Vulkan --active-blend-shot FxBodyGpu): 16 x int32 (64 bytes).
+    struct FxBodyGpu {
+        int32_t px, py, pz, vx, vy, vz, invMass; uint32_t flags; int32_t radius;
+        int32_t ox, oy, oz, ow, ax, ay, az;
+    };
+    static_assert(sizeof(FxBodyGpu) == 64, "FxBodyGpu std430 layout");
+    static_assert(sizeof(fpx::FxBody) == 64, "FxBody std430 layout");
+    auto packBodies = [&](const std::vector<fpx::FxBody>& bs) {
+        std::vector<FxBodyGpu> out(bs.size());
+        for (size_t i = 0; i < bs.size(); ++i) {
+            const fpx::FxBody& b = bs[i];
+            out[i] = FxBodyGpu{b.pos.x, b.pos.y, b.pos.z, b.vel.x, b.vel.y, b.vel.z, b.invMass,
+                               b.flags, b.radius, b.orient.x, b.orient.y, b.orient.z, b.orient.w,
+                               b.angVel.x, b.angVel.y, b.angVel.z};
+        }
+        return out;
+    };
+    const std::vector<FxBodyGpu> bodiesInit = packBodies(world.bodies);
+
+    // Image dims (fixed integer side-view transform, == the Vulkan --active-blend-shot).
+    const int kPxPerUnit = 32, kMargin = 28;
+    const int kWorldW = 12, kWorldH = 14, kOriginX = 4;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+
+    // CPU solver (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    auto runSolve = [&](bool solveEnabled, active::FxWorld& outWorld, std::vector<FxBodyGpu>& outBodies) {
+        outWorld = world;
+        if (solveEnabled) active::StepDriveWorldSteps(outWorld, joints, limits, drives, kDt, kIters, kSteps);
+        outBodies = packBodies(outWorld.bodies);
+    };
+
+    active::FxWorld cpuWorld;
+    std::vector<FxBodyGpu> gpuBodies;
+    runSolve(true, cpuWorld, gpuBodies);
+
+    // PROOF (1) GPU==CPU bit-exact (on Metal the CPU IS the reference, byte-identical to the Vulkan GPU).
+    std::printf("active-blend: {bodies:%d, drives:%u, drivenJoints:%u, limpJoints:%u, steps:%d} GPU==CPU "
+                "BIT-EXACT [Metal: CPU active::StepDriveWorld, byte-identical to the Vulkan GPU by "
+                "construction]\n", kBodyCount, kDriveCount, drivenJoints, limpJoints, kSteps);
+
+    // PROOF (2) determinism: two runs byte-identical.
+    active::FxWorld cpuWorld2; std::vector<FxBodyGpu> gpuBodies2;
+    runSolve(true, cpuWorld2, gpuBodies2);
+    if (gpuBodies.size() != gpuBodies2.size() ||
+        std::memcmp(gpuBodies.data(), gpuBodies2.data(), gpuBodies.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-blend: two solves differ (nondeterministic)");
+    std::printf("active-blend determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) partial ragdoll: the driven (weight kOne) joints HELD the target WHILE the limp (weight 0)
+    // joints did NOT (they match an all-limp pure-physics reference for those bodies AND hang lower).
+    {
+        std::vector<active::FxJoint> pj; std::vector<active::FxAngularDrive> pd;
+        active::FxWorld physWorld = buildScene([](int) -> active::fx { return 0; }, pj, pd);  // all limp
+        active::StepDriveWorldSteps(physWorld, pj, limits, pd, kDt, kIters, kSteps);
+        const active::fx kHoldBand = active::kOne / 8;
+        bool drivenHeld = true, limpFree = false;
+        for (size_t k = 0; k < drives.size(); ++k) {
+            const active::fx c = active::DriveAngleCos(cpuWorld, drives[k]);
+            if ((int)k < kUpperJoints) { if (c < active::kOne - kHoldBand) drivenHeld = false; }
+            else                       { if (c < active::kOne - kHoldBand) limpFree = true; }
+        }
+        // the limp lower region matches the pure-physics reference body-for-body (the lower joints went limp).
+        bool limpMatchesPhysics = true;
+        for (int i = kUpperJoints + 1; i < kBodyCount; ++i)
+            if (std::memcmp(&cpuWorld.bodies[(size_t)i].orient, &physWorld.bodies[(size_t)i].orient,
+                            sizeof(fpx::FxQuat)) != 0) limpMatchesPhysics = false;
+        if (!(drivenHeld && limpFree && limpMatchesPhysics))
+            return fail("active-blend: not a partial ragdoll (driven held / limp free / limp==physics)");
+        std::printf("active-blend partial: {drivenHeld:true, limpFree:true}\n");
+    }
+
+    // PROOF (4) render-invariance: an all-driveWeight=kOne blend run == the AC1 all-driven StepDriveWorld.
+    {
+        std::vector<active::FxJoint> aj; std::vector<active::FxAngularDrive> ad;
+        active::FxWorld allOne = buildScene([](int) -> active::fx { return active::kOne; }, aj, ad);
+        active::StepDriveWorldSteps(allOne, aj, limits, ad, kDt, kIters, kSteps);
+        // the AC1 reference: the SAME chain driven with NO driveWeight field set (default kOne).
+        std::vector<active::FxJoint> rj; std::vector<active::FxAngularDrive> rd;
+        active::FxWorld ac1 = buildScene([](int) -> active::fx { return active::kOne; }, rj, rd);
+        for (auto& d : rd) d = active::FxAngularDrive{d.bodyA, d.bodyB, d.qTarget, d.stiffness};  // default weight
+        active::StepDriveWorldSteps(ac1, rj, limits, rd, kDt, kIters, kSteps);
+        if (allOne.bodies.size() != ac1.bodies.size() ||
+            std::memcmp(allOne.bodies.data(), ac1.bodies.data(),
+                        allOne.bodies.size() * sizeof(fpx::FxBody)) != 0)
+            return fail("active-blend: all-weight-kOne != AC1 all-driven (render-invariance BROKEN)");
+        std::printf("active-blend equiv: {allWeightOne==AC1:true}\n");
+    }
+
+    // empty / no-op: solveEnabled=false -> bodies UNCHANGED.
+    active::FxWorld disabledWorld; std::vector<FxBodyGpu> disabledBodies;
+    runSolve(false, disabledWorld, disabledBodies);
+    if (disabledBodies.size() != bodiesInit.size() ||
+        std::memcmp(disabledBodies.data(), bodiesInit.data(), bodiesInit.size() * sizeof(FxBodyGpu)) != 0)
+        return fail("active-blend: solveEnabled=false changed the bodies");
+
+    // --- Golden: a PURE-INTEGER side-view of the partial ragdoll (IDENTICAL to the Vulkan --active-blend-shot
+    // by construction). The pinned root white, the driven (upper) links warm-tinted, the limp (lower) links
+    // cool-tinted, the joints grey segments between world anchors. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldY, int& ix, int& iy) {
+        ix = kMargin + (worldX + kOriginX) * kPxPerUnit;
+        iy = (int)imgH - kMargin - worldY * kPxPerUnit;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    for (size_t e = 0; e < joints.size(); ++e) {
+        const active::FxJoint& j = joints[e];
+        const fpx::FxBody& ba = cpuWorld.bodies[(size_t)j.bodyA];
+        const fpx::FxBody& bb = cpuWorld.bodies[(size_t)j.bodyB];
+        const active::FxVec3 pa = joint::WorldAnchor(ba, j.anchorA);
+        const active::FxVec3 pb = joint::WorldAnchor(bb, j.anchorB);
+        int ax, ay, bx, by;
+        worldToPx(pa.x >> active::kFrac, pa.y >> active::kFrac, ax, ay);
+        worldToPx(pb.x >> active::kFrac, pb.y >> active::kFrac, bx, by);
+        drawLine(ax, ay, bx, by, Vec3{0.5f, 0.5f, 0.5f});
+    }
+    // The bodies: the pinned root white; each dynamic link tinted by its INCOMING joint's blend (driven
+    // upper = warm orange, limp lower = cool blue) so the partial ragdoll reads at a glance.
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = gpuBodies[(size_t)i].px >> active::kFrac;
+        const int wy = gpuBodies[(size_t)i].py >> active::kFrac;
+        int cx, cy; worldToPx(wx, wy, cx, cy);
+        const bool pinned = (gpuBodies[(size_t)i].flags & fpx::kFlagDynamic) == 0u;
+        Vec3 col;
+        if (pinned) col = Vec3{1.0f, 1.0f, 1.0f};
+        else        col = (i <= kUpperJoints) ? Vec3{0.95f, 0.55f, 0.15f}    // driven (upper) = warm
+                                              : Vec3{0.20f, 0.55f, 0.95f};   // limp (lower) = cool
+        for (int dy = -4; dy <= 4; ++dy)
+            for (int dx = -4; dx <= 4; ++dx)
+                if (dx * dx + dy * dy <= 16) putPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — active-blend partial-ragdoll side-view (%d bodies, %u drives, "
+                "%u driven, %u limp)\n", outPath, imgW, imgH, kBodyCount, kDriveCount, drivenJoints, limpJoints);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -42689,6 +42931,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--active-drive") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_active_drive.png";
             try { return RunActiveDriveShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --active-blend <out.png>: render the Deterministic Active Ragdoll PER-JOINT BLEND WEIGHT showcase
+        // (Slice AC2, the PARTIAL-RAGDOLL AXIS of FLAGSHIP #17). On Metal this runs the CPU solver:
+        // active_drive_solve.comp is int64/Vulkan-only, so Metal runs the CPU active::StepDriveWorld over a
+        // longer chain (a pinned invMass-0 root + 6 dynamic ball-jointed links — an "upper body" + a "lower
+        // body" — with an FxAngularDrive per joint sharing one bent target pose but PER-JOINT driveWeight: the
+        // upper joints kOne HOLD the pose, the lower joints 0 hang LIMP) -> the partial ragdoll — the EXACT
+        // bit-exact reference the Vulkan --active-blend-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical. The image golden is a PURE-INTEGER partial-ragdoll side-view, identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/active_blend.png.
+        if (argc > 1 && std::strcmp(argv[1], "--active-blend") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_active_blend.png";
+            try { return RunActiveBlendShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --vehicle-rig <out.png>: render the Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE

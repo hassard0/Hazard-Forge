@@ -81,15 +81,25 @@ inline fx FxDot4(const FxQuat& a, const FxQuat& b) {
 // target quaternion, B-in-A's-frame) by `stiffness` in [0, kOne] (the per-iteration nlerp fraction:
 // stiffness 0 -> no drive; stiffness kOne -> snap to qTarget; the VH1 spring soft-constraint pattern on
 // orientation). std430-packable as plain int32s: bodyA, bodyB (2 x uint32) + qTarget.xyzw (4 x int32) +
-// stiffness (1 x int32) = 7 x 4-byte = 28 bytes. The GPU mirror PADS to a 16-byte-aligned 32-byte stride
-// (one trailing int `_pad` = 8 x 4-byte = 32 bytes) so the std430 StructuredBuffer stride matches; the
-// host FxAngularDriveGpu carries the same trailing pad. The C++ record here is the 28-byte logical record
-// (the showcase/test pack it field-by-field into the 32-byte GPU mirror — like the JT/VH records).
+// stiffness (1 x int32) + driveWeight (1 x int32, AC2) = 8 x 4-byte = 32 bytes. The AC1 GPU mirror ALREADY
+// padded the 28-byte logical record to a 16-byte-aligned 32-byte stride (one trailing int `_pad`); AC2
+// REPURPOSES that reserved pad slot as `driveWeight` so the std430 STRIDE IS UNCHANGED (no new shader file)
+// — the intended in-flagship extension AC1 reserved the pad for. The host FxAngularDriveGpu carries
+// driveWeight where it carried the pad; the C++ record is now the 32-byte logical record.
+//
+// AC2 driveWeight (the PER-JOINT PHYSICAL BLEND WEIGHT): the physical blend alpha in [0, kOne] that scales
+// the MAGNITUDE of the applied inverse-mass correction (NOT stiffness: stiffness is the per-iteration nlerp
+// RATE — a low-stiffness drive still converges over K iters; driveWeight is HOW MUCH of the correction is
+// applied at all). kOne -> the full AC1 correction (the joint tracks the target — ACTIVE); 0 -> ZERO
+// correction (pure physics — LIMP ragdoll, the drive is a no-op); intermediate -> a partial pull competing
+// with gravity (a soft physical blend). DEFAULTS to kOne so AC1 call-sites are UNCHANGED in behavior
+// (fxmul(w, kOne) == w in Q16.16 -> the AC1 apply byte-for-byte — the render-invariance contract).
 struct FxAngularDrive {
     uint32_t bodyA = 0;               // index of the first body (the frame body — A's frame defines qTarget)
     uint32_t bodyB = 0;               // index of the second body (the driven body)
     FxQuat   qTarget;                 // UNIT target relative orientation qA⁻¹·qB (default identity {0,0,0,kOne})
     fx       stiffness = 0;           // Q16.16 per-iteration nlerp fraction in [0,kOne] (0 -> no drive)
+    fx       driveWeight = kOne;      // AC2: Q16.16 physical blend alpha in [0,kOne] (kOne -> active/AC1, 0 -> limp)
 };
 
 // ----- SolveAngularDrive: drive ONE joint's relative orientation toward qTarget (the bit-exact core) ---
@@ -127,8 +137,12 @@ inline void SolveAngularDrive(FxWorld& world, const FxAngularDrive& drv) {
     const FxQuat qAtarget = FxQuatMul(qB, QConj(qrelDriven));    // qA such that qA⁻¹·qB == qrelDriven
     const fx wA = fxdiv(a.invMass, wsum);
     const fx wB = fxdiv(b.invMass, wsum);
-    b.orient = FxQuatNormalize(QNlerp(qB, qBtarget, wB));        // a pinned body (w 0) is NOT rotated
-    a.orient = FxQuatNormalize(QNlerp(qA, qAtarget, wA));
+    // AC2: scale each apply share by the per-joint physical blend weight (kOne -> the full AC1 correction
+    // [fxmul(w,kOne)==w, render-invariant]; 0 -> QNlerp(q, target, 0)==q -> no rotation -> pure physics/limp).
+    const fx sA = fxmul(wA, drv.driveWeight);
+    const fx sB = fxmul(wB, drv.driveWeight);
+    b.orient = FxQuatNormalize(QNlerp(qB, qBtarget, sB));        // a pinned body (w 0) is NOT rotated
+    a.orient = FxQuatNormalize(QNlerp(qA, qAtarget, sA));
 }
 
 // ----- DriveAngleCos: the held-to-target metric (the .w of qrel·qTarget⁻¹) — the SwingAngleCos shape ----
