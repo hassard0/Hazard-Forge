@@ -91,6 +91,7 @@
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
+#include "sim/broad.h"              // Slice BP1: deterministic integer broadphase THE BODY GRID + CSR CELL TABLE (BodyGrid/MakeBodyGrid/BodyCellOf/FlatBodyCellId/BodyCellTable/BuildBodyCellTable/BodyGridMeasure, keyed on fpx::FxBody) — shared verbatim with broad_cell_{count,scan,emit}.comp (MSL-NATIVE) + the Vulkan --broad-cell-shot; Metal --broad-cell DISPATCHES the GPU shaders
 #include "sim/couple.h"             // Slice CP1: deterministic rigid<->fluid coupling unified world + body->fluid grid-hash query (CoupleWorld/GatherBodyParticles/BodyParticleAccept) — shared verbatim with couple_body_{count,scan,emit}.comp + the Vulkan --couple-query-shot
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
 #include "sim/couple_gf.h"           // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
@@ -24785,6 +24786,279 @@ static int RunGrainNeighborsShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — grain neighbor-count heat (%u neighbors, maxPer %u)\n",
                 outPath, imgW, imgH, kTotalNeighbors, maxPer);
+    return 0;
+}
+
+// ===== Slice BP1 — Deterministic Integer Broadphase THE BODY GRID + CSR CELL TABLE showcase (--broad-cell) ==
+// The BEACHHEAD of FLAGSHIP #23 (DETERMINISTIC INTEGER BROADPHASE). Like GR2's --grain-neighbors, the cell
+// table is PURE INT32 (BodyCellOf = FloorDiv per axis + an ascending-index scatter, NO int64/fxmul/sqrt), so
+// the broad_cell_{count,scan,emit} shaders MSL-gen natively and Metal DISPATCHES THE GPU passes directly: the
+// SAME fixed body lattice + clustered bodies the Vulkan --broad-cell-shot builds feed the SAME three passes
+// (count->scan->emit) -> ReadBuffer reads cellStart + cellBodies, PROVEN BIT-EXACT vs the CPU
+// broad.h::BuildBodyCellTable reference (memcmp, NO tol — the same proofs the Vulkan --broad-cell-shot runs);
+// enabled=false -> cleared no-op; two runs byte-identical. The image golden is the integer top-down (XZ)
+// body-by-flat-cell-id viz, identical to the Vulkan path BY CONSTRUCTION (the bar is STRICT ZERO cross-vendor).
+// New golden tests/golden/metal/broad_cell.png. NO new shader, NO new RHI.
+static int RunBroadCellShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace broad = hf::sim::broad;
+    namespace fpx = hf::sim::fpx;
+
+    // The fixed scene (== the Vulkan --broad-cell-shot): a deterministic 4x4x4 lattice at spacing == cellSize
+    // (~one body per cell) + a few clustered bodies in/near the origin cell (so a cell holds >1 body -> the
+    // emit ordering matters), varied radii within the cellSize bound (cellSize >= 2*maxRadius, the BP2 contract).
+    const fpx::fx kCellSize = fpx::kOne * 2;           // 2.0 world-unit cells
+    const fpx::fx kMaxRadius = fpx::kOne / 2;          // 0.5 (diameter 1.0 <= cellSize)
+    auto mkBody = [&](int wx, int wy, int wz, fpx::fx radius) {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{(fpx::fx)(wx * (int)fpx::kOne), (fpx::fx)(wy * (int)fpx::kOne),
+                            (fpx::fx)(wz * (int)fpx::kOne)};
+        b.radius = radius;
+        b.invMass = fpx::kOne;
+        b.flags = fpx::kFlagDynamic;
+        return b;
+    };
+    std::vector<fpx::FxBody> bodies;
+    const int kLat = 4;   // 4x4x4 = 64 lattice bodies at spacing 2 (one per cell)
+    for (int z = 0; z < kLat; ++z)
+        for (int y = 0; y < kLat; ++y)
+            for (int x = 0; x < kLat; ++x)
+                bodies.push_back(mkBody(x * 2, y * 2, z * 2, kMaxRadius));
+    // A few clustered bodies (varied radii) packed into the origin cell + an adjacent one.
+    bodies.push_back(mkBody(0, 0, 1, fpx::kOne / 4));
+    bodies.push_back(mkBody(1, 0, 0, fpx::kOne / 3));
+    bodies.push_back(mkBody(1, 1, 1, fpx::kOne / 2));
+    bodies.push_back(mkBody(2, 0, 1, fpx::kOne / 4));
+    const int kBodyCount = (int)bodies.size();
+
+    // The CPU reference grid + cell table (the GPU memcmp's against this).
+    const broad::BodyGrid grid = broad::MakeBodyGrid(bodies, kCellSize);
+    const uint32_t kCellCount = broad::BodyCellCount(grid);
+    const broad::BodyCellTable cpuTable = broad::BuildBodyCellTable(bodies, grid);
+    const broad::BodyGridMeasure cpuMeasure = broad::MeasureBodyGrid(bodies, grid, cpuTable);
+
+    // Image dims (fixed integer top-down transform, == the Vulkan --broad-cell-shot -> 268x268).
+    const int kPxPerUnit = 22;
+    const int kMargin = 24;
+    const int kWorldW = kLat * 2 + 2;
+    const int kWorldH = kLat * 2 + 2;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 FxBody mirror (matches the broad_cell shaders' BroadBody): pos.xyz + radius = 4 x int32.
+    struct BroadBodyGpu { int32_t px, py, pz, radius; };
+    static_assert(sizeof(BroadBodyGpu) == 16, "BroadBodyGpu std430 layout");
+    std::vector<BroadBodyGpu> bodiesInit((size_t)kBodyCount);
+    for (int i = 0; i < kBodyCount; ++i)
+        bodiesInit[(size_t)i] = BroadBodyGpu{bodies[(size_t)i].pos.x, bodies[(size_t)i].pos.y,
+                                             bodies[(size_t)i].pos.z, bodies[(size_t)i].radius};
+    rhi::BufferDesc bodyDesc;
+    bodyDesc.size = bodiesInit.size() * sizeof(BroadBodyGpu);
+    bodyDesc.initialData = bodiesInit.data();
+    bodyDesc.usage = rhi::BufferUsage::Storage;
+    auto bodiesBuf = device->CreateBuffer(bodyDesc);   // read-only on the GPU (shared)
+
+    // std430 BodyGridParams (matches the broad_cell shaders): int4 grid {cellSize, cellMinX, cellMinY,
+    // cellMinZ} + int4 dim {gridDimX, gridDimY, gridDimZ, bodyCount} + int4 cfg {cellCount, enabled,_,_}.
+    struct BodyGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(BodyGridParams) == 48, "BodyGridParams std430 layout");
+    auto makeGridParams = [&](int32_t enabled) {
+        BodyGridParams p{};
+        p.grid[0] = kCellSize; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+        p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+        p.dim[3] = kBodyCount;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    // Fresh-cleared per-run output buffers. cellCount (cellCount uints), cellStart (cellCount+1),
+    // cellCursor (cellCount), cellBodies (bodyCount).
+    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellBodyInit((size_t)kBodyCount, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    // cell_count(3 SSBO,64t), cell_scan(3,1t), cell_emit(5,1t) — the broad_cell MSL-native passes.
+    auto cellCountPipe = mkPipe("broad_cell_count.comp.gen.metal", "broad_cell_count_main", 3, 64);
+    auto cellScanPipe  = mkPipe("broad_cell_scan.comp.gen.metal", "broad_cell_scan_main", 3, 1);
+    auto cellEmitPipe  = mkPipe("broad_cell_emit.comp.gen.metal", "broad_cell_emit_main", 5, 1);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kBodyGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+    // Run the full 3-pass pipeline over fresh output buffers; read cellStart + cellBodies.
+    auto runCellTable = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                            std::vector<uint32_t>& outCellBodies) {
+        auto cellCountBuf  = makeUintBuf(cellCountInit);
+        auto cellStartBuf  = makeUintBuf(cellStartInit);
+        auto cellCursorBuf = makeUintBuf(cellCursorInit);
+        auto cellBodyBuf   = makeUintBuf(cellBodyInit);
+        BodyGridParams params = makeGridParams(enabled);
+        rhi::BufferDesc pd; pd.size = sizeof(BodyGridParams); pd.initialData = &params;
+        pd.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("broad_cell", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                // Pass 1: per-body cell count (atomic add).
+                cmd.BindComputePipeline(*cellCountPipe.second);
+                cmd.BindStorageBuffer(*bodiesBuf, 0);
+                cmd.BindStorageBuffer(*cellCountBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToComputeBarrier();
+                // Pass 2: single-thread exclusive prefix-sum -> cellStart.
+                cmd.BindComputePipeline(*cellScanPipe.second);
+                cmd.BindStorageBuffer(*cellCountBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                // Pass 3: single-thread ascending-body scatter -> cellBodies.
+                cmd.BindComputePipeline(*cellEmitPipe.second);
+                cmd.BindStorageBuffer(*bodiesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                cmd.BindStorageBuffer(*cellBodyBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCellStart.assign((size_t)kCellCount + 1u, 0u);
+        device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+        outCellBodies.assign((size_t)kBodyCount, 0u);
+        device->ReadBuffer(*cellBodyBuf, outCellBodies.data(), outCellBodies.size() * sizeof(uint32_t), 0);
+    };
+
+    // === GPU cell table (enabled) ===
+    std::vector<uint32_t> gCellStart, gCellBodies;
+    runCellTable(1, gCellStart, gCellBodies);
+
+    // PROOF (1) GPU==CPU cell table BIT-EXACT (integer memcmp, NO tol).
+    bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+        std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                    cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+    bool cellBodiesOk = (gCellBodies.size() == cpuTable.cellBodies.size()) &&
+        std::memcmp(gCellBodies.data(), cpuTable.cellBodies.data(),
+                    cpuTable.cellBodies.size() * sizeof(uint32_t)) == 0;
+    if (!cellStartOk || !cellBodiesOk)
+        return fail("broad-cell: GPU != CPU BuildBodyCellTable");
+    std::printf("broad-cell: {bodies:%d, cells:%u, occupied:%u} GPU==CPU BIT-EXACT\n",
+                kBodyCount, kCellCount, cpuMeasure.occupiedCells);
+
+    // PROOF (2) determinism: two full runs byte-identical.
+    {
+        std::vector<uint32_t> cs2, cb2;
+        runCellTable(1, cs2, cb2);
+        if (cs2 != gCellStart || cb2 != gCellBodies)
+            return fail("broad-cell: two runs differ (nondeterministic)");
+        std::printf("broad-cell determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) total partition: every body lands in exactly one cell, within-cell ASCENDING.
+    {
+        bool partition = (gCellStart[kCellCount] == (uint32_t)kBodyCount) &&
+                         (gCellBodies.size() == (size_t)kBodyCount);
+        // sum of per-cell counts == N AND cellStart monotone.
+        uint32_t sumCounts = 0;
+        for (uint32_t c = 0; c < kCellCount; ++c) {
+            if (gCellStart[c] > gCellStart[c + 1u]) partition = false;
+            sumCounts += gCellStart[c + 1u] - gCellStart[c];
+        }
+        if (sumCounts != (uint32_t)kBodyCount) partition = false;
+        // every body index appears EXACTLY once.
+        std::vector<int> seen((size_t)kBodyCount, 0);
+        for (uint32_t idx : gCellBodies) { if (idx < (uint32_t)kBodyCount) ++seen[idx]; else partition = false; }
+        for (int i = 0; i < kBodyCount; ++i) if (seen[(size_t)i] != 1) partition = false;
+        // within each cell the indices are ASCENDING AND each body sits in its own cell.
+        bool ascending = true;
+        for (uint32_t c = 0; c < kCellCount; ++c)
+            for (uint32_t s = gCellStart[c]; s < gCellStart[c + 1u]; ++s) {
+                uint32_t idx = gCellBodies[s];
+                if (s + 1u < gCellStart[c + 1u] && gCellBodies[s] >= gCellBodies[s + 1u]) ascending = false;
+                uint32_t bodyCell = broad::FlatBodyCellId(
+                    broad::BodyCellOf(bodies[idx].pos, grid.cellSize), grid);
+                if (bodyCell != c) ascending = false;
+            }
+        if (!partition || !ascending)
+            return fail("broad-cell: partition/ascending FAILED");
+        std::printf("broad-cell correct: {partition:%s, ascending:%s}\n",
+                    partition ? "true" : "false", ascending ? "true" : "false");
+    }
+
+    // PROOF (4) disabled no-op: enabled=0 -> cellStart all-zero, cellBodies cleared (the byte-identical no-op
+    // the shader's enabled=0 guard produces).
+    {
+        std::vector<uint32_t> dcs, dcb;
+        runCellTable(0, dcs, dcb);
+        bool allZero = true;
+        for (uint32_t v : dcs) if (v != 0u) allZero = false;
+        for (uint32_t v : dcb) if (v != 0u) allZero = false;
+        if (!allZero)
+            return fail("broad-cell: disabled run is not a no-op");
+        std::printf("broad-cell disabled: cleared (no-op)\n");
+    }
+
+    // --- Golden: a PURE-INTEGER top-down (XZ) view. Project each body's integer (pos.x>>kFrac, pos.z>>kFrac)
+    // to a pixel, colored by its FLAT CELL ID (hashColor) -> a clean cell tiling. CPU-colored from the
+    // read-back integers -> identical both backends by construction (== the Vulkan --broad-cell-shot). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto hashColor = [](uint32_t h) -> Vec3 {
+        h = (h ^ 61u) ^ (h >> 16); h *= 9u; h ^= h >> 4; h *= 0x27d4eb2du; h ^= h >> 15;
+        return Vec3{0.25f + 0.75f * ((h & 0xFF) / 255.0f),
+                    0.25f + 0.75f * (((h >> 8) & 0xFF) / 255.0f),
+                    0.25f + 0.75f * (((h >> 16) & 0xFF) / 255.0f)};
+    };
+    for (int i = 0; i < kBodyCount; ++i) {
+        const int wx = bodiesInit[(size_t)i].px >> fpx::kFrac;
+        const int wz = bodiesInit[(size_t)i].pz >> fpx::kFrac;
+        uint32_t cellId = broad::FlatBodyCellId(broad::BodyCellOf(bodies[(size_t)i].pos, grid.cellSize),
+                                                grid);
+        int cx = kMargin + wx * kPxPerUnit;
+        int cy = (int)imgH - kMargin - wz * kPxPerUnit;
+        Vec3 col = hashColor(cellId);
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — broad-cell body-by-cell-id (%u cells, %u occupied)\n",
+                outPath, imgW, imgH, kCellCount, cpuMeasure.occupiedCells);
     return 0;
 }
 
@@ -50291,6 +50565,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--grain-neighbors") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_neighbors.png";
             try { return RunGrainNeighborsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --broad-cell <out.png>: render the Deterministic Integer Broadphase THE BODY GRID + CSR CELL TABLE
+        // showcase (Slice BP1, the BEACHHEAD of FLAGSHIP #23). Like --grain-neighbors, the cell table is PURE
+        // INT32 (BodyCellOf = FloorDiv per axis + an ascending-index scatter, NO int64/fxmul/sqrt), so the
+        // broad_cell_{count,scan,emit} shaders MSL-gen natively and Metal DISPATCHES THE GPU passes: the SAME
+        // fixed body lattice + clustered bodies the Vulkan --broad-cell-shot builds feed the SAME three passes
+        // (count->scan->emit) -> ReadBuffer reads cellStart + cellBodies, PROVEN BIT-EXACT vs the CPU
+        // broad.h::BuildBodyCellTable reference (memcmp — the same proofs the Vulkan --broad-cell-shot runs);
+        // enabled=false -> cleared no-op; two runs byte-identical. The image golden is the integer top-down (XZ)
+        // body-by-flat-cell-id viz, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/broad_cell.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--broad-cell") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_broad_cell.png";
+            try { return RunBroadCellShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-query <out.png>: render the Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD +
