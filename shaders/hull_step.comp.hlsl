@@ -449,6 +449,22 @@ struct EpaOut { int depth; int3 normal; int3 cA; int3 cB; };
 EpaOut RunEpa(FxHull hA, int4 oA, int3 pA, FxHull hB, int4 oB, int3 pB, GjkOut g) {
     EpaOut res; res.depth = 0; res.normal = int3(0, HF_FPX_ONE, 0); res.cA = int3(0,0,0); res.cB = int3(0,0,0);
 
+    // DETERMINISM HARDENING (the GJ4 nondeterminism fix): the EPA polytope state lives in `static` arrays that
+    // are reused across the ~67k Gjk/Epa calls this single thread makes per dispatch. HLSL `static` globals have
+    // NO initializer here, so the SPIR-V Private variables are UNDEFINED at dispatch start; the CPU reference
+    // (gjk.h::Epa) uses a fresh value-initialized `Polytope poly;` (all-zero) each call. The degenerate bail
+    // paths (gVertCount<4, gFaceCount==0) read slot [0] even when the count is 0 — on the CPU that reads a
+    // zero-initialized PolyFace, on the GPU it would read stale/undefined memory (nondeterministic between
+    // dispatches). Explicitly zero ALL polytope slots here so every read is deterministic-zero exactly like the
+    // CPU `Polytope` value-init, regardless of count. Matches gjk.h's value-initialized Polytope BY CONSTRUCTION.
+    [unroll] for (uint zi = 0u; zi < (uint)HF_EPA_MAX_PV; ++zi) {
+        gVerts[zi] = int3(0,0,0); gVertsA[zi] = int3(0,0,0); gVertsB[zi] = int3(0,0,0);
+    }
+    [unroll] for (uint zf = 0u; zf < (uint)HF_EPA_MAX_PF; ++zf) {
+        gFaceA[zf] = 0u; gFaceB[zf] = 0u; gFaceC[zf] = 0u; gFaceN[zf] = int3(0,0,0); gFaceD[zf] = 0;
+    }
+    gInterior = int3(0,0,0);
+
     gVertCount = 0u;
     gFaceCount = 0u;
 
