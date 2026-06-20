@@ -543,6 +543,102 @@ int main() {
         }
     }
 
+    // Slice GJ5 — LOCKSTEP + ROLLBACK (the netcode beat): ApplyHullCommands, SimHullTick, HullSnapshot,
+    // SnapshotHull/RestoreHull, HullBodiesEqual, RunHullLockstep, RunHullRollback. PURE CPU. The whole hull
+    // sim is lockstep- and rollback-replayable.
+    {
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+        auto hbody = [&](fx x, fx y, fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.dt          = kOne / 60;
+        cfg.solveIters  = 24;
+        cfg.restitution = 0;
+        cfg.slop        = kOne / 64;
+        cfg.beta        = (fx)((int64_t)4 * kOne / 10);
+        cfg.linDamp     = (fx)((int64_t)97 * kOne / 100);
+        cfg.angDamp     = (fx)((int64_t)30 * kOne / 100);
+        cfg.posIters    = 4;
+        const uint32_t kTicks = 240u;
+        const uint32_t kRollbackAt = 30u;
+
+        // The GJ4 settle scene: floor + tetra + octa + static box + wedge.
+        auto buildScene = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(hbody(0, 0, 0, false));            w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));
+            w.bodies.push_back(hbody(fd(-2.0), fd(2.5), 0, true)); w.hulls.push_back(gjk::MakeTetra(kOne));
+            w.bodies.push_back(hbody(0, fd(2.5), 0, true));        w.hulls.push_back(gjk::MakeOcta(kOne));
+            w.bodies.push_back(hbody(fd(2.6), fd(2.0), 0, false)); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            w.bodies.push_back(hbody(fd(1.2), fd(2.4), 0, true));  w.hulls.push_back(gjk::MakeWedge(kOne, kOne, kOne));
+            return w;
+        };
+        const gjk::HullWorld kInit = buildScene();
+
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{4u,  convex::kConvexCmdAddImpulse, 1u, convex::FxVec3{fi(2), 0, 0}},
+            convex::ConvexCommand{8u,  convex::kConvexCmdSetAngVel,  2u, convex::FxVec3{0, kOne, 0}},
+            convex::ConvexCommand{12u, convex::kConvexCmdAddImpulse, 4u, convex::FxVec3{-fi(1), fi(1), 0}},
+        };
+        std::vector<convex::ConvexCommand> mispredictStream = authStream;
+        mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                         convex::FxVec3{fi(30), 0, 0}});
+
+        // --- RunHullLockstep: authority == replica BIT-IDENTICAL (inputs-only re-sim) ---
+        bool lockstepIdentical = false;
+        const gjk::HullWorld authority =
+            gjk::RunHullLockstep(kInit, cfg, authStream, kTicks, &lockstepIdentical);
+        const gjk::HullWorld replica = gjk::RunHullLockstep(kInit, cfg, authStream, kTicks);
+        check(lockstepIdentical, "RunHullLockstep sets outIdentical=true (authority==replica)");
+        check(gjk::HullBodiesEqual(authority.bodies, replica.bodies),
+              "RunHullLockstep: authority == replica BIT-IDENTICAL (inputs-only)");
+
+        // --- two runs byte-identical (determinism) ---
+        const gjk::HullWorld authority2 = gjk::RunHullLockstep(kInit, cfg, authStream, kTicks);
+        check(gjk::HullBodiesEqual(authority2.bodies, authority.bodies),
+              "RunHullLockstep: two runs BYTE-IDENTICAL (deterministic)");
+
+        // --- the command stream moved the hulls NON-TRIVIALLY (not a frozen no-op) ---
+        gjk::HullWorld noCmd = buildScene();
+        gjk::StepHullWorldN(noCmd, cfg, kTicks);
+        check(!gjk::HullBodiesEqual(authority.bodies, noCmd.bodies),
+              "command stream moved the hulls non-trivially (commanded != no-command settle)");
+
+        // --- SnapshotHull / RestoreHull round-trips the bodies exactly ---
+        {
+            gjk::HullWorld w = gjk::RunHullLockstep(kInit, cfg, authStream, kRollbackAt);
+            const gjk::HullSnapshot snap = gjk::SnapshotHull(w, kRollbackAt);
+            check(snap.tick == kRollbackAt, "SnapshotHull captures the tick");
+            gjk::SimHullTick(w, cfg, authStream, kRollbackAt);   // mutate
+            check(!gjk::HullBodiesEqual(w.bodies, snap.bodies),
+                  "SimHullTick mutated the world (snapshot now differs)");
+            gjk::RestoreHull(w, snap);
+            check(gjk::HullBodiesEqual(w.bodies, snap.bodies),
+                  "SnapshotHull/RestoreHull round-trips the bodies exactly");
+        }
+
+        // --- RunHullRollback: corrected == authority AND the mispredict genuinely diverged ---
+        bool rollbackCorrected = false, mispredictDiverged = false;
+        const gjk::HullWorld rolledBack =
+            gjk::RunHullRollback(kInit, cfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                 &rollbackCorrected, &mispredictDiverged);
+        check(rollbackCorrected && gjk::HullBodiesEqual(rolledBack.bodies, authority.bodies),
+              "RunHullRollback: corrected == authority BIT-EXACT");
+        check(mispredictDiverged,
+              "RunHullRollback: mispredict genuinely diverged before rollback (real divergence corrected)");
+    }
+
     (void)hullNames;
     if (g_fail == 0) std::printf("gjk_test: ALL PASS\n");
     else std::printf("gjk_test: %d FAIL\n", g_fail);

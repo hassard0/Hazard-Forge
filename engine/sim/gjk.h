@@ -1290,5 +1290,154 @@ inline HullStackMeasure MeasureHullStack(const HullWorld& world) {
     return ms;
 }
 
+// =========================================================================================================
+// Slice GJ5 — General Convex-Hull Contacts: LOCKSTEP + ROLLBACK (the netcode beat). APPENDED after
+// MeasureHullStack (GJ1-GJ4's lines above are BYTE-FROZEN). PURE CPU — NO shader, NO RHI. Because
+// StepHullWorld (GJ4) is a fully deterministic integer tick whose ONLY mutable state is the `bodies` vector
+// (the `hulls` are immutable/shared geometry, like a convex::ConvexWorld's `boxes`), GJ5 is the direct CX5
+// twin: the same command/snapshot/lockstep/rollback shapes convex::RunConvexLockstep/RunConvexRollback use,
+// with StepConvexWorld -> StepHullWorld swapped. Two peers fed only an input-command stream re-derive the
+// entire hull world byte-identical, and a rollback re-sims from a snapshot bit-for-bit.
+//
+// REUSE (do NOT redefine): the frozen convex:: command machinery — convex::ConvexCommand (a hull body is an
+// fpx::FxBody, identical to a convex body), convex::kConvexCmdAddImpulse / convex::kConvexCmdSetAngVel, and
+// convex::ConvexBodiesEqual (it takes std::vector<FxBody>& -> directly callable on HullWorld.bodies). The
+// per-command apply logic mirrors convex::ApplyConvexCommands's body (which takes a ConvexWorld& and so
+// can't run on a HullWorld) reproduced over world.bodies, incl. the out-of-range-bodyId guard. Both backends
+// run THIS identical CPU harness -> the golden is bit-identical BY CONSTRUCTION (cross-vendor 0 px).
+
+// ----- ApplyHullCommands(world, commands, tick): apply this tick's commands in FIXED array order -----------
+// Reproduces convex::ApplyConvexCommands's body over world.bodies (it takes a ConvexWorld& so it cannot be
+// called on a HullWorld directly). Apply, in the commands' FIXED array order, every command whose .tick ==
+// `tick`. An out-of-range bodyId is a no-op (the deterministic guard). kConvexCmdAddImpulse scales arg by the
+// body's invMass (a true IMPULSE -> velocity change; a STATIC body with invMass==0 takes nothing BY
+// CONSTRUCTION). kConvexCmdSetAngVel overwrites angVel. An unknown kind is a no-op. Pure integer, fixed order.
+inline void ApplyHullCommands(HullWorld& world, const std::vector<convex::ConvexCommand>& commands,
+                              uint32_t tick) {
+    for (size_t c = 0; c < commands.size(); ++c) {
+        const convex::ConvexCommand& cmd = commands[c];
+        if (cmd.tick != tick) continue;
+        if (cmd.bodyId >= (uint32_t)world.bodies.size()) continue;   // out-of-range -> no-op (deterministic)
+        FxBody& b = world.bodies[(size_t)cmd.bodyId];
+        if (cmd.kind == convex::kConvexCmdAddImpulse) {
+            b.vel = FxAdd(b.vel, convex::FxScale(cmd.arg, b.invMass));
+        } else if (cmd.kind == convex::kConvexCmdSetAngVel) {
+            b.angVel = cmd.arg;
+        }
+    }
+}
+
+// ----- SimHullTick(world, cfg, commands, tick): ONE deterministic tick with its inputs --------------------
+// (1) ApplyHullCommands(world, commands, tick) — this tick's perturbations, in array order, BEFORE the step
+// so the impulse/spin integrates this tick; (2) StepHullWorld(world, cfg) — the GJ4 5-pass tick reused
+// VERBATIM. Pure integer, fixed order -> bit-identical on every peer/platform. (The convex::SimConvexTick
+// analog.)
+inline void SimHullTick(HullWorld& world, const convex::ConvexStepConfig& cfg,
+                        const std::vector<convex::ConvexCommand>& commands, uint32_t tick) {
+    ApplyHullCommands(world, commands, tick);
+    StepHullWorld(world, cfg);
+}
+
+// ----- HullSnapshot: the captured mutable world state at a tick (the rollback restore point) --------------
+// The ONLY mutable replayable state is the bodies vector (the `hulls` are immutable/shared geometry, so they
+// are NOT snapshotted) + the tick. A deep-copy of std::vector<FxBody>. Bit-exact round-trip with RestoreHull.
+// (The convex::ConvexSnapshot analog.)
+struct HullSnapshot {
+    std::vector<fpx::FxBody> bodies;   // a deep-copy of the body world (vel/pos/orient/angVel/invMass/flags)
+    uint32_t                 tick = 0; // the tick this snapshot was taken at (the rollback restore point)
+};
+
+// ----- SnapshotHull(world, tick): deep-copy the body world (the rollback restore point) -------------------
+// A value copy -> deep-copies the body vector. Bit-exact round-trip with RestoreHull.
+inline HullSnapshot SnapshotHull(const HullWorld& world, uint32_t tick) {
+    HullSnapshot snap;
+    snap.bodies = world.bodies;   // deep copy
+    snap.tick   = tick;
+    return snap;
+}
+
+// ----- RestoreHull(world, snap): restore the body world from a snapshot (the rollback) --------------------
+// Memberwise copy — restores vel/pos/orient/angVel exactly. The `hulls` are immutable/shared, so they are
+// left untouched. Bit-exact round-trip with SnapshotHull.
+inline void RestoreHull(HullWorld& world, const HullSnapshot& snap) {
+    world.bodies = snap.bodies;   // restore the deep-copied body world (hulls untouched)
+}
+
+// ----- HullBodiesEqual(a, b): byte-for-byte equality of two body vectors (the peer/rollback memcmp) -------
+// REUSES the frozen convex::ConvexBodiesEqual (it takes std::vector<FxBody>& — a hull body IS an fpx::FxBody,
+// the SAME flat POD). The make-or-break comparison the lockstep + rollback proofs build on.
+inline bool HullBodiesEqual(const std::vector<fpx::FxBody>& a, const std::vector<fpx::FxBody>& b) {
+    return convex::ConvexBodiesEqual(a, b);
+}
+
+// ----- RunHullLockstep(world0, cfg, commands, ticks): two peers converge from inputs alone ----------------
+// THE peer entry point (the convex::RunConvexLockstep control flow over SimHullTick). Two independent peers
+// (authority + replica) BOTH start from `world0`, BOTH run SimHullTick for `ticks` with the SAME command
+// stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism. Sets *outIdentical (if non-null) to
+// whether the two final body vectors are byte-identical (the make-or-break lockstep proof) + returns the
+// converged AUTHORITY world (for the golden). The peer step order is PINNED.
+inline HullWorld RunHullLockstep(const HullWorld& world0, const convex::ConvexStepConfig& cfg,
+                                 const std::vector<convex::ConvexCommand>& commands, uint32_t ticks,
+                                 bool* outIdentical = nullptr) {
+    HullWorld authority = world0;   // a fresh copy
+    HullWorld replica   = world0;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimHullTick(authority, cfg, commands, t);
+        SimHullTick(replica,   cfg, commands, t);
+    }
+    if (outIdentical) *outIdentical = HullBodiesEqual(authority.bodies, replica.bodies);
+    return authority;
+}
+
+// ----- RunHullRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) -----------------
+// The rollback harness (the convex::RunConvexRollback control flow over SimHullTick).
+// (1) advance ticks 0..rollbackAt from `world0` applying authStream; (2) SAVE a HullSnapshot AT rollbackAt
+// (SnapshotHull — the body world); (2b) speculatively advance a few ticks (<=3) with the MISPREDICTED stream
+// (a WRONG/extra impulse — the client prediction that diverges), capturing that diverged intermediate;
+// (3) ROLLBACK — RestoreHull to the snapshot + RE-SIMULATE rollbackAt..ticks with the CORRECT authStream ->
+// the corrected final world. Returns the corrected world; sets *outCorrectedEqAuthority (if non-null) to
+// whether it == RunHullLockstep(world0, cfg, authStream, ticks) byte-for-byte, and *outMispredictDiverged
+// (if non-null) to whether the speculative pre-rollback state DIFFERED from the authority at the same tick
+// (proving a REAL divergence was corrected, not a no-op). cfg + the streams are CONSTANT, NOT snapshotted.
+inline HullWorld RunHullRollback(const HullWorld& world0, const convex::ConvexStepConfig& cfg,
+                                 const std::vector<convex::ConvexCommand>& authStream,
+                                 const std::vector<convex::ConvexCommand>& mispredictStream,
+                                 uint32_t ticks, uint32_t rollbackAt,
+                                 bool* outCorrectedEqAuthority = nullptr,
+                                 bool* outMispredictDiverged = nullptr) {
+    HullWorld w = world0;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimHullTick(w, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — just the body world).
+    const HullSnapshot snap = SnapshotHull(w, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimHullTick(w, cfg, mispredictStream, rollbackAt + s);
+    HullWorld speculative = w;   // the diverged pre-rollback intermediate (for the "real divergence" proof)
+    // (3) ROLLBACK: restore the snapshot (the body world) + re-sim rollbackAt..ticks with the authStream.
+    RestoreHull(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimHullTick(w, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        HullWorld authAtSpec = world0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimHullTick(authAtSpec, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !HullBodiesEqual(speculative.bodies, authAtSpec.bodies);
+        if (outCorrectedEqAuthority) {
+            const HullWorld authFinal = RunHullLockstep(world0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = HullBodiesEqual(w.bodies, authFinal.bodies);
+        }
+    }
+    return w;
+}
+
 }  // namespace gjk
 }  // namespace hf::sim
