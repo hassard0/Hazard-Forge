@@ -78,6 +78,7 @@
 #include "sim/joint.h"          // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"        // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot
 #include "sim/active.h"         // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot
+#include "sim/boids.h"          // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids, brute-force all-pairs Reynolds seek+separation) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot
 #include "nav/navmesh.h"        // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp
 #include "render/hiz.h"         // Slice CJ: Hi-Z occlusion cull math (pure CPU; shared with the cull compute)
 #include "render/ssgi.h"  // Slice BR: SSGI bilateral-denoise params (SsgiDenoiseParams defaults)
@@ -469,6 +470,7 @@ int main(int argc, char** argv) {
     const char* fpxShotPath = nullptr; // --fpx-shot <out.bmp> (Slice FPX1: Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer broadphase, the beachhead of FLAGSHIP #6 — an 8x8 grid of dynamic bodies integrated K=120 fixed Q16.16 steps by one GPU thread per body, GPU==CPU body array bit-exact, integer side-view debug-viz)
     const char* fluidIntegrateShotPath = nullptr; // --fluid-integrate-shot <out.bmp> (Slice FL1: Deterministic GPU Fluid Q16.16 PARTICLE POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #9 — a 10x10x10 = 1000-particle dam-break block in a corner integrated ~120 fixed Q16.16 steps under gravity by one GPU thread per particle, GPU==CPU particle array bit-exact, integer side-view debug-viz of the falling/settling block)
     const char* grainIntegrateShotPath = nullptr; // --grain-integrate-shot <out.bmp> (Slice GR1: Deterministic GPU Granular/Sand Q16.16 GRAIN POOL INTEGRATOR, the BEACHHEAD of FLAGSHIP #10 — a 10x10x10 = 1000-grain dropped block in a corner integrated fixed Q16.16 steps under gravity by one GPU thread per grain with a RADIUS-AWARE ground rest, GPU==CPU grain array bit-exact, integer side-view debug-viz of the falling/settling grain block)
+    const char* boidsSteerShotPath = nullptr; // --boids-steer-shot <out.bmp> (Slice BD1: Deterministic GPU Crowds INTEGER STEERING, the BEACHHEAD of FLAGSHIP #18 — a ~36-agent cluster seeks a target offset to one side while separating, settled K StepBoids steps by one GPU thread per agent [JACOBI/ping-pong: read the frozen input buffer, brute-force all-pairs seek+separation, per-axis clamp force/speed, integrate, write the output buffer], GPU==CPU agent array bit-exact, integer 2D top-down debug-viz of the loose flock streaming toward the target)
     const char* grainNeighborsShotPath = nullptr; // --grain-neighbors-shot <out.bmp> (Slice GR2: Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH, the 2nd slice of FLAGSHIP #10 — the GR1 1000-grain dropped block (settled to a mid-fall pile) bucketed into a uniform spatial-hash grid at cell-size hSearch (BuildGrainCellTable) + a per-grain 27-cell-stencil candidate NEIGHBOR LIST (BuildGrainNeighborList, per-axis |dx|<hSearch reject) via PURE-INT32 count->scan->emit (grain_cell_{count,scan,emit} + grain_neighbor_{count,scan,emit}.comp, MSL-native), GPU==CPU cell-table+neighbor-list bit-exact, integer per-grain neighbor-count heat viz; NO contact solve (GR3), NO radial overlap cull)
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
     const char* cgrainQueryShotPath = nullptr; // --cgrain-query-shot <out.bmp> (Slice CG1: Deterministic Rigid<->Grain Coupling UNIFIED bodies+grains WORLD + BODY->GRAIN grid-hash QUERY, the BEACHHEAD of FLAGSHIP #12 — a poured grain bed (GR1 InitGrainBlock, settled with GR4 friction steps) + a few FxBody spheres placed partly buried. Build the GR2 grain grid + cell table (reused grain_cell_{count,scan,emit}) then the per-body grain QUERY via THREE pure-INT32 count->scan->emit passes (cgrain_body_{count,scan,emit}.comp, MSL-native): each body gathers the grains inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - g.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CG2/CG3). GPU=={cellStart,cellGrains,bodyStart,bodyGrains}==CPU couple_grain.h::GatherBodyGrains bit-exact (memcmp), per-body gathered-grain heat viz (buried bodies populated, clear bodies empty). NO momentum exchange (CG2 support/drag, CG3 displacement, CG4 step, CG5 lockstep, CG6 render), NO new RHI; couple_grain.h #includes fpx.h + grain.h read-only)
@@ -691,6 +693,11 @@ int main(int argc, char** argv) {
         // parse limit C1061, like the fluid/cloth/fpx/mc/nav shots.
         if (std::strcmp(argv[i], "--grain-integrate-shot") == 0 && i + 1 < argc) {
             grainIntegrateShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        if (std::strcmp(argv[i], "--boids-steer-shot") == 0 && i + 1 < argc) {
+            boidsSteerShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -18689,6 +18696,262 @@ int main(int argc, char** argv) {
         // plane -> a single flat line (a poor golden). K=100 catches it MID-FALL: the bottom ~2 layers rest at
         // groundY + radius while the upper layers are still a falling stack (8 distinct y-levels) -> a
         // recognizable settling grain BLOCK with a built-up base, the coverage proof non-trivial on both axes.
+        // --- Deterministic GPU Crowds Q16.16 INTEGER STEERING (--boids-steer-shot <out.bmp>, Slice BD1, the
+        // BEACHHEAD of FLAGSHIP #18). A small cluster of ~36 agents (a 6x6 grid, 1-unit spacing) started near
+        // the origin with a shared seek target offset to one side (+x, far away) is settled K=240 StepBoids
+        // steps by shaders/boids_steer.comp: ONE GPU thread per agent runs the Reynolds steer tick (SteerSeek
+        // toward the target + a brute-force all-pairs SteerSeparation over the frozen input buffer, per-axis
+        // clamp force/speed, integrate) — JACOBI/PING-PONG: each step reads gAgentsIn + writes gAgentsOut, then
+        // the host swaps the two buffers. The seek+separation+clamps+integrate are copied VERBATIM from
+        // engine/sim/boids.h::StepBoids. ReadBuffer reads the integer Q16.16 agent array; the CPU
+        // boids::StepBoidsSteps over the SAME cluster must match it BIT-EXACT (memcmp, NO tol). boids_steer.comp
+        // is int64 -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids (byte-identical by construction).
+        // The golden is a PURE-INTEGER 2D top-down view (each agent's integer (pos.x>>kFrac, pos.z>>kFrac) -> a
+        // pixel, hashColor dot; the target a white cross) -> identical both backends by construction. NO grid
+        // (BD2), NO alignment/cohesion (BD3), NO new RHI.
+        if (boidsSteerShotPath) {
+            using math::Vec3;
+            namespace boids = hf::sim::boids;
+            namespace vg = hf::render::vg;
+
+            // The deterministic flock recipe (== the Metal --boids-steer config). All host-snapped Q16.16.
+            const boids::fx kOne = boids::kOne;
+            auto wu = [&](int u) { return (boids::fx)(u * (int)kOne); };
+            auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+            const boids::fx kDt = kOne / 60;
+            const int kSteps = 240;
+            const int kGrid = 6;                         // 6x6 = 36 agents
+
+            boids::BoidsConfig cfg;
+            cfg.seekGain  = frac(1, 4);                  // 0.25 proportional seek
+            cfg.sepGain   = frac(1, 2);                  // 0.5 separation push
+            cfg.sepRadius = wu(2);                       // 2-unit neighbor radius (> the 1-unit spacing)
+            cfg.maxForce  = wu(8);
+            cfg.maxSpeed  = wu(6);
+            cfg.target    = boids::FxVec3{wu(40), 0, 0}; // far to +x
+            cfg.gravity   = boids::FxVec3{0, 0, 0};
+
+            // The initial cluster: a kGrid x kGrid grid, 1-unit spacing, centered near the origin.
+            auto makeCluster = [&]() {
+                std::vector<boids::Agent> a;
+                for (int gx = 0; gx < kGrid; ++gx)
+                    for (int gz = 0; gz < kGrid; ++gz)
+                        a.push_back(boids::Agent{boids::FxVec3{wu(gx), 0, wu(gz)}, boids::FxVec3{0, 0, 0}});
+                return a;
+            };
+            const std::vector<boids::Agent> cluster0 = makeCluster();
+            const int kAgentCount = (int)cluster0.size();
+
+            // std430 Agent mirror (matches shaders/boids_steer.comp Agent): 6 x int32 (24 bytes).
+            struct AgentGpu { int32_t px, py, pz, vx, vy, vz; };
+            static_assert(sizeof(AgentGpu) == 24, "AgentGpu std430 layout");
+            static_assert(sizeof(boids::Agent) == 24, "Agent std430 layout");
+            auto packAgents = [&](const std::vector<boids::Agent>& ps) {
+                std::vector<AgentGpu> out(ps.size());
+                for (size_t i = 0; i < ps.size(); ++i) {
+                    const boids::Agent& p = ps[i];
+                    out[i] = AgentGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z};
+                }
+                return out;
+            };
+            const std::vector<AgentGpu> agentsInit = packAgents(cluster0);
+
+            // BoidsParams (matches boids_steer.comp BoidsParams std430): 4 x int4 (64 bytes).
+            struct BoidsParams { int32_t p0[4], p1[4], p2[4], p3[4]; };
+            static_assert(sizeof(BoidsParams) == 64, "BoidsParams std430 layout");
+            auto makeParams = [&](const boids::BoidsConfig& c, int32_t stepEnabled) {
+                BoidsParams p{};
+                p.p0[0] = c.seekGain; p.p0[1] = c.sepGain; p.p0[2] = c.sepRadius; p.p0[3] = c.maxForce;
+                p.p1[0] = c.maxSpeed; p.p1[1] = c.target.x; p.p1[2] = c.target.y; p.p1[3] = c.target.z;
+                p.p2[0] = c.gravity.x; p.p2[1] = c.gravity.y; p.p2[2] = c.gravity.z; p.p2[3] = kDt;
+                p.p3[0] = kAgentCount; p.p3[1] = stepEnabled; p.p3[2] = 0; p.p3[3] = 0;
+                return p;
+            };
+
+            auto makeAgentBuf = [&](const std::vector<AgentGpu>& data) {
+                rhi::BufferDesc d;
+                d.size = data.size() * sizeof(AgentGpu);
+                d.initialData = data.data();
+                d.usage = rhi::BufferUsage::Storage;
+                return device->CreateBuffer(d);
+            };
+
+            // Compute pipeline: 3 storage buffers (agentsIn, agentsOut, params); 64 threads/group.
+            auto boidsCsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/boids_steer.comp.hlsl.spv");
+            auto boidsCs = device->CreateShaderModule({std::span<const uint32_t>(boidsCsWords)});
+            rhi::ComputePipelineDesc boidsCdesc;
+            boidsCdesc.compute = boidsCs.get();
+            boidsCdesc.storageBufferCount = 3;
+            boidsCdesc.pushConstantSize = 0;
+            boidsCdesc.threadsPerGroupX = 64;
+            auto boidsCompute = device->CreateComputePipeline(boidsCdesc);
+            const uint32_t kGroups = ((uint32_t)kAgentCount + 63u) / 64u;
+
+            // Run K Jacobi/ping-pong steps over fresh in/out buffers + the given config; read back the result.
+            auto runSteer = [&](const boids::BoidsConfig& c, int32_t stepEnabled, int steps,
+                                std::vector<AgentGpu>& outAgents) {
+                auto bufA = makeAgentBuf(agentsInit);
+                auto bufB = makeAgentBuf(agentsInit);   // pre-sized output (overwritten each step)
+                BoidsParams params = makeParams(c, stepEnabled);
+                rhi::BufferDesc pDesc;
+                pDesc.size = sizeof(BoidsParams);
+                pDesc.initialData = &params;
+                pDesc.usage = rhi::BufferUsage::Storage;
+                auto paramsBuf = device->CreateBuffer(pDesc);
+
+                rhi::IBuffer* in = bufA.get();
+                rhi::IBuffer* out = bufB.get();
+                for (int s = 0; s < steps; ++s) {
+                    render::RenderGraph g;
+                    render::RgResource rgSwap = g.ImportSwapchain("swapchain");
+                    rhi::IBuffer* curIn = in;
+                    rhi::IBuffer* curOut = out;
+                    g.AddPass("boids_steer", {}, {rgSwap},
+                        [&, curIn, curOut](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                            cmd.BindComputePipeline(*boidsCompute);
+                            cmd.BindStorageBuffer(*curIn, 0);
+                            cmd.BindStorageBuffer(*curOut, 1);
+                            cmd.BindStorageBuffer(*paramsBuf, 2);
+                            cmd.DispatchCompute(kGroups);
+                            cmd.ComputeToVertexBarrier();
+                            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                            cmd.EndRenderPass();
+                        });
+                    g.Execute(*device);
+                    device->WaitIdle();
+                    rhi::IBuffer* tmp = in; in = out; out = tmp;   // ping-pong: out becomes next in
+                }
+                outAgents.assign((size_t)kAgentCount, AgentGpu{});
+                device->ReadBuffer(*in, outAgents.data(), outAgents.size() * sizeof(AgentGpu), 0);
+            };
+
+            // === GPU steer (enabled, K steps, ping-pong) ===
+            std::vector<AgentGpu> gpuAgents;
+            runSteer(cfg, 1, kSteps, gpuAgents);
+
+            // === CPU reference: StepBoidsSteps over the SAME cluster ===
+            std::vector<boids::Agent> cpuFlock = cluster0;
+            boids::StepBoidsSteps(cpuFlock, cfg, kDt, kSteps);
+            std::vector<AgentGpu> cpuAgents = packAgents(cpuFlock);
+
+            // PROOF (1) GPU==CPU agents BIT-EXACT after K steps (integer memcmp, NO tolerance).
+            if (gpuAgents.size() != cpuAgents.size() ||
+                std::memcmp(gpuAgents.data(), cpuAgents.data(),
+                            (size_t)kAgentCount * sizeof(AgentGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: boids GPU agent array != CPU StepBoids "
+                             "(a float crept into the fixed-point steering, or an op-order/ping-pong bug?)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-steer: {agents:%d, steps:%d} GPU==CPU BIT-EXACT\n", kAgentCount, kSteps);
+
+            // PROOF (2) two-run determinism byte-identical.
+            std::vector<AgentGpu> gpuAgents2;
+            runSteer(cfg, 1, kSteps, gpuAgents2);
+            if (gpuAgents.size() != gpuAgents2.size() ||
+                std::memcmp(gpuAgents.data(), gpuAgents2.data(),
+                            gpuAgents.size() * sizeof(AgentGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: boids two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-steer determinism: two runs BYTE-IDENTICAL\n");
+
+            // PROOF (3) seek + separate: meanToTarget DROPPED (they sought it) AND minSep is ABOVE a floor
+            // (separation kept them apart — they didn't collapse). Measured on the bit-exact GPU result.
+            std::vector<boids::Agent> gpuFlock((size_t)kAgentCount);
+            for (int i = 0; i < kAgentCount; ++i)
+                gpuFlock[(size_t)i] = boids::Agent{
+                    boids::FxVec3{gpuAgents[(size_t)i].px, gpuAgents[(size_t)i].py, gpuAgents[(size_t)i].pz},
+                    boids::FxVec3{gpuAgents[(size_t)i].vx, gpuAgents[(size_t)i].vy, gpuAgents[(size_t)i].vz}};
+            const boids::BoidsStats before = boids::MeasureBoids(cluster0, cfg);
+            const boids::BoidsStats after  = boids::MeasureBoids(gpuFlock, cfg);
+            const boids::fx kSepFloor = boids::kOne / 4;   // ~0.25 world-unit L1 floor
+            const bool soughtAndSeparated =
+                (after.meanToTarget < before.meanToTarget) && (after.minSep > kSepFloor);
+            if (!soughtAndSeparated) {
+                std::fprintf(stderr, "FATAL: boids behavior incoherent (meanToTarget %d->%d, minSep %d)\n",
+                             before.meanToTarget, after.meanToTarget, after.minSep);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-steer behavior: {meanToTarget:%d, minSep:%d, soughtAndSeparated:true}\n",
+                        after.meanToTarget, after.minSep);
+
+            // PROOF (4) control: a sepGain=0 run lets the flock collapse toward the target (minSep -> ~0).
+            boids::BoidsConfig ctrl = cfg; ctrl.sepGain = 0;
+            std::vector<AgentGpu> ctrlAgents;
+            runSteer(ctrl, 1, kSteps, ctrlAgents);
+            std::vector<boids::Agent> ctrlFlock((size_t)kAgentCount);
+            for (int i = 0; i < kAgentCount; ++i)
+                ctrlFlock[(size_t)i] = boids::Agent{
+                    boids::FxVec3{ctrlAgents[(size_t)i].px, ctrlAgents[(size_t)i].py, ctrlAgents[(size_t)i].pz},
+                    boids::FxVec3{0, 0, 0}};
+            const boids::BoidsStats ctrlStats = boids::MeasureBoids(ctrlFlock, ctrl);
+            if (ctrlStats.minSep >= after.minSep) {
+                std::fprintf(stderr, "FATAL: boids control did not collapse (noSep minSep %d >= sep minSep %d)\n",
+                             ctrlStats.minSep, after.minSep);
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-steer control: {noSep:collapsed}\n");
+
+            // PROOF (5, parity with grain) disabled no-op: stepEnabled=0 -> agents UNCHANGED.
+            std::vector<AgentGpu> disabledAgents;
+            runSteer(cfg, 0, kSteps, disabledAgents);
+            if (disabledAgents.size() != agentsInit.size() ||
+                std::memcmp(disabledAgents.data(), agentsInit.data(),
+                            agentsInit.size() * sizeof(AgentGpu)) != 0) {
+                std::fprintf(stderr, "FATAL: boids stepEnabled=false changed the agents\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // --- Golden: a PURE-INTEGER 2D TOP-DOWN view. Project each agent's integer
+            // (pos.x>>kFrac, pos.z>>kFrac) to a pixel via a FIXED integer transform, splat a hashColor dot; the
+            // target is marked with a white cross. CPU-colored from the read-back integers -> identical both
+            // backends by construction. The flock spans x in ~[0, target.x], so scale x to fit. ---
+            const int kPxPerUnit = 18;
+            const int kMargin = 24;
+            const int kWorldW = 44;   // x spans ~0..40 (target) + slack
+            const int kWorldH = 12;   // z spans ~0..6 (cluster) + slack
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit / 2);   // half-scale x (wide)
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            // Integer world->pixel transform (top-down x-right, z-down). x half-scaled to fit the wide spread.
+            auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+                ix = kMargin + worldX * kPxPerUnit / 2;
+                iy = kMargin + (worldZ + 3) * kPxPerUnit;   // +3 so a small negative z stays on-canvas
+            };
+            auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            // The target: a white cross.
+            {
+                int tx, ty; worldToPx(cfg.target.x >> boids::kFrac, cfg.target.z >> boids::kFrac, tx, ty);
+                for (int d = -4; d <= 4; ++d) { plot(tx + d, ty, 255, 255, 255, 0); plot(tx, ty + d, 255, 255, 255, 0); }
+            }
+            // Each agent as a small 2x2 dot at its integer (pos.x>>kFrac, pos.z>>kFrac).
+            for (int i = 0; i < kAgentCount; ++i) {
+                const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+                const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+                int cx, cy; worldToPx(wx, wz, cx, cy);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+                     (uint8_t)(col.z * 255.0f + 0.5f), 1);
+            }
+            bool ok = WriteBMP(boidsSteerShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — boids flock top-down (meanToTarget %d, minSep %d)\n",
+                                boidsSteerShotPath, imgW, imgH, after.meanToTarget, after.minSep);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", boidsSteerShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
         if (grainIntegrateShotPath) {
             using math::Vec3;
             namespace grain = hf::sim::grain;

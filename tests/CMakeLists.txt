@@ -636,6 +636,17 @@ hf_add_pure_test(vehicle_test)
 # #includes sim/joint.h + sim/fpx.h read-only.
 hf_add_pure_test(active_test)
 
+# Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: DETERMINISTIC GPU CROWDS —
+# boids + steering + path-following): the INTEGER STEERING PRIMITIVE integer core (engine/sim/boids.h) the GPU
+# shaders/boids_steer.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox
+# (fx/kFrac/kOne/fxmul/FxVec3/FxAdd/FxSub/FxScale) read-only. Pins SteerSeek (the force points target-ward,
+# zero at the target, scales with seekGain), SteerSeparation (a too-close neighbor pushes the agent away,
+# beyond sepRadius contributes nothing, symmetric neighbors cancel, exactly on the radius is excluded),
+# StepBoids (a tight cluster seeking a target spreads + advances [meanToTarget drops, minSep above a floor];
+# the sepGain=0 control collapses; the per-axis clamp caps force/speed; two runs byte-identical). Pure C++
+# (hf_core), ASan-eligible. boids.h #includes sim/fpx.h read-only.
+hf_add_pure_test(boids_test)
+
 # Deterministic Fixed-Point Physics Slice 1 (Slice FPX1, the BEACHHEAD of FLAGSHIP #6): the Q16.16
 # fixed-point INTEGRATOR + integer broadphase core (engine/sim/fpx.h) the GPU
 # shaders/fpx_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Pins fxmul known products

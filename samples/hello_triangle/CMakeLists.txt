@@ -498,6 +498,21 @@ hf_compile_shaders(
     # ReadBuffer -> bit-exact GPU==CPU body array + cross-backend, proven memcmp. NO new RHI; existing
     # shaders + goldens untouched.
     "shaders/fpx_integrate.comp.hlsl:cs"
+    # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
+    # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
+    # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the
+    # shared target) + a brute-force all-pairs SteerSeparation (accumulate raw integer (a.pos-o.pos) deltas for
+    # neighbors within sepRadius², skip self by index), per-axis clamps the force, integrates velocity
+    # (per-axis clamped) + position, and writes agent i into gAgentsOut — the seek + separation + clamps +
+    # integrate copied VERBATIM from engine/sim/boids.h::StepBoids. JACOBI/PING-PONG (read gAgentsIn / write
+    # gAgentsOut -> race-free, NO atomics, order-independent; the host ping-pongs the buffers between steps).
+    # Like fpx_integrate.comp / grain_integrate.comp this is int64 (the gain*offset + force*dt + vel*dt fxmul
+    # over Q16.16 overflows int32; the separation d²<sepRadius² compare is also int64) -> VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; the Metal --boids-steer showcase
+    # runs the CPU boids::StepBoids (byte-identical by construction, the fpx_integrate.comp convention). Pure
+    # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU agent array + cross-backend, proven memcmp. NO
+    # new RHI; existing shaders + goldens untouched.
+    "shaders/boids_steer.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8: deterministic GPU cloth):
     # cloth_integrate.comp runs the Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per
     # particle runs `steps` iterations of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp)

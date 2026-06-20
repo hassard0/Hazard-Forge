@@ -98,6 +98,7 @@
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
+#include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
 #include "render/decal.h"           // Slice BH: screen-space projected-decal box transform (pure math)
@@ -17826,6 +17827,168 @@ static int RunFluidIntegrateShowcase(const char* outPath) {
 // CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
 // tests/golden/metal/grain_integrate.png (baked on the Mac by the controller); two runs DIFF 0.0000. NO GPU
 // compute, NO neighbours/contact/friction (GR2+), NO new RHI.
+// ===== Slice BD1 — Deterministic GPU Crowds Q16.16 INTEGER STEERING showcase (--boids-steer) (the BEACHHEAD
+// of FLAGSHIP #18). Like FL1/GR1/FPX1 (and UNLIKE the int32 broadphase shaders), the boids steer/integrate is
+// int64 (the gain*offset + force*dt + vel*dt fxmul over Q16.16 overflows int32; the separation d²<sepRadius²
+// compare), so shaders/boids_steer.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) and is NOT in
+// this dir's hf_gen_msl list; on Metal the --boids-steer showcase runs the CPU boids::StepBoids — the EXACT
+// bit-exact reference the Vulkan --boids-steer-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the fpx_integrate.comp/grain_integrate.comp
+// convention), while the Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic 6x6 = 36
+// agent cluster (1-unit spacing, a shared seek target far to +x, the SAME config), runs boids::StepBoidsSteps
+// K=240 steps, and CPU-colors the SAME PURE-INTEGER 2D top-down view (each agent's integer (pos.x>>kFrac,
+// pos.z>>kFrac) -> a pixel, hashColor dot; the target a white cross) as the Vulkan --boids-steer-shot -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/boids_steer.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000. NO GPU compute (int64 -> Vulkan-only), NO grid (BD2), NO new RHI.
+static int RunBoidsSteerShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace boids = hf::sim::boids;
+    namespace vg = render::vg;
+
+    // The deterministic flock recipe (== the Vulkan --boids-steer-shot config). All host-snapped Q16.16.
+    const boids::fx kOne = boids::kOne;
+    auto wu = [&](int u) { return (boids::fx)(u * (int)kOne); };
+    auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+    const boids::fx kDt = kOne / 60;
+    const int kSteps = 240;
+    const int kGrid = 6;
+
+    boids::BoidsConfig cfg;
+    cfg.seekGain  = frac(1, 4);
+    cfg.sepGain   = frac(1, 2);
+    cfg.sepRadius = wu(2);
+    cfg.maxForce  = wu(8);
+    cfg.maxSpeed  = wu(6);
+    cfg.target    = boids::FxVec3{wu(40), 0, 0};
+    cfg.gravity   = boids::FxVec3{0, 0, 0};
+
+    auto makeCluster = [&]() {
+        std::vector<boids::Agent> a;
+        for (int gx = 0; gx < kGrid; ++gx)
+            for (int gz = 0; gz < kGrid; ++gz)
+                a.push_back(boids::Agent{boids::FxVec3{wu(gx), 0, wu(gz)}, boids::FxVec3{0, 0, 0}});
+        return a;
+    };
+    const std::vector<boids::Agent> cluster0 = makeCluster();
+    const int kAgentCount = (int)cluster0.size();
+
+    // std430 Agent mirror (== the Vulkan --boids-steer-shot AgentGpu): 6 x int32 (24 bytes).
+    struct AgentGpu { int32_t px, py, pz, vx, vy, vz; };
+    static_assert(sizeof(AgentGpu) == 24, "AgentGpu std430 layout");
+    static_assert(sizeof(boids::Agent) == 24, "Agent std430 layout");
+    auto packAgents = [&](const std::vector<boids::Agent>& ps) {
+        std::vector<AgentGpu> out(ps.size());
+        for (size_t i = 0; i < ps.size(); ++i) {
+            const boids::Agent& p = ps[i];
+            out[i] = AgentGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z};
+        }
+        return out;
+    };
+    const std::vector<AgentGpu> agentsInit = packAgents(cluster0);
+
+    // CPU steer (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against). stepEnabled=false ->
+    // agents UNCHANGED (the no-op path).
+    auto runSteer = [&](const boids::BoidsConfig& c, bool stepEnabled, std::vector<AgentGpu>& outAgents) {
+        if (!stepEnabled) { outAgents = agentsInit; return; }
+        std::vector<boids::Agent> a = cluster0;
+        boids::StepBoidsSteps(a, c, kDt, kSteps);
+        outAgents = packAgents(a);
+    };
+
+    // CPU steer (enabled, K steps) — the Metal showcase agent array.
+    std::vector<AgentGpu> gpuAgents;
+    runSteer(cfg, true, gpuAgents);
+
+    // GPU==CPU is N/A on the Metal CPU path: this agent array IS the CPU StepBoids reference the Vulkan
+    // --boids-steer-shot proved the GPU shader bit-identical against -> byte-identical to the Vulkan GPU result
+    // BY CONSTRUCTION. Print the same proof line for parity.
+    std::printf("boids-steer: {agents:%d, steps:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU boids::StepBoids, byte-identical to the Vulkan GPU result by construction]\n",
+                kAgentCount, kSteps);
+
+    // two-run determinism.
+    std::vector<AgentGpu> gpuAgents2;
+    runSteer(cfg, true, gpuAgents2);
+    if (gpuAgents.size() != gpuAgents2.size() ||
+        std::memcmp(gpuAgents.data(), gpuAgents2.data(), gpuAgents.size() * sizeof(AgentGpu)) != 0)
+        return fail("boids-steer: two runs differ (nondeterministic)");
+    std::printf("boids-steer determinism: two runs BYTE-IDENTICAL\n");
+
+    // seek + separate: meanToTarget DROPPED + minSep ABOVE a floor.
+    std::vector<boids::Agent> gpuFlock((size_t)kAgentCount);
+    for (int i = 0; i < kAgentCount; ++i)
+        gpuFlock[(size_t)i] = boids::Agent{
+            boids::FxVec3{gpuAgents[(size_t)i].px, gpuAgents[(size_t)i].py, gpuAgents[(size_t)i].pz},
+            boids::FxVec3{gpuAgents[(size_t)i].vx, gpuAgents[(size_t)i].vy, gpuAgents[(size_t)i].vz}};
+    const boids::BoidsStats before = boids::MeasureBoids(cluster0, cfg);
+    const boids::BoidsStats after  = boids::MeasureBoids(gpuFlock, cfg);
+    const boids::fx kSepFloor = boids::kOne / 4;
+    if (!((after.meanToTarget < before.meanToTarget) && (after.minSep > kSepFloor)))
+        return fail("boids-steer: behavior incoherent (sought/separated)");
+    std::printf("boids-steer behavior: {meanToTarget:%d, minSep:%d, soughtAndSeparated:true}\n",
+                after.meanToTarget, after.minSep);
+
+    // control: a sepGain=0 run collapses (minSep -> ~0, below the separating run).
+    boids::BoidsConfig ctrl = cfg; ctrl.sepGain = 0;
+    std::vector<AgentGpu> ctrlAgents;
+    runSteer(ctrl, true, ctrlAgents);
+    std::vector<boids::Agent> ctrlFlock((size_t)kAgentCount);
+    for (int i = 0; i < kAgentCount; ++i)
+        ctrlFlock[(size_t)i] = boids::Agent{
+            boids::FxVec3{ctrlAgents[(size_t)i].px, ctrlAgents[(size_t)i].py, ctrlAgents[(size_t)i].pz},
+            boids::FxVec3{0, 0, 0}};
+    if (boids::MeasureBoids(ctrlFlock, ctrl).minSep >= after.minSep)
+        return fail("boids-steer: control did not collapse");
+    std::printf("boids-steer control: {noSep:collapsed}\n");
+
+    // disabled no-op: stepEnabled=false -> agents UNCHANGED.
+    std::vector<AgentGpu> disabledAgents;
+    runSteer(cfg, false, disabledAgents);
+    if (disabledAgents.size() != agentsInit.size() ||
+        std::memcmp(disabledAgents.data(), agentsInit.data(), agentsInit.size() * sizeof(AgentGpu)) != 0)
+        return fail("boids-steer: stepEnabled=false changed the agents");
+
+    // --- Golden: a PURE-INTEGER 2D top-down view (IDENTICAL to the Vulkan --boids-steer-shot by construction).
+    const int kPxPerUnit = 18, kMargin = 24;
+    const int kWorldW = 44, kWorldH = 12;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit / 2);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+        ix = kMargin + worldX * kPxPerUnit / 2;
+        iy = kMargin + (worldZ + 3) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+            }
+    };
+    {
+        int tx, ty; worldToPx(cfg.target.x >> boids::kFrac, cfg.target.z >> boids::kFrac, tx, ty);
+        for (int d = -4; d <= 4; ++d) { plot(tx + d, ty, 255, 255, 255, 0); plot(tx, ty + d, 255, 255, 255, 0); }
+    }
+    for (int i = 0; i < kAgentCount; ++i) {
+        const int wx = gpuAgents[(size_t)i].px >> boids::kFrac;
+        const int wz = gpuAgents[(size_t)i].pz >> boids::kFrac;
+        int cx, cy; worldToPx(wx, wz, cx, cy);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+             (uint8_t)(col.z * 255.0f + 0.5f), 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — boids flock top-down (meanToTarget %d, minSep %d)\n",
+                outPath, imgW, imgH, after.meanToTarget, after.minSep);
+    return 0;
+}
+
 static int RunGrainIntegrateShowcase(const char* outPath) {
     using math::Vec3;
     namespace grain = hf::sim::grain;
@@ -43442,6 +43605,18 @@ int main(int argc, char** argv) {
         // side-view debug-viz (each grain's integer (pos.x>>kFrac, pos.y>>kFrac) -> a pixel, hashColor dot),
         // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/grain_integrate.png; two
         // runs DIFF 0.0000.
+        // --boids-steer <out.png>: render the Deterministic GPU Crowds INTEGER STEERING showcase (Slice BD1,
+        // the BEACHHEAD of FLAGSHIP #18). int64 steer/integrate -> boids_steer.comp is Vulkan-only; on Metal
+        // this runs the CPU boids::StepBoids — the EXACT bit-exact reference the Vulkan --boids-steer-shot
+        // GPU==CPU memcmp compares against; stepEnabled=false -> agents unchanged; two runs byte-identical. The
+        // image golden is a PURE-INTEGER 2D top-down view (each agent's integer (pos.x>>kFrac, pos.z>>kFrac) ->
+        // a pixel, hashColor dot; the target a white cross), identical to the Vulkan path BY CONSTRUCTION. New
+        // golden tests/golden/metal/boids_steer.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--boids-steer") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_boids_steer.png";
+            try { return RunBoidsSteerShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_grain_integrate.png";
             try { return RunGrainIntegrateShowcase(out); }
