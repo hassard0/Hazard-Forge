@@ -693,6 +693,16 @@ hf_add_pure_test(fric_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(persist_test)
 
+# General Convex-Hull Contacts Slice 1 (Slice GJ1, the BEACHHEAD of FLAGSHIP #22: DETERMINISTIC GENERAL
+# CONVEX-HULL CONTACTS via integer GJK + EPA, hf::sim::gjk): the integer SUPPORT-FUNCTION core
+# (engine/sim/gjk.h) the GPU shaders/gjk_support.comp.hlsl copies VERBATIM + proves bit-identical. gjk.h
+# #includes sim/convex.h read-only (transitively fpx.h). Pins SupportLocal (maximal vs brute force over the
+# canonical tetra/box/octa/wedge hulls x a direction sweep; the strict-greater scan keeps the LOWEST tied
+# index); Support (matches the hand-computed conjugate-rotate-in world support for a rotated body);
+# SupportMinkowski (== Support_A(dir) - Support_B(-dir)); MeasureSupport a PURE function (two calls byte-equal).
+# Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(gjk_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

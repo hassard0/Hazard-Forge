@@ -1108,6 +1108,17 @@ hf_compile_shaders(
     # instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU
     # SatResult array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/convex_sat.comp.hlsl:cs"
+    # General Convex-Hull Contacts Slice 1 (Slice GJ1, the BEACHHEAD of FLAGSHIP #22): gjk_support.comp is the
+    # convex-hull SUPPORT FUNCTION — ONE THREAD PER (hull, direction) QUERY (per-query INDEPENDENT, 64
+    # threads/group, NO atomics) runs the world-space support, copying engine/sim/gjk.h::Support's body
+    # VERBATIM (the SAME conjugate-rotate the direction into local, the SAME FIXED strict-greater lowest-index
+    # argmax SupportLocal, the SAME FxRotate out + pos), writing its OWN gOut[query] support vertex + extent.
+    # queryEnabled=0 -> cleared support. Like convex_sat.comp this is int64 (the FxDot/FxRotate Q16.16
+    # products), so it is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the
+    # Metal --gjk-support showcase runs the CPU gjk::Support instead (byte-identical by construction). Pure
+    # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU support array + cross-backend, proven memcmp.
+    # NO new RHI; existing shaders + goldens untouched.
+    "shaders/gjk_support.comp.hlsl:cs"
     # Deterministic Convex Rigid-Body Contacts Slice 2 (Slice CX2): convex_manifold.comp is the box-box
     # CONTACT MANIFOLD pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
     # runs the 15-axis BoxSat then BuildManifold (the reference/incident face clip via Sutherland-Hodgman in

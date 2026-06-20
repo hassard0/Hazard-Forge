@@ -99,6 +99,7 @@
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
 #include "sim/convex.h"              // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
+#include "sim/gjk.h"                  // Slice GJ1: deterministic general convex-hull contacts THE SUPPORT FUNCTION (FxHull/SupportLocal/Support/SupportMinkowski/MeasureSupport + canonical hull builders) — shared verbatim with gjk_support.comp + the Vulkan --gjk-support-shot (int64 -> Vulkan-only; Metal --gjk-support runs the CPU Support)
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
 #include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
@@ -26582,6 +26583,164 @@ static int RunFricBasisShowcase(const char* outPath) {
 // CPU-colors the SAME 2D top-down (XZ) view -> the golden is bit-identical cross-backend BY CONSTRUCTION
 // (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
 // tests/golden/metal/convex_sat.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+// ===== Slice GJ1 — Deterministic General Convex-Hull Contacts THE SUPPORT FUNCTION showcase (--gjk-support)
+// ====== The BEACHHEAD of FLAGSHIP #22 (hf::sim::gjk). Like CX1's --convex-sat, the support transform is int64
+// (the FxRotate/FxDot Q16.16 products), so shaders/gjk_support.comp is VULKAN-SPIR-V-ONLY (glslc can't parse
+// int64 in HLSL) -> NOT in hf_gen_msl. The Metal --gjk-support showcase runs the CPU gjk::Support — the EXACT
+// bit-exact reference the Vulkan --gjk-support-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the convex_sat.comp / fpx_solve.comp
+// split). It builds the SAME fixed scene (the canonical tetra/box/octa/wedge hull set at fixed poses, a couple
+// rotated, x the same direction sweep) as the Vulkan --gjk-support-shot, runs gjk::Support over it, and writes
+// the SAME PURE-INTEGER 2D top-down golden tests/golden/metal/gjk_support.png (Mac-baked by the controller —
+// do NOT commit); two runs DIFF 0.0000.
+static int RunGjkSupportShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace gjk = hf::sim::gjk;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    // The canonical hull set (== the Vulkan --gjk-support-shot config).
+    std::vector<gjk::FxHull> hullSet;
+    hullSet.push_back(gjk::MakeTetra(kOne));
+    hullSet.push_back(gjk::MakeBox(kOne, kOne, kOne));
+    hullSet.push_back(gjk::MakeOcta(kOne));
+    hullSet.push_back(gjk::MakeWedge(kOne, kOne, kOne));
+    const uint32_t kHullCount = (uint32_t)hullSet.size();
+
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int)convex::kOne); };
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    std::vector<fpx::FxBody> bodySet(kHullCount);
+    for (uint32_t i = 0; i < kHullCount; ++i) {
+        bodySet[i].pos = {fi((int)i * 4 - 6), 0, fi(0)};
+        bodySet[i].orient = fpx::FxQuat{0, 0, 0, convex::kOne};
+    }
+    bodySet[1].orient = fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45});
+    bodySet[3].orient = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45});
+
+    std::vector<convex::FxVec3> dirSet;
+    dirSet.push_back({ fi(1), 0, 0});
+    dirSet.push_back({-fi(1), 0, 0});
+    dirSet.push_back({0,  fi(1), 0});
+    dirSet.push_back({0, -fi(1), 0});
+    dirSet.push_back({0, 0,  fi(1)});
+    dirSet.push_back({0, 0, -fi(1)});
+    dirSet.push_back({ fi(1),  fi(1),  fi(1)});
+    dirSet.push_back({-fi(1),  fi(1), -fi(1)});
+    const uint32_t kDirCount = (uint32_t)dirSet.size();
+    const uint32_t kQueryCount = kHullCount * kDirCount;
+
+    struct SupportOutGpu { int32_t sx, sy, sz, extent; };
+    auto packSupport = [&](const convex::FxVec3& s, fx ext) {
+        return SupportOutGpu{s.x, s.y, s.z, ext};
+    };
+
+    // CPU gjk::Support (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against), FIXED order.
+    auto runGjk = [&](std::vector<SupportOutGpu>& out) {
+        out.assign((size_t)kQueryCount, SupportOutGpu{});
+        for (uint32_t i = 0; i < kHullCount; ++i)
+            for (uint32_t d = 0; d < kDirCount; ++d) {
+                const convex::FxVec3 s = gjk::Support(hullSet[i], bodySet[i], dirSet[d]);
+                out[i * kDirCount + d] = packSupport(s, convex::FxDot(s, dirSet[d]));
+            }
+    };
+
+    std::vector<SupportOutGpu> results;
+    runGjk(results);
+
+    // GPU==CPU is N/A on the Metal CPU path: this IS the CPU gjk::Support reference the Vulkan --gjk-support-
+    // shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("gjk-support: {hulls:%u, dirs:%u, queries:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU gjk::Support, byte-identical to the Vulkan GPU result by construction]\n",
+                kHullCount, kDirCount, kQueryCount);
+
+    // determinism: two runs byte-identical.
+    std::vector<SupportOutGpu> results2;
+    runGjk(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(SupportOutGpu)) != 0)
+        return fail("gjk-support: two runs differ (nondeterministic)");
+    std::printf("gjk-support determinism: two runs BYTE-IDENTICAL\n");
+
+    // correctness: the returned support is a genuine maximum (no world vertex beats its extent) + the
+    // Minkowski identity for a sample pair.
+    bool maximalAll = true;
+    for (uint32_t i = 0; i < kHullCount; ++i)
+        for (uint32_t d = 0; d < kDirCount; ++d) {
+            const fx got = results[i * kDirCount + d].extent;
+            const fpx::FxBody& b = bodySet[i];
+            for (uint32_t v = 0; v < hullSet[i].count; ++v) {
+                const convex::FxVec3 wv =
+                    convex::FxAdd(fpx::FxRotate(b.orient, hullSet[i].verts[v]), b.pos);
+                if (convex::FxDot(wv, dirSet[d]) > got) maximalAll = false;
+            }
+        }
+    bool minkOk = true;
+    for (uint32_t d = 0; d < kDirCount; ++d) {
+        const convex::FxVec3 mink =
+            gjk::SupportMinkowski(hullSet[1], bodySet[1], hullSet[2], bodySet[2], dirSet[d]);
+        const convex::FxVec3 sa = gjk::Support(hullSet[1], bodySet[1], dirSet[d]);
+        const convex::FxVec3 sb = gjk::Support(hullSet[2], bodySet[2],
+                                               convex::FxVec3{-dirSet[d].x, -dirSet[d].y, -dirSet[d].z});
+        const convex::FxVec3 ex = gjk::FxSub(sa, sb);
+        if (mink.x != ex.x || mink.y != ex.y || mink.z != ex.z) minkOk = false;
+    }
+    if (!maximalAll || !minkOk) return fail("gjk-support: correctness failed");
+    std::printf("gjk-support correct: {maximalAll:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view as the Vulkan --gjk-support-shot (identical by
+    // construction). Each hull's world vertices (cool) + the per-direction support points (hot). ---
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalf = 10;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int64_t gx = ((int64_t)wx * kPxPerUnit) >> convex::kFrac;
+        const int64_t gz = ((int64_t)wz * kPxPerUnit) >> convex::kFrac;
+        ix = kMargin + kWorldHalf * kPxPerUnit + (int)gx;
+        iy = kMargin + kWorldHalf * kPxPerUnit + (int)gz;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto putDot = [&](int ix, int iy, int rad, const Vec3& col) {
+        for (int dy = -rad; dy <= rad; ++dy)
+            for (int dx = -rad; dx <= rad; ++dx)
+                if (dx * dx + dy * dy <= rad * rad) putPx(ix + dx, iy + dy, col);
+    };
+    const Vec3 vertCol{0.40f, 0.55f, 0.85f};
+    const Vec3 supCol{1.0f, 0.60f, 0.25f};
+    for (uint32_t i = 0; i < kHullCount; ++i) {
+        const fpx::FxBody& b = bodySet[i];
+        for (uint32_t v = 0; v < hullSet[i].count; ++v) {
+            const convex::FxVec3 wv =
+                convex::FxAdd(fpx::FxRotate(b.orient, hullSet[i].verts[v]), b.pos);
+            int px, py; worldToPx(wv.x, wv.z, px, py);
+            putDot(px, py, 1, vertCol);
+        }
+        for (uint32_t d = 0; d < kDirCount; ++d) {
+            const SupportOutGpu& s = results[i * kDirCount + d];
+            int px, py; worldToPx(s.sx, s.sz, px, py);
+            putDot(px, py, 2, supCol);
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — hull support points top-down view (%u hulls, %u dirs)\n",
+                outPath, imgW, imgH, kHullCount, kDirCount);
+    return 0;
+}
+
 static int RunConvexSatShowcase(const char* outPath) {
     using math::Vec3;
     namespace convex = hf::sim::convex;
@@ -49570,6 +49729,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-sat") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_sat.png";
             try { return RunConvexSatShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gjk-support <out.png>: render the Deterministic General Convex-Hull Contacts THE SUPPORT FUNCTION
+        // showcase (Slice GJ1, the BEACHHEAD of FLAGSHIP #22). On Metal this runs the CPU support:
+        // gjk_support.comp is int64/Vulkan-only (glslc can't parse the FxRotate/FxDot int64), so Metal runs the
+        // CPU gjk::Support over the SAME fixed canonical-hull scene -> the EXACT bit-exact reference the Vulkan
+        // --gjk-support-shot GPU==CPU memcmp compares against; two runs byte-identical; the support is maximal.
+        // The image golden is a PURE-INTEGER 2D top-down view, identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/gjk_support.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gjk-support") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gjk_support.png";
+            try { return RunGjkSupportShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-manifold <out.png>: render the Deterministic Convex Rigid-Body Contacts CONTACT MANIFOLD
