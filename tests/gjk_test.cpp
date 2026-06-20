@@ -339,6 +339,103 @@ int main() {
         check(m1.overlapping + m1.separated == m1.pairs, "MeasureGjk overlap+separated == pairs");
     }
 
+    // ================= Slice GJ3 — EPA (penetration depth + contact normal) =================
+    // Build a fixed set of OVERLAPPING pairs (the GJ3 scene): an analytic box-into-box FACE overlap (known
+    // depth+axis), plus a couple of deeper/rotated overlaps. Positions in HALF-units (2x2x2 unit boxes).
+    {
+        auto fhalf = [&](int n) { return (fx)(((int64_t)n * (int)kOne) / 2); };
+        auto bodyHalf = [&](int xh, int yh, int zh, fpx::FxQuat q = fpx::FxQuat{0,0,0,kOne}) {
+            fpx::FxBody b; b.pos = {fhalf(xh), fhalf(yh), fhalf(zh)}; b.orient = q; return b;
+        };
+        const fpx::FxQuat qX45e = fpx::FxQuatNormalize(fpx::FxQuat{(fx)25080, 0, 0, (fx)60547});
+
+        struct EpaCase { gjk::FxHull hA; fpx::FxBody bA; gjk::FxHull hB; fpx::FxBody bB; fx expectDepth; int axis; };
+        std::vector<EpaCase> ecases;
+        // 0: FACE overlap on X — boxes offset 1.5 on X -> penetration 0.5 along X (the analytic case).
+        ecases.push_back({box, bodyHalf(0,0,0), box, bodyHalf(3,0,0), kOne/2, 0});
+        // 1: FACE overlap on Z — offset 1.0 on Z -> penetration 1.0 along Z.
+        ecases.push_back({box, bodyHalf(0,0,0), box, bodyHalf(0,0,2), kOne, 2});
+        // 2: DEEP — tetra into box, near-coincident.
+        ecases.push_back({tetra, bodyHalf(0,0,0), box, bodyHalf(1,0,0), 0, -1});
+        // 3: ROTATED box (45 X) into a box on Y.
+        ecases.push_back({box, bodyHalf(0,0,0,qX45e), box, bodyHalf(0,2,0), 0, -1});
+
+        // --- analytic depth + the normal is unit + separates ---
+        {
+            bool depthOK = true, unitOK = true, sepOK = true, allValid = true;
+            const fx kDepthBand = kOne / 4;
+            for (const EpaCase& c : ecases) {
+                const gjk::GjkResult g = gjk::Gjk(c.hA, c.bA, c.hB, c.bB);
+                check(g.overlap != 0u, "EPA case is an overlapping pair (GJK reports overlap)");
+                const gjk::EpaResult e = gjk::Epa(c.hA, c.bA, c.hB, c.bB, g.simplex);
+                if (e.valid == 0u) allValid = false;
+                // depth >= 0.
+                if (e.depth < 0) allValid = false;
+                // normal ~unit.
+                const fx nlen = fpx::FxLength(e.normal);
+                if (nlen < kOne - kOne/16 || nlen > kOne + kOne/16) unitOK = false;
+                // analytic depth (labeled axis cases).
+                if (c.axis >= 0) {
+                    const fx diff = (e.depth > c.expectDepth) ? (e.depth - c.expectDepth) : (c.expectDepth - e.depth);
+                    if (diff > kDepthBand) depthOK = false;
+                }
+                // separation re-query: translate B by depth*normal (a hair past) -> no overlap.
+                fpx::FxBody bMoved = c.bB;
+                bMoved.pos = fpx::FxAdd(bMoved.pos, fpx::FxScale(e.normal, e.depth + kOne/8));
+                const gjk::GjkResult rq = gjk::Gjk(c.hA, c.bA, c.hB, bMoved);
+                if (rq.overlap != 0u) sepOK = false;
+            }
+            check(allValid, "Epa returns valid with depth >= 0 for every overlapping pair");
+            check(unitOK, "Epa contact normal is unit length (within band)");
+            check(depthOK, "Epa analytic depth matches the known answer within band");
+            check(sepOK, "Epa normal separates (re-query after translating B by depth*normal is non-overlapping)");
+        }
+
+        // --- Epa is deterministic (two calls byte-equal) ---
+        {
+            bool allDet = true;
+            for (const EpaCase& c : ecases) {
+                const gjk::GjkResult g = gjk::Gjk(c.hA, c.bA, c.hB, c.bB);
+                const gjk::EpaResult a = gjk::Epa(c.hA, c.bA, c.hB, c.bB, g.simplex);
+                const gjk::EpaResult b = gjk::Epa(c.hA, c.bA, c.hB, c.bB, g.simplex);
+                if (std::memcmp(&a, &b, sizeof(gjk::EpaResult)) != 0) allDet = false;
+            }
+            check(allDet, "Epa is deterministic (two calls byte-equal for every pair)");
+        }
+
+        // --- polytope valid: the closest face's distance >= 0 (the depth) AND iterations bounded ---
+        {
+            bool ok = true;
+            for (const EpaCase& c : ecases) {
+                const gjk::GjkResult g = gjk::Gjk(c.hA, c.bA, c.hB, c.bB);
+                const gjk::EpaResult e = gjk::Epa(c.hA, c.bA, c.hB, c.bB, g.simplex);
+                if (e.depth < 0) ok = false;
+                if (e.iterations > gjk::kEpaMaxIter) ok = false;
+            }
+            check(ok, "Epa polytope valid (closest face distance >= 0, iterations <= kEpaMaxIter)");
+        }
+
+        // --- max-iter / cap path returns valid with no crash/UB: feed a degenerate (empty) seed -> the
+        // robust blow-up either builds a tetra or bails deterministically, always valid, no crash. ---
+        {
+            gjk::Simplex empty; empty.count = 0;
+            const gjk::EpaResult e = gjk::Epa(box, bodyHalf(0,0,0), box, bodyHalf(1,0,0), empty);
+            check(e.valid == 1u, "Epa with a degenerate (empty) seed returns valid (no crash/UB)");
+            check(e.iterations <= gjk::kEpaMaxIter, "Epa with a degenerate seed has bounded iterations");
+        }
+
+        // --- MeasureEpa is a PURE function (two calls byte-equal) ---
+        {
+            std::vector<gjk::GjkPair> epairs;
+            for (const EpaCase& c : ecases) epairs.push_back({c.hA, c.bA, c.hB, c.bB});
+            const gjk::EpaMeasure m1 = gjk::MeasureEpa(epairs.data(), (uint32_t)epairs.size());
+            const gjk::EpaMeasure m2 = gjk::MeasureEpa(epairs.data(), (uint32_t)epairs.size());
+            check(std::memcmp(&m1, &m2, sizeof(gjk::EpaMeasure)) == 0,
+                  "MeasureEpa is a pure function (two calls byte-equal)");
+            check(m1.converged + m1.maxIter == m1.pairs, "MeasureEpa converged+maxIter == pairs");
+        }
+    }
+
     (void)hullNames;
     if (g_fail == 0) std::printf("gjk_test: ALL PASS\n");
     else std::printf("gjk_test: %d FAIL\n", g_fail);

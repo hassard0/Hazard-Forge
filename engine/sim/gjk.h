@@ -614,5 +614,471 @@ inline GjkMeasure MeasureGjk(const GjkPair* pairs, uint32_t count) {
     return m;
 }
 
+// =========================================================================================================
+// Slice GJ3 — General Convex-Hull Contacts: THE EPA ALGORITHM (penetration depth + contact normal — THE
+// CRUX). APPENDED after MeasureGjk (GJ1+GJ2's lines above are BYTE-FROZEN). Builds the Expanding Polytope
+// Algorithm: seeded from GJK's terminal OVERLAP simplex (the tetra enclosing the origin), it grows a polytope
+// of the Minkowski difference outward to the boundary, returning the PENETRATION DEPTH (the minimum
+// translation to separate the hulls) + the CONTACT NORMAL (A->B) + the contact (witness) points on each hull.
+// This is the single most determinism-sensitive piece of the flagship: float-engine EPA's face-distance +
+// horizon-expansion accumulations are FPU-order/vendor-dependent. GJ3 does it ENTIRELY in Q16.16 with a FIXED
+// iteration bound, pinned face/horizon ordering, and integer tie-breaks. gjk_epa.comp copies Epa's body
+// VERBATIM (int64 -> Vulkan-only; Metal runs the CPU Epa, byte-identical by construction).
+//
+// THE int64 REALITY (the GJ1/GJ2 lesson): the face normals (FxCross), the unit-normal FxNormalize (FxISqrt +
+// fxdiv), the origin-distance FxDot, and the barycentric fxdiv are all int64. DXC compiles int64 (the Vulkan
+// path); glslc CANNOT parse int64 in HLSL, so shaders/gjk_epa.comp.hlsl is VULKAN-SPIR-V-ONLY (NOT in
+// hf_gen_msl); the Metal --gjk-epa runs the CPU Epa -> byte-identical BY CONSTRUCTION, while the Vulkan side
+// carries the GPU==CPU memcmp.
+//
+// DETERMINISM CRUX (spelled out — the make-or-break):
+//   (a) FIXED iteration bound kEpaMaxIter — never an unbounded while; on hitting the bound (or a buffer cap)
+//       return the CURRENT closest face (deterministic, within-band — NOT guaranteed analytically optimal,
+//       the honest EPA caveat).
+//   (b) Closest-face selection: min face.dist (the integer perpendicular origin-distance
+//       FxDot(face.normal, face.vertex) with face.normal a UNIT FxNormalize outward normal), FIXED tie-break
+//       = the LOWEST face index (the convex.h:28 / SupportLocal idiom).
+//   (c) Consistent winding: every face normal points AWAY from the interior (the origin is interior, so
+//       FxDot(normal, faceVertex) >= 0); the winding is flipped deterministically at face creation if not.
+//   (d) Pinned horizon: when removing the faces a new vertex can SEE, collect the horizon edges with the std
+//       EPA edge-cancel rule (the reversed edge already in the list -> the edge is interior, remove it; else
+//       add it) in a FIXED face/edge traversal order; re-triangulate by connecting the new vertex to each
+//       horizon edge in the FIXED collected order -> identical CPU/GPU.
+//   (e) Degenerate-face guard: a near-zero raw face cross (FxLength < kEdgeEps) is NOT selectable (skipped).
+//   (f) Duplicate-vertex guard: a new support already in the polytope (exact integer equality) -> converged.
+//   Pure integer, FIXED orders -> identical CPU/GPU.
+
+using fpx::FxNormalize;   // the Q16.16 unit vector (int64 FxISqrt + fxdiv) — the UNIT face normals
+
+// The FIXED EPA iteration bound. Each iteration adds at most one vertex; 48 is a generous, deterministic
+// ceiling for hulls of <= kMaxHullVerts (the polytope never needs more refinement than its vertex budget).
+constexpr uint32_t kEpaMaxIter = 48;
+
+// The fixed-size polytope buffers (the GPU has no dynamic allocation). kMaxPolyVerts seed (4) + up to one new
+// vertex per iteration; kMaxPolyFaces covers the triangulated convex hull of those verts (a convex polytope
+// of V verts has 2V-4 triangular faces, so 128 comfortably covers 64 verts). On a cap overflow Epa returns
+// the current closest face (deterministic, documented).
+constexpr uint32_t kMaxPolyVerts = 64;
+constexpr uint32_t kMaxPolyFaces = 128;
+
+// kEpaTol: the Q16.16 convergence epsilon (the kEdgeEps / kFacePrefEps honesty lineage). A new support whose
+// projection onto the closest face's normal exceeds face.dist by NO MORE than this is "not measurably farther
+// out" -> the face IS the boundary -> converged. ~1/256 of a world unit, the SAME threshold CPU + GPU.
+constexpr fx kEpaTol = convex::kEdgeEps;   // ~0.0039 world units
+
+// ----- PolyFace: a triangle of the expanding polytope (CSO-vertex indices a,b,c into Polytope::verts) + its
+// UNIT outward normal + the perpendicular origin-distance dist = FxDot(normal, verts[a]) (>= 0 by the outward
+// winding). std430-packable: 3 uint indices + int3 normal + int dist.
+struct PolyFace {
+    uint32_t a = 0, b = 0, c = 0;
+    FxVec3   normal;     // UNIT outward normal (FxNormalize of the raw face cross)
+    fx       dist = 0;   // perpendicular origin-distance = FxDot(normal, verts[a]) >= 0
+};
+
+// ----- Polytope: the expanding polytope — the CSO vertices (verts) + their witness vertices on hull A
+// (vertsA) and hull B (vertsB) for contact recovery + the triangular faces. Fixed-size buffers (no dynamic
+// alloc -> GPU-portable). vertCount <= kMaxPolyVerts, faceCount <= kMaxPolyFaces.
+struct Polytope {
+    FxVec3   verts[kMaxPolyVerts];    // CSO points
+    FxVec3   vertsA[kMaxPolyVerts];   // witness on hull A (Support_A) parallel to verts
+    FxVec3   vertsB[kMaxPolyVerts];   // witness on hull B (Support_B(-dir)) parallel to verts
+    PolyFace faces[kMaxPolyFaces];
+    FxVec3   interior;                // a FIXED interior reference (the seed tetra centroid) — the polytope
+                                      // only grows outward, so this stays interior; faces are wound to point
+                                      // AWAY from it (robust when the origin lies on the seed boundary).
+    uint32_t vertCount = 0;
+    uint32_t faceCount = 0;
+};
+
+// ----- EpaResult: the EPA outcome. valid=1 always for an overlapping seed (the bound/cap path still returns
+// the current closest face). depth = the penetration depth (>= 0); normal = the UNIT contact normal A->B
+// (translating B by depth*normal separates the pair); contactA/contactB = the witness contact points on each
+// hull (the barycentric projection of the origin onto the closest face applied to vertsA/vertsB);
+// featureFaceId = a deterministic id packing the closest face's three vertex indices (the ContactKey raw
+// material for later slices); iterations = EPA iterations taken. std430-packable below (the GPU mirror).
+struct EpaResult {
+    fx       depth = 0;
+    FxVec3   normal;        // UNIT, A->B
+    FxVec3   contactA;      // witness on hull A
+    FxVec3   contactB;      // witness on hull B
+    uint32_t featureFaceId = 0;
+    uint32_t iterations    = 0;
+    uint32_t valid         = 0;   // 0/1 (a uint for the std430 GPU mirror)
+};
+
+// EpaAddFace(poly, a, b, c): build a face from CSO-vertex indices a,b,c with a CONSISTENT OUTWARD winding.
+// The raw cross n = (verts[b]-verts[a]) x (verts[c]-verts[a]); if FxLength(n) < kEdgeEps the triangle is
+// DEGENERATE -> NOT added (deterministic skip). The UNIT normal is oriented to point AWAY from the polytope
+// INTERIOR reference (the seed tetra centroid): if FxDot(unit, verts[a] - interior) < 0 flip the winding
+// (swap b<->c, negate the normal). This is robust even when the ORIGIN lies on the seed boundary (a segment/
+// triangle through the origin — common for axis-aligned box overlaps); the centroid is always strictly
+// interior. face.dist = FxDot(normal, verts[a]) is the SIGNED perpendicular origin-distance (>= 0 when the
+// origin is on the inner side, the normal penetration case). Append if there is room (else a no-op). Returns
+// true if a face was added.
+inline bool EpaAddFace(Polytope& poly, uint32_t a, uint32_t b, uint32_t c) {
+    if (poly.faceCount >= kMaxPolyFaces) return false;
+    const FxVec3 ab = FxSub(poly.verts[b], poly.verts[a]);
+    const FxVec3 ac = FxSub(poly.verts[c], poly.verts[a]);
+    const FxVec3 raw = FxCross(ab, ac);
+    if (FxLength(raw) < convex::kEdgeEps) return false;   // (e) degenerate face -> skip
+    FxVec3 n = FxNormalize(raw);
+    PolyFace f;
+    // Orient AWAY from the interior reference (the seed centroid).
+    if (FxDot(n, FxSub(poly.verts[a], poly.interior)) < 0) {
+        f.a = a; f.b = c; f.c = b;
+        n = FxNeg(n);
+    } else {
+        f.a = a; f.b = b; f.c = c;
+    }
+    f.normal = n;
+    f.dist = FxDot(n, poly.verts[a]);   // SIGNED origin-distance along the outward normal
+    poly.faces[poly.faceCount++] = f;
+    return true;
+}
+
+// Epa(hullA, bodyA, hullB, bodyB, terminalSimplex): the EPA main loop. Seeds the polytope from GJK's terminal
+// OVERLAP simplex, expands the face closest to the origin toward the boundary, and returns the penetration
+// depth + the unit contact normal (A->B) + the contact points. Pure integer, FIXED orders. gjk_epa.comp
+// copies THIS body VERBATIM.
+inline EpaResult Epa(const FxHull& hullA, const FxBody& bodyA,
+                     const FxHull& hullB, const FxBody& bodyB,
+                     const Simplex& terminalSimplex) {
+    EpaResult res;
+
+    Polytope poly;
+    poly.vertCount = 0;
+    poly.faceCount = 0;
+
+    // ----- SEED: copy the terminal simplex's CSO points + witnesses into the polytope verts. -----
+    uint32_t sc = terminalSimplex.count;
+    if (sc > 4) sc = 4;
+    for (uint32_t i = 0; i < sc; ++i) {
+        poly.verts[i]  = terminalSimplex.pts[i];
+        poly.vertsA[i] = terminalSimplex.csoA[i];
+        poly.vertsB[i] = terminalSimplex.csoB[i];
+    }
+    poly.vertCount = sc;
+
+    // EpaSupport: append a CSO support + its witnesses along a UNIT dir, return the new vertex index (or the
+    // current vertCount if the cap is hit — the caller checks). Pinned: the dir is whatever the caller passes.
+    auto epaSupport = [&](const FxVec3& dir) -> uint32_t {
+        if (poly.vertCount >= kMaxPolyVerts) return kMaxPolyVerts;   // cap -> no room
+        const FxVec3 wA = Support(hullA, bodyA, dir);
+        const FxVec3 wB = Support(hullB, bodyB, FxNeg(dir));
+        const uint32_t idx = poly.vertCount;
+        poly.verts[idx]  = FxSub(wA, wB);
+        poly.vertsA[idx] = wA;
+        poly.vertsB[idx] = wB;
+        ++poly.vertCount;
+        return idx;
+    };
+
+    // ----- Seed expansion to a tetra (the spec's non-tetra path). If the terminal simplex is < 4 points,
+    // grow it deterministically to a tetra enclosing the origin. GJK frequently hands EPA a DEGENERATE
+    // overlap simplex (a segment or triangle THROUGH the origin — common for axis-aligned box overlaps), so
+    // the blow-up must be robust: each step adds a vertex that is genuinely NON-degenerate vs the current
+    // simplex (else it tries the next fixed candidate direction). Every choice is pinned (fixed candidate
+    // order + fixed argmax) so CPU==GPU. -----
+    // The FIXED candidate direction set for the blow-up probes (unit-ish, the 6 axes + 4 long diagonals).
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    const FxVec3 kProbe[10] = {
+        {kOne, 0, 0}, {0, kOne, 0}, {0, 0, kOne},
+        {-kOne, 0, 0}, {0, -kOne, 0}, {0, 0, -kOne},
+        {kOne, kOne, kOne}, {-kOne, kOne, kOne}, {kOne, -kOne, kOne}, {kOne, kOne, -kOne},
+    };
+
+    if (poly.vertCount < 2) {
+        // 0 or 1 point: add a support along +X; if it duplicates, walk the probe set for a distinct one.
+        for (uint32_t p = 0; p < 10 && poly.vertCount < 2; ++p) {
+            const FxVec3 dir = FxNormalize(kProbe[p]);
+            const FxVec3 wA = Support(hullA, bodyA, dir);
+            const FxVec3 wB = Support(hullB, bodyB, FxNeg(dir));
+            const FxVec3 sp = FxSub(wA, wB);
+            bool dup = false;
+            for (uint32_t v = 0; v < poly.vertCount; ++v) if (FxVec3Eq(sp, poly.verts[v])) { dup = true; break; }
+            if (dup) continue;
+            poly.verts[poly.vertCount] = sp; poly.vertsA[poly.vertCount] = wA;
+            poly.vertsB[poly.vertCount] = wB; ++poly.vertCount;
+        }
+    }
+    if (poly.vertCount == 2) {
+        // Edge -> triangle: probe perpendicular to the edge. For each fixed candidate axis, the support that
+        // lies FARTHEST off the segment line (max perpendicular distance) is the most non-degenerate third
+        // vertex. Walk the probe set in FIXED order; accept the FIRST that yields a non-collinear vertex.
+        const FxVec3 e = FxSub(poly.verts[1], poly.verts[0]);
+        const fx eLen = FxLength(e);
+        bool added = false;
+        for (uint32_t p = 0; p < 10 && !added; ++p) {
+            // direction = the probe component perpendicular to the edge (Gram-Schmidt, integer).
+            FxVec3 dir = kProbe[p];
+            if (eLen >= convex::kEdgeEps) {
+                const fx proj = fxdiv(FxDot(dir, e), eLen);          // scalar projection (Q16.16)
+                const FxVec3 eUnit = FxNormalize(e);
+                dir = FxSub(dir, FxScale(eUnit, proj));              // remove the parallel component
+            }
+            if (FxLength(dir) < convex::kEdgeEps) continue;          // probe ~parallel to the edge -> skip
+            dir = FxNormalize(dir);
+            const FxVec3 wA = Support(hullA, bodyA, dir);
+            const FxVec3 wB = Support(hullB, bodyB, FxNeg(dir));
+            const FxVec3 sp = FxSub(wA, wB);
+            bool dup = false;
+            for (uint32_t v = 0; v < poly.vertCount; ++v) if (FxVec3Eq(sp, poly.verts[v])) { dup = true; break; }
+            if (dup) continue;
+            // non-collinear check: the triangle (v0,v1,sp) must have a non-degenerate normal.
+            const FxVec3 nrm = FxCross(FxSub(poly.verts[1], poly.verts[0]), FxSub(sp, poly.verts[0]));
+            if (FxLength(nrm) < convex::kEdgeEps) continue;
+            poly.verts[2] = sp; poly.vertsA[2] = wA; poly.vertsB[2] = wB; poly.vertCount = 3;
+            added = true;
+        }
+    }
+    if (poly.vertCount == 3) {
+        // Triangle -> tetra: add a support along the triangle normal. Pick the SIGN that places the new vertex
+        // on the side that, with the triangle, encloses the origin (the origin's side of the plane). If that
+        // support duplicates / is coplanar, try the opposite sign, then walk the probe set.
+        const FxVec3 ab = FxSub(poly.verts[1], poly.verts[0]);
+        const FxVec3 ac = FxSub(poly.verts[2], poly.verts[0]);
+        FxVec3 n = FxCross(ab, ac);
+        FxVec3 nUnit = (FxLength(n) < convex::kEdgeEps) ? FxVec3{0, kOne, 0} : FxNormalize(n);
+        const fx side = FxDot(nUnit, FxNeg(poly.verts[0]));         // origin's side of the plane
+        // Candidate directions in FIXED order: the enclosing-side normal first, then its opposite, then probes.
+        FxVec3 cands[12];
+        cands[0] = (side >= 0) ? nUnit : FxNeg(nUnit);
+        cands[1] = FxNeg(cands[0]);
+        for (uint32_t p = 0; p < 10; ++p) cands[2 + p] = FxNormalize(kProbe[p]);
+        for (uint32_t c = 0; c < 12 && poly.vertCount == 3; ++c) {
+            const FxVec3 dir = cands[c];
+            const FxVec3 wA = Support(hullA, bodyA, dir);
+            const FxVec3 wB = Support(hullB, bodyB, FxNeg(dir));
+            const FxVec3 sp = FxSub(wA, wB);
+            bool dup = false;
+            for (uint32_t v = 0; v < poly.vertCount; ++v) if (FxVec3Eq(sp, poly.verts[v])) { dup = true; break; }
+            if (dup) continue;
+            // non-coplanar check: the signed volume of (v0,v1,v2,sp) must be non-trivial.
+            const fx vol = FxDot(n, FxSub(sp, poly.verts[0]));
+            if (absfx(vol) < convex::kEdgeEps) continue;
+            poly.verts[3] = sp; poly.vertsA[3] = wA; poly.vertsB[3] = wB; poly.vertCount = 4;
+        }
+    }
+    // If we still do not have 4 verts (a pathological degenerate seed), bail deterministically with a valid,
+    // documented zero-depth result (the honest cap path; this should not happen for a genuine overlap).
+    if (poly.vertCount < 4) {
+        res.valid = 1;
+        res.depth = 0;
+        res.normal = FxVec3{0, kOne, 0};
+        res.contactA = (poly.vertCount > 0) ? poly.vertsA[0] : FxVec3{0, 0, 0};
+        res.contactB = (poly.vertCount > 0) ? poly.vertsB[0] : FxVec3{0, 0, 0};
+        res.featureFaceId = 0;
+        res.iterations = 0;
+        return res;
+    }
+
+    // ----- The FIXED interior reference = the seed tetra centroid (v0+v1+v2+v3)/4. The polytope only grows
+    // outward, so this point stays strictly interior; faces are wound to point AWAY from it -> robust even
+    // when the ORIGIN lies on the seed boundary (a box-face overlap's segment-through-origin simplex). -----
+    poly.interior = FxScale(FxAdd(FxAdd(poly.verts[0], poly.verts[1]), FxAdd(poly.verts[2], poly.verts[3])),
+                            kOne / 4);
+
+    // ----- Build the initial tetra's 4 faces with consistent OUTWARD winding. Verts 0,1,2,3 -> the 4 faces
+    // (0,1,2),(0,1,3),(0,2,3),(1,2,3). EpaAddFace orients each away from the interior centroid. -----
+    poly.faceCount = 0;
+    EpaAddFace(poly, 0, 1, 2);
+    EpaAddFace(poly, 0, 1, 3);
+    EpaAddFace(poly, 0, 2, 3);
+    EpaAddFace(poly, 1, 2, 3);
+
+    // If the seed produced no valid face (fully degenerate), bail deterministically.
+    if (poly.faceCount == 0) {
+        res.valid = 1;
+        res.depth = 0;
+        res.normal = FxVec3{0, kOne, 0};
+        res.contactA = poly.vertsA[0];
+        res.contactB = poly.vertsB[0];
+        res.featureFaceId = 0;
+        res.iterations = 0;
+        return res;
+    }
+
+    // ----- The EPA expansion loop (FIXED bound). -----
+    uint32_t closestFace = 0;
+    uint32_t iter = 0;
+    for (; iter < kEpaMaxIter; ++iter) {
+        // (b) Find the face closest to the origin: min dist, FIXED tie-break = the LOWEST face index.
+        closestFace = 0;
+        fx minDist = poly.faces[0].dist;
+        for (uint32_t f = 1; f < poly.faceCount; ++f) {
+            if (poly.faces[f].dist < minDist) {   // STRICT-less -> ties keep the LOWEST index
+                minDist = poly.faces[f].dist;
+                closestFace = f;
+            }
+        }
+        const PolyFace cf = poly.faces[closestFace];
+
+        // Query the support along the closest face's UNIT outward normal.
+        const FxVec3 dir = cf.normal;
+        const FxVec3 wA = Support(hullA, bodyA, dir);
+        const FxVec3 wB = Support(hullB, bodyB, FxNeg(dir));
+        const FxVec3 sp = FxSub(wA, wB);
+
+        // Convergence: the support's projection onto the normal is NOT measurably farther out than the face.
+        const fx proj = FxDot(sp, dir);
+        if (proj <= cf.dist + kEpaTol) break;   // CONVERGED — cf IS the boundary
+
+        // (f) Duplicate-vertex guard: the new support is already a polytope vertex -> no progress -> converged.
+        bool dup = false;
+        for (uint32_t v = 0; v < poly.vertCount; ++v)
+            if (FxVec3Eq(sp, poly.verts[v])) { dup = true; break; }
+        if (dup) break;
+
+        // Cap guard: no room for the new vertex -> return the current closest face (deterministic).
+        if (poly.vertCount >= kMaxPolyVerts) break;
+
+        // Add the new vertex.
+        const uint32_t nv = poly.vertCount;
+        poly.verts[nv]  = sp;
+        poly.vertsA[nv] = wA;
+        poly.vertsB[nv] = wB;
+        ++poly.vertCount;
+
+        // (d) Remove every face the new vertex can SEE (FxDot(face.normal, sp - face.vertex) > 0) and collect
+        // the HORIZON edges (the std EPA edge-cancel: a reversed edge already in the list is interior ->
+        // remove it; else add it). FIXED face + edge traversal order.
+        // Horizon edges are stored as ordered (u,v) pairs in fixed arrays.
+        uint32_t horizU[kMaxPolyFaces * 3];
+        uint32_t horizV[kMaxPolyFaces * 3];
+        uint32_t horizCount = 0;
+        auto addEdge = [&](uint32_t u, uint32_t v) {
+            // Cancel if the REVERSED edge (v,u) is already present; else add (u,v). FIXED scan order.
+            for (uint32_t e = 0; e < horizCount; ++e) {
+                if (horizU[e] == v && horizV[e] == u) {
+                    // remove edge e by swapping with the last (order-preserving compaction would also work;
+                    // a swap-remove is deterministic given the fixed insertion order + fixed scan).
+                    horizU[e] = horizU[horizCount - 1];
+                    horizV[e] = horizV[horizCount - 1];
+                    --horizCount;
+                    return;
+                }
+            }
+            if (horizCount < kMaxPolyFaces * 3) { horizU[horizCount] = u; horizV[horizCount] = v; ++horizCount; }
+        };
+
+        // Walk faces in FIXED index order; a visible face contributes its 3 edges to the horizon then is
+        // marked for removal (we compact the face array after).
+        bool removed[kMaxPolyFaces];
+        for (uint32_t f = 0; f < poly.faceCount; ++f) removed[f] = false;
+        for (uint32_t f = 0; f < poly.faceCount; ++f) {
+            const PolyFace& face = poly.faces[f];
+            const FxVec3 toNew = FxSub(sp, poly.verts[face.a]);
+            if (FxDot(face.normal, toNew) > 0) {   // the new vertex can SEE this face
+                removed[f] = true;
+                addEdge(face.a, face.b);
+                addEdge(face.b, face.c);
+                addEdge(face.c, face.a);
+            }
+        }
+
+        // Compact out the removed faces (FIXED order — keep the survivors in their original relative order).
+        uint32_t w = 0;
+        for (uint32_t f = 0; f < poly.faceCount; ++f) {
+            if (!removed[f]) { if (w != f) poly.faces[w] = poly.faces[f]; ++w; }
+        }
+        poly.faceCount = w;
+
+        // Re-triangulate: connect the new vertex to each horizon edge in the FIXED collected order.
+        for (uint32_t e = 0; e < horizCount; ++e) {
+            EpaAddFace(poly, horizU[e], horizV[e], nv);
+        }
+
+        // Degenerate-collapse guard: if every face got removed and nothing re-triangulated (a fully
+        // degenerate expansion), stop deterministically with the current best (re-find next iteration would
+        // read an empty face set). Keep at least one face.
+        if (poly.faceCount == 0) {
+            // Rebuild a minimal face from the new vertex + the first two seed verts so the result is defined.
+            EpaAddFace(poly, 0, 1, nv);
+            if (poly.faceCount == 0) { ++iter; break; }
+        }
+    }
+
+    // ----- CONVERGED (or hit the bound/cap): the closest face IS the boundary. Recover depth/normal/contacts.
+    // Re-find the closest face (the loop's last closestFace may predate a re-triangulation on the converged
+    // iteration; re-scan for safety — FIXED min + lowest-index). -----
+    closestFace = 0;
+    {
+        fx minDist = poly.faces[0].dist;
+        for (uint32_t f = 1; f < poly.faceCount; ++f) {
+            if (poly.faces[f].dist < minDist) { minDist = poly.faces[f].dist; closestFace = f; }
+        }
+    }
+    const PolyFace cf = poly.faces[closestFace];
+
+    // Barycentric projection of the ORIGIN onto the closest face's plane: the origin's perpendicular foot is
+    // proj = cf.normal * cf.dist (the closest point of the face plane to the origin). Express it in the face's
+    // barycentric coords (u,v,w) over (verts[a], verts[b], verts[c]) via the integer Cramer formula, then
+    // apply the SAME weights to vertsA/vertsB to recover the witness contact points on each hull.
+    const FxVec3 pA = poly.verts[cf.a];
+    const FxVec3 pB = poly.verts[cf.b];
+    const FxVec3 pC = poly.verts[cf.c];
+    const FxVec3 foot = FxScale(cf.normal, cf.dist);   // origin's foot on the face plane (the closest point)
+    // Barycentrics of `foot` in triangle (pA,pB,pC): v0=B-A, v1=C-A, v2=foot-A; solve via the dot-product
+    // (Ericson ClosestPtPointTriangle barycentric tail) — all integer fxmul/fxdiv, FIXED order.
+    const FxVec3 v0 = FxSub(pB, pA);
+    const FxVec3 v1 = FxSub(pC, pA);
+    const FxVec3 v2 = FxSub(foot, pA);
+    const fx d00 = FxDot(v0, v0);
+    const fx d01 = FxDot(v0, v1);
+    const fx d11 = FxDot(v1, v1);
+    const fx d20 = FxDot(v2, v0);
+    const fx d21 = FxDot(v2, v1);
+    const fx denom = fxmul(d00, d11) - fxmul(d01, d01);
+    fx bu, bv, bw;
+    if (denom > convex::kEdgeEps || denom < -convex::kEdgeEps) {
+        bv = fxdiv(fxmul(d11, d20) - fxmul(d01, d21), denom);   // weight on pB
+        bw = fxdiv(fxmul(d00, d21) - fxmul(d01, d20), denom);   // weight on pC
+        bu = kOne - bv - bw;                                     // weight on pA
+    } else {
+        bu = kOne; bv = 0; bw = 0;   // degenerate triangle -> full weight on pA (deterministic)
+    }
+    const FxVec3 cA = FxAdd(FxAdd(FxScale(poly.vertsA[cf.a], bu), FxScale(poly.vertsA[cf.b], bv)),
+                            FxScale(poly.vertsA[cf.c], bw));
+    const FxVec3 cB = FxAdd(FxAdd(FxScale(poly.vertsB[cf.a], bu), FxScale(poly.vertsB[cf.b], bv)),
+                            FxScale(poly.vertsB[cf.c], bw));
+
+    res.valid = 1;
+    res.depth = cf.dist;
+    res.normal = cf.normal;     // UNIT, A->B (the outward CSO normal IS the direction to push B off A)
+    res.contactA = cA;
+    res.contactB = cB;
+    // featureFaceId: pack the closest face's three vertex indices (deterministic; the ContactKey raw material).
+    res.featureFaceId = (cf.a & 0x3FFu) | ((cf.b & 0x3FFu) << 10) | ((cf.c & 0x3FFu) << 20);
+    res.iterations = iter;
+    return res;
+}
+
+// ----- EpaMeasure: a deterministic summary the showcase/test asserts. Over a fixed set of OVERLAPPING
+// (hull,body) PAIRS: the number of pairs run, how many CONVERGED (iterations < kEpaMaxIter), how many hit the
+// bound, and the SUM of the penetration depths. A PURE function -> two MeasureEpa calls over the same inputs
+// are byte-equal.
+struct EpaMeasure {
+    uint32_t pairs     = 0;   // # of EPA queries
+    uint32_t converged = 0;   // pairs that converged within the bound
+    uint32_t maxIter   = 0;   // pairs that hit kEpaMaxIter
+    fx       depthSum  = 0;   // Σ of the penetration depths
+};
+
+// MeasureEpa(pairs, count): run Gjk then Epa over each OVERLAPPING pair in FIXED order, accumulate the
+// summary (skips separated pairs — EPA needs an overlap seed). PURE — the SAME inputs give a byte-equal
+// EpaMeasure every call.
+inline EpaMeasure MeasureEpa(const GjkPair* pairs, uint32_t count) {
+    EpaMeasure m;
+    for (uint32_t i = 0; i < count; ++i) {
+        const GjkResult g = Gjk(pairs[i].hullA, pairs[i].bodyA, pairs[i].hullB, pairs[i].bodyB);
+        if (!g.overlap) continue;
+        const EpaResult e = Epa(pairs[i].hullA, pairs[i].bodyA, pairs[i].hullB, pairs[i].bodyB, g.simplex);
+        ++m.pairs;
+        if (e.iterations < kEpaMaxIter) ++m.converged; else ++m.maxIter;
+        m.depthSum += e.depth;
+    }
+    return m;
+}
+
 }  // namespace gjk
 }  // namespace hf::sim

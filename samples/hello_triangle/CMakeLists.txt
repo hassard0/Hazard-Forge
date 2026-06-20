@@ -1127,6 +1127,17 @@ hf_compile_shaders(
     # gjk::Gjk instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU GjkResult array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/gjk_distance.comp.hlsl:cs"
+    # General Convex-Hull Contacts Slice 3 (Slice GJ3, THE CRUX): gjk_epa.comp is the EPA ALGORITHM pass —
+    # ONE THREAD PER OVERLAPPING HULL-PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) runs the full
+    # EPA polytope expansion (penetration depth + contact normal A->B + contact points), seeded from the
+    # precomputed terminal GJK simplex, copying gjk.h::Epa VERBATIM (the seed-to-tetra, the OUTWARD-winding
+    # face build, the min-dist lowest-index closest-face selection, the visible-face removal + edge-cancel
+    # horizon + fixed-order re-triangulation, the barycentric contact recovery). int64 (the FxNormalize/FxDot/
+    # FxCross/fxdiv products) -> VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd —
+    # the Metal --gjk-epa showcase runs the CPU gjk::Epa instead (byte-identical by construction). Pure integer
+    # SSBO compute + ReadBuffer -> bit-exact GPU==CPU EpaResult array + cross-backend, proven memcmp. NO new
+    # RHI; existing shaders + goldens untouched.
+    "shaders/gjk_epa.comp.hlsl:cs"
     # Deterministic Convex Rigid-Body Contacts Slice 2 (Slice CX2): convex_manifold.comp is the box-box
     # CONTACT MANIFOLD pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
     # runs the 15-axis BoxSat then BuildManifold (the reference/incident face clip via Sutherland-Hodgman in

@@ -26938,6 +26938,195 @@ static int RunGjkDistanceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GJ3 — Deterministic General Convex-Hull Contacts THE EPA ALGORITHM showcase (--gjk-epa) ======
+// ====== THE CRUX, slice 3 of FLAGSHIP #22 (hf::sim::gjk). Like GJ1/GJ2, EPA is int64 (the FxNormalize/FxDot/
+// FxCross/fxdiv products), so shaders/gjk_epa.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) ->
+// NOT in hf_gen_msl. The Metal --gjk-epa showcase runs the CPU gjk::Epa — the EXACT bit-exact reference the
+// Vulkan --gjk-epa-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the
+// Vulkan GPU result BY CONSTRUCTION. It builds the SAME fixed OVERLAPPING-pair scene (face/corner/tetra/
+// rotated) as the Vulkan --gjk-epa-shot, runs gjk::Gjk then gjk::Epa over it, and writes the SAME PURE-INTEGER
+// 2D top-down golden tests/golden/metal/gjk_epa.png (Mac-baked by the controller — do NOT commit); two runs
+// DIFF 0.0000.
+static int RunGjkEpaShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace gjk = hf::sim::gjk;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    // The canonical hull set (== the Vulkan --gjk-epa-shot config), indexed by the pair scene.
+    std::vector<gjk::FxHull> hullSet;
+    hullSet.push_back(gjk::MakeTetra(kOne));            // 0
+    hullSet.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 1
+    hullSet.push_back(gjk::MakeOcta(kOne));             // 2
+    hullSet.push_back(gjk::MakeWedge(kOne, kOne, kOne));// 3
+
+    auto fh = [&](int numHalves) { return (fx)(((int64_t)numHalves * (int)convex::kOne) / 2); };
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    const fpx::FxQuat qX45 = fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45});
+    const fpx::FxQuat qZ45 = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45});
+    auto bodyAt = [&](int xh, int yh, int zh, fpx::FxQuat q = fpx::FxQuat{0,0,0,convex::kOne}) {
+        fpx::FxBody b; b.pos = {fh(xh), fh(yh), fh(zh)}; b.orient = q; return b;
+    };
+
+    struct ScenePair { uint32_t a; fpx::FxBody ba; uint32_t b; fpx::FxBody bb; fx expectDepth; int axis; };
+    std::vector<ScenePair> scene;
+    scene.push_back({1, bodyAt(0, 0, 0), 1, bodyAt(3, 0, 0), kOne / 2, 0});
+    scene.push_back({1, bodyAt(-12, 12, -4), 1, bodyAt(-12, 12, -2), kOne, 2});
+    scene.push_back({1, bodyAt(12, 12, 0), 1, bodyAt(15, 12, 3), 0, -1});
+    scene.push_back({0, bodyAt(-12, -12, 0), 1, bodyAt(-11, -12, 0), 0, -1});
+    scene.push_back({1, bodyAt(0, -12, 0, qX45), 1, bodyAt(0, -10, 0), 0, -1});
+    scene.push_back({3, bodyAt(12, -12, 0, qZ45), 1, bodyAt(14, -12, 0), 0, -1});
+    const uint32_t kPairCount = (uint32_t)scene.size();
+
+    // The EpaResultGpu mirror (== the Vulkan packer): the memcmp-comparable packed result.
+    struct EpaResultGpu {
+        int32_t  depth;
+        int32_t  nx, ny, nz;
+        int32_t  cax, cay, caz;
+        int32_t  cbx, cby, cbz;
+        uint32_t featureFaceId;
+        uint32_t iterations;
+        uint32_t valid;
+    };
+    auto packResult = [&](const gjk::EpaResult& r) {
+        EpaResultGpu g; std::memset(&g, 0, sizeof(EpaResultGpu));
+        g.depth = r.depth;
+        g.nx = r.normal.x; g.ny = r.normal.y; g.nz = r.normal.z;
+        g.cax = r.contactA.x; g.cay = r.contactA.y; g.caz = r.contactA.z;
+        g.cbx = r.contactB.x; g.cby = r.contactB.y; g.cbz = r.contactB.z;
+        g.featureFaceId = r.featureFaceId; g.iterations = r.iterations; g.valid = r.valid;
+        return g;
+    };
+
+    // CPU gjk::Gjk -> gjk::Epa (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    std::vector<gjk::EpaResult> raw(kPairCount);
+    std::vector<gjk::GjkResult> gjkRes(kPairCount);
+    std::vector<EpaResultGpu> results(kPairCount);
+    auto run = [&](std::vector<EpaResultGpu>& out) {
+        out.assign((size_t)kPairCount, EpaResultGpu{});
+        for (uint32_t i = 0; i < kPairCount; ++i) {
+            gjkRes[i] = gjk::Gjk(hullSet[scene[i].a], scene[i].ba, hullSet[scene[i].b], scene[i].bb);
+            gjk::EpaResult r = gjk::Epa(hullSet[scene[i].a], scene[i].ba, hullSet[scene[i].b], scene[i].bb,
+                                        gjkRes[i].simplex);
+            raw[i] = r; out[i] = packResult(r);
+        }
+    };
+    run(results);
+
+    uint32_t nConv = 0, nMaxIter = 0;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        if (results[i].iterations < gjk::kEpaMaxIter) ++nConv; else ++nMaxIter;
+    }
+    std::printf("gjk-epa: {pairs:%u, converged:%u, maxIter:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU gjk::Epa, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, nConv, nMaxIter);
+
+    // determinism: two runs byte-identical.
+    std::vector<EpaResultGpu> results2;
+    run(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(EpaResultGpu)) != 0)
+        return fail("gjk-epa: two runs differ (nondeterministic)");
+    std::printf("gjk-epa determinism: two runs BYTE-IDENTICAL\n");
+
+    // correctness: analytic depth within band + the normal is unit + SEPARATES (re-query after translating B
+    // by depth*normal is non-overlapping).
+    bool depthInBand = true, normalSeparates = true;
+    const fx kDepthBand = kOne / 4;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const gjk::EpaResult& e = raw[i];
+        const fx nlen = fpx::FxLength(e.normal);
+        if (nlen < kOne - kOne / 16 || nlen > kOne + kOne / 16) normalSeparates = false;
+        if (scene[i].axis >= 0) {
+            const fx diff = (e.depth > scene[i].expectDepth) ? (e.depth - scene[i].expectDepth)
+                                                             : (scene[i].expectDepth - e.depth);
+            if (diff > kDepthBand) depthInBand = false;
+        }
+        const fx push = e.depth + kOne / 8;
+        fpx::FxBody bbMoved = scene[i].bb;
+        bbMoved.pos = fpx::FxAdd(bbMoved.pos, fpx::FxScale(e.normal, push));
+        const gjk::GjkResult rq = gjk::Gjk(hullSet[scene[i].a], scene[i].ba, hullSet[scene[i].b], bbMoved);
+        if (rq.overlap != 0u) normalSeparates = false;
+    }
+    if (!depthInBand || !normalSeparates) return fail("gjk-epa: correctness failed");
+    std::printf("gjk-epa correct: {depthInBand:true, normalSeparates:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view as the Vulkan --gjk-epa-shot (identical by
+    // construction). Each overlapping pair's hull footprints (hot) + a contact-normal arrow + contact markers.
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalf = 10;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int64_t gx = ((int64_t)wx * kPxPerUnit) >> convex::kFrac;
+        const int64_t gz = ((int64_t)wz * kPxPerUnit) >> convex::kFrac;
+        ix = kMargin + kWorldHalf * kPxPerUnit + (int)gx;
+        iy = kMargin + kWorldHalf * kPxPerUnit + (int)gz;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto putDot = [&](int ix, int iy, int rad, const Vec3& col) {
+        for (int dy = -rad; dy <= rad; ++dy)
+            for (int dx = -rad; dx <= rad; ++dx)
+                if (dx * dx + dy * dy <= rad * rad) putPx(ix + dx, iy + dy, col);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            putPx(x0, y0, col);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    const Vec3 hotCol{0.95f, 0.45f, 0.20f};
+    const Vec3 normCol{0.30f, 0.95f, 0.55f};
+    const Vec3 cAcol{0.20f, 0.85f, 0.95f};
+    const Vec3 cBcol{0.95f, 0.30f, 0.85f};
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const gjk::FxHull& hA = hullSet[scene[i].a]; const fpx::FxBody& bA = scene[i].ba;
+        const gjk::FxHull& hB = hullSet[scene[i].b]; const fpx::FxBody& bB = scene[i].bb;
+        for (uint32_t v = 0; v < hA.count; ++v) {
+            const convex::FxVec3 w = convex::FxAdd(fpx::FxRotate(bA.orient, hA.verts[v]), bA.pos);
+            int px, py; worldToPx(w.x, w.z, px, py); putDot(px, py, 1, hotCol);
+        }
+        for (uint32_t v = 0; v < hB.count; ++v) {
+            const convex::FxVec3 w = convex::FxAdd(fpx::FxRotate(bB.orient, hB.verts[v]), bB.pos);
+            int px, py; worldToPx(w.x, w.z, px, py); putDot(px, py, 1, hotCol);
+        }
+        const convex::FxVec3 cA{results[i].cax, results[i].cay, results[i].caz};
+        const convex::FxVec3 cB{results[i].cbx, results[i].cby, results[i].cbz};
+        const convex::FxVec3 mid = fpx::FxScale(fpx::FxAdd(cA, cB), kOne / 2);
+        const convex::FxVec3 n{results[i].nx, results[i].ny, results[i].nz};
+        const convex::FxVec3 tip = fpx::FxAdd(mid, fpx::FxScale(n, results[i].depth + kOne / 2));
+        int mx, my; worldToPx(mid.x, mid.z, mx, my);
+        int tx, ty; worldToPx(tip.x, tip.z, tx, ty);
+        drawLine(mx, my, tx, ty, normCol);
+        int ax, ay; worldToPx(cA.x, cA.z, ax, ay); putDot(ax, ay, 2, cAcol);
+        int bx, by; worldToPx(cB.x, cB.z, bx, by); putDot(bx, by, 2, cBcol);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — EPA contact-normal top-down view (%u pairs, %u conv, %u maxIter)\n",
+                outPath, imgW, imgH, kPairCount, nConv, nMaxIter);
+    return 0;
+}
+
 static int RunConvexSatShowcase(const char* outPath) {
     using math::Vec3;
     namespace convex = hf::sim::convex;
@@ -49950,6 +50139,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gjk-distance") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gjk_distance.png";
             try { return RunGjkDistanceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gjk-epa <out.png>: render the Deterministic General Convex-Hull Contacts THE EPA ALGORITHM showcase
+        // (Slice GJ3, THE CRUX, slice 3 of FLAGSHIP #22). On Metal this runs the CPU EPA: gjk_epa.comp is int64/
+        // Vulkan-only (glslc can't parse the FxNormalize/FxDot/FxCross/fxdiv int64), so Metal runs the CPU
+        // gjk::Gjk -> gjk::Epa over the SAME fixed OVERLAPPING-pair scene -> the EXACT bit-exact reference the
+        // Vulkan --gjk-epa-shot GPU==CPU memcmp compares against; two runs byte-identical; the analytic depth is
+        // within band + the normal separates. The image golden is a PURE-INTEGER 2D top-down EPA view, identical
+        // to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/gjk_epa.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gjk-epa") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gjk_epa.png";
+            try { return RunGjkEpaShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-manifold <out.png>: render the Deterministic Convex Rigid-Body Contacts CONTACT MANIFOLD
