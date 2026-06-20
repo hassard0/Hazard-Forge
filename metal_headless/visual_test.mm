@@ -29917,6 +29917,331 @@ static int RunFractRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Vehicle Physics LIT 3D INSTANCED RENDER CAPSTONE showcase (Slice VH6, the money-shot
+// COMPLETING FLAGSHIP #16 — the SIXTEENTH flagship). Mirrors the Vulkan --vehicle-render-shot path EXACTLY:
+// builds the bit-exact VH1-VH5 driven car (VehicleFromConfig + a drive+steer stream + K StepVehicleDrivenSteps,
+// host-side, pure integer — the SAME scene as the Vulkan path so the state + transforms are byte-identical by
+// construction), builds the FLOAT instance set via vehicle::VehicleToRenderInstances (each body's bit-exact
+// pos/orient -> a math::FromTRS model matrix x a per-body SHAPE scale [chassis box / wheelRadius
+// lateral-flattened sphere], the ONLY float crossing, render-only), and renders the matte CAR-PAINT box chassis
+// + the matte TYRE round wheels as TWO colored instanced draws through the EXISTING instanced lit pipeline
+// (lit_instanced.vert.gen.metal + lit.frag.gen.metal — the --fract-render / --fpx-render wiring) over the ground
+// + sky + shadow, MATTE (roughness 1.0) so the car does NOT mirror the sky IBL into iridescence (the GF6 lesson).
+// The state + transforms (hence the visual) are byte-identical to the Vulkan path by construction. FLOAT
+// visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run) + provenance. New golden
+// tests/golden/metal/vehicle_render.png. NO new shader, NO RHI.
+static int RunVehicleRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace vehicle = hf::sim::vehicle;
+    namespace fpx     = hf::sim::fpx;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The bit-exact VH1-VH5 driven car -> a driven pose (the SAME scene as the Vulkan --vehicle-render-shot
+    // — byte-identical state + transforms by construction). ===
+    // K=12 GENTLE driven ticks (the SAME scene as the Vulkan --vehicle-render-shot): seat the suspension +
+    // nudge the car forward WITHOUT over-compressing the springs (a long/hard run sags the chassis into the
+    // wheels — the FPX6 coherence lesson) -> a clean box-on-four-wheels car at ride height.
+    const vehicle::fx kDt = vehicle::kOne / 60;
+    const int kTicks = 12;
+    const int kIters = 16;
+    const int kSolveIters = 8;
+    vehicle::VehicleConfig cfg;
+    // Render-scene-local shorter suspension (the cfg is local — NOT a change to the VH1-VH5 defaults): with
+    // suspensionLen 0.7 the settled chassis box tucks down ONTO the wheel tops -> a coherent box-on-four-wheels
+    // car (the FPX6 coherence lesson). Kept in lockstep with the Vulkan --vehicle-render-shot.
+    cfg.suspensionLen = (vehicle::fx)(vehicle::kOne * 7 / 10);
+    vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+    const uint32_t kBodies = (uint32_t)veh.world.bodies.size();
+    std::vector<vehicle::FxCommand> stream;
+    for (int t = 0; t < kTicks; ++t) {
+        vehicle::FxCommand d2; d2.tick = (uint32_t)t; d2.kind = vehicle::kCmdDriveTorque;
+        d2.bodyId = veh.wheelIndex[2]; d2.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
+        stream.push_back(d2);
+        vehicle::FxCommand d3; d3.tick = (uint32_t)t; d3.kind = vehicle::kCmdDriveTorque;
+        d3.bodyId = veh.wheelIndex[3]; d3.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
+        stream.push_back(d3);
+    }
+    vehicle::StepVehicleDrivenSteps(veh, cfg, stream, kDt, kTicks, kIters, kSolveIters);
+
+    const vehicle::VehicleRenderInstances ri = vehicle::VehicleToRenderInstances(veh, cfg);
+    std::vector<scene::InstanceData> chassisInstances, wheelInstances;
+    {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = ri.chassis.m[k];
+        chassisInstances.push_back(inst);
+    }
+    for (const Mat4& wm : ri.wheels) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = wm.m[k];
+        wheelInstances.push_back(inst);
+    }
+    const uint32_t kChassis = (uint32_t)chassisInstances.size();
+    const uint32_t kWheels  = (uint32_t)wheelInstances.size();
+    const uint32_t kInstanceCount = kChassis + kWheels;
+    std::vector<scene::InstanceData> allInstances;
+    allInstances.reserve(kInstanceCount);
+    allInstances.insert(allInstances.end(), chassisInstances.begin(), chassisInstances.end());
+    allInstances.insert(allInstances.end(), wheelInstances.begin(), wheelInstances.end());
+
+    // === Reuse the EXISTING instanced lit pipeline (the --fract-render / --fpx-render wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    // Ground: a muted warm-grey asphalt floor (kept in lockstep with the Vulkan --vehicle-render-shot).
+    const uint8_t groundPx[4] = {96, 92, 84, 255};
+    auto groundTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    // Per-draw ALBEDO TEXTURE: warm matte car-paint chassis + dark matte tyre wheels, both roughness 1.0 ->
+    // no iridescence (the GF6/FR6/JT6 lesson). Kept in lockstep with the Vulkan --vehicle-render-shot.
+    const uint8_t chassisPx[4] = {235, 70,  45, 255};   // warm matte CAR-PAINT (saturated warm red)
+    const uint8_t wheelPx[4]   = { 70, 66,  72, 255};   // matte TYRE (charcoal — reads as a wheel, not a shadow)
+    auto chassisTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, chassisPx, sizeof(chassisPx)});
+    auto wheelTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, wheelPx,   sizeof(wheelPx)});
+    scene::Mesh plane  = scene::Mesh::Plane(*device);
+    scene::Mesh cube   = scene::Mesh::Cube(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> allBuffer, chassisBuffer, wheelBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc d;
+        d.size = (uint64_t)allInstances.size() * sizeof(scene::InstanceData);
+        d.initialData = allInstances.data(); d.usage = rhi::BufferUsage::Vertex;
+        allBuffer = device->CreateBuffer(d);
+    }
+    if (kChassis > 0) {
+        rhi::BufferDesc d;
+        d.size = (uint64_t)chassisInstances.size() * sizeof(scene::InstanceData);
+        d.initialData = chassisInstances.data(); d.usage = rhi::BufferUsage::Vertex;
+        chassisBuffer = device->CreateBuffer(d);
+    }
+    if (kWheels > 0) {
+        rhi::BufferDesc d;
+        d.size = (uint64_t)wheelInstances.size() * sizeof(scene::InstanceData);
+        d.initialData = wheelInstances.data(); d.usage = rhi::BufferUsage::Vertex;
+        wheelBuffer = device->CreateBuffer(d);
+    }
+
+    Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+    // Fixed 3/4 hero camera + directional light (== the Vulkan --vehicle-render-shot camera/light). Aim at the
+    // driven chassis world pos so the whole car reads on the ground; the light rakes from the camera's
+    // upper-near side -> a warm car-paint read (the GF6/FR6 lesson). Kept in lockstep with the Vulkan showcase.
+    const float chassisX = fpx::FxToFloat(veh.world.bodies[(size_t)veh.chassisIndex].pos.x);
+    const Vec3 eye{chassisX + 2.6f, 1.05f, 4.8f};
+    const Vec3 center{chassisX, 1.05f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = 0.2f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.4f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{0.2f, -0.8f, -0.4f});
+        Vec3 sc{chassisX, 0.95f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 20.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-10.0f, 10.0f, -10.0f, 10.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*allBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;  // fully matte neutral floor
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundTex, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                // metallic 0, roughness 1.0 (FULLY matte) — kills the IBL iridescence (the GF6/FR6/JT6 lesson).
+                float matteMat[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+                if (kChassis > 0) {
+                    cmd.PushConstants(matteMat, sizeof(matteMat));
+                    cmd.BindMaterial(*chassisTex, *flatNormal);
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    cmd.BindInstanceBuffer(*chassisBuffer);
+                    cmd.DrawIndexedInstanced(cube.indexCount(), kChassis);
+                }
+                if (kWheels > 0) {
+                    cmd.PushConstants(matteMat, sizeof(matteMat));
+                    cmd.BindMaterial(*wheelTex, *flatNormal);
+                    cmd.BindVertexBuffer(sphere.vertices());
+                    cmd.BindIndexBuffer(sphere.indices());
+                    cmd.BindInstanceBuffer(*wheelBuffer);
+                    cmd.DrawIndexedInstanced(sphere.indexCount(), kWheels);
+                }
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) instances from bit-exact state: M == 1 chassis + 4 wheels == 5.
+    std::printf("vehicle-render: {bodies:%u, instances:%u} from bit-exact driven state\n",
+                kBodies, kInstanceCount);
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("vehicle-render two runs DIFFER (nondeterministic)");
+    std::printf("vehicle-render determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) provenance: rebuilding from the same bit-exact car -> byte-equal matrices.
+    {
+        const vehicle::VehicleRenderInstances rebuild = vehicle::VehicleToRenderInstances(veh, cfg);
+        bool identical = (rebuild.wheels.size() == ri.wheels.size()) &&
+                         std::memcmp(ri.chassis.m, rebuild.chassis.m, sizeof(float) * 16) == 0;
+        for (size_t k = 0; k < ri.wheels.size() && identical; ++k)
+            if (std::memcmp(ri.wheels[k].m, rebuild.wheels[k].m, sizeof(float) * 16) != 0) identical = false;
+        if (!identical) return fail("vehicle-render instances != rebuild (transform not pure)");
+    }
+    std::printf("vehicle-render provenance: instances == rebuild\n");
+
+    // coverage / coherence.
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    if (shaded == 0) return fail("vehicle-render coverage 0 (nothing shaded)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("vehicle-render uniform image (no coherent scene)");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic vehicle lit 3D render (%u bodies, %u chassis, %u wheels)\n",
+                outPath, cw, ch, kBodies, kChassis, kWheels);
+    return 0;
+}
+
 // --- Deterministic Grain<->Fluid Coupling LIT 3D RENDER CAPSTONE showcase (Slice GF6, the money-shot
 // COMPLETING FLAGSHIP #13 — the THIRTEENTH flagship). Mirrors the Vulkan --cgf-render-shot path EXACTLY: runs
 // the bit-exact GF1-GF5 coupled sim (the SAME GF4 wet-sand scene — a packed 8x3x6 grain bed pre-settled by GR4
@@ -41568,6 +41893,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_render.png";
             try { return RunFractRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vehicle-render <out.png>: render the Deterministic Vehicle Physics LIT 3D INSTANCED RENDER CAPSTONE
+        // showcase (Slice VH6, the money-shot COMPLETING FLAGSHIP #16 — the SIXTEENTH flagship). Builds the
+        // bit-exact VH1-VH5 driven car (VehicleFromConfig + a drive+steer stream + K StepVehicleDrivenSteps,
+        // host-side, pure integer), builds the FLOAT instance set via vehicle::VehicleToRenderInstances
+        // (fpx::FxBodyTransform pose x a per-body SHAPE scale — the ONLY float crossing, render-only), and
+        // renders the matte CAR-PAINT box chassis + the matte TYRE round wheels as lit 3D INSTANCED draws through
+        // the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag, the --fract-render/--fpx-render
+        // wiring) over the ground/sky/shadow, MATTE (roughness 1.0) so the car is not iridescent. The state +
+        // transforms are byte-identical to the Vulkan --vehicle-render-shot by construction. FLOAT visresolve-
+        // bar: Metal-render==Metal-golden DIFF 0.0000 + provenance; cross-vendor ~the float baseline. New golden
+        // tests/golden/metal/vehicle_render.png. NO new shader, NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--vehicle-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vehicle_render.png";
+            try { return RunVehicleRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fpx <out.png>: render the Deterministic Fixed-Point Physics Q16.16 INTEGRATOR + integer

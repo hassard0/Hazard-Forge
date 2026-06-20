@@ -501,6 +501,7 @@ int main(int argc, char** argv) {
     const char* vehicleStepShotPath = nullptr; // --vehicle-step-shot <out.bmp> (Slice VH3: Deterministic Vehicle Physics DRIVE + STEER COMMANDS + THE LOCKED VEHICLE TICK, the 3rd slice of FLAGSHIP #16 — build a car (VehicleFromConfig), feed a SCRIPTED command stream (kCmdDriveTorque on the rear wheels + a kCmdSteer on a front hinge) over K StepVehicle ticks. NO new shader: per tick the GPU applies the commands HOST-side, drives the EXISTING vehicle_spring_solve.comp + joint_angular_solve.comp (steps=1, iters=K, SENTINEL groundY) for integrate + K {spring | hinge}, host-rebuilds the FPX2 pair list, then drives fpx_solve.comp (dt=0, real groundY) for the FPX3 contacts -> memcmp GPU body world vs the CPU StepVehicle. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) drive moved the chassis forward + spun the driven wheels (a no-command control stays put); (4) steer re-aimed the front wheels (rears unchanged). int64 -> all shaders Vulkan-only; Metal --vehicle-step runs the CPU StepVehicle. STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader/RHI; VH1/VH2 + JT2/fpx shaders + their goldens + fpx.h/joint.h UNCHANGED (VH3 additive))
     const char* vehicleTractionShotPath = nullptr; // --vehicle-traction-shot <out.bmp> (Slice VH4: Deterministic Vehicle Physics WHEEL-GROUND TRACTION / FRICTION, the NEW-PHYSICS BEAT of FLAGSHIP #16 — VH3 drove the car with a velocity SEED (fpx contacts have no inertia tensor); VH4 replaces it with a REAL deterministic TRACTION model: at each grounded wheel a Coulomb-cone-clamped tangential ground force converts wheel spin (kCmdDriveTorque) into chassis forward motion. NO new shader: per tick the GPU applies the commands HOST-side, drives the EXISTING vehicle_spring_solve.comp + joint_angular_solve.comp (PHASE A/B), runs ApplyWheelTraction HOST-side (PHASE C, between the constraint dispatches + the contact dispatch), then host-rebuilds the FPX2 pair list + drives fpx_solve.comp (PHASE D, dt=0) -> memcmp GPU body world vs the CPU StepVehicleDriven. NO chassis velocity seed — forward comes from TRACTION. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) the drive moved the chassis forward fromTraction (no seed) + the driven wheels spin; (4) a kMuMax==0 control stays idle despite spinning wheels (the cone, not a seed, does the work). int64 -> all shaders Vulkan-only; Metal --vehicle-traction runs the CPU StepVehicleDriven. STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader/RHI; VH1/VH2/VH3 (incl StepVehicle) + JT2/fpx shaders + their goldens + fpx.h/joint.h UNCHANGED (VH4 additive — append-only in vehicle.h))
     const char* vehicleLockstepShotPath = nullptr; // --vehicle-lockstep-shot <out.bmp> (Slice VH5: Deterministic Vehicle Physics LOCKSTEP + ROLLBACK — THE NETCODE HEADLINE of FLAGSHIP #16, the FPX5/FR5/GR5/CG5/JT5 twin. PURE-CPU harness over the VH1-VH4 driven tick (vehicle::StepVehicleDriven): a car driven+steered by a scripted command stream; RunVehicleLockstep proves authority==replica BIT-IDENTICAL (inputs-only re-derivation) + RunVehicleRollback corrects a mispredicted steer to authority BIT-EXACT (the mispredict diverged before rollback) + two-run determinism. THE VH TWIST: the VehicleSnapshot captures the bodies AND the 4 steered hinge axes (kCmdSteer mutates hinges[i].axis + ApplyWheelTraction reads them — live replayable state the ragdoll JT5 bodies-only snapshot didn't need); reuses fpx::SnapshotWorld/RestoreWorld read-only for the body half. PURE CPU: the showcase still spins up the device/swapchain for the render but does ZERO GPU compute dispatch; both backends run the IDENTICAL RunVehicleLockstep/RunVehicleRollback C++ and render the converged car via the VH3/VH4 2D side-view path REUSED VERBATIM -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). PROOFS (fail loudly, exact lines): (1) 'vehicle-lockstep: {bodies:<N>, ticks:<T>} authority==replica BIT-IDENTICAL'; (2) 'vehicle-lockstep rollback: corrected==authority BIT-EXACT'; (3) 'vehicle-lockstep mispredict: diverged before rollback (real divergence fixed)'; (4) 'vehicle-lockstep determinism: two runs BYTE-IDENTICAL'. Golden = tests/golden/metal/vehicle_lockstep.png (Mac-baked by the controller). STANDALONE arg-parse loop (the FR1 C1061 lesson). NO GPU dispatch, NO new shader, NO new RHI; VH1-VH4 vehicle.h code + their shaders + fpx.h/joint.h + hf_gen_msl UNCHANGED (VH5 additive — only the snapshot + the harness + the showcase))
+    const char* vehicleRenderShotPath = nullptr; // --vehicle-render-shot <out.bmp> (Slice VH6: Deterministic Vehicle Physics LIT 3D INSTANCED RENDER CAPSTONE — the money-shot COMPLETING FLAGSHIP #16 (the SIXTEENTH flagship). RENDERS the bit-exact VH1-VH5 driven car as a lit 3D scene: a matte warm-car-paint BOX chassis sitting on four matte dark ROUND wheels, driven on the ground under a directional light. Build a car (VehicleFromConfig), feed a drive+steer stream, run K StepVehicleDrivenSteps to a driven pose (the SAME scene the Metal --vehicle-render builds -> byte-identical integer state), build the FLOAT instances via vehicle::VehicleToRenderInstances (each body's BIT-EXACT pos/orient -> a math::FromTRS model matrix composed with a per-body SHAPE scale [chassis half-extents BOX / wheelRadius lateral-flattened SPHERE], the ONE float crossing, render-only, OUT of the bit-exact sim path; the FPX6/FR6/JT6 bridge), draw TWO colored instanced draws (the cube-mesh chassis in warm matte car-paint, the sphere-mesh wheels in dark matte tyre) through the EXISTING instanced lit pipeline (lit_instanced.vert + lit.frag + scene::InstanceTransformLayout, the FrameData camera/light UBO, sky + instanced/static shadow + post — REUSED VERBATIM from --fract-render-shot/--fpx-render-shot; NO new shader/RHI) over the ground from a fixed 3/4 camera, MATTE (roughness 1.0) so the car does NOT mirror the sky IBL into iridescence (the GF6/FR6/JT6 lesson). FLOAT visresolve-bar: the SIM is bit-exact but the final raster/shade is float, so the golden is Metal-baked + the gate is Metal-determinism (two renders BYTE-IDENTICAL) + provenance (every instance transform IS the bit-exact body pose) + visual parity. PROOFS: (1) 'vehicle-render: {bodies:<N>, instances:<M>} from bit-exact driven state'; (2) 'vehicle-render determinism: two runs BYTE-IDENTICAL'; (3) 'vehicle-render provenance: instances == rebuild'. STANDALONE arg-parse loop (the FR1 C1061 lesson). NO new shader/RHI; VH1-VH5 vehicle.h-core + their shaders + fpx.h/joint.h + hf_gen_msl UNCHANGED (VH6 additive — only the render-only helper + the showcase). Completes the SIXTEENTH flagship)
     const char* clothCollideShotPath = nullptr; // --cloth-collide-shot <out.bmp> (Slice CL4: Deterministic GPU Cloth INTEGER COLLISION — a 24x24 sheet falls + DRAPES over a static FxBody sphere (the SphereCollider reuses fpx::FxBody pos+radius, the SAME Q16.16 units); StepClothCollide (CL3 solve + CollideSpheres + CollidePlane) ~40 steps x 6 iters on ONE GPU thread, GPU==CPU particle array bit-exact vs cloth.h::StepClothCollide, integer 3/4 view of the draped cloth + sphere outline; int64 -> Vulkan-only, Metal runs CPU StepClothCollide)
     const char* clothLockstepShotPath = nullptr; // --cloth-lockstep-shot <out.bmp> (Slice CL5: Deterministic GPU Cloth LOCKSTEP + ROLLBACK proof, the HEADLINE of FLAGSHIP #8 — PURE-CPU harness over the CL1-CL4 cloth (the FPX5 twin): a 16x16 cloth (top corners pinned) fed a scripted wind/pin command stream; authority==replica BIT-EXACT inputs-only + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); converged-cloth-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI)
     const char* coupleLockstepShotPath = nullptr; // --couple-lockstep-shot <out.bmp> (Slice CP5: Deterministic Rigid<->Fluid Coupling LOCKSTEP + ROLLBACK proof, the multi-body netcode HEADLINE of FLAGSHIP #11 — PURE-CPU harness over the CP1-CP4 coupled step (the FL5/GR5/FPX5 twin, the FIRST MULTI-BODY lockstep): the CP4 static-basin coupled scene (a dynamic pool + a dynamic FxBody) fed a scripted command stream that SHOVES the body (kCmdBodyShove) + winds the fluid; authority==replica BIT-EXACT inputs-only across BOTH the bodies AND the fluid + rollback corrects a misprediction to authority BIT-EXACT (mispredict diverged then converged); the snapshot covers BOTH the bodies AND the particles vectors; converged coupled-state golden bit-identical cross-backend; NO GPU dispatch, NO new shader, NO new RHI; CP1-CP4 + their shaders/goldens UNCHANGED, fpx.h/fluid.h/cloth.h/grain.h + engine/physics/ UNTOUCHED)
@@ -2497,6 +2498,15 @@ int main(int argc, char** argv) {
     // does NO compute dispatch. Its OWN loop (the FR1 C1061 standalone pattern — NOT the big else-if ladder).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--vehicle-lockstep-shot") == 0) { vehicleLockstepShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice VH6: --vehicle-render-shot <out.bmp> (Deterministic Vehicle Physics LIT 3D INSTANCED RENDER
+    // CAPSTONE — the money-shot COMPLETING FLAGSHIP #16). Build a car, drive it to a pose, build the FLOAT
+    // instances via vehicle::VehicleToRenderInstances, draw TWO colored instanced draws (matte car-paint cube
+    // chassis + matte tyre sphere wheels) through the EXISTING instanced-lit pipeline. Its OWN loop (the FR1
+    // C1061 standalone pattern — NOT the big else-if ladder).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--vehicle-render-shot") == 0) { vehicleRenderShotPath = argv[i + 1]; break; }
     }
 
     // --pick-test: fully headless (no window/GPU). Build the same deterministic multi-object scene
@@ -16831,6 +16841,407 @@ int main(int argc, char** argv) {
                                 "(%u bodies, %u anchor, %u chunks)\n",
                                 fractRenderShotPath, cw, ch2, kBodies, kAnchor, kDynamic);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", fractRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // === Slice VH6 — Deterministic Vehicle Physics LIT 3D INSTANCED RENDER CAPSTONE
+        // (--vehicle-render-shot <out.bmp>) — the money-shot COMPLETING FLAGSHIP #16 (the SIXTEENTH flagship).
+        // Builds the bit-exact VH1-VH5 driven car (VehicleFromConfig + a drive+steer stream + K
+        // StepVehicleDrivenSteps to a driven pose, the sim pure integer — the SAME scene the Metal
+        // --vehicle-render builds, so the integer state is byte-identical cross-backend by construction), turns
+        // it into a FLOAT instance set via vehicle::VehicleToRenderInstances (each body's bit-exact pos/orient
+        // -> a math::FromTRS model matrix x a per-body SHAPE scale [chassis box half-extents / wheelRadius
+        // lateral-flattened sphere], the ONE float crossing, render-only), and renders the matte CAR-PAINT box
+        // chassis + the matte TYRE round wheels as TWO colored instanced draws through the EXISTING instanced-lit
+        // pipeline (lit_instanced.vert + lit.frag, sky + shadow + post — REUSED VERBATIM from
+        // --fract-render-shot/--fpx-render-shot; NO new shader/RHI) over the ground from a fixed 3/4 camera +
+        // directional light. THE GF6/FR6/JT6 LESSON: roughness 1.0 (MATTE) + warm/dark albedo so the car does
+        // NOT mirror the sky IBL into iridescence. FLOAT visresolve-bar (Metal-baked golden). STANDALONE branch.
+        if (vehicleRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace vehicle = hf::sim::vehicle;
+            namespace fpx     = hf::sim::fpx;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // === The bit-exact VH1-VH5 driven car -> a driven pose (the input; deterministic, shared with the
+            // Metal --vehicle-render by construction via the SAME scene + stream). Build the car, spin BOTH rear
+            // wheels every tick + steer the front-right hinge at a couple ticks, run K StepVehicleDrivenSteps. K
+            // is chosen so the driven car stays on-screen (a short, framed run). Pure integer sim. ===
+            // K=12 driven ticks at a GENTLE throttle: enough to seat the suspension + nudge the car forward
+            // (it IS the bit-exact driven car) WITHOUT over-compressing the springs (a long/hard run sags the
+            // chassis down INTO the wheels and reads as a blob — the FPX6 coherence lesson). At K=12 the chassis
+            // rests at ride height (~1.45) on the four corner wheels (y=0.5) -> a clean box-on-four-wheels car.
+            const vehicle::fx kDt = vehicle::kOne / 60;
+            const int kTicks = 12;          // a short, framed driven run -> the car stays assembled
+            const int kIters = 16;          // Gauss-Seidel spring/hinge passes per tick
+            const int kSolveIters = 8;      // FPX3 contact sweeps per tick
+            vehicle::VehicleConfig cfg;
+            // A render-scene-local shorter suspension travel (the cfg is local to this showcase, NOT a change to
+            // the VH1-VH5 defaults): with suspensionLen 0.7 the settled chassis box-bottom TUCKS down onto the
+            // wheel tops (a slight overlap) so the box reads as sitting ON the four wheels — a coherent car (the
+            // FPX6 coherence lesson), instead of floating above them on a tall default suspension.
+            cfg.suspensionLen = (vehicle::fx)(vehicle::kOne * 7 / 10);   // 0.7 suspension travel
+            vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+            const uint32_t kBodies = (uint32_t)veh.world.bodies.size();   // 5
+            std::vector<vehicle::FxCommand> stream;
+            for (int t = 0; t < kTicks; ++t) {
+                vehicle::FxCommand d2; d2.tick = (uint32_t)t; d2.kind = vehicle::kCmdDriveTorque;
+                d2.bodyId = veh.wheelIndex[2]; d2.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
+                stream.push_back(d2);
+                vehicle::FxCommand d3; d3.tick = (uint32_t)t; d3.kind = vehicle::kCmdDriveTorque;
+                d3.bodyId = veh.wheelIndex[3]; d3.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
+                stream.push_back(d3);
+            }
+            vehicle::StepVehicleDrivenSteps(veh, cfg, stream, kDt, kTicks, kIters, kSolveIters);
+
+            // The split instance set (chassis box + 4 wheel spheres) — the ONE float crossing, render-only.
+            const vehicle::VehicleRenderInstances ri = vehicle::VehicleToRenderInstances(veh, cfg);
+            std::vector<scene::InstanceData> chassisInstances;   // the 1 box chassis (warm car paint)
+            std::vector<scene::InstanceData> wheelInstances;     // the 4 round wheels (dark tyre)
+            {
+                scene::InstanceData inst;
+                for (int k = 0; k < 16; ++k) inst.model[k] = ri.chassis.m[k];
+                chassisInstances.push_back(inst);
+            }
+            for (const Mat4& wm : ri.wheels) {
+                scene::InstanceData inst;
+                for (int k = 0; k < 16; ++k) inst.model[k] = wm.m[k];
+                wheelInstances.push_back(inst);
+            }
+            const uint32_t kChassis = (uint32_t)chassisInstances.size();
+            const uint32_t kWheels  = (uint32_t)wheelInstances.size();
+            const uint32_t kInstanceCount = kChassis + kWheels;
+
+            // The combined set (chassis-then-wheels) feeds the single shadow draw (both via the sphere shadow —
+            // the chassis is a sphere-bound body, a close-enough shadow proxy; the lit draws use the right mesh).
+            std::vector<scene::InstanceData> allInstances;
+            allInstances.reserve(kInstanceCount);
+            allInstances.insert(allInstances.end(), chassisInstances.begin(), chassisInstances.end());
+            allInstances.insert(allInstances.end(), wheelInstances.begin(), wheelInstances.end());
+
+            // === Reuse the EXISTING instanced-lit pipeline (the --fract-render-shot / --fpx-render-shot wiring). ===
+            auto instVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_instanced.vert.hlsl.spv");
+            auto litFsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto instVs = device->CreateShaderModule({std::span<const uint32_t>(instVsWords)});
+            auto litFs  = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc instDesc;
+            instDesc.vertex = instVs.get();
+            instDesc.fragment = litFs.get();
+            instDesc.vertexLayout = scene::MeshVertexLayout();
+            instDesc.instanceLayout = scene::InstanceTransformLayout();
+            instDesc.colorFormat = device->Swapchain().ColorFormat();
+            instDesc.depthTest = true;
+            instDesc.usesFrameUniforms = true;
+            instDesc.usesTexture = true;
+            instDesc.pushConstantSize = sizeof(float) * 4;
+            auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get();
+            litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true;
+            litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true;
+            litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto instShWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_instanced.vert.hlsl.spv");
+            auto shadowFsW   = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto instShVs = device->CreateShaderModule({std::span<const uint32_t>(instShWords)});
+            auto shadowFs = device->CreateShaderModule({std::span<const uint32_t>(shadowFsW)});
+            rhi::GraphicsPipelineDesc instShDesc;
+            instShDesc.vertex = instShVs.get();
+            instShDesc.fragment = shadowFs.get();
+            instShDesc.vertexLayout = scene::MeshVertexLayout();
+            instShDesc.instanceLayout = scene::InstanceTransformLayout();
+            instShDesc.depthTest = true;
+            instShDesc.depthOnly = true;
+            instShDesc.usesFrameUniforms = true;
+            instShDesc.pushConstantSize = 0;
+            auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+            auto staticShW = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShVs = device->CreateShaderModule({std::span<const uint32_t>(staticShW)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShVs.get();
+            stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true;
+            stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true;
+            stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            // Ground: a muted warm rock floor (NOT the blue-tinted checkerboard, whose white checks mirror the
+            // blue sky IBL and read as an iridescent slab). A neutral warm floor lets the car read (the GF6/FR6
+            // lesson, kept in lockstep with the Metal --vehicle-render).
+            const uint8_t groundPx[4] = {96, 92, 84, 255};    // muted warm-grey asphalt floor
+            auto groundTex = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            // The chassis vs wheels distinguished by per-draw ALBEDO TEXTURE (the lit pipeline's albedo is
+            // gTex*meshVertexColor; the `material` push constant is metallic/roughness ONLY, NOT colour). The
+            // lit.frag adds a BLUE sky-tinted ambient even at roughness 1.0, so HEAVILY-SATURATED WARM car-paint
+            // (like FR6's sand) is needed so the chassis reads as warm car paint, not blue; the wheels a DARK
+            // matte tyre. Both at roughness 1.0 -> no iridescence (the GF6/FR6/JT6 lesson).
+            const uint8_t chassisPx[4] = {235, 70,  45, 255};  // warm matte CAR-PAINT (saturated warm red)
+            const uint8_t wheelPx[4]   = { 70, 66,  72, 255};  // matte TYRE (charcoal — light enough to read as a wheel, not a shadow)
+            auto chassisTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, chassisPx, sizeof(chassisPx)});
+            auto wheelTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, wheelPx,   sizeof(wheelPx)});
+            scene::Mesh plane  = scene::Mesh::Plane(*device);
+            scene::Mesh cube   = scene::Mesh::Cube(*device);
+            scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+            std::unique_ptr<rhi::IBuffer> allBuffer;       // combined (shadow pass)
+            std::unique_ptr<rhi::IBuffer> chassisBuffer;   // chassis only (car-paint cube draw)
+            std::unique_ptr<rhi::IBuffer> wheelBuffer;     // wheels only (tyre sphere draw)
+            if (kInstanceCount > 0) {
+                rhi::BufferDesc d;
+                d.size = (uint64_t)allInstances.size() * sizeof(scene::InstanceData);
+                d.initialData = allInstances.data();
+                d.usage = rhi::BufferUsage::Vertex;
+                allBuffer = device->CreateBuffer(d);
+            }
+            if (kChassis > 0) {
+                rhi::BufferDesc d;
+                d.size = (uint64_t)chassisInstances.size() * sizeof(scene::InstanceData);
+                d.initialData = chassisInstances.data();
+                d.usage = rhi::BufferUsage::Vertex;
+                chassisBuffer = device->CreateBuffer(d);
+            }
+            if (kWheels > 0) {
+                rhi::BufferDesc d;
+                d.size = (uint64_t)wheelInstances.size() * sizeof(scene::InstanceData);
+                d.initialData = wheelInstances.data();
+                d.usage = rhi::BufferUsage::Vertex;
+                wheelBuffer = device->CreateBuffer(d);
+            }
+
+            Mat4 groundModel = Mat4::Scale({10.0f, 1.0f, 10.0f});
+
+            // The car centres near the chassis world pos. The chassis spans ~±1.5 (X length) × ±1.0 (Z width) at
+            // ride height ~1.5; the driven run pushes it a little forward (+X). Aim a fixed 3/4 hero camera at
+            // the car centre so the whole car (box chassis on its four wheels) reads on the ground. The light
+            // rakes from the camera's upper-near side so the camera-facing surfaces are lit (NOT back-lit into
+            // the blue ambient) -> a warm car-paint read (the GF6/FR6 lesson).
+            const float chassisX = fpx::FxToFloat(veh.world.bodies[(size_t)veh.chassisIndex].pos.x);
+            // A CLOSE fixed 3/4 hero camera so the whole car (the ~3x2 box on its four corner wheels) FILLS the
+            // frame and reads as a car (the FPX6 coherence lesson — frame it tight, on the ground).
+            const Vec3 eye{chassisX + 2.6f, 1.05f, 4.8f};
+            const Vec3 center{chassisX, 1.05f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = 0.2f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.4f;
+                fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{0.2f, -0.8f, -0.4f});
+                Vec3 sc{chassisX, 0.95f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 20.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-10.0f, 10.0f, -10.0f, 10.0f, 1.0f, 48.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instShadowPipeline);
+                        cmd.BindVertexBuffer(sphere.vertices());
+                        cmd.BindInstanceBuffer(*allBuffer);
+                        cmd.BindIndexBuffer(sphere.indices());
+                        cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;  // fully matte neutral floor
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    if (kInstanceCount > 0) {
+                        cmd.BindPipeline(*instPipeline);
+                        // metallic 0, roughness 1.0 (FULLY matte). At roughness==1 the IBL Fresnel rim collapses
+                        // to F0 (0.04) so the grazing-angle blue-sky reflection that would make the car read as
+                        // iridescent vanishes, leaving the matte albedo to dominate (the GF6/FR6/JT6 discipline).
+                        float matteMat[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+                        // DRAW 1: the chassis — the warm matte car-paint CUBE.
+                        if (kChassis > 0) {
+                            cmd.PushConstants(matteMat, sizeof(matteMat));
+                            cmd.BindMaterial(*chassisTex, *flatNormal);
+                            cmd.BindVertexBuffer(cube.vertices());
+                            cmd.BindIndexBuffer(cube.indices());
+                            cmd.BindInstanceBuffer(*chassisBuffer);
+                            cmd.DrawIndexedInstanced(cube.indexCount(), kChassis);
+                        }
+                        // DRAW 2: the wheels — the dark matte tyre SPHERES (lateral-flattened).
+                        if (kWheels > 0) {
+                            cmd.PushConstants(matteMat, sizeof(matteMat));
+                            cmd.BindMaterial(*wheelTex, *flatNormal);
+                            cmd.BindVertexBuffer(sphere.vertices());
+                            cmd.BindIndexBuffer(sphere.indices());
+                            cmd.BindInstanceBuffer(*wheelBuffer);
+                            cmd.DrawIndexedInstanced(sphere.indexCount(), kWheels);
+                        }
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!device->GetCapturedPixels(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOFS ===
+            auto countShaded = [](const std::vector<uint8_t>& img) -> uint32_t {
+                uint32_t n = 0;
+                for (size_t p = 0; p + 3 < img.size(); p += 4) {
+                    const int b = img[p + 0], g = img[p + 1], r = img[p + 2];
+                    if (b + g + r > 60) ++n;
+                }
+                return n;
+            };
+            const uint32_t shaded = countShaded(px);
+
+            // (1) instances from bit-exact state: M == 1 chassis + 4 wheels == 5.
+            std::printf("vehicle-render: {bodies:%u, instances:%u} from bit-exact driven state\n",
+                        kBodies, kInstanceCount);
+
+            // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+            if (!device->GetCapturedPixels(px2, cw2, ch3)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (2nd render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (px.size() != px2.size() || std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                std::fprintf(stderr, "FATAL: vehicle-render two runs DIFFER (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("vehicle-render determinism: two runs BYTE-IDENTICAL\n");
+
+            // (3) provenance: rebuilding the instances from the SAME bit-exact car -> byte-equal matrices (the
+            // render transform is a pure function of the integer body state).
+            {
+                const vehicle::VehicleRenderInstances rebuild = vehicle::VehicleToRenderInstances(veh, cfg);
+                bool identical = (rebuild.wheels.size() == ri.wheels.size()) &&
+                                 std::memcmp(ri.chassis.m, rebuild.chassis.m, sizeof(float) * 16) == 0;
+                for (size_t k = 0; k < ri.wheels.size() && identical; ++k)
+                    if (std::memcmp(ri.wheels[k].m, rebuild.wheels[k].m, sizeof(float) * 16) != 0)
+                        identical = false;
+                if (!identical) {
+                    std::fprintf(stderr, "FATAL: vehicle-render instances != rebuild (transform not a pure "
+                                         "function of the state)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("vehicle-render provenance: instances == rebuild\n");
+
+            // coverage / coherence: shaded>0 and not uniform (a recognizable lit 3D car scene).
+            if (shaded == 0) {
+                std::fprintf(stderr, "FATAL: vehicle-render coverage 0 (nothing shaded)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (shaded == (uint32_t)(px.size() / 4)) {
+                std::fprintf(stderr, "FATAL: vehicle-render uniform image (no coherent scene)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            bool ok = WriteBMP(vehicleRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — deterministic vehicle lit 3D render "
+                                "(%u bodies, %u chassis, %u wheels)\n",
+                                vehicleRenderShotPath, cw, ch2, kBodies, kChassis, kWheels);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", vehicleRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
