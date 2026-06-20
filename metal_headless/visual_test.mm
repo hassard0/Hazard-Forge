@@ -25062,6 +25062,267 @@ static int RunBroadCellShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BP2 — Deterministic Integer Broadphase THE CANDIDATE-PAIR GENERATOR showcase (--broad-pair) ===
+// THE CRUX of FLAGSHIP #23. Like BP1's --broad-cell, the pair generator is PURE INT32 (the 27-cell stencil +
+// the six-compare AabbOverlap + an ascending scatter, NO int64/fxmul/sqrt), so the broad_pair_{count,scan,
+// emit} shaders MSL-gen natively and Metal DISPATCHES THE GPU passes directly: the SAME fixed uniform-radius
+// body cloud the Vulkan --broad-pair-shot builds feeds the SAME three passes (count->scan->emit) over the BP1
+// cell table -> ReadBuffer reads perBodyOffset + pairsOut, PROVEN BIT-EXACT vs the CPU
+// broad.h::BuildBroadphasePairs (memcmp, NO tol); the equivalence proof: the grid-pair set (sorted) ==
+// fpx::BuildPairs all-pairs (sorted) byte-for-byte; two runs byte-identical. The image golden is the integer
+// top-down (XZ) AABB-footprint + candidate-pair-segment viz, identical to the Vulkan path BY CONSTRUCTION (the
+// bar is STRICT ZERO cross-vendor). New golden tests/golden/metal/broad_pair.png. NO new RHI.
+static int RunBroadPairShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace broad = hf::sim::broad;
+    namespace fpx = hf::sim::fpx;
+
+    // The fixed scene (== the Vulkan --broad-pair-shot): a cloud of uniform-radius dynamic bodies — a sparse
+    // 4x1x4 grid backbone (spacing 2 == cellSize) + tight clusters whose AABBs overlap (a non-trivial pair set).
+    const fpx::fx kCellSize = fpx::kOne * 2;     // 2.0 world-unit cells
+    const fpx::fx kRadius   = fpx::kOne / 2;     // 0.5 uniform (diameter 1.0 <= cellSize)
+    const fpx::fx kHalf     = fpx::kOne / 2;     // 0.5
+    auto mkBody = [&](fpx::fx x, fpx::fx y, fpx::fx z) {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{x, y, z};
+        b.radius = kRadius;
+        b.invMass = fpx::kOne;
+        b.flags = fpx::kFlagDynamic;
+        return b;
+    };
+    auto wu = [&](int n) { return (fpx::fx)(n * (int)fpx::kOne); };
+    std::vector<fpx::FxBody> bodies;
+    for (int z = 0; z < 4; ++z)
+        for (int x = 0; x < 4; ++x)
+            bodies.push_back(mkBody(wu(x * 2), 0, wu(z * 2)));
+    bodies.push_back(mkBody(wu(0) + kHalf, 0, wu(0) + kHalf));
+    bodies.push_back(mkBody(wu(0) + kHalf, 0, wu(0)));
+    bodies.push_back(mkBody(wu(0), 0, wu(0) + kHalf));
+    bodies.push_back(mkBody(wu(2) - kHalf, 0, wu(2)));
+    bodies.push_back(mkBody(wu(2),         0, wu(2)));
+    bodies.push_back(mkBody(wu(2) + kHalf, 0, wu(2)));
+    bodies.push_back(mkBody(wu(2),         0, wu(2) + kHalf));
+    bodies.push_back(mkBody(wu(6),         0, wu(6)));
+    bodies.push_back(mkBody(wu(6) + kHalf, 0, wu(6)));
+    const int kBodyCount = (int)bodies.size();
+
+    // The CPU reference grid + cell table + pair list.
+    const broad::BodyGrid grid = broad::MakeBodyGrid(bodies, kCellSize);
+    const uint32_t kCellCount = broad::BodyCellCount(grid);
+    const broad::BodyCellTable cpuTable = broad::BuildBodyCellTable(bodies, grid);
+    std::vector<uint32_t> cpuOffset;
+    std::vector<fpx::FxPair> cpuPairs;
+    broad::BuildBroadphasePairs(bodies, grid, cpuTable, cpuOffset, cpuPairs);
+    const uint32_t kPairCount = (uint32_t)cpuPairs.size();
+    std::vector<uint32_t> cpuOffsetSentinel = cpuOffset;
+    cpuOffsetSentinel.push_back(kPairCount);
+
+    // Image dims (fixed integer top-down transform, == the Vulkan --broad-pair-shot).
+    const int kPxPerUnit = 36;
+    const int kMargin = 28;
+    const int kWorldW = 9;
+    const int kWorldH = 9;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 FxBody mirror (matches the broad_pair shaders' BroadBody).
+    struct BroadBodyGpu { int32_t px, py, pz, radius; };
+    static_assert(sizeof(BroadBodyGpu) == 16, "BroadBodyGpu std430 layout");
+    std::vector<BroadBodyGpu> bodiesInit((size_t)kBodyCount);
+    for (int i = 0; i < kBodyCount; ++i)
+        bodiesInit[(size_t)i] = BroadBodyGpu{bodies[(size_t)i].pos.x, bodies[(size_t)i].pos.y,
+                                             bodies[(size_t)i].pos.z, bodies[(size_t)i].radius};
+    rhi::BufferDesc bodyDesc;
+    bodyDesc.size = bodiesInit.size() * sizeof(BroadBodyGpu);
+    bodyDesc.initialData = bodiesInit.data();
+    bodyDesc.usage = rhi::BufferUsage::Storage;
+    auto bodiesBuf = device->CreateBuffer(bodyDesc);
+
+    struct BodyGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(BodyGridParams) == 48, "BodyGridParams std430 layout");
+    auto makeGridParams = [&](int32_t enabled) {
+        BodyGridParams p{};
+        p.grid[0] = kCellSize; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+        p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+        p.dim[3] = kBodyCount;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    // BP1 cell table uploaded as read-only inputs (the broad_pair shaders read the BP1 grid output).
+    std::vector<uint32_t> cellStartInit = cpuTable.cellStart;
+    std::vector<uint32_t> cellBodiesInit = cpuTable.cellBodies;
+    std::vector<uint32_t> perBodyCountInit((size_t)kBodyCount, 0u);
+    std::vector<uint32_t> perBodyOffsetInit((size_t)kBodyCount + 1u, 0u);
+    std::vector<uint32_t> pairsInit((size_t)(kPairCount ? kPairCount : 1u) * 2u, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto cellStartBuf  = makeUintBuf(cellStartInit);
+    auto cellBodiesBuf = makeUintBuf(cellBodiesInit);
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    // pair_count(5 SSBO,64t), pair_scan(3,1t), pair_emit(6,1t) — the broad_pair MSL-native passes.
+    auto pairCountPipe = mkPipe("broad_pair_count.comp.gen.metal", "broad_pair_count_main", 5, 64);
+    auto pairScanPipe  = mkPipe("broad_pair_scan.comp.gen.metal", "broad_pair_scan_main", 3, 1);
+    auto pairEmitPipe  = mkPipe("broad_pair_emit.comp.gen.metal", "broad_pair_emit_main", 6, 1);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kBodyGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+    auto runPairs = [&](int32_t enabled, std::vector<uint32_t>& outOffset,
+                        std::vector<uint32_t>& outPairs) {
+        auto perBodyCountBuf  = makeUintBuf(perBodyCountInit);
+        auto perBodyOffsetBuf = makeUintBuf(perBodyOffsetInit);
+        auto pairsBuf         = makeUintBuf(pairsInit);
+        BodyGridParams params = makeGridParams(enabled);
+        rhi::BufferDesc pd; pd.size = sizeof(BodyGridParams); pd.initialData = &params;
+        pd.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("broad_pair", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*pairCountPipe.second);
+                cmd.BindStorageBuffer(*bodiesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellBodiesBuf, 2);
+                cmd.BindStorageBuffer(*perBodyCountBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*pairScanPipe.second);
+                cmd.BindStorageBuffer(*perBodyCountBuf, 0);
+                cmd.BindStorageBuffer(*perBodyOffsetBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*pairEmitPipe.second);
+                cmd.BindStorageBuffer(*bodiesBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellBodiesBuf, 2);
+                cmd.BindStorageBuffer(*perBodyOffsetBuf, 3);
+                cmd.BindStorageBuffer(*pairsBuf, 4);
+                cmd.BindStorageBuffer(*paramsBuf, 5);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outOffset.assign((size_t)kBodyCount + 1u, 0u);
+        device->ReadBuffer(*perBodyOffsetBuf, outOffset.data(), outOffset.size() * sizeof(uint32_t), 0);
+        outPairs.assign(pairsInit.size(), 0u);
+        device->ReadBuffer(*pairsBuf, outPairs.data(), outPairs.size() * sizeof(uint32_t), 0);
+    };
+
+    // === GPU pair list (enabled) ===
+    std::vector<uint32_t> gOffset, gPairsRaw;
+    runPairs(1, gOffset, gPairsRaw);
+
+    // PROOF (1) GPU==CPU pairs + offsets BIT-EXACT.
+    bool offsetOk = (gOffset.size() == cpuOffsetSentinel.size()) &&
+        std::memcmp(gOffset.data(), cpuOffsetSentinel.data(),
+                    cpuOffsetSentinel.size() * sizeof(uint32_t)) == 0;
+    std::vector<uint32_t> cpuPairsRaw;
+    cpuPairsRaw.reserve((size_t)kPairCount * 2u);
+    for (const fpx::FxPair& p : cpuPairs) { cpuPairsRaw.push_back(p.i); cpuPairsRaw.push_back(p.j); }
+    bool pairsOk = (kPairCount == 0) ||
+        std::memcmp(gPairsRaw.data(), cpuPairsRaw.data(),
+                    (size_t)kPairCount * 2u * sizeof(uint32_t)) == 0;
+    if (!offsetOk || !pairsOk) return fail("broad-pair: GPU != CPU BuildBroadphasePairs");
+    std::printf("broad-pair: {bodies:%d, pairs:%u} GPU==CPU BIT-EXACT\n", kBodyCount, kPairCount);
+
+    // PROOF (2) determinism: two full runs byte-identical.
+    {
+        std::vector<uint32_t> o2, p2;
+        runPairs(1, o2, p2);
+        if (o2 != gOffset || p2 != gPairsRaw)
+            return fail("broad-pair: two runs differ (nondeterministic)");
+        std::printf("broad-pair determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) THE EQUIVALENCE PROOF: the GPU grid-pair set (sorted) == fpx::BuildPairs all-pairs (sorted).
+    {
+        std::vector<fpx::FxPair> gPairs((size_t)kPairCount);
+        for (uint32_t k = 0; k < kPairCount; ++k)
+            gPairs[(size_t)k] = fpx::FxPair{gPairsRaw[(size_t)k * 2u], gPairsRaw[(size_t)k * 2u + 1u]};
+        if (!broad::PairSetEquivalentToAllPairs(bodies, gPairs))
+            return fail("broad-pair: equivalence FAILED (grid-pairs != all-pairs)");
+        std::printf("broad-pair equivalence: grid-pairs == all-pairs {pairs:%u} BYTE-IDENTICAL\n",
+                    kPairCount);
+    }
+
+    // --- Golden: a PURE-INTEGER top-down (XZ) view (== the Vulkan --broad-pair-shot). AABB footprints +
+    // a segment per emitted candidate pair. CPU-drawn from the read-back integers -> identical both backends. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](fpx::fx x, fpx::fx z, int& outX, int& outY) {
+        const float fxx = (float)x / (float)fpx::kOne;
+        const float fzz = (float)z / (float)fpx::kOne;
+        outX = kMargin + (int)((fxx + 1.0f) * kPxPerUnit + 0.5f);
+        outY = (int)imgH - kMargin - (int)((fzz + 1.0f) * kPxPerUnit + 0.5f);
+    };
+    auto setPx = [&](int ix, int iy, uint8_t r, uint8_t gg, uint8_t b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = b; dst[1] = gg; dst[2] = r; dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t gg, uint8_t b) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            setPx(x0, y0, r, gg, b);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    for (const fpx::FxPair& p : cpuPairs) {
+        int ax, ay, bx, by;
+        toPx(bodies[p.i].pos.x, bodies[p.i].pos.z, ax, ay);
+        toPx(bodies[p.j].pos.x, bodies[p.j].pos.z, bx, by);
+        drawLine(ax, ay, bx, by, 70, 180, 200);
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        int loX, loY, hiX, hiY;
+        toPx(bodies[(size_t)i].pos.x - kRadius, bodies[(size_t)i].pos.z - kRadius, loX, loY);
+        toPx(bodies[(size_t)i].pos.x + kRadius, bodies[(size_t)i].pos.z + kRadius, hiX, hiY);
+        int x0 = std::min(loX, hiX), x1 = std::max(loX, hiX);
+        int y0 = std::min(loY, hiY), y1 = std::max(loY, hiY);
+        for (int x = x0; x <= x1; ++x) { setPx(x, y0, 230, 210, 120); setPx(x, y1, 230, 210, 120); }
+        for (int y = y0; y <= y1; ++y) { setPx(x0, y, 230, 210, 120); setPx(x1, y, 230, 210, 120); }
+        int cx, cy; toPx(bodies[(size_t)i].pos.x, bodies[(size_t)i].pos.z, cx, cy);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) setPx(cx + dx, cy + dy, 255, 255, 255);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — broad-pair candidate pairs (%d bodies, %u pairs)\n",
+                outPath, imgW, imgH, kBodyCount, kPairCount);
+    return 0;
+}
+
 // ===== Slice CL2 — Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD showcase (--cloth-edges) =====
 // UNLIKE CL1's --cloth-integrate (int64 cloth_integrate.comp -> CPU on Metal), the constraint-graph build
 // is PURE INT32 (CountOwnedEdges + the fixed emit order = index arithmetic + bounds compares, NO int64, NO
@@ -50580,6 +50841,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--broad-cell") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_broad_cell.png";
             try { return RunBroadCellShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --broad-pair <out.png>: render the Deterministic Integer Broadphase THE CANDIDATE-PAIR GENERATOR
+        // showcase (Slice BP2, THE CRUX of FLAGSHIP #23). Like --broad-cell, the pair generator is PURE INT32
+        // (the 27-cell stencil + the six-compare AabbOverlap + an ascending scatter, NO int64/fxmul/sqrt), so
+        // the broad_pair_{count,scan,emit} shaders MSL-gen natively and Metal DISPATCHES THE GPU passes: the
+        // SAME uniform-radius body cloud the Vulkan --broad-pair-shot builds feeds the SAME three passes
+        // (count->scan->emit) over the BP1 cell table -> ReadBuffer reads perBodyOffset + pairsOut, PROVEN
+        // BIT-EXACT vs the CPU broad.h::BuildBroadphasePairs (memcmp); the equivalence proof grid-pairs ==
+        // fpx::BuildPairs all-pairs (sorted) byte-for-byte; two runs byte-identical. The image golden is the
+        // integer top-down (XZ) AABB-footprint + candidate-pair-segment viz, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/broad_pair.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--broad-pair") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_broad_pair.png";
+            try { return RunBroadPairShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-query <out.png>: render the Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD +

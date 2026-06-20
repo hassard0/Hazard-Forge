@@ -402,6 +402,19 @@ hf_gen_msl(boids_neighbor_emit.comp  boids_neighbor_emit.comp.hlsl  comp boids_n
 hf_gen_msl(broad_cell_count.comp     broad_cell_count.comp.hlsl     comp broad_cell_count_main)
 hf_gen_msl(broad_cell_scan.comp      broad_cell_scan.comp.hlsl      comp broad_cell_scan_main)
 hf_gen_msl(broad_cell_emit.comp      broad_cell_emit.comp.hlsl      comp broad_cell_emit_main)
+# Deterministic Integer Broadphase Slice 2 (Slice BP2, THE CRUX of FLAGSHIP #23): THE CANDIDATE-PAIR GENERATOR —
+# the 27-cell-stencil pair cull over the BP1 grid + CSR cell table. broad_pair_count.comp (ONE thread per body i:
+# scan i's 3x3x3 stencil in FIXED order, count j>i with AabbOverlap — the six-compare predicate copied VERBATIM
+# from broad.h/fpx.h), broad_pair_scan.comp (SINGLE-THREAD exclusive prefix-sum -> perBodyOffset),
+# broad_pair_emit.comp (SINGLE-THREAD ascending-body scatter of the canonical fpx::FxPair{i,j} into each body's
+# disjoint slice — single-thread because the per-i emit ORDER must be reproduced bit-for-bit). ALL PURE INT32
+# (FloorDiv + integer compares + an ascending scatter, NO int64/fxmul/sqrt) so these MSL-generate NATIVELY (a
+# TRUE GPU pass on BOTH backends). ReadBuffer reads pairsOut + offsets, PROVEN BIT-EXACT vs the CPU
+# broad.h::BuildBroadphasePairs (memcmp) + grid-pairs==all-pairs equivalence vs fpx::BuildPairs. Behind
+# --broad-pair only; NO new RHI; all existing shaders + goldens untouched.
+hf_gen_msl(broad_pair_count.comp     broad_pair_count.comp.hlsl     comp broad_pair_count_main)
+hf_gen_msl(broad_pair_scan.comp      broad_pair_scan.comp.hlsl      comp broad_pair_scan_main)
+hf_gen_msl(broad_pair_emit.comp      broad_pair_emit.comp.hlsl      comp broad_pair_emit_main)
 # Deterministic Persistent Contacts Slice 1 (Slice PS1, the BEACHHEAD of FLAGSHIP #21: DETERMINISTIC
 # WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist): persist_key.comp is THE CONTACT FEATURE
 # ID pass — ONE thread per contact point runs the order-normalized integer key (bodyA<bodyB swap) + the fixed

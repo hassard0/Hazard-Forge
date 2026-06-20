@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>      // BP2: std::string for the per-scene test labels
 #include <vector>
 #include "test_main.h"  // HF_TEST_MAIN_INIT(): headless crash-dialog suppression
 
@@ -42,6 +43,16 @@ static fx FromInt(int v) { return (fx)(v << kFrac); }
 static fpx::FxBody MakeBody(int x, int y, int z, fx radius) {
     fpx::FxBody b;
     b.pos = fpx::FxVec3{FromInt(x), FromInt(y), FromInt(z)};
+    b.radius = radius;
+    b.invMass = kOne;
+    b.flags = fpx::kFlagDynamic;
+    return b;
+}
+
+// A dynamic body at a Q16.16 world position (for clustered/overlapping BP2 scenes with sub-unit offsets).
+static fpx::FxBody MakeBodyFx(fx x, fx y, fx z, fx radius) {
+    fpx::FxBody b;
+    b.pos = fpx::FxVec3{x, y, z};
     b.radius = radius;
     b.invMass = kOne;
     b.flags = fpx::kFlagDynamic;
@@ -194,6 +205,162 @@ int main() {
         bool seq = (t.cellBodies.size() == 6u);
         for (uint32_t i = 0; i < t.cellBodies.size(); ++i) if (t.cellBodies[i] != i) seq = false;
         check(seq, "single-cluster cellBodies == {0,1,2,3,4,5} (ascending body index)");
+    }
+
+    // ======================= Slice BP2 — THE CANDIDATE-PAIR GENERATOR =======================
+    // Pins the BP2 contracts the GPU broad_pair_* + the equivalence proof build on:
+    //   * BuildBroadphasePairs emits the canonical i<j set; every emitted pair has i<j, each unordered pair
+    //     appears EXACTLY once, the per-body offsets are an exclusive prefix-sum of the counts.
+    //   * PairSetEquivalentToAllPairs is TRUE (grid-pairs == fpx::BuildPairs all-pairs, byte-identical after
+    //     sort) for several scenes (sparse / clustered / all-overlapping) — THE CRUX.
+    //   * determinism: two builds byte-identical.
+    //   * degenerate single-body scene -> zero pairs.
+    const fx kHalf = kOne / 2;   // 0.5 (a Q16.16-exact sub-unit offset)
+
+    // Helper: build the grid + cell table for a body set at the BP2 cell-size and run the pair generator.
+    auto buildPairs = [&](const std::vector<fpx::FxBody>& bodies, std::vector<uint32_t>& off,
+                          std::vector<fpx::FxPair>& pairs) {
+        broad::BodyGrid grid = broad::MakeBodyGrid(bodies, kCellSize);
+        broad::BodyCellTable table = broad::BuildBodyCellTable(bodies, grid);
+        broad::BuildBroadphasePairs(bodies, grid, table, off, pairs);
+    };
+
+    // ----- BroadphaseAccept == fpx::AabbOverlap over BodyAabb (the predicate identity) -----
+    {
+        fpx::FxBody a = MakeBodyFx(0, 0, 0, kRadius);
+        fpx::FxBody b = MakeBodyFx(kHalf, 0, 0, kRadius);          // 0.5 apart, diam 1.0 -> overlap
+        fpx::FxBody c = MakeBodyFx(kOne * 3, 0, 0, kRadius);       // 3 apart -> no overlap
+        check(broad::BroadphaseAccept(a, b), "BroadphaseAccept: near pair overlaps");
+        check(!broad::BroadphaseAccept(a, c), "BroadphaseAccept: distant pair does not overlap");
+        check(broad::BroadphaseAccept(a, b) ==
+              fpx::AabbOverlap(fpx::BodyAabb(a), fpx::BodyAabb(b)),
+              "BroadphaseAccept == fpx::AabbOverlap(BodyAabb,BodyAabb)");
+    }
+
+    // ----- canonical i<j set + offsets + equivalence, over THREE scenes -----
+    auto pinScene = [&](const std::vector<fpx::FxBody>& bodies, const char* tag) {
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> pairs;
+        buildPairs(bodies, off, pairs);
+        const uint32_t n = (uint32_t)bodies.size();
+        // every emitted pair has i<j AND i,j in range.
+        bool canonical = true;
+        for (const fpx::FxPair& p : pairs)
+            if (!(p.i < p.j && p.j < n)) canonical = false;
+        check(canonical, (std::string(tag) + ": every emitted pair is canonical i<j in range").c_str());
+        // each unordered pair appears EXACTLY once (sort + adjacent-dup check).
+        std::vector<fpx::FxPair> sorted = pairs;
+        broad::SortPairsCanonical(sorted);
+        bool unique = true;
+        for (size_t s = 1; s < sorted.size(); ++s)
+            if (sorted[s].i == sorted[s - 1].i && sorted[s].j == sorted[s - 1].j) unique = false;
+        check(unique, (std::string(tag) + ": each unordered pair appears once").c_str());
+        // offsets are an exclusive prefix-sum: off.size()==n, monotone non-decreasing, sum == pair count
+        // (each body i's slice [off[i], off[i+1]) — with off[n] implied == pairs.size()).
+        bool offOk = (off.size() == (size_t)n);
+        for (uint32_t i = 1; i < n; ++i) if (off[i] < off[i - 1]) offOk = false;
+        if (n > 0) offOk = offOk && (off[0] == 0u);
+        check(offOk, (std::string(tag) + ": perBodyOffset is a monotone exclusive prefix-sum").c_str());
+        // THE EQUIVALENCE PROOF: grid-pairs == fpx::BuildPairs all-pairs (byte-identical after sort).
+        check(broad::PairSetEquivalentToAllPairs(bodies, pairs),
+              (std::string(tag) + ": PairSetEquivalentToAllPairs (grid-pairs == all-pairs)").c_str());
+        // determinism: a second build is byte-identical.
+        std::vector<uint32_t> off2;
+        std::vector<fpx::FxPair> pairs2;
+        buildPairs(bodies, off2, pairs2);
+        bool det = (off2 == off) && (pairs2.size() == pairs.size()) &&
+                   (pairs.empty() ||
+                    std::memcmp(pairs2.data(), pairs.data(), pairs.size() * sizeof(fpx::FxPair)) == 0);
+        check(det, (std::string(tag) + ": BuildBroadphasePairs is deterministic (two builds byte-equal)").c_str());
+        return (uint32_t)pairs.size();
+    };
+
+    // Scene A — SPARSE: a 3x1x3 grid at spacing 2 (no two bodies overlap -> zero pairs).
+    {
+        std::vector<fpx::FxBody> bodies;
+        for (int z = 0; z < 3; ++z)
+            for (int x = 0; x < 3; ++x)
+                bodies.push_back(MakeBody(x * 2, 0, z * 2, kRadius));
+        uint32_t p = pinScene(bodies, "sparse");
+        check(p == 0u, "sparse scene -> zero candidate pairs");
+    }
+
+    // Scene B — CLUSTERED: a sparse backbone + a tight 3-body cluster (a triangle of pairs) + a tight pair.
+    {
+        std::vector<fpx::FxBody> bodies;
+        for (int z = 0; z < 3; ++z)
+            for (int x = 0; x < 3; ++x)
+                bodies.push_back(MakeBody(x * 2, 0, z * 2, kRadius));
+        bodies.push_back(MakeBodyFx(kHalf, 0, kHalf, kRadius));   // near body 0 (0,0,0) -> overlaps
+        bodies.push_back(MakeBodyFx(kHalf, 0, 0, kRadius));
+        bodies.push_back(MakeBodyFx(0, 0, kHalf, kRadius));
+        uint32_t p = pinScene(bodies, "clustered");
+        check(p >= 3u, "clustered scene -> a non-trivial pair set (>=3 from the cluster triangle)");
+    }
+
+    // Scene C — ALL-OVERLAPPING: k bodies all within one cell, pairwise overlapping -> k*(k-1)/2 pairs
+    // (the dense limit where grid-pairs == all-pairs must STILL hold exactly).
+    {
+        std::vector<fpx::FxBody> bodies;
+        const int k = 5;
+        for (int i = 0; i < k; ++i) bodies.push_back(MakeBodyFx((fx)(i * (int)(kOne / 8)), 0, 0, kRadius));
+        uint32_t p = pinScene(bodies, "all-overlap");
+        check(p == (uint32_t)(k * (k - 1) / 2), "all-overlapping scene -> k*(k-1)/2 pairs (the dense limit)");
+    }
+
+    // ----- a body straddling a cell boundary: the ±1 stencil still finds the overlap -----
+    {
+        // Two bodies at x=1.5 and x=2.5 (cells 0 and 1 at cellSize 2): 1.0 apart, diam 1.0 -> AABBs touch.
+        std::vector<fpx::FxBody> bodies;
+        bodies.push_back(MakeBodyFx(kOne + kHalf, 0, 0, kRadius));      // x=1.5, cell 0
+        bodies.push_back(MakeBodyFx(kOne * 2 + kHalf, 0, 0, kRadius));  // x=2.5, cell 1
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> pairs;
+        buildPairs(bodies, off, pairs);
+        check(pairs.size() == 1u && pairs[0].i == 0u && pairs[0].j == 1u,
+              "cross-cell-boundary overlap found by the ±1 stencil (canonical {0,1})");
+        check(broad::PairSetEquivalentToAllPairs(bodies, pairs),
+              "cross-cell-boundary: grid-pairs == all-pairs");
+    }
+
+    // ----- degenerate: a single body -> zero pairs -----
+    {
+        std::vector<fpx::FxBody> bodies;
+        bodies.push_back(MakeBody(0, 0, 0, kRadius));
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> pairs;
+        buildPairs(bodies, off, pairs);
+        check(pairs.empty(), "single-body scene -> zero pairs");
+        check(off.size() == 1u && off[0] == 0u, "single-body offsets == {0}");
+        check(broad::PairSetEquivalentToAllPairs(bodies, pairs),
+              "single-body: grid-pairs == all-pairs (both empty)");
+    }
+
+    // ----- empty: zero bodies -> zero pairs, equivalence holds -----
+    {
+        std::vector<fpx::FxBody> bodies;
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> pairs;
+        buildPairs(bodies, off, pairs);
+        check(pairs.empty() && off.empty(), "empty scene -> zero pairs, empty offsets");
+        check(broad::PairSetEquivalentToAllPairs(bodies, pairs), "empty: grid-pairs == all-pairs");
+    }
+
+    // ----- MeasureBroadphasePairs is a pure summary (pairs match a direct build, canonical flag true) -----
+    {
+        std::vector<fpx::FxBody> bodies;
+        bodies.push_back(MakeBodyFx(0, 0, 0, kRadius));
+        bodies.push_back(MakeBodyFx(kHalf, 0, 0, kRadius));
+        bodies.push_back(MakeBodyFx(0, 0, kHalf, kRadius));
+        broad::BodyGrid grid = broad::MakeBodyGrid(bodies, kCellSize);
+        broad::BodyCellTable table = broad::BuildBodyCellTable(bodies, grid);
+        broad::BroadphasePairMeasure m = broad::MeasureBroadphasePairs(bodies, grid, table);
+        std::vector<uint32_t> off; std::vector<fpx::FxPair> pairs;
+        broad::BuildBroadphasePairs(bodies, grid, table, off, pairs);
+        check(m.bodies == 3u && m.pairs == (uint32_t)pairs.size(), "MeasureBroadphasePairs.{bodies,pairs} match");
+        check(m.allCanonical, "MeasureBroadphasePairs.allCanonical == true");
+        broad::BroadphasePairMeasure m2 = broad::MeasureBroadphasePairs(bodies, grid, table);
+        check(std::memcmp(&m, &m2, sizeof(m)) == 0, "MeasureBroadphasePairs is a pure function (two calls equal)");
     }
 
     if (g_fail == 0) std::printf("broad_test: ALL PASS\n");

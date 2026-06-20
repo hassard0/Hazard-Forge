@@ -627,6 +627,19 @@ hf_compile_shaders(
     "shaders/broad_cell_count.comp.hlsl:cs"
     "shaders/broad_cell_scan.comp.hlsl:cs"
     "shaders/broad_cell_emit.comp.hlsl:cs"
+    # Deterministic Integer Broadphase Slice 2 (Slice BP2, THE CRUX of FLAGSHIP #23): THE CANDIDATE-PAIR
+    # GENERATOR — the 27-cell-stencil pair cull over the BP1 grid + CSR cell table, meshed by THREE pure-INT32
+    # count->scan->emit passes. broad_pair_count.comp (ONE thread per body i: scan i's 3x3x3 stencil in FIXED
+    # order, count j>i with the six-compare AabbOverlap copied VERBATIM from broad.h/fpx.h), broad_pair_scan.comp
+    # (SINGLE-THREAD exclusive prefix-sum -> perBodyOffset + sentinel), broad_pair_emit.comp (SINGLE-THREAD
+    # ascending-body scatter of the canonical fpx::FxPair{i,j} into each body's disjoint slice — single-thread
+    # because the per-i emit ORDER must be reproduced bit-for-bit). ALL PURE INT32 (FloorDiv + integer compares +
+    # an ascending scatter, NO int64/fxmul/sqrt) so these MSL-GENERATE NATIVELY (in hf_gen_msl) and Metal
+    # dispatches the GPU passes. ReadBuffer reads pairsOut + offsets, PROVEN BIT-EXACT vs the CPU
+    # broad.h::BuildBroadphasePairs (memcmp) + grid-pairs==all-pairs equivalence vs fpx::BuildPairs. NO new RHI.
+    "shaders/broad_pair_count.comp.hlsl:cs"
+    "shaders/broad_pair_scan.comp.hlsl:cs"
+    "shaders/broad_pair_emit.comp.hlsl:cs"
     # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
     # grid-hash QUERY meshed by THREE pure-INT32 count->scan->emit passes (the GR2 grain_neighbor twin, per
     # BODY instead of per grain) OVER the reused FL2 fluid cell table (fluid_cell_{count,scan,emit} build the

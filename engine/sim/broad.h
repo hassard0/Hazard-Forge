@@ -29,7 +29,9 @@
 // the bounding-box cell volume — fine for the canonical pile scenes, the MakeGrainGrid precedent; a hashed
 // grid is a future refinement).
 
+#include <algorithm>   // BP2: std::sort (the canonical pair-set sort for the equivalence proof)
 #include <cstdint>
+#include <cstring>     // BP2: std::memcmp (the byte-exact equivalence compare)
 #include <vector>
 
 #include "sim/gjk.h"   // read-only: transitively gives convex/fric/persist/fpx/grain. We use fpx:: only:
@@ -169,6 +171,177 @@ inline BodyGridMeasure MeasureBodyGrid(const std::vector<fpx::FxBody>& bodies, c
         if (cnt > 0u) ++m.occupiedCells;
         if (cnt > m.maxCellOccupancy) m.maxCellOccupancy = cnt;
     }
+    return m;
+}
+
+// ===== Slice BP2 — THE CANDIDATE-PAIR GENERATOR (the crux) ============================================
+// The 27-cell-stencil candidate-pair generator over the BP1 body grid + CSR cell table: for each body i
+// (ascending), scan the 3x3x3 = 27-cell stencil around i's cell (FIXED order, clamped to the bounded
+// grid) and emit the canonical pair fpx::FxPair{i, j} for each body j in those cells with j > i AND
+// fpx::AabbOverlap(BodyAabb(i), BodyAabb(j)). The result is the SAME candidate-pair set the O(n^2)
+// fpx::BuildPairs all-pairs scan produces — PROVED by PairSetEquivalentToAllPairs (sort both lists by
+// (i,j); byte-compare). Pure int32 (stencil iteration + the six-compare AABB predicate + an ascending
+// scatter; NO fxmul, NO int64, NO sqrt) -> the broad_pair_{count,scan,emit}.comp shaders MSL-generate
+// NATIVELY (a TRUE GPU pass on BOTH backends).
+//
+// REUSE (read-only, byte-frozen): fpx::FxAabb / fpx::BodyAabb / fpx::AabbOverlap / fpx::FxPair (the AABB
+// predicate + the canonical pair shape) + fpx::BuildPairs (THE all-pairs reference). The 27-cell stencil
+// STRUCTURE mirrors grain.h::BuildGrainNeighborList, but with the j>i de-dup + the AABB predicate (NOT
+// the radius test) — a rigid pair list is canonical i<j ONCE (the fpx.h:283 discipline).
+//
+// THE DET-CRUX (the grain/BP1 lesson): the COUNT is per-body-disjoint (race-free); the EMIT is the
+// single-thread ascending-body scatter (a parallel atomic cursor would make the within-list order
+// GPU-schedule-dependent -> nondeterministic). Within body i the stencil cells are visited in a FIXED
+// (dz,dy,dx) order, bodies within a cell ascending -> the per-i emit order is deterministic (NOT
+// necessarily ascending-j across cells; the equivalence proof compares SETS via a canonical sort).
+//
+// THE cellSize BOUND: the ±1 stencil is EXACT only when cellSize >= the max body AABB diameter
+// (2*maxRadius), so two overlapping AABBs are always within ±1 cell. The BP2 scene/tests honor this
+// (uniform-radius dynamic bodies, cellSize >= 2*radius); a body larger than one cell is a BP3 concern.
+
+// BroadphaseAccept(a, b): the candidate-pair predicate — fpx::AabbOverlap over the two body AABBs (the
+// six-compare separating-axis test). Pure int32, copied into broad_pair_count/emit VERBATIM.
+inline bool BroadphaseAccept(const fpx::FxBody& a, const fpx::FxBody& b) {
+    return fpx::AabbOverlap(fpx::BodyAabb(a), fpx::BodyAabb(b));
+}
+
+// CountBroadphasePairs(bodies, grid, table, perBodyOut): per body i, count j>i in the 27-cell stencil
+// with overlapping AABB (per-body-disjoint, race-free). perBodyOut[i] = that count; returns the total.
+// The shader broad_pair_count.comp computes THIS per thread (one thread per body i). FIXED stencil order.
+inline uint32_t CountBroadphasePairs(const std::vector<fpx::FxBody>& bodies, const BodyGrid& grid,
+                                     const BodyCellTable& table, std::vector<uint32_t>& perBodyOut) {
+    const uint32_t n = (uint32_t)bodies.size();
+    perBodyOut.assign((size_t)n, 0u);
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const fpx::FxCell ci = BodyCellOf(bodies[i].pos, grid.cellSize);
+        uint32_t c = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const fpx::FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            // Skip stencil cells outside the bounded grid (clamp).
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = FlatBodyCellId(nc, grid);
+            for (uint32_t s = table.cellStart[cell]; s < table.cellStart[cell + 1u]; ++s) {
+                const uint32_t j = table.cellBodies[s];
+                if (j <= i) continue;                                  // canonical de-dup: emit (i,j) once
+                if (BroadphaseAccept(bodies[i], bodies[j])) ++c;
+            }
+        }
+        perBodyOut[i] = c;
+        total += c;
+    }
+    return total;
+}
+
+// BuildBroadphasePairs(bodies, grid, table, perBodyOffset, pairsOut): the full count->scan->emit mesher.
+// (1) CountBroadphasePairs -> per-body counts; (2) exclusive prefix-sum -> perBodyOffset (the serial
+// scan); (3) single-thread ascending body i scatter each accepted (i,j>i) into i's disjoint slice in the
+// FIXED stencil order. The pair list is grouped by i (ascending), then stencil-cell (dz,dy,dx ascending),
+// then j (ascending within a cell) -> fully deterministic. The GPU broad_pair_{count,scan,emit} mirror
+// this byte-for-byte.
+inline void BuildBroadphasePairs(const std::vector<fpx::FxBody>& bodies, const BodyGrid& grid,
+                                 const BodyCellTable& table, std::vector<uint32_t>& perBodyOffset,
+                                 std::vector<fpx::FxPair>& pairsOut) {
+    const uint32_t n = (uint32_t)bodies.size();
+    std::vector<uint32_t> counts;
+    const uint32_t total = CountBroadphasePairs(bodies, grid, table, counts);
+    // (2) SCAN: exclusive prefix-sum -> perBodyOffset (each body's disjoint write base).
+    perBodyOffset.assign((size_t)n, 0u);
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        perBodyOffset[i] = running;
+        running += counts[i];
+    }
+    // (3) EMIT: single-thread ascending body i scatter into [perBodyOffset[i], ..) in the FIXED order.
+    pairsOut.assign((size_t)total, fpx::FxPair{0u, 0u});
+    for (uint32_t i = 0; i < n; ++i) {
+        const fpx::FxCell ci = BodyCellOf(bodies[i].pos, grid.cellSize);
+        uint32_t local = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const fpx::FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = FlatBodyCellId(nc, grid);
+            for (uint32_t s = table.cellStart[cell]; s < table.cellStart[cell + 1u]; ++s) {
+                const uint32_t j = table.cellBodies[s];
+                if (j <= i) continue;
+                if (BroadphaseAccept(bodies[i], bodies[j])) {
+                    pairsOut[perBodyOffset[i] + local] = fpx::FxPair{i, j};
+                    ++local;
+                }
+            }
+        }
+    }
+}
+
+// SortPairsCanonical(pairs): sort a pair list by (i, j) ascending (a canonical total order). Used by the
+// equivalence proof to compare the grid-pair SET against fpx::BuildPairs as SETS (sort-then-memcmp). Pure
+// integer compares.
+inline void SortPairsCanonical(std::vector<fpx::FxPair>& pairs) {
+    std::sort(pairs.begin(), pairs.end(), [](const fpx::FxPair& a, const fpx::FxPair& b) {
+        return a.i != b.i ? a.i < b.i : a.j < b.j;
+    });
+}
+
+// PairSetEquivalentToAllPairs(bodies, gridPairs): THE EQUIVALENCE PROOF. Build the all-pairs reference via
+// fpx::BuildPairs over the SAME bodies, sort BOTH lists by (i,j), and compare as SETS (same count,
+// byte-identical after sort). Returns true iff the grid-emitted candidate set is BYTE-IDENTICAL to the
+// O(n^2) reference — the broadphase is provably bit-transparent (no pair missed, none duplicated). EXACT
+// (a byte memcmp of sorted lists), NOT within-band. The make-or-break falsifiable claim.
+inline bool PairSetEquivalentToAllPairs(const std::vector<fpx::FxBody>& bodies,
+                                        const std::vector<fpx::FxPair>& gridPairs) {
+    fpx::FxWorld world;
+    world.bodies = bodies;
+    std::vector<uint32_t> refOffset;
+    std::vector<fpx::FxPair> refPairs;
+    fpx::BuildPairs(world, refOffset, refPairs);   // the all-pairs reference (already i-then-j ordered)
+    if (refPairs.size() != gridPairs.size()) return false;
+    std::vector<fpx::FxPair> a = gridPairs;        // copy: the grid list is stencil-ordered, sort it
+    std::vector<fpx::FxPair> b = refPairs;
+    SortPairsCanonical(a);
+    SortPairsCanonical(b);
+    if (a.empty()) return true;
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(fpx::FxPair)) == 0;
+}
+
+// ----- BroadphasePairMeasure: a deterministic summary the showcase/test asserts (a pure function) -------
+struct BroadphasePairMeasure {
+    uint32_t bodies = 0;       // the body count
+    uint32_t pairs = 0;        // the total candidate-pair count
+    uint32_t maxPerBody = 0;   // the peak per-body emitted-pair count
+    bool     allCanonical = false;  // every emitted pair has i < j AND each unordered pair appears once
+};
+
+inline BroadphasePairMeasure MeasureBroadphasePairs(const std::vector<fpx::FxBody>& bodies,
+                                                    const BodyGrid& grid, const BodyCellTable& table) {
+    BroadphasePairMeasure m;
+    m.bodies = (uint32_t)bodies.size();
+    std::vector<uint32_t> offset;
+    std::vector<fpx::FxPair> pairs;
+    BuildBroadphasePairs(bodies, grid, table, offset, pairs);
+    m.pairs = (uint32_t)pairs.size();
+    // peak per-body count (from the offsets + total).
+    const uint32_t n = m.bodies;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t hi = (i + 1u < n) ? offset[i + 1u] : m.pairs;
+        const uint32_t cnt = hi - offset[i];
+        if (cnt > m.maxPerBody) m.maxPerBody = cnt;
+    }
+    // canonical: every pair i<j AND no unordered duplicate (sort + adjacent-equal check).
+    bool canonical = true;
+    for (const fpx::FxPair& p : pairs) if (p.i >= p.j) canonical = false;
+    std::vector<fpx::FxPair> sorted = pairs;
+    SortPairsCanonical(sorted);
+    for (size_t s = 1; s < sorted.size(); ++s)
+        if (sorted[s].i == sorted[s - 1].i && sorted[s].j == sorted[s - 1].j) canonical = false;
+    m.allCanonical = canonical;
     return m;
 }
 
