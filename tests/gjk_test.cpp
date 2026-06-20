@@ -639,6 +639,75 @@ int main() {
               "RunHullRollback: mispredict genuinely diverged before rollback (real divergence corrected)");
     }
 
+    // ===== Slice GJ6 — THE LIT 3D RENDER CAPSTONE: HullToRenderInstances over the settled hull world. =====
+    // Pure CPU, render-only float. Pins: (a) the canonical-hull triangle counts (tetra 4, box 12, octa 8,
+    // wedge 8); (b) HullToRenderInstances is a PURE FUNCTION of the world (two calls byte-equal — the
+    // provenance contract); (c) a render of the SETTLED world differs from a PERTURBED world (the render
+    // reflects the bit-exact sim state). The integer sim is untouched.
+    {
+        auto fd = [&](double v) { return (fx)(v * (double)kOne + (v < 0 ? -0.5 : 0.5)); };
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto hbody = [&](fx x, fx y, fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+
+        // (a) per-hull canonical triangle counts (HullTriIndices) — tetra 4 / box 12 / octa 8 / wedge 8.
+        {
+            std::vector<uint32_t> tris;
+            gjk::HullTriIndices(gjk::MakeTetra(kOne), tris);
+            check(tris.size() == 4u * 3u, "HullTriIndices: tetra = 4 triangles");
+            gjk::HullTriIndices(gjk::MakeBox(kOne, kOne, kOne), tris);
+            check(tris.size() == 12u * 3u, "HullTriIndices: box = 12 triangles");
+            gjk::HullTriIndices(gjk::MakeOcta(kOne), tris);
+            check(tris.size() == 8u * 3u, "HullTriIndices: octa = 8 triangles");
+            gjk::HullTriIndices(gjk::MakeWedge(kOne, kOne, kOne), tris);
+            check(tris.size() == 8u * 3u, "HullTriIndices: wedge = 8 triangles");
+        }
+
+        // The GJ4 settle scene (== the showcase): floor + tetra + octa + static box + wedge.
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity = convex::FxVec3{0, kGravY, 0}; cfg.dt = kOne / 60; cfg.solveIters = 24;
+        cfg.restitution = 0; cfg.slop = kOne / 64; cfg.beta = (fx)((int64_t)4 * kOne / 10);
+        cfg.linDamp = (fx)((int64_t)97 * kOne / 100); cfg.angDamp = (fx)((int64_t)30 * kOne / 100);
+        cfg.posIters = 4;
+        auto buildScene = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(hbody(0, 0, 0, false));            w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));
+            w.bodies.push_back(hbody(fd(-2.0), fd(2.5), 0, true)); w.hulls.push_back(gjk::MakeTetra(kOne));
+            w.bodies.push_back(hbody(0, fd(2.5), 0, true));        w.hulls.push_back(gjk::MakeOcta(kOne));
+            w.bodies.push_back(hbody(fd(2.6), fd(2.0), 0, false)); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            w.bodies.push_back(hbody(fd(1.2), fd(2.4), 0, true));  w.hulls.push_back(gjk::MakeWedge(kOne, kOne, kOne));
+            return w;
+        };
+        gjk::HullWorld settled = buildScene();
+        gjk::StepHullWorldN(settled, cfg, 240u);
+
+        // (b) PROVENANCE: two HullToRenderInstances calls on the settled world are BYTE-EQUAL.
+        const gjk::HullRenderMesh m1 = gjk::HullToRenderInstances(settled);
+        const gjk::HullRenderMesh m2 = gjk::HullToRenderInstances(settled);
+        check(gjk::HullRenderMeshEqual(m1, m2),
+              "HullToRenderInstances: two calls BYTE-EQUAL (pure function of the bit-exact world)");
+        // Non-trivial scene: tetra(4)+octa(8)+box(12)+wedge(8)+floor(12) = 44 triangles, 5 bodies meshed.
+        check(m1.triangles == (4u + 8u + 12u + 8u + 12u),
+              "HullToRenderInstances: triangle count == sum of the canonical-hull tris (44)");
+        check(m1.verts.size() == m1.triangles * 3u, "HullToRenderInstances: 3 verts per triangle (soup)");
+
+        // (c) the render reflects the sim state: a PERTURBED world produces a DIFFERENT soup.
+        gjk::HullWorld perturbed = buildScene();
+        gjk::StepHullWorldN(perturbed, cfg, 200u);   // a different settle tick count -> different poses
+        const gjk::HullRenderMesh mp = gjk::HullToRenderInstances(perturbed);
+        check(!gjk::HullRenderMeshEqual(m1, mp),
+              "HullToRenderInstances: settled vs perturbed world differ (render reflects the sim state)");
+    }
+
     (void)hullNames;
     if (g_fail == 0) std::printf("gjk_test: ALL PASS\n");
     else std::printf("gjk_test: %d FAIL\n", g_fail);

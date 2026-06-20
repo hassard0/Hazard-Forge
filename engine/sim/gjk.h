@@ -1439,5 +1439,221 @@ inline HullWorld RunHullRollback(const HullWorld& world0, const convex::ConvexSt
     return w;
 }
 
+// =========================================================================================================
+// Slice GJ6 — General Convex-Hull Contacts: THE LIT 3D RENDER CAPSTONE (the money-shot, FLAGSHIP #22 FINAL).
+// APPENDED after RunHullRollback (GJ1-GJ5's lines above are BYTE-FROZEN). PURE host FLOAT, render-only — the
+// ONE float crossing of the whole flagship, OUTSIDE the bit-exact integer loop. Takes the bit-exact settled
+// HullWorld (GJ4 StepHullWorldN / GJ5 RunHullLockstep output) and produces a FLOAT world-space TRIANGLE SOUP
+// (positions + per-vertex normals + per-hull-type matte colors) the showcase draws LIT 3D through the EXISTING
+// instanced-lit pipeline (lit.vert + lit.frag + shadow.vert, REUSED VERBATIM). NO new shader, NO new RHI. The
+// integer sim is NOT mutated; HullToRenderInstances is a PURE FUNCTION of the world (two calls byte-equal — the
+// provenance contract the showcase asserts).
+//
+// THE DESIGN CALL (the CX6/FC6/FR6 render-capstone twin, adapted for PER-HULL meshes): unlike the box capstones
+// (a single shared cube mesh, instanced), GJ6's hulls have DIFFERENT meshes (tetra 4 tris, box 12, octa 8,
+// wedge 8), so the cleanest render-only form that REUSES the existing pipeline with the LEAST new plumbing is a
+// WORLD-SPACE TRIANGLE SOUP: transform each body's HullMesh triangles by the body's FLOAT transform
+// (fpx::FxBodyTransform's translate+rotate, REUSED in spirit), compute a per-triangle FLAT FLOAT normal for
+// lighting, tag each vertex with a per-hull-type matte color, and accumulate ONE float vertex buffer drawn as a
+// SINGLE non-instanced lit mesh (identity model matrix — the verts are already in world space). One draw,
+// no per-type instancing, no new pipeline. MATTE (the showcase sets metallic 0 / roughness 1) to DODGE the
+// documented GF6/FR6/JT6/PS6/CX6 IRIDESCENCE TRAP.
+//
+// PER-HULL FACE TRIANGULATION (the GJ6-new geometry): GJ1's FxHull is VERTS-ONLY. We add a FIXED triangle index
+// list for each CANONICAL hull (tetra/box/octa/wedge) — host float, render-only, it does NOT touch the integer
+// FxHull the sim collides. The winding is fixed OUTWARD per triangle at build time by orienting each face normal
+// AWAY from the hull centroid (the origin for these origin-symmetric canonical hulls) — the EpaAddFace idiom in
+// float. (A general convex-hull-from-points triangulator is YAGNI here — GJ6 renders the canonical-hull meshes;
+// a general triangulator is a documented future refinement.)
+//
+// SEAM DISCIPLINE: unchanged — header-only, ZERO backend symbols. GJ6 only APPENDS this render bridge; the
+// bit-exact GJ1-GJ5 sim is untouched. It uses fpx::FxToFloat (already #included read-only via convex.h->fpx.h)
+// + plain host float math (no math::Mat4 dependency — the soup carries world-space floats directly). NO new
+// shader, NO new RHI.
+
+// ----- HullRenderVertex: ONE float render vertex of the world-space triangle soup (render-only POD) ----------
+// pos/normal are world-space FLOAT; color is the per-hull-type matte albedo tint (fed into the lit shader's
+// vertex-color * texture albedo). Self-contained (no engine/scene dependency) — the showcase copies these into
+// its scene::Vertex array. Deterministic: a pure float function of the body's bit-exact pos/orient.
+struct HullRenderVertex {
+    float pos[3];
+    float normal[3];
+    float color[3];
+};
+
+// ----- HullRenderMesh: the accumulated world-space triangle soup (3 verts per triangle, no index buffer) ----
+// verts.size() is a multiple of 3 (each consecutive triple is one outward-wound, flat-shaded triangle). A PURE
+// FUNCTION of the HullWorld (two HullToRenderInstances calls produce byte-equal verts — the provenance proof).
+struct HullRenderMesh {
+    std::vector<HullRenderVertex> verts;   // triangle soup: 3 consecutive verts == 1 triangle
+    uint32_t triangles = 0;                // verts.size() / 3 (convenience; == the drawn triangle count)
+};
+
+// ----- HullTriIndices(hull): the FIXED face triangulation of a canonical hull as flat triangle indices -------
+// Returns the per-hull triangle index list (into hull.verts), keyed by the vertex COUNT (the canonical hulls
+// have distinct counts: tetra 4 / octa 6 / box 8 / wedge 6 — the box vs the two 6-vert hulls are disambiguated
+// below). The winding here is arbitrary; HullToRenderMesh flips each triangle OUTWARD against the hull centroid
+// at build time, so the source winding does not matter. Render-only host data. count==6 needs a tie-break
+// between octa (6 verts, 8 tri) and wedge (6 verts, 8 tri): both are emitted with their own table, selected by
+// the caller via the explicit hull-kind it built — but since the soup builder only needs A valid triangulation
+// per hull and re-orients outward, we key octa/wedge by a structural test (an octa vertex lies on a single axis
+// pole; a wedge does not), making this a PURE function of the verts. tetra=4tri, box=12tri, octa=8tri,
+// wedge=8tri (== the spec's canonical-hull tri counts).
+inline void HullTriIndices(const FxHull& hull, std::vector<uint32_t>& tris) {
+    tris.clear();
+    auto push = [&](uint32_t a, uint32_t b, uint32_t c) { tris.push_back(a); tris.push_back(b); tris.push_back(c); };
+    if (hull.count == 4) {
+        // Tetra verts 0..3 — the 4 triangular faces (every triple of the 4 verts).
+        push(0, 1, 2); push(0, 1, 3); push(0, 2, 3); push(1, 2, 3);
+    } else if (hull.count == 8) {
+        // Box: sign sweep idx = ix*4 + iy*2 + iz (x outer, y mid, z inner). 6 quad faces -> 12 tris.
+        // -x face {0,1,3,2}, +x {4,5,7,6}, -y {0,1,5,4}, +y {2,3,7,6}, -z {0,2,6,4}, +z {1,3,7,5}.
+        auto quad = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) { push(a, b, c); push(a, c, d); };
+        quad(0, 1, 3, 2); quad(4, 5, 7, 6); quad(0, 1, 5, 4); quad(2, 3, 7, 6); quad(0, 2, 6, 4); quad(1, 3, 7, 5);
+    } else if (hull.count == 6) {
+        // 6 verts: octa (axis poles +x,-x,+y,-y,+z,-z) OR wedge (triangular prism). Disambiguate structurally:
+        // an OCTA vertex always has exactly TWO zero coordinates (it is an axis pole); a WEDGE vertex never does
+        // (all its verts have all-nonzero-ish coords for the canonical builder). A PURE function of the verts.
+        bool isOcta = true;
+        for (uint32_t i = 0; i < 6 && isOcta; ++i) {
+            int zeros = (hull.verts[i].x == 0) + (hull.verts[i].y == 0) + (hull.verts[i].z == 0);
+            if (zeros < 2) isOcta = false;
+        }
+        if (isOcta) {
+            // Octa: 8 triangular faces, each joining a +/- pole pair around the equator. Poles: +x=0,-x=1,
+            // +y=2,-y=3,+z=4,-z=5. The 8 faces are (x-pole, y-pole, z-pole) sign combinations.
+            push(0, 2, 4); push(0, 4, 3); push(0, 3, 5); push(0, 5, 2);
+            push(1, 4, 2); push(1, 3, 4); push(1, 5, 3); push(1, 2, 5);
+        } else {
+            // Wedge (triangular prism): verts 0(+x,-y,+z) 1(+x,-y,-z) 2(-x,-y,+z) 3(-x,-y,-z) 4(-x,+y,+z)
+            // 5(-x,+y,-z). 2 triangular caps (the +z/-z ends: {0,2,4} and {1,3,5}) + 3 quad sides -> 8 tris.
+            push(0, 2, 4); push(1, 5, 3);                                  // the two triangular caps
+            auto quad = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) { push(a, b, c); push(a, c, d); };
+            quad(0, 1, 3, 2);   // bottom rectangle (-y face)
+            quad(0, 4, 5, 1);   // slanted hypotenuse face (the +x->ridge slope)
+            quad(2, 3, 5, 4);   // back rectangle (-x face)
+        }
+    }
+    // Any other count -> empty (the canonical hulls only; documented YAGNI for a general triangulator).
+}
+
+// ----- per-hull-type matte albedo tints (render-only). Static floor = cool grey; dynamic hulls = warm matte
+// per-type accents (the CX6/FR6 warm-amber lesson: keep GREEN low so lit.frag's up-normal blue-sky ambient does
+// not push the read toward green/iridescence). These are the vertex-color tints multiplied by a white texture.
+inline void HullTypeColor(const FxHull& hull, bool dynamic, float out[3]) {
+    if (!dynamic) { out[0] = 0.51f; out[1] = 0.50f; out[2] = 0.49f; return; }   // cool matte grey floor/static box
+    if (hull.count == 4)      { out[0] = 0.92f; out[1] = 0.37f; out[2] = 0.12f; }   // tetra: warm rust-orange
+    else if (hull.count == 8) { out[0] = 0.85f; out[1] = 0.30f; out[2] = 0.20f; }   // box: warm brick
+    else {
+        bool isOcta = true;
+        for (uint32_t i = 0; i < 6 && isOcta; ++i) {
+            int zeros = (hull.verts[i].x == 0) + (hull.verts[i].y == 0) + (hull.verts[i].z == 0);
+            if (zeros < 2) isOcta = false;
+        }
+        if (isOcta) { out[0] = 0.80f; out[1] = 0.55f; out[2] = 0.12f; }   // octa: warm amber-gold
+        else        { out[0] = 0.78f; out[1] = 0.42f; out[2] = 0.10f; }   // wedge: warm tan
+    }
+}
+
+// ----- HullToRenderMesh(world): the bit-exact settled hull world -> the FLOAT world-space triangle soup -------
+// For each body i (FIXED order), transform its canonical HullMesh triangles by the body's FLOAT transform
+// (FxToFloat(pos) + the unit-quaternion rotation of the local vertex — fpx::FxBodyTransform's translate+rotate
+// reproduced in plain host float so the soup carries world-space floats directly, NO math::Mat4 plumbing),
+// compute a per-triangle FLAT outward FLOAT normal (the cross of two edges, flipped to point AWAY from the
+// transformed hull centroid), tag every vertex with the per-hull-type matte color, and append the 3 verts. A
+// PURE FUNCTION of `world` (no clock/RNG) — two calls produce byte-equal verts (the provenance contract). The
+// hulls' LOCAL verts are FxToFloat'd render-only; the integer sim is untouched.
+inline HullRenderMesh HullToRenderMesh(const HullWorld& world) {
+    HullRenderMesh out;
+    const size_t n = world.bodies.size() < world.hulls.size() ? world.bodies.size() : world.hulls.size();
+
+    // Rotate a LOCAL float vector by the body's (normalized) unit quaternion: v' = q * v * q^-1, plain float.
+    auto qrot = [](float qx, float qy, float qz, float qw, const float v[3], float out3[3]) {
+        // t = 2 * cross(q.xyz, v); v' = v + q.w*t + cross(q.xyz, t)
+        const float tx = 2.0f * (qy * v[2] - qz * v[1]);
+        const float ty = 2.0f * (qz * v[0] - qx * v[2]);
+        const float tz = 2.0f * (qx * v[1] - qy * v[0]);
+        out3[0] = v[0] + qw * tx + (qy * tz - qz * ty);
+        out3[1] = v[1] + qw * ty + (qz * tx - qx * tz);
+        out3[2] = v[2] + qw * tz + (qx * ty - qy * tx);
+    };
+
+    for (size_t i = 0; i < n; ++i) {
+        const FxBody& b = world.bodies[i];
+        const FxHull& hull = world.hulls[i];
+        std::vector<uint32_t> tris;
+        HullTriIndices(hull, tris);
+        if (tris.empty()) continue;
+
+        const bool dyn = convex::IsDynamic(b);
+        float color[3]; HullTypeColor(hull, dyn, color);
+
+        // The body's world transform pieces (render-only float; == fpx::FxBodyTransform's translate+rotate).
+        const float px = fpx::FxToFloat(b.pos.x), py = fpx::FxToFloat(b.pos.y), pz = fpx::FxToFloat(b.pos.z);
+        float qx = fpx::FxToFloat(b.orient.x), qy = fpx::FxToFloat(b.orient.y),
+              qz = fpx::FxToFloat(b.orient.z), qw = fpx::FxToFloat(b.orient.w);
+        // Normalize the quaternion (FxBodyTransform normalizes the orient; match it for a clean render).
+        const float qlen = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
+        if (qlen > 0.0f) { qx /= qlen; qy /= qlen; qz /= qlen; qw /= qlen; }
+
+        // The world-space centroid (the transformed hull centroid; for the origin-symmetric canonical hulls the
+        // LOCAL centroid is the origin, so the world centroid is the body position) — the outward reference.
+        const float cw[3] = {px, py, pz};
+
+        // Transform each local vert to world space once (cache), then emit the outward-wound triangles.
+        float worldV[kMaxHullVerts][3];
+        for (uint32_t v = 0; v < hull.count; ++v) {
+            const float lv[3] = {fpx::FxToFloat(hull.verts[v].x), fpx::FxToFloat(hull.verts[v].y),
+                                 fpx::FxToFloat(hull.verts[v].z)};
+            float rv[3]; qrot(qx, qy, qz, qw, lv, rv);
+            worldV[v][0] = rv[0] + px; worldV[v][1] = rv[1] + py; worldV[v][2] = rv[2] + pz;
+        }
+
+        for (size_t t = 0; t + 2 < tris.size(); t += 3) {
+            uint32_t ia = tris[t], ib = tris[t + 1], ic = tris[t + 2];
+            const float* A = worldV[ia];
+            const float* B0 = worldV[ib]; const float* C0 = worldV[ic];
+            // Flat face normal = (B-A) x (C-A), normalized + oriented OUTWARD (away from the world centroid).
+            float e1[3] = {B0[0] - A[0], B0[1] - A[1], B0[2] - A[2]};
+            float e2[3] = {C0[0] - A[0], C0[1] - A[1], C0[2] - A[2]};
+            float nrm[3] = {e1[1] * e2[2] - e1[2] * e2[1],
+                            e1[2] * e2[0] - e1[0] * e2[2],
+                            e1[0] * e2[1] - e1[1] * e2[0]};
+            const float nl = std::sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+            if (nl > 0.0f) { nrm[0] /= nl; nrm[1] /= nl; nrm[2] /= nl; }
+            // Face centroid -> outward test against the hull centroid; flip the winding if the normal points in.
+            const float fc[3] = {(A[0] + B0[0] + C0[0]) / 3.0f, (A[1] + B0[1] + C0[1]) / 3.0f,
+                                 (A[2] + B0[2] + C0[2]) / 3.0f};
+            const float outDot = nrm[0] * (fc[0] - cw[0]) + nrm[1] * (fc[1] - cw[1]) + nrm[2] * (fc[2] - cw[2]);
+            if (outDot < 0.0f) { const uint32_t tmp = ib; ib = ic; ic = tmp;
+                                 nrm[0] = -nrm[0]; nrm[1] = -nrm[1]; nrm[2] = -nrm[2]; }
+            const uint32_t idx3[3] = {ia, ib, ic};
+            for (int k = 0; k < 3; ++k) {
+                const float* P = worldV[idx3[k]];
+                HullRenderVertex hv;
+                hv.pos[0] = P[0]; hv.pos[1] = P[1]; hv.pos[2] = P[2];
+                hv.normal[0] = nrm[0]; hv.normal[1] = nrm[1]; hv.normal[2] = nrm[2];
+                hv.color[0] = color[0]; hv.color[1] = color[1]; hv.color[2] = color[2];
+                out.verts.push_back(hv);
+            }
+        }
+    }
+    out.triangles = (uint32_t)(out.verts.size() / 3);
+    return out;
+}
+
+// ----- HullToRenderInstances(world): the spec-named entry — the render payload for the showcase. ALIAS of
+// HullToRenderMesh (the per-hull-mesh capstones produce a triangle soup, not an instance set, but the name
+// mirrors the CX6/FC6 ConvexToRenderInstances idiom the spec/showcase reference). A PURE FUNCTION of the
+// bit-exact HullWorld — two calls byte-equal (the provenance contract the showcase asserts).
+inline HullRenderMesh HullToRenderInstances(const HullWorld& world) { return HullToRenderMesh(world); }
+
+// ----- HullRenderMeshEqual(a, b): byte-for-byte equality of two render soups (the provenance memcmp) ---------
+inline bool HullRenderMeshEqual(const HullRenderMesh& a, const HullRenderMesh& b) {
+    if (a.verts.size() != b.verts.size() || a.triangles != b.triangles) return false;
+    if (a.verts.empty()) return true;
+    return std::memcmp(a.verts.data(), b.verts.data(), a.verts.size() * sizeof(HullRenderVertex)) == 0;
+}
+
 }  // namespace gjk
 }  // namespace hf::sim

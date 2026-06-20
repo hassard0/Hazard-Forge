@@ -478,6 +478,8 @@ int main() {
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
             bool sawHullLockstepFeature = false;
+            // Slice GJ6: the deterministic-hull-render capability is advertised.
+            bool sawHullRenderFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -677,6 +679,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-gjk-epa") sawGjkEpaFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
+                    if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -860,6 +863,7 @@ int main() {
             check(sawGjkEpaFeature, "engine.features includes deterministic-gjk-epa");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
+            check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -1172,6 +1176,8 @@ int main() {
         bool sawGjkSettleShot = false;
         // Slice GJ5: the --gjk-lockstep-shot showcase flag is listed in the showcase manifest.
         bool sawGjkLockstepShot = false;
+        // Slice GJ6: the --gjk-render-shot showcase flag is listed in the showcase manifest.
+        bool sawGjkRenderShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1387,6 +1393,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-epa-shot") sawGjkEpaShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-settle-shot") sawGjkSettleShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-lockstep-shot") sawGjkLockstepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gjk-render-shot") sawGjkRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1570,6 +1577,7 @@ int main() {
         check(sawGjkEpaShot, "showcases manifest includes --gjk-epa-shot");
         check(sawGjkSettleShot, "showcases manifest includes --gjk-settle-shot");
         check(sawGjkLockstepShot, "showcases manifest includes --gjk-lockstep-shot");
+        check(sawGjkRenderShot, "showcases manifest includes --gjk-render-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");
