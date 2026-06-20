@@ -35402,6 +35402,308 @@ static int RunConvexRenderShowcase(const char* outPath) {
     return 0;
 }
 
+// --- Deterministic Contact Friction LIT 3D INSTANCED RENDER CAPSTONE showcase (Slice FC6, the money-shot
+// COMPLETING FLAGSHIP #20 — DETERMINISTIC TANGENTIAL CONTACT FRICTION, hf::sim::fric). Mirrors the Vulkan
+// --fric-render-shot path EXACTLY: builds the bit-exact FC4 friction RAMP scene (an 18-degree tilted static
+// ramp box + a dynamic box released on it, mu=kOne), runs fric::StepFrictionWorldN K ticks so the box GRIPS at
+// rest on the incline (host-side, pure integer — the SAME scene + config as the Vulkan path so the integer
+// state + transforms are byte-identical by construction), builds the split FLOAT instance set via
+// fric::FrictionToRenderInstances (a one-line delegate to the frozen convex::ConvexToRenderInstances — each
+// body -> an oriented CUBE: FxBodyTransform pose x the box's 2*halfExtents scale, the ONLY float crossing,
+// render-only), and renders the warm matte-AMBER dynamic box + the cool matte-GREY static ramp as TWO colored
+// instanced CUBE draws through the EXISTING instanced lit pipeline (lit_instanced.vert.gen.metal +
+// lit.frag.gen.metal — the --convex-render wiring) over the sky + shadow, MATTE (roughness 1.0) so the boxes
+// do NOT mirror the sky IBL into iridescence (the GF6/BD6/CX6 lesson). FLOAT visresolve-bar:
+// Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run) + provenance. New golden
+// tests/golden/metal/fric_render.png. NO new shader, NO RHI.
+static int RunFricRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fric    = hf::sim::fric;
+    namespace fpx     = hf::sim::fpx;
+    using convex::fx;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+
+    // === The bit-exact FC1-FC5 friction RAMP scene -> a box GRIPPED at rest on the tilted ramp (the SAME scene
+    // + config as the Vulkan --fric-render-shot — byte-identical state + transforms by construction). Pure
+    // integer sim. ===
+    const fx kGravY = (fx)(-9.8 * (double)convex::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    fric::FrictionStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 20;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = kOne;                            // ramp: none
+    kCfg.angDamp     = kOne;                            // OFF (the FC4 headline)
+    kCfg.posIters    = 4;
+    kCfg.mu          = kOne;                            // grippy contacts -> the box GRIPS on the incline
+    const int kTicks = 240;
+
+    auto makeBody = [&](fx x, fx y, fx z, fpx::FxQuat q, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = q;
+        b.invMass = dyn ? convex::kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const fpx::FxQuat qRamp = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)10252, (fx)64729}); // 18 deg / Z
+    const convex::FxBox kRamp{convex::FxVec3{fi(6), kOne, fi(3)}};
+    const convex::FxBox kSlider{convex::FxVec3{kOne, kOne, kOne}};
+    convex::ConvexWorld world;
+    world.bodies.push_back(makeBody(0, 0, 0, qRamp, false)); world.boxes.push_back(kRamp);
+    const convex::FxVec3 off =
+        fpx::FxRotate(qRamp, convex::FxVec3{0, kRamp.halfExtents.y + kSlider.halfExtents.y, 0});
+    world.bodies.push_back(makeBody(off.x, off.y, off.z, qRamp, true)); world.boxes.push_back(kSlider);
+    const uint32_t kBodies = (uint32_t)world.bodies.size();
+    fric::StepFrictionWorldN(world, kCfg, (uint32_t)kTicks);
+
+    const convex::ConvexRenderInstances ri = fric::FrictionToRenderInstances(world);
+    std::vector<scene::InstanceData> floorInstances, boxInstances;
+    for (const Mat4& fm : ri.floor) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = fm.m[k];
+        floorInstances.push_back(inst);
+    }
+    for (const Mat4& bm : ri.boxes) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = bm.m[k];
+        boxInstances.push_back(inst);
+    }
+    const uint32_t kFloorN = (uint32_t)floorInstances.size();
+    const uint32_t kBoxN   = (uint32_t)boxInstances.size();
+    const uint32_t kInstanceCount = kFloorN + kBoxN;
+    std::vector<scene::InstanceData> allInstances;
+    allInstances.reserve(kInstanceCount);
+    allInstances.insert(allInstances.end(), boxInstances.begin(), boxInstances.end());
+    allInstances.insert(allInstances.end(), floorInstances.begin(), floorInstances.end());
+
+    // === Reuse the EXISTING instanced lit pipeline (the --convex-render wiring, VERBATIM). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    // warm matte AMBER dynamic box + cool matte GREY ramp, both roughness 1.0 -> no iridescence (the GF6/BD6/CX6
+    // lesson). Kept in lockstep with the Vulkan --fric-render-shot.
+    const uint8_t boxPx[4]   = {235, 95, 30, 255};    // warm matte AMBER/RUST (red>>green>>blue — the CX6/VH6 lesson)
+    const uint8_t floorPx[4] = {130, 128, 124, 255};  // cool-grey matte ramp/floor
+    auto boxTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, boxPx,   sizeof(boxPx)});
+    auto floorTex = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, floorPx, sizeof(floorPx)});
+    scene::Mesh cube = scene::Mesh::Cube(*device);
+
+    std::unique_ptr<rhi::IBuffer> allBuffer, boxBuffer, floorBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc d;
+        d.size = (uint64_t)allInstances.size() * sizeof(scene::InstanceData);
+        d.initialData = allInstances.data(); d.usage = rhi::BufferUsage::Vertex;
+        allBuffer = device->CreateBuffer(d);
+    }
+    if (kBoxN > 0) {
+        rhi::BufferDesc d;
+        d.size = (uint64_t)boxInstances.size() * sizeof(scene::InstanceData);
+        d.initialData = boxInstances.data(); d.usage = rhi::BufferUsage::Vertex;
+        boxBuffer = device->CreateBuffer(d);
+    }
+    if (kFloorN > 0) {
+        rhi::BufferDesc d;
+        d.size = (uint64_t)floorInstances.size() * sizeof(scene::InstanceData);
+        d.initialData = floorInstances.data(); d.usage = rhi::BufferUsage::Vertex;
+        floorBuffer = device->CreateBuffer(d);
+    }
+
+    // Fixed 3/4 hero camera + directional light (== the Vulkan --fric-render-shot camera/light). Aim at the
+    // ramp mid-height so the whole tilted ramp + the gripped box read; the light rakes from the camera's
+    // upper-near side -> a warm amber read (the GF6/CX6 lesson). Kept in lockstep with the Vulkan showcase.
+    const Vec3 eye{8.5f, 5.0f, 9.0f};
+    const Vec3 center{0.0f, 1.4f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = 0.3f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.5f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{0.3f, -0.8f, -0.5f});
+        Vec3 sc{0.0f, 1.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 20.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-10.0f, 10.0f, -10.0f, 10.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(cube.vertices());
+                cmd.BindInstanceBuffer(*allBuffer);
+                cmd.BindIndexBuffer(cube.indices());
+                cmd.DrawIndexedInstanced(cube.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                // metallic 0, roughness 1.0 (FULLY matte) — kills the IBL iridescence (the GF6/BD6/CX6 lesson).
+                float matteMat[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+                if (kFloorN > 0) {
+                    cmd.PushConstants(matteMat, sizeof(matteMat));
+                    cmd.BindMaterial(*floorTex, *flatNormal);
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    cmd.BindInstanceBuffer(*floorBuffer);
+                    cmd.DrawIndexedInstanced(cube.indexCount(), kFloorN);
+                }
+                if (kBoxN > 0) {
+                    cmd.PushConstants(matteMat, sizeof(matteMat));
+                    cmd.BindMaterial(*boxTex, *flatNormal);
+                    cmd.BindVertexBuffer(cube.vertices());
+                    cmd.BindIndexBuffer(cube.indices());
+                    cmd.BindInstanceBuffer(*boxBuffer);
+                    cmd.DrawIndexedInstanced(cube.indexCount(), kBoxN);
+                }
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) provenance/stats: instance count == body count + instances == rebuild.
+    std::printf("fric-render: {bodies:%u, instances:%u, dynamic:%u} from bit-exact friction-settled world\n",
+                kBodies, kInstanceCount, kBoxN);
+    if (kInstanceCount != kBodies) return fail("fric-render instance count != body count");
+    {
+        const convex::ConvexRenderInstances rebuild = fric::FrictionToRenderInstances(world);
+        bool identical = (rebuild.floor.size() == ri.floor.size()) &&
+                         (rebuild.boxes.size() == ri.boxes.size());
+        for (size_t k = 0; k < ri.floor.size() && identical; ++k)
+            if (std::memcmp(ri.floor[k].m, rebuild.floor[k].m, sizeof(float) * 16) != 0) identical = false;
+        for (size_t k = 0; k < ri.boxes.size() && identical; ++k)
+            if (std::memcmp(ri.boxes[k].m, rebuild.boxes[k].m, sizeof(float) * 16) != 0) identical = false;
+        if (!identical) return fail("fric-render instances != rebuild (transform not pure)");
+    }
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("fric-render two runs DIFFER (nondeterministic)");
+    std::printf("fric-render determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) shaded: the boxes actually rendered (non-trivial non-black pixel count).
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("fric-render shaded: {nonBlackPixels:%u}\n", shaded);
+    const uint32_t kShadedFloor = 5000u;
+    if (shaded < kShadedFloor) return fail("fric-render shaded below floor (blank/scrambled frame)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("fric-render uniform image (no coherent scene)");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — deterministic friction lit 3D render "
+                "(%u bodies, %u ramp, %u boxes — box gripped on the ramp)\n",
+                outPath, cw, ch, kBodies, kFloorN, kBoxN);
+    return 0;
+}
+
 // --- Deterministic Grain<->Fluid Coupling LIT 3D RENDER CAPSTONE showcase (Slice GF6, the money-shot
 // COMPLETING FLAGSHIP #13 — the THIRTEENTH flagship). Mirrors the Vulkan --cgf-render-shot path EXACTLY: runs
 // the bit-exact GF1-GF5 coupled sim (the SAME GF4 wet-sand scene — a packed 8x3x6 grain bed pre-settled by GR4
@@ -47846,6 +48148,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-render") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_render.png";
             try { return RunConvexRenderShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fric-render <out.png>: render the Deterministic Contact Friction LIT 3D INSTANCED RENDER CAPSTONE
+        // showcase (Slice FC6, the money-shot COMPLETING FLAGSHIP #20). Builds the bit-exact FC4 friction RAMP
+        // scene (an 18-degree tilted static ramp box + a dynamic box, mu=kOne, StepFrictionWorldN K=240 ticks so
+        // the box GRIPS at rest on the incline — the SAME scene + config as the Vulkan --fric-render-shot so the
+        // integer state + transforms are byte-identical by construction), turns it into a split FLOAT instance set
+        // via fric::FrictionToRenderInstances (delegates to the frozen convex::ConvexToRenderInstances, each body
+        // -> an oriented CUBE), and renders the warm matte-amber box on a cool-grey ramp through the EXISTING
+        // instanced lit pipeline (lit_instanced + lit + shadow_instanced — the --convex-render wiring; NO new
+        // shader/RHI), MATTE (roughness 1.0) to dodge the GF6/BD6/CX6 iridescence trap. FLOAT visresolve-bar:
+        // Metal-render==Metal-golden DIFF 0.0000 (determinism, two-run) + provenance (instances == rebuild). New
+        // golden tests/golden/metal/fric_render.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fric-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fric_render.png";
+            try { return RunFricRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

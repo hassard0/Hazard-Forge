@@ -634,5 +634,29 @@ inline ConvexWorld RunFricRollback(const ConvexWorld& world0, const FrictionStep
     return w;
 }
 
+// =========================================================================================================
+// Slice FC6 — THE LIT 3D RENDER CAPSTONE (the money-shot). APPENDED after RunFricRollback (FC1-FC5's lines
+// above are BYTE-FROZEN). This is the CX6/FR6/CP6/CG6/GF6/BD6/VH6/JT6 render-capstone twin COMPLETING the
+// flagship. FC1-FC5 built + proved the deterministic, lockstep-replayable friction-locked contact sim; FC6
+// RENDERS the bit-exact friction-settled world as lit, shadowed 3D oriented boxes — the visual payoff, with
+// the distinctive friction money-shot: a box GRIPPED AT REST on a tilted ramp (impossible in the frictionless
+// solver, which would slide it off). RENDER-ONLY FLOAT, additive, ZERO new render shader, ZERO new RHI.
+//
+// MAXIMAL REUSE: the friction world IS a convex::ConvexWorld, so the FLOAT render bridge is EXACTLY CX6's —
+// FrictionToRenderInstances DELEGATES to the frozen convex::ConvexToRenderInstances(world) (the SAME split
+// instance set: static floor/ramp cubes vs dynamic boxes, each translate(FxToFloat(pos))*rotate(normalize(
+// orient))*scale(2*halfExtents) = an oriented CUBE). Provided here for namespace symmetry + the test/showcase
+// to call from fric::; the actual matrices come from the frozen CX6 helper (convex.h is byte-unchanged). A
+// PURE FUNCTION of the bit-exact world: two calls produce byte-equal matrices (the provenance contract the
+// showcase + the test assert). The bit-exact FC1-FC5 integer sim is NOT mutated.
+
+// ----- FrictionToRenderInstances(world): the bit-exact friction-settled world -> the split FLOAT instances --
+// A one-line delegate to the frozen convex::ConvexToRenderInstances — dynamic bodies -> boxes (warm matte
+// amber), statics -> floor/ramp (cool grey). Render-only, OUTSIDE the integer loop (the ONE float crossing of
+// the flagship — the CX6 bridge reused VERBATIM). Two calls byte-equal (the provenance proof).
+inline convex::ConvexRenderInstances FrictionToRenderInstances(const ConvexWorld& world) {
+    return convex::ConvexToRenderInstances(world);
+}
+
 }  // namespace fric
 }  // namespace hf::sim

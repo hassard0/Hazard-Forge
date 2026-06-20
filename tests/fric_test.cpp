@@ -660,6 +660,90 @@ int main() {
         }
     }
 
+    // ============ Slice FC6 — THE LIT 3D RENDER CAPSTONE (provenance: the render is a pure function) =========
+    // FrictionToRenderInstances of a SETTLED friction RAMP world (a tilted static ramp + a dynamic box gripped on
+    // it) -> the instance count == the body count; the dynamic/static split is correct; each instance's
+    // translation == convex::ConvexBoxShapeTransform / fpx::FxBodyTransform translation (the provenance proof);
+    // two calls are byte-identical (the render is a pure function of the bit-exact world). Pure CPU, render-only
+    // FLOAT delegate to the frozen convex helper.
+    {
+        auto fi = [&](int v) { return (fx)(v * (int)kOne); };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        auto makeBody = [&](fx x, fx y, fx z, fpx::FxQuat q, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = q;
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+        // The FC4 ramp scene (== the --fric-render-shot scene): an 18-degree tilted static ramp + a dynamic box
+        // placed on its top face, settled K ticks at mu=kOne so friction GRIPS the box on the incline.
+        const fpx::FxQuat qRamp = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)10252, (fx)64729}); // 18 deg / Z
+        const convex::FxBox kRamp{convex::FxVec3{fi(6), kOne, fi(3)}};
+        const convex::FxBox kSlider{convex::FxVec3{kOne, kOne, kOne}};
+        fric::FrictionStepConfig cfg;
+        cfg.gravity = FxVec3{0, kGravY, 0};
+        cfg.dt = kOne / 60; cfg.solveIters = 20; cfg.restitution = 0;
+        cfg.slop = kOne / 64; cfg.beta = (fx)((int64_t)4 * kOne / 10);
+        cfg.linDamp = kOne; cfg.angDamp = kOne; cfg.posIters = 4; cfg.mu = kOne;
+
+        convex::ConvexWorld world;
+        world.bodies.push_back(makeBody(0, 0, 0, qRamp, false)); world.boxes.push_back(kRamp);   // static ramp
+        const convex::FxVec3 off =
+            fpx::FxRotate(qRamp, convex::FxVec3{0, kRamp.halfExtents.y + kSlider.halfExtents.y, 0});
+        world.bodies.push_back(makeBody(off.x, off.y, off.z, qRamp, true)); world.boxes.push_back(kSlider);
+        const uint32_t kBodies = (uint32_t)world.bodies.size();   // 2: 1 static ramp + 1 dynamic box
+        fric::StepFrictionWorldN(world, cfg, 240u);
+
+        const convex::ConvexRenderInstances ri = fric::FrictionToRenderInstances(world);
+        const uint32_t kFloorN = (uint32_t)ri.floor.size();
+        const uint32_t kBoxN   = (uint32_t)ri.boxes.size();
+
+        // (1) the instance count == the body count.
+        check(kFloorN + kBoxN == kBodies,
+              "FC6 FrictionToRenderInstances: instance count == body count");
+        // (2) the dynamic/static split is correct (1 static ramp -> floor, 1 dynamic box -> boxes).
+        check(kFloorN == 1u, "FC6 split: the static ramp -> floor (1)");
+        check(kBoxN == 1u, "FC6 split: the dynamic box -> boxes (1)");
+
+        // (3) provenance — each instance's translation == the convex::ConvexBoxShapeTransform translation (the
+        // delegate produces EXACTLY the frozen CX6 matrices; the translation is FxToFloat(pos) of each body).
+        {
+            const math::Mat4 floorM = convex::ConvexBoxShapeTransform(world.bodies[0], world.boxes[0]);
+            const math::Mat4 boxM   = convex::ConvexBoxShapeTransform(world.bodies[1], world.boxes[1]);
+            // column-major Mat4: the translation is m[12..14].
+            check(std::memcmp(ri.floor[0].m, floorM.m, sizeof(float) * 16) == 0,
+                  "FC6 provenance: floor instance == ConvexBoxShapeTransform(static ramp)");
+            check(std::memcmp(ri.boxes[0].m, boxM.m, sizeof(float) * 16) == 0,
+                  "FC6 provenance: box instance == ConvexBoxShapeTransform(dynamic box)");
+            // the translation column equals FxToFloat(pos) of each body (the FxBodyTransform translation).
+            check(ri.boxes[0].m[12] == fpx::FxToFloat(world.bodies[1].pos.x) &&
+                  ri.boxes[0].m[13] == fpx::FxToFloat(world.bodies[1].pos.y) &&
+                  ri.boxes[0].m[14] == fpx::FxToFloat(world.bodies[1].pos.z),
+                  "FC6 provenance: box translation == FxToFloat(body.pos)");
+        }
+
+        // (4) the dynamic box GRIPPED on the ramp — it rests ABOVE the ramp top (did not slide off / fall
+        // through). The settled box centre stays well above the floor plane (friction held it on the incline).
+        check(world.bodies[1].pos.y > fi(1),
+              "FC6 money-shot: the dynamic box is GRIPPED on the ramp (rests above the ground, not slid off)");
+
+        // (5) the render is a PURE FUNCTION of the bit-exact world — two calls byte-identical (the provenance
+        // contract the showcase asserts).
+        {
+            const convex::ConvexRenderInstances ri2 = fric::FrictionToRenderInstances(world);
+            bool identical = (ri2.floor.size() == ri.floor.size()) && (ri2.boxes.size() == ri.boxes.size());
+            for (size_t k = 0; k < ri.floor.size() && identical; ++k)
+                if (std::memcmp(ri.floor[k].m, ri2.floor[k].m, sizeof(float) * 16) != 0) identical = false;
+            for (size_t k = 0; k < ri.boxes.size() && identical; ++k)
+                if (std::memcmp(ri.boxes[k].m, ri2.boxes[k].m, sizeof(float) * 16) != 0) identical = false;
+            check(identical, "FC6 FrictionToRenderInstances: two calls BYTE-IDENTICAL (pure function)");
+        }
+    }
+
     if (g_fail == 0) std::printf("fric_test: ALL PASS\n");
     else std::printf("fric_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;
