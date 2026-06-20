@@ -26741,6 +26741,203 @@ static int RunGjkSupportShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GJ2 — Deterministic General Convex-Hull Contacts THE GJK ALGORITHM showcase (--gjk-distance)
+// ====== The 2nd slice of FLAGSHIP #22 (hf::sim::gjk). Like GJ1's --gjk-support, the GJK sub-distance is int64
+// (the fxdiv/FxDot/FxCross/FxLength/FxNormalize products), so shaders/gjk_distance.comp is VULKAN-SPIR-V-ONLY
+// (glslc can't parse int64 in HLSL) -> NOT in hf_gen_msl. The Metal --gjk-distance showcase runs the CPU
+// gjk::Gjk — the EXACT bit-exact reference the Vulkan --gjk-distance-shot GPU==CPU memcmp already compares
+// against -> the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION. It builds the SAME
+// fixed hull-pair scene (separated / nearly-touching / shallow-overlap, a couple rotated) as the Vulkan
+// --gjk-distance-shot, runs gjk::Gjk over it, and writes the SAME PURE-INTEGER 2D top-down golden
+// tests/golden/metal/gjk_distance.png (Mac-baked by the controller — do NOT commit); two runs DIFF 0.0000.
+static int RunGjkDistanceShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace gjk = hf::sim::gjk;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    // The canonical hull set (== the Vulkan --gjk-distance-shot config), indexed by the pair scene.
+    std::vector<gjk::FxHull> hullSet;
+    hullSet.push_back(gjk::MakeTetra(kOne));            // 0
+    hullSet.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 1
+    hullSet.push_back(gjk::MakeOcta(kOne));             // 2
+    hullSet.push_back(gjk::MakeWedge(kOne, kOne, kOne));// 3
+
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int)convex::kOne); };
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    const fpx::FxQuat qX45 = fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45});
+    const fpx::FxQuat qZ45 = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45});
+    auto bodyAt = [&](int x, int y, int z, fpx::FxQuat q = fpx::FxQuat{0,0,0,convex::kOne}) {
+        fpx::FxBody b; b.pos = {fi(x), fi(y), fi(z)}; b.orient = q; return b;
+    };
+
+    struct ScenePair { uint32_t a; fpx::FxBody ba; uint32_t b; fpx::FxBody bb; };
+    std::vector<ScenePair> scene;
+    scene.push_back({1, bodyAt(-7, 0, 6), 1, bodyAt(-4, 0, 6)});
+    scene.push_back({0, bodyAt(2, 0, 6), 2, bodyAt(7, 0, 6)});
+    scene.push_back({1, bodyAt(-7, 0, 1), 1, bodyAt(-6, 0, 1)});
+    scene.push_back({1, bodyAt(0, 0, 1), 2, bodyAt(0, 0, 1)});
+    scene.push_back({1, bodyAt(-7, 0, -5, qX45), 2, bodyAt(-3, 0, -5)});
+    scene.push_back({3, bodyAt(4, 0, -5, qZ45), 1, bodyAt(4, 0, -5)});
+    const uint32_t kPairCount = (uint32_t)scene.size();
+
+    // The GjkResultGpu mirror (== the Vulkan packer): the memcmp-comparable packed result.
+    struct GjkResultGpu {
+        uint32_t overlap;
+        int32_t  sepx, sepy, sepz;
+        int32_t  cax, cay, caz;
+        int32_t  cbx, cby, cbz;
+        int32_t  spx[4]; int32_t spy[4]; int32_t spz[4];
+        int32_t  sax[4]; int32_t say[4]; int32_t saz[4];
+        int32_t  sbx[4]; int32_t sby[4]; int32_t sbz[4];
+        uint32_t simplexCount;
+        uint32_t witnessFeature;
+        uint32_t iterations;
+    };
+    auto packResult = [&](const gjk::GjkResult& r) {
+        GjkResultGpu g; std::memset(&g, 0, sizeof(GjkResultGpu));
+        g.overlap = r.overlap;
+        g.sepx = r.separation.x; g.sepy = r.separation.y; g.sepz = r.separation.z;
+        g.cax = r.closestA.x; g.cay = r.closestA.y; g.caz = r.closestA.z;
+        g.cbx = r.closestB.x; g.cby = r.closestB.y; g.cbz = r.closestB.z;
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (i < r.simplex.count) {
+                g.spx[i] = r.simplex.pts[i].x;  g.spy[i] = r.simplex.pts[i].y;  g.spz[i] = r.simplex.pts[i].z;
+                g.sax[i] = r.simplex.csoA[i].x; g.say[i] = r.simplex.csoA[i].y; g.saz[i] = r.simplex.csoA[i].z;
+                g.sbx[i] = r.simplex.csoB[i].x; g.sby[i] = r.simplex.csoB[i].y; g.sbz[i] = r.simplex.csoB[i].z;
+            }
+        }
+        g.simplexCount = r.simplex.count; g.witnessFeature = r.witnessFeature; g.iterations = r.iterations;
+        return g;
+    };
+
+    // CPU gjk::Gjk (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against), FIXED order.
+    std::vector<gjk::GjkResult> raw(kPairCount);
+    std::vector<GjkResultGpu> results(kPairCount);
+    auto run = [&](std::vector<GjkResultGpu>& out) {
+        out.assign((size_t)kPairCount, GjkResultGpu{});
+        for (uint32_t i = 0; i < kPairCount; ++i) {
+            gjk::GjkResult r = gjk::Gjk(hullSet[scene[i].a], scene[i].ba, hullSet[scene[i].b], scene[i].bb);
+            raw[i] = r; out[i] = packResult(r);
+        }
+    };
+    run(results);
+
+    uint32_t nSep = 0, nOver = 0;
+    for (uint32_t i = 0; i < kPairCount; ++i) { if (results[i].overlap) ++nOver; else ++nSep; }
+    std::printf("gjk-distance: {pairs:%u, separated:%u, overlapping:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU gjk::Gjk, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, nSep, nOver);
+
+    // determinism: two runs byte-identical.
+    std::vector<GjkResultGpu> results2;
+    run(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(GjkResultGpu)) != 0)
+        return fail("gjk-distance: two runs differ (nondeterministic)");
+    std::printf("gjk-distance determinism: two runs BYTE-IDENTICAL\n");
+
+    // correctness: the overlap boolean agrees with an INDEPENDENT support-sampling reference + the separated
+    // closest distance is within the documented fixed-point band of a brute-force vertex-distance upper bound.
+    auto refOverlap = [&](const gjk::FxHull& hA, const fpx::FxBody& bA,
+                          const gjk::FxHull& hB, const fpx::FxBody& bB) -> bool {
+        for (int ix = -2; ix <= 2; ++ix)
+            for (int iy = -2; iy <= 2; ++iy)
+                for (int iz = -2; iz <= 2; ++iz) {
+                    if (ix == 0 && iy == 0 && iz == 0) continue;
+                    const convex::FxVec3 d{fi(ix), fi(iy), fi(iz)};
+                    const convex::FxVec3 s = gjk::SupportMinkowski(hA, bA, hB, bB, d);
+                    if (convex::FxDot(s, d) < 0) return false;
+                }
+        return true;
+    };
+    auto bruteVertDist = [&](const gjk::FxHull& hA, const fpx::FxBody& bA,
+                             const gjk::FxHull& hB, const fpx::FxBody& bB) -> fx {
+        fx best = 0; bool first = true;
+        for (uint32_t i = 0; i < hA.count; ++i) {
+            const convex::FxVec3 wa = convex::FxAdd(fpx::FxRotate(bA.orient, hA.verts[i]), bA.pos);
+            for (uint32_t j = 0; j < hB.count; ++j) {
+                const convex::FxVec3 wb = convex::FxAdd(fpx::FxRotate(bB.orient, hB.verts[j]), bB.pos);
+                const fx dd = fpx::FxLength(fpx::FxSub(wa, wb));
+                if (first || dd < best) { best = dd; first = false; }
+            }
+        }
+        return best;
+    };
+    bool overlapAgrees = true, distInBand = true;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool ref = refOverlap(hullSet[scene[i].a], scene[i].ba, hullSet[scene[i].b], scene[i].bb);
+        if ((raw[i].overlap != 0u) != ref) overlapAgrees = false;
+        if (raw[i].overlap == 0u) {
+            const fx gjkDist = fpx::FxLength(raw[i].separation);
+            const fx upper = bruteVertDist(hullSet[scene[i].a], scene[i].ba, hullSet[scene[i].b], scene[i].bb);
+            if (gjkDist < 0 || gjkDist > upper + kOne / 16) distInBand = false;
+        }
+    }
+    if (!overlapAgrees || !distInBand) return fail("gjk-distance: correctness failed");
+    std::printf("gjk-distance correct: {overlapAgrees:true, distInBand:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view as the Vulkan --gjk-distance-shot (identical by
+    // construction). Each pair's hull footprints (overlapping HOT / separated COOL) + the closest-point
+    // witness markers (closestA cyan, closestB magenta) on separated pairs. ---
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalf = 10;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int64_t gx = ((int64_t)wx * kPxPerUnit) >> convex::kFrac;
+        const int64_t gz = ((int64_t)wz * kPxPerUnit) >> convex::kFrac;
+        ix = kMargin + kWorldHalf * kPxPerUnit + (int)gx;
+        iy = kMargin + kWorldHalf * kPxPerUnit + (int)gz;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto putDot = [&](int ix, int iy, int rad, const Vec3& col) {
+        for (int dy = -rad; dy <= rad; ++dy)
+            for (int dx = -rad; dx <= rad; ++dx)
+                if (dx * dx + dy * dy <= rad * rad) putPx(ix + dx, iy + dy, col);
+    };
+    const Vec3 sepCol{0.40f, 0.55f, 0.85f};
+    const Vec3 hotCol{0.95f, 0.45f, 0.20f};
+    const Vec3 wAcol{0.20f, 0.85f, 0.95f};
+    const Vec3 wBcol{0.95f, 0.30f, 0.85f};
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool over = results[i].overlap != 0;
+        const Vec3 vcol = over ? hotCol : sepCol;
+        const gjk::FxHull& hA = hullSet[scene[i].a]; const fpx::FxBody& bA = scene[i].ba;
+        const gjk::FxHull& hB = hullSet[scene[i].b]; const fpx::FxBody& bB = scene[i].bb;
+        for (uint32_t v = 0; v < hA.count; ++v) {
+            const convex::FxVec3 w = convex::FxAdd(fpx::FxRotate(bA.orient, hA.verts[v]), bA.pos);
+            int px, py; worldToPx(w.x, w.z, px, py); putDot(px, py, 1, vcol);
+        }
+        for (uint32_t v = 0; v < hB.count; ++v) {
+            const convex::FxVec3 w = convex::FxAdd(fpx::FxRotate(bB.orient, hB.verts[v]), bB.pos);
+            int px, py; worldToPx(w.x, w.z, px, py); putDot(px, py, 1, vcol);
+        }
+        if (!over) {
+            int ax, ay; worldToPx(results[i].cax, results[i].caz, ax, ay); putDot(ax, ay, 2, wAcol);
+            int bx, by; worldToPx(results[i].cbx, results[i].cbz, bx, by); putDot(bx, by, 2, wBcol);
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — GJK hull-pair top-down view (%u pairs, %u sep, %u over)\n",
+                outPath, imgW, imgH, kPairCount, nSep, nOver);
+    return 0;
+}
+
 static int RunConvexSatShowcase(const char* outPath) {
     using math::Vec3;
     namespace convex = hf::sim::convex;
@@ -49741,6 +49938,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gjk-support") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gjk_support.png";
             try { return RunGjkSupportShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gjk-distance <out.png>: render the Deterministic General Convex-Hull Contacts THE GJK ALGORITHM
+        // showcase (Slice GJ2, the 2nd slice of FLAGSHIP #22). On Metal this runs the CPU GJK: gjk_distance.comp
+        // is int64/Vulkan-only (glslc can't parse the sub-distance fxdiv/FxDot/FxCross int64), so Metal runs the
+        // CPU gjk::Gjk over the SAME fixed hull-pair scene -> the EXACT bit-exact reference the Vulkan
+        // --gjk-distance-shot GPU==CPU memcmp compares against; two runs byte-identical; the overlap boolean
+        // agrees with an independent reference. The image golden is a PURE-INTEGER 2D top-down view, identical
+        // to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/gjk_distance.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gjk-distance") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gjk_distance.png";
+            try { return RunGjkDistanceShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-manifold <out.png>: render the Deterministic Convex Rigid-Body Contacts CONTACT MANIFOLD

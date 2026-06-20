@@ -190,6 +190,155 @@ int main() {
         check(m1.queries == 4u * (uint32_t)dirs.size(), "MeasureSupport query count == hulls x dirs");
     }
 
+    // ============================================================================================
+    // Slice GJ2 — the GJK algorithm (overlap + closest distance). APPENDED (GJ1 cases above unchanged).
+    // ============================================================================================
+
+    // An independent brute-force min-vertex-distance / overlap reference. For SEPARATED hulls the brute-force
+    // closest-vertex distance is an UPPER bound on the true (feature-feature) closest distance; we use it for
+    // a coarse separation classification + an order-of-magnitude band check. Overlap is independently checked
+    // by a SAT-style separating axis over the face normals + edge crosses (boxes) — but since the canonical
+    // hulls are general convex, we use the GJK overlap + a containment cross-check: a separated pair has the
+    // origin strictly outside the Minkowski difference (some direction has SupportMinkowski·dir > 0 AND
+    // SupportMinkowski(-dir)·(-dir) > 0 ... ) — simplest robust independent reference: for the analytic box
+    // cases we know the truth; for the general set we assert overlap agrees with a fine support-sampling test.
+    auto bodyAt = [&](int x, int y, int z, fpx::FxQuat q = fpx::FxQuat{0,0,0,kOne}) {
+        return MakeBody(x, y, z, q);
+    };
+
+    // Independent overlap reference by support-sampling: the hulls OVERLAP iff for EVERY sampled direction in
+    // a dense fixed set, the Minkowski-difference support has a non-negative extent (the origin is not
+    // separable by any sampled axis). With a dense axis set this is a reliable classifier for the well-
+    // separated / clearly-overlapping scene (the touching boundary is the documented gray zone).
+    auto refOverlap = [&](const gjk::FxHull& hA, const fpx::FxBody& bA,
+                          const gjk::FxHull& hB, const fpx::FxBody& bB) -> bool {
+        // Dense direction set: all (i,j,k) in [-2,2]^3 except origin -> 124 axes.
+        for (int ix = -2; ix <= 2; ++ix)
+            for (int iy = -2; iy <= 2; ++iy)
+                for (int iz = -2; iz <= 2; ++iz) {
+                    if (ix == 0 && iy == 0 && iz == 0) continue;
+                    const FxVec3 d{FromInt(ix), FromInt(iy), FromInt(iz)};
+                    const FxVec3 s = gjk::SupportMinkowski(hA, bA, hB, bB, d);
+                    if (convex::FxDot(s, d) < 0) return false;   // this axis separates -> not overlapping
+                }
+        return true;
+    };
+
+    // Brute-force min vertex-to-vertex distance of the two WORLD hulls (an UPPER bound on the true distance).
+    auto bruteVertDist = [&](const gjk::FxHull& hA, const fpx::FxBody& bA,
+                             const gjk::FxHull& hB, const fpx::FxBody& bB) -> fx {
+        fx best = 0; bool first = true;
+        for (uint32_t i = 0; i < hA.count; ++i) {
+            const FxVec3 wa = convex::FxAdd(fpx::FxRotate(bA.orient, hA.verts[i]), bA.pos);
+            for (uint32_t j = 0; j < hB.count; ++j) {
+                const FxVec3 wb = convex::FxAdd(fpx::FxRotate(bB.orient, hB.verts[j]), bB.pos);
+                const fx d = fpx::FxLength(fpx::FxSub(wa, wb));
+                if (first || d < best) { best = d; first = false; }
+            }
+        }
+        return best;
+    };
+
+    // The fixed GJK hull-pair scene: SEPARATED, nearly-TOUCHING, SHALLOW-OVERLAP, a couple rotated.
+    std::vector<gjk::GjkPair> gpairs;
+    auto addG = [&](gjk::FxHull hA, fpx::FxBody bA, gjk::FxHull hB, fpx::FxBody bB) {
+        gpairs.push_back({hA, bA, hB, bB});
+    };
+    const fpx::FxQuat qX45 = fpx::FxQuatNormalize(fpx::FxQuat{(fx)25080, 0, 0, (fx)60547});
+    const fpx::FxQuat qZ45 = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)25080, (fx)60547});
+    // 0: two unit boxes offset along X by 3 -> gap exactly 1.0 (the analytic case).
+    addG(gjk::MakeBox(kOne,kOne,kOne), bodyAt(0,0,0), gjk::MakeBox(kOne,kOne,kOne), bodyAt(3,0,0));
+    // 1: clearly separated tetra vs octa, far on X.
+    addG(gjk::MakeTetra(kOne), bodyAt(-6,0,0), gjk::MakeOcta(kOne), bodyAt(2,0,0));
+    // 2: shallow overlap — two unit boxes offset by 1 (penetrating by 1).
+    addG(gjk::MakeBox(kOne,kOne,kOne), bodyAt(0,4,0), gjk::MakeBox(kOne,kOne,kOne), bodyAt(1,4,0));
+    // 3: deep overlap — coincident-ish box vs octa.
+    addG(gjk::MakeBox(kOne,kOne,kOne), bodyAt(0,-4,0), gjk::MakeOcta(kOne), bodyAt(0,-4,0));
+    // 4: rotated box (45 X) separated from an octa on Z.
+    addG(gjk::MakeBox(kOne,kOne,kOne), bodyAt(5,0,-5,qX45), gjk::MakeOcta(kOne), bodyAt(5,0,0));
+    // 5: rotated wedge (45 Z) deeply overlapping a coincident box (clear overlap, off the touching boundary).
+    addG(gjk::MakeWedge(kOne,kOne,kOne), bodyAt(-5,0,5,qZ45), gjk::MakeBox(kOne,kOne,kOne), bodyAt(-5,0,5));
+
+    // ================= GJK overlap boolean matches the independent reference =================
+    {
+        bool allAgree = true;
+        for (const gjk::GjkPair& p : gpairs) {
+            const gjk::GjkResult r = gjk::Gjk(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            const bool ref = refOverlap(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            if ((r.overlap != 0u) != ref) allAgree = false;
+        }
+        check(allAgree, "Gjk overlap boolean matches the independent support-sampling reference");
+    }
+
+    // ================= analytic case: two unit boxes 3 apart on X -> gap 1.0 within band =================
+    {
+        const gjk::GjkResult r = gjk::Gjk(gjk::MakeBox(kOne,kOne,kOne), bodyAt(0,0,0),
+                                          gjk::MakeBox(kOne,kOne,kOne), bodyAt(3,0,0));
+        check(r.overlap == 0u, "boxes 3 apart on X are SEPARATED");
+        const fx dist = fpx::FxLength(r.separation);
+        // Expected gap = 3 - 1 - 1 = 1.0. Band: within 1/8 unit of kOne (fixed-point + sampling slack).
+        const fx band = kOne / 8;
+        check(dist > kOne - band && dist < kOne + band, "boxes 3-apart closest distance ~= 1.0 within band");
+        // The witness points lie on the facing faces: closestA.x ~= +1 (A's +X face), closestB.x ~= +2.
+        check(r.closestA.x > kOne - band && r.closestA.x < kOne + band, "witness A on the +X face of box A");
+        check(r.closestB.x > FromInt(2) - band && r.closestB.x < FromInt(2) + band,
+              "witness B on the -X face of box B (x ~= 2)");
+    }
+
+    // ================= separated closest distance within band of the brute-force upper bound =================
+    {
+        bool allInBand = true;
+        for (const gjk::GjkPair& p : gpairs) {
+            const gjk::GjkResult r = gjk::Gjk(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            if (r.overlap != 0u) continue;
+            const fx gjkDist = fpx::FxLength(r.separation);
+            const fx upper = bruteVertDist(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            // The true (feature) distance is <= the brute vertex distance; GJK must be <= upper + a small
+            // fixed-point slack, and non-negative.
+            if (gjkDist < 0) allInBand = false;
+            if (gjkDist > upper + kOne / 16) allInBand = false;
+        }
+        check(allInBand, "Gjk separated closest distance is within band (<= brute vertex distance)");
+    }
+
+    // ================= Gjk is deterministic (two calls byte-equal) =================
+    {
+        bool allDet = true;
+        for (const gjk::GjkPair& p : gpairs) {
+            const gjk::GjkResult a = gjk::Gjk(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            const gjk::GjkResult b = gjk::Gjk(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            if (std::memcmp(&a, &b, sizeof(gjk::GjkResult)) != 0) allDet = false;
+        }
+        check(allDet, "Gjk is deterministic (two calls byte-equal for every pair)");
+    }
+
+    // ================= terminal simplex valid (count 1-4, points are genuine SupportMinkowski results) ======
+    {
+        bool allValid = true;
+        for (const gjk::GjkPair& p : gpairs) {
+            const gjk::GjkResult r = gjk::Gjk(p.hullA, p.bodyA, p.hullB, p.bodyB);
+            if (r.simplex.count < 1 || r.simplex.count > 4) allValid = false;
+            // Each simplex CSO point must equal csoA - csoB (a genuine Minkowski-difference point).
+            for (uint32_t i = 0; i < r.simplex.count; ++i) {
+                const FxVec3 expect = fpx::FxSub(r.simplex.csoA[i], r.simplex.csoB[i]);
+                if (!(r.simplex.pts[i].x == expect.x && r.simplex.pts[i].y == expect.y &&
+                      r.simplex.pts[i].z == expect.z)) allValid = false;
+            }
+            if (r.iterations > gjk::kGjkMaxIter) allValid = false;
+        }
+        check(allValid, "Gjk terminal simplex valid (count 1-4, CSO points genuine, iters bounded)");
+    }
+
+    // ================= MeasureGjk is a PURE function (two calls byte-equal) =================
+    {
+        const gjk::GjkMeasure m1 = gjk::MeasureGjk(gpairs.data(), (uint32_t)gpairs.size());
+        const gjk::GjkMeasure m2 = gjk::MeasureGjk(gpairs.data(), (uint32_t)gpairs.size());
+        check(std::memcmp(&m1, &m2, sizeof(gjk::GjkMeasure)) == 0,
+              "MeasureGjk is a pure function (two calls byte-equal)");
+        check(m1.pairs == (uint32_t)gpairs.size(), "MeasureGjk pair count == scene size");
+        check(m1.overlapping + m1.separated == m1.pairs, "MeasureGjk overlap+separated == pairs");
+    }
+
     (void)hullNames;
     if (g_fail == 0) std::printf("gjk_test: ALL PASS\n");
     else std::printf("gjk_test: %d FAIL\n", g_fail);

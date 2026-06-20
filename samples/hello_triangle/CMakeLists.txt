@@ -1119,6 +1119,14 @@ hf_compile_shaders(
     # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU support array + cross-backend, proven memcmp.
     # NO new RHI; existing shaders + goldens untouched.
     "shaders/gjk_support.comp.hlsl:cs"
+    # General Convex-Hull Contacts Slice 2 (Slice GJ2): gjk_distance.comp is the GJK ALGORITHM pass — ONE
+    # THREAD PER HULL-PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) runs the full GJK simplex
+    # evolution (overlap + closest distance + witness points), copying gjk.h::Gjk VERBATIM. int64 (the
+    # sub-distance fxdiv + FxDot/FxCross/FxLength/FxNormalize/FxRotate products) -> VULKAN-SPIR-V-ONLY (DXC
+    # compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --gjk-distance showcase runs the CPU
+    # gjk::Gjk instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer -> bit-exact
+    # GPU==CPU GjkResult array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
+    "shaders/gjk_distance.comp.hlsl:cs"
     # Deterministic Convex Rigid-Body Contacts Slice 2 (Slice CX2): convex_manifold.comp is the box-box
     # CONTACT MANIFOLD pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
     # runs the 15-axis BoxSat then BuildManifold (the reference/incident face clip via Sutherland-Hodgman in
