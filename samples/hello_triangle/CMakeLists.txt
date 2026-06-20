@@ -1144,6 +1144,18 @@ hf_compile_shaders(
     # order-dependent (the Gauss-Seidel + in-place de-pen). Pure integer SSBO compute + ReadBuffer ->
     # bit-exact GPU==CPU final body world + cross-backend, proven memcmp. NO new RHI. THE SETTLING STACK.
     "shaders/convex_step.comp.hlsl:cs"
+    # Deterministic Contact Friction Slice 1 (Slice FC1, the BEACHHEAD of FLAGSHIP #20: DETERMINISTIC
+    # TANGENTIAL CONTACT FRICTION, hf::sim::fric): fric_basis.comp is THE TANGENT BASIS pass — ONE THREAD PER
+    # INPUT NORMAL (per-normal INDEPENDENT, 64 threads/group, NO atomics) runs the fixed integer Gram-Schmidt
+    # (least-aligned cardinal axis -> project off n -> FxNormalize -> FxCross(n,t1)), copying
+    # engine/sim/fric.h::MakeTangentBasis's body VERBATIM (the SAME LeastAlignedAxis argmin + lowest-index
+    # tie-break + the SAME FxDot/FxCross/FxNormalize int64 ops), writing its OWN gBases[normal] TangentBasis
+    # (t1.xyz, t2.xyz). basisEnabled=0 -> cleared bases. Like convex_sat.comp / fpx_solve.comp this is int64
+    # (the FxDot/FxCross/FxNormalize/FxISqrt Q16.16 products), so it is VULKAN-SPIR-V-ONLY (DXC compiles
+    # int64; glslc cannot) and is NOT MSL-gen'd — the Metal --fric-basis showcase runs the CPU
+    # MakeTangentBasis instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer ->
+    # bit-exact GPU==CPU TangentBasis array + cross-backend, proven memcmp. NO new RHI.
+    "shaders/fric_basis.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

@@ -99,6 +99,7 @@
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
 #include "sim/convex.h"              // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
+#include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -26116,6 +26117,177 @@ static int RunActiveLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FC1 — Deterministic Contact Friction THE TANGENT BASIS showcase (--fric-basis) ==============
+// (the integer BEACHHEAD of FLAGSHIP #20: DETERMINISTIC TANGENTIAL CONTACT FRICTION, hf::sim::fric). Like
+// CX1's --convex-sat, the tangent basis is int64 (FxNormalize/FxISqrt + the FxDot/FxCross Q16.16 products),
+// so shaders/fric_basis.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this
+// dir's hf_gen_msl list; on Metal the --fric-basis showcase runs the CPU fric::MakeTangentBasis — the EXACT
+// bit-exact reference the Vulkan --fric-basis-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the convex_sat.comp / fpx_solve.comp
+// convention), while the Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic
+// ~14-normal scene (axis-aligned / near-cardinal / oblique) as the Vulkan --fric-basis-shot, runs
+// fric::MakeTangentBasis over it, and CPU-draws the SAME 2D per-normal tangent-frame diagnostic -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/fric_basis.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000.
+static int RunFricBasisShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace fric = hf::sim::fric;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto norm = [&](int x, int y, int z) {
+        return fpx::FxNormalize(convex::FxVec3{fi(x), fi(y), fi(z)});
+    };
+
+    // The fixed deterministic normal scene (== the Vulkan --fric-basis-shot config).
+    std::vector<convex::FxVec3> normals;
+    normals.push_back(convex::FxVec3{kOne, 0, 0});
+    normals.push_back(convex::FxVec3{-kOne, 0, 0});
+    normals.push_back(convex::FxVec3{0, kOne, 0});
+    normals.push_back(convex::FxVec3{0, -kOne, 0});
+    normals.push_back(convex::FxVec3{0, 0, kOne});
+    normals.push_back(convex::FxVec3{0, 0, -kOne});
+    normals.push_back(norm(10, 1, 0));
+    normals.push_back(norm(0, 10, 1));
+    normals.push_back(norm(1, 0, 10));
+    normals.push_back(norm(1, 2, 3));
+    normals.push_back(norm(-2, 1, 1));
+    normals.push_back(norm(3, -1, 2));
+    normals.push_back(norm(1, 1, 1));
+    normals.push_back(norm(-1, -2, 3));
+
+    const uint32_t kNormalCount = (uint32_t)normals.size();
+
+    // Packed TangentBasis (== the Vulkan --fric-basis-shot TangentBasisGpu): 6 x int32 (24 bytes).
+    struct TangentBasisGpu { int32_t t1x, t1y, t1z, t2x, t2y, t2z; };
+    static_assert(sizeof(TangentBasisGpu) == 24, "TangentBasisGpu std430 layout");
+    auto packBasis = [&](const fric::TangentBasis& b) {
+        return TangentBasisGpu{b.t1.x, b.t1.y, b.t1.z, b.t2.x, b.t2.y, b.t2.z};
+    };
+
+    // CPU MakeTangentBasis (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    auto runBasis = [&](std::vector<TangentBasisGpu>& out) {
+        out.assign((size_t)kNormalCount, TangentBasisGpu{});
+        for (uint32_t i = 0; i < kNormalCount; ++i)
+            out[i] = packBasis(fric::MakeTangentBasis(normals[i]));
+    };
+
+    std::vector<TangentBasisGpu> bases;
+    runBasis(bases);
+
+    // GPU==CPU is N/A on the Metal CPU path: this IS the CPU MakeTangentBasis reference the Vulkan
+    // --fric-basis-shot proved the GPU shader bit-identical against -> byte-identical by construction.
+    std::printf("fric-basis: {normals:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fric::MakeTangentBasis, byte-identical to the Vulkan GPU result by construction]\n",
+                kNormalCount);
+
+    // determinism: two runs byte-identical.
+    std::vector<TangentBasisGpu> bases2;
+    runBasis(bases2);
+    if (bases.size() != bases2.size() ||
+        std::memcmp(bases.data(), bases2.data(), bases.size() * sizeof(TangentBasisGpu)) != 0)
+        return fail("fric-basis: two runs differ (nondeterministic)");
+    std::printf("fric-basis determinism: two runs BYTE-IDENTICAL\n");
+
+    // orthonormal: |n.t1|,|n.t2|,|t1.t2| ~0 AND |t1|,|t2| ~kOne within an integer epsilon.
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    const fx kEps = kOne / 256;
+    fx maxDotErr = 0, maxLenErr = 0;
+    for (uint32_t i = 0; i < kNormalCount; ++i) {
+        const convex::FxVec3 n = normals[i];
+        const convex::FxVec3 t1{bases[i].t1x, bases[i].t1y, bases[i].t1z};
+        const convex::FxVec3 t2{bases[i].t2x, bases[i].t2y, bases[i].t2z};
+        const fx d0 = absfx(convex::FxDot(n, t1));
+        const fx d1 = absfx(convex::FxDot(n, t2));
+        const fx d2 = absfx(convex::FxDot(t1, t2));
+        if (d0 > maxDotErr) maxDotErr = d0;
+        if (d1 > maxDotErr) maxDotErr = d1;
+        if (d2 > maxDotErr) maxDotErr = d2;
+        const fx e1 = absfx(fpx::FxLength(t1) - kOne);
+        const fx e2 = absfx(fpx::FxLength(t2) - kOne);
+        if (e1 > maxLenErr) maxLenErr = e1;
+        if (e2 > maxLenErr) maxLenErr = e2;
+    }
+    if (maxDotErr >= kEps || maxLenErr >= kEps) return fail("fric-basis: not orthonormal");
+    std::printf("fric-basis orthonormal: {maxDotErr:%d, lenErr:%d}\n", (int)maxDotErr, (int)maxLenErr);
+
+    // degeneracy-safe: the 6 axis-aligned normals still produce a valid orthonormal basis.
+    bool axisAlignedOk = true;
+    for (uint32_t i = 0; i < 6 && i < kNormalCount; ++i) {
+        const convex::FxVec3 n = normals[i];
+        const convex::FxVec3 t1{bases[i].t1x, bases[i].t1y, bases[i].t1z};
+        const convex::FxVec3 t2{bases[i].t2x, bases[i].t2y, bases[i].t2z};
+        if (absfx(convex::FxDot(n, t1)) >= kEps || absfx(convex::FxDot(n, t2)) >= kEps ||
+            absfx(convex::FxDot(t1, t2)) >= kEps ||
+            absfx(fpx::FxLength(t1) - kOne) >= kEps || absfx(fpx::FxLength(t2) - kOne) >= kEps)
+            axisAlignedOk = false;
+    }
+    if (!axisAlignedOk) return fail("fric-basis: an axis-aligned normal collapsed");
+    std::printf("fric-basis degeneracy: {axisAlignedOk:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D per-normal tangent-frame diagnostic as the Vulkan --fric-basis-shot
+    // (identical by construction). Each normal a cell: its two tangents t1/t2 as short colored segments from
+    // the cell center (t1 cyan, t2 magenta) + the normal projection a faint white segment + a center dot. ---
+    const int kCols = 5;
+    const int kRows = (int)((kNormalCount + kCols - 1) / kCols);
+    const int kCell = 96, kMargin = 16, kLen = 36;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kCols * kCell);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kRows * kCell);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto proj = [&](const convex::FxVec3& v, int cx, int cy, int& ox, int& oy) {
+        ox = cx + (int)(((int64_t)v.x * kLen) >> convex::kFrac);
+        oy = cy - (int)(((int64_t)v.y * kLen) >> convex::kFrac);
+    };
+    const Vec3 colN{1.0f, 1.0f, 1.0f}, colT1{0.25f, 0.85f, 0.95f}, colT2{0.95f, 0.35f, 0.85f};
+    for (uint32_t i = 0; i < kNormalCount; ++i) {
+        const int col = (int)(i % (uint32_t)kCols);
+        const int row = (int)(i / (uint32_t)kCols);
+        const int cx = kMargin + col * kCell + kCell / 2;
+        const int cy = kMargin + row * kCell + kCell / 2;
+        const convex::FxVec3 t1{bases[i].t1x, bases[i].t1y, bases[i].t1z};
+        const convex::FxVec3 t2{bases[i].t2x, bases[i].t2y, bases[i].t2z};
+        int nx, ny, x1, y1, x2, y2;
+        proj(normals[i], cx, cy, nx, ny);
+        proj(t1, cx, cy, x1, y1);
+        proj(t2, cx, cy, x2, y2);
+        drawLine(cx, cy, x1, y1, colT1);
+        drawLine(cx, cy, x2, y2, colT2);
+        drawLine(cx, cy, nx, ny, colN);
+        putPx(cx, cy, colN);
+        putPx(cx + 1, cy, colN); putPx(cx, cy + 1, colN);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — per-normal tangent-frame diagnostic (%u normals)\n",
+                outPath, imgW, imgH, kNormalCount);
+    return 0;
+}
+
 // ===== Slice CX1 — Deterministic Convex Rigid-Body Contacts THE BOX-BOX SAT showcase (--convex-sat) ======
 // (the BEACHHEAD of FLAGSHIP #19). Like FPX3's --fpx-solve / VH1's --vehicle-spring, the SAT is int64
 // (FxNormalize/FxISqrt + the FxDot/FxCross Q16.16 products), so shaders/convex_sat.comp is VULKAN-SPIR-V-
@@ -46762,6 +46934,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vehicle-spring") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vehicle_spring.png";
             try { return RunVehicleSpringShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fric-basis <out.png>: render the Deterministic Contact Friction THE TANGENT BASIS showcase (Slice
+        // FC1, the integer BEACHHEAD of FLAGSHIP #20). On Metal this runs the CPU basis: fric_basis.comp is
+        // int64/Vulkan-only (glslc can't parse the FxNormalize/FxISqrt/FxDot/FxCross int64), so Metal runs the
+        // CPU fric::MakeTangentBasis over the SAME fixed ~14-normal scene -> the EXACT bit-exact reference the
+        // Vulkan --fric-basis-shot GPU==CPU memcmp compares against; two runs byte-identical; orthonormal +
+        // degeneracy-safe. The image golden is a PURE-INTEGER 2D per-normal tangent-frame diagnostic, identical
+        // to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/fric_basis.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fric-basis") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fric_basis.png";
+            try { return RunFricBasisShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-sat <out.png>: render the Deterministic Convex Rigid-Body Contacts BOX-BOX SAT showcase

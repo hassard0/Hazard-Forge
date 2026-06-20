@@ -670,6 +670,17 @@ hf_add_pure_test(fpx_test)
 # (hf_core), ASan-eligible. convex.h #includes sim/fpx.h read-only.
 hf_add_pure_test(convex_test)
 
+# Deterministic Contact Friction Slice 1 (Slice FC1, the BEACHHEAD of FLAGSHIP #20: DETERMINISTIC TANGENTIAL
+# CONTACT FRICTION, hf::sim::fric): the integer TANGENT-BASIS core (engine/sim/fric.h) the GPU
+# shaders/fric_basis.comp.hlsl copies VERBATIM + proves bit-identical. fric.h #includes sim/convex.h
+# read-only (transitively fpx.h). Pins MakeTangentBasis: +z gives two unit tangents in the xy-plane mutually
+# orthogonal + orthogonal to z; an oblique normal gives an orthonormal (t1,t2) (the three dot products ~0,
+# the two lengths ~kOne within an integer epsilon); the least-aligned cardinal axis is the FIXED argmin
+# (lowest-index tie-break, NOT the most-aligned axis); the axis-aligned normals are all degeneracy-safe;
+# MeasureBasis deterministic orthonormality summary; two runs byte-identical. Pure C++ (hf_core),
+# ASan-eligible.
+hf_add_pure_test(fric_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
