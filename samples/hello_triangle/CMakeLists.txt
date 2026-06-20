@@ -1119,6 +1119,18 @@ hf_compile_shaders(
     # showcase runs the CPU BuildManifold instead (byte-identical by construction). Pure integer SSBO compute
     # + ReadBuffer -> bit-exact GPU==CPU ManifoldGpu array + cross-backend, proven memcmp. NO new RHI.
     "shaders/convex_manifold.comp.hlsl:cs"
+    # Deterministic Convex Rigid-Body Contacts Slice 3 (Slice CX3, THE NEW-PHYSICS BEAT): convex_solve.comp
+    # is the ANGULAR CONTACT IMPULSE pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group,
+    # NO atomics) runs BoxSat -> BuildManifold -> the box inertia tensors (FxBoxInvInertiaBody +
+    # WorldInvInertia) -> SolveManifoldImpulse (the FIXED Gauss-Seidel iters×points double loop with the
+    # A->B normal sign-correction), copying engine/sim/convex.h::ResolveContactPair VERBATIM, writing its OWN
+    # two resolved bodies gResults[pair*2 + 0/1] (the impulse drives BOTH linear vel AND angVel — the first
+    # contact-driven spin in the engine). solveEnabled=0 -> bodies UNCHANGED. Like convex_manifold.comp this
+    # is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16 products), so it is VULKAN-SPIR-V-
+    # ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --convex-tumble runs the CPU
+    # ResolveContactPair instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer ->
+    # bit-exact GPU==CPU resolved-body array + cross-backend, proven memcmp. NO new RHI. VELOCITY-ONLY.
+    "shaders/convex_solve.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

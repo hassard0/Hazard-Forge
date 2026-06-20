@@ -417,6 +417,200 @@ int main() {
               "CX2 MeasureManifold determinism: two runs BYTE-IDENTICAL");
     }
 
+    // ========================================================================================
+    // ================= Slice CX3 — THE ANGULAR CONTACT IMPULSE (the new physics) ==============
+    // ========================================================================================
+    // FxBoxInvInertiaBody, WorldInvInertia (-> FxMat3), SolveManifoldImpulse, ResolveContactPair.
+    // The FIRST contact-driven angVel in the engine: an OFF-CENTER box-box contact imparts spin.
+
+    // ================= FxBoxInvInertiaBody: matches the analytic (m/3)(h²+h²) inverse =================
+    {
+        // A unit box (halfExtents 1,1,1), mass 1 (invMass==kOne). Body inertia diagonal Ixx=(m/3)(hy²+hz²)
+        // = (1/3)(1+1) = 2/3 -> invIbody.x = 3*invMass/(hy²+hz²) = 3/2 = 1.5. Symmetric for all three.
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        const FxVec3 inv = convex::FxBoxInvInertiaBody(unit, kOne);
+        const fx threeHalves = FromInt(1) + kOne / 2;   // 1.5 in Q16.16
+        check(inv.x == threeHalves && inv.y == threeHalves && inv.z == threeHalves,
+              "FxBoxInvInertiaBody unit box mass 1 -> diag 1.5 each (3*invMass/(h²+h²))");
+
+        // A NON-cubic box (halfExtents 1,2,3), mass 1. invIbody.x = 3/(hy²+hz²) = 3/(4+9) = 3/13;
+        // invIbody.y = 3/(hx²+hz²) = 3/(1+9) = 3/10; invIbody.z = 3/(hx²+hy²) = 3/(1+4) = 3/5.
+        const convex::FxBox rect{FxVec3{kOne, FromInt(2), FromInt(3)}};
+        const FxVec3 invr = convex::FxBoxInvInertiaBody(rect, kOne);
+        check(invr.x == fpx::fxdiv(FromInt(3), FromInt(13)), "FxBoxInvInertiaBody rect x = 3/13");
+        check(invr.y == fpx::fxdiv(FromInt(3), FromInt(10)), "FxBoxInvInertiaBody rect y = 3/10");
+        check(invr.z == fpx::fxdiv(FromInt(3), FromInt(5)),  "FxBoxInvInertiaBody rect z = 3/5");
+
+        // A STATIC body (invMass==0) -> zero inverse inertia (infinite inertia, takes no angular impulse).
+        const FxVec3 invs = convex::FxBoxInvInertiaBody(unit, 0);
+        check(invs.x == 0 && invs.y == 0 && invs.z == 0,
+              "FxBoxInvInertiaBody static (invMass 0) -> (0,0,0)");
+    }
+
+    // ================= WorldInvInertia: identity orient -> diagonal; 90° rotate -> permuted ============
+    {
+        // For an IDENTITY-oriented box the world inverse inertia == diag(invIbody) (R==I -> R·diag·Rᵀ==diag).
+        const convex::FxBox rect{FxVec3{kOne, FromInt(2), FromInt(3)}};
+        const FxVec3 invb = convex::FxBoxInvInertiaBody(rect, kOne);
+        fpx::FxBody ident = MakeBoxBody(0, 0, 0);   // identity orient
+        const convex::FxMat3 Iw = convex::WorldInvInertia(ident, invb);
+        check(Iw.m[0] == invb.x && Iw.m[4] == invb.y && Iw.m[8] == invb.z,
+              "WorldInvInertia identity orient -> diagonal == invIbody");
+        check(Iw.m[1] == 0 && Iw.m[2] == 0 && Iw.m[3] == 0 && Iw.m[5] == 0 && Iw.m[6] == 0 && Iw.m[7] == 0,
+              "WorldInvInertia identity orient -> off-diagonal == 0");
+        // Symmetric (R·diag·Rᵀ is always symmetric).
+        check(Iw.m[1] == Iw.m[3] && Iw.m[2] == Iw.m[6] && Iw.m[5] == Iw.m[7],
+              "WorldInvInertia is symmetric (identity case)");
+
+        // A 90° rotation about Z maps local x->world y, local y->world -x: so the world diagonal PERMUTES —
+        // the x-diagonal world entry picks up the body's Y inverse inertia, the y-diagonal entry the X one,
+        // the z entry stays. q(90° about Z) = {0,0,sin45,cos45}, sin45=cos45=0.70710678 -> ~46341 in Q16.16.
+        fpx::FxBody rot = MakeBoxBody(0, 0, 0);
+        rot.orient = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)46341, (fx)46341});  // 90° about Z
+        const convex::FxMat3 Ir = convex::WorldInvInertia(rot, invb);
+        // The world (0,0) entry ~ invb.y, the (1,1) ~ invb.x, the (2,2) == invb.z. Allow a small fixed-point
+        // drift epsilon (the FxRotate of the axes + the outer-product products carry a few LSB).
+        const fx eps = kOne / 256;
+        auto absfx = [](fx v) { return v < 0 ? -v : v; };
+        check(absfx(Ir.m[0] - invb.y) < eps, "WorldInvInertia 90°Z -> world-x diag ~ body-y inertia");
+        check(absfx(Ir.m[4] - invb.x) < eps, "WorldInvInertia 90°Z -> world-y diag ~ body-x inertia");
+        check(absfx(Ir.m[8] - invb.z) < eps, "WorldInvInertia 90°Z -> world-z diag unchanged");
+        // Still symmetric.
+        check(absfx(Ir.m[1] - Ir.m[3]) < eps && absfx(Ir.m[2] - Ir.m[6]) < eps &&
+              absfx(Ir.m[5] - Ir.m[7]) < eps, "WorldInvInertia 90°Z still symmetric");
+    }
+
+    // ================= SolveManifoldImpulse: a 1-point OFF-CENTER contact -> non-zero angVel ===========
+    {
+        // A static box A at origin; a dynamic unit box B above it, moving DOWN, with the single contact point
+        // OFFSET in +x from B's center -> the downward impulse at an off-center lever arm torques B -> spin.
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody A = MakeBoxBody(0, 0, 0);
+        A.invMass = 0; A.flags = 0;                  // static floor box
+        fpx::FxBody B = MakeBoxBody(0, 2, 0);        // above A
+        B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+        B.vel = {0, -kOne, 0};                       // moving down at 1 u/s
+        const FxVec3 invIa = convex::FxBoxInvInertiaBody(unit, A.invMass);   // (0,0,0)
+        const FxVec3 invIb = convex::FxBoxInvInertiaBody(unit, B.invMass);
+        const convex::FxMat3 invIaW = convex::WorldInvInertia(A, invIa);
+        const convex::FxMat3 invIbW = convex::WorldInvInertia(B, invIb);
+
+        // One contact point at the touching plane (y=1), OFFSET +0.5 in x from B's center (x=0). normal +Y.
+        convex::ContactManifold m;
+        m.count = 1;
+        m.points[0] = FxVec3{kOne / 2, kOne, 0};
+        m.depths[0] = 0;
+        m.normal = FxVec3{0, kOne, 0};   // A->B is +Y
+
+        fpx::FxBody A2 = A, B2 = B;
+        convex::SolveManifoldImpulse(A2, B2, invIaW, invIbW, m, /*restitution*/0, /*iters*/1);
+        // The static body A is unaffected.
+        check(A2.vel.x == 0 && A2.vel.y == 0 && A2.vel.z == 0 && A2.angVel.x == 0 &&
+              A2.angVel.y == 0 && A2.angVel.z == 0, "SolveManifoldImpulse: static body A unaffected");
+        // B gained UPWARD linear velocity (the impulse removed the downward approach).
+        check(B2.vel.y > B.vel.y, "SolveManifoldImpulse: off-center -> B vel.y increased (approach removed)");
+        // B gained NON-ZERO angular velocity (the contact-driven spin — the new physics). A downward
+        // impulse (-Y) applied at +x lever -> torque rB×J = (+x)×(-Y) ~ +z -> ωB.z != 0.
+        check(B2.angVel.x == 0 && B2.angVel.z != 0 && B2.angVel.y == 0,
+              "SolveManifoldImpulse: off-center contact -> non-zero angVel.z (contact-driven spin)");
+        check(B2.angVel.z > 0, "SolveManifoldImpulse: +x lever, -Y impulse -> +z spin (sign check)");
+    }
+
+    // ================= SolveManifoldImpulse: a DEAD-CENTER symmetric contact -> zero angVel ============
+    {
+        // The SAME scene but the contact point is DEAD-CENTER under B (x=0) -> no lever arm -> NO spin.
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody A = MakeBoxBody(0, 0, 0); A.invMass = 0; A.flags = 0;
+        fpx::FxBody B = MakeBoxBody(0, 2, 0); B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+        B.vel = {0, -kOne, 0};
+        const FxVec3 invIb = convex::FxBoxInvInertiaBody(unit, B.invMass);
+        const convex::FxMat3 invIaW = convex::WorldInvInertia(A, FxVec3{0, 0, 0});
+        const convex::FxMat3 invIbW = convex::WorldInvInertia(B, invIb);
+        convex::ContactManifold m;
+        m.count = 1;
+        m.points[0] = FxVec3{0, kOne, 0};   // dead-center (x=0), no lever arm
+        m.depths[0] = 0;
+        m.normal = FxVec3{0, kOne, 0};
+        convex::SolveManifoldImpulse(A, B, invIaW, invIbW, m, 0, 1);
+        check(B.angVel.x == 0 && B.angVel.y == 0 && B.angVel.z == 0,
+              "SolveManifoldImpulse: dead-center contact -> angVel == (0,0,0) (no spin)");
+        check(B.vel.y > -kOne, "SolveManifoldImpulse: dead-center -> still removes the approach");
+    }
+
+    // ================= SolveManifoldImpulse: an already-SEPARATING contact -> no-op ====================
+    {
+        // B is moving AWAY (up) -> vn >= 0 -> the contact must NOT apply any impulse (deterministic skip).
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody A = MakeBoxBody(0, 0, 0); A.invMass = 0; A.flags = 0;
+        fpx::FxBody B = MakeBoxBody(0, 2, 0); B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+        B.vel = {0, kOne, 0};   // moving UP, away from A
+        const FxVec3 invIb = convex::FxBoxInvInertiaBody(unit, B.invMass);
+        const convex::FxMat3 invIaW = convex::WorldInvInertia(A, FxVec3{0, 0, 0});
+        const convex::FxMat3 invIbW = convex::WorldInvInertia(B, invIb);
+        convex::ContactManifold m;
+        m.count = 1;
+        m.points[0] = FxVec3{kOne / 2, kOne, 0};
+        m.depths[0] = 0;
+        m.normal = FxVec3{0, kOne, 0};
+        const fpx::FxBody Bbefore = B;
+        convex::SolveManifoldImpulse(A, B, invIaW, invIbW, m, 0, 1);
+        check(B.vel.x == Bbefore.vel.x && B.vel.y == Bbefore.vel.y && B.vel.z == Bbefore.vel.z &&
+              B.angVel.x == 0 && B.angVel.y == 0 && B.angVel.z == 0,
+              "SolveManifoldImpulse: separating contact (vn>=0) -> no-op");
+    }
+
+    // ================= ResolveContactPair: off-center hit -> spin; separating pair -> no-op ============
+    {
+        // An overlapping off-center box-box pair end-to-end: BoxSat -> BuildManifold -> world inertias ->
+        // SolveManifoldImpulse, all inside ResolveContactPair. B descends onto A, offset in x -> B spins.
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody A = MakeBoxBody(0, 0, 0); A.invMass = 0; A.flags = 0;
+        fpx::FxBody B = MakeBoxBody(0, 0, 0);
+        // B overlapping A on +Y, OFFSET +x so the face contact is off-center relative to the combined COM
+        // motion -> an asymmetric manifold -> spin. centers 1.5 apart on y (overlap 0.5), x offset +0.6.
+        B.pos = {(fx)(kOne * 6 / 10), kOne + kOne / 2, 0};
+        B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+        B.vel = {0, -kOne, 0};   // descending
+        convex::ContactSolveConfig cfg;
+        cfg.restitution = 0;
+        cfg.iters = 4;
+        fpx::FxBody A2 = A, B2 = B;
+        convex::ResolveContactPair(A2, unit, B2, unit, cfg);
+        check(A2.vel.x == 0 && A2.vel.y == 0 && A2.vel.z == 0 && A2.angVel.z == 0,
+              "ResolveContactPair: static A unaffected");
+        bool spun = (B2.angVel.x != 0 || B2.angVel.y != 0 || B2.angVel.z != 0);
+        check(spun, "ResolveContactPair: off-center overlap -> B gained spin (contact-driven angVel)");
+        check(B2.vel.y > B.vel.y, "ResolveContactPair: off-center overlap -> approach removed (vel.y up)");
+
+        // A SEPARATED pair -> BoxSat overlap=false -> ResolveContactPair is a no-op.
+        fpx::FxBody Sa = MakeBoxBody(0, 0, 0); Sa.invMass = 0; Sa.flags = 0;
+        fpx::FxBody Sb = MakeBoxBody(5, 0, 0); Sb.invMass = kOne; Sb.flags = fpx::kFlagDynamic;
+        Sb.vel = {-kOne, 0, 0};
+        const fpx::FxBody SbBefore = Sb;
+        convex::ResolveContactPair(Sa, unit, Sb, unit, cfg);
+        check(Sb.vel.x == SbBefore.vel.x && Sb.vel.y == SbBefore.vel.y && Sb.vel.z == SbBefore.vel.z &&
+              Sb.angVel.x == 0 && Sb.angVel.y == 0 && Sb.angVel.z == 0,
+              "ResolveContactPair: separated pair -> no-op");
+    }
+
+    // ================= CX3 determinism: two ResolveContactPair runs byte-identical =====================
+    {
+        const convex::FxBox unit{FxVec3{kOne, kOne, kOne}};
+        fpx::FxBody A = MakeBoxBody(0, 0, 0); A.invMass = 0; A.flags = 0;
+        fpx::FxBody B = MakeBoxBody(0, 0, 0);
+        B.pos = {(fx)(kOne * 6 / 10), kOne + kOne / 2, kOne / 4};
+        B.orient = fpx::FxQuatNormalize(fpx::FxQuat{(fx)8000, 0, 0, (fx)64000});
+        B.invMass = kOne; B.flags = fpx::kFlagDynamic;
+        B.vel = {0, -kOne, 0};
+        convex::ContactSolveConfig cfg; cfg.restitution = kOne / 4; cfg.iters = 6;
+        fpx::FxBody A1 = A, B1 = B, A2 = A, B2 = B;
+        convex::ResolveContactPair(A1, unit, B1, unit, cfg);
+        convex::ResolveContactPair(A2, unit, B2, unit, cfg);
+        check(std::memcmp(&B1, &B2, sizeof(fpx::FxBody)) == 0 &&
+              std::memcmp(&A1, &A2, sizeof(fpx::FxBody)) == 0,
+              "CX3 determinism: two ResolveContactPair runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("convex_test: ALL PASS\n");
     else std::printf("convex_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

@@ -26519,6 +26519,180 @@ static int RunConvexManifoldShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CX3 — Deterministic Convex Rigid-Body Contacts THE ANGULAR CONTACT IMPULSE showcase
+// (--convex-tumble) (the 3rd slice of FLAGSHIP #19, THE NEW-PHYSICS BEAT). Like CX1's --convex-sat / CX2's
+// --convex-manifold, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16
+// products), so shaders/convex_solve.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT
+// in this dir's hf_gen_msl list; on Metal the --convex-tumble showcase runs the CPU convex::ResolveContactPair
+// — the EXACT bit-exact reference the Vulkan --convex-tumble-shot GPU==CPU memcmp already compares against ->
+// the Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the convex_manifold.comp/
+// fpx_solve.comp convention), while the Vulkan side carries the GPU==CPU proof. So this builds the SAME
+// deterministic box-pair scene (an OFF-CENTER ledge-overhang hit -> spin + a DEAD-CENTER skew-edge control ->
+// exact zero spin), runs ResolveContactPair over it, free-integrates the off-center box forward to SHOW the
+// tumble, and CPU-colors the SAME 2D side-view motion-trail -> the golden is bit-identical cross-backend BY
+// CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/convex_tumble.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunConvexTumbleShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    const convex::ContactSolveConfig kCfg{/*restitution*/0, /*iters*/8};
+
+    auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = q;
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const fpx::FxQuat qI{0, 0, 0, kOne};
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+    const fpx::FxQuat qX = fpx::FxQuatNormalize(fpx::FxQuat{(fx)25080, 0, 0, (fx)60547}); // 45° about X
+    const fpx::FxQuat qZ = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)25080, (fx)60547}); // 45° about Z
+
+    std::vector<convex::SatPair> pairs;
+    const convex::FxBox kFloor{convex::FxVec3{fi(2), kOne, kOne}};
+    {   // Pair 0 — OFF-CENTER ledge overhang -> tumble.
+        fpx::FxBody A = bodyAt(0, 0, 0, qI, false);
+        fpx::FxBody B = bodyAt(fh(9, 4), fh(3, 2), 0, qI, true);
+        B.vel = {0, fi(-3), 0};
+        pairs.push_back({A, kFloor, B, kUnit});
+    }
+    {   // Pair 1 — DEAD-CENTER skew-edge control -> exact zero spin.
+        fpx::FxBody A = bodyAt(0, 0, 0, qX, false);
+        fpx::FxBody B = bodyAt(0, fh(17, 10), 0, qZ, true);
+        B.vel = {0, fi(-3), 0};
+        pairs.push_back({A, kUnit, B, kUnit});
+    }
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+    const uint32_t kResultCount = kPairCount * 2u;
+
+    // The resolved bodies (TWO per pair: resolvedA, resolvedB). The Metal CPU path IS the reference the
+    // Vulkan GPU==CPU memcmp compares against, so the proof line says GPU==CPU BIT-EXACT by construction.
+    std::vector<fpx::FxBody> resolved((size_t)kResultCount);
+    auto run = [&](std::vector<fpx::FxBody>& out) {
+        out.assign((size_t)kResultCount, fpx::FxBody{});
+        for (uint32_t i = 0; i < kPairCount; ++i) {
+            fpx::FxBody A = pairs[i].bodyA, B = pairs[i].bodyB;
+            convex::ResolveContactPair(A, pairs[i].boxA, B, pairs[i].boxB, kCfg);
+            out[i * 2 + 0] = A;
+            out[i * 2 + 1] = B;
+        }
+    };
+    run(resolved);
+
+    std::printf("convex-tumble: {pairs:%u, resolved:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU convex::ResolveContactPair, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, kResultCount);
+
+    std::vector<fpx::FxBody> resolved2;
+    run(resolved2);
+    if (resolved.size() != resolved2.size() ||
+        std::memcmp(resolved.data(), resolved2.data(), resolved.size() * sizeof(fpx::FxBody)) != 0)
+        return fail("convex-tumble: two runs differ (nondeterministic)");
+    std::printf("convex-tumble determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) THE NEW PHYSICS — the off-center pair drove spin + removed the approach.
+    const fpx::FxBody offB = resolved[0 * 2 + 1];
+    const bool contactDroveSpin = (offB.angVel.x != 0 || offB.angVel.y != 0 || offB.angVel.z != 0);
+    const bool approachRemoved = (offB.vel.y > pairs[0].bodyB.vel.y);
+    if (!contactDroveSpin || !approachRemoved)
+        return fail("convex-tumble: newphysics failed (off-center contact did not impart spin)");
+    std::printf("convex-tumble newphysics: {contactDroveSpin:true, approachRemoved:true}\n");
+
+    // PROOF (4) control — the dead-center pair produced NO spin.
+    const fpx::FxBody ctrB = resolved[1 * 2 + 1];
+    if (ctrB.angVel.x != 0 || ctrB.angVel.y != 0 || ctrB.angVel.z != 0)
+        return fail("convex-tumble: control failed (dead-center hit produced spin)");
+    std::printf("convex-tumble control: {centeredHit:noSpin}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) tumble motion-trail as the Vulkan
+    // --convex-tumble-shot (identical by construction). ---
+    const int kPxPerUnit = 26, kMargin = 24;
+    const int kWorldHalfX = 14, kWorldHalfY = 9;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int shiftUnits, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac) + shiftUnits;
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, int shiftUnits, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], shiftUnits, x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], shiftUnits, x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    fpx::FxBody trail = offB;
+    const convex::FxVec3 kNoG{0, 0, 0};
+    const fx kDt = kOne / 30;
+    const int kTicks = 36;
+    const int kSample = 4;
+    int sampleIdx = 0;
+    for (int tk = 0; tk <= kTicks; ++tk) {
+        if (tk % kSample == 0) {
+            const float f = 0.30f + 0.70f * (float)tk / (float)kTicks;
+            const Vec3 col{1.0f * f, 0.55f * f, 0.20f * f};
+            const int shift = -10 + sampleIdx * 2;
+            drawBoxXY(trail, kUnit, shift, col);
+            ++sampleIdx;
+        }
+        fpx::IntegrateBodyFull(trail, kNoG, kDt);
+    }
+    drawBoxXY(pairs[0].bodyB, kUnit, -12, Vec3{0.25f, 0.45f, 0.85f});
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — angular-impulse tumble side-view (%u pairs, off-center angVel.z=%d)\n",
+                outPath, imgW, imgH, kPairCount, offB.angVel.z);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -45978,6 +46152,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-manifold") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_manifold.png";
             try { return RunConvexManifoldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --convex-tumble <out.png>: render the Deterministic Convex Rigid-Body Contacts THE ANGULAR CONTACT
+        // IMPULSE showcase (Slice CX3, THE NEW-PHYSICS BEAT, the 3rd slice of FLAGSHIP #19). On Metal this
+        // runs the CPU impulse solve: convex_solve.comp is int64/Vulkan-only (glslc can't parse the inertia
+        // fxdiv + the FxDot/FxCross/FxMat3MulVec int64), so Metal runs the CPU convex::ResolveContactPair over
+        // the SAME box-pair scene (an OFF-CENTER ledge-overhang hit -> spin + a DEAD-CENTER skew-edge control
+        // -> exact zero spin) -> the EXACT bit-exact reference the Vulkan --convex-tumble-shot GPU==CPU memcmp
+        // compares against; solveEnabled=false -> bodies unchanged; two runs byte-identical; the off-center
+        // box gains spin (the first contact-driven angVel), the dead-center control does not. The image golden
+        // is a PURE-INTEGER 2D side-view tumble motion-trail, identical to the Vulkan path BY CONSTRUCTION.
+        // New golden tests/golden/metal/convex_tumble.png.
+        if (argc > 1 && std::strcmp(argv[1], "--convex-tumble") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_convex_tumble.png";
+            try { return RunConvexTumbleShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

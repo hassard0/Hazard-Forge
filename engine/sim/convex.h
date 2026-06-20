@@ -574,5 +574,139 @@ inline ManifoldMeasure MeasureManifold(const std::vector<SatPair>& pairs) {
     return m;
 }
 
+// =========================================================================================================
+// Slice CX3 — THE ANGULAR CONTACT IMPULSE (the new physics). APPENDED after MeasureManifold (CX1+CX2's
+// lines above are BYTE-FROZEN). Turns the CX2 ContactManifold into the VELOCITY response: the inverse-mass
+// + INERTIA-TENSOR contact impulse, applied to BOTH linear velocity AND angular velocity. This is the FIRST
+// time in the whole engine that `angVel` is driven by a contact — a box hitting a static box OFF-CENTER
+// gains spin and TUMBLES (impossible in the sphere-sphere fpx solver). Deterministic integer Gauss-Seidel,
+// every order PINNED. VELOCITY-ONLY (NO position de-penetration — that is CX4); the showcase free-integrates
+// the resolved body with IntegrateBodyFull to SHOW the tumble.
+//
+// THE int64 REALITY (the CX1/CX2/FPX3 lesson): the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16
+// products are int64. DXC compiles int64 (Vulkan); glslc cannot. So shaders/convex_solve.comp is
+// VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --convex-tumble runs THIS CPU ResolveContactPair —
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU memcmp.
+
+using fpx::FxScale;
+using fpx::FxAdd;
+
+// ----- ContactSolveConfig: the impulse solve parameters (restitution + Gauss-Seidel sweep count) ---------
+struct ContactSolveConfig {
+    fx       restitution = 0;   // Q16.16 bounce factor (0 = fully inelastic; the CX3 showcase uses 0)
+    uint32_t iters       = 4;   // Gauss-Seidel sweeps over the manifold points
+};
+
+// ----- FxBoxInvInertiaBody: the 3 diagonal BODY-space inverse inertias of a box -------------------------
+// A box with half-extents (hx,hy,hz) and mass m has the analytic DIAGONAL body-space inertia
+// Ixx=(m/3)(hy²+hz²), Iyy=(m/3)(hx²+hz²), Izz=(m/3)(hx²+hy²) (from the full extents 2h). We store
+// invMass=1/m, so the body-space INVERSE inertia diagonal is invIbody = (3·invMass/(hy²+hz²),
+// 3·invMass/(hx²+hz²), 3·invMass/(hx²+hy²)) — each a Q16.16 fxdiv(3*invMass, fxmul(h,h)+fxmul(h,h)) (int64
+// inside fxmul/fxdiv). A STATIC body (invMass==0) -> (0,0,0) (infinite inertia, takes no angular impulse).
+inline FxVec3 FxBoxInvInertiaBody(const FxBox& box, fx invMass) {
+    if (invMass == 0) return FxVec3{0, 0, 0};
+    const fx hx = box.halfExtents.x, hy = box.halfExtents.y, hz = box.halfExtents.z;
+    const fx hx2 = fxmul(hx, hx), hy2 = fxmul(hy, hy), hz2 = fxmul(hz, hz);
+    const fx three = 3 * invMass;   // 3·invMass in Q16.16 (invMass < a few kOne -> no int32 overflow)
+    return FxVec3{
+        fxdiv(three, hy2 + hz2),
+        fxdiv(three, hx2 + hz2),
+        fxdiv(three, hx2 + hy2),
+    };
+}
+
+// ----- WorldInvInertia: R·diag(invIbody)·Rᵀ as an explicit FxMat3 (the FxMat3 type's first real use) ----
+// R's columns are the body's WORLD face axes (BoxAxes). For an orthonormal R, R·diag·Rᵀ = Σ_k invIbody[k]·
+// (axis_k ⊗ axis_k) — the sum of each world axis outer-product with itself, scaled by its inverse inertia.
+// Symmetric. Pure integer (the outer products are fxmul, the scaled sums are int64-safe within bound).
+inline FxMat3 WorldInvInertia(const FxBody& body, const FxVec3& invIbody) {
+    FxVec3 ax[3];
+    BoxAxes(body, ax);
+    const fx d[3] = {invIbody.x, invIbody.y, invIbody.z};
+    FxMat3 M;   // zero-initialized
+    for (int k = 0; k < 3; ++k) {
+        const FxVec3& a = ax[k];
+        const fx dk = d[k];
+        // outer = dk * (a ⊗ a); accumulate into M (row r, col c) = Σ_k dk * a[r] * a[c]. Two nested fxmul.
+        const fx ax0 = a.x, ax1 = a.y, ax2 = a.z;
+        const fx da0 = fxmul(dk, ax0), da1 = fxmul(dk, ax1), da2 = fxmul(dk, ax2);
+        M.m[0] += fxmul(da0, ax0); M.m[1] += fxmul(da0, ax1); M.m[2] += fxmul(da0, ax2);
+        M.m[3] += fxmul(da1, ax0); M.m[4] += fxmul(da1, ax1); M.m[5] += fxmul(da1, ax2);
+        M.m[6] += fxmul(da2, ax0); M.m[7] += fxmul(da2, ax1); M.m[8] += fxmul(da2, ax2);
+    }
+    return M;
+}
+
+// ----- SolveManifoldImpulse: the Gauss-Seidel velocity+angular impulse over a ContactManifold -----------
+// The normal is SIGN-CORRECTED to point from A toward B ONCE (flip if FxDot(normal, bodyB.pos-bodyA.pos)<0;
+// this sidesteps the CX2 ref->inc ambiguity). Then `iters` sweeps; in each sweep the manifold points are
+// iterated 0..count-1 in order, mutating the body vel/angVel IN PLACE (Gauss-Seidel — later points see the
+// earlier updates; the single-thread GPU mirror reproduces this bit-for-bit). For each point:
+//   rA = p - bodyA.pos, rB = p - bodyB.pos (world lever arms from each center of mass).
+//   vpA = vA + ωA×rA, vpB = vB + ωB×rB (contact-point velocities; ω is WORLD-frame body.angVel).
+//   vn = (vpB - vpA)·n; if vn >= 0 (separating/resting) -> SKIP this point (deterministic).
+//   k = invMassA + invMassB + n·((invIaW·(rA×n))×rA) + n·((invIbW·(rB×n))×rB); if k<=0 -> skip (degenerate).
+//   jn = -(1+restitution)·vn / k, CLAMPED to >= 0 (a contact only PUSHES). J = n·jn.
+//   vA -= J·invMassA; ωA -= invIaW·(rA×J);   vB += J·invMassB; ωB += invIbW·(rB×J).
+inline void SolveManifoldImpulse(FxBody& bodyA, FxBody& bodyB, const FxMat3& invIaW, const FxMat3& invIbW,
+                                 const ContactManifold& manifold, fx restitution, uint32_t iters) {
+    if (manifold.count == 0) return;
+    // Sign-correct the normal to point A->B ONCE.
+    FxVec3 n = manifold.normal;
+    if (FxDot(n, fpx::FxSub(bodyB.pos, bodyA.pos)) < 0) n = FxVec3{-n.x, -n.y, -n.z};
+
+    const fx invMassA = bodyA.invMass;
+    const fx invMassB = bodyB.invMass;
+
+    for (uint32_t it = 0; it < iters; ++it) {
+        for (uint32_t pi = 0; pi < manifold.count; ++pi) {
+            const FxVec3 p  = manifold.points[pi];
+            const FxVec3 rA = fpx::FxSub(p, bodyA.pos);
+            const FxVec3 rB = fpx::FxSub(p, bodyB.pos);
+            // contact-point velocities vpA = vA + ωA×rA, vpB = vB + ωB×rB.
+            const FxVec3 vpA = FxAdd(bodyA.vel, FxCross(bodyA.angVel, rA));
+            const FxVec3 vpB = FxAdd(bodyB.vel, FxCross(bodyB.angVel, rB));
+            const fx vn = FxDot(fpx::FxSub(vpB, vpA), n);
+            if (vn >= 0) continue;   // separating/resting -> no impulse (deterministic)
+
+            // effective-mass denominator k.
+            const FxVec3 raxn = FxCross(rA, n);
+            const FxVec3 rbxn = FxCross(rB, n);
+            const fx angA = FxDot(n, FxCross(FxMat3MulVec(invIaW, raxn), rA));
+            const fx angB = FxDot(n, FxCross(FxMat3MulVec(invIbW, rbxn), rB));
+            const fx k = invMassA + invMassB + angA + angB;
+            if (k <= 0) continue;   // degenerate -> skip
+
+            // scalar impulse jn = -(1+restitution)·vn / k, clamped >= 0.
+            fx jn = fxdiv(-fxmul(kOne + restitution, vn), k);
+            if (jn < 0) jn = 0;
+            const FxVec3 J = FxScale(n, jn);
+
+            // apply to BOTH bodies (statics with invMass==0 / invI==0 are unaffected).
+            bodyA.vel = fpx::FxSub(bodyA.vel, FxScale(J, invMassA));
+            bodyA.angVel = fpx::FxSub(bodyA.angVel, FxMat3MulVec(invIaW, FxCross(rA, J)));
+            bodyB.vel = FxAdd(bodyB.vel, FxScale(J, invMassB));
+            bodyB.angVel = FxAdd(bodyB.angVel, FxMat3MulVec(invIbW, FxCross(rB, J)));
+        }
+    }
+}
+
+// ----- ResolveContactPair: BoxSat -> BuildManifold -> world inertias -> SolveManifoldImpulse ------------
+// One box-box pair end-to-end. !overlap -> no-op (the velocities/angVels are untouched). VELOCITY-ONLY (NO
+// position de-penetration — CX4). The shader copies THIS body VERBATIM (with the BoxSat/BuildManifold/
+// inertia/SolveManifoldImpulse it calls) so the GPU resolved-body result is byte-identical to the CPU.
+inline void ResolveContactPair(FxBody& bodyA, const FxBox& boxA, FxBody& bodyB, const FxBox& boxB,
+                               const ContactSolveConfig& cfg) {
+    const SatResult sat = BoxSat(bodyA, boxA, bodyB, boxB);
+    if (!sat.overlap) return;   // separated -> no-op
+    const ContactManifold m = BuildManifold(bodyA, boxA, bodyB, boxB, sat);
+    if (m.count == 0) return;
+    const FxVec3 invIa = FxBoxInvInertiaBody(boxA, bodyA.invMass);
+    const FxVec3 invIb = FxBoxInvInertiaBody(boxB, bodyB.invMass);
+    const FxMat3 invIaW = WorldInvInertia(bodyA, invIa);
+    const FxMat3 invIbW = WorldInvInertia(bodyB, invIb);
+    SolveManifoldImpulse(bodyA, bodyB, invIaW, invIbW, m, cfg.restitution, cfg.iters);
+}
+
 }  // namespace convex
 }  // namespace hf::sim
