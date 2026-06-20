@@ -387,6 +387,21 @@ hf_gen_msl(boids_cell_emit.comp      boids_cell_emit.comp.hlsl      comp boids_c
 hf_gen_msl(boids_neighbor_count.comp boids_neighbor_count.comp.hlsl comp boids_neighbor_count_main)
 hf_gen_msl(boids_neighbor_scan.comp  boids_neighbor_scan.comp.hlsl  comp boids_neighbor_scan_main)
 hf_gen_msl(boids_neighbor_emit.comp  boids_neighbor_emit.comp.hlsl  comp boids_neighbor_emit_main)
+# Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23: DETERMINISTIC INTEGER
+# BROADPHASE, hf::sim::broad): THE BODY GRID + CSR CELL TABLE (the grain_cell_*/boids_cell_*/fluid_cell_* twin,
+# keyed on fpx::FxBody instead of grains/agents/particles). broad_cell_count.comp (ONE thread per body:
+# InterlockedAdd into its cell's counter — BodyCellOf = FloorDiv per axis at cell-size cellSize, the
+# bounded-dense-grid linearization, VERBATIM engine/sim/broad.h), broad_cell_scan.comp (SINGLE-THREAD exclusive
+# prefix-sum -> cellStart CSR), broad_cell_emit.comp (SINGLE-THREAD ascending-body scatter into cellBodies —
+# single-thread because the within-cell order must be ascending body index, NOT GPU-scheduling order). ALL PURE
+# INT32 (FloorDiv + integer compares + an ascending-index scatter, NO int64/fxmul/sqrt) so UNLIKE the int64
+# fxmul integrators these MSL-generate NATIVELY (a TRUE GPU pass on BOTH backends, the strongest cross-vendor
+# proof tier). ReadBuffer reads the cell table, PROVEN BIT-EXACT vs the CPU broad.h::BuildBodyCellTable (memcmp).
+# Behind --broad-cell only; NO new RHI (rides the grain_cell compute-dispatch + SSBO path); all existing
+# shaders + goldens untouched.
+hf_gen_msl(broad_cell_count.comp     broad_cell_count.comp.hlsl     comp broad_cell_count_main)
+hf_gen_msl(broad_cell_scan.comp      broad_cell_scan.comp.hlsl      comp broad_cell_scan_main)
+hf_gen_msl(broad_cell_emit.comp      broad_cell_emit.comp.hlsl      comp broad_cell_emit_main)
 # Deterministic Persistent Contacts Slice 1 (Slice PS1, the BEACHHEAD of FLAGSHIP #21: DETERMINISTIC
 # WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist): persist_key.comp is THE CONTACT FEATURE
 # ID pass — ONE thread per contact point runs the order-normalized integer key (bodyA<bodyB swap) + the fixed

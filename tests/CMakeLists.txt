@@ -742,6 +742,14 @@ hf_add_pure_test(fluid_test)
 # later GR slices). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(grain_test)
 
+# Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): the BODY GRID + CSR CELL
+# TABLE core (engine/sim/broad.h) the GPU shaders/broad_cell_{count,scan,emit}.comp.hlsl copy VERBATIM + prove
+# bit-identical. The grain.h GrainGrid/GrainCellTable count->scan->emit, keyed on fpx::FxBody. broad_test pins
+# BuildBodyCellTable as a TOTAL partition (each body once, ascending within cell, cellStart monotone, last==N),
+# MakeBodyGrid's tight bound (cellMin/gridDim, empty->1x1x1, negative coords via FloorDiv), FlatBodyCellId in
+# [0,cellCount), MeasureBodyGrid pure, and two-build determinism. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(broad_test)
+
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the UNIFIED
 # COUPLED WORLD + the BODY->FLUID grid-hash QUERY core (engine/sim/couple.h) the GPU
 # shaders/couple_body_{count,scan,emit}.comp.hlsl copy VERBATIM + prove bit-identical. The GR2 grain-neighbor

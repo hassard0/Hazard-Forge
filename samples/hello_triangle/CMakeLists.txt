@@ -613,6 +613,20 @@ hf_compile_shaders(
     "shaders/grain_neighbor_count.comp.hlsl:cs"
     "shaders/grain_neighbor_scan.comp.hlsl:cs"
     "shaders/grain_neighbor_emit.comp.hlsl:cs"
+    # Deterministic Integer Broadphase Slice 1 (Slice BP1, the BEACHHEAD of FLAGSHIP #23): THE BODY GRID + CSR
+    # CELL TABLE meshed by THREE pure-INT32 count->scan->emit passes (the GR2 grain_cell_* twin, keyed on
+    # fpx::FxBody). broad_cell_count.comp (ONE thread per body: InterlockedAdd into its cell's counter —
+    # BodyCellOf = FloorDiv per axis at cell-size cellSize, the bounded-dense-grid linearization, VERBATIM
+    # engine/sim/broad.h), broad_cell_scan.comp (SINGLE-THREAD [numthreads(1,1,1)] exclusive prefix-sum ->
+    # cellStart CSR + sentinel), broad_cell_emit.comp (SINGLE-THREAD ascending-body scatter into cellBodies —
+    # single-thread because the within-cell order must be ascending body index, NOT GPU-scheduling order). ALL
+    # PURE INT32 (FloorDiv + integer compares + an ascending-index scatter, NO int64/fxmul/sqrt) so these
+    # MSL-GENERATE NATIVELY (they ARE in the Metal hf_gen_msl list) and Metal dispatches the GPU passes.
+    # ReadBuffer reads cellStart + cellBodies, PROVEN BIT-EXACT vs the CPU broad.h::BuildBodyCellTable (memcmp).
+    # NO new RHI; all existing shaders + goldens untouched.
+    "shaders/broad_cell_count.comp.hlsl:cs"
+    "shaders/broad_cell_scan.comp.hlsl:cs"
+    "shaders/broad_cell_emit.comp.hlsl:cs"
     # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
     # grid-hash QUERY meshed by THREE pure-INT32 count->scan->emit passes (the GR2 grain_neighbor twin, per
     # BODY instead of per grain) OVER the reused FL2 fluid cell table (fluid_cell_{count,scan,emit} build the
