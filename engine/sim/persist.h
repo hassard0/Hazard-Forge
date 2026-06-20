@@ -1086,5 +1086,32 @@ inline ConvexWorld RunPersistRollback(const ConvexWorld& world0, const Persisten
     return w;
 }
 
+// ====================================================================================================
+// Slice PS6 — Deterministic Persistent Contacts: THE LIT 3D RENDER CAPSTONE (the money-shot completing
+// FLAGSHIP #21: DETERMINISTIC WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist). PS1-PS5
+// built + proved the contact key, the persistent cache, the warm-started cone solver, sleeping islands, and
+// the lockstep+rollback netcode. PS6 RENDERS the bit-exact warm+sleep converged world (a convex::ConvexWorld)
+// as a LIT 3D INSTANCED scene — a warm-started tower at dead rest (asleep), toppled by a wake-impulse, the
+// settled/toppled stack drawn as oriented matte boxes under directional light. The CX6/FR6/FC6/JT6 render-
+// capstone twin. RENDER-ONLY FLOAT, additive, ZERO new render shader, ZERO new RHI. PS1-PS5's code above is
+// byte-FROZEN; PS6 only APPENDS this one render-only delegate (the integer sim is untouched).
+//
+// MAXIMAL REUSE: the warm+sleep world IS a convex::ConvexWorld, so the FLOAT render bridge is EXACTLY CX6's —
+// PersistToRenderInstances DELEGATES to the frozen convex::ConvexToRenderInstances(world) (the SAME split
+// instance set: static floor cube vs dynamic boxes, each translate(FxToFloat(pos))*rotate(normalize(orient))*
+// scale(2*halfExtents) = an oriented CUBE). Provided here for namespace symmetry + so the test/showcase call
+// it from persist::; the actual matrices come from the frozen CX6 helper (convex.h is byte-unchanged). A PURE
+// FUNCTION of the bit-exact world: two calls produce byte-equal matrices (the provenance contract the showcase
+// + the test assert). The bit-exact PS1-PS5 integer sim is NOT mutated. **MATTE (the showcase sets metallic 0
+// / roughness 1)** to DODGE the documented GF6/FR6/JT6 IRIDESCENCE TRAP (stay matte).
+
+// ----- PersistToRenderInstances(world): the bit-exact warm+sleep world -> the split FLOAT instances ---------
+// A one-line delegate to the frozen convex::ConvexToRenderInstances — dynamic bodies -> boxes (warm matte
+// amber), statics -> floor (cool grey). Render-only, OUTSIDE the integer loop (the ONE float crossing of the
+// flagship — the CX6 bridge reused VERBATIM). Two calls byte-equal (the provenance proof).
+inline convex::ConvexRenderInstances PersistToRenderInstances(const ConvexWorld& world) {
+    return convex::ConvexToRenderInstances(world);
+}
+
 }  // namespace persist
 }  // namespace hf::sim

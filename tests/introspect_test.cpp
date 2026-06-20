@@ -466,6 +466,8 @@ int main() {
             bool sawPersistSleepFeature = false;
             // Slice PS5: the deterministic-persist-lockstep capability is advertised.
             bool sawPersistLockstepFeature = false;
+            // Slice PS6: the deterministic-persist-render capability is advertised.
+            bool sawPersistRenderFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -659,6 +661,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-persist-warm") sawPersistWarmFeature = true;
                     if (AsString(el->value) == "deterministic-persist-sleep") sawPersistSleepFeature = true;
                     if (AsString(el->value) == "deterministic-persist-lockstep") sawPersistLockstepFeature = true;
+                    if (AsString(el->value) == "deterministic-persist-render") sawPersistRenderFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -836,6 +839,7 @@ int main() {
         check(sawPersistWarmFeature, "engine.features includes deterministic-persist-warm");
         check(sawPersistSleepFeature, "engine.features includes deterministic-persist-sleep");
         check(sawPersistLockstepFeature, "engine.features includes deterministic-persist-lockstep");
+        check(sawPersistRenderFeature, "engine.features includes deterministic-persist-render");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -1136,6 +1140,8 @@ int main() {
         bool sawPersistSleepShot = false;
         // Slice PS5: the --persist-lockstep-shot showcase flag is listed in the showcase manifest.
         bool sawPersistLockstepShot = false;
+        // Slice PS6: the --persist-render-shot showcase flag is listed in the showcase manifest.
+        bool sawPersistRenderShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1345,6 +1351,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-warm-shot") sawPersistWarmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-sleep-shot") sawPersistSleepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-lockstep-shot") sawPersistLockstepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--persist-render-shot") sawPersistRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1522,6 +1529,7 @@ int main() {
         check(sawPersistWarmShot, "showcases manifest includes --persist-warm-shot");
         check(sawPersistSleepShot, "showcases manifest includes --persist-sleep-shot");
         check(sawPersistLockstepShot, "showcases manifest includes --persist-lockstep-shot");
+        check(sawPersistRenderShot, "showcases manifest includes --persist-render-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");

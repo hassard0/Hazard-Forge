@@ -805,6 +805,129 @@ int main() {
         }
     }
 
+    // ============================================================================================
+    // Slice PS6 — THE LIT 3D RENDER CAPSTONE (the money-shot): PersistToRenderInstances over the
+    // converged warm+sleep world. A render-only FLOAT delegate to the frozen CX6 bridge; the bit-exact
+    // PS1-PS5 sim is NOT mutated. Tests (pure CPU): (1) the provenance contract — two calls produce
+    // byte-equal math::Mat4 arrays (the render is a pure function of the bit-exact sim); (2) the instance
+    // split is correct (floor count == the static body count, boxes count == the dynamic body count);
+    // (3) a render of the ASLEEP settled world differs from the WOKEN toppled world (the render reflects
+    // the sim state). The SAME PS4 warm+sleep tower scene + PS5 command stream as the block above.
+    {
+        const fpx::FxQuat qI{0, 0, 0, convex::kOne};
+        const convex::fx kOne = convex::kOne;
+        auto fi = [&](int v) { return (convex::fx)(v * (int)convex::kOne); };
+        const convex::fx kGravY = (convex::fx)(-9.8 * (double)kOne - 0.5);
+
+        auto makeBody = [&](convex::fx x, convex::fx y, convex::fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = qI;
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+        const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+        const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+        auto buildTower = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            return w;
+        };
+
+        persist::SleepConfig cfg;
+        cfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.warm.dt          = kOne / 60;
+        cfg.warm.solveIters  = 20;
+        cfg.warm.restitution = 0;
+        cfg.warm.slop        = kOne / 64;
+        cfg.warm.beta        = (convex::fx)((int64_t)4 * kOne / 10);    // 0.4
+        cfg.warm.linDamp     = (convex::fx)((int64_t)98 * kOne / 100);  // 0.98
+        cfg.warm.angDamp     = (convex::fx)((int64_t)90 * kOne / 100);  // 0.90
+        cfg.warm.posIters    = 4;
+        cfg.warm.mu          = kOne;
+        cfg.sleepThreshold   = kOne;
+        cfg.wakeThreshold    = (convex::fx)(2 * (int)kOne);
+        cfg.sleepDelay       = 30;
+
+        const uint32_t kTicks    = 220;
+        const uint32_t kWakeTick = 160;
+        std::vector<convex::ConvexCommand> authStream;
+        authStream.push_back(convex::ConvexCommand{2u,  convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(1) / 2, 0, 0}});
+        authStream.push_back(convex::ConvexCommand{5u,  convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{-fi(1) / 4, 0, 0}});
+        authStream.push_back(convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(6), 0, 0}});
+
+        const convex::ConvexWorld w0 = buildTower();
+        const persist::PersistentCache cache0;
+        const std::vector<persist::SleepState> sleep0;
+
+        // The converged AUTHORITY world (the woken/toppled tower) — the exact state the showcase renders.
+        const persist::PersistState authority =
+            persist::RunPersistLockstep(w0, cache0, sleep0, cfg, authStream, kTicks);
+        const convex::ConvexWorld& cw = authority.world;
+
+        // Count the static + dynamic bodies (the expected split — floor == static, boxes == dynamic).
+        uint32_t staticCount = 0, dynamicCount = 0;
+        for (const fpx::FxBody& b : cw.bodies) {
+            if (convex::IsDynamic(b)) ++dynamicCount; else ++staticCount;
+        }
+
+        // ================= (1) provenance: two calls byte-equal (the render is a pure function) =================
+        {
+            const convex::ConvexRenderInstances a = persist::PersistToRenderInstances(cw);
+            const convex::ConvexRenderInstances b = persist::PersistToRenderInstances(cw);
+            bool equal = (a.floor.size() == b.floor.size()) && (a.boxes.size() == b.boxes.size());
+            for (size_t k = 0; k < a.floor.size() && equal; ++k)
+                if (std::memcmp(a.floor[k].m, b.floor[k].m, sizeof(float) * 16) != 0) equal = false;
+            for (size_t k = 0; k < a.boxes.size() && equal; ++k)
+                if (std::memcmp(a.boxes[k].m, b.boxes[k].m, sizeof(float) * 16) != 0) equal = false;
+            check(equal,
+                  "PS6 render: two PersistToRenderInstances calls produce BYTE-EQUAL Mat4 arrays (provenance)");
+        }
+
+        // ================= (2) the instance split is correct (floor == static, boxes == dynamic) =================
+        {
+            const convex::ConvexRenderInstances ri = persist::PersistToRenderInstances(cw);
+            check(ri.floor.size() == staticCount,
+                  "PS6 render: floor instance count == the static body count");
+            check(ri.boxes.size() == dynamicCount,
+                  "PS6 render: boxes instance count == the dynamic body count");
+            check(ri.floor.size() == 1 && ri.boxes.size() == 3,
+                  "PS6 render: the scene split is {floor:1, boxes:3} (the warm+sleep tower)");
+        }
+
+        // ================= (3) the asleep settled world vs the woken toppled world DIFFER =================
+        {
+            // Settle + SLEEP the SAME tower WITHOUT the wake-impulse (only the early nudges, which fade).
+            std::vector<convex::ConvexCommand> settleStream;
+            settleStream.push_back(authStream[0]);
+            settleStream.push_back(authStream[1]);
+            const persist::PersistState asleep =
+                persist::RunPersistLockstep(w0, cache0, sleep0, cfg, settleStream, kWakeTick);
+
+            const convex::ConvexRenderInstances riAsleep  = persist::PersistToRenderInstances(asleep.world);
+            const convex::ConvexRenderInstances riToppled = persist::PersistToRenderInstances(cw);
+            check(riAsleep.boxes.size() == riToppled.boxes.size(),
+                  "PS6 render: both worlds have the same dynamic-box count (only the transforms differ)");
+            bool differ = false;
+            for (size_t k = 0; k < riAsleep.boxes.size() && !differ; ++k)
+                if (std::memcmp(riAsleep.boxes[k].m, riToppled.boxes[k].m, sizeof(float) * 16) != 0) differ = true;
+            check(differ,
+                  "PS6 render: the ASLEEP settled world's box matrices DIFFER from the WOKEN toppled world's "
+                  "(the render reflects the sim state)");
+
+            // The toppled tower is genuinely non-trivial (the wake actually moved/tilted a dynamic body).
+            const persist::SleepMeasure m = persist::MeasureSleep(cw, authority.sleep);
+            check(m.awakeCount > 0 || m.maxSpeed > 0,
+                  "PS6 render: the converged authority world is the non-trivial woken/toppled tower");
+        }
+    }
+
     if (g_fail == 0) std::printf("persist_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
