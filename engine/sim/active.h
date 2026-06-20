@@ -537,5 +537,26 @@ inline ActiveRagdoll RunActiveRollback(const anim::Skeleton& skeleton, const ani
     return active;
 }
 
+// ====================================================================================================
+// Slice AC6 — LIT 3D SKINNED RENDER CAPSTONE (THE MONEY-SHOT, COMPLETES FLAGSHIP #17). AC1-AC5 built +
+// proved a deterministic, blendable, hit-reacting, lockstep-replayable active ragdoll. AC6 RENDERS it:
+// the bit-exact active-ragdoll pose (a character TRACKING an animation clip via physics torques) drives
+// the EXISTING Fox skinned lit render — the physics moat poses the animation mesh. JT6 VERBATIM with the
+// palette source swapped (the JT6 RagdollToPalette precedent). The ONE float crossing on the render path,
+// render-only, OUTSIDE the bit-exact sim loop (joint::PoseToPalette, Q16.16->float). NO new shader, NO new
+// RHI. AC6 APPENDS ONLY this thin alias — AC1-AC5 above is byte-FROZEN.
+
+// ----- ActiveToPalette: the JT6 RagdollToPalette alias over the active ragdoll's settled world ----------
+// The active ragdoll's joint palette, flattened for the skinning pipeline, IS exactly
+// joint::PoseToPalette(skeleton, active.ragdoll.world) (the std::vector<math::Mat4> the showcase copies into
+// the fixed-size JointPalette UBO in skeleton order). A pure deterministic function of the bit-exact active
+// body state (the provenance proof: rebuild from the settled world reproduces the palette byte-for-byte) —
+// the SAME palette joint::RagdollToPalette names for a JT4 ragdoll, here for the AC3-clip-tracked active
+// pose. It exists only to spell out the bridge at the call site; the showcase may call PoseToPalette
+// directly with no change. One Mat4 per joint, in skeleton order.
+inline std::vector<math::Mat4> ActiveToPalette(const anim::Skeleton& skeleton, const ActiveRagdoll& active) {
+    return joint::PoseToPalette(skeleton, active.ragdoll.world);
+}
+
 }  // namespace active
 }  // namespace hf::sim

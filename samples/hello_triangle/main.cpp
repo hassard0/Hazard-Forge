@@ -501,6 +501,7 @@ int main(int argc, char** argv) {
     const char* activeDriveShotPath = nullptr; // --active-drive-shot <out.bmp> (Slice AC1: Deterministic Active Ragdoll / Physical-Animation Blending, the BEACHHEAD of FLAGSHIP #17, hf::sim::active — the ANGULAR POSE-DRIVE primitive. A 3-LINK CHAIN (a pinned invMass-0 root + 3 dynamic ball-jointed bodies) with an FxAngularDrive per joint whose qTarget bends it to an L-shape; settle K StepDriveWorld steps -> the chain is DRIVEN to + HOLDS the L-pose against gravity (vs a stiffness-0 control that hangs straight). One GPU thread runs the K-step StepDriveWorld (shaders/active_drive_solve.comp: IntegrateBodyFull all -> iters Gauss-Seidel {all SolveBallJoint | all SolveAngularLimit | all SolveAngularDrive} -> ground clamp, copied VERBATIM from active.h), GPU==CPU body array bit-exact vs active.h::StepDriveWorld. int64 quaternion math -> active_drive_solve.comp is Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) drove to + held the target (DriveAngleCos within band + bent from the straight-hang control); (4) a stiffness-0 control hangs straight. NO new RHI; the ONLY new shader is active_drive_solve.comp (int64, Vulkan-only — NOT in hf_gen_msl). STANDALONE arg-parse loop (the FR1 C1061 lesson))
     const char* activeStepShotPath = nullptr; // --active-step-shot <out.bmp> (Slice AC3: Deterministic Active Ragdoll THE ANIM-TARGET STEP — THE PILLAR BRIDGE, the 3rd slice of FLAGSHIP #17, hf::sim::active. AC1 built the angular drive-to-target primitive; AC2 the per-joint blend weight; AC3 unites the anim pillar (engine/anim/) and the physics moat: each tick SAMPLE an anim clip into its per-bone LOCAL rotations -> WRITE those into the joints' drive qTargets -> run the AC1/AC2 integer drive step, so a JT4 ragdoll TRACKS an animation clip via physics torques while still colliding/yielding. A synthetic ~9-joint humanoid anim::Skeleton bound via active::ActiveFromSkeleton (RagdollFromSkeleton + one FxAngularDrive per non-root edge, qTarget identity), driven K StepActive ticks tracking a synthetic bend clip. The clip-sample + the float->Q16.16 qTarget snap (FxQuatFromFloat, round-to-nearest, the JT4 bind idiom) are a documented DETERMINISTIC FLOAT crossing OUTSIDE the bit-exact loop — computed HOST-side IDENTICALLY for the GPU + CPU paths, so the only thing the GPU/CPU bit-exactly reproduce is the integer StepDriveWorld over those shared qTargets (the AC1 contract, now with per-tick-varying targets). The GPU host-samples+snaps+uploads the per-tick drives then dispatches the AC1 active_drive_solve.comp per tick -> memcmp the GPU body world vs the CPU StepActive (NO tolerance — the GPU==CPU make-or-break). int64 quaternion math -> active_drive_solve.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --active-step runs the CPU StepActive. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) tracks the clip (mean DriveAngleCos within band + posedNotLimp vs a no-drive control); (4) clip-advance is live (sampling at two times -> different qTargets). NO new shader (the drive solve is AC1's; the sample+snap is host C++), NO new RHI. STANDALONE arg-parse loop (the FR1 C1061 lesson))
     const char* activeLockstepShotPath = nullptr; // --active-lockstep-shot <out.bmp> (Slice AC5: Deterministic Active Ragdoll LOCKSTEP + ROLLBACK — THE NETCODE HEADLINE; PURE CPU)
+    const char* activeRenderShotPath = nullptr; // --active-render-shot <out.bmp> (Slice AC6: Deterministic Active Ragdoll LIT 3D SKINNED RENDER CAPSTONE — THE MONEY-SHOT COMPLETING FLAGSHIP #17. JT6 VERBATIM with the palette source swapped: load the Fox skeleton + skinned mesh -> active::ActiveFromSkeleton (pinned root, FIRM stiffness so the Fox holds a COHERENT animated pose) -> active::StepActiveSteps tracking a clip -> active::ActiveToPalette (= joint::PoseToPalette, the ONE float crossing) -> dev.SetJointPalette -> render the Fox skinned + lit + shadowed through the EXISTING lit_skinned/shadow_skinned pipelines (the JT6 path VERBATIM — camera/light/shadow/sky/post unchanged). FLOAT visresolve-bar. PROOFS: palette provenance/count, two-run BYTE-IDENTICAL, active palette != bind palette. STANDALONE arg-parse loop. NO new shader, NO new RHI; AC1-AC5 + active.h's AC1-AC5 + engine/anim/ UNCHANGED (AC6 additive — only the ActiveToPalette alias + the showcase))
     const char* activeRecoverShotPath = nullptr; // --active-recover-shot <out.bmp> (Slice AC4: Deterministic Active Ragdoll ACTIVE -> LIMP -> RECOVER — THE HEADLINE BEHAVIOR, the 4th slice of FLAGSHIP #17, hf::sim::active. A global physicality knob in [0,kOne] scales every drive weight (StepActivePhysicality, into a scratch set — no persistent mutation) + a host velocity-kick impulse (ApplyImpulse) at struckTick + a deterministic recovery ramp (PhysicalityAtTick) drive the AC3 humanoid through anim (physicality kOne, tracks the clip) -> struck (a torso impulse + physicality 0 for limpTicks, goes limp) -> recover (physicality ramps 0->kOne over recoverTicks, returns to the clip). The GPU runs the SAME host per-tick logic (physicality, impulse at struckTick, the scratch-scaled drives, RE-UPLOAD) + the AC1 active_drive_solve.comp per tick -> memcmp the GPU body world vs the CPU StepActiveRecover at the final tick (NO tolerance). int64 -> active_drive_solve.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); Metal --active-recover runs the CPU StepActiveRecover. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) phases {animCos, struckCos<animCos, recoverCos>struckCos}; (4) equiv (physicality-kOne no-impulse == AC3 StepActive). A TRIPTYCH golden of the 3 captured states (anim / struck / recovered). NO new shader (the drive solve is AC1's; physicality + impulse are host C++), NO new RHI. STANDALONE arg-parse loop (the FR1 C1061 lesson))
     const char* activeBlendShotPath = nullptr; // --active-blend-shot <out.bmp> (Slice AC2: Deterministic Active Ragdoll PER-JOINT BLEND WEIGHT — THE PARTIAL-RAGDOLL AXIS, the 2nd slice of FLAGSHIP #17, hf::sim::active. AC1 added the angular drive-to-target primitive; AC2 adds the per-joint physical blend weight — a per-drive driveWeight in [0,kOne] blending each joint between fully anim-driven (kOne — hold the target) and fully limp physics (0 — no drive). A LONGER CHAIN (a pinned invMass-0 root + 6 dynamic ball-jointed links, an "upper body" + a "lower body") with an FxAngularDrive per joint sharing one bent target pose but PER-JOINT driveWeight: the upper joints kOne (HOLD the bracing pose), the lower joints 0 (limp — HANG free); settle K StepDriveWorld steps -> the upper chain holds while the lower hangs (the partial ragdoll). One GPU thread runs the K-step StepDriveWorld (shaders/active_drive_solve.comp, now reading driveWeight at the AC1-reserved 32-byte-stride pad slot — the std430 stride UNCHANGED), GPU==CPU body array bit-exact vs active.h::StepDriveWorld. int64 quaternion math -> active_drive_solve.comp is Vulkan-only; Metal --active-blend runs the CPU StepDriveWorld. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) partial ragdoll (driven joints held + limp joints free/match pure-physics); (4) all-weight-kOne == AC1 all-driven (render-invariance). NO new RHI; NO new shader (active_drive_solve.comp gains ONLY the driveWeight read). STANDALONE arg-parse loop (the FR1 C1061 lesson))
     const char* vehicleRigShotPath = nullptr; // --vehicle-rig-shot <out.bmp> (Slice VH2: Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE, the 2nd slice of FLAGSHIP #16 — ASSEMBLE a car (1 chassis FxBody + 4 wheel FxBodies tied by 4 VH1 FxSpringJoints + 4 joint::FxAngularLimit hinges) via VehicleFromConfig + settle it K StepVehicleRig steps so the chassis floats at ride height + the 4 wheels rest on the ground, the suspension compressed. NO new shader: the GPU driver composes the EXISTING vehicle_spring_solve.comp (PHASE A: integrate + K spring passes, SENTINEL groundY) + joint_angular_solve.comp (PHASE B: dt=0, jointCount=0, K angular/hinge passes, SENTINEL groundY) in the locked order, then the HOST wheel ground clamp (PHASE C) -> the SAME ops as the CPU StepVehicleRig -> GPU body world memcmp'd BIT-EXACT. PROOFS: (1) GPU==CPU bit-exact; (2) determinism; (3) settled on its suspension (wheels on ground + chassis at ride height + springs compressed); (4) hinges hold the wheels in-plane. int64 -> both shaders Vulkan-only; Metal --vehicle-rig runs the CPU StepVehicleRig. NO new shader/RHI; VH1 + JT2's shaders + their goldens + fpx.h/joint.h/grain.h/fluid.h/cloth.h/couple*.h/fract.h + engine/physics UNCHANGED (VH2 additive))
@@ -2512,6 +2513,16 @@ int main(int argc, char** argv) {
     // device for the render but does NO compute). Its OWN loop (the FR1 C1061 standalone-loop pattern).
     for (int i = 1; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--active-lockstep-shot") == 0) { activeLockstepShotPath = argv[i + 1]; break; }
+    }
+
+    // Slice AC6: --active-render-shot <out.bmp> (Deterministic Active Ragdoll LIT 3D SKINNED RENDER CAPSTONE —
+    // THE MONEY-SHOT COMPLETING FLAGSHIP #17). JT6 VERBATIM with the palette source swapped: the bit-exact
+    // active-ragdoll pose (the Fox TRACKING an anim clip via physics torques, held COHERENT by a pinned root +
+    // firm stiffness) drives the EXISTING Fox skinned render. active::ActiveFromSkeleton -> StepActiveSteps ->
+    // active::ActiveToPalette (= joint::PoseToPalette, the ONE float crossing) -> SetJointPalette -> the SAME
+    // lit_skinned/shadow_skinned draw. NO new shader, NO new RHI. Its OWN loop (the FR1 C1061 pattern).
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--active-render-shot") == 0) { activeRenderShotPath = argv[i + 1]; break; }
     }
 
     // Slice VH2: --vehicle-rig-shot <out.bmp> (Deterministic Vehicle Physics THE VEHICLE RIG + WHEEL HINGE,
@@ -17669,6 +17680,367 @@ int main(int argc, char** argv) {
                                 "(%u bones, %u palette)\n",
                                 jointRenderShotPath, cw, ch2, kBones, kPaletteCount);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", jointRenderShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // === Slice AC6: --active-render-shot <out.bmp> — Deterministic Active Ragdoll LIT 3D SKINNED RENDER
+        // CAPSTONE — THE MONEY-SHOT COMPLETING FLAGSHIP #17. JT6 VERBATIM with ONE swap: the joint palette
+        // comes from an ActiveRagdoll TRACKING a clip (the Fox held in a COHERENT animated pose BY PHYSICS)
+        // instead of a collapsing JT4 ragdoll. Load the Fox skeleton + skinned mesh (the JT6/--skinning setup
+        // VERBATIM) -> active::ActiveFromSkeleton (pinned root + FIRM stiffness) -> active::StepActiveSteps to
+        // a held clip-tracked pose -> active::ActiveToPalette -> SetJointPalette -> render the Fox skinned +
+        // lit + shadowed through the EXISTING lit_skinned/shadow_skinned pipelines (camera/light/shadow/sky/
+        // post unchanged). FLOAT visresolve-bar. NO new shader, NO new RHI. ===
+        if (activeRenderShotPath) {
+            using math::Mat4; using math::Vec3;
+            namespace active = hf::sim::active;
+            namespace joint  = hf::sim::joint;
+            namespace fpx    = hf::sim::fpx;
+            namespace anim   = hf::anim;
+            uint32_t w = window.FramebufferWidth();
+            uint32_t h = window.FramebufferHeight();
+            float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
+
+            // --- The EXISTING skinned + shadow + sky + post pipelines (the --skinning-shot wiring VERBATIM). ---
+            auto skVsWords  = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit_skinned.vert.hlsl.spv");
+            auto litFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.frag.hlsl.spv");
+            auto skVs  = device->CreateShaderModule({std::span<const uint32_t>(skVsWords)});
+            auto litFs = device->CreateShaderModule({std::span<const uint32_t>(litFsWords)});
+            rhi::GraphicsPipelineDesc skDesc;
+            skDesc.vertex = skVs.get(); skDesc.fragment = litFs.get();
+            skDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skDesc.colorFormat = device->Swapchain().ColorFormat();
+            skDesc.depthTest = true; skDesc.usesFrameUniforms = true;
+            skDesc.usesTexture = true; skDesc.usesJointPalette = true;
+            skDesc.pushConstantSize = sizeof(float) * 20;
+            auto skinnedPipeline = device->CreateGraphicsPipeline(skDesc);
+
+            auto litVsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/lit.vert.hlsl.spv");
+            auto litVs = device->CreateShaderModule({std::span<const uint32_t>(litVsWords)});
+            rhi::GraphicsPipelineDesc litDesc;
+            litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+            litDesc.vertexLayout = scene::MeshVertexLayout();
+            litDesc.colorFormat = device->Swapchain().ColorFormat();
+            litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+            litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+            auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+            auto skShadowWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow_skinned.vert.hlsl.spv");
+            auto shadowFsWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.frag.hlsl.spv");
+            auto skShadowVs = device->CreateShaderModule({std::span<const uint32_t>(skShadowWords)});
+            auto shadowFs   = device->CreateShaderModule({std::span<const uint32_t>(shadowFsWords)});
+            rhi::GraphicsPipelineDesc skShDesc;
+            skShDesc.vertex = skShadowVs.get(); skShDesc.fragment = shadowFs.get();
+            skShDesc.vertexLayout = scene::SkinnedMeshVertexLayout();
+            skShDesc.depthTest = true; skShDesc.depthOnly = true;
+            skShDesc.usesFrameUniforms = true; skShDesc.usesJointPalette = true;
+            skShDesc.pushConstantSize = sizeof(float) * 16;
+            auto skinnedShadowPipeline = device->CreateGraphicsPipeline(skShDesc);
+
+            auto staticShadowWords = LoadSpirv(std::string(HF_SHADER_DIR) + "/shadow.vert.hlsl.spv");
+            auto staticShadowVs = device->CreateShaderModule({std::span<const uint32_t>(staticShadowWords)});
+            rhi::GraphicsPipelineDesc stShDesc;
+            stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = shadowFs.get();
+            stShDesc.vertexLayout = scene::MeshVertexLayout();
+            stShDesc.depthTest = true; stShDesc.depthOnly = true;
+            stShDesc.usesFrameUniforms = true; stShDesc.pushConstantSize = sizeof(float) * 16;
+            auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+            auto skyVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.vert.hlsl.spv");
+            auto skyFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/sky.frag.hlsl.spv");
+            auto skyVsM = device->CreateShaderModule({std::span<const uint32_t>(skyVsW)});
+            auto skyFsM = device->CreateShaderModule({std::span<const uint32_t>(skyFsW)});
+            rhi::GraphicsPipelineDesc skyD;
+            skyD.vertex = skyVsM.get(); skyD.fragment = skyFsM.get();
+            skyD.colorFormat = device->Swapchain().ColorFormat();
+            skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+            auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+            auto postVsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.vert.hlsl.spv");
+            auto postFsW = LoadSpirv(std::string(HF_SHADER_DIR) + "/post.frag.hlsl.spv");
+            auto postVsM = device->CreateShaderModule({std::span<const uint32_t>(postVsW)});
+            auto postFsM = device->CreateShaderModule({std::span<const uint32_t>(postFsW)});
+            rhi::GraphicsPipelineDesc postD;
+            postD.vertex = postVsM.get(); postD.fragment = postFsM.get();
+            postD.colorFormat = device->Swapchain().ColorFormat();
+            postD.depthTest = false; postD.usesFrameUniforms = false;
+            postD.usesTexture = true; postD.fullscreen = true;
+            auto postPipe = device->CreateGraphicsPipeline(postD);
+
+            auto rt = device->CreateRenderTarget(w, h);
+            auto shadowMap = device->CreateShadowMap(2048);
+            device->SetShadowMap(*shadowMap);
+
+            std::vector<uint8_t> checker = MakeCheckerboard();
+            auto groundTex = device->CreateTexture(
+                {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+            const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+            auto flatNormal = device->CreateTexture(
+                {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+            scene::Mesh plane = scene::Mesh::Plane(*device);
+
+            // === Load the Fox + ACTIVE-RAGDOLL-IZE its skeleton (the SAME scene the Metal --active-render
+            // builds, so the palette is byte-identical cross-backend by construction). The Fox TRACKS a clip
+            // via physics torques (the bit-exact AC3 StepActive integer sim); the bind + the read-back are
+            // deterministic host float crossings (the JT4/AC3 shape). ===
+            hf::asset::SkinnedModel fox = hf::asset::LoadSkinnedGltfModel(*device, HF_FOX_MODEL_PATH);
+            const anim::Skeleton& skel = fox.skeleton;
+            const uint32_t kBones = (uint32_t)skel.joints.size();
+
+            // The active recipe: worldScale==boneRadius==1 so FxBodyTransform(body)·inverseBind is ~identity at
+            // the bind pose (the fox renders correctly at bind — the JT6 legibility recipe), a PINNED root + a
+            // FREE cone (the drive does the work, AC3-style) + a FIRM drive stiffness so the Fox is DRIVEN to +
+            // HOLDS a coherent animated pose (NOT a limp collapse, NOT a shattered/hyperextended pose — the JT6
+            // coherence discipline). gravity host-snapped -9.8; ground far below so the held pose fills the frame
+            // (the Fox is anchored by its pinned root + the drive, not resting on the floor).
+            const active::fx kGravY = (active::fx)(-9.8 * (double)active::kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            const active::fx kDt = active::kOne / 60;
+            const int kIters = 24;
+            const int kSteps = 200;                            // settle the driven pose to a held stance
+            const active::fx kDriveStiff = active::kOne / 4;   // FIRM (0.25) per-iteration drive -> holds the pose
+
+            joint::RagdollConfig cfg;
+            cfg.worldScale = active::kOne;
+            cfg.boneRadius = active::kOne;                     // == worldScale: bind palette ~identity (legible fox)
+            cfg.invMass    = active::kOne;
+            cfg.coneCos    = -active::kOne;                    // 180-degree free cone (the drive does the work)
+            cfg.coneSin    = 0;
+            cfg.gravity    = active::FxVec3{0, kGravY, 0};
+            cfg.groundY    = (active::fx)(-1000 * (int)active::kOne);   // far below -> focus the held pose
+            cfg.rootStatic = true;                             // pin the root -> the fox holds from its anchor
+
+            // A synthetic GENTLE pose clip on the Fox skeleton: a small rotation about Z on every non-root bone
+            // (~25 deg, qZ25 = {0,0,sin(12.5),cos(12.5)}) driving each bone's LOCAL rotation from identity (t=0)
+            // to the gentle pose (t=1). A MODEST angle (NOT the AC3/test qZ90) so the Fox reads as a coherent
+            // recognizable posed character — physics holds it in an animated stance, distinctly off bind but
+            // NOT contorted. (A real Fox clip — Walk/Run/Survey — would also work; a synthetic gentle pose is the
+            // simplest coherent money-shot, the spec's documented choice — the headline is "physics-posed skinned
+            // character", the clip identity is secondary.)
+            const float kPoseS = 0.2164396f;   // sin(12.5 deg)
+            const float kPoseC = 0.9762960f;   // cos(12.5 deg)
+            anim::Animation poseClip;
+            poseClip.name = "active-pose";
+            poseClip.duration = 1.0f;
+            for (size_t j = 1; j < skel.joints.size(); ++j) {
+                anim::Channel ch;
+                ch.jointIndex = (int)j;
+                ch.path = anim::Channel::Path::Rotation;
+                ch.interp = anim::Channel::Interp::Linear;
+                ch.times = {0.0f, 1.0f};
+                ch.values = {0, 0, 0, 1,   0, 0, kPoseS, kPoseC};   // identity@t=0, gentle qZ25@t=1
+                poseClip.channels.push_back(ch);
+            }
+
+            // Bind the active ragdoll (the JT4 bodies + ball joints + cone limits + one drive per non-root edge).
+            active::ActiveRagdoll act = active::ActiveFromSkeleton(skel, cfg, kDriveStiff);
+            const uint32_t kJointCount = (uint32_t)act.ragdoll.joints.size();
+
+            // The bind-pose palette (the reference proof (3) shows the held active pose DIFFERS from).
+            const std::vector<Mat4> bindPalette = active::ActiveToPalette(skel, act);
+
+            // The bit-exact active step: drive the Fox to TRACK the gentle pose clip held at its end (startTime
+            // 1.0 -> the gentle stance) over K StepActive ticks -> a held coherent animated pose.
+            active::StepActiveSteps(act, skel, poseClip, kDt, kIters, kSteps, /*startTime=*/1.0f);
+
+            // The active palette (the AC6 read-back — the ONE float crossing; the SAME layout the skinning
+            // pipeline expects). active::ActiveToPalette is the thin JT6-alias for PoseToPalette over the world.
+            const std::vector<Mat4> palette = active::ActiveToPalette(skel, act);
+            const uint32_t kPaletteCount = (uint32_t)palette.size();
+
+            // Pad to 64 identity matrices for the fixed-size JointPalette UBO (the --skinning-shot layout).
+            std::vector<float> paletteData(64 * 16);
+            for (int j = 0; j < 64; ++j) {
+                Mat4 mm = (j < (int)palette.size()) ? palette[j] : Mat4::Identity();
+                for (int k = 0; k < 16; ++k) paletteData[j * 16 + k] = mm.m[k];
+            }
+
+            // Place the fox: the SAME ground-aligned uniform-scale recipe as --skinning-shot/JT6 (only the
+            // palette changed; the model placement is unchanged so the framing matches the anim showcase).
+            float foxH = fox.bbMax[1] - fox.bbMin[1];
+            float scaleS = (foxH > 1e-4f) ? (2.5f / foxH) : 0.05f;
+            float cx = 0.5f * (fox.bbMin[0] + fox.bbMax[0]);
+            float cz = 0.5f * (fox.bbMin[2] + fox.bbMax[2]);
+            Mat4 foxModel = Mat4::Translate({-cx * scaleS, -fox.bbMin[1] * scaleS, -cz * scaleS})
+                          * Mat4::Scale({scaleS, scaleS, scaleS});
+            Mat4 groundModel = Mat4::Scale({8.0f, 1.0f, 8.0f});
+
+            // Camera + light + sky (the --skinning-shot/JT6 frame data VERBATIM).
+            const Vec3 eye{3.5f, 2.6f, 4.5f};
+            const Vec3 center{0.0f, 1.0f, 0.0f};
+            FrameData fd{};
+            {
+                Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+                Mat4 proj = Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f);
+                Mat4 vp = proj * view;
+                for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+                fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+                fd.lightColor[0] = 0.98f; fd.lightColor[1] = 0.95f; fd.lightColor[2] = 0.88f; fd.lightColor[3] = 1.0f;
+                fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+                fd.ptCount[0] = 0.0f;
+                Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+                Vec3 sc{0.0f, 1.0f, 0.0f};
+                Vec3 lightEye = sc - lightDir * 12.0f;
+                Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+                Mat4 lightOrtho = Mat4::Ortho(-6.0f, 6.0f, -6.0f, 6.0f, 1.0f, 25.0f);
+                Mat4 lightVP = lightOrtho * lightView;
+                for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+                Vec3 fwd = math::normalize(center - eye);
+                Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+                Vec3 up = math::cross(right, fwd);
+                fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+                fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+                fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+                fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+                fd.skyParams[1] = aspect;
+            }
+
+            render::RenderGraph graph;
+            render::RgResource rgShadow = graph.ImportTarget(
+                "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+            render::RgResource rgScene = graph.ImportTarget(
+                "sceneColor", render::RgResourceKind::SceneColor, *rt);
+            render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+            graph.AddPass("shadow", {}, {rgShadow},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*staticShadowPipeline);
+                    cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(plane.vertices());
+                    cmd.BindIndexBuffer(plane.indices());
+                    cmd.DrawIndexed(plane.indexCount());
+                    cmd.BindPipeline(*skinnedShadowPipeline);
+                    cmd.PushConstants(foxModel.m, sizeof(float) * 16);
+                    cmd.BindVertexBuffer(fox.mesh.vertices());
+                    cmd.BindIndexBuffer(fox.mesh.indices());
+                    cmd.DrawIndexed(fox.mesh.indexCount());
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("scene", {rgShadow}, {rgScene},
+                [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+                    dev.SetFrameUniforms(&fd, sizeof(FrameData));
+                    dev.SetJointPalette(paletteData.data(), paletteData.size() * sizeof(float));
+                    cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+                    cmd.BindPipeline(*skyPipe);
+                    cmd.Draw(3);
+                    cmd.BindPipeline(*litPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                        pc[16] = 0.0f; pc[17] = 0.85f; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*groundTex, *flatNormal);
+                        cmd.BindVertexBuffer(plane.vertices());
+                        cmd.BindIndexBuffer(plane.indices());
+                        cmd.DrawIndexed(plane.indexCount());
+                    }
+                    cmd.BindPipeline(*skinnedPipeline);
+                    {
+                        float pc[20];
+                        for (int k = 0; k < 16; ++k) pc[k] = foxModel.m[k];
+                        pc[16] = fox.metallic; pc[17] = fox.roughness; pc[18] = 0.0f; pc[19] = 0.0f;
+                        cmd.PushConstants(pc, sizeof(pc));
+                        cmd.BindMaterial(*fox.baseColor, *flatNormal);
+                        cmd.BindVertexBuffer(fox.mesh.vertices());
+                        cmd.BindIndexBuffer(fox.mesh.indices());
+                        cmd.DrawIndexed(fox.mesh.indexCount());
+                    }
+                    cmd.EndRenderPass();
+                });
+
+            graph.AddPass("post", {rgScene}, {rgSwap},
+                [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                    cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                    cmd.BindPipeline(*postPipe);
+                    cmd.BindTexture(*rt);
+                    cmd.Draw(3);
+                    cmd.EndRenderPass();
+                });
+
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+
+            std::vector<uint8_t> px; uint32_t cw = 0, ch2 = 0;
+            if (!device->GetCapturedPixels(px, cw, ch2)) {
+                std::fprintf(stderr, "FATAL: no captured pixels\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOFS (fail loudly; the exact lines from the spec §3) ===
+            // (1) palette provenance: the palette fed to the skinning pipeline == ActiveToPalette rebuilt from
+            //     the settled active world (the float palette is a pure function of the bit-exact body state),
+            //     count == the Fox joint count.
+            {
+                const std::vector<Mat4> rebuild = active::ActiveToPalette(skel, act);
+                bool identical = (rebuild.size() == palette.size() && palette.size() == (size_t)kBones);
+                for (size_t k = 0; k < palette.size() && identical; ++k)
+                    if (std::memcmp(palette[k].m, rebuild[k].m, sizeof(float) * 16) != 0) identical = false;
+                if (!identical) {
+                    std::fprintf(stderr, "FATAL: active-render palette != rebuild (palette not a pure "
+                                         "function of the bit-exact active state)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("active-render: {bones:%u, joints:%u, palette:%u} from bit-exact active pose\n",
+                        kBones, kJointCount, kPaletteCount);
+
+            // (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+            device->CaptureNextFrame();
+            graph.SetSwapchainRetryArm([&] { device->CaptureNextFrame(); });
+            graph.Execute(*device);
+            std::vector<uint8_t> px2; uint32_t cw2 = 0, ch3 = 0;
+            if (!device->GetCapturedPixels(px2, cw2, ch3)) {
+                std::fprintf(stderr, "FATAL: no captured pixels (2nd render)\n");
+                device->WaitIdle(); return 1;
+            }
+            if (px.size() != px2.size() || std::memcmp(px.data(), px2.data(), px.size()) != 0) {
+                std::fprintf(stderr, "FATAL: active-render two runs DIFFER (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("active-render determinism: two runs BYTE-IDENTICAL\n");
+
+            // (3) the pose IS the active ragdoll (not bind): the rendered palette DIFFERS from the bind-pose
+            //     palette (the physics-tracked pose actually moved the mesh off bind).
+            {
+                bool differs = (bindPalette.size() == palette.size());
+                bool anyDiff = false;
+                for (size_t k = 0; k < palette.size() && differs; ++k)
+                    if (std::memcmp(palette[k].m, bindPalette[k].m, sizeof(float) * 16) != 0) anyDiff = true;
+                if (!differs || !anyDiff) {
+                    std::fprintf(stderr, "FATAL: active-render active palette == bind palette (the physics "
+                                         "drive did not pose the mesh)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+            std::printf("active-render posed: active palette != bind palette (physics posed the mesh)\n");
+
+            // coverage / coherence: shaded > 0 and not uniform (a recognizable lit posed character).
+            {
+                uint32_t shaded = 0;
+                for (size_t p = 0; p + 3 < px.size(); p += 4) {
+                    const int b = px[p + 0], g = px[p + 1], r = px[p + 2];
+                    if (b + g + r > 60) ++shaded;
+                }
+                if (shaded == 0) {
+                    std::fprintf(stderr, "FATAL: active-render coverage 0 (nothing shaded)\n");
+                    device->WaitIdle(); return 1;
+                }
+                if (shaded == (uint32_t)(px.size() / 4)) {
+                    std::fprintf(stderr, "FATAL: active-render uniform image (no coherent scene)\n");
+                    device->WaitIdle(); return 1;
+                }
+            }
+
+            bool ok = WriteBMP(activeRenderShotPath, px, cw, ch2);
+            if (ok) std::printf("wrote %s (%ux%u) — deterministic active-ragdoll-posed Fox lit 3D skinned "
+                                "render (%u bones, %u palette)\n",
+                                activeRenderShotPath, cw, ch2, kBones, kPaletteCount);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", activeRenderShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }

@@ -851,6 +851,47 @@ int main() {
               "AC5 RunActiveRollback: the mispredicted (pre-rollback) state DIVERGED from authority (real fix)");
     }
 
+    // ============================================================================================
+    // ============== AC6: ActiveToPalette (the JT6 RagdollToPalette alias — render bridge) =========
+    // ============================================================================================
+
+    // ===== AC6 (1): ActiveToPalette returns one Mat4 per skeleton joint =====
+    {
+        active::ActiveRagdoll act = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        const std::vector<math::Mat4> palette = active::ActiveToPalette(humanoid, act);
+        check(palette.size() == humanoid.joints.size(),
+              "AC6 ActiveToPalette: one Mat4 per skeleton joint (skeleton order)");
+    }
+
+    // ===== AC6 (2): ActiveToPalette == joint::PoseToPalette(skeleton, active.ragdoll.world) EXACTLY =====
+    // The alias is exact — the palette IS a pure function of the bit-exact active body state (provenance).
+    {
+        active::ActiveRagdoll act = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        // settle a clip-tracked pose so the world is non-trivial (the render takes a posed snapshot).
+        active::StepActiveSteps(act, humanoid, bendClip, active::kOne / 60, 24, 120, /*startTime=*/1.0f);
+        const std::vector<math::Mat4> palette  = active::ActiveToPalette(humanoid, act);
+        const std::vector<math::Mat4> rebuild  = joint::PoseToPalette(humanoid, act.ragdoll.world);
+        bool identical = (palette.size() == rebuild.size());
+        for (size_t k = 0; k < palette.size() && identical; ++k)
+            if (std::memcmp(palette[k].m, rebuild[k].m, sizeof(float) * 16) != 0) identical = false;
+        check(identical, "AC6 ActiveToPalette == joint::PoseToPalette(skeleton, active.ragdoll.world) (exact)");
+    }
+
+    // ===== AC6 (3): a settled active pose's palette != the bind-pose palette (physics posed the mesh) =====
+    {
+        active::ActiveRagdoll act = active::ActiveFromSkeleton(humanoid, acCfg, kDriveStiff);
+        const std::vector<math::Mat4> bindPalette = active::ActiveToPalette(humanoid, act);   // before any step
+        // drive the ragdoll to track the bent clip -> a distinctly non-bind pose.
+        active::StepActiveSteps(act, humanoid, bendClip, active::kOne / 60, 24, 200, /*startTime=*/1.0f);
+        const std::vector<math::Mat4> posedPalette = active::ActiveToPalette(humanoid, act);
+        bool differs = (bindPalette.size() == posedPalette.size());
+        bool anyDiff = false;
+        for (size_t k = 0; k < posedPalette.size() && differs; ++k)
+            if (std::memcmp(posedPalette[k].m, bindPalette[k].m, sizeof(float) * 16) != 0) anyDiff = true;
+        check(differs && anyDiff,
+              "AC6 ActiveToPalette: a settled active pose's palette != the bind-pose palette (physics posed it)");
+    }
+
     if (g_fail == 0) std::printf("active_test: ALL PASS\n");
     else std::printf("active_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
