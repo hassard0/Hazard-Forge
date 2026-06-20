@@ -381,6 +381,158 @@ int main() {
         }
     }
 
+    // ================= FC4 — StepFrictionWorld (the friction-locked world step) =====================
+    // The MONEY-PHYSICS beat: a dynamic box released on a TILTED static box GRIPS (high mu) or SLIDES (low
+    // mu, a strict inequality — friction is what holds it, not the geometry), and a settling box stack stands
+    // at angDamp = kOne (friction physically holds the tower). Plus determinism + statics-frozen.
+    {
+        auto fi = [&](int v) { return (fx)(v * (int)kOne); };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));   // host-snapped -9.8
+
+        auto makeBody = [&](fx x, fx y, fx z, fpx::FxQuat q, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = q;
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+
+        // ---------- THE RAMP scene: a TILTED static box + a dynamic box resting on its inclined top face.
+        // 18 deg tilt about Z (tan ~ 0.325): mu=kOne (1.0) GRIPS, mu=kOne/16 (~0.06 < tan) SLIDES.
+        const fpx::FxQuat qI{0, 0, 0, kOne};
+        const fpx::FxQuat qRamp = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)10252, (fx)64729});  // 18 deg / Z
+        const convex::FxBox kRamp{convex::FxVec3{fi(6), kOne, fi(3)}};       // a wide flat slab (ramp)
+        const convex::FxBox kBox{convex::FxVec3{kOne, kOne, kOne}};          // a unit box (the slider)
+
+        // The dynamic box's rest center = the ramp's surface offset (0, rampHalfY + boxHalfY, 0) rotated into
+        // the ramp's frame, so the box sits flush on the inclined top face. A tiny extra lift lets it settle.
+        auto rampSliderStart = [&]() {
+            const convex::FxVec3 localUp{0, kRamp.halfExtents.y + kBox.halfExtents.y, 0};
+            convex::FxVec3 off = fpx::FxRotate(qRamp, localUp);
+            return convex::FxVec3{off.x, off.y, off.z};
+        };
+        auto buildRamp = [&](bool dummy) {
+            (void)dummy;
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, qRamp, false)); w.boxes.push_back(kRamp);   // static ramp
+            const convex::FxVec3 s = rampSliderStart();
+            w.bodies.push_back(makeBody(s.x, s.y, s.z, qRamp, true)); w.boxes.push_back(kBox);  // slider
+            return w;
+        };
+
+        fric::FrictionStepConfig rampCfg;
+        rampCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        rampCfg.dt          = kOne / 60;
+        rampCfg.solveIters  = 20;
+        rampCfg.restitution = 0;
+        rampCfg.slop        = kOne / 64;
+        rampCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        rampCfg.linDamp     = kOne;
+        rampCfg.angDamp     = kOne;
+        rampCfg.posIters    = 4;
+        const uint32_t kRampTicks = 240u;
+
+        // The down-ramp displacement = how far the slider's center moved along the ramp's local-X (the slope
+        // direction). We measure it by projecting (finalPos - startPos) onto the ramp's world X axis.
+        auto downRampDisp = [&](fx mu) {
+            fric::FrictionStepConfig cfg = rampCfg; cfg.mu = mu;
+            convex::ConvexWorld w = buildRamp(true);
+            const convex::FxVec3 start = w.bodies[1].pos;
+            fric::StepFrictionWorldN(w, cfg, kRampTicks);
+            const convex::FxVec3 end = w.bodies[1].pos;
+            convex::FxVec3 rampX[3];
+            convex::BoxAxes(w.bodies[0], rampX);   // ramp world axes; [0] = local X (down-slope)
+            const convex::FxVec3 d = fpx::FxSub(end, start);
+            const fx along = convex::FxDot(d, rampX[0]);
+            return along < 0 ? -along : along;   // magnitude of down-ramp travel
+        };
+
+        const fx gripDisp  = downRampDisp(kOne);          // high mu -> grips
+        const fx slideDisp = downRampDisp(kOne / 16);     // low mu -> slides
+        // (1) the HIGH-mu box GRIPS: its down-ramp displacement is below a small threshold (it did NOT slide).
+        check(gripDisp < fi(1), "FC4 ramp: high-mu box GRIPS (down-ramp displacement small)");
+        // (2) the LOW-mu box SLIDES FARTHER than the high-mu box by a clear margin (a strict inequality —
+        // friction is what holds the high-mu box).
+        check(slideDisp > gripDisp + kOne / 2, "FC4 ramp: low-mu box SLIDES farther (strict inequality)");
+
+        // ---------- THE STACK scene at angDamp = kOne: friction holds the tower (the FC4 headline).
+        const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+        const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+        auto buildStack = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, qI, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, qI, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, qI, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, qI, true)); w.boxes.push_back(kSlab);
+            return w;
+        };
+        fric::FrictionStepConfig stackCfg;
+        stackCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        stackCfg.dt          = kOne / 60;
+        stackCfg.solveIters  = 20;
+        stackCfg.restitution = 0;
+        stackCfg.slop        = kOne / 64;
+        stackCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        stackCfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98 (LINEAR damping only — settles drop)
+        stackCfg.angDamp     = kOne;                            // OFF — friction holds the tower (the headline)
+        stackCfg.posIters    = 4;
+        stackCfg.mu          = kOne;                            // grippy contacts
+        const uint32_t kStackTicks = 240u;
+
+        convex::ConvexWorld stack = buildStack();
+        fric::StepFrictionWorldN(stack, stackCfg, kStackTicks);
+        const fric::StackMeasure ms = fric::MeasureFrictionStack(stack);
+        check(ms.maxSpeed < kOne / 2, "FC4 stack: comes to REST at angDamp=kOne (maxSpeed small)");
+        check(ms.maxPenetration < kOne / 16, "FC4 stack: no interpenetration at angDamp=kOne");
+        const fx y1 = stack.bodies[1].pos.y, y2 = stack.bodies[2].pos.y, y3 = stack.bodies[3].pos.y;
+        const fx g01 = y2 - y1, g12 = y3 - y2;
+        const fx loBand = fi(1) - kOne / 4, hiBand = fi(1) + kOne / 4;
+        const bool ordered = (y1 < y2 && y2 < y3) &&
+                             (g01 > loBand && g01 < hiBand) && (g12 > loBand && g12 < hiBand);
+        check(ordered, "FC4 stack: stays ORDERED + box-height apart at angDamp=kOne (tower stands)");
+
+        // ---------- determinism: two StepFrictionWorldN runs byte-identical (both scenes).
+        {
+            convex::ConvexWorld a = buildStack(), b = buildStack();
+            fric::StepFrictionWorldN(a, stackCfg, kStackTicks);
+            fric::StepFrictionWorldN(b, stackCfg, kStackTicks);
+            bool same = true;
+            for (size_t i = 0; i < a.bodies.size() && same; ++i)
+                if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+            check(same, "FC4 determinism: two StepFrictionWorldN stack runs byte-identical");
+        }
+        {
+            fric::FrictionStepConfig cfg = rampCfg; cfg.mu = kOne;
+            convex::ConvexWorld a = buildRamp(true), b = buildRamp(true);
+            fric::StepFrictionWorldN(a, cfg, kRampTicks);
+            fric::StepFrictionWorldN(b, cfg, kRampTicks);
+            bool same = true;
+            for (size_t i = 0; i < a.bodies.size() && same; ++i)
+                if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+            check(same, "FC4 determinism: two StepFrictionWorldN ramp runs byte-identical");
+        }
+
+        // ---------- statics never move: the floor (body 0) and the ramp (body 0) are byte-unchanged.
+        {
+            convex::ConvexWorld w = buildStack();
+            const fpx::FxBody floorBefore = w.bodies[0];
+            fric::StepFrictionWorldN(w, stackCfg, kStackTicks);
+            check(std::memcmp(&w.bodies[0], &floorBefore, sizeof(fpx::FxBody)) == 0,
+                  "FC4 statics: the floor never moves");
+        }
+        {
+            fric::FrictionStepConfig cfg = rampCfg; cfg.mu = kOne;
+            convex::ConvexWorld w = buildRamp(true);
+            const fpx::FxBody rampBefore = w.bodies[0];
+            fric::StepFrictionWorldN(w, cfg, kRampTicks);
+            check(std::memcmp(&w.bodies[0], &rampBefore, sizeof(fpx::FxBody)) == 0,
+                  "FC4 statics: the ramp never moves");
+        }
+    }
+
     if (g_fail == 0) std::printf("fric_test: ALL PASS\n");
     else std::printf("fric_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

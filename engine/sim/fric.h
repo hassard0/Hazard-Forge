@@ -393,5 +393,135 @@ inline void ResolveContactFriction(fpx::FxBody& bodyA, const FxBox& boxA,
     SolveFrictionImpulse(bodyA, bodyB, invIaW, invIbW, fm, cfg.restitution, cfg.mu, cfg.iters);
 }
 
+// =========================================================================================================
+// Slice FC4 — THE FRICTION-LOCKED WORLD STEP (the money-physics beat). APPENDED after ResolveContactFriction
+// (FC1-FC3's lines above are BYTE-FROZEN). FC1-FC3 built the tangent basis, the per-contact FrictionPoint[]
+// state, and the cone-clamped impulse solver. FC4 wires friction into the FULL per-tick WORLD step: the CX4
+// 5-pass tick (convex::StepConvexWorld, frozen) REPRODUCED with the FC3 SolveFrictionImpulse swapped in for
+// the normal-only convex::SolveManifoldImpulse — so a box released on a tilted static box GRIPS (static cone)
+// or SLIDES + decelerates (kinetic cone), and a settling box stack stands with angular damping turned OFF
+// (friction physically holds the tower). INTEGER bit-exact over many ticks, every order PINNED.
+//
+// FC4 does NOT call/modify the frozen convex::StepConvexWorld — it reproduces the step shell, reusing the
+// frozen helpers (convex::IsDynamic, BoxSatStable, FxBoxInvInertiaBody, WorldInvInertia, the position
+// de-penetration math) + the FC2/FC3 BuildFrictionPoints/SolveFrictionImpulse. The ONLY swap vs CX4 is the
+// impulse pass: per overlapping pair BuildFrictionPoints (FC2) -> SolveFrictionImpulse(.., 1) (ONE inner
+// sweep — the world loop is the outer Gauss-Seidel) instead of BuildManifold -> SolveManifoldImpulse.
+//
+// THE int64 REALITY (the CX4/FC3 lesson): the whole chain is int64. DXC compiles int64 (Vulkan); glslc
+// cannot. So shaders/fric_step.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), single-thread over the small
+// body set (the convex_step.comp convention); the Metal --fric-ramp/--fric-stack runs the CPU
+// StepFrictionWorldN -> byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side
+// carries the GPU==CPU memcmp proof. fric_step.comp copies StepFrictionWorldN VERBATIM.
+
+// Pull the convex world types FC4 uses (re-use, do NOT redefine).
+using convex::ConvexWorld;
+using convex::IsDynamic;
+using convex::BoxSatStable;
+using convex::StackMeasure;
+
+// ----- FrictionStepConfig: the full-step parameters (the convex::ConvexStepConfig fields + the Coulomb mu) -
+// gravity/dt/solveIters/restitution/slop/beta/linDamp/angDamp/posIters are the CX4 step knobs (same meaning,
+// same defaults); mu is the FC3 Coulomb friction coefficient (the cone half-angle |jt| <= mu*jn). The FC4
+// HEADLINE is angDamp = kOne (angular damping OFF) — friction holds the tower with no angular-damping aid.
+struct FrictionStepConfig {
+    FxVec3   gravity;                  // Q16.16 acceleration (e.g. (0,-9.8,0) host-snapped)
+    fx       dt          = kOne / 60;
+    uint32_t solveIters  = 8;          // world-level Gauss-Seidel sweeps over the pair list
+    fx       restitution = 0;          // Q16.16 bounce factor (0 = fully inelastic)
+    fx       slop        = kOne / 64;  // allowed penetration before pushing apart
+    fx       beta        = (fx)((int64_t)8 * kOne / 10);   // 0.8 — the position-correction fraction
+    fx       linDamp     = kOne;       // velocity retain per tick (kOne = none)
+    fx       angDamp     = kOne;       // angular-velocity retain per tick (kOne = none — the FC4 headline)
+    uint32_t posIters    = 1;          // position de-penetration sweep count
+    fx       mu          = 0;          // Q16.16 Coulomb friction coefficient (0 = frictionless == CX4)
+};
+
+// ----- StepFrictionWorld(world, cfg): ONE deterministic friction-locked tick. The CX4 5-pass step (frozen
+// convex::StepConvexWorld) REPRODUCED, ALL orders PINNED, with the FC3 friction solve swapped into the
+// impulse pass. The shader copies THIS body VERBATIM so the GPU final body world is byte-identical to the CPU.
+inline void StepFrictionWorld(ConvexWorld& world, const FrictionStepConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // (1) Predict-integrate every dynamic body (static bodies untouched), then the per-tick velocity
+    // retention (kOne = off — and the FC4 headline is that friction holds the stack at angDamp = kOne).
+    // Fixed body order. (== convex::StepConvexWorld step 1.)
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // (2) The world inverse inertias, recomputed ONCE per tick from the post-integrate orient. Indexed by
+    // body. Statics get a zero matrix. (== convex::StepConvexWorld.)
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxVec3 invIbody = FxBoxInvInertiaBody(world.boxes[i], world.bodies[i].invMass);
+        invIW[i] = WorldInvInertia(world.bodies[i], invIbody);
+    }
+
+    // (3) Impulse solve — world-level Gauss-Seidel over the all-pairs i<j list, FIXED order each sweep, ONE
+    // SolveFrictionImpulse sweep per pair (the world loop is the outer Gauss-Seidel). The friction manifold +
+    // basis are re-derived per pair per sweep from the CURRENT positions (positions don't move in the velocity
+    // solve, but vel/angVel do — re-deriving keeps the order pinned + the GPU-copy trivial). Skip static-static
+    // pairs. The mutation is in place (later pairs see it). THE ONLY swap vs CX4: BuildFrictionPoints ->
+    // SolveFrictionImpulse (normal + cone-clamped tangent) instead of BuildManifold -> SolveManifoldImpulse.
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+                FrictionManifold fm = BuildFrictionPoints(world.bodies[i], world.boxes[i],
+                                                          world.bodies[j], world.boxes[j]);
+                if (fm.count == 0) continue;
+                SolveFrictionImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], fm,
+                                     cfg.restitution, cfg.mu, 1);   // ONE inner sweep — outer loop is the GS
+            }
+        }
+    }
+
+    // (4) Position de-penetration (the CX4 step-4, convex.h:907-932 reproduced VERBATIM). posIters sweeps,
+    // each over every overlapping pair in the FIXED i<j order, pushing the two bodies APART along the
+    // A->B-corrected SAT axis by fxmul(max(0, pen - slop), beta) split by inverse mass. LINEAR only. Re-run
+    // BoxSatStable for the current depth. Fixed order, in place (later pairs/sweeps see earlier pushes).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;   // both static -> skip
+                const convex::SatResult sat = BoxSatStable(world.bodies[i], world.boxes[i],
+                                                           world.bodies[j], world.boxes[j]);
+                if (!sat.overlap) continue;
+                FxVec3 nrm = sat.axis;
+                if (FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                fx excess = sat.penetration - cfg.slop;
+                if (excess <= 0) continue;   // within the allowed band -> no push (the anti-jitter slop)
+                const fx corrected = fxmul(excess, cfg.beta);
+                const fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                const fx wj = kOne - wi;
+                const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+                world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+                world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+    // (5) Orientation was already integrated in step (1).
+}
+
+// ----- StepFrictionWorldN(world, cfg, ticks): run `ticks` StepFrictionWorld steps. -----------------------
+inline void StepFrictionWorldN(ConvexWorld& world, const FrictionStepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepFrictionWorld(world, cfg);
+}
+
+// ----- MeasureFrictionStack(world): the deterministic rest + interpenetration summary (== the CX4
+// convex::MeasureStack form, re-exposed here for the FC4 showcases/tests). Max dynamic-body speed + max
+// pairwise penetration + dynamic count. Pure integer, fixed order.
+inline StackMeasure MeasureFrictionStack(const ConvexWorld& world) {
+    return convex::MeasureStack(world);
+}
+
 }  // namespace fric
 }  // namespace hf::sim

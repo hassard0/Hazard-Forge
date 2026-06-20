@@ -1182,6 +1182,19 @@ hf_compile_shaders(
     # ResolveContactFriction instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer
     # -> bit-exact GPU==CPU resolved bodies + cross-backend, proven memcmp. NO new RHI.
     "shaders/fric_solve.comp.hlsl:cs"
+    # Deterministic Contact Friction Slice 4 (Slice FC4): fric_step.comp is THE FRICTION-LOCKED WORLD STEP
+    # (the money-physics beat) — ONE thread ([numthreads(1,1,1)]) runs the WHOLE StepFrictionWorldN over the
+    # small body set (predict-integrate -> all-pairs narrowphase -> world Gauss-Seidel impulse with the FC3
+    # normal + cone-clamped TANGENT friction solve swapped in for CX4's normal-only SolveManifoldImpulse ->
+    # POSITION de-penetration, K ticks), copying engine/sim/fric.h::StepFrictionWorld/StepFrictionWorldN
+    # VERBATIM (the ONLY swap vs convex_step.comp is the impulse pass). So a box GRIPS/SLIDES on a ramp and a
+    # stack stands at angDamp=kOne (friction holds it). stepEnabled=0 -> bodies UNCHANGED. GPU final body world
+    # memcmp'd BIT-EXACT vs the CPU fric::StepFrictionWorldN. Like convex_step.comp / fric_solve.comp this is
+    # int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --fric-ramp /
+    # --fric-stack showcase runs the CPU StepFrictionWorldN instead (byte-identical by construction). Pure
+    # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU + cross-backend, proven memcmp. NO new RHI.
+    "shaders/fric_step.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

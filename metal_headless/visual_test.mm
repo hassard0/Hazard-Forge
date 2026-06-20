@@ -27408,6 +27408,203 @@ static int RunConvexStackShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FC4 — Deterministic Contact Friction THE FRICTION-LOCKED WORLD STEP showcase (--fric-ramp /
+// --fric-stack) (the 4th slice + money-physics beat of FLAGSHIP #20, hf::sim::fric). Like CX4, the full step
+// is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products + the FC3 friction
+// solve), so shaders/fric_step.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in
+// this dir's hf_gen_msl list; on Metal the --fric-ramp/--fric-stack showcase runs the CPU
+// fric::StepFrictionWorldN — the EXACT bit-exact reference the Vulkan --fric-ramp-shot/--fric-stack-shot
+// GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION (the convex_step.comp/fric_solve.comp convention), while the Vulkan side carries the GPU==CPU
+// proof. The RAMP scene = a dynamic box released on an 18-degree TILTED static box (high-mu grips, a low-mu
+// control slides); the STACK scene = the CX4 settling tower at angDamp=kOne (friction holds it). Proof lines
+// match the Vulkan side EXACTLY. New goldens tests/golden/metal/fric_ramp.png + fric_stack.png (baked on the
+// Mac by the controller); two runs DIFF 0.0000.
+static int RunFricStepShowcase(const char* outPath, bool isRamp) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fric   = hf::sim::fric;
+    namespace fpx    = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+
+    auto makeBody = [&](fx x, fx y, fx z, fpx::FxQuat q, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = q;
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const fpx::FxQuat qI{0, 0, 0, kOne};
+    const fpx::FxQuat qRamp = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)10252, (fx)64729}); // 18 deg / Z
+    const convex::FxBox kRamp{convex::FxVec3{fi(6), kOne, fi(3)}};
+    const convex::FxBox kSlider{convex::FxVec3{kOne, kOne, kOne}};
+    const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+    const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};
+
+    fric::FrictionStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 20;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = isRamp ? kOne : (fx)((int64_t)98 * kOne / 100);
+    kCfg.angDamp     = kOne;                            // OFF for BOTH (the FC4 headline)
+    kCfg.posIters    = 4;
+    kCfg.mu          = kOne;
+    const int kTicks = 240;
+
+    auto buildRamp = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, qRamp, false)); w.boxes.push_back(kRamp);
+        const convex::FxVec3 off =
+            fpx::FxRotate(qRamp, convex::FxVec3{0, kRamp.halfExtents.y + kSlider.halfExtents.y, 0});
+        w.bodies.push_back(makeBody(off.x, off.y, off.z, qRamp, true)); w.boxes.push_back(kSlider);
+        return w;
+    };
+    auto buildStack = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, qI, false)); w.boxes.push_back(kFloor);
+        w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, qI, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, qI, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, qI, true)); w.boxes.push_back(kSlab);
+        return w;
+    };
+    auto buildScene = [&]() { return isRamp ? buildRamp() : buildStack(); };
+    const char* sceneName = isRamp ? "ramp" : "stack";
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    convex::ConvexWorld world = buildScene();
+    const uint32_t kBodyCount = (uint32_t)world.bodies.size();
+    fric::StepFrictionWorldN(world, kCfg, (uint32_t)kTicks);
+    std::printf("fric-step: {scene:%s, bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fric::StepFrictionWorldN, byte-identical to the Vulkan GPU result by construction]\n",
+                sceneName, kBodyCount, kTicks);
+
+    convex::ConvexWorld world2 = buildScene();
+    fric::StepFrictionWorldN(world2, kCfg, (uint32_t)kTicks);
+    bool same = true;
+    for (size_t i = 0; i < world.bodies.size() && same; ++i)
+        if (std::memcmp(&world.bodies[i], &world2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("fric-step: two runs differ (nondeterministic)");
+    std::printf("fric-step determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) friction locks: the high-mu ramp box GRIPS + the stack stands at angDamp=kOne.
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    auto rampGripDisp = [&](fx mu) {
+        fric::FrictionStepConfig c = kCfg; c.mu = mu; c.linDamp = kOne;
+        convex::ConvexWorld w = buildRamp();
+        const convex::FxVec3 start = w.bodies[1].pos;
+        fric::StepFrictionWorldN(w, c, (uint32_t)kTicks);
+        convex::FxVec3 rampAx[3]; convex::BoxAxes(w.bodies[0], rampAx);
+        const convex::FxVec3 d = fpx::FxSub(w.bodies[1].pos, start);
+        return absfx(convex::FxDot(d, rampAx[0]));
+    };
+    const fx gripDisp = rampGripDisp(kOne);
+    const fx slideDisp = rampGripDisp(kOne / 16);
+    const bool rampGripped = (gripDisp < fi(1));
+    bool stackStandsNoDamp;
+    {
+        fric::FrictionStepConfig c = kCfg;
+        c.linDamp = (fx)((int64_t)98 * kOne / 100); c.mu = kOne;
+        convex::ConvexWorld sw = buildStack();
+        fric::StepFrictionWorldN(sw, c, (uint32_t)kTicks);
+        const convex::StackMeasure ms = fric::MeasureFrictionStack(sw);
+        const bool atRest = (ms.maxSpeed < kOne / 2);
+        const bool noInterpen = (ms.maxPenetration < kOne / 16);
+        const fx y1 = sw.bodies[1].pos.y, y2 = sw.bodies[2].pos.y, y3 = sw.bodies[3].pos.y;
+        const fx g01 = y2 - y1, g12 = y3 - y2;
+        const fx loBand = fi(1) - kOne / 4, hiBand = fi(1) + kOne / 4;
+        const bool stacked = (y1 < y2 && y2 < y3) &&
+                             (g01 > loBand && g01 < hiBand) && (g12 > loBand && g12 < hiBand);
+        stackStandsNoDamp = (atRest && noInterpen && stacked);
+    }
+    if (!rampGripped || !stackStandsNoDamp)
+        return fail("fric-step: NOT locked (friction did not hold the box/tower at angDamp=kOne)");
+    std::printf("fric-step locked: {rampGripped:true, stackStandsNoDamp:true}\n");
+
+    // PROOF (4) control: the low-mu ramp box slides farther than the high-mu box.
+    if (!(slideDisp > gripDisp + kOne / 2))
+        return fail("fric-step: control failed (low-mu box did not slide farther than high-mu)");
+    std::printf("fric-step control: {lowMuSlides:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) as the Vulkan --fric-ramp-shot/--fric-stack-shot. ---
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalfX = 11, kWorldHalfY = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    if (isRamp) {
+        drawBoxXY(world.bodies[0], kRamp, Vec3{0.30f, 0.40f, 0.55f});
+        drawBoxXY(world.bodies[1], kSlider, Vec3{0.95f, 0.55f, 0.20f});
+    } else {
+        drawBoxXY(world.bodies[0], kFloor, Vec3{0.30f, 0.40f, 0.55f});
+        const Vec3 slabCol[3] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.95f, 0.70f, 0.25f},
+                                 Vec3{0.85f, 0.90f, 0.40f}};
+        for (uint32_t i = 1; i < kBodyCount; ++i)
+            drawBoxXY(world.bodies[i], kSlab, slabCol[(i - 1) % 3]);
+    }
+    const convex::StackMeasure ms = fric::MeasureFrictionStack(world);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — friction-locked %s side-view (%u boxes, %d ticks, maxSpeed=%d)\n",
+                outPath, imgW, imgH, sceneName, kBodyCount, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice CX5 — Deterministic Convex Rigid-Body Contacts LOCKSTEP + ROLLBACK showcase (--convex-lockstep)
 // (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #19, the FR5/BD5 twin). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the CX5 harness (convex.h::RunConvexLockstep/RunConvexRollback) is header-only integer
@@ -47409,6 +47606,23 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_stack.png";
             try { return RunConvexStackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fric-ramp / --fric-stack <out.png>: render the Deterministic Contact Friction THE FRICTION-LOCKED
+        // WORLD STEP showcase (Slice FC4, the money-physics beat of FLAGSHIP #20). On Metal this runs the CPU
+        // step: fric_step.comp is int64/Vulkan-only (glslc can't parse the inertia/impulse/quaternion int64),
+        // so Metal runs the CPU fric::StepFrictionWorldN over the SAME scene (ramp: a box released on a tilted
+        // static box; stack: the CX4 tower at angDamp=kOne) -> the EXACT bit-exact reference the Vulkan
+        // --fric-ramp-shot/--fric-stack-shot GPU==CPU memcmp compares against; byte-identical BY CONSTRUCTION.
+        // New goldens tests/golden/metal/fric_ramp.png + fric_stack.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fric-ramp") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fric_ramp.png";
+            try { return RunFricStepShowcase(out, /*isRamp*/true); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        if (argc > 1 && std::strcmp(argv[1], "--fric-stack") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fric_stack.png";
+            try { return RunFricStepShowcase(out, /*isRamp*/false); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-lockstep <out.png>: render the Deterministic Convex Rigid-Body Contacts LOCKSTEP + ROLLBACK
