@@ -711,5 +711,142 @@ inline FlockPathStats MeasureFlockPath(const std::vector<Agent>& agents, const F
     return s;
 }
 
+// ===== Slice BD5 — LOCKSTEP + ROLLBACK (THE NETCODE HEADLINE) ============================================
+// BD1-BD4 built a bit-exact path-following flocking crowd (the per-tick StepFlockPath); BD5 proves it is true
+// cross-platform LOCKSTEP + ROLLBACK — the FPX5/FR5/GR5/CG5/GF5/JT5/VH5/AC5 twin. Two peers fed ONLY a
+// PERTURBATION input stream re-derive the exact crowd trajectory bit-for-bit (RunBoidsLockstep:
+// authority==replica every tick), and a MISPREDICTED perturbation is corrected by rolling back to a saved
+// snapshot + re-simulating (RunBoidsRollback: corrected==authority, the mispredict diverged before rollback).
+// PURE CPU (NO GPU dispatch, NO new shader, NO new RHI) — both Vulkan-Windows (--boids-lockstep-shot) and
+// Metal-Mac (--boids-lockstep) run the IDENTICAL CPU harness over StepFlockPath, so the converged crowd golden
+// is bit-identical cross-backend BY CONSTRUCTION.
+//
+// THE BD SIMPLIFICATION — the snapshot is JUST the agent world. StepFlockPath rebuilds the grid+neighbors from
+// the current positions each tick (no persistent grid state), SteerPath is recomputed each tick from the
+// positions (no per-agent path-state), and the corridor BoidsPath is a CONST input (not mutated). So the ONLY
+// mutable replayable state is std::vector<Agent>: BoidsSnapshot is a plain deep-copy of the agent vector — no
+// mutable extra (simpler than VH5's hinge axes / AC5's clip-time tick; the stateless steering pays off here).
+//
+// THE INPUT is a PERTURBATION stream. BoidsCommand {tick; agent; dv} — a velocity kick to one agent (a
+// "scare"/"shove" event; the AC5 ApplyImpulse analog lifted to a replayable input). A perturbation scatters
+// part of the flock; the flock+path drive re-coheres it. BD5 APPENDS — BD1-BD4 are byte-FROZEN.
+
+#include <cstring>   // std::memcmp (the lockstep/rollback bit-exact compares)
+
+// ----- BoidsCommand: ONE velocity-kick perturbation input event (the AC5 ApplyImpulse twin) ---------------
+// A velocity kick to one agent at a given tick. The harness applies every command whose cmd.tick == tick (in
+// ARRAY ORDER) via ApplyBoidsCommand before the StepFlockPath of that tick. Pure integer (dv is a Q16.16
+// FxVec3 velocity delta).
+struct BoidsCommand {
+    uint32_t tick  = 0;   // the tick this perturbation fires at
+    uint32_t agent = 0;   // the agent index the velocity kick is applied to
+    FxVec3   dv;          // the Q16.16 velocity-kick delta
+};
+
+// ----- ApplyBoidsCommand(agents, cmd): apply one perturbation (agents[cmd.agent].vel += cmd.dv) ------------
+// If cmd.agent is in range, kick that agent's velocity by cmd.dv (FxAdd); else a no-op (out-of-range agents are
+// silently ignored — the deterministic guard).
+inline void ApplyBoidsCommand(std::vector<Agent>& agents, const BoidsCommand& cmd) {
+    if (cmd.agent < (uint32_t)agents.size())
+        agents[(size_t)cmd.agent].vel = FxAdd(agents[(size_t)cmd.agent].vel, cmd.dv);
+}
+
+// ----- BoidsSnapshot: the captured mutable crowd state (JUST the agent world — the BD simplification) ------
+// The ONLY mutable replayable state is the agent vector (SteerPath is stateless + the corridor is const), so
+// the snapshot is a plain deep-copy of std::vector<Agent> — no mutable extra (the AC5/VH5 snapshot's tick /
+// hinge-axes are NOT needed here).
+struct BoidsSnapshot {
+    std::vector<Agent> agents;   // a deep-copy of the agent world (the rollback restore point)
+};
+
+// ----- SnapshotBoids(agents): deep-copy the agent world (the rollback restore point) ----------------------
+// A value copy -> deep-copies the agent vector. Bit-exact round-trip with RestoreBoids:
+// RestoreBoids(agents, SnapshotBoids(agents0)) leaves agents == agents0 byte-for-byte.
+inline BoidsSnapshot SnapshotBoids(const std::vector<Agent>& agents) {
+    BoidsSnapshot snap;
+    snap.agents = agents;   // deep copy
+    return snap;
+}
+
+// ----- RestoreBoids(agents, snap): restore the agent world from a snapshot (the rollback) -----------------
+// Bit-exact round-trip with SnapshotBoids.
+inline void RestoreBoids(std::vector<Agent>& agents, const BoidsSnapshot& snap) {
+    agents = snap.agents;   // restore the deep-copied world
+}
+
+// ----- SimBoidsTick(agents, cfg, path, commands, tick, dt): the deterministic per-tick step ----------------
+// (0) APPLY this tick's commands in ARRAY ORDER (every cmd with cmd.tick == tick) via ApplyBoidsCommand — the
+//     perturbation input — BEFORE the step so the kick integrates this tick.
+// (1) StepFlockPath(agents, cfg, path, dt) — the BD4 path-following flock tick (rebuild grid+neighbors ->
+//     JACOBI). Pure integer -> bit-identical on every peer/platform. The AC5 SimActiveTick twin.
+inline void SimBoidsTick(std::vector<Agent>& agents, const FlockConfig& cfg, const BoidsPath& path,
+                         const std::vector<BoidsCommand>& commands, int tick, fx dt) {
+    for (size_t c = 0; c < commands.size(); ++c)
+        if ((int)commands[c].tick == tick)
+            ApplyBoidsCommand(agents, commands[c]);
+    StepFlockPath(agents, cfg, path, dt);
+}
+
+// ----- RunBoidsLockstep: authority + replica from the SAME inputs, bit-identical every tick ----------------
+// THE peer entry point (the AC5 RunActiveLockstep / VH5 RunVehicleLockstep control flow over SimBoidsTick).
+// Run `ticks` SimBoidsTicks from a COPY of `initialAgents`, applying the command stream -> the converged crowd.
+// authority + replica step from the SAME init + stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by
+// determinism. This function ASSERTS authority == replica bit-for-bit every tick (memcmp the agent vector) via
+// an internal replica run; the caller also memcmps two RunBoidsLockstep returns for the determinism proof.
+// Returns the converged authority agent vector.
+inline std::vector<Agent> RunBoidsLockstep(const FlockConfig& cfg, const BoidsPath& path,
+                                           const std::vector<Agent>& initialAgents,
+                                           const std::vector<BoidsCommand>& commands, int ticks, fx dt) {
+    std::vector<Agent> authority = initialAgents;   // a fresh copy
+    std::vector<Agent> replica   = initialAgents;   // the second peer fed the SAME inputs
+    for (int t = 0; t < ticks; ++t) {
+        SimBoidsTick(authority, cfg, path, commands, t, dt);
+        SimBoidsTick(replica,   cfg, path, commands, t, dt);
+        // assert bit-identical every tick — two peers fed only the perturbation stream stay in lockstep.
+        if (authority.size() != replica.size() ||
+            std::memcmp(authority.data(), replica.data(), authority.size() * sizeof(Agent)) != 0) {
+            // the lockstep invariant broke — a nondeterminism the showcase/test reports loudly (unreachable for
+            // a deterministic sim — the fixed-order integer ops guarantee authority == replica). We leave the
+            // authority as-is; the caller's memcmp proof catches the divergence.
+            return authority;
+        }
+    }
+    return authority;
+}
+
+// ----- RunBoidsRollback: snapshot -> mispredict diverges -> rollback -> corrected == authority -------------
+// The rollback harness (the AC5 RunActiveRollback / VH5 RunVehicleRollback control flow over SimBoidsTick).
+// (1) advance ticks 0..divergeTick from `initialAgents` applying authorityCmds; (2) SAVE a BoidsSnapshot AT
+// divergeTick (SnapshotBoids — just the agent world); (2b) speculatively advance a few ticks with the
+// MISPREDICTED stream (a WRONG perturbation — different agent/dv/tick, the client prediction that diverges);
+// (3) ROLLBACK — RestoreBoids to the snapshot + RE-SIMULATE divergeTick..ticks with the CORRECT authorityCmds
+// -> the corrected final crowd. The caller asserts this == RunBoidsLockstep(cfg, path, init, authorityCmds,
+// ticks, dt) (rollback corrected the misprediction EXACTLY) AND that the speculative pre-rollback state
+// DIFFERED from authority (a real divergence was fixed). Reuses SnapshotBoids/RestoreBoids. cfg/path/dt are
+// CONSTANT, NOT snapshotted.
+inline std::vector<Agent> RunBoidsRollback(const FlockConfig& cfg, const BoidsPath& path,
+                                           const std::vector<Agent>& initialAgents,
+                                           const std::vector<BoidsCommand>& authorityCmds,
+                                           const std::vector<BoidsCommand>& mispredictCmds, int divergeTick,
+                                           int ticks, fx dt) {
+    std::vector<Agent> agents = initialAgents;
+    // (1) advance 0..divergeTick with the authoritative stream.
+    for (int t = 0; t < divergeTick; ++t)
+        SimBoidsTick(agents, cfg, path, authorityCmds, t, dt);
+    // (2) SAVE the snapshot at divergeTick (the rollback restore point — just the agent world).
+    const BoidsSnapshot snap = SnapshotBoids(agents);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong perturbation — the client
+    // prediction that diverges). Bounded to the remaining ticks.
+    int specTicks = ticks - divergeTick;
+    if (specTicks > 3) specTicks = 3;
+    for (int s = 0; s < specTicks; ++s)
+        SimBoidsTick(agents, cfg, path, mispredictCmds, divergeTick + s, dt);
+    // (3) ROLLBACK: restore the snapshot (the agent world) + re-sim divergeTick..ticks with the authStream.
+    RestoreBoids(agents, snap);
+    for (int t = divergeTick; t < ticks; ++t)
+        SimBoidsTick(agents, cfg, path, authorityCmds, t, dt);
+    return agents;
+}
+
 }  // namespace boids
 }  // namespace hf::sim

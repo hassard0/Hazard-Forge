@@ -18425,6 +18425,259 @@ static int RunBoidsPathShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BD5 — Deterministic GPU Crowds LOCKSTEP + ROLLBACK showcase (--boids-lockstep) (the 5th slice of
+// FLAGSHIP #18, THE NETCODE HEADLINE). PURE CPU (NO GPU dispatch, NO new shader, NO hf_gen_msl entry) — the
+// IDENTICAL CPU harness the Vulkan --boids-lockstep-shot runs: two peers fed ONLY a perturbation stream re-
+// derive the path-following crowd bit-for-bit (RunBoidsLockstep authority==replica) + a mispredicted kick is
+// corrected by rolling back to a snapshot — JUST the agent world (SteerPath is stateless + the corridor is
+// const) — and re-simulating (RunBoidsRollback corrected==authority, mispredict diverged before rollback). The
+// converged crowd is rendered via the SAME pure-integer BD4 2D top-down view -> the golden matches the Vulkan
+// one EXACTLY by construction. New golden tests/golden/metal/boids_lockstep.png (Mac-baked by the controller);
+// two runs DIFF 0.0000.
+static int RunBoidsLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace boids = hf::sim::boids;
+    namespace nav   = hf::nav;
+    namespace vg    = render::vg;
+
+    // === (1) Build the bit-exact integer navmesh + A* corridor HOST-side (the --nav-path 32x32 scene). ===
+    const int kNavW = 32, kNavH = 32;
+    nav::Heightfield hfld;
+    hfld.w = kNavW; hfld.h = kNavH;
+    hfld.bminX = 0; hfld.bminY = 0; hfld.bminZ = 0;
+    hfld.bmaxX = kNavW; hfld.bmaxY = 64; hfld.bmaxZ = kNavH;
+    hfld.cs = 1; hfld.ch = 1;
+    const int kNavCols = hfld.columnCount();
+    nav::WalkableConfig navCfg; navCfg.walkableHeight = 2; navCfg.walkableClimb = 1;
+    const int32_t kMaxError = 0;
+    std::vector<nav::NavTri> navTris = nav::MakeShowcaseTriangles(hfld);
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hfld, std::span<const nav::NavTri>(navTris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kNavCols);
+    for (int c = 0; c < kNavCols; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+    }
+    std::vector<uint32_t> navWalkable; std::vector<int32_t> navSurfaceY;
+    nav::FilterWalkableSpans(hfld, navCfg, mergedPerCol, navWalkable, navSurfaceY);
+    std::vector<uint32_t> navDist;
+    nav::BuildDistanceField(hfld, navCfg, navWalkable, navSurfaceY, navDist);
+    const uint32_t navMaxDist = nav::MaxDistOf(navDist);
+    std::vector<uint32_t> navRegion;
+    const uint32_t navRegionCount =
+        nav::BuildRegions(hfld, navCfg, navWalkable, navSurfaceY, navDist, navMaxDist, navRegion);
+    std::vector<nav::Contour> navContours;
+    nav::TraceContours(hfld, navRegion, navRegionCount, navContours);
+    for (auto& cc : navContours) {
+        std::vector<nav::ContourVertex> s; nav::SimplifyContour(cc.verts, kMaxError, s); cc.verts = s;
+    }
+    std::vector<nav::Poly> navPolys;
+    nav::BuildPolyMesh(navContours, navPolys);
+    std::vector<int32_t> navFlatVerts;
+    std::vector<uint32_t> navVOff((size_t)navRegionCount, 0u);
+    {
+        std::vector<int> contourOfRegion((size_t)navRegionCount + 1u, -1);
+        for (size_t ci = 0; ci < navContours.size(); ++ci)
+            contourOfRegion[(size_t)navContours[ci].region] = (int)ci;
+        uint32_t base = 0u;
+        for (uint32_t R = 1u; R <= navRegionCount; ++R) {
+            navVOff[(size_t)(R - 1u)] = base;
+            const int ci = contourOfRegion[(size_t)R];
+            if (ci < 0) continue;
+            const auto& vv = navContours[(size_t)ci].verts;
+            for (const auto& v : vv) { navFlatVerts.push_back(v.x); navFlatVerts.push_back(v.z); }
+            base += (uint32_t)vv.size();
+        }
+    }
+    const uint32_t kNavPolyCount = (uint32_t)navPolys.size();
+    std::vector<uint32_t> navPolyVertBase((size_t)kNavPolyCount, 0u);
+    for (uint32_t pi = 0; pi < kNavPolyCount; ++pi) {
+        const uint32_t R = navPolys[pi].region;
+        navPolyVertBase[pi] = (R >= 1u && R <= navRegionCount) ? navVOff[R - 1u] : 0u;
+    }
+    std::vector<int32_t> navCx, navCz;
+    nav::ComputePolyCentroids(navPolys, navFlatVerts, navPolyVertBase, navCx, navCz);
+    uint32_t navStart = 0u, navGoal = 0u;
+    nav::SelectStartGoal(navPolys, navCx, navCz, navStart, navGoal);
+    std::vector<uint32_t> corridor;
+    nav::FindPath(navPolys, navCx, navCz, navStart, navGoal, corridor);
+
+    // === (2) The corridor poly centroids -> a Q16.16 BoidsPath. ===
+    boids::BoidsPath path;
+    for (uint32_t pid : corridor) {
+        if (pid >= (uint32_t)navCx.size()) continue;
+        path.waypoints.push_back(boids::FxVec3{navCx[pid] << boids::kFrac, 0, navCz[pid] << boids::kFrac});
+    }
+    if (path.waypoints.size() < 2) return fail("boids-lockstep: nav corridor too short");
+    const boids::FxVec3 kStartWp = path.waypoints.front();
+    const boids::FxVec3 kGoalWp  = path.waypoints.back();
+
+    // === (3) The flock config + the 16x16=256-agent flock spawned at the corridor START. ===
+    const boids::fx kOne = boids::kOne;
+    auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+    const boids::fx kDt = kOne / 60;
+    const int kTicks = 300;
+    const int kGrid = 16;
+    const boids::fx kRadius = (boids::fx)(3 * (int)kOne);
+
+    boids::FlockConfig cfg;
+    cfg.seekGain         = 0;
+    cfg.sepGain          = frac(1, 8);
+    cfg.alignGain        = frac(1, 2);
+    cfg.cohGain          = frac(1, 2);
+    cfg.perceptionRadius = kRadius;
+    cfg.maxForce         = (boids::fx)(8 * (int)kOne);
+    cfg.maxSpeed         = (boids::fx)(6 * (int)kOne);
+    cfg.target           = boids::FxVec3{0, 0, 0};
+    cfg.gravity          = boids::FxVec3{0, 0, 0};
+    cfg.pathGain         = frac(1, 4);
+
+    const boids::fx sx = kStartWp.x - (boids::fx)((kGrid / 2) * (int)kOne);
+    const boids::fx sz = kStartWp.z - (boids::fx)((kGrid / 2) * (int)kOne);
+    std::vector<boids::Agent> flock0;
+    for (int gx = 0; gx < kGrid; ++gx)
+        for (int gz = 0; gz < kGrid; ++gz)
+            flock0.push_back(boids::Agent{
+                boids::FxVec3{sx + (boids::fx)(gx * (int)kOne), 0, sz + (boids::fx)(gz * (int)kOne)},
+                boids::FxVec3{0, 0, 0}});
+    const int kAgentCount = (int)flock0.size();
+
+    // === (4) The scripted perturbation authStream (== the Vulkan --boids-lockstep-shot stream). ===
+    const std::vector<boids::BoidsCommand> authStream = {
+        {10u,   0u, boids::FxVec3{ (boids::fx)(6 * (int)kOne), 0,  (boids::fx)(5 * (int)kOne)}},
+        {10u, 128u, boids::FxVec3{-(boids::fx)(6 * (int)kOne), 0, -(boids::fx)(5 * (int)kOne)}},
+        {10u, 255u, boids::FxVec3{ (boids::fx)(5 * (int)kOne), 0, -(boids::fx)(6 * (int)kOne)}},
+        {60u,  64u, boids::FxVec3{-(boids::fx)(5 * (int)kOne), 0,  (boids::fx)(6 * (int)kOne)}},
+    };
+    const int kPerturbations = (int)authStream.size();
+
+    // === PROOF (1) authority == replica BIT-IDENTICAL. ===
+    std::vector<boids::Agent> authority =
+        boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, kDt);
+    std::vector<boids::Agent> replica =
+        boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, kDt);
+    if (authority.size() != replica.size() ||
+        std::memcmp(authority.data(), replica.data(), authority.size() * sizeof(boids::Agent)) != 0)
+        return fail("boids-lockstep: authority != replica (the lockstep math broke)");
+    std::printf("boids-lockstep: {agents:%d, ticks:%d, perturbations:%d} authority==replica BIT-IDENTICAL\n",
+                kAgentCount, kTicks, kPerturbations);
+
+    // === PROOF (3) the mispredict DIVERGED before the rollback. ===
+    const int kDivergeTick = 120;
+    const std::vector<boids::BoidsCommand> mispredictStream = {
+        {120u, 200u, boids::FxVec3{ (boids::fx)(8 * (int)kOne), 0,  (boids::fx)(8 * (int)kOne)}},
+        {121u,  50u, boids::FxVec3{-(boids::fx)(8 * (int)kOne), 0, -(boids::fx)(8 * (int)kOne)}},
+    };
+    std::vector<boids::Agent> mispredicted = flock0;
+    for (int t = 0; t < kDivergeTick; ++t)
+        boids::SimBoidsTick(mispredicted, cfg, path, authStream, t, kDt);
+    for (int t = kDivergeTick; t < kDivergeTick + 3; ++t)
+        boids::SimBoidsTick(mispredicted, cfg, path, mispredictStream, t, kDt);
+    std::vector<boids::Agent> authAtSpec = flock0;
+    for (int t = 0; t < kDivergeTick + 3; ++t)
+        boids::SimBoidsTick(authAtSpec, cfg, path, authStream, t, kDt);
+    if (!(mispredicted.size() == authAtSpec.size() &&
+          std::memcmp(mispredicted.data(), authAtSpec.data(),
+                      mispredicted.size() * sizeof(boids::Agent)) != 0))
+        return fail("boids-lockstep: mispredict did NOT diverge (the rollback test is vacuous)");
+
+    // === PROOF (2) the rollback corrects to authority BIT-EXACT. ===
+    std::vector<boids::Agent> corrected = boids::RunBoidsRollback(
+        cfg, path, flock0, authStream, mispredictStream, kDivergeTick, kTicks, kDt);
+    if (corrected.size() != authority.size() ||
+        std::memcmp(corrected.data(), authority.data(), corrected.size() * sizeof(boids::Agent)) != 0)
+        return fail("boids-lockstep: rollback corrected != authority");
+    std::printf("boids-lockstep rollback: corrected==authority BIT-EXACT\n");
+    std::printf("boids-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+    // === PROOF (4) two runs BYTE-IDENTICAL. ===
+    std::vector<boids::Agent> run2 =
+        boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, kDt);
+    if (authority.size() != run2.size() ||
+        std::memcmp(authority.data(), run2.data(), authority.size() * sizeof(boids::Agent)) != 0)
+        return fail("boids-lockstep: two runs differ (nondeterministic)");
+    std::printf("boids-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the converged crowd via the BD4 2D top-down view (IDENTICAL to the Vulkan shot). ---
+    const int kWaypointCount = (int)path.waypoints.size();
+    int wMinX = kStartWp.x >> boids::kFrac, wMaxX = wMinX;
+    int wMinZ = kStartWp.z >> boids::kFrac, wMaxZ = wMinZ;
+    auto extend = [&](int wx, int wz) {
+        if (wx < wMinX) wMinX = wx; if (wx > wMaxX) wMaxX = wx;
+        if (wz < wMinZ) wMinZ = wz; if (wz > wMaxZ) wMaxZ = wz;
+    };
+    for (int w = 0; w < kWaypointCount; ++w)
+        extend(path.waypoints[(size_t)w].x >> boids::kFrac, path.waypoints[(size_t)w].z >> boids::kFrac);
+    for (int i = 0; i < kAgentCount; ++i)
+        extend(authority[(size_t)i].pos.x >> boids::kFrac, authority[(size_t)i].pos.z >> boids::kFrac);
+    const int kPxPerUnit = 12, kMargin = 24, kSlack = 4;
+    const int viewX0 = wMinX - kSlack, viewZ0 = wMinZ - kSlack;
+    const int kWorldW = (wMaxX - wMinX) + kSlack * 2 + 1;
+    const int kWorldH = (wMaxZ - wMinZ) + kSlack * 2 + 1;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+        ix = kMargin + (worldX - viewX0) * kPxPerUnit;
+        iy = kMargin + (worldZ - viewZ0) * kPxPerUnit;
+    };
+    auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+        for (int dy = -half; dy <= half; ++dy)
+            for (int dx = -half; dx <= half; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+            }
+    };
+    auto lineSeg = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int sx2 = dx < 0 ? -1 : 1, sy2 = dy < 0 ? -1 : 1;
+        int err = adx - ady, x = x0, y = y0;
+        for (int step = 0; step < 4096; ++step) {
+            plot(x, y, r, g, b, 0);
+            if (x == x1 && y == y1) break;
+            int e2 = 2 * err;
+            if (e2 > -ady) { err -= ady; x += sx2; }
+            if (e2 <  adx) { err += adx; y += sy2; }
+        }
+    };
+    for (int w = 0; w + 1 < kWaypointCount; ++w) {
+        int ax, ay, bx, by;
+        worldToPx(path.waypoints[(size_t)w].x >> boids::kFrac,
+                  path.waypoints[(size_t)w].z >> boids::kFrac, ax, ay);
+        worldToPx(path.waypoints[(size_t)(w + 1)].x >> boids::kFrac,
+                  path.waypoints[(size_t)(w + 1)].z >> boids::kFrac, bx, by);
+        lineSeg(ax, ay, bx, by, 50, 60, 90);
+    }
+    { int sxp, syp; worldToPx(kStartWp.x >> boids::kFrac, kStartWp.z >> boids::kFrac, sxp, syp);
+      plot(sxp, syp, 40, 200, 40, 3); }
+    { int gxp, gyp; worldToPx(kGoalWp.x >> boids::kFrac, kGoalWp.z >> boids::kFrac, gxp, gyp);
+      plot(gxp, gyp, 220, 40, 40, 3); }
+    for (int i = 0; i < kAgentCount; ++i) {
+        const int wx = authority[(size_t)i].pos.x >> boids::kFrac;
+        const int wz = authority[(size_t)i].pos.z >> boids::kFrac;
+        int cx, cy; worldToPx(wx, wz, cx, cy);
+        const int tipX = (authority[(size_t)i].pos.x + authority[(size_t)i].vel.x) >> boids::kFrac;
+        const int tipZ = (authority[(size_t)i].pos.z + authority[(size_t)i].vel.z) >> boids::kFrac;
+        int tx, ty; worldToPx(tipX, tipZ, tx, ty);
+        lineSeg(cx, cy, tx, ty, 90, 110, 90);
+        Vec3 col = vg::hashColor((uint32_t)i);
+        plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+             (uint8_t)(col.z * 255.0f + 0.5f), 1);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — boids lockstep+rollback converged crowd (%d agents, %d ticks)\n",
+                outPath, imgW, imgH, kAgentCount, kTicks);
+    return 0;
+}
+
 static int RunGrainIntegrateShowcase(const char* outPath) {
     using math::Vec3;
     namespace grain = hf::sim::grain;
@@ -44393,6 +44646,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--boids-path") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_boids_path.png";
             try { return RunBoidsPathShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --boids-lockstep <out.png>: render the Deterministic GPU Crowds LOCKSTEP + ROLLBACK showcase (Slice
+        // BD5, the 5th slice of FLAGSHIP #18, THE NETCODE HEADLINE). PURE CPU — the IDENTICAL CPU harness the
+        // Vulkan --boids-lockstep-shot runs: two peers fed ONLY a perturbation stream re-derive the path-
+        // following crowd bit-for-bit (RunBoidsLockstep authority==replica) + a mispredicted kick is rolled back
+        // to a snapshot (just the agent world) + corrected (RunBoidsRollback corrected==authority, mispredict
+        // diverged before rollback). The converged crowd is rendered via the SAME pure-integer BD4 2D top-down
+        // view, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/boids_lockstep.png;
+        // two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--boids-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_boids_lockstep.png";
+            try { return RunBoidsLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {

@@ -538,6 +538,147 @@ int main() {
         }
     }
 
+    // ===== Slice BD5: LOCKSTEP + ROLLBACK (the netcode headline; PURE CPU) =====
+    // What this PINS (the contracts the --boids-lockstep showcase + the cross-platform golden build on):
+    //   * SnapshotBoids/RestoreBoids: a deep-copy round-trip — snapshot -> mutate (a few perturb+step ticks)
+    //     -> restore -> the agent vector is bit-identical to the snapshot.
+    //   * ApplyBoidsCommand: kicks the target agent's velocity by dv (FxAdd); out-of-range agent -> no-op.
+    //   * RunBoidsLockstep: an authority + a replica fed the SAME perturbation stream stay bit-identical.
+    //   * RunBoidsRollback: a mispredicted kick DIVERGES (mispredicted != authority before rollback), then the
+    //     rollback corrects to authority bit-for-bit.
+    //   * Two runs byte-identical (determinism).
+    {
+        // The BD4 path-following flock recipe (a small flock + a short corridor so the test is fast).
+        auto lockCfg = [&]() {
+            boids::FlockConfig c;
+            c.seekGain         = 0;
+            c.sepGain          = frac(1, 8);   // 0.125 weak separation
+            c.alignGain        = frac(1, 2);   // 0.5 alignment
+            c.cohGain          = frac(1, 2);   // 0.5 cohesion
+            c.perceptionRadius = wu(3);
+            c.maxForce         = wu(8);
+            c.maxSpeed         = wu(6);
+            c.target           = boids::FxVec3{0, 0, 0};
+            c.gravity          = boids::FxVec3{0, 0, 0};
+            c.pathGain         = frac(1, 4);   // 0.25 corridor-follow
+            return c;
+        };
+        const boids::FlockConfig cfg = lockCfg();
+        const boids::fx dt = boids::kOne / 60;
+        boids::BoidsPath path;
+        path.waypoints = {boids::FxVec3{wu(0), 0, wu(0)}, boids::FxVec3{wu(20), 0, wu(8)},
+                          boids::FxVec3{wu(40), 0, wu(16)}};
+        // a 6x6 = 36-agent flock at the corridor start.
+        auto makeFlock = [&]() {
+            std::vector<boids::Agent> a;
+            for (int gx = 0; gx < 6; ++gx)
+                for (int gz = 0; gz < 6; ++gz)
+                    a.push_back(boids::Agent{boids::FxVec3{wu(gx), 0, wu(gz)}, boids::FxVec3{0, 0, 0}});
+            return a;
+        };
+        const std::vector<boids::Agent> flock0 = makeFlock();
+        const int kTicks = 80;
+
+        // ----- ApplyBoidsCommand: kicks the target agent's velocity; out-of-range -> no-op -----
+        {
+            std::vector<boids::Agent> a = makeFlock();
+            const boids::FxVec3 v0 = a[5].vel;
+            boids::ApplyBoidsCommand(a, boids::BoidsCommand{0u, 5u, boids::FxVec3{wu(3), 0, -wu(2)}});
+            check(a[5].vel.x == v0.x + wu(3) && a[5].vel.z == v0.z - wu(2),
+                  "ApplyBoidsCommand: kicks the target agent's velocity by dv");
+            // out-of-range agent -> no-op (no crash, no mutation).
+            std::vector<boids::Agent> b = makeFlock();
+            const std::vector<boids::Agent> bRef = makeFlock();
+            boids::ApplyBoidsCommand(b, boids::BoidsCommand{0u, 9999u, boids::FxVec3{wu(5), 0, 0}});
+            check(b.size() == bRef.size() &&
+                  std::memcmp(b.data(), bRef.data(), b.size() * sizeof(boids::Agent)) == 0,
+                  "ApplyBoidsCommand: out-of-range agent -> no-op");
+        }
+
+        // ----- SnapshotBoids/RestoreBoids: deep-copy round-trip -----
+        {
+            std::vector<boids::Agent> a = flock0;
+            // advance a few ticks so the world is non-trivial.
+            std::vector<boids::BoidsCommand> empty;
+            for (int t = 0; t < 5; ++t) boids::SimBoidsTick(a, cfg, path, empty, t, dt);
+            const boids::BoidsSnapshot snap = boids::SnapshotBoids(a);
+            // mutate: a few perturb + step ticks.
+            std::vector<boids::BoidsCommand> kicks = {{5u, 3u, boids::FxVec3{wu(4), 0, 0}}};
+            for (int t = 5; t < 12; ++t) boids::SimBoidsTick(a, cfg, path, kicks, t, dt);
+            check(a.size() == snap.agents.size() &&
+                  std::memcmp(a.data(), snap.agents.data(), a.size() * sizeof(boids::Agent)) != 0,
+                  "SnapshotBoids: the world changed after the snapshot (sanity)");
+            // restore -> bit-identical to the snapshot.
+            boids::RestoreBoids(a, snap);
+            check(a.size() == snap.agents.size() &&
+                  std::memcmp(a.data(), snap.agents.data(), a.size() * sizeof(boids::Agent)) == 0,
+                  "RestoreBoids: round-trip restores the snapshot BYTE-IDENTICAL");
+        }
+
+        // The scripted perturbation stream (a few velocity kicks scattering parts of the flock).
+        const std::vector<boids::BoidsCommand> authStream = {
+            {2u,  0u, boids::FxVec3{ wu(6), 0,  wu(4)}},
+            {2u, 12u, boids::FxVec3{-wu(5), 0, -wu(3)}},
+            {20u, 7u, boids::FxVec3{ wu(4), 0, -wu(5)}},
+        };
+
+        // ----- RunBoidsLockstep: authority == replica over the perturbation stream -----
+        {
+            std::vector<boids::Agent> authority =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, dt);
+            std::vector<boids::Agent> replica =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, dt);
+            check(authority.size() == replica.size() &&
+                  std::memcmp(authority.data(), replica.data(), authority.size() * sizeof(boids::Agent)) == 0,
+                  "RunBoidsLockstep: authority == replica BIT-IDENTICAL (inputs-only re-derivation)");
+        }
+
+        // ----- RunBoidsRollback: a mispredicted kick diverges, the rollback corrects to authority -----
+        {
+            const int divergeTick = 30;
+            // a WRONG perturbation at divergeTick (a different agent + a strong-enough kick to truly diverge).
+            const std::vector<boids::BoidsCommand> mispredictStream = {
+                {30u, 20u, boids::FxVec3{wu(6), 0, wu(6)}},
+                {31u, 25u, boids::FxVec3{-wu(6), 0, -wu(6)}},
+            };
+            std::vector<boids::Agent> authority =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, dt);
+
+            // the speculative (pre-rollback) state: advance to divergeTick with authStream, then a few ticks
+            // with the WRONG stream -> it must DIVERGE from authority (a real divergence to fix).
+            std::vector<boids::Agent> mispredicted = flock0;
+            for (int t = 0; t < divergeTick; ++t) boids::SimBoidsTick(mispredicted, cfg, path, authStream, t, dt);
+            for (int t = divergeTick; t < divergeTick + 3; ++t)
+                boids::SimBoidsTick(mispredicted, cfg, path, mispredictStream, t, dt);
+            // compare to authority at the SAME tick count (advance a fresh authority copy to divergeTick+3).
+            std::vector<boids::Agent> authAtSpec = flock0;
+            for (int t = 0; t < divergeTick + 3; ++t) boids::SimBoidsTick(authAtSpec, cfg, path, authStream, t, dt);
+            check(mispredicted.size() == authAtSpec.size() &&
+                  std::memcmp(mispredicted.data(), authAtSpec.data(),
+                              mispredicted.size() * sizeof(boids::Agent)) != 0,
+                  "RunBoidsRollback: mispredicted DIVERGED from authority before rollback (real divergence)");
+
+            // the rollback corrects to authority bit-for-bit.
+            std::vector<boids::Agent> corrected =
+                boids::RunBoidsRollback(cfg, path, flock0, authStream, mispredictStream, divergeTick, kTicks, dt);
+            check(corrected.size() == authority.size() &&
+                  std::memcmp(corrected.data(), authority.data(),
+                              corrected.size() * sizeof(boids::Agent)) == 0,
+                  "RunBoidsRollback: corrected == authority BIT-EXACT (rollback fixed the misprediction)");
+        }
+
+        // ----- two runs byte-identical (determinism) -----
+        {
+            std::vector<boids::Agent> r1 =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, dt);
+            std::vector<boids::Agent> r2 =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, dt);
+            check(r1.size() == r2.size() &&
+                  std::memcmp(r1.data(), r2.data(), r1.size() * sizeof(boids::Agent)) == 0,
+                  "RunBoidsLockstep: two runs BYTE-IDENTICAL");
+        }
+    }
+
     if (g_fail == 0) std::printf("boids_test: ALL PASS\n");
     else             std::printf("boids_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

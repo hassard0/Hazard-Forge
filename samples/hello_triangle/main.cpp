@@ -475,6 +475,7 @@ int main(int argc, char** argv) {
     const char* boidsNeighborsShotPath = nullptr; // --boids-neighbors-shot <out.bmp> (Slice BD2: Deterministic GPU Crowds GRID-HASH NEIGHBOR LIST, the 2nd slice of FLAGSHIP #18 — a larger flock (~256-1024 agents spread over an area, settled K StepBoids steps) bucketed into a uniform spatial-hash grid at cell-size = the perception radius (BuildBoidsCellTable) + a per-agent 27-cell-stencil NEIGHBOR LIST (BuildBoidsNeighborList, per-axis |dx|<radius reject) via PURE-INT32 count->scan->emit (boids_cell_{count,scan,emit} + boids_neighbor_{count,scan,emit}.comp, MSL-native — a TRUE GPU pass on BOTH backends, unlike BD1's int64 boids_steer), GPU==CPU cell-table+neighbor-list bit-exact vs boids.h::BuildBoidsCellTable/BuildBoidsNeighborList, integer per-agent neighbor-count heat viz; NO flock step (BD3), NO new RHI; boids.h append-only over BD1)
     const char* boidsFlockShotPath = nullptr; // --boids-flock-shot <out.bmp> (Slice BD3: Deterministic GPU Crowds THE FULL FLOCK STEP, the 3rd slice of FLAGSHIP #18 — a ~256-agent flock settled K StepFlock steps: per tick the GPU rebuilds the BD2 neighbor list (MSL-native boids_cell_*/boids_neighbor_* on the current positions, over a FIXED generously-sized grid) then runs the int64 boids_flock.comp — ONE thread per agent: the 3 Reynolds rules (separation Σ(pos_i-pos_j)*sepGain + alignment ((Σvel_j)/count-vel_i)*alignGain + cohesion ((Σpos_j)/count-pos_i)*cohGain; integer-divide means, count==0 guard) + optional seek + integrate, JACOBI ping-pong; boids_flock.comp is int64 Vulkan-only (NOT in hf_gen_msl) while the BD2 grid passes stay MSL-native. GPU==CPU agent array bit-exact vs boids.h::StepFlock (memcmp), integer 2D top-down flock viz (each agent a dot + a short velocity tick showing the aligned heading); NO path-following (BD4), NO new RHI; boids.h append-only over BD1/BD2)
     const char* boidsPathShotPath = nullptr; // --boids-path-shot <out.bmp> (Slice BD4: Deterministic GPU Crowds PATH-FOLLOWING THE A* CORRIDOR — THE NAV BRIDGE, the 4th slice of FLAGSHIP #18 — a ~256-agent flock spawned at a navmesh corridor START streams along the bit-exact nav::FindPath A* corridor to the goal while flocking. Per tick the GPU rebuilds the BD2 neighbor list (MSL-native boids_cell_*/boids_neighbor_*) then runs the render-invariantly-extended boids_flock.comp (path ON: a pathCount uniform + a gWaypoints buffer + the SteerPath arrive-to-next-waypoint term; pathCount==0 == BD3 byte-identical) — JACOBI ping-pong; the corridor is built HOST-side once from the --nav-path navmesh + FindPath, the poly centroids -> Q16.16 BoidsPath waypoints. GPU==CPU agent array bit-exact vs boids.h::StepFlockPath (memcmp), integer 2D top-down view (the navmesh + corridor polyline faint underneath, the agents streaming along it). NO new shader file (boids_flock.comp extended render-invariantly, still int64 Vulkan-only), NO new RHI; nav reused read-only; boids.h append-only. STANDALONE branch (C1061 avoidance))
+    const char* boidsLockstepShotPath = nullptr; // --boids-lockstep-shot <out.bmp> (Slice BD5: Deterministic GPU Crowds LOCKSTEP + ROLLBACK — THE NETCODE HEADLINE, the 5th slice of FLAGSHIP #18 — PURE CPU: build the BD4 navmesh+corridor + a flock at the start, a scripted perturbation authStream (a few velocity kicks scattering parts of the flock at a few ticks), run boids::RunBoidsLockstep (authority==replica BIT-IDENTICAL) + boids::RunBoidsRollback (a mispredicted kick rolled back to a snapshot — just the agent world — corrected==authority, the mispredict diverged before rollback), render the converged crowd via the BD4 2D top-down view; the converged golden is bit-identical cross-backend by construction (both backends run the identical CPU harness, NO GPU dispatch); the snapshot is JUST std::vector<Agent> (the BD simplification — SteerPath stateless + corridor const); the 4 proof lines authority==replica / rollback==authority / mispredict-diverged / two-runs-byte-identical; NO new shader, NO new RHI; boids.h append-only over BD1-BD4)
     const char* coupleQueryShotPath = nullptr; // --couple-query-shot <out.bmp> (Slice CP1: Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD + BODY->FLUID grid-hash QUERY, the BEACHHEAD of FLAGSHIP #11 — a settled fluid pool (FL1 InitBlock) + a few FxBody spheres placed partly submerged. Build the FL2 fluid grid + cell table (reused fluid_cell_{count,scan,emit}) then the per-body fluid-particle QUERY via THREE pure-INT32 count->scan->emit passes (couple_body_{count,scan,emit}.comp, MSL-native): each body gathers the fluid particles inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - p.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CP2). GPU=={cellStart,cellParticles,bodyStart,bodyParticles}==CPU couple.h::GatherBodyParticles bit-exact (memcmp), per-body gathered-particle heat viz (submerged bodies populated, clear bodies empty). NO momentum exchange (CP2 buoyancy/drag, CP3 displacement, CP4 step, CP5 lockstep, CP6 render), NO new RHI; couple.h #includes fpx.h + fluid.h read-only)
     const char* cgrainQueryShotPath = nullptr; // --cgrain-query-shot <out.bmp> (Slice CG1: Deterministic Rigid<->Grain Coupling UNIFIED bodies+grains WORLD + BODY->GRAIN grid-hash QUERY, the BEACHHEAD of FLAGSHIP #12 — a poured grain bed (GR1 InitGrainBlock, settled with GR4 friction steps) + a few FxBody spheres placed partly buried. Build the GR2 grain grid + cell table (reused grain_cell_{count,scan,emit}) then the per-body grain QUERY via THREE pure-INT32 count->scan->emit passes (cgrain_body_{count,scan,emit}.comp, MSL-native): each body gathers the grains inside its BodyAabb cell RANGE passing the per-axis |body.pos.axis - g.pos.axis| < body.radius reject (a box; the exact radial sphere cull deferred to CG2/CG3). GPU=={cellStart,cellGrains,bodyStart,bodyGrains}==CPU couple_grain.h::GatherBodyGrains bit-exact (memcmp), per-body gathered-grain heat viz (buried bodies populated, clear bodies empty). NO momentum exchange (CG2 support/drag, CG3 displacement, CG4 step, CG5 lockstep, CG6 render), NO new RHI; couple_grain.h #includes fpx.h + grain.h read-only)
     const char* cgfQueryShotPath = nullptr; // --cgf-query-shot <out.bmp> (Slice GF1: Deterministic Grain<->Fluid Coupling UNIFIED TWO-POOL WORLD + SHARED-GRID CROSS QUERY, the BEACHHEAD of FLAGSHIP #13 — a settled grain bed (GR1 InitGrainBlock + GR4 friction) + an overlapping fluid block (FL1 InitBlock). Build ONE shared grid over BOTH pools' union AABB, bucket each pool into its own cell table (reused grain_cell_* + fluid_cell_* sized to the shared grid), then the two CROSS lists via SIX pure-INT32 count->scan->emit passes (cgf_gf_{count,scan,emit} grain->fluid + cgf_fg_{count,scan,emit} fluid->grain, MSL-native): each grain gathers the FLUID in its 27-cell stencil + each fluid the GRAINS in its 27-cell stencil, accepted iff the per-axis |query.axis - target.axis| < h box reject passes (the exact radial cull deferred to GF2/GF3). GPU=={grainCellTable,fluidCellTable,gfStart,gfNeighbors,fgStart,fgNeighbors}==CPU couple_gf.h::BuildCGFNeighbors bit-exact (memcmp), cross-pool neighbour heat viz (overlap populated, separated empty), the symmetry X==Y. NO momentum exchange (GF2-GF6), NO new RHI; couple_gf.h #includes fpx.h + grain.h + fluid.h read-only)
@@ -754,6 +755,17 @@ int main(int argc, char** argv) {
         // STANDALONE branch (C1061 avoidance, like the boids-flock shot).
         if (std::strcmp(argv[i], "--boids-path-shot") == 0 && i + 1 < argc) {
             boidsPathShotPath = argv[i + 1];
+            ++i;
+            continue;
+        }
+        // Slice BD5: --boids-lockstep-shot <out.bmp> — the Deterministic GPU Crowds LOCKSTEP + ROLLBACK (THE
+        // NETCODE HEADLINE, the 5th slice of FLAGSHIP #18). PURE CPU (no GPU dispatch): build the BD4
+        // navmesh+corridor + a flock, run a scripted perturbation stream through RunBoidsLockstep
+        // (authority==replica) + RunBoidsRollback (a mispredicted kick rolled back), render the converged crowd
+        // via the BD4 2D top-down view. Both backends run the identical CPU harness -> the converged golden is
+        // bit-identical cross-backend by construction. STANDALONE branch (C1061 avoidance).
+        if (std::strcmp(argv[i], "--boids-lockstep-shot") == 0 && i + 1 < argc) {
+            boidsLockstepShotPath = argv[i + 1];
             ++i;
             continue;
         }
@@ -20269,6 +20281,281 @@ int main(int argc, char** argv) {
             if (ok) std::printf("wrote %s (%ux%u) — boids path-following A* corridor (%d waypoints, D %d->%d)\n",
                                 boidsPathShotPath, imgW, imgH, kWaypointCount, D0, D1);
             else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", boidsPathShotPath);
+            device->WaitIdle();
+            return ok ? 0 : 1;
+        }
+
+        // --- Deterministic GPU Crowds LOCKSTEP + ROLLBACK — THE NETCODE HEADLINE (--boids-lockstep-shot
+        // <out.bmp>, Slice BD5, the 5th slice of FLAGSHIP #18). PURE CPU (no GPU dispatch): two peers fed ONLY a
+        // perturbation stream re-derive the exact path-following crowd bit-for-bit (RunBoidsLockstep:
+        // authority==replica) + a mispredicted kick is corrected by rolling back to a snapshot — JUST the agent
+        // world (SteerPath is stateless + the corridor is const, so there is no mutable extra) — and re-
+        // simulating (RunBoidsRollback: corrected==authority, mispredict diverged before rollback). Both
+        // backends run the IDENTICAL CPU harness over StepFlockPath, so the converged crowd golden is bit-
+        // identical cross-backend by construction. The device is created for the RENDER only (NO compute
+        // dispatch). STANDALONE branch (C1061 avoidance).
+        if (boidsLockstepShotPath) {
+            using math::Vec3;
+            namespace boids = hf::sim::boids;
+            namespace nav   = hf::nav;
+            namespace vg    = hf::render::vg;
+
+            // === (1) Build the bit-exact integer navmesh + A* corridor HOST-side (the --nav-path 32x32 scene). ===
+            const int kNavW = 32, kNavH = 32;
+            nav::Heightfield hfld;
+            hfld.w = kNavW; hfld.h = kNavH;
+            hfld.bminX = 0; hfld.bminY = 0; hfld.bminZ = 0;
+            hfld.bmaxX = kNavW; hfld.bmaxY = 64; hfld.bmaxZ = kNavH;
+            hfld.cs = 1; hfld.ch = 1;
+            const int kNavCols = hfld.columnCount();
+            nav::WalkableConfig navCfg; navCfg.walkableHeight = 2; navCfg.walkableClimb = 1;
+            const int32_t kMaxError = 0;
+            std::vector<nav::NavTri> navTris = nav::MakeShowcaseTriangles(hfld);
+            std::vector<uint32_t> rColCount, rColOffset;
+            std::vector<nav::Span> rSpans;
+            nav::RasterizeTriangleSpans(hfld, std::span<const nav::NavTri>(navTris), rColCount, rColOffset, rSpans);
+            std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kNavCols);
+            for (int c = 0; c < kNavCols; ++c) {
+                std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                          rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+                mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+            }
+            std::vector<uint32_t> navWalkable; std::vector<int32_t> navSurfaceY;
+            nav::FilterWalkableSpans(hfld, navCfg, mergedPerCol, navWalkable, navSurfaceY);
+            std::vector<uint32_t> navDist;
+            nav::BuildDistanceField(hfld, navCfg, navWalkable, navSurfaceY, navDist);
+            const uint32_t navMaxDist = nav::MaxDistOf(navDist);
+            std::vector<uint32_t> navRegion;
+            const uint32_t navRegionCount =
+                nav::BuildRegions(hfld, navCfg, navWalkable, navSurfaceY, navDist, navMaxDist, navRegion);
+            std::vector<nav::Contour> navContours;
+            nav::TraceContours(hfld, navRegion, navRegionCount, navContours);
+            for (auto& cc : navContours) {
+                std::vector<nav::ContourVertex> s; nav::SimplifyContour(cc.verts, kMaxError, s); cc.verts = s;
+            }
+            std::vector<nav::Poly> navPolys;
+            nav::BuildPolyMesh(navContours, navPolys);
+            std::vector<int32_t> navFlatVerts;
+            std::vector<uint32_t> navVOff((size_t)navRegionCount, 0u);
+            {
+                std::vector<int> contourOfRegion((size_t)navRegionCount + 1u, -1);
+                for (size_t ci = 0; ci < navContours.size(); ++ci)
+                    contourOfRegion[(size_t)navContours[ci].region] = (int)ci;
+                uint32_t base = 0u;
+                for (uint32_t R = 1u; R <= navRegionCount; ++R) {
+                    navVOff[(size_t)(R - 1u)] = base;
+                    const int ci = contourOfRegion[(size_t)R];
+                    if (ci < 0) continue;
+                    const auto& vv = navContours[(size_t)ci].verts;
+                    for (const auto& v : vv) { navFlatVerts.push_back(v.x); navFlatVerts.push_back(v.z); }
+                    base += (uint32_t)vv.size();
+                }
+            }
+            const uint32_t kNavPolyCount = (uint32_t)navPolys.size();
+            std::vector<uint32_t> navPolyVertBase((size_t)kNavPolyCount, 0u);
+            for (uint32_t pi = 0; pi < kNavPolyCount; ++pi) {
+                const uint32_t R = navPolys[pi].region;
+                navPolyVertBase[pi] = (R >= 1u && R <= navRegionCount) ? navVOff[R - 1u] : 0u;
+            }
+            std::vector<int32_t> navCx, navCz;
+            nav::ComputePolyCentroids(navPolys, navFlatVerts, navPolyVertBase, navCx, navCz);
+            uint32_t navStart = 0u, navGoal = 0u;
+            nav::SelectStartGoal(navPolys, navCx, navCz, navStart, navGoal);
+            std::vector<uint32_t> corridor;
+            nav::FindPath(navPolys, navCx, navCz, navStart, navGoal, corridor);
+
+            // === (2) The corridor poly centroids -> a Q16.16 BoidsPath. ===
+            boids::BoidsPath path;
+            for (uint32_t pid : corridor) {
+                if (pid >= (uint32_t)navCx.size()) continue;
+                path.waypoints.push_back(boids::FxVec3{navCx[pid] << boids::kFrac, 0, navCz[pid] << boids::kFrac});
+            }
+            if (path.waypoints.size() < 2) {
+                std::fprintf(stderr, "FATAL: boids-lockstep nav corridor too short (%zu waypoints)\n",
+                             path.waypoints.size());
+                device->WaitIdle(); return 1;
+            }
+            const boids::FxVec3 kStartWp = path.waypoints.front();
+            const boids::FxVec3 kGoalWp  = path.waypoints.back();
+
+            // === (3) The flock config + the 16x16=256-agent flock spawned at the corridor START. ===
+            const boids::fx kOne = boids::kOne;
+            auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+            const boids::fx kDt = kOne / 60;
+            const int kTicks = 300;
+            const int kGrid = 16;                          // 16x16 = 256 agents
+            const boids::fx kRadius = (boids::fx)(3 * (int)kOne);
+
+            boids::FlockConfig cfg;
+            cfg.seekGain         = 0;
+            cfg.sepGain          = frac(1, 8);
+            cfg.alignGain        = frac(1, 2);
+            cfg.cohGain          = frac(1, 2);
+            cfg.perceptionRadius = kRadius;
+            cfg.maxForce         = (boids::fx)(8 * (int)kOne);
+            cfg.maxSpeed         = (boids::fx)(6 * (int)kOne);
+            cfg.target           = boids::FxVec3{0, 0, 0};
+            cfg.gravity          = boids::FxVec3{0, 0, 0};
+            cfg.pathGain         = frac(1, 4);
+
+            const boids::fx sx = kStartWp.x - (boids::fx)((kGrid / 2) * (int)kOne);
+            const boids::fx sz = kStartWp.z - (boids::fx)((kGrid / 2) * (int)kOne);
+            std::vector<boids::Agent> flock0;
+            for (int gx = 0; gx < kGrid; ++gx)
+                for (int gz = 0; gz < kGrid; ++gz)
+                    flock0.push_back(boids::Agent{
+                        boids::FxVec3{sx + (boids::fx)(gx * (int)kOne), 0, sz + (boids::fx)(gz * (int)kOne)},
+                        boids::FxVec3{0, 0, 0}});
+            const int kAgentCount = (int)flock0.size();
+
+            // === (4) The scripted perturbation authStream — a few velocity kicks scattering parts of the flock
+            // off the path at a few ticks (the crowd is perturbed then re-coheres + re-follows). ===
+            const std::vector<boids::BoidsCommand> authStream = {
+                {10u,   0u, boids::FxVec3{ (boids::fx)(6 * (int)kOne), 0,  (boids::fx)(5 * (int)kOne)}},
+                {10u, 128u, boids::FxVec3{-(boids::fx)(6 * (int)kOne), 0, -(boids::fx)(5 * (int)kOne)}},
+                {10u, 255u, boids::FxVec3{ (boids::fx)(5 * (int)kOne), 0, -(boids::fx)(6 * (int)kOne)}},
+                {60u,  64u, boids::FxVec3{-(boids::fx)(5 * (int)kOne), 0,  (boids::fx)(6 * (int)kOne)}},
+            };
+            const int kPerturbations = (int)authStream.size();
+
+            // === PROOF (1) authority == replica BIT-IDENTICAL (two peers fed only the perturbation stream). ===
+            std::vector<boids::Agent> authority =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, kDt);
+            std::vector<boids::Agent> replica =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, kDt);
+            if (authority.size() != replica.size() ||
+                std::memcmp(authority.data(), replica.data(),
+                            authority.size() * sizeof(boids::Agent)) != 0) {
+                std::fprintf(stderr, "FATAL: boids-lockstep authority != replica (the lockstep math broke)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-lockstep: {agents:%d, ticks:%d, perturbations:%d} authority==replica BIT-IDENTICAL\n",
+                        kAgentCount, kTicks, kPerturbations);
+
+            // === PROOF (3) the mispredict DIVERGED before the rollback (a real divergence to fix). ===
+            const int kDivergeTick = 120;
+            const std::vector<boids::BoidsCommand> mispredictStream = {
+                {120u, 200u, boids::FxVec3{ (boids::fx)(8 * (int)kOne), 0,  (boids::fx)(8 * (int)kOne)}},
+                {121u,  50u, boids::FxVec3{-(boids::fx)(8 * (int)kOne), 0, -(boids::fx)(8 * (int)kOne)}},
+            };
+            std::vector<boids::Agent> mispredicted = flock0;
+            for (int t = 0; t < kDivergeTick; ++t)
+                boids::SimBoidsTick(mispredicted, cfg, path, authStream, t, kDt);
+            for (int t = kDivergeTick; t < kDivergeTick + 3; ++t)
+                boids::SimBoidsTick(mispredicted, cfg, path, mispredictStream, t, kDt);
+            std::vector<boids::Agent> authAtSpec = flock0;
+            for (int t = 0; t < kDivergeTick + 3; ++t)
+                boids::SimBoidsTick(authAtSpec, cfg, path, authStream, t, kDt);
+            const bool diverged = mispredicted.size() == authAtSpec.size() &&
+                std::memcmp(mispredicted.data(), authAtSpec.data(),
+                            mispredicted.size() * sizeof(boids::Agent)) != 0;
+            if (!diverged) {
+                std::fprintf(stderr, "FATAL: boids-lockstep mispredict did NOT diverge "
+                             "(the rollback test is vacuous — the wrong kick must visibly change the crowd)\n");
+                device->WaitIdle(); return 1;
+            }
+
+            // === PROOF (2) the rollback corrects to authority BIT-EXACT. ===
+            std::vector<boids::Agent> corrected = boids::RunBoidsRollback(
+                cfg, path, flock0, authStream, mispredictStream, kDivergeTick, kTicks, kDt);
+            if (corrected.size() != authority.size() ||
+                std::memcmp(corrected.data(), authority.data(),
+                            corrected.size() * sizeof(boids::Agent)) != 0) {
+                std::fprintf(stderr, "FATAL: boids-lockstep rollback corrected != authority "
+                             "(the rollback failed to re-derive the authoritative crowd)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-lockstep rollback: corrected==authority BIT-EXACT\n");
+            std::printf("boids-lockstep mispredict: diverged before rollback (real divergence fixed)\n");
+
+            // === PROOF (4) two full runs BYTE-IDENTICAL (determinism). ===
+            std::vector<boids::Agent> run2 =
+                boids::RunBoidsLockstep(cfg, path, flock0, authStream, kTicks, kDt);
+            if (authority.size() != run2.size() ||
+                std::memcmp(authority.data(), run2.data(), authority.size() * sizeof(boids::Agent)) != 0) {
+                std::fprintf(stderr, "FATAL: boids-lockstep two runs differ (nondeterministic)\n");
+                device->WaitIdle(); return 1;
+            }
+            std::printf("boids-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+            // --- Golden: the converged crowd via the BD4 2D top-down view (corridor faint + agents streaming). ---
+            const int kWaypointCount = (int)path.waypoints.size();
+            int wMinX = kStartWp.x >> boids::kFrac, wMaxX = wMinX;
+            int wMinZ = kStartWp.z >> boids::kFrac, wMaxZ = wMinZ;
+            auto extend = [&](int wx, int wz) {
+                if (wx < wMinX) wMinX = wx; if (wx > wMaxX) wMaxX = wx;
+                if (wz < wMinZ) wMinZ = wz; if (wz > wMaxZ) wMaxZ = wz;
+            };
+            for (int w = 0; w < kWaypointCount; ++w)
+                extend(path.waypoints[(size_t)w].x >> boids::kFrac, path.waypoints[(size_t)w].z >> boids::kFrac);
+            for (int i = 0; i < kAgentCount; ++i)
+                extend(authority[(size_t)i].pos.x >> boids::kFrac, authority[(size_t)i].pos.z >> boids::kFrac);
+            const int kPxPerUnit = 12;
+            const int kMargin = 24;
+            const int kSlack = 4;
+            const int viewX0 = wMinX - kSlack, viewZ0 = wMinZ - kSlack;
+            const int kWorldW = (wMaxX - wMinX) + kSlack * 2 + 1;
+            const int kWorldH = (wMaxZ - wMinZ) + kSlack * 2 + 1;
+            const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+            const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+            std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+            for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+                bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+            }
+            auto worldToPx = [&](int worldX, int worldZ, int& ix, int& iy) {
+                ix = kMargin + (worldX - viewX0) * kPxPerUnit;
+                iy = kMargin + (worldZ - viewZ0) * kPxPerUnit;
+            };
+            auto plot = [&](int cx, int cy, uint8_t r, uint8_t g, uint8_t b, int half) {
+                for (int dy = -half; dy <= half; ++dy)
+                    for (int dx = -half; dx <= half; ++dx) {
+                        const int ix = cx + dx, iy = cy + dy;
+                        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                        dst[0] = b; dst[1] = g; dst[2] = r; dst[3] = 255;
+                    }
+            };
+            auto line = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t g, uint8_t b) {
+                int dx = x1 - x0, dy = y1 - y0;
+                int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+                int sx2 = dx < 0 ? -1 : 1, sy2 = dy < 0 ? -1 : 1;
+                int err = adx - ady, x = x0, y = y0;
+                for (int step = 0; step < 4096; ++step) {
+                    plot(x, y, r, g, b, 0);
+                    if (x == x1 && y == y1) break;
+                    int e2 = 2 * err;
+                    if (e2 > -ady) { err -= ady; x += sx2; }
+                    if (e2 <  adx) { err += adx; y += sy2; }
+                }
+            };
+            for (int w = 0; w + 1 < kWaypointCount; ++w) {
+                int ax, ay, bx, by;
+                worldToPx(path.waypoints[(size_t)w].x >> boids::kFrac,
+                          path.waypoints[(size_t)w].z >> boids::kFrac, ax, ay);
+                worldToPx(path.waypoints[(size_t)(w + 1)].x >> boids::kFrac,
+                          path.waypoints[(size_t)(w + 1)].z >> boids::kFrac, bx, by);
+                line(ax, ay, bx, by, 50, 60, 90);
+            }
+            { int sxp, syp; worldToPx(kStartWp.x >> boids::kFrac, kStartWp.z >> boids::kFrac, sxp, syp);
+              plot(sxp, syp, 40, 200, 40, 3); }
+            { int gxp, gyp; worldToPx(kGoalWp.x >> boids::kFrac, kGoalWp.z >> boids::kFrac, gxp, gyp);
+              plot(gxp, gyp, 220, 40, 40, 3); }
+            for (int i = 0; i < kAgentCount; ++i) {
+                const int wx = authority[(size_t)i].pos.x >> boids::kFrac;
+                const int wz = authority[(size_t)i].pos.z >> boids::kFrac;
+                int cx, cy; worldToPx(wx, wz, cx, cy);
+                const int tipX = (authority[(size_t)i].pos.x + authority[(size_t)i].vel.x) >> boids::kFrac;
+                const int tipZ = (authority[(size_t)i].pos.z + authority[(size_t)i].vel.z) >> boids::kFrac;
+                int tx, ty; worldToPx(tipX, tipZ, tx, ty);
+                line(cx, cy, tx, ty, 90, 110, 90);
+                Vec3 col = vg::hashColor((uint32_t)i);
+                plot(cx, cy, (uint8_t)(col.x * 255.0f + 0.5f), (uint8_t)(col.y * 255.0f + 0.5f),
+                     (uint8_t)(col.z * 255.0f + 0.5f), 1);
+            }
+            bool ok = WriteBMP(boidsLockstepShotPath, bgra, imgW, imgH);
+            if (ok) std::printf("wrote %s (%ux%u) — boids lockstep+rollback converged crowd (%d agents, %d ticks)\n",
+                                boidsLockstepShotPath, imgW, imgH, kAgentCount, kTicks);
+            else std::fprintf(stderr, "FATAL: could not write BMP to %s\n", boidsLockstepShotPath);
             device->WaitIdle();
             return ok ? 0 : 1;
         }
