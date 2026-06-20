@@ -848,5 +848,48 @@ inline std::vector<Agent> RunBoidsRollback(const FlockConfig& cfg, const BoidsPa
     return agents;
 }
 
+// ===== Slice BD6 — THE LIT 3D INSTANCED RENDER CAPSTONE (THE MONEY-SHOT, COMPLETES FLAGSHIP #18) ==========
+// BD1-BD5 built + proved a deterministic, path-following, lockstep-replayable crowd (the integer sim stays
+// bit-exact). BD6 RENDERS it: the bit-exact agent set -> a FLOAT instance set (one per-agent model matrix), the
+// ONE float crossing (render-only, OUT of the bit-exact sim path), drawn through the EXISTING lit_instanced
+// pipeline. The DIRECT TWIN of grain.h::GrainToRenderInstances over a boids::Agent instead of a GrainParticle:
+// a unit sphere TRANSLATED to the agent's float world position (FxToFloat(pos)) and SCALED by a uniform agent
+// radius (translate(pos/(float)kOne) * scale(radius) — NO rotation; the agent is a matte sphere, rotation-
+// invariant, the FL6/GR6 droplet/grain case, NOT a velocity-oriented lookAt — a heading rotation is render-only
+// scope OUT of this capstone to keep the helper a pure translate*scale provenance twin). A PURE FUNCTION of the
+// bit-exact agent state (two calls byte-equal — the provenance contract). Render-only, NO sim mutation, NO new
+// shader, NO new RHI. BD6 APPENDS ONLY this helper (BD1-BD5 byte-frozen). fpx::FxToFloat is the single Q16.16->
+// float crossing (the grain::GrainToFloat / fluid::FluidToFloat twin); math::Mat4 comes via fpx.h's math/math.h.
+
+using fpx::FxToFloat;   // read-only: the single Q16.16 -> float world-units conversion (the ONE render crossing)
+
+// ----- BoidsAgentTransform(a, radius): the render-only model matrix for ONE agent ------------------------
+// A unit sphere TRANSLATED to the agent's float world position (FxToFloat(pos.xyz)) and SCALED by the agent
+// radius (a float world-unit radius). translate(pos/(float)kOne) * scale(radius) — NO rotation (a matte agent
+// sphere is rotation-invariant). Pure deterministic host float (no RNG, no clock). The provenance: the transform
+// IS the bit-exact Agent::pos. The grain::GrainParticleTransform twin over a boids::Agent.
+inline math::Mat4 BoidsAgentTransform(const Agent& a, float radius) {
+    const math::Vec3 t{FxToFloat(a.pos.x), FxToFloat(a.pos.y), FxToFloat(a.pos.z)};
+    return math::Mat4::Translate(t) * math::Mat4::Scale(math::Vec3{radius, radius, radius});
+}
+
+// ----- BoidsToRenderInstances(agents, radius): one per-instance model matrix per agent --------------------
+// Build ONE per-instance model matrix per agent (the instanced lit-sphere render input — a sphere at each
+// agent's bit-exact world position, scaled by the agent radius). Output is a flat array of math::Mat4 (16
+// floats each), the scene::InstanceData / InstanceTransformLayout packing the EXISTING instanced lit pipeline
+// consumes (the caller copies each 16-float block into a scene::InstanceData — boids.h does NOT include
+// scene/vertex.h, mirroring grain.h::GrainToRenderInstances). Empty flock -> empty output (the empty no-op:
+// zero instances -> the cleared base scene). A PURE FUNCTION of the bit-exact agent state (deterministic, NO
+// sim mutation, NO RNG): BoidsToRenderInstances(a, r) == BoidsToRenderInstances(a, r) byte-for-byte (the
+// provenance contract). The grain::GrainToRenderInstances twin over a flock. (cfg is unused — the render scale
+// is a host render parameter, not a sim tuning; the signature takes a float radius like the grain twin.)
+inline std::vector<math::Mat4> BoidsToRenderInstances(const std::vector<Agent>& agents, float radius) {
+    std::vector<math::Mat4> out;
+    out.reserve(agents.size());
+    for (const Agent& a : agents)
+        out.push_back(BoidsAgentTransform(a, radius));
+    return out;
+}
+
 }  // namespace boids
 }  // namespace hf::sim

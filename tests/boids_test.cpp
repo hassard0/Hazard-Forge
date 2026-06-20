@@ -679,6 +679,50 @@ int main() {
         }
     }
 
+    // ===== Slice BD6: THE LIT 3D INSTANCED RENDER CAPSTONE — BoidsToRenderInstances (render-only float) =====
+    // BoidsToRenderInstances is the bit-exact agent set -> a FLOAT instance set (one model matrix per agent).
+    // PINS: (1) it produces N instances (one per agent); (2) each instance's translation == its agent's
+    // FxToFloat(pos); (3) it is a PURE FUNCTION (two calls byte-equal — the provenance contract); (4) the empty
+    // no-op (zero agents -> zero instances).
+    {
+        // a small deterministic flock at distinct Q16.16 world positions (a few world units apart).
+        std::vector<boids::Agent> agents = {
+            {boids::FxVec3{wu(1), wu(0), wu(2)}, boids::FxVec3{wu(1), 0, 0}},
+            {boids::FxVec3{wu(3), wu(0), wu(4)}, boids::FxVec3{0, 0, wu(1)}},
+            {boids::FxVec3{-wu(2), wu(1), wu(5)}, boids::FxVec3{0, 0, 0}},
+            {boids::FxVec3{wu(7), wu(0), -wu(3)}, boids::FxVec3{-wu(1), 0, wu(1)}},
+        };
+        const float kRenderRadius = 0.5f;
+        const std::vector<math::Mat4> mats = boids::BoidsToRenderInstances(agents, kRenderRadius);
+
+        // (1) one instance per agent.
+        check(mats.size() == agents.size(), "BoidsToRenderInstances: one instance per agent (M == N)");
+
+        // (2) each instance's translation == its agent's FxToFloat(pos) (column-major mat4: m[12..14]).
+        bool transOk = (mats.size() == agents.size());
+        for (size_t i = 0; i < mats.size() && transOk; ++i) {
+            const math::Mat4& m = mats[i];
+            const boids::Agent& a = agents[i];
+            transOk = (m.m[12] == boids::FxToFloat(a.pos.x)) &&
+                      (m.m[13] == boids::FxToFloat(a.pos.y)) &&
+                      (m.m[14] == boids::FxToFloat(a.pos.z));
+        }
+        check(transOk, "BoidsToRenderInstances: each instance translation == its agent FxToFloat(pos)");
+
+        // (3) PURE FUNCTION: two calls byte-equal (the provenance contract).
+        const std::vector<math::Mat4> mats2 = boids::BoidsToRenderInstances(agents, kRenderRadius);
+        check(mats.size() == mats2.size() &&
+              std::memcmp(mats.data(), mats2.data(), mats.size() * sizeof(math::Mat4)) == 0,
+              "BoidsToRenderInstances: pure function — two calls BYTE-EQUAL (provenance)");
+
+        // (4) the empty no-op: zero agents -> zero instances.
+        {
+            std::vector<boids::Agent> empty;
+            check(boids::BoidsToRenderInstances(empty, kRenderRadius).empty(),
+                  "BoidsToRenderInstances: empty flock -> empty output (no-op)");
+        }
+    }
+
     if (g_fail == 0) std::printf("boids_test: ALL PASS\n");
     else             std::printf("boids_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

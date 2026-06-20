@@ -18678,6 +18678,405 @@ static int RunBoidsLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BD6 — Deterministic GPU Crowds LIT 3D INSTANCED RENDER CAPSTONE showcase (--boids-render) (the
+// 6th + FINAL slice COMPLETING FLAGSHIP #18, the money-shot). Mirrors the Vulkan --boids-render-shot path
+// EXACTLY: builds the BD4 navmesh+corridor + a flock at the corridor START, runs K boids::StepFlockPath steps
+// to a streaming pose (the SAME bit-exact boids.h scene as the Vulkan shot -> byte-identical integer agent
+// state + transforms by construction), turns each agent's bit-exact integer pos into ONE float per-instance
+// model matrix (boids.h::BoidsToRenderInstances — the grain::GrainToRenderInstances twin), and renders the
+// matte lit 3D crowd as INSTANCED spheres (one per AGENT) through the EXISTING instanced lit pipeline
+// (lit_instanced.vert.gen.metal + lit.frag.gen.metal — the --grain-render / --couple-render wiring) over the
+// ground + sky + shadow + post. MATTE agents (roughness 1.0 + warm/cool albedo) to dodge sky-IBL iridescence
+// (the GF6/FR6/VH6 lesson). The FLOAT visresolve-bar: Metal-render==Metal-golden DIFF 0.0000 (determinism,
+// two-run) + provenance (every instance transform IS the bit-exact Agent::pos). New golden
+// tests/golden/metal/boids_render.png. NO new shader (hf_gen_msl UNCHANGED), NO new RHI.
+static int RunBoidsRenderShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace boids = hf::sim::boids;
+    namespace nav   = hf::nav;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === (1) Build the bit-exact integer navmesh + A* corridor HOST-side (the --nav-path 32x32 scene — the
+    // SAME build as the Vulkan --boids-render-shot, so the corridor is byte-identical). ===
+    const int kNavW = 32, kNavH = 32;
+    nav::Heightfield hfld;
+    hfld.w = kNavW; hfld.h = kNavH;
+    hfld.bminX = 0; hfld.bminY = 0; hfld.bminZ = 0;
+    hfld.bmaxX = kNavW; hfld.bmaxY = 64; hfld.bmaxZ = kNavH;
+    hfld.cs = 1; hfld.ch = 1;
+    const int kNavCols = hfld.columnCount();
+    nav::WalkableConfig navCfg; navCfg.walkableHeight = 2; navCfg.walkableClimb = 1;
+    const int32_t kMaxError = 0;
+    std::vector<nav::NavTri> navTris = nav::MakeShowcaseTriangles(hfld);
+    std::vector<uint32_t> rColCount, rColOffset;
+    std::vector<nav::Span> rSpans;
+    nav::RasterizeTriangleSpans(hfld, std::span<const nav::NavTri>(navTris), rColCount, rColOffset, rSpans);
+    std::vector<std::vector<nav::Span>> mergedPerCol((size_t)kNavCols);
+    for (int c = 0; c < kNavCols; ++c) {
+        std::vector<nav::Span> raw(rSpans.begin() + rColOffset[(size_t)c],
+                                  rSpans.begin() + rColOffset[(size_t)c] + rColCount[(size_t)c]);
+        mergedPerCol[(size_t)c] = nav::MergeColumnSpans(std::move(raw));
+    }
+    std::vector<uint32_t> navWalkable; std::vector<int32_t> navSurfaceY;
+    nav::FilterWalkableSpans(hfld, navCfg, mergedPerCol, navWalkable, navSurfaceY);
+    std::vector<uint32_t> navDist;
+    nav::BuildDistanceField(hfld, navCfg, navWalkable, navSurfaceY, navDist);
+    const uint32_t navMaxDist = nav::MaxDistOf(navDist);
+    std::vector<uint32_t> navRegion;
+    const uint32_t navRegionCount =
+        nav::BuildRegions(hfld, navCfg, navWalkable, navSurfaceY, navDist, navMaxDist, navRegion);
+    std::vector<nav::Contour> navContours;
+    nav::TraceContours(hfld, navRegion, navRegionCount, navContours);
+    for (auto& cc : navContours) {
+        std::vector<nav::ContourVertex> s; nav::SimplifyContour(cc.verts, kMaxError, s); cc.verts = s;
+    }
+    std::vector<nav::Poly> navPolys;
+    nav::BuildPolyMesh(navContours, navPolys);
+    std::vector<int32_t> navFlatVerts;
+    std::vector<uint32_t> navVOff((size_t)navRegionCount, 0u);
+    {
+        std::vector<int> contourOfRegion((size_t)navRegionCount + 1u, -1);
+        for (size_t ci = 0; ci < navContours.size(); ++ci)
+            contourOfRegion[(size_t)navContours[ci].region] = (int)ci;
+        uint32_t base = 0u;
+        for (uint32_t R = 1u; R <= navRegionCount; ++R) {
+            navVOff[(size_t)(R - 1u)] = base;
+            const int ci = contourOfRegion[(size_t)R];
+            if (ci < 0) continue;
+            const auto& vv = navContours[(size_t)ci].verts;
+            for (const auto& v : vv) { navFlatVerts.push_back(v.x); navFlatVerts.push_back(v.z); }
+            base += (uint32_t)vv.size();
+        }
+    }
+    const uint32_t kNavPolyCount = (uint32_t)navPolys.size();
+    std::vector<uint32_t> navPolyVertBase((size_t)kNavPolyCount, 0u);
+    for (uint32_t pi = 0; pi < kNavPolyCount; ++pi) {
+        const uint32_t R = navPolys[pi].region;
+        navPolyVertBase[pi] = (R >= 1u && R <= navRegionCount) ? navVOff[R - 1u] : 0u;
+    }
+    std::vector<int32_t> navCx, navCz;
+    nav::ComputePolyCentroids(navPolys, navFlatVerts, navPolyVertBase, navCx, navCz);
+    uint32_t navStart = 0u, navGoal = 0u;
+    nav::SelectStartGoal(navPolys, navCx, navCz, navStart, navGoal);
+    std::vector<uint32_t> corridor;
+    nav::FindPath(navPolys, navCx, navCz, navStart, navGoal, corridor);
+
+    // === (2) The corridor poly centroids -> a Q16.16 BoidsPath. ===
+    boids::BoidsPath path;
+    for (uint32_t pid : corridor) {
+        if (pid >= (uint32_t)navCx.size()) continue;
+        path.waypoints.push_back(boids::FxVec3{navCx[pid] << boids::kFrac, 0, navCz[pid] << boids::kFrac});
+    }
+    if (path.waypoints.size() < 2) return fail("boids-render: nav corridor too short");
+    const boids::FxVec3 kStartWp = path.waypoints.front();
+
+    // === (3) The flock config + the 16x16=256-agent flock at the corridor START (== the Vulkan shot). ===
+    const boids::fx kOne = boids::kOne;
+    auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+    const boids::fx kDt = kOne / 60;
+    const int kSteps = 300;
+    const int kGrid = 16;
+    const boids::fx kRadius = (boids::fx)(3 * (int)kOne);
+
+    boids::FlockConfig cfg;
+    cfg.seekGain         = 0;
+    cfg.sepGain          = frac(1, 8);
+    cfg.alignGain        = frac(1, 2);
+    cfg.cohGain          = frac(1, 2);
+    cfg.perceptionRadius = kRadius;
+    cfg.maxForce         = (boids::fx)(8 * (int)kOne);
+    cfg.maxSpeed         = (boids::fx)(6 * (int)kOne);
+    cfg.target           = boids::FxVec3{0, 0, 0};
+    cfg.gravity          = boids::FxVec3{0, 0, 0};
+    cfg.pathGain         = frac(1, 4);
+
+    const boids::fx sx = kStartWp.x - (boids::fx)((kGrid / 2) * (int)kOne);
+    const boids::fx sz = kStartWp.z - (boids::fx)((kGrid / 2) * (int)kOne);
+    std::vector<boids::Agent> flock0;
+    for (int gx = 0; gx < kGrid; ++gx)
+        for (int gz = 0; gz < kGrid; ++gz)
+            flock0.push_back(boids::Agent{
+                boids::FxVec3{sx + (boids::fx)(gx * (int)kOne), 0, sz + (boids::fx)(gz * (int)kOne)},
+                boids::FxVec3{0, 0, 0}});
+    const uint32_t kAgentCount = (uint32_t)flock0.size();
+
+    // Run the bit-exact BD4 path-following flock to a streaming pose (the integer sim output -> render input).
+    std::vector<boids::Agent> agents = flock0;
+    boids::StepFlockPathSteps(agents, cfg, path, kDt, kSteps);
+
+    const float kAgentRenderRadius = 1.0f;   // larger so the crowd reads clearly from the 3/4 view
+    const std::vector<Mat4> mats = boids::BoidsToRenderInstances(agents, kAgentRenderRadius);
+    std::vector<scene::InstanceData> instances;
+    instances.reserve(mats.size());
+    for (const Mat4& m : mats) {
+        scene::InstanceData inst;
+        for (int k = 0; k < 16; ++k) inst.model[k] = m.m[k];
+        instances.push_back(inst);
+    }
+    const uint32_t kInstanceCount = (uint32_t)instances.size();
+
+    // The flock centroid + half-extent (float) — the camera target + framing distance so the WHOLE crowd is
+    // framed wherever it streamed to (== the Vulkan --boids-render-shot framing).
+    Vec3 crowdCenter{0, 0, 0};
+    float crowdHalf = 8.0f;
+    if (kAgentCount > 0) {
+        double cx = 0, cy = 0, cz = 0;
+        for (const boids::Agent& a : agents) {
+            cx += boids::FxToFloat(a.pos.x); cy += boids::FxToFloat(a.pos.y); cz += boids::FxToFloat(a.pos.z);
+        }
+        crowdCenter = Vec3{(float)(cx / kAgentCount), (float)(cy / kAgentCount), (float)(cz / kAgentCount)};
+        float maxR = 0.0f;
+        for (const boids::Agent& a : agents) {
+            const float ax = boids::FxToFloat(a.pos.x) - crowdCenter.x;
+            const float az = boids::FxToFloat(a.pos.z) - crowdCenter.z;
+            const float r = std::sqrt(ax * ax + az * az);
+            if (r > maxR) maxR = r;
+        }
+        crowdHalf = maxR > 2.0f ? maxR : 2.0f;
+    }
+
+    // === Reuse the EXISTING instanced lit pipeline (the --grain-render / --couple-render wiring). ===
+    auto instVs = loadMSL("lit_instanced.vert.gen.metal", "instanced_vertex");
+    auto litFs  = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc instDesc;
+    instDesc.vertex = instVs.get(); instDesc.fragment = litFs.get();
+    instDesc.vertexLayout = scene::MeshVertexLayout();
+    instDesc.instanceLayout = scene::InstanceTransformLayout();
+    instDesc.colorFormat = device->Swapchain().ColorFormat();
+    instDesc.depthTest = true; instDesc.usesFrameUniforms = true;
+    instDesc.usesTexture = true; instDesc.pushConstantSize = sizeof(float) * 4;
+    auto instPipeline = device->CreateGraphicsPipeline(instDesc);
+
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto instShVs = loadMSL("shadow_instanced.vert.gen.metal", "instanced_shadow_vertex");
+    rhi::GraphicsPipelineDesc instShDesc;
+    instShDesc.vertex = instShVs.get(); instShDesc.fragment = nullptr;
+    instShDesc.vertexLayout = scene::MeshVertexLayout();
+    instShDesc.instanceLayout = scene::InstanceTransformLayout();
+    instShDesc.depthTest = true; instShDesc.depthOnly = true;
+    instShDesc.usesFrameUniforms = true; instShDesc.pushConstantSize = 0;
+    auto instShadowPipeline = device->CreateGraphicsPipeline(instShDesc);
+
+    auto shadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc shDesc;
+    shDesc.vertex = shadowVs.get(); shDesc.fragment = nullptr;
+    shDesc.vertexLayout = scene::MeshVertexLayout();
+    shDesc.depthTest = true; shDesc.depthOnly = true;
+    shDesc.usesFrameUniforms = true; shDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(shDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    std::vector<uint8_t> checker = MakeCheckerboard();
+    auto groundTex = device->CreateTexture(
+        {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+    scene::Mesh plane = scene::Mesh::Plane(*device);
+    scene::Mesh sphere = scene::Mesh::Sphere(*device);
+
+    std::unique_ptr<rhi::IBuffer> instanceBuffer;
+    if (kInstanceCount > 0) {
+        rhi::BufferDesc instBufDesc;
+        instBufDesc.size = (uint64_t)instances.size() * sizeof(scene::InstanceData);
+        instBufDesc.initialData = instances.data();
+        instBufDesc.usage = rhi::BufferUsage::Vertex;
+        instanceBuffer = device->CreateBuffer(instBufDesc);
+    }
+
+    // A warm-amber SOLID albedo for the matte agents (== the Vulkan --boids-render-shot agentTex).
+    const uint8_t agentPx[4] = {216, 140, 64, 255};
+    auto agentTex = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, agentPx, sizeof(agentPx)});
+    // A muted cool-grey SOLID ground (NOT the busy checker) so the warm crowd POPS (== the Vulkan shot).
+    const uint8_t groundPx[4] = {70, 78, 86, 255};
+    auto groundSolid = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, groundPx, sizeof(groundPx)});
+
+    const float kGroundScale = crowdHalf + 5.0f;
+    Mat4 groundModel = Mat4::Translate({crowdCenter.x, 0.0f, crowdCenter.z}) *
+                       Mat4::Scale({kGroundScale, 1.0f, kGroundScale});
+
+    // Fixed 3/4 camera aimed at the streamed crowd centroid, pulled back to the crowd half-extent so the WHOLE
+    // swarm is framed (== the Vulkan --boids-render-shot camera).
+    const float kCamDist = crowdHalf + 5.0f;
+    const Vec3 center{crowdCenter.x, 0.5f, crowdCenter.z};
+    const Vec3 eye{crowdCenter.x + kCamDist, kCamDist * 0.8f, crowdCenter.z + kCamDist};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 200.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.5f; fd.lightDir[1] = -1.0f; fd.lightDir[2] = -0.3f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{-0.5f, -1.0f, -0.3f});
+        Vec3 sc{crowdCenter.x, 1.0f, crowdCenter.z};
+        Vec3 lightEye = sc - lightDir * 26.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-20.0f, 20.0f, -20.0f, 20.0f, 1.0f, 60.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*staticShadowPipeline);
+            cmd.PushConstants(groundModel.m, sizeof(float) * 16);
+            cmd.BindVertexBuffer(plane.vertices());
+            cmd.BindIndexBuffer(plane.indices());
+            cmd.DrawIndexed(plane.indexCount());
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instShadowPipeline);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.BindPipeline(*litPipeline);
+            {
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = groundModel.m[k];
+                pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;   // matte muted ground
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*groundSolid, *flatNormal);
+                cmd.BindVertexBuffer(plane.vertices());
+                cmd.BindIndexBuffer(plane.indices());
+                cmd.DrawIndexed(plane.indexCount());
+            }
+            if (kInstanceCount > 0) {
+                cmd.BindPipeline(*instPipeline);
+                // MATTE agents: metallic 0 + roughness 1 -> NO sky-IBL mirror -> NO iridescence; the warm
+                // albedo is the bound agentTex.
+                float material[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+                cmd.PushConstants(material, sizeof(material));
+                cmd.BindMaterial(*agentTex, *flatNormal);
+                cmd.BindVertexBuffer(sphere.vertices());
+                cmd.BindInstanceBuffer(*instanceBuffer);
+                cmd.BindIndexBuffer(sphere.indices());
+                cmd.DrawIndexedInstanced(sphere.indexCount(), kInstanceCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    // PROOF (1) instances from bit-exact state (M == N).
+    if (kInstanceCount != kAgentCount) return fail("boids-render instance count != agent count");
+    std::printf("boids-render: {agents:%u, instances:%u} from bit-exact flock state\n",
+                kAgentCount, kInstanceCount);
+
+    // PROOF (2) determinism: render a SECOND frame, must be BYTE-IDENTICAL.
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("boids-render two renders DIFFER (nondeterministic)");
+    std::printf("boids-render determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) provenance: BoidsToRenderInstances is a PURE FUNCTION — call again, assert byte-equal.
+    {
+        const std::vector<Mat4> rebuild = boids::BoidsToRenderInstances(agents, kAgentRenderRadius);
+        if (rebuild.size() != mats.size() ||
+            std::memcmp(rebuild.data(), mats.data(), mats.size() * sizeof(Mat4)) != 0)
+            return fail("boids-render provenance: instances != rebuild (not pure)");
+    }
+    std::printf("boids-render provenance: instances == rebuild\n");
+
+    // coverage sanity (coherence guard): shaded>0 and non-uniform.
+    {
+        uint32_t shaded = 0;
+        for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+            if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+        if (shaded == 0) return fail("boids-render coverage 0 (nothing shaded)");
+        if (shaded == (uint32_t)(bgra.size() / 4)) return fail("boids-render uniform image (no coherent crowd)");
+    }
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — bit-exact path-following crowd lit 3D render (%u agents)\n",
+                outPath, cw, ch, kAgentCount);
+    return 0;
+}
+
 static int RunGrainIntegrateShowcase(const char* outPath) {
     using math::Vec3;
     namespace grain = hf::sim::grain;
@@ -44659,6 +45058,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--boids-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_boids_lockstep.png";
             try { return RunBoidsLockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --boids-render <out.png>: render the Deterministic GPU Crowds LIT 3D INSTANCED RENDER CAPSTONE (Slice
+        // BD6, the 6th + FINAL slice COMPLETING FLAGSHIP #18, the money-shot). Builds the SAME bit-exact boids.h
+        // scene as the Vulkan --boids-render-shot (the BD4 navmesh+corridor + a flock streamed K StepFlockPath
+        // steps), turns each agent's bit-exact integer pos into ONE float per-instance model matrix
+        // (BoidsToRenderInstances), and renders the matte lit 3D crowd through the EXISTING lit_instanced
+        // pipeline -> byte-identical state + transforms to the Vulkan path by construction. New golden
+        // tests/golden/metal/boids_render.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--boids-render") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_boids_render.png";
+            try { return RunBoidsRenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {
