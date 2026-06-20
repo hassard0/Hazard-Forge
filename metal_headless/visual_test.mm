@@ -27196,6 +27196,292 @@ static int RunFricPointsShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PS2 — Deterministic Persistent Contacts THE PERSISTENT MANIFOLD CACHE showcase (--persist-cache)
+// (the 2nd slice of FLAGSHIP #21). Like FC2's --fric-points, the manifold it caches is int64 (the SAT/clip +
+// the tangent basis), so shaders/persist_cache.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot)
+// and is NOT in this dir's hf_gen_msl list (UNLIKE PS1's persist_key.comp which IS MSL-native, the KEY alone is
+// pure int32); on Metal the --persist-cache showcase runs the CPU persist::BuildKeyedManifold + MatchCache — the
+// EXACT bit-exact reference the Vulkan --persist-cache-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the fric_points.comp convention), while the
+// Vulkan side carries the GPU==CPU proof. So this builds the SAME synthesized TWO-TICK match over the CX2/FC2
+// 12-box-pair scene (tick 1 seeds the cache via UpdateCache; tick 2 rebuilds + MatchCache so matched points
+// inherit, a changed pair cold-starts, a removed pair is evicted), and CPU-colors the SAME 2D top-down
+// inherited-impulse view -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-
+// pixel bar). Proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/persist_cache.png (baked
+// on the Mac by the controller); two runs DIFF 0.0000.
+static int RunPersistCacheShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fric = hf::sim::fric;
+    namespace fpx = hf::sim::fpx;
+    namespace persist = hf::sim::persist;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    auto qIdentity = []() { return fpx::FxQuat{0, 0, 0, convex::kOne}; };
+    auto qAboutX = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45}); };
+    auto qAboutZ = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45}); };
+    auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q) {
+        fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; return b;
+    };
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    std::vector<convex::SatPair> pairs;
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+    const convex::FxBox kBig{convex::FxVec3{fi(4), fi(4), fi(4)}};
+    auto addPair = [&](convex::SatPair p) { pairs.push_back(p); };
+    addPair({bodyAt(fi(-7), 0, fi(6), qIdentity()), kUnit, bodyAt(fi(-2), 0, fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(5), 0, fi(6), qIdentity()), kBig, bodyAt(fi(6), 0, fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-7), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(-5), 0, fi(2), qIdentity()), kUnit});
+    addPair({bodyAt(0, 0, fi(2), qAboutX()), kUnit, bodyAt(fi(1), fi(1), fi(3), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(4), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(8), fi(4), fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-7), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-11, 2), 0, fi(-2), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-2), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-1, 1), 0, fi(-2), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(3), 0, fi(-2), qAboutZ()), kUnit, bodyAt(fi(8), 0, fi(-2), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-6), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(-11, 2), 0, fi(-6), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(-1), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(1, 4), fh(5, 4), fh(-19, 4), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(4), 0, fi(-6), qIdentity()), kUnit, bodyAt(fi(7), 0, fi(-6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(8), 0, fi(0), qIdentity()), kBig, bodyAt(fi(8), 0, fh(3, 2), qIdentity()), kUnit});
+
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // The SAME deterministic synthesized per-contact impulse seed as the Vulkan --persist-cache-shot.
+    auto synthImpulses = [&](const persist::ContactKey& k, fx& jn, fx& jt1, fx& jt2) {
+        const uint32_t h = persist::ContactKeyHash(k);
+        jn  = (fx)((int32_t)((h % 4096u) + 256u));
+        jt1 = (fx)((int32_t)(h % 2048u) - 1024);
+        jt2 = (fx)((int32_t)((h >> 8) % 2048u) - 1024);
+    };
+
+    const uint32_t kChangedPair = kPairCount - 1u;
+    const uint32_t kRemovedPair = 2u;
+
+    // ===== TICK 1: build the keyed manifolds + seed the cache =====
+    persist::PersistentCache cache;
+    uint32_t tick1Contacts = 0;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        persist::KeyedFrictionManifold keyed = persist::BuildKeyedManifold(
+            2u * p, 2u * p + 1u, pairs[p].bodyA, pairs[p].boxA, pairs[p].bodyB, pairs[p].boxB);
+        for (uint32_t i = 0; i < keyed.fm.count; ++i) {
+            fx jn, jt1, jt2;
+            synthImpulses(keyed.keys[i], jn, jt1, jt2);
+            cache.entries.push_back(persist::CachedContact{keyed.keys[i], jn, jt1, jt2});
+        }
+        tick1Contacts += keyed.fm.count;
+    }
+
+    // ===== TICK 2: the changed + removed pairs =====
+    std::vector<convex::SatPair> pairs2 = pairs;
+    pairs2[kChangedPair].bodyB.pos.x += fh(7, 4);
+    pairs2[kRemovedPair].bodyB.pos.x += fi(20);
+
+    // Packed KeyedManifoldGpu (== the Vulkan --persist-cache-shot KeyedManifoldGpu): count + 4 FricPoint + 4 key.
+    struct ContactKeyGpu { uint32_t bodyA, bodyB, axisIndex, featureIndex; };
+    static_assert(sizeof(ContactKeyGpu) == 16, "ContactKeyGpu std430 layout");
+    struct FricPointGpu {
+        int32_t px, py, pz, nx, ny, nz, t1x, t1y, t1z, t2x, t2y, t2z, ni, ti1, ti2;
+    };
+    static_assert(sizeof(FricPointGpu) == 60, "FricPointGpu std430 layout");
+    struct KeyedManifoldGpu { uint32_t count; FricPointGpu pts[4]; ContactKeyGpu keys[4]; };
+    static_assert(sizeof(KeyedManifoldGpu) == 308, "KeyedManifoldGpu std430 layout");
+    auto packKeyed = [&](const persist::KeyedFrictionManifold& m) {
+        KeyedManifoldGpu g{};
+        g.count = m.fm.count;
+        for (int k = 0; k < 4; ++k) {
+            const fric::FrictionPoint& fp = m.fm.pts[k];
+            g.pts[k] = FricPointGpu{fp.point.x, fp.point.y, fp.point.z, fp.normal.x, fp.normal.y, fp.normal.z,
+                                    fp.t1.x, fp.t1.y, fp.t1.z, fp.t2.x, fp.t2.y, fp.t2.z,
+                                    fp.normalImpulse, fp.tangentImpulse1, fp.tangentImpulse2};
+            g.keys[k] = ContactKeyGpu{m.keys[k].bodyA, m.keys[k].bodyB, m.keys[k].axisIndex,
+                                      m.keys[k].featureIndex};
+        }
+        return g;
+    };
+
+    auto run = [&](std::vector<KeyedManifoldGpu>& out, std::vector<persist::KeyedFrictionManifold>& outKeyed,
+                   uint32_t& contacts, uint32_t& matched, uint32_t& coldStart) {
+        out.assign((size_t)kPairCount, KeyedManifoldGpu{});
+        outKeyed.assign((size_t)kPairCount, persist::KeyedFrictionManifold{});
+        contacts = 0; matched = 0; coldStart = 0;
+        for (uint32_t p = 0; p < kPairCount; ++p) {
+            persist::KeyedFrictionManifold keyed = persist::BuildKeyedManifold(
+                2u * p, 2u * p + 1u, pairs2[p].bodyA, pairs2[p].boxA, pairs2[p].bodyB, pairs2[p].boxB);
+            const persist::CacheMeasure cm = persist::MeasureCache(cache, keyed);
+            persist::MatchCache(cache, keyed);
+            outKeyed[p] = keyed;
+            out[p] = packKeyed(keyed);
+            contacts += keyed.fm.count; matched += cm.matched; coldStart += cm.coldStart;
+        }
+    };
+
+    std::vector<KeyedManifoldGpu> results;
+    std::vector<persist::KeyedFrictionManifold> resultsKeyed;
+    uint32_t tick2Contacts = 0, matched = 0, coldStart = 0;
+    run(results, resultsKeyed, tick2Contacts, matched, coldStart);
+
+    std::printf("persist-cache: {pairs:%u, contacts:%u, matched:%u, coldStart:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU persist::BuildKeyedManifold+MatchCache, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kPairCount, tick2Contacts, matched, coldStart);
+
+    std::vector<KeyedManifoldGpu> results2;
+    std::vector<persist::KeyedFrictionManifold> resultsKeyed2;
+    uint32_t c2 = 0, m2 = 0, cs2 = 0;
+    run(results2, resultsKeyed2, c2, m2, cs2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(KeyedManifoldGpu)) != 0)
+        return fail("persist-cache: two runs differ (nondeterministic)");
+    std::printf("persist-cache determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) cache correct: inheritedExact / freshColdStart / staleEvicted.
+    bool inheritedExact = true, freshColdStart = true, staleEvicted = true;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        const persist::KeyedFrictionManifold& keyed = resultsKeyed[p];
+        for (uint32_t i = 0; i < keyed.fm.count; ++i) {
+            fx cn = 0, ct1 = 0, ct2 = 0; bool inCache = false;
+            for (const persist::CachedContact& c : cache.entries)
+                if (persist::ContactKeysEqual(c.key, keyed.keys[i])) {
+                    cn = c.normalImpulse; ct1 = c.tangentImpulse1; ct2 = c.tangentImpulse2;
+                    inCache = true; break;
+                }
+            if (inCache) {
+                if (keyed.fm.pts[i].normalImpulse != cn || keyed.fm.pts[i].tangentImpulse1 != ct1 ||
+                    keyed.fm.pts[i].tangentImpulse2 != ct2) inheritedExact = false;
+            } else {
+                if (keyed.fm.pts[i].normalImpulse != 0 || keyed.fm.pts[i].tangentImpulse1 != 0 ||
+                    keyed.fm.pts[i].tangentImpulse2 != 0) freshColdStart = false;
+            }
+        }
+    }
+    persist::PersistentCache tick2Cache;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        const persist::KeyedFrictionManifold& keyed = resultsKeyed[p];
+        for (uint32_t i = 0; i < keyed.fm.count; ++i)
+            tick2Cache.entries.push_back(persist::CachedContact{keyed.keys[i],
+                keyed.fm.pts[i].normalImpulse, keyed.fm.pts[i].tangentImpulse1,
+                keyed.fm.pts[i].tangentImpulse2});
+    }
+    if (tick2Cache.entries.size() != tick2Contacts) staleEvicted = false;
+    for (const persist::CachedContact& c : tick2Cache.entries)
+        if (c.key.bodyA == 2u * kRemovedPair && c.key.bodyB == 2u * kRemovedPair + 1u) staleEvicted = false;
+    if (!inheritedExact || !freshColdStart || !staleEvicted) return fail("persist-cache: correctness failed");
+    std::printf("persist-cache correct: {inheritedExact:true, freshColdStart:true, staleEvicted:true}\n");
+
+    // PROOF (4) round-trip.
+    bool roundTrip = true;
+    {
+        persist::KeyedFrictionManifold rt = persist::BuildKeyedManifold(
+            0u, 1u, pairs[0].bodyA, pairs[0].boxA, pairs[0].bodyB, pairs[0].boxB);
+        for (uint32_t i = 0; i < rt.fm.count; ++i) {
+            rt.fm.pts[i].normalImpulse = (fx)((int)i * 100 + 7);
+            rt.fm.pts[i].tangentImpulse1 = (fx)((int)i * 50 - 3);
+            rt.fm.pts[i].tangentImpulse2 = (fx)((int)i * 25 + 1);
+        }
+        persist::PersistentCache rtCache;
+        persist::UpdateCache(rtCache, rt);
+        persist::KeyedFrictionManifold rt2 = persist::BuildKeyedManifold(
+            0u, 1u, pairs[0].bodyA, pairs[0].boxA, pairs[0].bodyB, pairs[0].boxB);
+        persist::MatchCache(rtCache, rt2);
+        for (uint32_t i = 0; i < rt2.fm.count; ++i)
+            if (rt2.fm.pts[i].normalImpulse != rt.fm.pts[i].normalImpulse ||
+                rt2.fm.pts[i].tangentImpulse1 != rt.fm.pts[i].tangentImpulse1 ||
+                rt2.fm.pts[i].tangentImpulse2 != rt.fm.pts[i].tangentImpulse2) roundTrip = false;
+    }
+    if (!roundTrip) return fail("persist-cache roundtrip: storeThenMatch != stored");
+    std::printf("persist-cache roundtrip: {storeThenMatch==stored:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) inherited-impulse view as the Vulkan --persist-cache-shot.
+    const int kPxPerUnit = 18, kMargin = 24;
+    const int kWorldHalf = 12;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalf) * kPxPerUnit;
+        iy = kMargin + (gz + kWorldHalf) * kPxPerUnit;
+    };
+    auto worldToPxF = [&](fx wx, fx wz, int& ix, int& iy) {
+        ix = kMargin + (int)(((int64_t)(wx + (kWorldHalf << convex::kFrac)) * kPxPerUnit) >> convex::kFrac);
+        iy = kMargin + (int)(((int64_t)(wz + (kWorldHalf << convex::kFrac)) * kPxPerUnit) >> convex::kFrac);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawBox = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 az = axes[2];
+        const fx hx = box.halfExtents.x, hz = box.halfExtents.z;
+        fx cxs[4], czs[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sz[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sz[k] * fpx::fxmul(hz, az.x);
+            czs[k] = b.pos.z + sx[k] * fpx::fxmul(hx, ax.z) + sz[k] * fpx::fxmul(hz, az.z);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], czs[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], czs[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    const Vec3 greyWarm{0.42f, 0.34f, 0.26f}, greyCold{0.24f, 0.26f, 0.30f};
+    int32_t maxJn = 1;
+    for (uint32_t p = 0; p < kPairCount; ++p)
+        for (uint32_t i = 0; i < results[p].count; ++i)
+            if (results[p].pts[i].ni > maxJn) maxJn = results[p].pts[i].ni;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        if (results[p].count == 0u) continue;
+        const bool warm = results[p].pts[0].ni > 0;
+        drawBox(pairs2[p].bodyA, pairs2[p].boxA, warm ? greyWarm : greyCold);
+        drawBox(pairs2[p].bodyB, pairs2[p].boxB, warm ? greyWarm : greyCold);
+        for (uint32_t i = 0; i < results[p].count; ++i) {
+            const FricPointGpu& fp = results[p].pts[i];
+            int cx, cy;
+            worldToPxF(fp.px, fp.pz, cx, cy);
+            Vec3 col;
+            if (fp.ni > 0) {
+                const float t = (float)fp.ni / (float)maxJn;
+                col = Vec3{0.45f + 0.55f * t, 0.30f + 0.45f * t, 0.10f + 0.10f * t};
+            } else {
+                col = Vec3{0.12f, 0.12f, 0.14f};
+            }
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx)
+                    putPx(cx + dx, cy + dy, col);
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — persistent-cache inherited-impulse view (%u pairs, tick1:%u tick2:%u "
+                "contacts, %u matched)\n", outPath, imgW, imgH, kPairCount, tick1Contacts, tick2Contacts, matched);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -47595,6 +47881,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--persist-key") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_persist_key.png";
             try { return RunPersistKeyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --persist-cache <out.png>: render the Deterministic Persistent Contacts THE PERSISTENT MANIFOLD CACHE
+        // showcase (Slice PS2, the 2nd slice of FLAGSHIP #21). On Metal this runs the CPU cache: the manifold it
+        // caches is int64 (BoxSatStable/BuildManifold + the tangent basis), so shaders/persist_cache.comp is
+        // VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl — UNLIKE PS1's persist_key.comp which IS, the KEY alone is pure
+        // int32); Metal runs the CPU persist::BuildKeyedManifold + MatchCache over the SAME synthesized two-tick
+        // box-pair scene -> the EXACT bit-exact reference the Vulkan --persist-cache-shot GPU==CPU memcmp compares
+        // against; two runs byte-identical; matched points inherit their tick-1 impulse, the changed pair cold-
+        // starts, the removed pair is evicted. The image golden is a PURE-INTEGER 2D top-down inherited-impulse
+        // view, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/persist_cache.png.
+        if (argc > 1 && std::strcmp(argv[1], "--persist-cache") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_persist_cache.png";
+            try { return RunPersistCacheShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-break <out.png>: render the Deterministic Rigid-Body Fracture BONDED-CLUSTER BREAK

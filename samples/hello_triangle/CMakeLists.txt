@@ -1209,6 +1209,20 @@ hf_compile_shaders(
     # MakeContactKey/ContactKeyHash. Pure integer SSBO compute + ReadBuffer. NO new RHI; existing shaders +
     # goldens untouched. persist.h is a NEW additive sibling (#includes sim/fric.h read-only).
     "shaders/persist_key.comp.hlsl:cs"
+    # Deterministic Persistent Contacts Slice 2 (Slice PS2): persist_cache.comp is THE PERSISTENT MANIFOLD
+    # CACHE pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) RECOMPUTES the
+    # keyed friction manifold (BoxSatStable -> BuildManifold -> the FC1 tangent basis + the PS1 ContactKey per
+    # point, copying engine/sim/convex.h + engine/sim/fric.h::BuildFrictionPoints + engine/sim/persist.h::
+    # MakeContactKey VERBATIM) then MATCHES the persistent cache (a small SSBO scanned in FIXED order, copying
+    # persist.h::MatchCache VERBATIM) so a matched point INHERITS its prior normal+tangent impulses, writing its
+    # OWN gManifolds[pair] KeyedManifoldGpu (count + 4 FricPoint + 4 ContactKey). cacheEnabled=0 -> cleared.
+    # UNLIKE PS1's persist_key.comp (the KEY alone is pure int32 -> MSL-native) the MANIFOLD this caches is int64
+    # (the clip fxdiv + the FxDot/FxCross/FxNormalize Q16.16 products), so this shader is VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --persist-cache showcase runs the CPU
+    # persist::BuildKeyedManifold + MatchCache instead (byte-identical by construction, the fric_points.comp
+    # convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU inherited-impulse KeyedManifold
+    # array + cross-backend, proven memcmp. NO new RHI; PS1 + existing shaders + goldens untouched.
+    "shaders/persist_cache.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table
