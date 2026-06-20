@@ -19,6 +19,7 @@
 // Pure C++ (hf_core), ASan-eligible like the other sim-math tests.
 #include "sim/boids.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -182,6 +183,96 @@ int main() {
               std::memcmp(a1.data(), a2.data(), a1.size() * sizeof(boids::Agent)) == 0,
               "StepBoids: two runs BYTE-IDENTICAL");
         static_assert(sizeof(boids::Agent) == 24, "Agent std430 layout (6 x int32, 24 bytes)");
+    }
+
+    // ===== Slice BD2: the GRID-HASH NEIGHBOR LIST (engine/sim/boids.h, the GR2 grain engine cloned) =====
+    // What this PINS (the contracts boids_cell_*/boids_neighbor_*.comp + the GPU==CPU memcmp build on):
+    //   * BuildBoidsCellTable partitions EVERY agent into a cell exactly once (cellAgents.size()==N, cellStart
+    //     monotone non-decreasing, last == N — a complete CSR partition).
+    //   * BuildBoidsNeighborList: every emitted neighbor is within the radius box AND i != j; the grid result
+    //     MATCHES a brute-force O(N²) box reference exactly (no misses, no extras) — the grid found ALL true
+    //     neighbors and ONLY them.
+    //   * Two runs byte-identical (deterministic).
+    {
+        const boids::fx radius = wu(2);   // perception radius == the cell size
+
+        // A 5x1x5 agent grid at 1-unit spacing (so the radius-2 box neighborhood is non-trivial).
+        std::vector<boids::Agent> agents;
+        for (int gx = 0; gx < 5; ++gx)
+            for (int gz = 0; gz < 5; ++gz)
+                agents.push_back(at(gx, 0, gz));
+        const uint32_t N = (uint32_t)agents.size();
+
+        const boids::BoidsGrid grid = boids::MakeBoidsGrid(agents, radius);
+        const boids::BoidsCellTable table = boids::BuildBoidsCellTable(agents, grid);
+
+        // (1) partition complete: cellAgents has exactly N entries; cellStart monotone; last == N.
+        check(table.cellAgents.size() == N, "BuildBoidsCellTable: cellAgents.size() == N (every agent bucketed)");
+        check(table.cellStart.size() == (size_t)boids::BoidsCellCount(grid) + 1u,
+              "BuildBoidsCellTable: cellStart has cellCount+1 entries");
+        bool monotone = true;
+        for (size_t c = 1; c < table.cellStart.size(); ++c)
+            if (table.cellStart[c] < table.cellStart[c - 1]) monotone = false;
+        check(monotone, "BuildBoidsCellTable: cellStart monotone non-decreasing");
+        check(table.cellStart.back() == N, "BuildBoidsCellTable: cellStart last == N (the total)");
+        // every agent index appears exactly once across cellAgents.
+        {
+            std::vector<int> seen((size_t)N, 0);
+            for (uint32_t v : table.cellAgents) if (v < N) ++seen[(size_t)v];
+            bool eachOnce = true;
+            for (uint32_t i = 0; i < N; ++i) if (seen[(size_t)i] != 1) eachOnce = false;
+            check(eachOnce, "BuildBoidsCellTable: each agent index appears exactly once");
+        }
+
+        // (2) neighbor list: every emitted neighbor within radius + matches the brute-force reference.
+        const boids::BoidsNeighborList list = boids::BuildBoidsNeighborList(agents, grid, table, radius);
+        check(list.neighborStart.size() == (size_t)N + 1u, "BuildBoidsNeighborList: neighborStart N+1 entries");
+        check(list.neighborStart.back() == (uint32_t)list.neighbors.size(),
+              "BuildBoidsNeighborList: neighborStart last == neighbors.size()");
+        bool withinRadius = true;
+        for (uint32_t i = 0; i < N && withinRadius; ++i)
+            for (uint32_t s = list.neighborStart[i]; s < list.neighborStart[i + 1u]; ++s) {
+                uint32_t j = list.neighbors[s];
+                if (j == i) withinRadius = false;
+                if (!boids::BoidsNeighborAccept(agents[i].pos, agents[j].pos, radius)) withinRadius = false;
+            }
+        check(withinRadius, "BuildBoidsNeighborList: every emitted neighbor within radius (and i!=j)");
+
+        // brute-force O(N²) box reference: the grid result must match it set-for-set (no misses/extras).
+        bool matchesBrute = true;
+        for (uint32_t i = 0; i < N && matchesBrute; ++i) {
+            // reference: the SORTED set of j!=i with BoidsNeighborAccept.
+            std::vector<uint32_t> ref;
+            for (uint32_t j = 0; j < N; ++j) {
+                if (j == i) continue;
+                if (boids::BoidsNeighborAccept(agents[i].pos, agents[j].pos, radius)) ref.push_back(j);
+            }
+            // the grid list for i, sorted (the emit order is stencil-then-ascending-j, so it may differ; the
+            // SET must match — sort both then compare).
+            std::vector<uint32_t> got(list.neighbors.begin() + list.neighborStart[i],
+                                      list.neighbors.begin() + list.neighborStart[i + 1u]);
+            std::sort(got.begin(), got.end());
+            if (got.size() != ref.size() || std::memcmp(got.data(), ref.data(), ref.size() * sizeof(uint32_t)))
+                matchesBrute = false;
+        }
+        check(matchesBrute, "BuildBoidsNeighborList: matches the brute-force O(N²) reference (no misses/extras)");
+
+        // (3) two runs byte-identical (deterministic).
+        const boids::BoidsCellTable t2 = boids::BuildBoidsCellTable(agents, grid);
+        const boids::BoidsNeighborList l2 = boids::BuildBoidsNeighborList(agents, grid, t2, radius);
+        check(t2.cellStart == table.cellStart && t2.cellAgents == table.cellAgents &&
+              l2.neighborStart == list.neighborStart && l2.neighbors == list.neighbors,
+              "BuildBoids{CellTable,NeighborList}: two runs BYTE-IDENTICAL");
+
+        // (4) a single isolated agent -> ZERO neighbors (the sparse no-op).
+        {
+            std::vector<boids::Agent> one = {at(3, 5, 0)};
+            boids::BoidsGrid g1 = boids::MakeBoidsGrid(one, radius);
+            boids::BoidsCellTable c1 = boids::BuildBoidsCellTable(one, g1);
+            boids::BoidsNeighborList n1 = boids::BuildBoidsNeighborList(one, g1, c1, radius);
+            check(n1.neighbors.empty() && n1.neighborStart[1] == 0u,
+                  "BuildBoidsNeighborList: single agent -> 0 neighbors");
+        }
     }
 
     if (g_fail == 0) std::printf("boids_test: ALL PASS\n");

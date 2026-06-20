@@ -22831,6 +22831,305 @@ static int RunCGrainLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BD2 — Deterministic GPU Crowds GRID-HASH NEIGHBOR LIST showcase (--boids-neighbors) =========
+// UNLIKE BD1's --boids-steer (int64 boids_steer.comp -> CPU on Metal), the neighbor search is PURE INT32
+// (BoidsCellOf = FloorDiv per axis + the per-axis |dx|<radius BoidsNeighborAccept = integer divide +
+// abs-compare, NO int64/fxmul/sqrt), so the boids_cell_{count,scan,emit} + boids_neighbor_{count,scan,emit}
+// shaders MSL-gen natively and Metal DISPATCHES THE GPU passes directly: the SAME settled 256-agent flock
+// feeds the SAME six passes -> ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs the CPU
+// boids.h::BuildBoidsCellTable + BuildBoidsNeighborList reference (memcmp — the same proofs the Vulkan
+// --boids-neighbors-shot runs); two runs byte-identical. The image golden is the integer per-agent
+// neighbor-count heat viz, identical to the Vulkan path BY CONSTRUCTION. New golden
+// tests/golden/metal/boids_neighbors.png; two runs DIFF 0.0000. radius = 2.0 (the perception radius == the
+// cell size). NO new RHI. A TRUE GPU pass on BOTH backends — the strongest cross-vendor proof (unlike BD1).
+static int RunBoidsNeighborsShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace boids = hf::sim::boids;
+
+    // The flock recipe (== the Vulkan --boids-neighbors-shot config). All host-snapped Q16.16.
+    const boids::fx kOne = boids::kOne;
+    auto wu = [&](int u) { return (boids::fx)(u * (int)kOne); };
+    auto frac = [&](int n, int d) { return (boids::fx)((int64_t)n * (int64_t)kOne / d); };
+    const boids::fx kDt = kOne / 60;
+    const int kGrid = 16;                          // 16x16 = 256 agents
+    const boids::fx kRadius = wu(2);               // perception radius == the grid cell size
+
+    boids::BoidsConfig cfg;
+    cfg.seekGain  = frac(1, 4);
+    cfg.sepGain   = frac(1, 2);
+    cfg.sepRadius = kRadius;
+    cfg.maxForce  = wu(8);
+    cfg.maxSpeed  = wu(6);
+    cfg.target    = boids::FxVec3{wu(40), 0, 0};
+    cfg.gravity   = boids::FxVec3{0, 0, 0};
+
+    // STRICTLY POSITIVE origin (+4 units in x and z — the grain dropped-block precedent) so FloorDiv never
+    // sees a negative numerator (the grid cell math stays in the positive-coordinate regime).
+    const boids::fx kOrigin = wu(4);
+    std::vector<boids::Agent> agents;
+    for (int gx = 0; gx < kGrid; ++gx)
+        for (int gz = 0; gz < kGrid; ++gz)
+            agents.push_back(boids::Agent{boids::FxVec3{kOrigin + wu(gx), 0, kOrigin + wu(gz)},
+                                          boids::FxVec3{0, 0, 0}});
+    boids::StepBoidsSteps(agents, cfg, kDt, 30);
+    const int kAgentCount = (int)agents.size();
+
+    // The CPU reference grid + cell table + neighbor list (the GPU memcmp's against this).
+    const boids::BoidsGrid grid = boids::MakeBoidsGrid(agents, kRadius);
+    const uint32_t kCellCount = boids::BoidsCellCount(grid);
+    const boids::BoidsCellTable cpuTable = boids::BuildBoidsCellTable(agents, grid);
+    const boids::BoidsNeighborList cpuList = boids::BuildBoidsNeighborList(agents, grid, cpuTable, kRadius);
+    const uint32_t kTotalNeighbors = (uint32_t)cpuList.neighbors.size();
+    const uint32_t kNeighAlloc = kTotalNeighbors > 0u ? kTotalNeighbors : 1u;
+
+    // Image dims (fixed integer top-down transform, == the Vulkan --boids-neighbors-shot).
+    const int kPxPerUnit = 22, kMargin = 24, kWorldW = kGrid + 10, kWorldH = kGrid + 10;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldW * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldH * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 Agent mirror (== the Vulkan --boids-neighbors-shot AgentGpu): 6 x int32 (24).
+    struct AgentGpu { int32_t px, py, pz, vx, vy, vz; };
+    static_assert(sizeof(AgentGpu) == 24, "AgentGpu std430 layout");
+    std::vector<AgentGpu> agentsInit((size_t)kAgentCount);
+    for (int i = 0; i < kAgentCount; ++i) {
+        const boids::Agent& p = agents[(size_t)i];
+        agentsInit[(size_t)i] = AgentGpu{p.pos.x, p.pos.y, p.pos.z, p.vel.x, p.vel.y, p.vel.z};
+    }
+    rhi::BufferDesc agentDesc;
+    agentDesc.size = agentsInit.size() * sizeof(AgentGpu);
+    agentDesc.initialData = agentsInit.data();
+    agentDesc.usage = rhi::BufferUsage::Storage;
+    auto agentsBuf = device->CreateBuffer(agentDesc);
+
+    struct BoidsGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(BoidsGridParams) == 48, "BoidsGridParams std430 layout");
+    auto makeGridParams = [&](int32_t enabled) {
+        BoidsGridParams p{};
+        p.grid[0] = kRadius; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y; p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+        p.dim[3] = kAgentCount;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    std::vector<uint32_t> cellCountInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellStartInit((size_t)kCellCount + 1u, 0u);
+    std::vector<uint32_t> cellCursorInit((size_t)kCellCount, 0u);
+    std::vector<uint32_t> cellAgentInit((size_t)kAgentCount, 0u);
+    std::vector<uint32_t> perAgentInit((size_t)kAgentCount, 0u);
+    std::vector<uint32_t> nbrStartInit((size_t)kAgentCount + 1u, 0u);
+    std::vector<uint32_t> nbrInit((size_t)kNeighAlloc, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    auto cellCountPipe = mkPipe("boids_cell_count.comp.gen.metal", "boids_cell_count_main", 3, 64);
+    auto cellScanPipe  = mkPipe("boids_cell_scan.comp.gen.metal", "boids_cell_scan_main", 3, 1);
+    auto cellEmitPipe  = mkPipe("boids_cell_emit.comp.gen.metal", "boids_cell_emit_main", 5, 1);
+    auto nbrCountPipe  = mkPipe("boids_neighbor_count.comp.gen.metal", "boids_neighbor_count_main", 5, 64);
+    auto nbrScanPipe   = mkPipe("boids_neighbor_scan.comp.gen.metal", "boids_neighbor_scan_main", 3, 1);
+    auto nbrEmitPipe   = mkPipe("boids_neighbor_emit.comp.gen.metal", "boids_neighbor_emit_main", 6, 64);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kAgentGroups = ((uint32_t)kAgentCount + 63u) / 64u;
+
+    auto runNeighbors = [&](int32_t enabled, std::vector<uint32_t>& outCellStart,
+                            std::vector<uint32_t>& outCellAgents, std::vector<uint32_t>& outNbrStart,
+                            std::vector<uint32_t>& outNbr, std::vector<uint32_t>& outPerAgent) {
+        auto cellCountBuf = makeUintBuf(cellCountInit);
+        auto cellStartBuf = makeUintBuf(cellStartInit);
+        auto cellCursorBuf = makeUintBuf(cellCursorInit);
+        auto cellAgentBuf = makeUintBuf(cellAgentInit);
+        auto perAgentBuf = makeUintBuf(perAgentInit);
+        auto nbrStartBuf = makeUintBuf(nbrStartInit);
+        auto nbrBuf = makeUintBuf(nbrInit);
+        BoidsGridParams params = makeGridParams(enabled);
+        rhi::BufferDesc pd; pd.size = sizeof(BoidsGridParams); pd.initialData = &params;
+        pd.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("boids_neighbors", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*cellCountPipe.second);
+                cmd.BindStorageBuffer(*agentsBuf, 0);
+                cmd.BindStorageBuffer(*cellCountBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(kAgentGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellScanPipe.second);
+                cmd.BindStorageBuffer(*cellCountBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*cellEmitPipe.second);
+                cmd.BindStorageBuffer(*agentsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellCursorBuf, 2);
+                cmd.BindStorageBuffer(*cellAgentBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*nbrCountPipe.second);
+                cmd.BindStorageBuffer(*agentsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellAgentBuf, 2);
+                cmd.BindStorageBuffer(*perAgentBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kAgentGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*nbrScanPipe.second);
+                cmd.BindStorageBuffer(*perAgentBuf, 0);
+                cmd.BindStorageBuffer(*nbrStartBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*nbrEmitPipe.second);
+                cmd.BindStorageBuffer(*agentsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellAgentBuf, 2);
+                cmd.BindStorageBuffer(*nbrStartBuf, 3);
+                cmd.BindStorageBuffer(*nbrBuf, 4);
+                cmd.BindStorageBuffer(*paramsBuf, 5);
+                cmd.DispatchCompute(kAgentGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outCellStart.assign((size_t)kCellCount + 1u, 0u);
+        device->ReadBuffer(*cellStartBuf, outCellStart.data(), outCellStart.size() * sizeof(uint32_t), 0);
+        outCellAgents.assign((size_t)kAgentCount, 0u);
+        device->ReadBuffer(*cellAgentBuf, outCellAgents.data(), outCellAgents.size() * sizeof(uint32_t), 0);
+        outNbrStart.assign((size_t)kAgentCount + 1u, 0u);
+        device->ReadBuffer(*nbrStartBuf, outNbrStart.data(), outNbrStart.size() * sizeof(uint32_t), 0);
+        outNbr.assign((size_t)kNeighAlloc, 0u);
+        device->ReadBuffer(*nbrBuf, outNbr.data(), outNbr.size() * sizeof(uint32_t), 0);
+        outPerAgent.assign((size_t)kAgentCount, 0u);
+        device->ReadBuffer(*perAgentBuf, outPerAgent.data(), outPerAgent.size() * sizeof(uint32_t), 0);
+    };
+
+    // GPU neighbors (enabled).
+    std::vector<uint32_t> gCellStart, gCellAgents, gNbrStart, gNbr, gPerAgent;
+    runNeighbors(1, gCellStart, gCellAgents, gNbrStart, gNbr, gPerAgent);
+
+    // PROOF (1) GPU==CPU cell table + neighbor list BIT-EXACT.
+    uint32_t maxPer = 0; for (uint32_t c : gPerAgent) if (c > maxPer) maxPer = c;
+    bool cellStartOk = (gCellStart.size() == cpuTable.cellStart.size()) &&
+        std::memcmp(gCellStart.data(), cpuTable.cellStart.data(),
+                    cpuTable.cellStart.size() * sizeof(uint32_t)) == 0;
+    bool cellAgentsOk = (gCellAgents.size() == cpuTable.cellAgents.size()) &&
+        std::memcmp(gCellAgents.data(), cpuTable.cellAgents.data(),
+                    cpuTable.cellAgents.size() * sizeof(uint32_t)) == 0;
+    bool nbrStartOk = (gNbrStart.size() == cpuList.neighborStart.size()) &&
+        std::memcmp(gNbrStart.data(), cpuList.neighborStart.data(),
+                    cpuList.neighborStart.size() * sizeof(uint32_t)) == 0;
+    bool nbrOk = (kTotalNeighbors == (uint32_t)cpuList.neighbors.size()) &&
+        std::memcmp(gNbr.data(), cpuList.neighbors.data(),
+                    (size_t)kTotalNeighbors * sizeof(uint32_t)) == 0;
+    if (!cellStartOk || !cellAgentsOk || !nbrStartOk || !nbrOk)
+        return fail("boids-neighbors: GPU != CPU BuildBoidsCellTable/BuildBoidsNeighborList");
+    std::printf("boids-neighbors: {agents:%d, cells:%u, neighbors:%u} GPU==CPU BIT-EXACT\n",
+                kAgentCount, kCellCount, kTotalNeighbors);
+
+    // PROOF (2) determinism.
+    {
+        std::vector<uint32_t> c2, ca2, ns2, n2, pa2;
+        runNeighbors(1, c2, ca2, ns2, n2, pa2);
+        if (c2 != gCellStart || ca2 != gCellAgents || ns2 != gNbrStart || n2 != gNbr || pa2 != gPerAgent)
+            return fail("boids-neighbors: two runs differ (nondeterministic)");
+        std::printf("boids-neighbors determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) every emitted neighbor within radius (and i!=j) AND matches a brute-force O(N²) reference.
+    {
+        bool withinRadius = true;
+        for (uint32_t i = 0; i < (uint32_t)kAgentCount && withinRadius; ++i)
+            for (uint32_t s = gNbrStart[i]; s < gNbrStart[i + 1u]; ++s) {
+                uint32_t j = gNbr[s];
+                if (j == i) withinRadius = false;
+                if (!boids::BoidsNeighborAccept(agents[i].pos, agents[j].pos, kRadius)) withinRadius = false;
+            }
+        bool matchesBruteForce = true;
+        for (uint32_t i = 0; i < (uint32_t)kAgentCount && matchesBruteForce; ++i) {
+            uint32_t ref = 0;
+            for (uint32_t j = 0; j < (uint32_t)kAgentCount; ++j) {
+                if (j == i) continue;
+                if (boids::BoidsNeighborAccept(agents[i].pos, agents[j].pos, kRadius)) ++ref;
+            }
+            if (ref != gPerAgent[i]) matchesBruteForce = false;
+        }
+        if (!withinRadius || !matchesBruteForce)
+            return fail("boids-neighbors: correctness failed (withinRadius / matchesBruteForce)");
+        std::printf("boids-neighbors correct: {withinRadius:true, matchesBruteForce:true}\n");
+    }
+
+    // PROOF (4) partition complete: the cell table buckets every agent exactly once.
+    {
+        bool monotone = true;
+        for (size_t c = 1; c < gCellStart.size(); ++c)
+            if (gCellStart[c] < gCellStart[c - 1]) monotone = false;
+        bool complete = monotone && (gCellStart.back() == (uint32_t)kAgentCount) &&
+                        (gCellAgents.size() == (size_t)kAgentCount);
+        if (!complete) return fail("boids-neighbors: partition incomplete");
+        std::printf("boids-neighbors partition: {complete:true}\n");
+    }
+
+    // --- Golden: the integer per-agent neighbor-count HEAT top-down view (IDENTICAL to the Vulkan
+    // --boids-neighbors-shot by construction; CPU-colored from the read-back integer perAgentCount). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto heat = [](float t) -> Vec3 {
+        if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+        float r = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 3.0f)));
+        float g = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 2.0f)));
+        float b = std::min(1.0f, std::max(0.0f, 1.5f - std::fabs(4.0f * t - 1.0f)));
+        return Vec3{r, g, b};
+    };
+    const float maxPerF = maxPer > 0 ? (float)maxPer : 1.0f;
+    for (int i = 0; i < kAgentCount; ++i) {
+        const int wx = agentsInit[(size_t)i].px >> boids::kFrac;
+        const int wz = agentsInit[(size_t)i].pz >> boids::kFrac;
+        int cx = kMargin + wx * kPxPerUnit;
+        int cy = (int)imgH - kMargin - wz * kPxPerUnit;
+        Vec3 col = heat((float)gPerAgent[(size_t)i] / maxPerF);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int ix = cx + dx, iy = cy + dy;
+                if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) continue;
+                uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+                dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+                dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+                dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+                dst[3] = 255;
+            }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — boids neighbor-count heat (%u neighbors, maxPer %u)\n",
+                outPath, imgW, imgH, kTotalNeighbors, maxPer);
+    return 0;
+}
+
 // ===== Slice GR2 — Deterministic GPU Granular/Sand GRID-HASH NEIGHBOR SEARCH showcase (--grain-neighbors) =
 // UNLIKE GR1's --grain-integrate (int64 grain_integrate.comp -> CPU on Metal), the neighbor search is PURE
 // INT32 (GrainCellOf = FloorDiv per axis + the per-axis |dx|<hSearch GrainNeighborAccept = integer divide +
@@ -43615,6 +43914,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--boids-steer") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_boids_steer.png";
             try { return RunBoidsSteerShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --boids-neighbors <out.png>: render the Deterministic GPU Crowds GRID-HASH NEIGHBOR LIST showcase
+        // (Slice BD2). UNLIKE --boids-steer (int64 integrator -> CPU on Metal), the neighbor search is PURE
+        // INT32 (BoidsCellOf = FloorDiv per axis + the per-axis |dx|<radius BoidsNeighborAccept, NO int64/sqrt),
+        // so the boids_cell_{count,scan,emit} + boids_neighbor_{count,scan,emit} shaders MSL-gen natively and
+        // Metal DISPATCHES THE GPU passes: the SAME settled 256-agent flock feeds the SAME six passes ->
+        // ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs the CPU
+        // boids.h::BuildBoidsCellTable + BuildBoidsNeighborList (memcmp — the same proofs the Vulkan
+        // --boids-neighbors-shot runs); two runs byte-identical. The image golden is the integer per-agent
+        // neighbor-count heat viz, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/boids_neighbors.png; two runs DIFF 0.0000. A TRUE GPU pass on BOTH backends.
+        if (argc > 1 && std::strcmp(argv[1], "--boids-neighbors") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_boids_neighbors.png";
+            try { return RunBoidsNeighborsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--grain-integrate") == 0) {

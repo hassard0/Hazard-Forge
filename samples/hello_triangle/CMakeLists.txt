@@ -513,6 +513,30 @@ hf_compile_shaders(
     # integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU agent array + cross-backend, proven memcmp. NO
     # new RHI; existing shaders + goldens untouched.
     "shaders/boids_steer.comp.hlsl:cs"
+    # Deterministic GPU Crowds Slice 2 (Slice BD2, the 2nd slice of FLAGSHIP #18): the GRID-HASH NEIGHBOR LIST
+    # meshed by SIX pure-INT32 count->scan->emit passes (the GR2 grain_cell/grain_neighbor twin, applied to
+    # agents). The CELL TABLE: boids_cell_count.comp (ONE thread per agent: InterlockedAdd into its cell's
+    # counter — the cell id is BoidsCellOf = FloorDiv per axis at cell-size radius, the bounded-dense-grid
+    # linearization, VERBATIM engine/sim/boids.h), boids_cell_scan.comp (SINGLE-THREAD [numthreads(1,1,1)]
+    # exclusive prefix-sum -> cellStart CSR + sentinel), boids_cell_emit.comp (SINGLE-THREAD ascending-agent
+    # scatter into cellAgents — single-thread because the within-cell order must be ascending agent index, NOT
+    # GPU-scheduling order). The NEIGHBOR LIST: boids_neighbor_count.comp (ONE thread per agent: count
+    # candidates in its 27-cell stencil passing the per-axis |dx|<radius reject — BoidsNeighborAccept VERBATIM),
+    # boids_neighbor_scan.comp (SINGLE-THREAD exclusive prefix-sum -> neighborStart), boids_neighbor_emit.comp
+    # (ONE thread per agent emits its candidates into its DISJOINT neighbors[] slice, NO atomics — the
+    # per-agent-disjoint pattern). ALL PURE INT32 (FloorDiv integer divide + per-axis abs-compare, NO
+    # int64/fxmul/sqrt — the box is the perception neighborhood, the int64 dist² compare AVOIDED to stay
+    # MSL-native), so UNLIKE BD1's boids_steer these MSL-GENERATE NATIVELY (they ARE in the Metal hf_gen_msl
+    # list) and Metal dispatches the GPU passes — a TRUE GPU pass on BOTH backends, the strongest cross-vendor
+    # proof. ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs the CPU
+    # boids.h::BuildBoidsCellTable + BuildBoidsNeighborList (memcmp). NO new RHI; BD1's boids_steer + goldens
+    # untouched.
+    "shaders/boids_cell_count.comp.hlsl:cs"
+    "shaders/boids_cell_scan.comp.hlsl:cs"
+    "shaders/boids_cell_emit.comp.hlsl:cs"
+    "shaders/boids_neighbor_count.comp.hlsl:cs"
+    "shaders/boids_neighbor_scan.comp.hlsl:cs"
+    "shaders/boids_neighbor_emit.comp.hlsl:cs"
     # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8: deterministic GPU cloth):
     # cloth_integrate.comp runs the Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per
     # particle runs `steps` iterations of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp)

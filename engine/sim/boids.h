@@ -195,5 +195,237 @@ inline BoidsStats MeasureBoids(const std::vector<Agent>& agents, const BoidsConf
     return s;
 }
 
+// ===== Slice BD2 — the GRID-HASH NEIGHBOR LIST (the SCALABLE neighbor engine; THE REUSE SPINE) ===========
+// Builds the per-agent NEIGHBOR LIST over the BD1 agent pool via a uniform spatial-hash grid, with the proven
+// count->scan->emit compaction (grain.h's GrainGrid/GrainCellTable/GrainNeighborList engine, byte-for-byte
+// CLONED for boids::Agent + Agent.pos). PURE INT32 -> the BD2 shaders MSL-generate NATIVELY (a true GPU pass
+// on BOTH backends, unlike BD1's int64 steer/integrate): the whole neighbor search is integer INDEX
+// arithmetic. Cell ids are FloorDiv per axis (the cell size is the perception radius); the cell bucketing is
+// count->scan->emit of agent indices; the candidate reject is a per-axis |pos_i.axis - pos_j.axis| < radius
+// compare (fx is int32 -> a PURE INT32 compare, NO squaring, NO products, NO int64, NO sqrt). The exact radial
+// cull is the box reject: a neighbor is accepted iff it lies within the radius-box on EVERY axis (the GR2/FL2
+// "box candidate" discipline — the box IS the accepted neighborhood; BD3's flock forces weight by it). NO
+// float, NO sqrt, NO int64 (the int64 dist² compare is AVOIDED — the box keeps the whole pass MSL-native, the
+// spec's strongest-proof escape hatch; glslc cannot parse int64 in HLSL, which is exactly why BD1's int64
+// boids_steer is Vulkan-only while BD2 stays int32 / in hf_gen_msl).
+//
+// THE PERCEPTION RADIUS `radius` (the cell size): the range within which two agents are flock NEIGHBORS (the
+// BD3 sep/align/cohesion radius; BD1's sepRadius). The grid cell-size == radius, so the 3x3x3 stencil around
+// an agent's cell covers every cell that can hold a box-neighbor (|dx| < radius => the neighbor is at most one
+// cell away per axis). The caller picks radius >= the agent spacing so the flock is a NON-DEGENERATE neighbor
+// graph (each interior agent sees its lateral neighbours -> a rich "dense cluster hot / sparse edge cold" heat
+// viz).
+//
+// REUSE: fpx::FloorDiv (the deterministic floor-division for negative coords, fpx.h:177), fpx::FxCell
+// (fpx.h:183), fpx::CellId (fpx.h:196). The whole engine is grain.h::MakeGrainGrid/BuildGrainCellTable/
+// GrainNeighborAccept/BuildGrainNeighborList with boids::Agent + radius for the cell-size + Agent.pos as
+// position. The shaders boids_cell_{count,scan,emit} + boids_neighbor_{count,scan,emit} copy this VERBATIM.
+
+using fpx::FloorDiv;     // read-only: the deterministic floor-division (correct for negative coords)
+using fpx::FxCell;       // read-only: the int3 cell coordinate
+using fpx::CellId;       // read-only: the flat cell linearization
+
+// ----- The bounded dense grid over the agent AABB (the grain.h::GrainGrid scheme verbatim) ----------------
+// CHOSEN SCHEME: a BOUNDED DENSE GRID (== grain.h::GrainGrid). Cell-size = the perception radius. An agent's
+// cell coord is FloorDiv(pos.axis, radius) per axis (monotone across 0 for negatives). The grid covers
+// [cellMin, cellMin+gridDim) cells; a cell's flat id is fpx::CellId of (coord - cellMin) into gridDim. The
+// caller sizes the grid to the agent AABB (every agent's cell in [0,gridDim)), so the linearization is total +
+// collision-free + deterministic. cellMin lets the grid sit at any world location (incl. negative coords).
+struct BoidsGrid {
+    fx     cellSize = 0;   // Q16.16 cell size (== the perception radius)
+    FxCell cellMin;        // the integer cell coord of the grid's (0,0,0) corner (the AABB lower cell)
+    FxCell gridDim;        // the grid extent in cells per axis (cellCount = x*y*z)
+};
+
+// BoidsCellOf(pos, cellSize): the integer grid cell an agent's position falls in, FloorDiv per axis. Pure int32.
+inline FxCell BoidsCellOf(const FxVec3& pos, fx cellSize) {
+    return FxCell{FloorDiv(pos.x, cellSize), FloorDiv(pos.y, cellSize), FloorDiv(pos.z, cellSize)};
+}
+
+// FlatBoidsCellId(cell, grid): the flat id of an absolute cell coord into the bounded dense grid (offset by
+// cellMin into [0,gridDim), then fpx::CellId). The caller guarantees the cell is in range; returns the linear
+// cell index in [0, gridDim.x*y*z).
+inline uint32_t FlatBoidsCellId(const FxCell& cell, const BoidsGrid& grid) {
+    const FxCell local{cell.x - grid.cellMin.x, cell.y - grid.cellMin.y, cell.z - grid.cellMin.z};
+    return CellId(local, grid.gridDim);
+}
+
+// BoidsCellCount(grid): the total number of cells in the dense grid (gridDim.x * y * z).
+inline uint32_t BoidsCellCount(const BoidsGrid& grid) {
+    return (uint32_t)(grid.gridDim.x * grid.gridDim.y * grid.gridDim.z);
+}
+
+// MakeBoidsGrid(agents, cellSize): build the bounded dense grid that tightly covers the agent pool at cell-size
+// cellSize (== the perception radius). cellMin = the min cell coord over all agents; gridDim = (maxCell -
+// minCell + 1) per axis. Empty pool -> a 1x1x1 grid at origin (deterministic degenerate). Pure int32 (==
+// grain.h::MakeGrainGrid).
+inline BoidsGrid MakeBoidsGrid(const std::vector<Agent>& agents, fx cellSize) {
+    BoidsGrid grid;
+    grid.cellSize = cellSize;
+    if (agents.empty()) {
+        grid.cellMin = FxCell{0, 0, 0};
+        grid.gridDim = FxCell{1, 1, 1};
+        return grid;
+    }
+    FxCell lo = BoidsCellOf(agents[0].pos, cellSize);
+    FxCell hi = lo;
+    for (const Agent& a : agents) {
+        const FxCell c = BoidsCellOf(a.pos, cellSize);
+        if (c.x < lo.x) lo.x = c.x; if (c.x > hi.x) hi.x = c.x;
+        if (c.y < lo.y) lo.y = c.y; if (c.y > hi.y) hi.y = c.y;
+        if (c.z < lo.z) lo.z = c.z; if (c.z > hi.z) hi.z = c.z;
+    }
+    grid.cellMin = lo;
+    grid.gridDim = FxCell{hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1};
+    return grid;
+}
+
+// ----- BuildBoidsCellTable: bucket agent indices into cells (the count->scan->emit on agents) -------------
+// The CSR-style cell table: cellStart[c..] is the exclusive prefix-sum of per-cell counts (cellStart has
+// cellCount+1 entries; cellStart[c]..cellStart[c+1] is cell c's slice), and cellAgents[] holds the agent
+// indices grouped by cell, ASCENDING agent index within each cell (deterministic). count->scan->emit: (1)
+// count agents per cell; (2) exclusive prefix-sum -> cellStart; (3) scatter each agent index into its cell's
+// slice (the emit, ascending-index order by construction since the agent loop is ascending). Pure int32 -> the
+// GPU boids_cell_{count,scan,emit} mirror this byte-for-byte. (DET-CRUX: the EMIT is the single-thread
+// ascending-agent scatter — a parallel atomic cursor would make the within-cell order GPU-scheduling-dependent
+// -> non-deterministic. The cell COUNT + the neighbor passes are per-agent-disjoint + race-free; only the
+// cell-emit scatter is the ordered pass.) (== grain.h::BuildGrainCellTable.)
+struct BoidsCellTable {
+    std::vector<uint32_t> cellStart;    // cellCount+1 exclusive prefix-sum offsets (CSR row pointers)
+    std::vector<uint32_t> cellAgents;   // agent indices grouped by cell (size == agent count)
+};
+
+inline BoidsCellTable BuildBoidsCellTable(const std::vector<Agent>& agents, const BoidsGrid& grid) {
+    const uint32_t n = (uint32_t)agents.size();
+    const uint32_t cells = BoidsCellCount(grid);
+    BoidsCellTable table;
+    // (1) COUNT: per-cell agent count.
+    std::vector<uint32_t> counts((size_t)cells, 0u);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t c = FlatBoidsCellId(BoidsCellOf(agents[i].pos, grid.cellSize), grid);
+        ++counts[c];
+    }
+    // (2) SCAN: exclusive prefix-sum -> cellStart (cellCount+1 entries; the last == n).
+    table.cellStart.assign((size_t)cells + 1u, 0u);
+    uint32_t running = 0;
+    for (uint32_t c = 0; c < cells; ++c) {
+        table.cellStart[c] = running;
+        running += counts[c];
+    }
+    table.cellStart[cells] = running;   // == n (the total)
+    // (3) EMIT: scatter each agent index into its cell's slice (ascending index by the ascending loop).
+    table.cellAgents.assign((size_t)n, 0u);
+    std::vector<uint32_t> cursor((size_t)cells, 0u);   // per-cell write cursor (local offset)
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t c = FlatBoidsCellId(BoidsCellOf(agents[i].pos, grid.cellSize), grid);
+        table.cellAgents[table.cellStart[c] + cursor[c]] = i;
+        ++cursor[c];
+    }
+    return table;
+}
+
+// ----- The neighbor reject (the PURE INT32 per-axis |dx| < radius candidate test) ------------------------
+// BoidsNeighborAccept(a, b, radius): accept b as a neighbor of a iff |a.axis - b.axis| < radius on EVERY axis
+// (a box of half-width radius — the perception neighborhood). PURE INT32: an integer subtract + abs + compare
+// per axis, NO products, NO int64, NO sqrt (the box keeps the whole pass MSL-native — the radial dist²<radius²
+// compare would need an int64 product glslc cannot parse, the spec's documented escape hatch). The shader
+// copies THIS verbatim. (== grain.h::GrainNeighborAccept with radius for hSearch.)
+inline bool BoidsNeighborAccept(const FxVec3& a, const FxVec3& b, fx radius) {
+    fx dx = a.x - b.x; if (dx < 0) dx = -dx;
+    fx dy = a.y - b.y; if (dy < 0) dy = -dy;
+    fx dz = a.z - b.z; if (dz < 0) dz = -dz;
+    return dx < radius && dy < radius && dz < radius;
+}
+
+// ----- BuildBoidsNeighborList: per-agent neighbors over the 27-cell stencil (count->scan->emit) -----------
+// For each agent i, scan the 27 cells of its 3x3x3 stencil (the cell + its 26 neighbors); for each agent
+// j != i in those cells, accept iff BoidsNeighborAccept(pos_i, pos_j, radius). Emit the accepted j into
+// neighbors[] at i's offset, in a FIXED order: ascending stencil-cell (dz,dy,dx -1..+1), then within a cell
+// ascending j (cellAgents is already ascending-index per cell) -> fully deterministic. The variable-length
+// per-agent lists are laid out by count->scan->emit (neighborStart = exclusive prefix-sum; neighbors[] grouped
+// by i). Stencil cells outside the grid are skipped (clamped). Pure int32 (== grain.h::BuildGrainNeighborList).
+struct BoidsNeighborList {
+    std::vector<uint32_t> neighborStart;   // agentCount+1 exclusive prefix-sum offsets (CSR)
+    std::vector<uint32_t> neighbors;       // neighbor j indices grouped by i (in stencil order)
+};
+
+// CountBoidsNeighbors(agents, grid, table, radius, perAgentOut): the count pass. perAgentOut[i] = #neighbors
+// of i (j!=i in the 27-cell stencil passing BoidsNeighborAccept); returns the total. The GPU
+// boids_neighbor_count mirrors THIS per-thread (one thread per agent i).
+inline uint32_t CountBoidsNeighbors(const std::vector<Agent>& agents, const BoidsGrid& grid,
+                                    const BoidsCellTable& table, fx radius,
+                                    std::vector<uint32_t>& perAgentOut) {
+    const uint32_t n = (uint32_t)agents.size();
+    perAgentOut.assign((size_t)n, 0u);
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const FxCell ci = BoidsCellOf(agents[i].pos, grid.cellSize);
+        uint32_t c = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            // Skip stencil cells outside the bounded grid (clamp).
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = FlatBoidsCellId(nc, grid);
+            for (uint32_t s = table.cellStart[cell]; s < table.cellStart[cell + 1u]; ++s) {
+                const uint32_t j = table.cellAgents[s];
+                if (j == i) continue;                                      // NO self-neighbor
+                if (BoidsNeighborAccept(agents[i].pos, agents[j].pos, radius)) ++c;
+            }
+        }
+        perAgentOut[i] = c;
+        total += c;
+    }
+    return total;
+}
+
+// BuildBoidsNeighborList(agents, grid, table, radius): the full builder (count->scan->emit). (1)
+// CountBoidsNeighbors -> per-agent counts; (2) exclusive prefix-sum -> neighborStart; (3) emit each accepted j
+// into i's disjoint slice in the FIXED stencil order. The list is grouped by i (ascending), then stencil-cell
+// (dz,dy,dx ascending), then j (ascending within a cell) -> fully deterministic. The GPU does the SAME three
+// passes -> the GPU neighbors[]+neighborStart memcmp's against this byte-for-byte.
+inline BoidsNeighborList BuildBoidsNeighborList(const std::vector<Agent>& agents, const BoidsGrid& grid,
+                                                const BoidsCellTable& table, fx radius) {
+    const uint32_t n = (uint32_t)agents.size();
+    BoidsNeighborList list;
+    std::vector<uint32_t> counts;
+    const uint32_t total = CountBoidsNeighbors(agents, grid, table, radius, counts);
+    // (2) SCAN: exclusive prefix-sum -> neighborStart (agentCount+1 entries; the last == total).
+    list.neighborStart.assign((size_t)n + 1u, 0u);
+    uint32_t running = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        list.neighborStart[i] = running;
+        running += counts[i];
+    }
+    list.neighborStart[n] = running;   // == total
+    // (3) EMIT: each agent writes its neighbors into its disjoint [neighborStart[i], ..) slice.
+    list.neighbors.assign((size_t)total, 0u);
+    for (uint32_t i = 0; i < n; ++i) {
+        const FxCell ci = BoidsCellOf(agents[i].pos, grid.cellSize);
+        uint32_t local = 0;
+        for (int dz = -1; dz <= 1; ++dz)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const FxCell nc{ci.x + dx, ci.y + dy, ci.z + dz};
+            if (nc.x < grid.cellMin.x || nc.x >= grid.cellMin.x + grid.gridDim.x) continue;
+            if (nc.y < grid.cellMin.y || nc.y >= grid.cellMin.y + grid.gridDim.y) continue;
+            if (nc.z < grid.cellMin.z || nc.z >= grid.cellMin.z + grid.gridDim.z) continue;
+            const uint32_t cell = FlatBoidsCellId(nc, grid);
+            for (uint32_t s = table.cellStart[cell]; s < table.cellStart[cell + 1u]; ++s) {
+                const uint32_t j = table.cellAgents[s];
+                if (j == i) continue;
+                if (BoidsNeighborAccept(agents[i].pos, agents[j].pos, radius)) {
+                    list.neighbors[list.neighborStart[i] + local] = j;
+                    ++local;
+                }
+            }
+        }
+    }
+    return list;
+}
+
 }  // namespace boids
 }  // namespace hf::sim

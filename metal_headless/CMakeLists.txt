@@ -366,6 +366,27 @@ hf_gen_msl(grain_cell_emit.comp      grain_cell_emit.comp.hlsl      comp grain_c
 hf_gen_msl(grain_neighbor_count.comp grain_neighbor_count.comp.hlsl comp grain_neighbor_count_main)
 hf_gen_msl(grain_neighbor_scan.comp  grain_neighbor_scan.comp.hlsl  comp grain_neighbor_scan_main)
 hf_gen_msl(grain_neighbor_emit.comp  grain_neighbor_emit.comp.hlsl  comp grain_neighbor_emit_main)
+# Deterministic GPU Crowds Slice 2 (Slice BD2, the 2nd slice of FLAGSHIP #18): the GRID-HASH NEIGHBOR LIST
+# (the GR2 grain_cell/grain_neighbor twin, applied to agents). The CELL TABLE: boids_cell_count.comp (ONE
+# thread per agent: InterlockedAdd into its cell's counter — BoidsCellOf = FloorDiv per axis at cell-size
+# radius, the bounded-dense-grid linearization, VERBATIM engine/sim/boids.h), boids_cell_scan.comp
+# (SINGLE-THREAD exclusive prefix-sum -> cellStart CSR), boids_cell_emit.comp (SINGLE-THREAD ascending-agent
+# scatter into cellAgents — single-thread because the within-cell order must be ascending agent index). The
+# NEIGHBOR LIST: boids_neighbor_count.comp (ONE thread per agent: count 27-cell-stencil candidates passing the
+# per-axis |dx|<radius reject — BoidsNeighborAccept VERBATIM), boids_neighbor_scan.comp (SINGLE-THREAD
+# exclusive prefix-sum -> neighborStart), boids_neighbor_emit.comp (ONE thread per agent emits its candidates
+# into its DISJOINT neighbors[] slice, NO atomics). ALL PURE INT32 (FloorDiv + per-axis abs-compare, NO
+# int64/fxmul/sqrt — the box is the perception neighborhood, the int64 dist² compare AVOIDED), so UNLIKE BD1's
+# int64 boids_steer these MSL-generate NATIVELY (a TRUE GPU pass on BOTH backends, the strongest cross-vendor
+# proof). ReadBuffer reads the cell table + neighbor list, PROVEN BIT-EXACT vs the CPU
+# boids.h::BuildBoidsCellTable + BuildBoidsNeighborList (memcmp). Behind --boids-neighbors only; BD1's
+# boids_steer (Vulkan-only, NOT here) + existing goldens untouched.
+hf_gen_msl(boids_cell_count.comp     boids_cell_count.comp.hlsl     comp boids_cell_count_main)
+hf_gen_msl(boids_cell_scan.comp      boids_cell_scan.comp.hlsl      comp boids_cell_scan_main)
+hf_gen_msl(boids_cell_emit.comp      boids_cell_emit.comp.hlsl      comp boids_cell_emit_main)
+hf_gen_msl(boids_neighbor_count.comp boids_neighbor_count.comp.hlsl comp boids_neighbor_count_main)
+hf_gen_msl(boids_neighbor_scan.comp  boids_neighbor_scan.comp.hlsl  comp boids_neighbor_scan_main)
+hf_gen_msl(boids_neighbor_emit.comp  boids_neighbor_emit.comp.hlsl  comp boids_neighbor_emit_main)
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new
