@@ -16866,35 +16866,46 @@ int main(int argc, char** argv) {
             uint32_t h = window.FramebufferHeight();
             float aspect = (h > 0) ? (float)w / (float)h : 1.0f;
 
-            // === The bit-exact VH1-VH5 driven car -> a driven pose (the input; deterministic, shared with the
-            // Metal --vehicle-render by construction via the SAME scene + stream). Build the car, spin BOTH rear
-            // wheels every tick + steer the front-right hinge at a couple ticks, run K StepVehicleDrivenSteps. K
-            // is chosen so the driven car stays on-screen (a short, framed run). Pure integer sim. ===
-            // K=12 driven ticks at a GENTLE throttle: enough to seat the suspension + nudge the car forward
-            // (it IS the bit-exact driven car) WITHOUT over-compressing the springs (a long/hard run sags the
-            // chassis down INTO the wheels and reads as a blob — the FPX6 coherence lesson). At K=12 the chassis
-            // rests at ride height (~1.45) on the four corner wheels (y=0.5) -> a clean box-on-four-wheels car.
+            // === The bit-exact VH1-VH5 car -> a SETTLED pose (the input; deterministic, shared with the Metal
+            // --vehicle-render by construction via the SAME scene + EMPTY stream). The drive/steer demonstration
+            // was already proven in VH3/VH4; the CAPSTONE renders a CLEAN, SETTLED car so it reads as a car and
+            // not a driven-scatter (a steered run moves the wheels apart from the corners and the chassis floats
+            // — the "not a car" cause). Build the car, run K StepVehicleDrivenSteps with an EMPTY command stream
+            // so the springs seat + the 4 wheels settle SYMMETRICALLY at the 4 corners under the body. Pure
+            // integer sim. ===
             const vehicle::fx kDt = vehicle::kOne / 60;
-            const int kTicks = 12;          // a short, framed driven run -> the car stays assembled
+            const int kTicks = 24;          // enough settle ticks for the springs to seat the body on the wheels
             const int kIters = 16;          // Gauss-Seidel spring/hinge passes per tick
             const int kSolveIters = 8;      // FPX3 contact sweeps per tick
             vehicle::VehicleConfig cfg;
-            // A render-scene-local shorter suspension travel (the cfg is local to this showcase, NOT a change to
-            // the VH1-VH5 defaults): with suspensionLen 0.7 the settled chassis box-bottom TUCKS down onto the
-            // wheel tops (a slight overlap) so the box reads as sitting ON the four wheels — a coherent car (the
-            // FPX6 coherence lesson), instead of floating above them on a tall default suspension.
-            cfg.suspensionLen = (vehicle::fx)(vehicle::kOne * 7 / 10);   // 0.7 suspension travel
+            // Render-scene-LOCAL cfg overrides (LOCAL to this showcase — NOT a change to the VH1-VH5 VehicleConfig
+            // DEFAULTS) re-tuned so the matte box BODY sits CLOSE on top of the FOUR corner wheels and reads as a
+            // chunky car (the FPX6 coherence lesson), instead of a thin plank floating over scattered balls:
+            //   NB the render shape scale is the cube/sphere LOCAL extent (cube spans [-0.5,0.5], sphere r 0.5),
+            //   so the WORLD box half-extent = chassisHalf{X,Y,Z}*0.5 and the WORLD wheel render radius =
+            //   wheelRadius*0.5. The defaults make a small slab with the wheels FAR OUTSIDE the box (the "plank
+            //   over scattered balls"); these overrides scale the BODY up so it actually CAPS the four wheels:
+            //   - chassisHalfX/Y/Z 4.0/1.4/1.9 : world box 2.0 long x 0.7 tall x 0.95 wide — a CAR BODY whose
+            //                                    sides sit at the wheel track so the wheels show at the corners.
+            //   - wheelRadius 0.9      : world render radius 0.45 (physics body radius 0.9 rests at y 0.9). The
+            //                            left/right wheels MUST be >= 0.9 apart in Z (>=2*body-radius) or the
+            //                            contact solver shoves them apart (the scatter cause) — hence wheelBaseZ
+            //                            0.95 (1.9 apart, clear) and wheelBaseX 1.5 (3.0 apart, clear).
+            //   - rideHeight 1.8 / suspensionLen 0.9 : settled chassis ~1.7 -> box bottom (1.7−0.35 = 1.35) sits
+            //                            just above the wheel render CENTRES (0.9) so the wheels poke out BELOW
+            //                            the body at the four corners -> reads as a car (small gap, FPX6).
+            cfg.chassisHalfX  = (vehicle::fx)(vehicle::kOne * 400 / 100);  // world box 2.00 long
+            cfg.chassisHalfY  = (vehicle::fx)(vehicle::kOne * 140 / 100);  // world box 0.70 tall
+            cfg.chassisHalfZ  = (vehicle::fx)(vehicle::kOne * 190 / 100);  // world box 0.95 wide (sides at the wheel track)
+            cfg.rideHeight    = (vehicle::fx)(vehicle::kOne * 170 / 100);  // 1.70 ride height
+            cfg.wheelRadius   = (vehicle::fx)(vehicle::kOne * 90 / 100);   // body r 0.90 (render r 0.45)
+            cfg.wheelBaseX    = (vehicle::fx)(vehicle::kOne * 150 / 100);  // ±1.50 corner (3.0 apart, clear)
+            cfg.wheelBaseZ    = (vehicle::fx)(vehicle::kOne * 95 / 100);   // ±0.95 corner (1.9 apart, >= 2*radius, NO scatter)
+            cfg.suspensionLen = (vehicle::fx)(vehicle::kOne * 78 / 100);   // 0.78 spring rest -> body tucks low on the wheels
             vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
             const uint32_t kBodies = (uint32_t)veh.world.bodies.size();   // 5
+            // EMPTY command stream: NO drive, NO steer -> the car settles symmetrically (a clean car, not a scatter).
             std::vector<vehicle::FxCommand> stream;
-            for (int t = 0; t < kTicks; ++t) {
-                vehicle::FxCommand d2; d2.tick = (uint32_t)t; d2.kind = vehicle::kCmdDriveTorque;
-                d2.bodyId = veh.wheelIndex[2]; d2.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
-                stream.push_back(d2);
-                vehicle::FxCommand d3; d3.tick = (uint32_t)t; d3.kind = vehicle::kCmdDriveTorque;
-                d3.bodyId = veh.wheelIndex[3]; d3.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
-                stream.push_back(d3);
-            }
             vehicle::StepVehicleDrivenSteps(veh, cfg, stream, kDt, kTicks, kIters, kSolveIters);
 
             // The split instance set (chassis box + 4 wheel spheres) — the ONE float crossing, render-only.
@@ -17059,10 +17070,11 @@ int main(int argc, char** argv) {
             // rakes from the camera's upper-near side so the camera-facing surfaces are lit (NOT back-lit into
             // the blue ambient) -> a warm car-paint read (the GF6/FR6 lesson).
             const float chassisX = fpx::FxToFloat(veh.world.bodies[(size_t)veh.chassisIndex].pos.x);
-            // A CLOSE fixed 3/4 hero camera so the whole car (the ~3x2 box on its four corner wheels) FILLS the
-            // frame and reads as a car (the FPX6 coherence lesson — frame it tight, on the ground).
-            const Vec3 eye{chassisX + 2.6f, 1.05f, 4.8f};
-            const Vec3 center{chassisX, 1.05f, 0.0f};
+            // A CLOSE fixed 3/4 HERO camera, slightly ABOVE the car, so the whole car (the chunky box on its four
+            // corner wheels) FILLS the frame and you SEE the body resting on the corner wheels on the ground (the
+            // FPX6 coherence lesson — frame it tight, from 3/4 above). Aimed at the body centre (~y 0.9).
+            const Vec3 eye{chassisX + 4.4f, 3.3f, 5.4f};
+            const Vec3 center{chassisX, 0.7f, 0.0f};
             FrameData fd{};
             {
                 Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});

@@ -29944,31 +29944,35 @@ static int RunVehicleRenderShowcase(const char* outPath) {
     auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
                                   p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
 
-    // === The bit-exact VH1-VH5 driven car -> a driven pose (the SAME scene as the Vulkan --vehicle-render-shot
-    // — byte-identical state + transforms by construction). ===
-    // K=12 GENTLE driven ticks (the SAME scene as the Vulkan --vehicle-render-shot): seat the suspension +
-    // nudge the car forward WITHOUT over-compressing the springs (a long/hard run sags the chassis into the
-    // wheels — the FPX6 coherence lesson) -> a clean box-on-four-wheels car at ride height.
+    // === The bit-exact VH1-VH5 car -> a SETTLED pose (the SAME scene as the Vulkan --vehicle-render-shot —
+    // byte-identical state + transforms by construction). ===
+    // The drive/steer demonstration was already proven in VH3/VH4; the CAPSTONE renders a CLEAN, SETTLED car
+    // (an EMPTY command stream, NO drive/steer) so the 4 wheels settle SYMMETRICALLY at the 4 corners under the
+    // body and it reads as a car (not a driven-scatter). Kept in lockstep with the Vulkan --vehicle-render-shot.
     const vehicle::fx kDt = vehicle::kOne / 60;
-    const int kTicks = 12;
+    const int kTicks = 24;
     const int kIters = 16;
     const int kSolveIters = 8;
     vehicle::VehicleConfig cfg;
-    // Render-scene-local shorter suspension (the cfg is local — NOT a change to the VH1-VH5 defaults): with
-    // suspensionLen 0.7 the settled chassis box tucks down ONTO the wheel tops -> a coherent box-on-four-wheels
-    // car (the FPX6 coherence lesson). Kept in lockstep with the Vulkan --vehicle-render-shot.
-    cfg.suspensionLen = (vehicle::fx)(vehicle::kOne * 7 / 10);
+    // Render-scene-LOCAL cfg overrides (LOCAL — NOT a change to the VH1-VH5 VehicleConfig DEFAULTS). The render
+    // shape scale is the cube/sphere LOCAL extent (cube spans [-0.5,0.5], sphere r 0.5), so the WORLD box
+    // half-extent = chassisHalf{X,Y,Z}*0.5 and the WORLD wheel render radius = wheelRadius*0.5. A scaled-up
+    // chunky BODY (world 2.0 long x 0.7 tall x 0.95 wide) on four wheels at the corners; the left/right wheels
+    // are >= 2*body-radius apart (wheelBaseZ 0.95, wheelBaseX 1.5) so the contact solver does NOT shove them
+    // apart (the scatter cause); suspensionLen 0.78 tucks the body low ON the wheels. Kept in lockstep with the
+    // Vulkan --vehicle-render-shot (the integer state + transforms are byte-identical by construction).
+    cfg.chassisHalfX  = (vehicle::fx)(vehicle::kOne * 400 / 100);  // world box 2.00 long
+    cfg.chassisHalfY  = (vehicle::fx)(vehicle::kOne * 140 / 100);  // world box 0.70 tall
+    cfg.chassisHalfZ  = (vehicle::fx)(vehicle::kOne * 190 / 100);  // world box 0.95 wide
+    cfg.rideHeight    = (vehicle::fx)(vehicle::kOne * 170 / 100);  // 1.70 ride height
+    cfg.wheelRadius   = (vehicle::fx)(vehicle::kOne * 90 / 100);   // body r 0.90 (render r 0.45)
+    cfg.wheelBaseX    = (vehicle::fx)(vehicle::kOne * 150 / 100);  // ±1.50 corner (3.0 apart, clear)
+    cfg.wheelBaseZ    = (vehicle::fx)(vehicle::kOne * 95 / 100);   // ±0.95 corner (1.9 apart, >= 2*radius, NO scatter)
+    cfg.suspensionLen = (vehicle::fx)(vehicle::kOne * 78 / 100);   // 0.78 spring rest -> body tucks low on the wheels
     vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
     const uint32_t kBodies = (uint32_t)veh.world.bodies.size();
+    // EMPTY command stream: NO drive, NO steer -> the car settles symmetrically (a clean car, not a scatter).
     std::vector<vehicle::FxCommand> stream;
-    for (int t = 0; t < kTicks; ++t) {
-        vehicle::FxCommand d2; d2.tick = (uint32_t)t; d2.kind = vehicle::kCmdDriveTorque;
-        d2.bodyId = veh.wheelIndex[2]; d2.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
-        stream.push_back(d2);
-        vehicle::FxCommand d3; d3.tick = (uint32_t)t; d3.kind = vehicle::kCmdDriveTorque;
-        d3.bodyId = veh.wheelIndex[3]; d3.arg = vehicle::FxVec3{vehicle::kOne / 2, 0, 0};
-        stream.push_back(d3);
-    }
     vehicle::StepVehicleDrivenSteps(veh, cfg, stream, kDt, kTicks, kIters, kSolveIters);
 
     const vehicle::VehicleRenderInstances ri = vehicle::VehicleToRenderInstances(veh, cfg);
@@ -30093,8 +30097,8 @@ static int RunVehicleRenderShowcase(const char* outPath) {
     // driven chassis world pos so the whole car reads on the ground; the light rakes from the camera's
     // upper-near side -> a warm car-paint read (the GF6/FR6 lesson). Kept in lockstep with the Vulkan showcase.
     const float chassisX = fpx::FxToFloat(veh.world.bodies[(size_t)veh.chassisIndex].pos.x);
-    const Vec3 eye{chassisX + 2.6f, 1.05f, 4.8f};
-    const Vec3 center{chassisX, 1.05f, 0.0f};
+    const Vec3 eye{chassisX + 4.4f, 3.3f, 5.4f};
+    const Vec3 center{chassisX, 0.7f, 0.0f};
     const float aspect = (float)W / (float)H;
     FrameData fd{};
     {
