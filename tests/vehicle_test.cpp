@@ -863,6 +863,50 @@ int main() {
         check(vehicleEqual(a, b), "VH5 determinism: two full lockstep runs BYTE-IDENTICAL");
     }
 
+    // ============ VH6: VehicleToRenderInstances — the bit-exact driven car -> the FLOAT instance set ======
+    // (1) the helper produces exactly 5 instances (1 chassis box + 4 wheel spheres); (2) the chassis/wheel
+    // instance TRANSLATIONS match their bodies' fpx::FxBodyTransform translations (provenance — the render
+    // matrix is a pure function of the bit-exact body pos); (3) the helper is a PURE FUNCTION (two calls
+    // byte-equal). The car is driven to a non-trivial pose first (the SAME drive stream shape as VH5).
+    {
+        vehicle::VehicleConfig cfg;
+        vehicle::Vehicle veh = vehicle::VehicleFromConfig(cfg);
+        const std::vector<vehicle::FxCommand> stream = buildVh5Stream(veh, kVh5Ticks);
+        vehicle::StepVehicleDrivenSteps(veh, cfg, stream, kVh5Dt, kVh5Ticks, kVh5Iters, kVh5SolveIters);
+
+        const vehicle::VehicleRenderInstances ri = vehicle::VehicleToRenderInstances(veh, cfg);
+        // (1) 1 chassis + 4 wheels == 5 instances.
+        check(ri.wheels.size() == 4, "VH6 render: 4 wheel instances (1 chassis + 4 wheels == 5)");
+
+        // (2) provenance: each instance translation (m[12..14]) == its body's FxBodyTransform translation
+        // (both are FxToFloat(pos)) — the render matrix derives purely from the bit-exact body pos.
+        {
+            const fpx::FxBody& c = veh.world.bodies[(size_t)veh.chassisIndex];
+            const math::Mat4 ct = fpx::FxBodyTransform(c);
+            check(ri.chassis.m[12] == ct.m[12] && ri.chassis.m[13] == ct.m[13] &&
+                  ri.chassis.m[14] == ct.m[14],
+                  "VH6 render: chassis instance translation == chassis body FxBodyTransform translation");
+        }
+        bool wheelsMatch = true;
+        for (int k = 0; k < 4 && wheelsMatch; ++k) {
+            const fpx::FxBody& w = veh.world.bodies[(size_t)veh.wheelIndex[k]];
+            const math::Mat4 wt = fpx::FxBodyTransform(w);
+            if (ri.wheels[(size_t)k].m[12] != wt.m[12] || ri.wheels[(size_t)k].m[13] != wt.m[13] ||
+                ri.wheels[(size_t)k].m[14] != wt.m[14])
+                wheelsMatch = false;
+        }
+        check(wheelsMatch,
+              "VH6 render: each wheel instance translation == its wheel body FxBodyTransform translation");
+
+        // (3) pure function: a rebuild from the SAME bit-exact state is byte-equal (the provenance contract).
+        const vehicle::VehicleRenderInstances rebuild = vehicle::VehicleToRenderInstances(veh, cfg);
+        bool pure = (rebuild.wheels.size() == ri.wheels.size()) &&
+                    std::memcmp(ri.chassis.m, rebuild.chassis.m, sizeof(float) * 16) == 0;
+        for (size_t k = 0; k < ri.wheels.size() && pure; ++k)
+            if (std::memcmp(ri.wheels[k].m, rebuild.wheels[k].m, sizeof(float) * 16) != 0) pure = false;
+        check(pure, "VH6 render: VehicleToRenderInstances is a PURE FUNCTION (two calls BYTE-EQUAL)");
+    }
+
     if (g_fail == 0) std::printf("vehicle_test: ALL PASS\n");
     else std::printf("vehicle_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

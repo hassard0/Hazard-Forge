@@ -969,5 +969,90 @@ inline Vehicle RunVehicleRollback(const VehicleConfig& cfg, const Vehicle& initi
     return v;
 }
 
+// ====================================================================================================
+// Slice VH6 — LIT 3D INSTANCED RENDER CAPSTONE (THE MONEY-SHOT COMPLETING FLAGSHIP #16: DETERMINISTIC
+// VEHICLE PHYSICS, hf::sim::vehicle). VH1-VH5 built + proved a deterministic drivable, lockstep-replayable
+// car (suspension -> rig -> drive/steer -> traction -> lockstep). VH6 RENDERS the bit-exact driven car as a
+// lit 3D scene: a matte BOX chassis sitting on four ROUND wheels, driving on the ground under a directional
+// light. **FLOAT render-only** — the SIM (VH1-VH5) stays bit-exact integer; the ONE float crossing is the
+// per-body fpx::FxBodyTransform composed with a render-only SHAPE scale (OUT of the bit-exact sim path).
+// **NO new shader, NO new RHI** — the showcase reuses the EXISTING lit-instanced pipeline VERBATIM. ADDITIVE:
+// the VH1-VH5 code above is byte-FROZEN; VH6 only APPENDS this render-only helper.
+//
+// THE DESIGN CALL (the FPX6/FR6/JT6 capstone twin): VehicleToRenderInstances runs OUTSIDE the bit-exact loop
+// (render-only): the car has driven to a pose (K StepVehicleDrivenSteps — the SAME scene both the Vulkan
+// --vehicle-render-shot AND the Metal --vehicle-render build, so the integer state is byte-identical
+// cross-backend BY CONSTRUCTION). For each body it builds a FLOAT model matrix from the body's BIT-EXACT
+// pos/orient via math::FromTRS (the same translate(pos/kOne) * rotate(normalize(orient/kOne)) that
+// fpx::FxBodyTransform uses — REUSED in spirit, the FPX6 precedent) composed with a per-body SHAPE scale:
+//   - THE CHASSIS (1 body): scale = the chassis box half-extents (chassisHalfX/Y/Z) -> a BOX. Drawn with the
+//     cube mesh, the chassis translation == fpx::FxBodyTransform(chassis) translation (the provenance proof).
+//   - THE 4 WHEELS (4 bodies): scale = (wheelRadius, wheelRadius*kWheelFlatten, wheelRadius) -> ROUND wheels
+//     FLATTENED laterally (the Z/lateral axle axis) so a sphere reads as a wheel, not a ball. Drawn with the
+//     sphere mesh, each wheel translation == its wheel body's fpx::FxBodyTransform translation.
+// Split into TWO instance sets (chassis vs wheels) so the showcase draws TWO colored instanced draws (the
+// FR6/GF6 two-draw pattern): the chassis in a warm matte CAR-PAINT colour, the wheels in a dark matte TYRE
+// colour. **MATTE (the showcase sets roughness 1.0)** so the bodies do NOT mirror the sky IBL into
+// iridescence (the GF6/FR6/JT6 hard lesson). VehicleToRenderInstances is a PURE FUNCTION of the bit-exact
+// Vehicle state (two calls byte-equal — the provenance contract).
+//
+// SEAM DISCIPLINE: unchanged — ZERO backend symbols, header-only. VH6 only ADDS the render bridge; the
+// bit-exact VH1-VH5 sim is untouched. It uses math::FromTRS + fpx::FxToFloat (already #included read-only via
+// fpx.h) — it does NOT re-implement them. NO new shader, NO new RHI.
+
+// The lateral (axle-axis) flatten factor: a wheel sphere is squashed to kWheelFlatten*wheelRadius along the
+// lateral Z axle so it reads as a disc/tyre rather than a ball (render-only, deterministic).
+inline constexpr float kWheelFlatten = 0.7f;
+
+// ----- VehicleRenderInstances: the split FLOAT instance set (the render-only output) -------------------
+// chassis : the single chassis BOX model matrix (FxBodyTransform pose x the chassis half-extent scale).
+// wheels  : the 4 wheel model matrices (FxBodyTransform pose x the wheelRadius scale, lateral-flattened).
+// Each math::Mat4 is column-major (== scene::InstanceData::model). The showcase draws `chassis` with the
+// cube mesh (warm matte car-paint) + `wheels` with the sphere mesh (dark matte tyre).
+struct VehicleRenderInstances {
+    math::Mat4              chassis;   // 1 box
+    std::vector<math::Mat4> wheels;    // 4 round wheels
+};
+
+// ----- VehicleBodyShapeTransform: the render-only T*R*S for one body with an explicit shape scale --------
+// translate(pos/kOne) * rotate(normalize(orient/kOne)) * scale(shape) — the fpx::FxBodyTransform translation
+// + rotation (REUSED in spirit, the FPX6 precedent) with a per-body NON-UNIFORM shape scale instead of the
+// body's uniform radius. Pure deterministic host float (no RNG, no clock). The translation is byte-equal to
+// fpx::FxBodyTransform(b)'s translation (both are FxToFloat(pos)) — the provenance proof rests on this.
+inline math::Mat4 VehicleBodyShapeTransform(const fpx::FxBody& b, const math::Vec3& shape) {
+    const math::Vec3 t{fpx::FxToFloat(b.pos.x), fpx::FxToFloat(b.pos.y), fpx::FxToFloat(b.pos.z)};
+    const math::Quat q = math::Normalize(math::Quat{
+        fpx::FxToFloat(b.orient.x), fpx::FxToFloat(b.orient.y),
+        fpx::FxToFloat(b.orient.z), fpx::FxToFloat(b.orient.w)});
+    return math::FromTRS(t, q, shape);
+}
+
+// ----- VehicleToRenderInstances: the bit-exact driven car -> the split FLOAT instance set (render-only) --
+// Builds the chassis BOX instance (pose x chassisHalf{X,Y,Z}) + the 4 wheel ROUND instances (pose x
+// wheelRadius, lateral-flattened) from the bit-exact Vehicle state. A PURE FUNCTION of (v, cfg): two calls
+// produce byte-equal matrices (the provenance contract the showcase asserts). The ONE float crossing of the
+// whole flagship (the FPX6/FR6/JT6 bridge); the bit-exact VH1-VH5 sim is NOT mutated.
+inline VehicleRenderInstances VehicleToRenderInstances(const Vehicle& v, const VehicleConfig& cfg) {
+    VehicleRenderInstances out;
+    const FxWorld& world = v.world;
+    // The chassis box: half-extents in world units (the render-only side-view shape, NOT the sphere radius).
+    const math::Vec3 chassisShape{fpx::FxToFloat(cfg.chassisHalfX), fpx::FxToFloat(cfg.chassisHalfY),
+                                  fpx::FxToFloat(cfg.chassisHalfZ)};
+    if (v.chassisIndex < (uint32_t)world.bodies.size())
+        out.chassis = VehicleBodyShapeTransform(world.bodies[(size_t)v.chassisIndex], chassisShape);
+    else
+        out.chassis = math::Mat4::Identity();
+    // The 4 wheels: a wheelRadius sphere flattened along the lateral (Z) axle so it reads as a tyre.
+    const float wr = fpx::FxToFloat(cfg.wheelRadius);
+    const math::Vec3 wheelShape{wr, wr, wr * kWheelFlatten};
+    out.wheels.reserve(4);
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t wi = v.wheelIndex[k];
+        if (wi >= (uint32_t)world.bodies.size()) continue;
+        out.wheels.push_back(VehicleBodyShapeTransform(world.bodies[(size_t)wi], wheelShape));
+    }
+    return out;
+}
+
 }  // namespace vehicle
 }  // namespace hf::sim
