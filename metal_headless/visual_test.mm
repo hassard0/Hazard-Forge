@@ -28521,6 +28521,177 @@ static int RunConvexStackShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GJ4 — Deterministic General Convex-Hull Contacts THE HULL WORLD STEP showcase (--gjk-settle)
+// (the 4th slice + new-physics beat of FLAGSHIP #22, hf::sim::gjk). Like CX4/GJ3, the full step is int64 (the
+// GJK/EPA support + the inertia fxdiv + the FxDot/FxCross/FxRotate/quaternion Q16.16 products), so
+// shaders/hull_step.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's
+// hf_gen_msl list; on Metal the --gjk-settle showcase runs the CPU gjk::StepHullWorldN — the EXACT bit-exact
+// reference the Vulkan --gjk-settle-shot GPU==CPU memcmp already compares against -> the Metal result is
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION (the convex_step.comp/gjk_epa.comp convention),
+// while the Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic scene (a static
+// floor box-hull + a dropped tetra + a dropped octa + a static box + a wedge), steps StepHullWorldN K=240
+// ticks over it -> a coherent settled world (tetra/octa at rest ON A FACE, the wedge interlocked), and
+// CPU-colors the SAME 2D side-view as the Vulkan --gjk-settle-shot -> the golden is bit-identical
+// cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side
+// EXACTLY. New golden tests/golden/metal/gjk_settle.png (baked on the Mac by the controller); two runs
+// DIFF 0.0000.
+static int RunGjkSettleShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace gjk    = hf::sim::gjk;
+    namespace fpx    = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)convex::kOne); };
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+
+    // The deterministic step config (== the Vulkan --gjk-settle-shot + the gjk_test makeStepCfg).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 24;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.linDamp     = (fx)((int64_t)97 * kOne / 100);  // 0.97
+    kCfg.angDamp     = (fx)((int64_t)30 * kOne / 100);  // 0.3
+    kCfg.posIters    = 4;
+    const int kTicks = 240;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    // THE SCENE (== the Vulkan --gjk-settle-shot): a static FLOOR (box-hull half-extent 4) + a dropped TETRA
+    // (rests on its FACE) + a dropped OCTA (rests on a FACE) + a static upright BOX + a WEDGE interlocked.
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false));            w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));   // 0 floor
+        w.bodies.push_back(makeBody(fd(-2.0), fd(2.5), 0, true)); w.hulls.push_back(gjk::MakeTetra(kOne));             // 1 tetra
+        w.bodies.push_back(makeBody(0, fd(2.5), 0, true));        w.hulls.push_back(gjk::MakeOcta(kOne));              // 2 octa
+        w.bodies.push_back(makeBody(fd(2.6), fd(2.0), 0, false)); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 3 box wall
+        w.bodies.push_back(makeBody(fd(1.2), fd(2.4), 0, true));  w.hulls.push_back(gjk::MakeWedge(kOne, kOne, kOne));// 4 wedge
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    gjk::HullWorld world = buildScene();
+    gjk::StepHullWorldN(world, kCfg, (uint32_t)kTicks);
+    std::printf("gjk-settle: {bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU gjk::StepHullWorldN, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kTicks);
+
+    gjk::HullWorld world2 = buildScene();
+    gjk::StepHullWorldN(world2, kCfg, (uint32_t)kTicks);
+    bool same = true;
+    for (size_t i = 0; i < world.bodies.size() && same; ++i)
+        if (std::memcmp(&world.bodies[i], &world2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("gjk-settle: two runs differ (nondeterministic)");
+    std::printf("gjk-settle determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) rest + held: the dynamic hulls came to REST + are HELD within slop+band, resting ON A FACE.
+    const gjk::HullStackMeasure ms = gjk::MeasureHullStack(world);
+    const bool atRest = (ms.maxSpeed < kOne / 2);
+    const bool held   = (ms.maxPenetration < kOne / 4);
+    const fx floorTop = world.bodies[0].pos.y + fi(1);
+    bool above = true;
+    for (uint32_t i = 0; i < kBodyCount; ++i)
+        if (convex::IsDynamic(world.bodies[i]) && world.bodies[i].pos.y <= floorTop) above = false;
+    if (!atRest || !held || !above)
+        return fail("gjk-settle: NOT settled (the hulls scattered / sank / exploded)");
+    std::printf("gjk-settle rest: {maxSpeed:%d, maxPen:%d, restedOnFace:true}\n",
+                ms.maxSpeed, ms.maxPenetration);
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the settled hull world as the Vulkan
+    // --gjk-settle-shot (identical by construction — the same render math + the same monotone-chain outline). ---
+    const int kPxPerUnit = 48, kMargin = 24;
+    const int kWorldHalfX = 6, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(world.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 hullCol[4] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.40f, 0.85f, 0.55f},
+                             Vec3{0.55f, 0.55f, 0.65f}, Vec3{0.90f, 0.85f, 0.35f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawHullXY(world.bodies[i], kInit.hulls[i], hullCol[(i - 1) % 4]);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — settled hull world side-view (%u hulls, %d ticks, maxSpeed=%d)\n",
+                outPath, imgW, imgH, kBodyCount, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice FC4 — Deterministic Contact Friction THE FRICTION-LOCKED WORLD STEP showcase (--fric-ramp /
 // --fric-stack) (the 4th slice + money-physics beat of FLAGSHIP #20, hf::sim::fric). Like CX4, the full step
 // is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products + the FC3 friction
@@ -50222,6 +50393,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_stack.png";
             try { return RunConvexStackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gjk-settle <out.png>: render the Deterministic General Convex-Hull Contacts THE HULL WORLD STEP
+        // showcase (Slice GJ4, the new-physics beat of FLAGSHIP #22). On Metal this runs the CPU step:
+        // hull_step.comp is int64/Vulkan-only (glslc can't parse the GJK/EPA/inertia/quaternion int64), so
+        // Metal runs the CPU gjk::StepHullWorldN over the SAME scene (a static floor box-hull + a dropped tetra
+        // + a dropped octa + a static box + a wedge, stepped K=240 ticks) -> the EXACT bit-exact reference the
+        // Vulkan --gjk-settle-shot GPU==CPU memcmp compares against; two runs byte-identical; the hulls settle
+        // (at rest + held, the tetra/octa resting ON A FACE). The image golden is a PURE-INTEGER 2D side-view
+        // of the settled hull world, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/gjk_settle.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gjk-settle") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gjk_settle.png";
+            try { return RunGjkSettleShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fric-ramp / --fric-stack <out.png>: render the Deterministic Contact Friction THE FRICTION-LOCKED

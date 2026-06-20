@@ -436,6 +436,113 @@ int main() {
         }
     }
 
+    // =====================================================================================================
+    // Slice GJ4 — THE HULL WORLD STEP (the new-physics beat): FxHullInvInertiaBody, HullContact, HullWorld,
+    // StepHullWorldN, HullStackMeasure. The contracts the GPU hull_step.comp + the GPU==CPU proof build on.
+    {
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto hbodyAt = [&](int x, int y, int z, bool dyn, fpx::FxQuat q = fpx::FxQuat{0,0,0,kOne}) {
+            fpx::FxBody b;
+            b.pos = {FromInt(x), FromInt(y), FromInt(z)};
+            b.orient = q;
+            b.invMass = dyn ? kOne : 0;
+            b.flags = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0,0,0};
+            b.angVel = {0,0,0};
+            return b;
+        };
+
+        // --- FxHullInvInertiaBody(cube hull) == FxBoxInvInertiaBody(same half-extents) (the cross-check) ---
+        {
+            const fx h = fi(2);
+            const gjk::FxHull cubeHull = gjk::MakeBox(h, h, h);
+            const convex::FxBox boxA{convex::FxVec3{h, h, h}};
+            const gjk::FxVec3 hullI = gjk::FxHullInvInertiaBody(cubeHull, kOne);
+            const convex::FxVec3 boxI = convex::FxBoxInvInertiaBody(boxA, kOne);
+            check(std::memcmp(&hullI, &boxI, sizeof(gjk::FxVec3)) == 0,
+                  "FxHullInvInertiaBody(cube hull) == FxBoxInvInertiaBody(same half-extents)");
+            // also a non-cube extent hbox hull cross-checks (the AABB == the hbox half-extents).
+            const gjk::FxHull slabHull = gjk::MakeBox(fi(3)/2, kOne/2, fi(3)/2);
+            const convex::FxBox slabBox{convex::FxVec3{fi(3)/2, kOne/2, fi(3)/2}};
+            const gjk::FxVec3 sH = gjk::FxHullInvInertiaBody(slabHull, kOne);
+            const convex::FxVec3 sB = convex::FxBoxInvInertiaBody(slabBox, kOne);
+            check(std::memcmp(&sH, &sB, sizeof(gjk::FxVec3)) == 0,
+                  "FxHullInvInertiaBody(slab hbox hull) == FxBoxInvInertiaBody (AABB cross-check)");
+        }
+
+        // --- FxHullInvInertiaBody static (invMass==0) -> (0,0,0) ---
+        {
+            const gjk::FxHull htetra = gjk::MakeTetra(kOne);
+            const gjk::FxVec3 z = gjk::FxHullInvInertiaBody(htetra, 0);
+            check(z.x == 0 && z.y == 0 && z.z == 0, "FxHullInvInertiaBody static (invMass==0) -> (0,0,0)");
+        }
+
+        // --- HullContact: count-1 manifold w/ EPA normal+pen for an overlapping pair; empty for separated ---
+        {
+            const gjk::FxHull hbox = gjk::MakeBox(kOne, kOne, kOne);
+            // OVERLAPPING: two unit boxes, centers 1 apart on X (half-extents 1 each -> overlap depth 1).
+            const fpx::FxBody bA = hbodyAt(0, 0, 0, true);
+            const fpx::FxBody bB = hbodyAt(1, 0, 0, true);
+            const convex::ContactManifold mo = gjk::HullContact(bA, hbox, bB, hbox);
+            const gjk::GjkResult g = gjk::Gjk(hbox, bA, hbox, bB);
+            const gjk::EpaResult e = gjk::Epa(hbox, bA, hbox, bB, g.simplex);
+            check(mo.count == 1u, "HullContact overlap -> count-1 manifold");
+            check(std::memcmp(&mo.normal, &e.normal, sizeof(gjk::FxVec3)) == 0,
+                  "HullContact normal == EPA normal");
+            check(mo.depths[0] == e.depth, "HullContact depth == EPA depth");
+            // SEPARATED: two unit boxes 4 apart on X -> no overlap -> empty manifold.
+            const fpx::FxBody bF = hbodyAt(4, 0, 0, true);
+            const convex::ContactManifold ms = gjk::HullContact(bA, hbox, bF, hbox);
+            check(ms.count == 0u, "HullContact separated -> empty manifold (count 0)");
+        }
+
+        // --- StepHullWorldN brings a dropped htetra to REST on the floor (maxSpeed below band, maxPen within
+        // band) over N ticks; and the step is DETERMINISTIC (two runs byte-equal). ---
+        {
+            const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            convex::ConvexStepConfig cfg;
+            cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+            cfg.dt          = kOne / 60;
+            cfg.solveIters  = 20;
+            cfg.restitution = 0;
+            cfg.slop        = kOne / 64;
+            cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+            cfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+            cfg.angDamp     = (fx)((int64_t)50 * kOne / 100);  // 0.5
+            cfg.posIters    = 4;
+            const uint32_t kTicks = 240u;
+
+            auto buildScene = [&]() {
+                gjk::HullWorld w;
+                // a wide static FLOOR (hbox-hull, top y = 1) + a dropped TETRA above it.
+                // Floor half-extent 4 (NOT 8): the frozen GJ2 GJK stalls (hits kGjkMaxIter -> reports
+                // separated) for a small hull deeply inside a VERY large hbox (verts at +-8 blow up the
+                // Minkowski support magnitudes past the fixed-point progress test); half-extent 4 keeps GJK
+                // converging in ~2 iters with the correct depth. Documented GJ4 scene constraint.
+                w.bodies.push_back(hbodyAt(0, 0, 0, false)); w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));
+                w.bodies.push_back(hbodyAt(0, 3, 0, true));  w.hulls.push_back(gjk::MakeTetra(kOne));
+                return w;
+            };
+
+            gjk::HullWorld w1 = buildScene();
+            gjk::StepHullWorldN(w1, cfg, kTicks);
+            const gjk::HullStackMeasure ms = gjk::MeasureHullStack(w1);
+            check(ms.maxSpeed < kOne, "StepHullWorldN: dropped htetra came to REST (maxSpeed < 1 unit/s)");
+            check(ms.maxPenetration < kOne / 4,
+                  "StepHullWorldN: htetra HELD on the floor (maxPen within slop+band, not sunk)");
+            // it did not fall through: the htetra center stays above the floor top (y=1).
+            check(w1.bodies[1].pos.y > kOne, "StepHullWorldN: htetra rests ABOVE the floor top (no sink)");
+
+            // determinism: a second identical run is byte-equal.
+            gjk::HullWorld w2 = buildScene();
+            gjk::StepHullWorldN(w2, cfg, kTicks);
+            check(w1.bodies.size() == w2.bodies.size() &&
+                  std::memcmp(w1.bodies.data(), w2.bodies.data(),
+                              w1.bodies.size() * sizeof(fpx::FxBody)) == 0,
+                  "StepHullWorldN is deterministic (two runs byte-identical)");
+        }
+    }
+
     (void)hullNames;
     if (g_fail == 0) std::printf("gjk_test: ALL PASS\n");
     else std::printf("gjk_test: %d FAIL\n", g_fail);

@@ -1174,6 +1174,21 @@ hf_compile_shaders(
     # order-dependent (the Gauss-Seidel + in-place de-pen). Pure integer SSBO compute + ReadBuffer ->
     # bit-exact GPU==CPU final body world + cross-backend, proven memcmp. NO new RHI. THE SETTLING STACK.
     "shaders/convex_step.comp.hlsl:cs"
+    # General Convex-Hull Contacts Slice 4 (Slice GJ4, THE NEW-PHYSICS BEAT): hull_step.comp is THE HULL WORLD
+    # STEP — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE StepHullWorldN over the small hull set (all-pairs
+    # over the few hulls): K ticks of predict-integrate -> all-pairs GJK/EPA narrowphase (HullContact =
+    # Gjk->Epa->ContactManifold) -> world Gauss-Seidel impulse -> POSITION de-penetration, copying
+    # engine/sim/gjk.h::StepHullWorld/StepHullWorldN VERBATIM (the StepConvexWorld 5-pass shell with the ONLY
+    # swap being BoxSatStable -> HullContact, the SAME fixed body+pair orders, the SAME split-by-invMass linear
+    # de-pen with slop+beta, the SAME per-tick damping). So arbitrary convex polyhedra (tetra/octa/wedge/box)
+    # integrate, collide, and SETTLE (a tetra resting on its triangular FACE — physics the box-only SAT can't
+    # represent). stepEnabled=0 -> bodies UNCHANGED. Like convex_step.comp / gjk_epa.comp this is int64 (the
+    # GJK/EPA support + the inertia fxdiv + the FxDot/FxCross/FxRotate/quaternion Q16.16 products), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --gjk-settle runs
+    # the CPU StepHullWorldN instead (byte-identical by construction). Single-thread because the world step is
+    # order-dependent (the Gauss-Seidel + in-place de-pen). Pure integer SSBO compute + ReadBuffer -> bit-exact
+    # GPU==CPU final body world + cross-backend, proven memcmp. NO new RHI. THE SETTLING HULL WORLD.
+    "shaders/hull_step.comp.hlsl:cs"
     # Deterministic Contact Friction Slice 1 (Slice FC1, the BEACHHEAD of FLAGSHIP #20: DETERMINISTIC
     # TANGENTIAL CONTACT FRICTION, hf::sim::fric): fric_basis.comp is THE TANGENT BASIS pass — ONE THREAD PER
     # INPUT NORMAL (per-normal INDEPENDENT, 64 threads/group, NO atomics) runs the fixed integer Gram-Schmidt

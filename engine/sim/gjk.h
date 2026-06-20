@@ -1080,5 +1080,215 @@ inline EpaMeasure MeasureEpa(const GjkPair* pairs, uint32_t count) {
     return m;
 }
 
+// =========================================================================================================
+// Slice GJ4 — General Convex-Hull Contacts: THE HULL WORLD STEP (the new-physics beat). APPENDED after
+// MeasureEpa (GJ1+GJ2+GJ3's lines above are BYTE-FROZEN). This puts the GJK/EPA narrowphase to WORK: it
+// reproduces convex::StepConvexWorld's deterministic 5-pass tick with the ONLY swap being the box-box SAT
+// narrowphase (convex::BoxSatStable) -> the GJK/EPA hull narrowphase (HullContact). So arbitrary convex
+// polyhedra (tetra/octa/wedge/box) integrate, collide, and SETTLE bit-identically across CPU/Vulkan/Metal —
+// physics the box-only SAT cannot represent (a tetra resting on its triangular FACE). Steps 1/3/5 (the
+// integrator, the impulse solver, the orientation) are reused VERBATIM from convex.h/fpx.h on the FxBody a
+// hull body has identically. Pure integer Q16.16, every order PINNED. hull_step.comp copies StepHullWorldN
+// VERBATIM (int64 -> Vulkan-only; Metal --gjk-settle runs the CPU path -> byte-identical by construction).
+//
+// THE int64 REALITY (the GJ1-GJ3 / CX4 lesson): the whole chain (GJK/EPA support + the inertia fxdiv + the
+// FxDot/FxCross/FxMat3MulVec/quaternion products) is int64. DXC compiles int64 (Vulkan); glslc CANNOT parse
+// int64 in HLSL, so shaders/hull_step.comp.hlsl is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal
+// --gjk-settle runs THIS CPU StepHullWorldN -> byte-identical to the Vulkan GPU result BY CONSTRUCTION,
+// while the Vulkan side carries the GPU==CPU memcmp.
+//
+// DESIGN CALLS (locked):
+//   * Diagonal hull inertia reusing convex::WorldInvInertia (no fixed-point 3x3 inverse): FxHullInvInertiaBody
+//     computes the hull's bounding-box half-extents (max |vert| per axis over the local verts) and returns the
+//     analytic box diagonal inverse inertia of THOSE half-extents (== convex::FxBoxInvInertiaBody by formula).
+//     This is EXACT for a cube hull (its AABB half-extents ARE its box half-extents — the cross-check the test
+//     asserts) and a documented diagonal approximation for the other symmetric canonical hulls (the
+//     off-diagonal products of inertia are dropped; a full symmetric-3x3 integer inertia + inverse is a future
+//     refinement). A STATIC body (invMass==0) -> (0,0,0). Pure integer, deterministic.
+//   * Single-point manifold (count 1) from EPA: HullContact runs Gjk; separated -> empty manifold; overlap ->
+//     Epa, then a convex::ContactManifold with normal = the EPA normal, one point = the MIDPOINT of the EPA
+//     contactA/contactB witnesses (the deterministic single contact — a face-resting hull may ROCK on one
+//     point, the documented stability limit; incident-face clipping for a multi-point manifold is a GJ-future
+//     refinement), depth = the EPA depth, count = 1. The EPA featureFaceId is mapped into the manifold's
+//     axisIndex/featureIndex slots (the convex::SatResult feature analog — keeps the manifold ContactKey-able
+//     for a future warm-start hull path). convex::ContactManifold is REUSED VERBATIM (no new manifold type).
+//   * angDamp is the stability knob (as in the convex step): the single-point manifold leaves a residual
+//     torque; a mild angular drag bleeds the spurious spin so the hull RESTS (the showcase uses 0.5).
+
+// ----- FxHullInvInertiaBody(hull, invMass): the hull's DIAGONAL body-space inverse inertia ----------------
+// The FxBoxInvInertiaBody analog for a general hull. We take the hull's AXIS-ALIGNED BOUNDING half-extents
+// (h_k = max over verts of |vert_k|, per axis, in FIXED vertex order) and return the analytic box diagonal
+// inverse inertia of those half-extents: invIbody = (3*invMass/(hy²+hz²), 3*invMass/(hx²+hz²),
+// 3*invMass/(hx²+hy²)) — IDENTICAL to convex::FxBoxInvInertiaBody by construction. For a cube hull (MakeBox)
+// the AABB half-extents ARE the box half-extents, so this EQUALS FxBoxInvInertiaBody for the same extents
+// (the cross-check). For the other canonical hulls it is the bounding-box diagonal inertia (a documented
+// approximation; the off-diagonal products of inertia are dropped — diagonal-only, exact for hulls symmetric
+// about the body origin). A STATIC body (invMass==0) -> (0,0,0). Pure integer, FIXED scan, identical CPU/GPU.
+inline FxVec3 FxHullInvInertiaBody(const FxHull& hull, fx invMass) {
+    if (invMass == 0) return FxVec3{0, 0, 0};
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    fx hx = 0, hy = 0, hz = 0;   // bounding half-extents = max |vert| per axis (FIXED vertex order)
+    for (uint32_t i = 0; i < hull.count; ++i) {
+        const fx ax = absfx(hull.verts[i].x), ay = absfx(hull.verts[i].y), az = absfx(hull.verts[i].z);
+        if (ax > hx) hx = ax;
+        if (ay > hy) hy = ay;
+        if (az > hz) hz = az;
+    }
+    const fx hx2 = fxmul(hx, hx), hy2 = fxmul(hy, hy), hz2 = fxmul(hz, hz);
+    const fx three = 3 * invMass;   // 3·invMass in Q16.16 (invMass < a few kOne -> no int32 overflow)
+    return FxVec3{
+        fxdiv(three, hy2 + hz2),
+        fxdiv(three, hx2 + hz2),
+        fxdiv(three, hx2 + hy2),
+    };
+}
+
+// ----- HullContact(bodyA, hullA, bodyB, hullB): the GJK/EPA narrowphase -> a convex::ContactManifold -------
+// Run Gjk; if the hulls do NOT overlap -> an empty manifold (count 0). If they overlap -> Epa(.., simplex)
+// for the depth+normal+contacts, and build a convex::ContactManifold: normal = the EPA UNIT normal (A->B),
+// ONE contact point = the MIDPOINT of the EPA contactA/contactB witnesses (documented single-point choice),
+// depths[0] = the EPA penetration depth, count = 1. (Single point -> a face-resting hull may rock; the
+// documented limit.) The EPA featureFaceId is stashed in the unused depths[3] slot (the ContactKey raw
+// material for a future warm-start hull path — the manifold carries no axisIndex field, so the feature id
+// rides the spare depth lane; it does NOT affect the solver, which reads only count/points/depths[0]/normal).
+// Pure integer, deterministic, identical CPU/GPU.
+inline convex::ContactManifold HullContact(const FxBody& bodyA, const FxHull& hullA,
+                                           const FxBody& bodyB, const FxHull& hullB) {
+    convex::ContactManifold m;   // count 0, points/depths/normal zeroed by the struct defaults
+    const GjkResult g = Gjk(hullA, bodyA, hullB, bodyB);
+    if (!g.overlap) return m;     // separated -> empty manifold
+    const EpaResult e = Epa(hullA, bodyA, hullB, bodyB, g.simplex);
+    m.count = 1u;
+    m.normal = e.normal;          // UNIT, A->B (the SolveManifoldImpulse + de-pen sign-correct it consistently)
+    m.points[0] = FxVec3{(e.contactA.x + e.contactB.x) / 2,
+                         (e.contactA.y + e.contactB.y) / 2,
+                         (e.contactA.z + e.contactB.z) / 2};   // midpoint of the two witnesses
+    m.depths[0] = e.depth;
+    m.depths[3] = (fx)e.featureFaceId;   // the deterministic feature id (the spare lane; solver ignores it)
+    return m;
+}
+
+// ----- HullWorld: a small set of oriented convex hulls, parallel bodies[i] <-> hulls[i] (the ConvexWorld
+// analog). Some bodies are STATIC (invMass==0, e.g. the floor). hulls[i] is body i's collision hull (local
+// verts, immutable/shared like a box's half-extents).
+struct HullWorld {
+    std::vector<FxBody> bodies;
+    std::vector<FxHull> hulls;
+};
+
+// ----- StepHullWorld(world, cfg): ONE deterministic tick — the convex::StepConvexWorld 5-pass shell with
+// the ONLY swap being BoxSatStable -> HullContact. ALL orders PINNED. The shader copies THIS body VERBATIM.
+//   (1) predict-integrate every dynamic body (fpx::IntegrateBodyFull + gravity) + per-tick linDamp/angDamp;
+//   (2) world inverse inertias once/tick (FxHullInvInertiaBody + convex::WorldInvInertia);
+//   (3) impulse solve — cfg.solveIters world-level Gauss-Seidel sweeps over the all-pairs i<j list, per
+//       overlapping pair HullContact -> convex::SolveManifoldImpulse (ONE inner sweep);
+//   (4) position de-penetration — cfg.posIters sweeps, per overlapping pair push apart along the
+//       A->B-corrected manifold normal by fxmul(max(0, pen-slop), beta) split by inverse mass (LINEAR only);
+//   (5) orientation was integrated in (1).
+inline void StepHullWorld(HullWorld& world, const convex::ConvexStepConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // (1) predict-integrate dynamic bodies (statics untouched) + per-tick velocity retention (angDamp is the
+    // resting-hull stability knob; kOne == none). Fixed body order. (== StepConvexWorld step 1.)
+    for (size_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != kOne) world.bodies[i].vel = convex::FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != kOne) world.bodies[i].angVel = convex::FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // The world inverse inertias, recomputed ONCE per tick from the post-integrate orient (the common cheap
+    // choice; deterministic). Statics -> a zero matrix (FxHullInvInertiaBody(.,0) -> 0). (== step 2.)
+    std::vector<convex::FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxVec3 invIbody = FxHullInvInertiaBody(world.hulls[i], world.bodies[i].invMass);
+        invIW[i] = convex::WorldInvInertia(world.bodies[i], invIbody);
+    }
+
+    // (3) impulse solve — world-level Gauss-Seidel over the all-pairs list, FIXED i<j order each outer sweep,
+    // ONE SolveManifoldImpulse sweep per pair (mutating bodies in place — later pairs see it). Skip
+    // static-static. The manifold is re-derived per pair per sweep from the CURRENT positions. (== step 3.)
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+                const convex::ContactManifold m = HullContact(world.bodies[i], world.hulls[i],
+                                                              world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                convex::SolveManifoldImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], m,
+                                             cfg.restitution, 1);   // ONE inner sweep — the outer loop is the GS
+            }
+        }
+    }
+
+    // (4) position de-penetration — cfg.posIters sweeps, each over every overlapping pair in the FIXED i<j
+    // order, pushing the two bodies APART along the A->B-corrected manifold normal by
+    //   corrected = fxmul(max(0, depths[0] - slop), beta)
+    // split by inverse mass (both static -> skip; one static -> the dynamic takes all). LINEAR only. Re-run
+    // HullContact for the current depth. Fixed order, in place. (== StepConvexWorld step 4, normal/depth from
+    // the manifold instead of BoxSat.)
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;   // both static -> skip
+                const convex::ContactManifold m = HullContact(world.bodies[i], world.hulls[i],
+                                                              world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                FxVec3 nrm = m.normal;
+                if (FxDot(nrm, FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                const fx excess = m.depths[0] - cfg.slop;
+                if (excess <= 0) continue;   // within the allowed band -> no push (the anti-jitter slop)
+                const fx corrected = fxmul(excess, cfg.beta);
+                const fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                const fx wj = kOne - wi;
+                const FxVec3 ci = convex::FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = convex::FxScale(nrm, fxmul(corrected, wj));
+                world.bodies[i].pos = FxSub(world.bodies[i].pos, ci);
+                world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+    // (5) orientation was already integrated in step (1).
+}
+
+// ----- StepHullWorldN(world, cfg, ticks): run `ticks` StepHullWorld steps -> the hulls settle. ------------
+inline void StepHullWorldN(HullWorld& world, const convex::ConvexStepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepHullWorld(world, cfg);
+}
+
+// ----- HullStackMeasure: the deterministic rest/interpenetration summary of a settled hull world (the
+// convex::StackMeasure analog). maxSpeed = max FxLength(vel) over the DYNAMIC bodies (the rest test);
+// maxPenetration = max HullContact depth over all i<j pairs (the held test); dynamicCount. Pure integer.
+struct HullStackMeasure {
+    fx       maxSpeed       = 0;
+    fx       maxPenetration = 0;
+    uint32_t dynamicCount   = 0;
+};
+
+// MeasureHullStack(world): the deterministic rest + interpenetration summary (pure integer, fixed order).
+inline HullStackMeasure MeasureHullStack(const HullWorld& world) {
+    HullStackMeasure ms;
+    const size_t n = world.bodies.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            ++ms.dynamicCount;
+            const fx sp = fpx::FxLength(world.bodies[i].vel);
+            if (sp > ms.maxSpeed) ms.maxSpeed = sp;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;
+            const convex::ContactManifold m = HullContact(world.bodies[i], world.hulls[i],
+                                                          world.bodies[j], world.hulls[j]);
+            if (m.count != 0 && m.depths[0] > ms.maxPenetration) ms.maxPenetration = m.depths[0];
+        }
+    }
+    return ms;
+}
+
 }  // namespace gjk
 }  // namespace hf::sim
