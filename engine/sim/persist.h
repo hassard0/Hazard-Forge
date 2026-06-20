@@ -29,6 +29,7 @@
 // "warm-start misses at sliding contacts" caveat.
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "sim/fric.h"   // read-only: convex::SatResult/ContactManifold/FxBox/SatPair + fpx::FxBody (transitive)
@@ -863,6 +864,226 @@ inline SleepMeasure MeasureSleep(const ConvexWorld& world, const std::vector<Sle
         }
     }
     return m;
+}
+
+// =========================================================================================================
+// Slice PS5 — DETERMINISTIC PERSISTENT CONTACTS: LOCKSTEP + ROLLBACK (THE NETCODE HEADLINE). APPENDED after
+// MeasureSleep (PS1-PS4's lines above are BYTE-FROZEN). PS1 built the contact key, PS2 the persistent cache,
+// PS3 the warm-started solver, PS4 deterministic sleeping islands. PS5 proves the WHOLE warm+sleeping sim is
+// LOCKSTEP- and ROLLBACK-replayable: two peers fed only an input-command stream warm-start, sleep, wake, and
+// re-derive the entire world byte-identical, and a rollback re-sims from a snapshot bit-for-bit. The KEY
+// difference from CX5/FC5: the replayable state now INCLUDES the persistent impulse cache + the per-body sleep
+// state, NOT just the bodies — a peer that only snapshotted the bodies would diverge (warm-starting from the
+// wrong impulses / mis-timing the sleep). So PS5's snapshot captures the TRIPLE (bodies + cache + sleep).
+//
+// PURE CPU (NO GPU shader, NO new RHI). MAXIMAL REUSE: the warm world is a convex::ConvexWorld (the SAME type
+// CX5's lockstep machinery operates on), so PS5 REUSES the FROZEN CX5 command machinery VERBATIM
+// (convex::ConvexCommand / kConvexCmdAddImpulse / kConvexCmdSetAngVel / ApplyConvexCommands / ConvexBodiesEqual
+// — defined in convex.h, NOT redefined) and only swaps the per-tick step to StepWarmSleepWorld (PS4) +
+// EXTENDS the snapshot/restore/equality to the cache + sleep. PS5's SimPersistTick / RunPersistLockstep /
+// RunPersistRollback mirror fric::SimFricTick / RunFricLockstep / RunFricRollback EXACTLY with that swap + the
+// extended replayable state. Both backends run the IDENTICAL CPU harness -> the converged authority-world
+// golden is bit-identical BY CONSTRUCTION (cross-vendor 0 px).
+
+// Pull the frozen CX5 command machinery into this namespace (re-use, do NOT redefine).
+using convex::ConvexCommand;
+using convex::kConvexCmdAddImpulse;
+using convex::kConvexCmdSetAngVel;
+using convex::ApplyConvexCommands;
+using convex::ConvexBodiesEqual;
+
+// ----- SimPersistTick(world, cache, sleep, cfg, commands, tick): ONE deterministic warm+sleep tick ---------
+// (1) convex::ApplyConvexCommands(world, commands, tick) — this tick's perturbations (a wake-impulse / a spin),
+//     in FIXED array order, BEFORE the step so a command that adds velocity raises the body's KE BEFORE the
+//     KE/sleep evaluation inside StepWarmSleepWorld measures it (the frozen CX5 helper, reused VERBATIM);
+// (2) StepWarmSleepWorld(world, cache, sleep, cfg) — the PS4 warm+sleep tick (KE hysteresis -> island
+//     propagation -> asleep-body freeze/skip -> warm impulse solve -> de-pen -> cache rebuild), reused
+//     VERBATIM. Pure integer, fixed order -> bit-identical on every peer/platform. The SimFricTick twin with
+//     StepFrictionWorld swapped for StepWarmSleepWorld + the cache+sleep carried through.
+inline void SimPersistTick(ConvexWorld& world, PersistentCache& cache, std::vector<SleepState>& sleep,
+                           const SleepConfig& cfg, const std::vector<ConvexCommand>& commands, uint32_t tick) {
+    ApplyConvexCommands(world, commands, tick);
+    StepWarmSleepWorld(world, cache, sleep, cfg);
+}
+
+// ----- PersistSnapshot: the FULL replayable state at a tick (the rollback restore point) -------------------
+// Unlike ConvexSnapshot (bodies only), the warm+sleep sim's replayable state is THREE things: the body world,
+// the persistent impulse cache (PS2 — last tick's accumulated impulses the warm-start reads), and the per-body
+// SleepState[] (PS4 — energy/quietTicks/asleep). A peer that only restored the bodies would diverge. All three
+// are deep-copied (std::vector copies). Bit-exact round-trip with RestorePersist.
+struct PersistSnapshot {
+    std::vector<FxBody>     bodies;   // a deep-copy of the body world (vel/pos/orient/angVel/invMass/flags)
+    PersistentCache         cache;    // a deep-copy of the persistent impulse cache (the warm-start inputs)
+    std::vector<SleepState> sleep;    // a deep-copy of the per-body sleep state (energy/quietTicks/asleep)
+    uint32_t                tick = 0; // the tick this snapshot was taken at (the rollback restore point)
+};
+
+// ----- SnapshotPersist(world, cache, sleep, tick): deep-copy the (bodies, cache, sleep) triple --------------
+// Value copies -> deep-copies all three vectors. Bit-exact round-trip with RestorePersist.
+inline PersistSnapshot SnapshotPersist(const ConvexWorld& world, const PersistentCache& cache,
+                                       const std::vector<SleepState>& sleep, uint32_t tick) {
+    PersistSnapshot snap;
+    snap.bodies = world.bodies;   // deep copy
+    snap.cache  = cache;          // deep copy (the entries vector)
+    snap.sleep  = sleep;          // deep copy
+    snap.tick   = tick;
+    return snap;
+}
+
+// ----- RestorePersist(world, cache, sleep, snap): restore the (bodies, cache, sleep) triple ----------------
+// Memberwise copies — restores all three exactly. Bit-exact round-trip with SnapshotPersist. The `boxes` are
+// immutable/shared, so they are left untouched.
+inline void RestorePersist(ConvexWorld& world, PersistentCache& cache, std::vector<SleepState>& sleep,
+                           const PersistSnapshot& snap) {
+    world.bodies = snap.bodies;   // restore the deep-copied body world
+    cache        = snap.cache;    // restore the deep-copied cache
+    sleep        = snap.sleep;    // restore the deep-copied sleep state
+}
+
+// ----- CacheEntriesEqual(a, b): field equality of two persistent caches (the cache half of the memcmp) -----
+// Equal iff the same number of entries AND each entry's ContactKey (4 x uint32) + the three accumulated
+// impulses (3 x fx) match. The cache is rebuilt in a FIXED order each tick (StepWarmSleepWorld step 5), so two
+// peers that ran the same inputs produce the cache in the same order — a positional field-compare is exact.
+inline bool CacheEntriesEqual(const PersistentCache& a, const PersistentCache& b) {
+    if (a.entries.size() != b.entries.size()) return false;
+    for (size_t i = 0; i < a.entries.size(); ++i) {
+        const CachedContact& x = a.entries[i];
+        const CachedContact& y = b.entries[i];
+        if (!ContactKeysEqual(x.key, y.key)) return false;
+        if (x.normalImpulse   != y.normalImpulse)   return false;
+        if (x.tangentImpulse1 != y.tangentImpulse1) return false;
+        if (x.tangentImpulse2 != y.tangentImpulse2) return false;
+    }
+    return true;
+}
+
+// ----- SleepStatesEqual(a, b): field equality of two sleep-state arrays (the sleep half of the memcmp) -----
+// Equal iff the same length AND each SleepState's energy (fx) + quietTicks (uint32) + asleep (bool) match.
+inline bool SleepStatesEqual(const std::vector<SleepState>& a, const std::vector<SleepState>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].energy     != b[i].energy)     return false;
+        if (a[i].quietTicks != b[i].quietTicks) return false;
+        if (a[i].asleep     != b[i].asleep)     return false;
+    }
+    return true;
+}
+
+// ----- PersistStatesEqual(bodiesA,cacheA,sleepA, bodiesB,cacheB,sleepB): the make-or-break TRIPLE memcmp ----
+// Two warm+sleep states are equal ONLY if ALL THREE match: the bodies (convex::ConvexBodiesEqual — a flat-POD
+// memcmp), the persistent cache (CacheEntriesEqual), and the per-body sleep state (SleepStatesEqual). This is
+// the comparison the lockstep + rollback proofs build on — a peer that re-derived the bodies but diverged on
+// the cache or the sleep timing is NOT equal. (Parameter shape: the three components passed explicitly so the
+// harness can compare an authority world against a replica world / a snapshot triple without packing a struct.)
+inline bool PersistStatesEqual(const std::vector<FxBody>& bodiesA, const PersistentCache& cacheA,
+                               const std::vector<SleepState>& sleepA,
+                               const std::vector<FxBody>& bodiesB, const PersistentCache& cacheB,
+                               const std::vector<SleepState>& sleepB) {
+    return ConvexBodiesEqual(bodiesA, bodiesB)
+        && CacheEntriesEqual(cacheA, cacheB)
+        && SleepStatesEqual(sleepA, sleepB);
+}
+
+// ----- PersistState: the small bundle RunPersistLockstep returns (the converged authority TRIPLE) ----------
+// The showcase needs the authority WORLD to render + the cache/sleep to prove equality; bundling the three
+// keeps the entry-point signature clean (the fric:: harness returns just the world; PS5 returns the triple).
+struct PersistState {
+    ConvexWorld             world;
+    PersistentCache         cache;
+    std::vector<SleepState> sleep;
+};
+
+// ----- RunPersistLockstep(world0, cache0, sleep0, cfg, commands, ticks, outIdentical): two peers converge ---
+// THE peer entry point (the fric::RunFricLockstep control flow over SimPersistTick, with the cache+sleep added
+// to the replayable state). Two independent peers (authority + replica) BOTH start from the SAME initial
+// (world0, cache0, sleep0), BOTH run SimPersistTick for `ticks` with the SAME command stream (INPUTS ONLY — no
+// state shared; each peer carries its OWN cache+sleep copies through the loop) -> BIT-IDENTICAL by determinism.
+// Sets *outIdentical (if non-null) to whether the two final (bodies, cache, sleep) TRIPLES are byte-identical
+// (PersistStatesEqual — the make-or-break lockstep proof) + returns the converged AUTHORITY triple (for the
+// golden render + the equality proofs). The peer step order is PINNED.
+inline PersistState RunPersistLockstep(const ConvexWorld& world0, const PersistentCache& cache0,
+                                       const std::vector<SleepState>& sleep0, const SleepConfig& cfg,
+                                       const std::vector<ConvexCommand>& commands, uint32_t ticks,
+                                       bool* outIdentical = nullptr) {
+    ConvexWorld             authWorld = world0;   // a fresh copy
+    PersistentCache         authCache = cache0;
+    std::vector<SleepState> authSleep = sleep0;
+    ConvexWorld             repWorld = world0;    // the second peer fed the SAME inputs
+    PersistentCache         repCache = cache0;
+    std::vector<SleepState> repSleep = sleep0;
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimPersistTick(authWorld, authCache, authSleep, cfg, commands, t);
+        SimPersistTick(repWorld,  repCache,  repSleep,  cfg, commands, t);
+    }
+    if (outIdentical)
+        *outIdentical = PersistStatesEqual(authWorld.bodies, authCache, authSleep,
+                                           repWorld.bodies,  repCache,  repSleep);
+    PersistState out;
+    out.world = std::move(authWorld);
+    out.cache = std::move(authCache);
+    out.sleep = std::move(authSleep);
+    return out;
+}
+
+// ----- RunPersistRollback(world0, cache0, sleep0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...)
+// The rollback harness (the fric::RunFricRollback control flow over SimPersistTick, with the cache+sleep added
+// to the snapshot). (1) advance ticks 0..rollbackAt from the initial triple applying authStream (carrying the
+// cache+sleep); (2) SnapshotPersist AT rollbackAt (ALL THREE — bodies + cache + sleep); (2b) speculatively
+// advance a few ticks (<=3) with the MISPREDICTED stream (a WRONG/extra impulse — the client prediction that
+// diverges), capturing that diverged triple; (3) ROLLBACK — RestorePersist to the snapshot (ALL THREE) +
+// RE-SIMULATE rollbackAt..ticks with the CORRECT authStream -> the corrected final triple. Returns the
+// corrected world; sets *outCorrectedEqAuthority (if non-null) to whether the corrected triple ==
+// RunPersistLockstep(world0, cache0, sleep0, cfg, authStream, ticks) byte-for-byte over ALL THREE, and
+// *outMispredictDiverged (if non-null) to whether the speculative pre-rollback triple DIFFERED (in at least one
+// of bodies/cache/sleep) from the authority at the same tick (proving a REAL divergence was corrected, not a
+// no-op). cfg + the streams are CONSTANT, NOT snapshotted.
+inline ConvexWorld RunPersistRollback(const ConvexWorld& world0, const PersistentCache& cache0,
+                                      const std::vector<SleepState>& sleep0, const SleepConfig& cfg,
+                                      const std::vector<ConvexCommand>& authStream,
+                                      const std::vector<ConvexCommand>& mispredictStream,
+                                      uint32_t ticks, uint32_t rollbackAt,
+                                      bool* outCorrectedEqAuthority = nullptr,
+                                      bool* outMispredictDiverged = nullptr) {
+    ConvexWorld             w     = world0;
+    PersistentCache         cache = cache0;
+    std::vector<SleepState> sleep = sleep0;
+    // (1) advance 0..rollbackAt with the authoritative stream (carrying the cache+sleep).
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimPersistTick(w, cache, sleep, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — the FULL bodies+cache+sleep triple).
+    const PersistSnapshot snap = SnapshotPersist(w, cache, sleep, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged triple.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimPersistTick(w, cache, sleep, cfg, mispredictStream, rollbackAt + s);
+    ConvexWorld             specWorld = w;       // the diverged pre-rollback intermediate (the "real divergence" proof)
+    PersistentCache         specCache = cache;
+    std::vector<SleepState> specSleep = sleep;
+    // (3) ROLLBACK: restore the snapshot (the full triple) + re-sim rollbackAt..ticks with the authStream.
+    RestorePersist(w, cache, sleep, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimPersistTick(w, cache, sleep, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        ConvexWorld             authWorld = world0;
+        PersistentCache         authCache = cache0;
+        std::vector<SleepState> authSleep = sleep0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimPersistTick(authWorld, authCache, authSleep, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !PersistStatesEqual(specWorld.bodies, specCache, specSleep,
+                                                         authWorld.bodies, authCache, authSleep);
+        if (outCorrectedEqAuthority) {
+            const PersistState authFinal = RunPersistLockstep(world0, cache0, sleep0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = PersistStatesEqual(w.bodies, cache, sleep,
+                                                          authFinal.world.bodies, authFinal.cache, authFinal.sleep);
+        }
+    }
+    return w;
 }
 
 }  // namespace persist

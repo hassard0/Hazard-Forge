@@ -655,6 +655,156 @@ int main() {
         }
     }
 
+    // =========================================================================================================
+    // Slice PS5 — LOCKSTEP + ROLLBACK (THE NETCODE HEADLINE). The whole warm+sleeping sim is replayable from
+    // inputs alone, with the replayable state = the TRIPLE (bodies + persistent cache + per-body sleep state).
+    // The make-or-break: (a) two peers fed only a command stream converge BYTE-IDENTICAL over all three;
+    // (b) SnapshotPersist/RestorePersist round-trip the triple exactly; (c) a rollback re-sims from a snapshot
+    // bit-for-bit to the authority; (d) the mispredicted intermediate genuinely DIVERGED; (e) a snapshot taken
+    // while the tower is ASLEEP restores so the replica stays asleep (the sleep state is part of the state);
+    // (f) two RunPersistLockstep runs byte-identical.
+    {
+        const fpx::FxQuat qI{0, 0, 0, convex::kOne};
+        const convex::fx kOne = convex::kOne;
+        auto fi = [&](int v) { return (convex::fx)(v * (int)convex::kOne); };
+        const convex::fx kGravY = (convex::fx)(-9.8 * (double)kOne - 0.5);
+
+        auto makeBody = [&](convex::fx x, convex::fx y, convex::fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = qI;
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            return b;
+        };
+        const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+        const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+        // The SAME PS4 warm+sleep tower scene (a static floor + 3 dynamic slabs).
+        auto buildTower = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+            w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+            return w;
+        };
+
+        persist::SleepConfig cfg;
+        cfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.warm.dt          = kOne / 60;
+        cfg.warm.solveIters  = 20;
+        cfg.warm.restitution = 0;
+        cfg.warm.slop        = kOne / 64;
+        cfg.warm.beta        = (convex::fx)((int64_t)4 * kOne / 10);    // 0.4
+        cfg.warm.linDamp     = (convex::fx)((int64_t)98 * kOne / 100);  // 0.98
+        cfg.warm.angDamp     = (convex::fx)((int64_t)90 * kOne / 100);  // 0.90
+        cfg.warm.posIters    = 4;
+        cfg.warm.mu          = kOne;
+        cfg.sleepThreshold   = kOne;
+        cfg.wakeThreshold    = (convex::fx)(2 * (int)kOne);
+        cfg.sleepDelay       = 30;
+
+        // The deterministic command stream: a couple of early perturbations, then (with the tower settled +
+        // ASLEEP) a wake-impulse at a fixed later tick wakes + topples it. A wake-impulse on a sleeping body is
+        // the PS4 wake event; ApplyConvexCommands runs BEFORE the step so the KE/sleep evaluation sees it.
+        const uint32_t kTicks    = 220;
+        const uint32_t kWakeTick = 160;   // > sleepDelay after settling: the tower is asleep by here
+        std::vector<convex::ConvexCommand> authStream;
+        // Early perturbations (small lateral nudges while still settling — exercise the warm solve).
+        authStream.push_back(convex::ConvexCommand{2u,  convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(1) / 2, 0, 0}});
+        authStream.push_back(convex::ConvexCommand{5u,  convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{-fi(1) / 4, 0, 0}});
+        // The wake-impulse (a strong lateral kick on the top slab — wakes the island + topples it).
+        authStream.push_back(convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(6), 0, 0}});
+
+        const convex::ConvexWorld w0 = buildTower();
+        const persist::PersistentCache cache0;            // cold start (empty cache)
+        const std::vector<persist::SleepState> sleep0;    // sized on first step
+
+        // ================= lockstep: authority == replica byte-for-byte (bodies + cache + sleep) =================
+        {
+            bool identical = false;
+            const persist::PersistState auth = persist::RunPersistLockstep(w0, cache0, sleep0, cfg, authStream,
+                                                                           kTicks, &identical);
+            check(identical, "PS5 lockstep: authority == replica BIT-IDENTICAL (bodies + cache + sleep)");
+            // The tower actually woke + moved by kWakeTick (the scene exercises wake, not a frozen no-op).
+            const persist::SleepMeasure m = persist::MeasureSleep(auth.world, auth.sleep);
+            check(m.awakeCount > 0 || m.maxSpeed > 0,
+                  "PS5 lockstep: the wake-impulse actually woke/moved the tower (the scene is non-trivial)");
+            (void)m;
+        }
+
+        // ================= determinism: two RunPersistLockstep runs byte-identical (the triple) =================
+        {
+            const persist::PersistState a = persist::RunPersistLockstep(w0, cache0, sleep0, cfg, authStream, kTicks);
+            const persist::PersistState b = persist::RunPersistLockstep(w0, cache0, sleep0, cfg, authStream, kTicks);
+            check(persist::PersistStatesEqual(a.world.bodies, a.cache, a.sleep,
+                                              b.world.bodies, b.cache, b.sleep),
+                  "PS5 determinism: two RunPersistLockstep runs BYTE-IDENTICAL (bodies + cache + sleep)");
+        }
+
+        // ================= snapshot/restore round-trips the triple exactly =================
+        {
+            // Advance partway to a non-trivial state (some cache + some sleep), snapshot, mutate, restore.
+            convex::ConvexWorld w = w0;
+            persist::PersistentCache c = cache0;
+            std::vector<persist::SleepState> s = sleep0;
+            for (uint32_t t = 0; t < 50u; ++t) persist::SimPersistTick(w, c, s, cfg, authStream, t);
+            const persist::PersistSnapshot snap = persist::SnapshotPersist(w, c, s, 50u);
+            // Mutate all three (advance several ticks — bodies + cache + sleep all change).
+            for (uint32_t t = 50u; t < 70u; ++t) persist::SimPersistTick(w, c, s, cfg, authStream, t);
+            check(!persist::PersistStatesEqual(w.bodies, c, s, snap.bodies, snap.cache, snap.sleep),
+                  "PS5 snapshot: advancing past the snapshot genuinely changed the triple (a real round-trip)");
+            persist::RestorePersist(w, c, s, snap);
+            check(persist::PersistStatesEqual(w.bodies, c, s, snap.bodies, snap.cache, snap.sleep),
+                  "PS5 snapshot: RestorePersist restores the (bodies + cache + sleep) triple EXACTLY");
+        }
+
+        // ================= a snapshot taken while the tower is ASLEEP restores -> the replica stays asleep ======
+        {
+            // Settle + sleep WITHOUT the wake-impulse (only the early nudges, which fade before sleepDelay).
+            std::vector<convex::ConvexCommand> settleStream;
+            settleStream.push_back(authStream[0]);
+            settleStream.push_back(authStream[1]);
+            convex::ConvexWorld w = w0;
+            persist::PersistentCache c = cache0;
+            std::vector<persist::SleepState> s = sleep0;
+            for (uint32_t t = 0; t < kWakeTick; ++t) persist::SimPersistTick(w, c, s, cfg, settleStream, t);
+            const persist::SleepMeasure mAsleep = persist::MeasureSleep(w, s);
+            check(mAsleep.asleepCount == 3 && mAsleep.awakeCount == 0,
+                  "PS5 sleep-snapshot: the tower is fully ASLEEP at the snapshot point");
+            const persist::PersistSnapshot snap = persist::SnapshotPersist(w, c, s, kWakeTick);
+            // A replica restores the snapshot + steps quietly (no command) -> must stay asleep (zero residual).
+            // The replica is seeded with the static scene GEOMETRY first (boxes are immutable/shared and NOT
+            // snapshotted by design — a real peer already knows the collision geometry); RestorePersist then
+            // overwrites the dynamic triple (bodies + cache + sleep) from the snapshot.
+            convex::ConvexWorld rw = w0; persist::PersistentCache rc; std::vector<persist::SleepState> rs;
+            persist::RestorePersist(rw, rc, rs, snap);
+            const std::vector<convex::ConvexCommand> none;
+            persist::SimPersistTick(rw, rc, rs, cfg, none, kWakeTick);
+            const persist::SleepMeasure mRep = persist::MeasureSleep(rw, rs);
+            check(mRep.asleepCount == 3 && mRep.maxSpeed == 0,
+                  "PS5 sleep-snapshot: the replica restored from the asleep snapshot STAYS ASLEEP (zero residual)");
+        }
+
+        // ================= rollback: corrected == authority AND the mispredict genuinely diverged =================
+        {
+            // The mispredicted stream: the WRONG wake-impulse (different body, different direction, wrong tick) —
+            // a client prediction that diverges, corrected by the rollback re-sim of the authStream.
+            std::vector<convex::ConvexCommand> mispredictStream;
+            mispredictStream.push_back(convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 2u,
+                                                             convex::FxVec3{-fi(7), 0, fi(3)}});
+            bool correctedEq = false, mispredictDiverged = false;
+            persist::RunPersistRollback(w0, cache0, sleep0, cfg, authStream, mispredictStream,
+                                        kTicks, kWakeTick, &correctedEq, &mispredictDiverged);
+            check(mispredictDiverged,
+                  "PS5 rollback: the mispredicted intermediate genuinely DIVERGED (a real divergence corrected)");
+            check(correctedEq,
+                  "PS5 rollback: the corrected re-sim == authority BIT-EXACT (bodies + cache + sleep)");
+        }
+    }
+
     if (g_fail == 0) std::printf("persist_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

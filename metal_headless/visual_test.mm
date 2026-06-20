@@ -28926,6 +28926,203 @@ static int RunFricLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice PS5 — Deterministic Persistent Contacts LOCKSTEP + ROLLBACK showcase (--persist-lockstep) =====
+// (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #21, the CX5/FC5/JT5 twin). PURE CPU — NO GPU compute, NO new
+// shader, NO new RHI; the PS5 harness (persist.h::RunPersistLockstep/RunPersistRollback) is header-only integer
+// math, so on Metal it runs the IDENTICAL CPU harness the Vulkan --persist-lockstep-shot runs on Windows -> the
+// converged authority-world golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform
+// bit-identity IS the lockstep evidence). THE KEY DIFFERENCE from CX5/FC5: the replayable state INCLUDES the
+// persistent impulse CACHE (PS2) + the per-body SLEEP STATE (PS4), so the snapshot captures the TRIPLE
+// (bodies+cache+sleep) and PersistStatesEqual compares all three. MAXIMAL REUSE: the PS4 StepWarmSleepWorld is
+// reused VERBATIM; PS5 only ADDS SimPersistTick + RunPersistLockstep + RunPersistRollback, REUSING the frozen
+// CX5 convex:: command helpers. Builds the SAME PS4 warm+sleep tower + the SAME command stream as the Vulkan
+// --persist-lockstep-shot, runs RunPersistLockstep twice + RunPersistRollback once; asserts authority==replica
+// (bodies+cache+sleep) + rollback==authority + mispredicted!=authority BIT-EXACT; renders the converged
+// authority world via the PS4 2D side-view render path. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/persist_lockstep.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunPersistLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex  = hf::sim::convex;
+    namespace persist = hf::sim::persist;
+    namespace fpx     = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+
+    // The deterministic warm+sleep config (== the Vulkan --persist-lockstep-shot + the PS4 --persist-sleep config).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    persist::SleepConfig kCfg;
+    kCfg.warm.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.warm.dt          = kOne / 60;
+    kCfg.warm.solveIters  = 20;
+    kCfg.warm.restitution = 0;
+    kCfg.warm.slop        = kOne / 64;
+    kCfg.warm.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    kCfg.warm.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+    kCfg.warm.angDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+    kCfg.warm.posIters    = 4;
+    kCfg.warm.mu          = kOne;
+    kCfg.sleepThreshold   = kOne;
+    kCfg.wakeThreshold    = (fx)(2 * (int)kOne);
+    kCfg.sleepDelay       = 30;
+    const uint32_t kTicks    = 220u;
+    const uint32_t kWakeTick = 160u;   // the tower is asleep here; also rollbackAt
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const convex::FxBox kFloor{convex::FxVec3{fi(8), kOne, fi(8)}};
+    const convex::FxBox kSlab{convex::FxVec3{fi(3) / 2, kOne / 2, fi(3) / 2}};   // 3 x 1 x 3
+    auto buildTower = [&]() {
+        convex::ConvexWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false)); w.boxes.push_back(kFloor);
+        w.bodies.push_back(makeBody(0, fi(1) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(2) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        w.bodies.push_back(makeBody(0, fi(3) + kOne * 5 / 8, 0, true)); w.boxes.push_back(kSlab);
+        return w;
+    };
+    const convex::ConvexWorld kInit = buildTower();
+    const persist::PersistentCache kCache0;             // cold start (empty cache)
+    const std::vector<persist::SleepState> kSleep0;     // sized on first step
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The scripted authoritative command stream (== the Vulkan --persist-lockstep-shot, verbatim).
+    const std::vector<convex::ConvexCommand> authStream = {
+        convex::ConvexCommand{2u,        convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(1) / 2, 0, 0}},
+        convex::ConvexCommand{5u,        convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{-fi(1) / 4, 0, 0}},
+        convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(6), 0, 0}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+    const std::vector<convex::ConvexCommand> mispredictStream = {
+        convex::ConvexCommand{2u,        convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(1) / 2, 0, 0}},
+        convex::ConvexCommand{5u,        convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{-fi(1) / 4, 0, 0}},
+        convex::ConvexCommand{kWakeTick, convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{-fi(7), 0, fi(3)}},
+    };
+
+    // === The harness (PURE CPU). The replayable state is the TRIPLE (bodies + cache + sleep). ===
+    bool lockstepIdentical = false;
+    const persist::PersistState authority =
+        persist::RunPersistLockstep(kInit, kCache0, kSleep0, kCfg, authStream, kTicks, &lockstepIdentical);
+    const persist::PersistState replica =
+        persist::RunPersistLockstep(kInit, kCache0, kSleep0, kCfg, authStream, kTicks);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    persist::RunPersistRollback(kInit, kCache0, kSleep0, kCfg, authStream, mispredictStream,
+                                kTicks, kWakeTick, &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP (bodies+cache+sleep).
+    if (!lockstepIdentical ||
+        !persist::PersistStatesEqual(authority.world.bodies, authority.cache, authority.sleep,
+                                     replica.world.bodies, replica.cache, replica.sleep))
+        return fail("persist-lockstep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("persist-lockstep: {bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL "
+                "(bodies+cache+sleep)\n", kBodyCount, kTicks, kCommandCount);
+
+    // PROOF (2) DETERMINISM (+ snapshot round-trip of the triple).
+    const persist::PersistState authority2 =
+        persist::RunPersistLockstep(kInit, kCache0, kSleep0, kCfg, authStream, kTicks);
+    if (!persist::PersistStatesEqual(authority2.world.bodies, authority2.cache, authority2.sleep,
+                                     authority.world.bodies, authority.cache, authority.sleep))
+        return fail("persist-lockstep: two runs differ (nondeterministic)");
+    {
+        convex::ConvexWorld w = kInit;
+        persist::PersistentCache c = kCache0;
+        std::vector<persist::SleepState> s = kSleep0;
+        for (uint32_t t = 0; t < kWakeTick; ++t) persist::SimPersistTick(w, c, s, kCfg, authStream, t);
+        const persist::PersistSnapshot snap = persist::SnapshotPersist(w, c, s, kWakeTick);
+        persist::SimPersistTick(w, c, s, kCfg, authStream, kWakeTick);
+        persist::RestorePersist(w, c, s, snap);
+        if (!persist::PersistStatesEqual(w.bodies, c, s, snap.bodies, snap.cache, snap.sleep))
+            return fail("persist-lockstep: snapshot round-trip != original (triple)");
+    }
+    std::printf("persist-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK (bodies+cache+sleep).
+    if (!rollbackCorrected)
+        return fail("persist-lockstep: rollback != authority (misprediction not corrected)");
+    std::printf("persist-lockstep rollback: corrected==authority BIT-EXACT\n");
+
+    // PROOF (4) mispredict real.
+    if (!mispredictDiverged)
+        return fail("persist-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("persist-lockstep mispredict: diverged before rollback (real divergence corrected)\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the converged authority world as the Vulkan
+    // --persist-lockstep-shot (identical by construction). ---
+    const convex::ConvexWorld& cw = authority.world;
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawBoxXY = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 ay = axes[1];
+        const fx hx = box.halfExtents.x, hy = box.halfExtents.y;
+        fx cxs[4], cys[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sy[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sy[k] * fpx::fxmul(hy, ay.x);
+            cys[k] = b.pos.y + sx[k] * fpx::fxmul(hx, ax.y) + sy[k] * fpx::fxmul(hy, ay.y);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], cys[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], cys[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    drawBoxXY(cw.bodies[0], kFloor, Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 slabCol[3] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.95f, 0.70f, 0.25f},
+                             Vec3{0.85f, 0.90f, 0.40f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawBoxXY(cw.bodies[i], kSlab, slabCol[(i - 1) % 3]);
+
+    const persist::SleepMeasure msl = persist::MeasureSleep(cw, authority.sleep);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — persist warm+sleep lockstep+rollback converged tower side-view "
+                "(%u boxes, %u ticks, asleep=%u, awake=%u)\n",
+                outPath, imgW, imgH, kBodyCount, kTicks, msl.asleepCount, msl.awakeCount);
+    return 0;
+}
+
 // ===== Slice VH1 — Deterministic Vehicle Physics SUSPENSION SPRING JOINT showcase (--vehicle-spring) ====
 // (the BEACHHEAD of FLAGSHIP #16). Like JT1's --joint-ball / CL3's --cloth-solve, the spring solve is int64
 // (FxLength/FxNormalize/FxDot/fxmul/fxdiv in SolveSpringJoint), so shaders/vehicle_spring_solve.comp is
@@ -49156,6 +49353,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fric-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fric_lockstep.png";
             try { return RunFricLockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --persist-lockstep <out.png>: render the Deterministic Persistent Contacts LOCKSTEP + ROLLBACK showcase
+        // (Slice PS5, the NETCODE HEADLINE of FLAGSHIP #21, the CX5/FC5 twin). PURE CPU — it runs the IDENTICAL
+        // CPU harness the Vulkan --persist-lockstep-shot runs on Windows over the SAME PS4 warm+sleep tower scene
+        // + command stream -> the converged authority-world golden is bit-identical cross-backend BY CONSTRUCTION.
+        // THE KEY DIFFERENCE from CX5/FC5: the replayable state INCLUDES the persistent cache + the per-body sleep
+        // state (the TRIPLE). Asserts authority==replica (bodies+cache+sleep) + rollback==authority +
+        // mispredicted!=authority BIT-EXACT; two runs byte-identical. NO GPU compute, NO new shader, NO new RHI.
+        // New golden tests/golden/metal/persist_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--persist-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_persist_lockstep.png";
+            try { return RunPersistLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-render <out.png>: render the Deterministic Convex Rigid-Body Contacts LIT 3D INSTANCED RENDER
