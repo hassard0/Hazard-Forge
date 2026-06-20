@@ -131,5 +131,121 @@ inline BasisMeasure MeasureBasis(const std::vector<FxVec3>& normals) {
     return m;
 }
 
+// =========================================================================================================
+// Slice FC2 — THE FRICTION-AUGMENTED MANIFOLD POINT. APPENDED after MeasureBasis (FC1's lines above are
+// BYTE-FROZEN). For a box-box pair, take the frozen CX2 contact manifold and pair every contact point with
+// its FC1 tangent basis + zeroed (warm-start-ready) impulse accumulators, into a FrictionManifold — the
+// per-contact solver STATE FC3's cone-clamped tangent-impulse solver consumes. PURE INTEGER, every order
+// PINNED -> bit-identical CPU<->Vulkan<->Metal.
+//
+// THE int64 REALITY (the FC1/CX1 lesson): the manifold clip (BoxSatStable/BuildManifold) + the tangent-basis
+// FxNormalize/FxDot/FxCross products are int64. DXC compiles int64 (Vulkan); glslc cannot. So the GPU shader
+// shaders/fric_points.comp is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --fric-points runs the CPU
+// BuildFrictionPoints below -> byte-identical to the Vulkan GPU result BY CONSTRUCTION (the FC1 convention),
+// while the Vulkan side carries the GPU==CPU memcmp proof. fric_points.comp copies BuildFrictionPoints's body
+// (and the BoxSatStable/BuildManifold/MakeTangentBasis it calls) VERBATIM, so the GPU FrictionPoint[] is
+// byte-identical to the CPU reference.
+
+// Pull the convex narrowphase types used by FC2 (re-use, do NOT redefine).
+using convex::FxBox;
+using convex::SatResult;
+using convex::ContactManifold;
+
+// ----- FrictionPoint: one contact point + the A->B normal + the FC1 tangent basis + zeroed accumulators ----
+// point = a CX2 contact point; normal = the manifold normal SIGN-CORRECTED to point from A toward B (the
+// SolveManifoldImpulse rule, applied ONCE per pair); (t1, t2) = MakeTangentBasis(normal) (the FC1 orthonormal
+// tangent basis); normalImpulse / tangentImpulse1 / tangentImpulse2 = the three impulse accumulators, ALL
+// ZEROED at build (the warm-start hooks FC3 fills; FC2 establishes the structure, the baseline re-solves from
+// zero each tick). std430-packable as 12 x int32 (48 bytes) — the GPU FrictionPoint mirror memcmp's against.
+struct FrictionPoint {
+    FxVec3 point;
+    FxVec3 normal;
+    FxVec3 t1;
+    FxVec3 t2;
+    fx     normalImpulse   = 0;
+    fx     tangentImpulse1 = 0;
+    fx     tangentImpulse2 = 0;
+};
+
+// ----- FrictionManifold: a fixed-capacity count + 4 FrictionPoints (the CX2 ContactManifold capacity) ------
+// count = the number of valid friction points (0 if separated, 1 for edge-edge, 1..4 for face). pts[0..count)
+// are filled, the rest left default (zeroed).
+struct FrictionManifold {
+    uint32_t      count = 0;
+    FrictionPoint pts[4];
+};
+
+// ----- BuildFrictionPoints(bodyA, boxA, bodyB, boxB): the frozen CX2 manifold + the FC1 basis per point -----
+// The PINNED steps (every ordering decision fixed; the shader copies THIS body VERBATIM):
+//   (1) sat = convex::BoxSatStable(bodyA, boxA, bodyB, boxB) (the CX4 face-preference SAT, frozen);
+//   (2) !sat.overlap -> return {count = 0} (separated);
+//   (3) m = convex::BuildManifold(bodyA, boxA, bodyB, boxB, sat);
+//   (4) nAB = m.normal SIGN-CORRECTED to point A->B ONCE (flip if FxDot(m.normal, bodyB.pos-bodyA.pos) < 0 —
+//       exactly the SolveManifoldImpulse rule);
+//   (5) (t1, t2) = MakeTangentBasis(nAB) (computed ONCE — the normal is the same for every point of a pair);
+//   (6) for each manifold point i in 0..m.count: pts[i] = {point = m.points[i], normal = nAB, t1, t2,
+//       accumulators = 0}; count = m.count.
+// PURE INTEGER, FIXED order -> bit-identical CPU<->Vulkan<->Metal. FC2 only BUILDS the state — applies NO
+// impulse (that is FC3); the accumulators stay zero.
+inline FrictionManifold BuildFrictionPoints(const fpx::FxBody& bodyA, const FxBox& boxA,
+                                            const fpx::FxBody& bodyB, const FxBox& boxB) {
+    FrictionManifold fm;
+    const SatResult sat = convex::BoxSatStable(bodyA, boxA, bodyB, boxB);
+    if (!sat.overlap) return fm;   // separated -> {count = 0}
+    const ContactManifold m = convex::BuildManifold(bodyA, boxA, bodyB, boxB, sat);
+    if (m.count == 0) return fm;   // degenerate (no kept points) -> empty
+    // The A->B normal sign-correction (the SolveManifoldImpulse rule), applied ONCE per pair.
+    FxVec3 nAB = m.normal;
+    if (FxDot(nAB, fpx::FxSub(bodyB.pos, bodyA.pos)) < 0) nAB = FxVec3{-nAB.x, -nAB.y, -nAB.z};
+    // The FC1 tangent basis at the (shared) A->B normal, computed ONCE.
+    const TangentBasis tb = MakeTangentBasis(nAB);
+    fm.count = m.count;
+    for (uint32_t i = 0; i < m.count; ++i) {
+        FrictionPoint& fp = fm.pts[i];
+        fp.point  = m.points[i];
+        fp.normal = nAB;
+        fp.t1     = tb.t1;
+        fp.t2     = tb.t2;
+        fp.normalImpulse   = 0;   // ZEROED at build (the FC3 warm-start hooks)
+        fp.tangentImpulse1 = 0;
+        fp.tangentImpulse2 = 0;
+    }
+    return fm;
+}
+
+// ----- FrictionPointMeasure: the deterministic summary over a set of box pairs ----------------------------
+// pairs            = total pairs measured; pairsWithContact = pairs reporting >=1 friction point; totalPoints
+// = the sum of all friction points; maxDotErr = the max over all points of |n.t1| / |n.t2| / |t1.t2| (the
+// basis orthogonality residual — 0 for a perfect basis, a small integer for the fixed-point drift). Pure
+// integer, fixed order -> deterministic. The showcase prints + asserts.
+struct FrictionPointMeasure {
+    uint32_t pairs            = 0;
+    uint32_t pairsWithContact = 0;
+    uint32_t totalPoints      = 0;
+    fx       maxDotErr        = 0;   // max |n.t1| / |n.t2| / |t1.t2| over all points
+};
+
+// MeasureFrictionPoints(pairs): BuildFrictionPoints over each pair, accumulate the deterministic summary.
+// Pure integer, fixed order.
+inline FrictionPointMeasure MeasureFrictionPoints(const std::vector<convex::SatPair>& pairs) {
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    FrictionPointMeasure pm;
+    pm.pairs = (uint32_t)pairs.size();
+    for (const convex::SatPair& p : pairs) {
+        const FrictionManifold fm = BuildFrictionPoints(p.bodyA, p.boxA, p.bodyB, p.boxB);
+        if (fm.count > 0) { ++pm.pairsWithContact; pm.totalPoints += fm.count; }
+        for (uint32_t i = 0; i < fm.count; ++i) {
+            const FrictionPoint& fp = fm.pts[i];
+            const fx d0 = absfx(FxDot(fp.normal, fp.t1));
+            const fx d1 = absfx(FxDot(fp.normal, fp.t2));
+            const fx d2 = absfx(FxDot(fp.t1, fp.t2));
+            if (d0 > pm.maxDotErr) pm.maxDotErr = d0;
+            if (d1 > pm.maxDotErr) pm.maxDotErr = d1;
+            if (d2 > pm.maxDotErr) pm.maxDotErr = d2;
+        }
+    }
+    return pm;
+}
+
 }  // namespace fric
 }  // namespace hf::sim

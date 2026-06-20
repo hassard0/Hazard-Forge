@@ -1156,6 +1156,18 @@ hf_compile_shaders(
     # MakeTangentBasis instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer ->
     # bit-exact GPU==CPU TangentBasis array + cross-backend, proven memcmp. NO new RHI.
     "shaders/fric_basis.comp.hlsl:cs"
+    # Deterministic Contact Friction Slice 2 (Slice FC2): fric_points.comp is THE FRICTION-AUGMENTED MANIFOLD
+    # POINT pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) runs
+    # BoxSatStable (the CX4 face-preference SAT) then BuildManifold (the CX2 contact manifold), pairs every
+    # contact point with the FC1 tangent basis MakeTangentBasis(nAB) + the A->B normal sign-correction (ONCE)
+    # + ZEROED impulse accumulators, writing its OWN gManifolds[pair] FrictionManifoldGpu (count + 4
+    # FrictionPoint). pointsEnabled=0 -> cleared. Copies engine/sim/convex.h::BoxSatStable/BuildManifold +
+    # engine/sim/fric.h::BuildFrictionPoints/MakeTangentBasis VERBATIM. Like convex_manifold.comp /
+    # fric_basis.comp this is int64 (the clip fxdiv + the FxDot/FxCross/FxNormalize Q16.16 products), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --fric-points
+    # showcase runs the CPU BuildFrictionPoints instead (byte-identical by construction). Pure integer SSBO
+    # compute + ReadBuffer -> bit-exact GPU==CPU FrictionManifold array + cross-backend, proven memcmp. NO new RHI.
+    "shaders/fric_points.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

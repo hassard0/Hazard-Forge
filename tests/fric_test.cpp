@@ -135,6 +135,131 @@ int main() {
               "determinism: two MakeTangentBasis runs byte-identical");
     }
 
+    // ================= FC2 — BuildFrictionPoints over the frozen CX2 manifold =================
+    // Scene helpers (the CX2 box-pair conventions): a body at a pos+orient, a unit box, the fixed-point
+    // helpers fi (integer->Q16.16) / fh (a fraction).
+    {
+        auto fi = [&](int v) { return (fx)(v * (int)kOne); };
+        auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)kOne / den); };
+        auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q) {
+            fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; return b;
+        };
+        const fpx::FxQuat qI{0, 0, 0, kOne};
+        const fpx::FxQuat qX = fpx::FxQuatNormalize(fpx::FxQuat{(fx)25080, 0, 0, (fx)60547}); // 45° about X
+        const fpx::FxQuat qZ = fpx::FxQuatNormalize(fpx::FxQuat{0, 0, (fx)25080, (fx)60547}); // 45° about Z
+        const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+        const convex::FxBox kBig{convex::FxVec3{fi(4), fi(4), fi(4)}};
+
+        // ---- a DEEP FACE-FACE pair: count matches BuildManifold, basis orthonormal to the A->B normal,
+        // all accumulators zero. (A big box with a unit box pushed deep inside on z -> a 4-point face patch.)
+        {
+            const fpx::FxBody A = bodyAt(fi(8), 0, fi(0), qI);
+            const fpx::FxBody B = bodyAt(fi(8), 0, fh(3, 2), qI);
+            const fric::FrictionManifold fm2 = fric::BuildFrictionPoints(A, kBig, B, kUnit);
+            const convex::SatResult sat = convex::BoxSatStable(A, kBig, B, kUnit);
+            const convex::ContactManifold m = convex::BuildManifold(A, kBig, B, kUnit, sat);
+            check(fm2.count == m.count, "FC2 face: count matches BuildManifold");
+            check(fm2.count >= 1u, "FC2 face: at least one contact point");
+            // The A->B normal (the SolveManifoldImpulse rule applied to the manifold normal).
+            convex::FxVec3 nAB = m.normal;
+            if (convex::FxDot(nAB, fpx::FxSub(B.pos, A.pos)) < 0) nAB = convex::FxVec3{-nAB.x, -nAB.y, -nAB.z};
+            for (uint32_t k = 0; k < fm2.count; ++k) {
+                const fric::FrictionPoint& fp = fm2.pts[k];
+                // normal stored == the A->B normal.
+                check(std::memcmp(&fp.normal, &nAB, sizeof(convex::FxVec3)) == 0,
+                      "FC2 face: stored normal == A->B normal");
+                // (t1,t2) orthonormal to the normal.
+                check(Absfx(convex::FxDot(fp.normal, fp.t1)) < kEps, "FC2 face: n . t1 ~ 0");
+                check(Absfx(convex::FxDot(fp.normal, fp.t2)) < kEps, "FC2 face: n . t2 ~ 0");
+                check(Absfx(convex::FxDot(fp.t1, fp.t2)) < kEps, "FC2 face: t1 . t2 ~ 0");
+                check(Absfx(fpx::FxLength(fp.t1) - kOne) < kEps, "FC2 face: |t1| ~ 1");
+                check(Absfx(fpx::FxLength(fp.t2) - kOne) < kEps, "FC2 face: |t2| ~ 1");
+                // accumulators zeroed at build.
+                check(fp.normalImpulse == 0, "FC2 face: normalImpulse zero");
+                check(fp.tangentImpulse1 == 0, "FC2 face: tangentImpulse1 zero");
+                check(fp.tangentImpulse2 == 0, "FC2 face: tangentImpulse2 zero");
+                // the basis == the FC1 MakeTangentBasis of the stored normal (the exact reuse contract).
+                const fric::TangentBasis tb = fric::MakeTangentBasis(fp.normal);
+                check(std::memcmp(&tb.t1, &fp.t1, sizeof(convex::FxVec3)) == 0, "FC2 face: t1 == MakeTangentBasis");
+                check(std::memcmp(&tb.t2, &fp.t2, sizeof(convex::FxVec3)) == 0, "FC2 face: t2 == MakeTangentBasis");
+            }
+        }
+
+        // ---- a SEPARATED pair: count 0.
+        {
+            const fpx::FxBody A = bodyAt(fi(-7), 0, fi(6), qI);
+            const fpx::FxBody B = bodyAt(fi(-2), 0, fi(6), qI);
+            const fric::FrictionManifold fm = fric::BuildFrictionPoints(A, kUnit, B, kUnit);
+            check(fm.count == 0u, "FC2 separated: count 0");
+        }
+
+        // ---- an EDGE-EDGE pair: count 1 with a valid orthonormal basis, the normal A->B.
+        {
+            const fpx::FxBody A = bodyAt(0, 0, fi(2), qX);
+            const fpx::FxBody B = bodyAt(fi(1), fi(1), fi(3), qZ);
+            const convex::SatResult sat = convex::BoxSatStable(A, kUnit, B, kUnit);
+            const fric::FrictionManifold fm = fric::BuildFrictionPoints(A, kUnit, B, kUnit);
+            check(sat.overlap, "FC2 edge: the pair overlaps (precondition)");
+            check(fm.count == convex::BuildManifold(A, kUnit, B, kUnit, sat).count,
+                  "FC2 edge: count matches BuildManifold");
+            for (uint32_t k = 0; k < fm.count; ++k) {
+                const fric::FrictionPoint& fp = fm.pts[k];
+                check(Absfx(convex::FxDot(fp.normal, fp.t1)) < kEps, "FC2 edge: n . t1 ~ 0");
+                check(Absfx(convex::FxDot(fp.normal, fp.t2)) < kEps, "FC2 edge: n . t2 ~ 0");
+                check(Absfx(convex::FxDot(fp.t1, fp.t2)) < kEps, "FC2 edge: t1 . t2 ~ 0");
+                check(Absfx(fpx::FxLength(fp.t1) - kOne) < kEps, "FC2 edge: |t1| ~ 1");
+                check(Absfx(fpx::FxLength(fp.t2) - kOne) < kEps, "FC2 edge: |t2| ~ 1");
+                check(fp.normalImpulse == 0 && fp.tangentImpulse1 == 0 && fp.tangentImpulse2 == 0,
+                      "FC2 edge: accumulators zero");
+            }
+        }
+
+        // ---- the normal points A->B for every overlapping pair (FxDot(normal, B.pos - A.pos) >= 0).
+        {
+            std::vector<convex::SatPair> pairs;
+            const convex::FxBox U = kUnit;
+            pairs.push_back({bodyAt(fi(5), 0, fi(6), qI), kBig, bodyAt(fi(6), 0, fi(6), qI), U});
+            pairs.push_back({bodyAt(fi(-7), 0, fi(2), qI), U, bodyAt(fi(-5), 0, fi(2), qI), U});
+            pairs.push_back({bodyAt(0, 0, fi(2), qX), U, bodyAt(fi(1), fi(1), fi(3), qZ), U});
+            bool allAtoB = true;
+            for (const convex::SatPair& p : pairs) {
+                const fric::FrictionManifold fm =
+                    fric::BuildFrictionPoints(p.bodyA, p.boxA, p.bodyB, p.boxB);
+                const convex::FxVec3 ab = fpx::FxSub(p.bodyB.pos, p.bodyA.pos);
+                for (uint32_t k = 0; k < fm.count; ++k)
+                    if (convex::FxDot(fm.pts[k].normal, ab) < 0) allAtoB = false;
+            }
+            check(allAtoB, "FC2: every contact normal points A->B");
+        }
+
+        // ---- determinism: two BuildFrictionPoints runs byte-identical.
+        {
+            const fpx::FxBody A = bodyAt(fi(8), 0, fi(0), qI);
+            const fpx::FxBody B = bodyAt(fi(8), 0, fh(3, 2), qI);
+            const fric::FrictionManifold a = fric::BuildFrictionPoints(A, kBig, B, kUnit);
+            const fric::FrictionManifold b = fric::BuildFrictionPoints(A, kBig, B, kUnit);
+            check(std::memcmp(&a, &b, sizeof(fric::FrictionManifold)) == 0,
+                  "FC2 determinism: two BuildFrictionPoints runs byte-identical");
+        }
+
+        // ---- MeasureFrictionPoints: the deterministic summary over a set of pairs.
+        {
+            std::vector<convex::SatPair> pairs;
+            const convex::FxBox U = kUnit;
+            pairs.push_back({bodyAt(fi(-7), 0, fi(6), qI), U, bodyAt(fi(-2), 0, fi(6), qI), U}); // separated
+            pairs.push_back({bodyAt(fi(5), 0, fi(6), qI), kBig, bodyAt(fi(6), 0, fi(6), qI), U}); // face
+            pairs.push_back({bodyAt(0, 0, fi(2), qX), U, bodyAt(fi(1), fi(1), fi(3), qZ), U});    // edge
+            const fric::FrictionPointMeasure pm = fric::MeasureFrictionPoints(pairs);
+            check(pm.pairs == (uint32_t)pairs.size(), "FC2 measure: counts every pair");
+            check(pm.pairsWithContact >= 2u, "FC2 measure: the two overlapping pairs report contact");
+            check(pm.totalPoints >= 2u, "FC2 measure: total points accumulated");
+            check(pm.maxDotErr < kEps, "FC2 measure: maxDotErr within epsilon");
+            const fric::FrictionPointMeasure pm2 = fric::MeasureFrictionPoints(pairs);
+            check(std::memcmp(&pm, &pm2, sizeof(fric::FrictionPointMeasure)) == 0,
+                  "FC2 measure: two runs byte-identical");
+        }
+    }
+
     if (g_fail == 0) std::printf("fric_test: ALL PASS\n");
     else std::printf("fric_test: %d FAILED\n", g_fail);
     return g_fail == 0 ? 0 : 1;

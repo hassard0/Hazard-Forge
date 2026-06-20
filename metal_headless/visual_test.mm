@@ -26691,6 +26691,229 @@ static int RunConvexManifoldShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice FC2 — Deterministic Contact Friction THE FRICTION-AUGMENTED MANIFOLD POINT showcase
+// (--fric-points) (the 2nd slice of FLAGSHIP #20). Like CX2's --convex-manifold / FC1's --fric-basis, the
+// SAT/clip + the tangent basis are int64 (the fxdiv/FxDot/FxCross/FxNormalize Q16.16 products), so
+// shaders/fric_points.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's
+// hf_gen_msl list; on Metal the --fric-points showcase runs the CPU fric::BuildFrictionPoints — the EXACT
+// bit-exact reference the Vulkan --fric-points-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION (the convex_manifold.comp / fric_basis.comp
+// convention), while the Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic
+// 12-box-pair scene as CX2, runs BoxSatStable -> BuildManifold -> the FC1 tangent basis + zeroed accumulators
+// per contact point, and CPU-colors the SAME 2D top-down (XZ) view + contact tangent frame -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/fric_points.png (baked on the Mac by the controller); two
+// runs DIFF 0.0000.
+static int RunFricPointsShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace fric = hf::sim::fric;
+    namespace fpx = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    const fx kS45 = (fx)25080, kC45 = (fx)60547;
+    auto qIdentity = []() { return fpx::FxQuat{0, 0, 0, convex::kOne}; };
+    auto qAboutX = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{kS45, 0, 0, kC45}); };
+    auto qAboutZ = [&]() { return fpx::FxQuatNormalize(fpx::FxQuat{0, 0, kS45, kC45}); };
+    auto bodyAt = [&](fx x, fx y, fx z, fpx::FxQuat q) {
+        fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; return b;
+    };
+    auto fi = [&](int v) { return (fx)(v * (int)convex::kOne); };
+    auto fh = [&](int num, int den) { return (fx)((int64_t)num * (int)convex::kOne / den); };
+
+    std::vector<convex::SatPair> pairs;
+    const convex::FxBox kUnit{convex::FxVec3{kOne, kOne, kOne}};
+    const convex::FxBox kBig{convex::FxVec3{fi(4), fi(4), fi(4)}};
+    auto addPair = [&](convex::SatPair p) { pairs.push_back(p); };
+    addPair({bodyAt(fi(-7), 0, fi(6), qIdentity()), kUnit, bodyAt(fi(-2), 0, fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(5), 0, fi(6), qIdentity()), kBig, bodyAt(fi(6), 0, fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-7), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(-5), 0, fi(2), qIdentity()), kUnit});
+    addPair({bodyAt(0, 0, fi(2), qAboutX()), kUnit, bodyAt(fi(1), fi(1), fi(3), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(4), 0, fi(2), qIdentity()), kUnit, bodyAt(fi(8), fi(4), fi(6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-7), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-11, 2), 0, fi(-2), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-2), 0, fi(-2), qIdentity()), kUnit, bodyAt(fh(-1, 1), 0, fi(-2), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(3), 0, fi(-2), qAboutZ()), kUnit, bodyAt(fi(8), 0, fi(-2), qIdentity()), kUnit});
+    addPair({bodyAt(fi(-6), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(-11, 2), 0, fi(-6), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(-1), 0, fi(-6), qAboutX()), kUnit, bodyAt(fh(1, 4), fh(5, 4), fh(-19, 4), qAboutZ()), kUnit});
+    addPair({bodyAt(fi(4), 0, fi(-6), qIdentity()), kUnit, bodyAt(fi(7), 0, fi(-6), qIdentity()), kUnit});
+    addPair({bodyAt(fi(8), 0, fi(0), qIdentity()), kBig, bodyAt(fi(8), 0, fh(3, 2), qIdentity()), kUnit});
+
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // Packed FricManifoldGpu (== the Vulkan --fric-points-shot FricManifoldGpu): count + 4 FricPointGpu.
+    struct FricPointGpu {
+        int32_t px, py, pz, nx, ny, nz, t1x, t1y, t1z, t2x, t2y, t2z, ni, ti1, ti2;
+    };
+    static_assert(sizeof(FricPointGpu) == 60, "FricPointGpu std430 layout");
+    struct FricManifoldGpu {
+        uint32_t count;
+        FricPointGpu pts[4];
+    };
+    static_assert(sizeof(FricManifoldGpu) == 244, "FricManifoldGpu std430 layout");
+    auto packFricPoint = [&](const fric::FrictionPoint& fp) {
+        return FricPointGpu{fp.point.x, fp.point.y, fp.point.z, fp.normal.x, fp.normal.y, fp.normal.z,
+                            fp.t1.x, fp.t1.y, fp.t1.z, fp.t2.x, fp.t2.y, fp.t2.z,
+                            fp.normalImpulse, fp.tangentImpulse1, fp.tangentImpulse2};
+    };
+    auto packManifold = [&](const fric::FrictionManifold& m) {
+        FricManifoldGpu g{};
+        g.count = m.count;
+        for (int k = 0; k < 4; ++k) g.pts[k] = packFricPoint(m.pts[k]);
+        return g;
+    };
+
+    auto run = [&](std::vector<FricManifoldGpu>& out) {
+        out.assign((size_t)kPairCount, FricManifoldGpu{});
+        for (uint32_t i = 0; i < kPairCount; ++i)
+            out[i] = packManifold(fric::BuildFrictionPoints(pairs[i].bodyA, pairs[i].boxA,
+                                                            pairs[i].bodyB, pairs[i].boxB));
+    };
+
+    std::vector<FricManifoldGpu> results;
+    run(results);
+    uint32_t withContact = 0, totalPoints = 0;
+    for (const FricManifoldGpu& r : results) if (r.count) { ++withContact; totalPoints += r.count; }
+
+    std::printf("fric-points: {pairs:%u, withContact:%u, points:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU fric::BuildFrictionPoints, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, withContact, totalPoints);
+
+    std::vector<FricManifoldGpu> results2;
+    run(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(FricManifoldGpu)) != 0)
+        return fail("fric-points: two runs differ (nondeterministic)");
+    std::printf("fric-points determinism: two runs BYTE-IDENTICAL\n");
+
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    const fx kEps = kOne / 256;
+    bool basisOrthonormal = true, countsMatchManifold = true, accumulatorsZero = true;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const convex::SatResult sat =
+            convex::BoxSatStable(pairs[i].bodyA, pairs[i].boxA, pairs[i].bodyB, pairs[i].boxB);
+        const convex::ContactManifold cm =
+            convex::BuildManifold(pairs[i].bodyA, pairs[i].boxA, pairs[i].bodyB, pairs[i].boxB, sat);
+        if (results[i].count != cm.count) countsMatchManifold = false;
+        for (uint32_t k = 0; k < results[i].count; ++k) {
+            const FricPointGpu& fp = results[i].pts[k];
+            const convex::FxVec3 n{fp.nx, fp.ny, fp.nz};
+            const convex::FxVec3 t1{fp.t1x, fp.t1y, fp.t1z};
+            const convex::FxVec3 t2{fp.t2x, fp.t2y, fp.t2z};
+            if (absfx(convex::FxDot(n, t1)) >= kEps || absfx(convex::FxDot(n, t2)) >= kEps ||
+                absfx(convex::FxDot(t1, t2)) >= kEps ||
+                absfx(fpx::FxLength(t1) - kOne) >= kEps || absfx(fpx::FxLength(t2) - kOne) >= kEps)
+                basisOrthonormal = false;
+            if (fp.ni != 0 || fp.ti1 != 0 || fp.ti2 != 0) accumulatorsZero = false;
+        }
+    }
+    if (!basisOrthonormal || !countsMatchManifold || !accumulatorsZero)
+        return fail("fric-points: correctness failed");
+    std::printf("fric-points correct: {basisOrthonormal:true, countsMatchManifold:true, "
+                "accumulatorsZero:true}\n");
+
+    bool allPointAtoB = true;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const convex::FxVec3 ab = fpx::FxSub(pairs[i].bodyB.pos, pairs[i].bodyA.pos);
+        for (uint32_t k = 0; k < results[i].count; ++k) {
+            const convex::FxVec3 n{results[i].pts[k].nx, results[i].pts[k].ny, results[i].pts[k].nz};
+            if (convex::FxDot(n, ab) < 0) allPointAtoB = false;
+        }
+    }
+    if (!allPointAtoB) return fail("fric-points: a contact normal did NOT point A->B");
+    std::printf("fric-points normal: {allPointAtoB:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view + contact tangent frame as the Vulkan
+    // --fric-points-shot. ---
+    const int kPxPerUnit = 18, kMargin = 24;
+    const int kWorldHalf = 12;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalf) * kPxPerUnit;
+        iy = kMargin + (gz + kWorldHalf) * kPxPerUnit;
+    };
+    auto worldToPxF = [&](fx wx, fx wz, int& ix, int& iy) {
+        ix = kMargin + (int)(((int64_t)(wx + (kWorldHalf << convex::kFrac)) * kPxPerUnit) >> convex::kFrac);
+        iy = kMargin + (int)(((int64_t)(wz + (kWorldHalf << convex::kFrac)) * kPxPerUnit) >> convex::kFrac);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int n = adx > ady ? adx : ady;
+        if (n == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= n; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / n);
+            int iy = y0 + (int)((int64_t)dy * s / n);
+            putPx(ix, iy, col);
+        }
+    };
+    auto drawBox = [&](const fpx::FxBody& b, const convex::FxBox& box, const Vec3& col) {
+        convex::FxVec3 axes[3];
+        convex::BoxAxes(b, axes);
+        const convex::FxVec3 ax = axes[0];
+        const convex::FxVec3 az = axes[2];
+        const fx hx = box.halfExtents.x, hz = box.halfExtents.z;
+        fx cxs[4], czs[4];
+        const int sx[4] = {+1, +1, -1, -1};
+        const int sz[4] = {+1, -1, -1, +1};
+        for (int k = 0; k < 4; ++k) {
+            cxs[k] = b.pos.x + sx[k] * fpx::fxmul(hx, ax.x) + sz[k] * fpx::fxmul(hz, az.x);
+            czs[k] = b.pos.z + sx[k] * fpx::fxmul(hx, ax.z) + sz[k] * fpx::fxmul(hz, az.z);
+        }
+        for (int k = 0; k < 4; ++k) {
+            int x0, y0, x1, y1;
+            worldToPx(cxs[k], czs[k], x0, y0);
+            worldToPx(cxs[(k + 1) % 4], czs[(k + 1) % 4], x1, y1);
+            drawLine(x0, y0, x1, y1, col);
+        }
+    };
+    const Vec3 hotA{1.0f, 0.55f, 0.25f}, hotB{1.0f, 0.78f, 0.40f};
+    const Vec3 coldA{0.30f, 0.55f, 0.95f}, coldB{0.50f, 0.72f, 1.0f};
+    const Vec3 colT1{0.25f, 0.85f, 0.95f}, colT2{0.95f, 0.35f, 0.85f}, colN{1.0f, 1.0f, 1.0f};
+    const int kTanLen = 9;
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const bool ov = results[i].count != 0u;
+        drawBox(pairs[i].bodyA, pairs[i].boxA, ov ? hotA : coldA);
+        drawBox(pairs[i].bodyB, pairs[i].boxB, ov ? hotB : coldB);
+        if (!ov) continue;
+        for (uint32_t k = 0; k < results[i].count; ++k) {
+            const FricPointGpu& fp = results[i].pts[k];
+            int mx, my;
+            worldToPxF(fp.px, fp.pz, mx, my);
+            putPx(mx, my, colN); putPx(mx + 1, my, colN); putPx(mx, my + 1, colN);
+            const int t1ex = mx + (int)(((int64_t)fp.t1x * kTanLen) >> convex::kFrac);
+            const int t1ez = my + (int)(((int64_t)fp.t1z * kTanLen) >> convex::kFrac);
+            const int t2ex = mx + (int)(((int64_t)fp.t2x * kTanLen) >> convex::kFrac);
+            const int t2ez = my + (int)(((int64_t)fp.t2z * kTanLen) >> convex::kFrac);
+            drawLine(mx, my, t1ex, t1ez, colT1);
+            drawLine(mx, my, t2ex, t2ez, colT2);
+            const int nex = mx + (int)(((int64_t)fp.nx * kTanLen) >> convex::kFrac);
+            const int nez = my + (int)(((int64_t)fp.nz * kTanLen) >> convex::kFrac);
+            drawLine(mx, my, nex, nez, colN);
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — friction-point tangent-frame top-down view (%u pairs, %u with contact, "
+                "%u points)\n", outPath, imgW, imgH, kPairCount, withContact, totalPoints);
+    return 0;
+}
+
 // ===== Slice CX3 — Deterministic Convex Rigid-Body Contacts THE ANGULAR CONTACT IMPULSE showcase
 // (--convex-tumble) (the 3rd slice of FLAGSHIP #19, THE NEW-PHYSICS BEAT). Like CX1's --convex-sat / CX2's
 // --convex-manifold, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec Q16.16
@@ -46972,6 +47195,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--convex-manifold") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_convex_manifold.png";
             try { return RunConvexManifoldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --fric-points <out.png>: render the Deterministic Contact Friction THE FRICTION-AUGMENTED MANIFOLD
+        // POINT showcase (Slice FC2, the 2nd slice of FLAGSHIP #20). On Metal this runs the CPU friction
+        // points: fric_points.comp is int64/Vulkan-only (glslc can't parse the clip fxdiv + the FxDot/FxCross/
+        // FxNormalize int64), so Metal runs the CPU convex::BoxSatStable -> BuildManifold + the FC1 tangent
+        // basis via fric::BuildFrictionPoints over the SAME fixed 12-box-pair scene -> the EXACT bit-exact
+        // reference the Vulkan --fric-points-shot GPU==CPU memcmp compares against; two runs byte-identical;
+        // every contact point has an orthonormal A->B-normal tangent basis + zeroed accumulators. The image
+        // golden is a PURE-INTEGER 2D top-down friction-point tangent-frame view, identical to the Vulkan path
+        // BY CONSTRUCTION. New golden tests/golden/metal/fric_points.png.
+        if (argc > 1 && std::strcmp(argv[1], "--fric-points") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_fric_points.png";
+            try { return RunFricPointsShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --convex-tumble <out.png>: render the Deterministic Convex Rigid-Body Contacts THE ANGULAR CONTACT
