@@ -1,269 +1,162 @@
 # Hazard Forge
 
-A C++20 cross-platform game engine built around a thin, explicit **Rendering Hardware Interface (RHI) seam** that renders natively on **Vulkan (Windows)** and **Apple Metal (macOS, Apple Silicon)** from one codebase. The design is Apple-native and Metal-first in philosophy, with Vulkan as the primary shipping platform; Metal parity is verified headlessly against committed golden images.
+A C++20 cross-platform game engine built around a thin, explicit **Rendering Hardware Interface (RHI) seam** that
+renders natively on **Vulkan (Windows)** and **Apple Metal (macOS, Apple Silicon)** from one codebase — and, above
+that, a **deterministic, fixed-point simulation suite** whose results are *bit-identical across CPU, Vulkan, and
+Metal* and *lockstep/rollback-replayable*. Every capability is verified headlessly against committed golden images
+that must diff `0.0000`.
 
-> **Status:** Active development — an in-progress engine, not a finished product. The RHI-seam thesis is proven on real hardware: the same engine code renders a full PBR/IBL/post-processed scene on a Vulkan RTX GPU (Windows) and on Apple Metal (M4, macOS), verified by **76 deterministic golden-image regression tests** (plus a machine-readable engine-state JSON golden, a byte-exact **material-graph introspection JSON golden**, **and** a byte-exact audio-WAV golden) that must each diff `0.0000`, and by a **76-test** ctest suite that runs clean under AddressSanitizer. Roughly slices A–DJ have shipped — PBR materials, image-based lighting, HDR bloom, SSAO, alpha-blended transparency, glTF scene-graph import, skeletal animation + blending **plus a parameter-driven animation state machine (cross-fade FSM)**, rigid-body physics, GPU instancing, compute particles **plus a data-driven CPU particle / VFX emitter (additive billboards, lifetime curves)**, immediate-mode debug visualization, an interactive runtime (fixed-timestep loop + flyable camera), a full shadow set (cascaded shadow maps, spot-light shadows, omnidirectional point-light cube shadows), clustered/Forward+ lighting, screen-space reflections, **screen-space global illumination (SSGI) — raw, edge-preserving bilateral spatial denoise, and temporal accumulation (the full GI trilogy)**, **screen-space projected decals**, volumetric fog / light shafts, reflection + irradiance probes (local cubemap GI), temporal anti-aliasing (TAA), CPU frustum culling, **GPU-driven culling + indirect draw**, **GPU multi-draw-indirect (MDI) batching** (144 objects in one indirect call, `gl_DrawID`-indexed per-draw data), **bindless textures** (a single descriptor-indexing array indexed per-draw — completing the GPU-driven story with MDI), a **fully-GPU-driven combined pass** (one `DrawIndexedMultiIndirect` + one bindless bind draw an entire multi-material scene) **and a fully-GPU-driven-CULLED pass** (compute frustum-cull → ordered compaction → the GPU-decided MDI drawCount → 1 indirect draw + 1 bindless bind — the complete cull→compact→MDI+bindless pipeline in one pass), **Hi-Z occlusion culling** (CJ — a max-depth pyramid + conservative screen-AABB occlusion test that, combined with frustum culling, completes the GPU-driven culling pipeline: frustum + occlusion, proven byte-identical to the frustum-only render), a **render graph with automatic resource-state barriers** (Vulkan-synchronization-validation-clean), **multithreaded command recording** (byte-identical 1-vs-N workers), a **data-driven material / shader graph** (expanded node set incl. a **tangent-space normal-map node** + a multi-material scene) with **live runtime material authoring** **and machine-readable graph introspection (JSON / Graphviz DOT)**, a **data-driven post-process stack** (ordered, JSON-authorable: color grade / chromatic aberration / film grain), a **baked-font text / HUD overlay renderer**, a **deterministic integer-mixer audio engine** (byte-exact WAV golden), a **deterministic networking trilogy** — replication snapshots/deltas, a seeded lossy transport + client jitter-buffer interpolation, **and client-side prediction + server reconciliation (rewind/replay)**, **distance-based scene / asset streaming** (per-frame budget + hysteresis), **procedural terrain / heightmap generation** (finite-difference normals) **plus streamed, distance-banded-LOD terrain tiles**, a **playable deterministic game sample**, machine-readable engine-state JSON introspection for agents, a live editor (mouse pick + gizmo drag + shader/scene hot-reload) **plus a docked ImGui editor shell (Scene Hierarchy / Inspector / Stats around a central Viewport) and live edit-ops → scene_io round-trip**, a **sky / atmosphere suite** completing sky + water + clouds + cloud shadows — a **Gerstner-wave water surface** (Fresnel reflect/refract), **thin-lens depth of field** (circle-of-confusion depth gather), **raymarched volumetric clouds** (Beer-Lambert transmittance + Henyey-Greenstein phase), and **cloud shadows on the ground** (CK — a sun-ray density march through the cloud field → Beer transmittance dappling the lit scene), **clustered light culling / Forward+** (CL — the many-lights flagship: a cluster grid + sphere-AABB light assignment, proven byte-identical to brute-force shading), **motion blur** (CN — a velocity-gather post pass; zero-velocity render byte-identical to the un-blurred scene), **order-independent transparency** (CO — Weighted Blended OIT: correct transparency without sorting, proven byte-identical under a permuted draw order), **parallax occlusion mapping** (CP — per-pixel surface depth + self-occlusion via a tangent-space height-field march; zero-height render byte-identical to plain normal mapping), **ground-truth ambient occlusion** (CR — GTAO horizon-search visibility integral coexisting with SSAO; radius=0 render byte-identical to the no-AO scene), **froxel volumetric fog** (CS — a true 3D view-space sun single-scattering volume via inject→integrate→apply compute/fragment passes, distinct from the 2D light-shaft fog; density=0 render byte-identical to the no-fog scene), **screen-space contact shadows** (CT — a short depth-march toward the sun filling the fine contact occlusion the CSM misses; maxDist=0 render byte-identical to the no-contact scene), **per-froxel clustered-light injection** (CV — the 96 clustered point lights cast colored volumetric shafts through the fog; lights-off render byte-identical to the CS sun-only fog and density=0 byte-identical to the no-fog scene), **auto-exposure** (CW — integer-histogram luminance metering → key-value exposure eye adaptation; adaptation-disabled render byte-identical to the standard fixed-exposure tonemap), **volumetric shadows** (CX — the froxel inject samples the sun's CSM per froxel to gate the in-scatter, completing the volumetric trilogy with dark fog volumes + foggy sun shafts; volumetric-shadows-off render byte-identical to the CV froxel-lights render), **subsurface scattering** (CZ — screen-space separable depth-aware diffusion for skin/wax; sssStrength=0 render byte-identical to the non-SSS lit scene), **box-projected reflection probe** (DA — local cubemap reflections parallax-corrected to a probe box so reflected walls line up with the room; parallaxStrength=0 render byte-identical to the standard infinite-cubemap reflection), **color grading** (DB — analytic lift/gamma/gain + ASC-CDL slope/offset/power + luma-preserving saturation, post-tonemap; the identity grade is byte-identical to the ungraded tonemap render), a **dynamic cubemap-capture reflection probe** (DD — the scene is rendered into 6 cube faces from the probe centre, then a reflective surface samples the captured cube box-projected; a captured face is byte-identical to the scene rendered directly with that face's view/proj), **planar reflections** (DE — the scene is rendered a second time through the camera reflected across a mirror plane into a 2D RT the floor samples; reflectivity=0 render byte-identical to the matte non-reflective render), and **contrast-adaptive sharpening** (DF — AMD FidelityFX CAS, an adaptive edge sharpen on the tonemapped SDR result clamped to the neighbourhood min/max so it never rings; sharpness=0 render byte-identical to the unsharpened tonemap render) — the **reflections suite is now SSR + box-projected probe + dynamic cubemap-capture probe + planar** — and a macOS windowed Metal viewport. Past the breadth phase, recent slices mark a **depth pivot** into real-time GI (SSGI raw → denoise → temporal), networking (state replication → lossy transport + interpolation → prediction + reconciliation), and GPU-driven rendering (MDI → bindless → combined GPU-driven pass → GPU-driven-culled pass). The newest arc begins a **DDGI dynamic global-illumination pillar** — **probe-grid ray-trace** (DH), **per-probe radiance capture** (DI), and **3rd-order SH-encode** (DJ) have landed (probe-update + GI-composite next), each holding a **GPU==CPU bit-exact compute proof** (host-precomputed transcendentals + `fma` so the GPU result is bit-identical to the CPU reference).
-
----
-
-## What it is
-
-Hazard Forge is a focused, tooling-obsessed C++ engine built slice by slice. Each slice lands a specific rendering or runtime capability through the shared RHI seam — which means every feature is simultaneously a Vulkan implementation and a specification for the Metal backend to implement.
-
-The central bet: **one engine layer above a clean seam, two GPU backends below it, verified headlessly by golden images.** No Vulkan symbols leak above `engine/rhi/`; no Metal symbols leak above `engine/rhi_metal/`. The seam invariant is the architectural spine of the project.
-
----
-
-## Features (shipped, slices A–DJ)
-
-### Rendering
-
-- **RHI abstraction** — Vulkan and Metal backends behind a pure C++ virtual-interface seam (`engine/rhi/rhi.h`). No backend symbol (`vk*` / `MTL*`) is visible to engine, scene, or application code.
-- **3D math library** — own `hf::math` (Vec3, Mat4, Quat): perspective/ortho/LookAt, TRS, rotations, `Inverse`, slerp. Column-major; Vulkan `[0,1]` depth; the Metal NDC +Y flip is applied CPU-side so the shared shaders are backend-neutral.
-- **PBR materials** — full glTF metallic-roughness Cook-Torrance shading: base color, metallic-roughness, tangent-space normal mapping, emissive, and ambient occlusion, bound as a 5-texture material set.
-- **Image-based lighting** — both a lightweight **procedural** sky-color IBL and real **HDR equirectangular** environment IBL (`assets/env/env.hdr`, CPU box-prefiltered mip chain → roughness-aware specular + diffuse irradiance).
-- **Directional shadow mapping (PCF)** — depth-only pass into a 2048² shadow map; 3×3 PCF in the lit shaders; `Mat4::Ortho` light projection. Static, skinned, and instanced shadow pipelines.
-- **Cascaded shadow maps (CSM)** — the directional light's frustum is split into N cascades (increasing splits over `(near, far]`), each fit to a tight ortho volume and rendered into one tile of a shadow atlas via `SetViewport`. The lit shaders select a cascade per fragment by view depth. `render/csm.h` is header-only and unit-tested (frustum split + per-cascade ortho fit).
-- **Spot lights + spot shadows** — a perspective spot-light shadow (`render/spot.h`: `spotViewProj` projection + cone attenuation smoothstep), depth-rendered into the shadow atlas and PCF-sampled in the lit pass.
-- **Omnidirectional point-light shadows** — a 6-face cube shadow atlas (`render/point_shadow.h`: per-face cube view-proj, dominant-axis face selection, 3×2 tile mapping) so a point light casts shadows in every direction. Rendered into six atlas tiles via `SetViewport`.
-- **Clustered / Forward+ lighting** — the view frustum is divided into a 3D cluster grid (exponential z-slices); each cluster gets the list of lights whose sphere overlaps it (`render/clustered.h`: `BuildClusters` → per-cluster offset/count + a flat light-index list). The lit pass reads the cluster set (set 3, storage buffers) and shades only the lights touching its cluster, scaling to **hundreds** of lights. Proven **byte-identical to brute-force** shading by golden (`clustered`, 192 lights).
-- **Clustered light culling / Forward+ (the many-lights flagship, CL)** — `render/cluster.h` builds the per-cluster light lists for a Forward+ pass: a `16×9×24` view-space **cluster grid** (3456 clusters) over which each light's **sphere is tested against every cluster's AABB** (`AssignLights` → per-cluster offset/count + a flat light-index list), so the lit pass shades only the lights touching a fragment's cluster — scaling to **hundreds** of lights. The grid + sphere-AABB assignment is header-only, pure-CPU shared math (zero backend symbols), and the GPU assignment is proven **byte-identical to the CPU reference** (GPU assigned `5606` == CPU ref `5606`) **and** the clustered shading is proven **byte-identical to brute-force** by golden. Unit-tested and golden-captured (`--clustered-lights-shot` / `--clustered-lights`, the `clustered_lights` golden), reporting `lights:96, clusters:3456, maxPerCluster:34, avgPerCluster:1.62, brimByteIdentical:true`.
-- **Screen-space reflections (SSR)** — a depth-marched SSR pass (`render/ssr.h`: view↔screen projection round-trip + view-space reflection ray) reflects the scene off a reflective floor by ray-marching the depth buffer, with the Vulkan/Metal yFlip handled in the projection.
-- **Screen-space global illumination (SSGI) — raw → bilateral denoise → temporal (the GI trilogy)** — one bounce of indirect **diffuse** lighting gathered in screen space (`render/ssgi.h`, header-only): for each pixel the view-space position + normal are reconstructed from the G-buffer **exactly like SSR** (the header re-exports `ssr::ReconstructViewPos` / `ssr::ViewToScreenUV` — documented reuse, not a duplicate), K cosine-weighted hemisphere rays are marched against depth with the **same march + binary-search as `ssr.frag`**, and on a hit the already-lit HDR scene color is read as incoming radiance; the mean indirect irradiance is multiplied by albedo and added to the scene (`--ssgi-shot` / `--ssgi`, the `ssgi` golden). The single-frame K=16 gather is noisy, so it is cleaned up two complementary ways. **(1) Spatial:** a separable **edge-preserving bilateral denoise** (`BilateralWeight`: spatial × range/normal weights) of the indirect buffer is mirrored verbatim in `shaders/ssgi_denoise.frag.hlsl` and pinned by the `ssgi_denoise` golden (`--ssgi-denoise-shot` / `--ssgi-denoise`). **(2) Temporal:** a fixed **N=8 accumulation** averages eight SSGI gathers, each with a **golden-angle-rotated hemisphere kernel** (the `ssgi.frag` `frame` param), into a running-mean HDR accumulation target (ping-pong RTs) before compositing — a static-camera accumulation with **no reprojection** (the camera is fixed for the golden), completing the trilogy `raw → spatial-denoise → temporal` (`--ssgi-temporal-shot` / `--ssgi-temporal`, the `ssgi_temporal` golden). All three are deterministic two-run byte-identical; the CPU kernel is shared with the shader and unit-tested (`ssgi_test`).
-- **Screen-space projected decals** — an oriented decal-box volume is projected top-down onto whatever scene geometry lies inside it, reusing the G-buffer: the deferred fragment's world position is reconstructed from depth (exactly as SSR/SSAO reconstruct view space, then mapped view→world via the camera) and transformed into decal-local space; if it lies in the unit box the decal texture is sampled and alpha-blended over the lit scene with a smoothstep edge fade (`render/decal.h`: `BuildDecalTransform` TRS + its inverse, `InsideUnitBox`, top-down `DecalUV`, `EdgeFade`). The CPU box-projection math is header-only and **shared** with the in-shader composite (`shaders/decal.frag.hlsl`) and the unit test (`decal_test`), so the test pins the same math the shader uses. Golden-captured (`--decal-shot` / `--decal`, the `decal` golden).
-- **Volumetric fog / light shafts** — a ray-marched volumetric pass (`render/volumetric.h`: Henyey-Greenstein phase function, camera-basis world-ray reconstruction, Beer-Lambert transmittance) accumulates in-scattered light through participating media (shadow-sampled god rays), composited over the lit scene. Header-only math is unit-tested.
-- **Reflection + irradiance probes (local cubemap GI)** — baked 6-face environment probes (`render/probe.h`: per-face cube projection + dominant-axis face selection + a combined reflection/irradiance atlas-tile layout the `lit_probe` shader mirrors) provide local specular reflection and diffuse irradiance, bound through the seam via `BindReflectionProbe`. Header-only math is unit-tested.
-- **Multi-pass post-processing** — fullscreen pass with FXAA, exposure, ACES tonemap, cinematic grade, film grain, and vignette.
-- **Data-driven post-process stack** — an ordered, JSON-authorable chain of post effects (`render/post_stack.h` / `.cpp`: a `PostStack` of `PostEffect`s applied **in order** to the resolved scene color). The effect set is **ACES Tonemap**, **ColorGrade** (per-channel lift/gamma/gain), **ChromaticAberration** (radial RGB split), **Vignette**, and **FilmGrain** (a fixed 32-bit integer hash of the integer pixel coord — clock/RNG-free, so golden-stable and bit-identical in HLSL). The CPU per-effect math is **shared** with the in-shader stack (`shaders/post_stack.frag.hlsl`) and the unit test (`post_stack_test`), exactly as SSR/decal share their math. The shader encodes the chain as a **flat float push-constant stream** — a `float4[7]` (112 B) + an `int4` count (16 B) = **128 bytes**, fitting inside the guaranteed `maxPushConstantsSize` minimum (a vec4-per-effect array would overflow a 128-byte GPU); the shader walks the stream with a running cursor and applies each effect in order. The stack is **data** (`LoadPostStack` parses it from JSON) so an agent can compose looks. Deterministic two-run byte-identical; golden-captured (`--poststack-shot` / `--poststack`, the `poststack` golden, `count:5`).
-- **HDR bloom** — render into an `RGBA16_Float` target, soft-knee threshold bright-pass, a 5-level downsample mip chain (13-tap dual filter), tent-filter upsample/combine, and a composite that tonemaps.
-- **SSAO** — view-space normal+depth g-buffer prepass, a 16-sample hemisphere-kernel AO pass (baked kernel + noise, no runtime RNG), a box blur, and a composite that multiplies the lit scene by the blurred AO (contact AO).
-- **Alpha-blended transparency** — a sorted (back-to-front) translucent pass that depth-tests against opaque geometry but does not write depth (`depthWrite=false`), with Fresnel-style alpha.
-- **GPU instancing** — a per-instance vertex stream (`scene::InstanceTransformLayout`) drives a single `DrawIndexedInstanced` call; transforms come from the deterministic `scene::BuildInstanceGrid` (no RNG).
-- **Compute particles** — a compute kernel animates a 50k-particle storage buffer (gravity + swirl fountain, deterministic respawn), drawn as additive points.
-- **CPU particle / VFX emitter** — an **authorable** emitter layer (`engine/vfx/particles.*`, pure CPU, zero backend symbols) — the VFX analogue of the authorable material graph, distinct from the fixed compute-particle fountain. A data-driven `EmitterConfig` (spawn rate, lifetime, initial velocity + spread, gravity, drag, **size-over-life** + **color-over-life** lifetime curves) is simulated on the CPU at a **fixed timestep** and rendered as camera-facing **additive alpha-blended billboards**, reusing the existing dynamic-textured-quad overlay infra (no new RHI seam symbols). Determinism is byte-exact: a **fixed-seed integer LCG** (the audio Noise voice's `1664525/1013904223` constants) drives the velocity-spread jitter (no `<random>`, no clock) and a **fixed number of fixed-dt** `Step()` calls drive the sim, so the same config + seed + step count yields identical billboards on both backends and two runs are bit-identical. Compiled into `hf_core` (ASan-scoped, `vfx_test`) and `hf_engine` (the `--vfx-shot` showcase + the Metal `--vfx` path); golden-captured (`--vfx-shot` / `--vfx`, the `vfx` golden), reporting `emitters:1, alive:960, spawned:1800`.
-- **Procedural skybox** — gradient sky + sun disk drawn first in the scene pass via camera-ray reconstruction from the per-frame UBO. No matrix inverse, no extra textures.
-- **Gerstner-wave water (sky/atmosphere suite, CF)** — a `gridN×gridN` water surface displaced by a fixed sum of **Gerstner waves** (`render/water.h`: per-wave amplitude / wavelength / steepness / direction, evaluated at a fixed `time`) with **Fresnel-weighted reflect/refract** shading (Schlick Fresnel mixing a reflected-sky term and a refracted depth-tinted term). The displacement + normal + Fresnel math is header-only, pure CPU (zero backend symbols) and **shared verbatim** with `shaders/water.*`, so the water-mesh pass is deterministic-at-fixed-time and two-run byte-identical. Golden-captured (`--water-shot` / `--water`, the `water` golden), reporting `waves:3, time:1.3, gridN:128`.
-- **Depth of field (CG)** — a **thin-lens circle-of-confusion (CoC) depth gather** (`render/dof.h`: `CoC(depth)` from a thin-lens model — `focalDist` / `aperture` / `maxCoC` — then a fullscreen neighbour gather weighted by CoC) that keeps the focus plane sharp and blurs out-of-focus depths. The CoC + gather math is header-only, pure CPU, and mirrored in `shaders/dof.frag.hlsl`; deterministic two-run byte-identical. Golden-captured (`--dof-shot` / `--dof`, the `dof` golden), reporting `focalDist:12.0, aperture:90.0, maxCoC:18.0`.
-- **Volumetric clouds (sky/atmosphere suite, CH)** — a **raymarched cumulus** layer (`render/clouds.h`: a fixed `steps` march through a `coverage`-thresholded procedural density slab, accumulating **Beer-Lambert** transmittance for self-shadowing and a **Henyey-Greenstein (HG) phase** term for forward sun scattering, composited over the sky). The density / Beer-Lambert / HG math is header-only, pure CPU, and shared with `shaders/clouds.frag.hlsl`, evaluated at a fixed `time`; deterministic two-run byte-identical. With the procedural sky and the CF water this completes the **sky / atmosphere suite (sky + water + clouds)**. Golden-captured (`--clouds-shot` / `--clouds`, the `clouds` golden), reporting `steps:64, coverage:0.42, time:2`.
-- **Cloud shadows on the ground (sky/atmosphere suite, CK)** — completing the sky / atmosphere suite (**sky + water + clouds + cloud shadows**): the cloud field dapples the **direct sun** on the lit scene as moving ground shadows. For each shaded point a fixed `steps` **sun-ray density march** through the same procedural cloud slab accumulates **Beer transmittance** (`render/clouds.h`: `CloudShadow(worldPos, sunDir, time)`), which attenuates the direct-light term in the lit pass. The march is header-only, pure CPU, shared verbatim with the lit shader, and evaluated at a fixed `time`; deterministic two-run byte-identical. Golden-captured (`--cloud-shadows-shot` / `--cloud-shadows`, the `cloud_shadows` golden), reporting `steps:24, time:2`.
-- **Temporal anti-aliasing (TAA)** — a reprojecting TAA resolve (`render/taa.h`: deterministic Halton(2,3) sub-pixel jitter sequence + history reprojection + neighborhood clamp) accumulates jittered frames into a stable image. The jitter sequence is bit-identical across runs and backends, so the resolved golden is deterministic.
-- **Motion blur (CN)** — a **velocity-gather** post pass (`render/motion_blur.h`, header-only, pure CPU, zero backend symbols): per-object + camera screen-space velocity (`ScreenVelocity`, projecting current vs. previous world position) is clamped to `maxBlurPx`, and the post pass gathers `taps` scene-color samples along the velocity streak. The velocity / clamp / gather math is shared verbatim with `shaders/motion_blur.frag.hlsl`, so the velocity field — hence the golden — is bit-identical on Vulkan + Metal. **Render-invariant proof:** with **zero motion** the gather short-circuits to a plain copy, so the blurred render is **byte-identical** to the un-blurred scene color (`motion-blur zeroVel==scene-color: BYTE-IDENTICAL`). Deterministic two-run byte-identical; golden-captured (`--motionblur-shot` / `--motionblur`, the `motion_blur` golden), reporting `maxBlurPx:28, taps:24, velScale:1.0`.
-- **Order-independent transparency (OIT, CO)** — **Weighted Blended OIT** (`render/oit.h`, header-only, pure CPU, zero backend symbols): the transparent set is rendered into two MRT targets — a `SUM` accum (additive blend) and a `PRODUCT` revealage (the multiplicative `(0, 1−srcAlpha)` blend) — then a fullscreen **resolve** combines them, giving correct transparency **without sorting**. Because the accum is commutative-additive and the revealage is a commutative product, the result is **independent of draw order**. The single additive RHI flag the resolve needs is `GraphicsPipelineDesc::oitRevealageBlend` (a pure-interface `bool`, default `false`; the actual blend factors live only in the backend pipeline code). **Render-invariant proof:** the showcase renders the glass set in canonical and in a **permuted** order and asserts the captures are **byte-identical** (`oit permuted==canonical: BYTE-IDENTICAL`, canonical hash `9007024d7792ac3e`). The accum/revealage/resolve math is shared verbatim with `shaders/oit_*.frag.hlsl`. Deterministic two-run byte-identical; golden-captured (`--oit-shot` / `--oit`, the `oit` golden), reporting `layers:5, orderIndependent:true`.
-- **Parallax occlusion mapping (POM, CP)** — per-pixel surface depth + self-occlusion (`render/pom.h`, header-only, pure CPU, zero backend symbols): a **steep-parallax** march through a tangent-space height field, a **binary-refinement** step at the intersection, and a **self-shadow** march toward the light, all in tangent space and using the same lighting model as `lit.frag`. The march / refine / self-shadow math is shared verbatim with the POM fragment shader. **Render-invariant proof:** with `heightScale = 0` the march degenerates to the base UV and the self-shadow to `1.0`, so the POM render is **byte-identical** to plain normal mapping — the real-field-at-zero-height and a dedicated flat-field path produce the same image (`pom heightScale=0 == plain normal mapping: BYTE-IDENTICAL`, hash `3d50b38bd46040f0`). Deterministic two-run byte-identical; golden-captured (`--pom-shot` / `--pom`, the `pom` golden), reporting `heightScale:0.08, steps:32`.
-- **Ground-truth ambient occlusion (GTAO, CR)** — horizon-search ground-truth AO (`render/gtao.h`, header-only, pure CPU, zero backend symbols) following Jimenez et al. 2016, **coexisting with SSAO** as a separate, more accurate AO term (not a replacement). For each shaded pixel it sweeps several **slice** directions across the screen, marches the depth field both ways to find the two largest **horizon** elevation angles, and evaluates the closed-form cosine-weighted **arc integral** between them (`IntegrateArc` / `HorizonAngle` / `Visibility`) — the EXACT cosine-weighted visibility for the found horizons, averaged over slices to V ∈ [0,1]. The integral is shared verbatim with `shaders/gtao.frag.hlsl` and pinned by `gtao_test`. **Render-invariant proof:** with `radius = 0` every marched sample coincides with the center, no horizon is raised, and `IntegrateArc` of the fully-open arc is EXACTLY 1 on every slice → V == 1 everywhere → the GTAO-applied image equals the no-AO scene **byte-identically** (`gtao radius=0 == no-AO scene: BYTE-IDENTICAL`, hash `e0a46f7a287906f8`). Deterministic two-run byte-identical; golden-captured (`--gtao-shot` / `--gtao`, the `gtao` golden), reporting `slices:8, steps:8, radius:0.6`.
-- **Froxel volumetric fog (CS)** — a **froxel (frustum-voxel)** sun single-scattering volume (`render/froxel.h`, header-only, pure CPU, zero backend symbols): a true **3D view-space** single-scattering fog, **distinct from** the 2D light-shaft volumetric pass. The view frustum is partitioned into a `dimX×dimY×dimZ` grid of view-space froxels (XY follow framebuffer tiles, Z is split into **exponential** depth slices via `SliceZ`/`ViewZToSlice`, exact inverses) over a flat SSBO volume processed in three GPU passes — **INJECT** (per-froxel height-based `Density` + Henyey-Greenstein `Phase`), **INTEGRATE** (per-column front-to-back single-scattering via `IntegrateStep`, accumulating in-scatter + transmittance), and **APPLY** (fullscreen — reconstruct the G-buffer view depth, sample the integrated volume, composite `out = scene*T + inScatter`). The math is shared verbatim with `froxel_inject.comp.hlsl` / `froxel_integrate.comp.hlsl` / `froxel_apply.frag.hlsl` and pinned by `froxel_test`. The two inter-pass barriers use the additive seam entry points `ICommandBuffer::ComputeToComputeBarrier()` / `ComputeToFragmentBarrier()` (pure-interface, defaulted empty bodies; the real barriers live only in the backend command buffers), and the COMPUTE→COMPUTE→FRAGMENT chain is **SYNC-HAZARD-free** under the Khronos sync-validation layer. **Render-invariant proof:** with `baseDensity = 0` every froxel's `Density` is 0 → extinction 0 → `IntegrateStep` is a no-op (T stays 1, L stays 0) → apply computes `out = scene*1 + 0 = scene` **byte-identically** (`froxel density=0 == no-fog scene: BYTE-IDENTICAL`, hash `48a4d3cb2104d3ba`). Deterministic two-run byte-identical; golden-captured (`--froxelfog-shot` / `--froxelfog`, the `froxel_fog` golden), reporting `froxels:16x9x64, density:0.06, g:0.76`.
-- **Screen-space contact shadows (CT)** — a short **screen-space depth-march toward the sun** (`render/contact_shadows.h`, header-only, pure CPU, zero backend symbols) that fills the fine contact occlusion the CSM is too coarse to capture (the dark line where a sphere rests on the ground, the crease where a thin object nearly touches). For each shaded pixel it reconstructs the view-space position from G-buffer depth and marches a short ray toward the sun in `steps` increments out to `maxDist`; at each step it projects to screen, samples the stored depth, and — within a `thickness` window and past a self-occlusion `bias` — darkens **only the direct sun term** (ambient / IBL / point lights untouched, exactly like the CSM term). `RayMarchShadow` / `ProjectToUV` are shared verbatim with `shaders/contact_shadows.frag.hlsl` and pinned by `contact_shadows_test`. **Render-invariant proof:** with `maxDist = 0` (short-circuited with `steps ≤ 0`) the march step length is 0 → every marched point coincides with the origin → no occluder is found → the factor is 1 everywhere → the contact-shadowed render equals the plain lit render **byte-identically** (`contact maxDist=0 == no-contact scene: BYTE-IDENTICAL`, hash `a41c0ede5a8a3261`). Deterministic two-run byte-identical; golden-captured (`--contactshadow-shot` / `--contactshadow`, the `contact_shadows` golden), reporting `steps:24, maxDist:0.9, thickness:0.6`.
-- **Per-froxel clustered-light injection (CV)** — the froxel-fog inject pass (`render/froxel.h` `InjectClusteredLights`, header-only, pure CPU, zero backend symbols) is fused with the CL clustered-light grid so the **96 clustered point lights** scatter through the fog as **colored volumetric shafts**: for each froxel it walks the cluster's light list (the same CL `16×9×24` grid + flat index buffer) and adds each light's range-attenuated, Henyey-Greenstein-phased in-scatter on top of the CS sun single-scatter. The math is shared verbatim with `froxel_inject.comp.hlsl` (cluster grid `b2` + light SSBO `b3`) and pinned by `froxel_test`. **Render-invariant proofs:** with `injectLights = false` the per-froxel light loop is skipped → the volume equals the CS sun-only fog **byte-identically** (`lights-off == CS fog: BYTE-IDENTICAL`, hash `94398fa72c19c956`); with `baseDensity = 0` it equals the no-fog scene **byte-identically** (hash `ef6ffb56167ea125`). Deterministic two-run byte-identical; golden-captured (`--froxellights-shot` / `--froxellights`, the `froxel_lights` golden), reporting `lights:96, froxels:16x9x64, density:0.06, g:0.76`.
-- **Auto-exposure (CW)** — integer-histogram eye adaptation (`render/auto_exposure.h`, header-only, pure CPU, zero backend symbols): a compute pass builds a **256-bin log-luminance histogram** of the HDR scene, a reduction finds the key-value average luminance, and the tonemap applies the derived **key-value exposure** (Saturate/ EV mapping). The integer histogram makes the metering bit-identical run-to-run and across compilers; the math is shared verbatim with the histogram/exposure shaders and pinned by `auto_exposure_test`. **Render-invariant proof:** with `adaptationEnabled = false` the pass uses the fixed baseline exposure E0 and is **byte-identical** to the standard fixed-exposure tonemap (`adaptation-off == standard tonemap: BYTE-IDENTICAL`, hash `b7290c092f82cfc0`). Deterministic two-run byte-identical; golden-captured (`--autoexposure-shot` / `--autoexposure`, the `auto_exposure` golden), reporting `bins:256, EV:-3.211, keyValue:0.18`.
-- **Volumetric shadows (CX)** — sun light shafts through the fog (`render/froxel.h` `SunVisibility`, header-only, pure CPU, zero backend symbols), completing the **volumetric trilogy** (sun scatter → clustered-light scatter → sun-shadow gate). The froxel inject pass samples the sun's **CSM shadow map per froxel** (via the new compute-stage `BindShadowMapCompute` RHI interface) and **gates the sun in-scatter** by the per-froxel sun visibility → dark fog volumes behind occluders and crisp foggy sun shafts where the light reaches. The shadow sample is shared verbatim with `froxel_inject.comp.hlsl` and pinned by `froxel_test`. **Render-invariant proofs:** with `volumetricShadows = false` the visibility gate is 1 everywhere → the volume equals the CV froxel-lights render **byte-identically** (`vol-shadows-off == CV: BYTE-IDENTICAL`, hash `128d407347627b6d`); with `baseDensity = 0` it equals the no-fog scene **byte-identically** (hash `ef6ffb56167ea125`). The shadow-pass→inject-compute read barrier is SYNC-HAZARD-free under the Khronos sync-validation layer. Deterministic two-run byte-identical; golden-captured (`--volshadows-shot` / `--volshadows`, the `vol_shadows` golden), reporting `froxels:16x9x64, cascades:1, density:0.06`.
-- **Subsurface scattering (SSS, CZ)** — screen-space **separable diffusion** SSS (`render/sss.h`, header-only, pure CPU, zero backend symbols) for translucent materials (skin, wax): the diffuse-lit scene is blurred by a depth-aware, separable Gaussian whose per-tap weights follow a multi-Gaussian diffusion profile, with the blur **kernel width scaled by `1/depth`** (and bilateral depth gating) so scattering stays correct under perspective and never bleeds across silhouettes. The profile / separable-tap math is shared verbatim with `shaders/sss.frag.hlsl` and pinned by `sss_test`. **Render-invariant proof:** with `sssStrength = 0` every tap collapses to the center sample → the SSS render is **byte-identical** to the non-SSS lit scene (`sss strength=0 == non-SSS scene: BYTE-IDENTICAL`, hash `1b4bb87e79d914c6`). Deterministic two-run byte-identical; golden-captured (`--sss-shot` / `--sss`, the `sss` golden), reporting `width:26, strength:14, taps:17`.
-- **Box-projected reflection probe (DA)** — local cubemap reflections (`render/reflection_probe.h`, header-only, pure CPU, zero backend symbols): the specular reflection ray is **parallax-corrected** to a local **probe box** (intersect the reflected ray with the AABB around the probe origin, then look the corrected direction up in the cubemap) so a reflected wall lines up with the actual room geometry instead of an infinitely-distant environment. The ray-box intersection / direction-correction math is shared verbatim with `shaders/refl_probe.frag.hlsl` and pinned by `reflection_probe_test`. **Render-invariant proof:** with `parallaxStrength = 0` the correction degenerates to the raw reflection direction → the box-projected render is **byte-identical** to the standard infinite-cubemap reflection (`refl-probe parallax=0 == standard infinite-cubemap reflection: BYTE-IDENTICAL`, hash `7bd456b9ca8189f7`). Deterministic two-run byte-identical; golden-captured (`--reflprobe-shot` / `--reflprobe`, the `refl_probe` golden), reporting `boxSize:12, parallax:1`.
-- **Color grading (DB)** — analytic post-tonemap grade (`render/color_grade.h`, header-only, pure CPU, zero backend symbols): a **lift/gamma/gain** transfer, an **ASC-CDL** slope/offset/power, and a **luma-preserving saturation** (Rec. 709 luma) applied **after** the tonemap, the standard colorist controls. The grade math is shared verbatim with `shaders/color_grade.frag.hlsl` and pinned by `color_grade_test`. **Render-invariant proof:** the **identity grade** (unit slope/gain, zero lift/offset, unit gamma/power, saturation 1) is a no-op → the graded render is **byte-identical** to the ungraded tonemap (`color-grade identity == ungraded scene: BYTE-IDENTICAL`, hash `2e974369d510a410`). Deterministic two-run byte-identical; golden-captured (`--colorgrade-shot` / `--colorgrade`, the `color_grade` golden), reporting `sat:1.18, gamma:1.05`.
-- **Dynamic cubemap-capture reflection probe (DD)** — a **runtime** local reflection probe that captures the live scene instead of a baked environment (`render/cubemap.h`, header-only, pure CPU, zero backend symbols — the 6-face capture math: per-face look-at view + 90° projection): the scene is rendered into the **6 faces of a cube render target** from the probe centre, then a reflective sphere/floor samples the captured cube (box-projected, reusing DA's parallax correction). The capture uses the **additive cubemap render-target RHI** — `IRHIDevice::CreateCubemapTarget` → `ICubemapTarget`, `BeginCubemapFace`/`EndCubemapFace` to render each face, `ReadCubemapFace`/`ReadRenderTarget` for the read-back proof, and `ICommandBuffer::BindCubemapProbe` to sample the captured cube — all pure-interface (defaulted bodies in `rhi.h`; the real impls live only in `rhi_vulkan/vulkan_cubemap_target.*` + `rhi_metal/metal_cubemap_target.*`). The render graph emits the **capture→sample barrier** (the 6 face passes then a ShaderRead transition), proven SYNC-HAZARD-free under the Khronos sync-validation layer. **Render-invariant proof:** a **captured cube face is byte-identical to the scene rendered directly** with that face's view/proj (`capture-probe face-0 cube == direct face-0 render: BYTE-IDENTICAL`, hash `88b1504807350383`) — the capture-correctness proof. Deterministic two-run byte-identical; golden-captured (`--captureprobe-shot` / `--captureprobe`, the `capture_probe` golden), reporting `{faces:6, cubeSize:512}`.
-- **Planar reflections (DE)** — a flat **mirror-plane** reflection distinct from SSR (screen-space) and the cubemap probes (DA/DD): the scene is rendered a **second time through the camera reflected across the mirror plane** into a 2D reflection RT, then the mirror floor samples that RT at its own screen UV (`render/planar_reflection.h`, header-only, pure CPU, zero backend symbols): `reflectedVP = mainProj · ReflectionMatrix(plane) · mainView` via a **Householder reflection**, with a **Lengyel oblique near-clip** set to the mirror plane (geometry behind the mirror clipped) and the **front-face winding flipped** (a reflection mirrors handedness) via the existing `cullNone` knob — **no new RHI seam**. The render graph emits the **reflection-write→sample barrier** (ShaderRead), proven SYNC-HAZARD-free under the sync-validation layer. The reflection math is shared verbatim with `shaders/planar.frag.hlsl` and pinned by `planar_reflection_test`. **Render-invariant proof:** with `reflectivity = 0` the floor never reads the reflection RT → the planar render is **byte-identical** to the matte non-reflective render (`planar reflectivity=0 == matte-floor render: BYTE-IDENTICAL`, hash `0f44066f3005fc01`). Deterministic two-run byte-identical; golden-captured (`--planar-shot` / `--planar`, the `planar_reflection` golden), reporting `{reflectivity:0.75}`.
-- **Contrast-adaptive sharpening (CAS, DF)** — **AMD FidelityFX CAS** (`render/cas.h`, header-only, pure CPU, zero backend symbols): an adaptive **3×3-cross edge sharpen** on the tonemapped SDR result whose per-pixel sharpening amount is driven by the local contrast and **clamped to the neighbourhood min/max so it never rings or overshoots**. The CAS weight + clamp math is shared verbatim with `shaders/cas.frag.hlsl` and pinned by `cas_test`. **Render-invariant proof:** with `sharpness = 0` the adaptive term is zero → the CAS render is **byte-identical** to the unsharpened tonemap (`cas sharpness=0 == unsharpened scene: BYTE-IDENTICAL`, hash `2e974369d510a410`). Deterministic two-run byte-identical; golden-captured (`--cas-shot` / `--cas`, the `cas` golden), reporting `{0.8}`.
-- **DDGI probe-grid ray-trace (the dynamic-GI beachhead, DH)** — the first slice of a **DDGI dynamic global-illumination pillar** (dynamic diffuse GI via irradiance probes): a world-space lattice of irradiance **probes**, each tracing `kRaysPerProbe = 16` deterministic **Fibonacci-sphere** rays against the scene's **view-space depth field** read back as a **flat `float[w*h]` SSBO** (the G-buffer `.w` channel, not a sampled depth texture — mirroring `froxel_inject`), recording per ray the world-space hit position + distance (or `kRayMiss`). `render/probe_gi.h` (header-only, pure CPU, zero backend symbols) re-exports `ssr::ViewToScreenUV` / `ssr::ReconstructViewPos` so the probe march and the in-shader march share the **same** projection, and `FibonacciSphere` / `TraceRayToDepth` are copied **verbatim** into `shaders/probe_raytrace.comp.hlsl`. **GPU==CPU bit-exact proof:** the showcase runs the probe-raytrace compute over the uploaded flat depth field and the CPU reference runs `probegi::TraceRayToDepth` over the **same** field; the two ray-hit SSBOs must be **BIT-EXACT** (`memcmp`) — the probe analog of the gpu-cull gpu==cpuRef proof. **probeCount=0 no-op proof:** `dimX==0` → `DispatchCompute(0)` → the ray-hit SSBO is byte-identical to the cleared upload (all `kRayMiss`). The compute→readback barrier is **SYNC-HAZARD-free** under the Khronos sync-validation layer. This slice is **only** the verified ray-trace data layer (no visible indirect lighting yet). Unit-tested (`probe_gi_test`) and golden-captured (`--probegi-shot` / `--probegi`, the `probegi` golden), reporting `{probes:256, rays:16, hits:1474}`.
-- **DDGI per-probe radiance capture (DI)** — the second DDGI slice: a small **2×2×2 = 8-probe** grid where each probe's lit scene is captured into the **6 faces of a cube render target from the probe centre** — looping the single cubemap RT one probe at a time — and read back into a **per-probe radiance store** (`render/probe_capture.h`, header-only, pure CPU, zero backend symbols, reusing DD's per-face cubemap look-at/projection math). It reuses the **additive cubemap render-target RHI** (DD's `CreateCubemapTarget`/`BeginCubemapFace`/`EndCubemapFace`/`ReadCubemapFace`) and DD's unchanged `probe_bake` capture shaders — **no new RHI, no new shader**. **Render-invariant proof:** a captured face is **byte-identical** to the scene rendered directly with that face's view/proj (`probe-capture face-0 == direct render: BYTE-IDENTICAL`, hash `d17a0d18a10ca823`); **probeCount=0** leaves the radiance store byte-identical to its cleared value. The per-probe capture→read barriers are SYNC-HAZARD-free under the sync-validation layer. Deterministic two-run byte-identical; golden-captured (`--probecapture-shot` / `--probecapture`, the `probe_capture` golden), reporting `{probes:8, faces:48, cubeSize:64}`.
-- **DDGI probe SH-encode (DJ)** — the third DDGI slice: each captured probe cubemap is encoded into **3rd-order real spherical harmonics** (9 coefficients per RGB channel) by a **pure compute pass** over a fixed host-precomputed sample set (`render/probe_sh.h`, header-only, pure CPU, zero backend symbols). The sample directions + `SHBasis9` weights + solid-angle weights are uploaded as **exact bits** that both the GPU encode and the CPU reference read, with the transcendentals host-precomputed and accumulated via `fma`, so the per-probe SH SSBO is **GPU==CPU BIT-EXACT**. **Render-invariant proofs:** the GPU per-probe SH SSBO is BIT-EXACT to the CPU `probesh` reference; a **zero-radiance** cubemap encodes to **zero-SH**; **probeCount=0** leaves the SH SSBO byte-identical to its cleared value. Deterministic two-run byte-identical; golden-captured (`--probesh-shot` / `--probesh`, the `probe_sh` golden), reporting `{probes:8, bands:3, coeffs:9}`. (Probe-update + GI-composite are the next DDGI slices.)
-- **Frustum culling** — `render::Frustum` extracts the six Gribb–Hartmann planes from the view-projection and tests sphere/AABB bounds CPU-side (`render/frustum.h`, header-only + unit-tested); the `cull` showcase visualizes which objects survive the cull from an overview camera.
-- **GPU-driven culling + indirect draw** — a compute pass culls the instance set against the frustum on the GPU and compacts the survivors into an ordered indirect-args buffer (`render/gpu_cull.h` reference CPU model, mirrored by the compute shader), which a single `DrawIndexedIndirect` consumes. The CPU reference and the GPU result agree, and the `gpu_cull` golden matches the brute-force draw.
-- **GPU multi-draw-indirect (MDI) batching** — a header-only pure-CPU builder (`render/mdi.h`: `BuildBatch`) lays out, for a scene of N distinct objects, the two GPU buffers one `DrawIndexedMultiIndirect(drawCount=N)` call consumes: an **indirect-args** buffer of N `MdiCommand` records (byte-identical to `VkDrawIndexedIndirectCommand` / `MTLDrawIndexedPrimitivesIndirectArguments`) and a **per-draw storage** buffer of N `PerDraw` records (model matrix + material), indexed by **`gl_DrawID`** (SPIR-V `DrawIndex`) rather than `firstInstance`. The MDI vertex shader (`shaders/lit_mdi.vert.hlsl`) reads `PerDraw[gl_DrawID]`, so command i and `PerDraw[i]` describe the same object. New RHI seam: `DrawIndexedMultiIndirect` + `BindPerDrawData`. On **Vulkan** the showcase issues one true `vkCmdDrawIndexedIndirect`; the seam's default makes it a per-object fallback on backends without MDI, and the Metal golden renders the identical scene per-object. **Render-invariant by construction** — the single builder feeds both the one-MDI-call path and the per-object reference path, so they are byte-identical: `--mdi-shot` reports `drawCalls:1, refDrawCalls:144` and `mdi==per-draw: BYTE-IDENTICAL`. Unit-tested (`mdi_test`) and golden-captured (`--mdi-shot` / `--mdi`, the `mdi` golden).
-- **Bindless textures** — instead of rebinding a per-material descriptor set before every draw, all scene textures are bound **once** as a single large descriptor **array** and selected per-draw by a `texIndex`. A header-only, pure-CPU index **table / interner** (`render/bindless.h`: `BuildBindlessTable` — stable first-insertion indices, de-duplicated) is the single source of truth for which texture each draw uses. On **Vulkan** this is **true bindless**: a runtime sampled-image array bound once under `VK_EXT_descriptor_indexing` (`PARTIALLY_BOUND` + `VARIABLE_DESCRIPTOR_COUNT` + `UPDATE_AFTER_BIND`, descriptor-indexing device features enabled), sampled via `gTextures[NonUniformResourceIndex(texIndex)]` in `shaders/lit_bindless.frag.hlsl` (DXC emits `SPV_EXT_descriptor_indexing`); the descriptor-indexing implementation lives **only** in `engine/rhi_vulkan/vulkan_bindless.*` behind a new seam (`CreateBindlessTextureSet` → `IBindlessTextureSet` + `BindBindlessTextures`), and **Metal** inherits the defaulted no-op and renders the identical multi-texture scene via the per-material **bound** path. **Render-invariant by construction** — `--bindless-shot` renders the bindless-array path **and** the per-material bound reference (same texture, same sampler) and asserts the two captures are **byte-identical** (FNV), reporting `textureBinds:1, refTextureBinds:5` and `bindless==bound: BYTE-IDENTICAL`. Pairs with MDI to complete the GPU-driven story (one indirect call + one texture-array bind). Unit-tested (`bindless_test`) and golden-captured (`--bindless-shot` / `--bindless`, the `bindless` golden).
-- **Fully-GPU-driven combined pass (MDI + bindless capstone)** — `render::gpudriven::BuildBatch` (`engine/render/gpu_driven.h`, header-only, pure-CPU, zero backend symbols) **composes** the proven MDI (`render/mdi.h`) and bindless (`render/bindless.h`) slices into the modern GPU-driven renderer: a single combined per-draw record (`GpuDrivenPerDraw` — model + material + `texIndex`, the 96-byte std430 layout `lit_gpudriven.vert` reads as `PerDraw[gl_DrawID]`) plus the bindless texture-index table, so **one** `DrawIndexedMultiIndirect(N)` + **one** `BindBindlessTextures` draw an entire **multi-material** scene. `lit_gpudriven.frag` samples `gTextures[NonUniformResourceIndex(texIndex)]`. **Render-invariant by construction** — the single builder is the source of truth for the commands, the per-draw records, **and** the bindless table, so the one-call render is byte-identical to N per-object per-material **bound** draws: `--gpudriven-shot` reports `drawCalls:1, textureBinds:1` and `gpudriven==bound: BYTE-IDENTICAL`. On **Vulkan** it issues one true indirect draw + one array bind; **Metal** inherits the per-object bound path and renders the identical scene. Unit-tested (`gpu_driven_test`) and golden-captured (`--gpudriven-shot` / `--gpudriven`, the `gpudriven` golden).
-- **Fully-GPU-driven-CULLED pass (compute-cull → MDI + bindless)** — the capstone that completes the GPU-driven pipeline: a **compute** pass frustum-culls the instance set and **compacts** the survivors **in source-index order** (the AR ordered prefix-sum scan, not an unordered atomic append), writing the **GPU-decided MDI `drawCount`** consumed by **one** `DrawIndexedMultiIndirect` + **one** bindless bind — so the GPU both **decides** which objects survive and **draws** exactly them in a single pass. `render::gpuculled::Cull` (`engine/render/gpu_culled.h`, header-only, pure-CPU, zero backend symbols) is the authoritative CPU mirror of `shaders/gpudriven_cull.comp.hlsl`, reusing the **identical** conservative `render::frustum::SphereOutside` test on the **identical** `render::gpu_cull::InstanceWorldSphere` bounds, emitting `render::gpudriven::GpuDrivenPerDraw` survivors. **Render-invariant by construction** — `--gpucull-draw-shot` renders the same survivor subset per-object **bound** (CPU frustum-cull → draw only the survivors) and asserts byte-identity: `gpucull-draw==bound: BYTE-IDENTICAL`, `total:144, drawn:107, cpuRef:107, drawCalls:1, textureBinds:1`. Unit-tested (`gpu_culled_test`) and golden-captured (`--gpucull-draw-shot` / `--gpucull-draw`, the `gpucull_draw` golden).
-- **Hi-Z occlusion culling (completing the GPU-driven culling pipeline, CJ)** — the occlusion half of GPU-driven culling: a depth pre-pass builds a **Hi-Z max-depth pyramid** (`render/hiz.h`, header-only, pure-CPU, zero backend symbols) that a **conservative screen-AABB occlusion test** queries — each frustum-surviving candidate's screen-space bounding box is tested against the coarsest covering Hi-Z mip, and objects fully behind already-drawn geometry are culled. Combined with frustum culling this completes the GPU-driven culling pipeline (**frustum + occlusion**). **Render-invariant by construction** — the occluded objects contribute zero pixels, so `--hiz-cull-shot` is **byte-identical** to the frustum-only render: it reports `total:31, frustumKept:31, occluded:24, drawn:7, cpuOccluded:24` and `hiz-cull==frustum-only: BYTE-IDENTICAL`. Unit-tested (`hiz_test`) and golden-captured (`--hiz-cull-shot` / `--hiz-cull`, the `hiz_cull` golden).
-- **Render graph + automatic barriers** — `render::RenderGraph` declares passes over imported resources (shadow map / scene color / swapchain) and a **resource-state tracker + barrier solver** automatically inserts the correct transitions between passes from each resource's prior→next state. On Vulkan each transition lowers to an explicit `vkCmdPipelineBarrier2`, **proven hazard-free by the Khronos synchronization-validation layer**; on Metal the tracked-hazard model makes them no-ops. The graph logic itself carries zero backend symbols.
-- **Multithreaded command recording** — passes record into per-thread secondary command buffers from a worker pool and are replayed in deterministic creation order (`vkCmdExecuteCommands` on Vulkan; an `MTLParallelRenderCommandEncoder`'s sub-encoders on Metal). A 1-worker render and an N-worker render are **byte-identical** (proven by the `mt` golden and a 1-vs-N hash test).
-- **Data-driven material / shader graph** — materials are authored as a node graph in JSON (`assets/materials/*.mat.json`); `material::ShaderGraph` + the codegen emit HLSL for the PBR inputs (base color / metallic / roughness / emissive / **normal**). The node set spans `Constant`, `UV`, `TextureSample`, `Multiply`, `Add`, `Lerp`, `Fresnel`, a **Slice-AZ expansion** — `Swizzle`, `MakeFloat3`, `MakeFloat4`, `Dot`, `Normalize`, `Power`, `OneMinus`, `Saturate` — and the **Slice-BE `NormalMap` node** (samples a tangent-space normal-map slot and decodes `c*2-1`, feeding the `PBROutput` sink's 5th `normal` input), all terminating at the `PBROutput` sink — enough to author non-trivial materials as graphs. When a graph drives `PBROutput.normal`, codegen emits the perturbed-normal `hfShadePBRN` lighting variant (TBN-transformed shading normal); graphs that leave `normal` unconnected codegen byte-identically to before, so every pre-BE golden is unchanged. A **build-time codegen tool** bakes the showcase materials into committed generated HLSL, and a **live runtime path** re-compiles an edited material on the fly (dxc subprocess → SPIR-V → pipeline) for in-editor authoring. The build-time and runtime paths render **byte-identically** (the `mat_graph` / `mat_graph2` goldens; a runtime==build-time hash check). A **multi-material scene** (`--material-multi-shot` / `--material-multi`) renders three spheres each shaded by a distinct graph material in one frame (the `mat_multi` golden), and the `NormalMap` node is pinned by the `mat_normal` golden (`--material-normal-shot` / `--material-normal`). Finally, **machine-readable graph introspection** (`material::DescribeGraphJson` / `ToDot`, `engine/material/graph_introspect.*`) dumps any `*.mat.json` graph as deterministic, pretty-printed **JSON** (nodes with id/type/params/typed input ports + resolved output type, edges, the PBROutput sink) or a **Graphviz DOT** digraph — completing the author → render → **inspect** loop for an agent or a future visual node editor. Pure CPU (zero backend symbols), byte-identical run-to-run (stable id-ascending node order, declaration-order ports). Exposed via `--material-introspect <mat.json> [out.json]` and pinned by a byte-exact JSON golden (`tests/golden/material/showcase3_graph.json`).
-
-### Text / HUD and audio
-
-- **Text / HUD overlay renderer** — `engine/ui/` bakes a fixed 8×8 monospace bitmap font into an RGBA atlas (`BuildFontAtlas`) and lays a string out into a batch of screen-space NDC quads (`LayoutText`) — pure CPU, zero backend symbols, no asset/clock/RNG, so the same string yields the same pixels on both backends. The draw side reuses the existing alpha-blend + sampled-texture **screen-space overlay** pass (`shaders/text.{vert,frag}.hlsl`), compositing the HUD over the scene after post. Golden-captured standalone (`--hud-shot` / `--hud`, the `hud` golden) and over the game (`--game-hud-shot` / `--game-hud`, the `game_hud` golden).
-- **Deterministic audio mixer + WAV writer** — `engine/audio/` is a software mixer that is **integer / fixed-point end to end** (Q15 gains, an int32 accumulator, hard-clamp to int16 — no float in the sample loop) with sine/square/noise voices and a piecewise-linear ADSR envelope, plus a canonical 16-bit-PCM WAV writer (hand-serialized little-endian, no timestamps). Pure CPU in `hf_core` (ASan-scoped, unit-tested), it produces **bit-identical** output on every compiler/run; `--audio-render out.wav` renders a fixed scene that is byte-exact against the committed `tests/golden/audio/scene.wav` golden.
-
-### Networking / replication
-
-- **Deterministic state-replication snapshot layer** — `engine/net/snapshot.*` is a pure-CPU replication core (zero RHI/backend symbols, ASan-scoped, unit-tested via `replication_test`): an **authority** serializes a per-tick snapshot of replicated entity state (the roll-game player + pickups) into a fixed little-endian byte stream — periodic full **keyframes** plus **deltas** between them — and a **replica** applies that stream to reconstruct **bit-identical** state. Transport here is an in-process "perfect channel" (no sockets/UDP/TCP); floats round-trip as their raw IEEE-754 bits since authority and replica are the same build. (Slice BU below adds an **imperfect** seeded transport + client interpolation on top of this core.) The `--net-shot` showcase steps the authority sim, feeds its bytes to the replica, asserts the replica state matches at the capture tick, and renders the **replica's** reconstructed scene through the existing lit/shadowed path (the `net` golden); it reports a fixed `replicaMatch:true, savings:43.5%` (`fullBytes:37233, deltaBytes:21045`) — delta replication vs full snapshots.
-- **Simulated lossy transport + client jitter-buffer interpolation** — `engine/net/transport.*` builds on the BQ snapshot layer to model the **hard** part of networking — an **imperfect channel** plus a **client jitter buffer** — without any real sockets. A `SimChannel` applies a **fixed-tick latency** plus seeded **packet loss + reordering** drawn from a pure **integer LCG** seeded by `lossSeed` + the send sequence (NO real RNG, NO clock), so the same config + same send stream yields a bit-identical delivered/dropped/reordered sequence. The `ClientView` buffers delivered snapshots keyed by tick and renders at `renderTick = latestReceivedTick - interpDelay` (default 2 ticks behind the leading edge), **interpolating** across the two buffered snapshots that bracket `renderTick` (reusing BQ `Interpolate`: lerp position + nlerp/slerp orientation) so a single **dropped** snapshot is spanned by its neighbors and hidden — with **hold-last** as the documented edge policy (never extrapolates past the newest snapshot). Pure CPU, zero RHI/backend symbols, ASan-scoped + unit-tested (`net_transport_test`); the `--netsim-shot` / `--netsim` showcase steps the authority sim through the lossy channel into the client and renders the client's **interpolated** scene through the existing lit/shadowed path (the `netsim` golden), reporting a fixed `delivered:226, dropped:42, reordered:29, converged:true` (the smoothing hides the lossy channel).
-- **Client-side prediction + server reconciliation (completing the networking trilogy)** — `engine/net/prediction.*` adds the third networking depth slice on top of the BQ replication + BU transport: instead of waiting a full round-trip to display the local player, a `PredictedClient` **predicts ahead** by applying local `InputCmd`s immediately (`PredictTick`), then **reconciles** when an authoritative frame arrives (`OnAuthoritative`) by **rewinding** to the acknowledged authoritative state and **replaying** the still-unacknowledged inputs. To rewind/replay bit-exactly the `AuthState` carries not just the replicated snapshot but the **full player `RigidBody`** (position **and velocity**), so the replay reproduces the same trajectory. The test is non-trivial by design: the authority runs the same sim **plus** a scripted **server-only impulse** the client cannot predict, creating a **real misprediction** (`maxMisprediction > 0`) that reconciliation then corrects. Deterministic — scripted inputs + scripted server-only impulse + the seeded BU channel + fixed latency are bit-stable. Pure CPU, **zero backend symbols** (the seam baseline stays at the 2 `rhi_factory` lines), ASan-scoped + unit-tested (`prediction_test`); the `--netpredict-shot` / `--netpredict` showcase drives authority → delayed lossy channel → predicted+reconciled client and renders the reconciled scene lit + shadowed (the `netpredict` golden), reporting `maxMisprediction:0.0655, converged:true` (byte-identical cross-backend, two-run deterministic).
-
-### Assets, animation, physics
-
-- **glTF loading** — header-only `cgltf`. Single-model loaders (geometry + full PBR material set) **and** a full **scene-graph import** (`LoadGltfScene`: node hierarchy walked to world transforms, one renderable per primitive, deduped materials).
-- **Skeletal animation + blending** — GPU skinning (joint palette at a dedicated vertex binding); single-clip sampling and **cross-clip blending** (`BlendAnimations`: lerp T/S, slerp R per joint) on the CPU in `hf::anim`.
-- **Animation state machine (cross-fade FSM)** — `anim::StateMachine` (`engine/anim/state_machine.*`) is a parameter-driven finite state machine built **purely on top of** the existing skeletal-animation core: named states each reference a clip (with per-state playback speed + loop flag), and parameter-threshold-gated `Transition` edges (incl. `from == -1` any-state edges) fire in fixed authoring order — first satisfied wins. `Update(dt)` advances a deterministic cursor; `Evaluate()` produces a joint-matrix palette via `SampleAnimation` (not transitioning) or **`BlendAnimations` with weight = `transitionTime/duration`** (cross-fading), which the **unchanged GPU skinning path** consumes — **no new RHI / shader**. The FSM output is a pure function of (state graph, scripted parameter timeline, fixed-dt sequence): zero input/RNG/clock, zero backend symbols. Unit-tested (`anim_fsm_test`) and golden-captured (`--anim-fsm-shot` / `--anim-fsm`, the `anim_fsm` golden); the showcase reports a fixed mid walk→run transition `state:walk->run, blend:0.53, speed:0.925, step:37`.
-- **Rigid-body physics** — impulse-based `physics::World` (spheres + ground, contact resolution), deterministic fixed-step settling.
-
-### World streaming and terrain
-
-- **Distance-based scene / asset streaming** — `scene::StreamingWorld` divides a large world into a fixed `N×N` grid of cells; `Update(cameraPos)` keeps cells inside `loadRadius` resident, unloads cells beyond the larger `unloadRadius` (the in-between **hysteresis** band prevents thrashing), and processes loads/unloads **nearest-first** under a per-frame **budget** so content streams in over frames. The resident set is a pure function of (camera path, radii, budget, prior state) — pure CPU, zero RHI/backend symbols, unit-tested (`streaming_test`) and golden-captured (`--stream-shot` / `--stream`, the `stream` golden). Driven by a fixed scripted camera path the per-frame residency is bit-stable; the showcase capture frame reports `frame:40, resident:24`.
-- **Procedural terrain / heightmap** — `terrain::Height(x,z)` is a fixed pure function (a few sines/cosines plus a deterministic integer value-noise lattice); `terrain::BuildTerrain(n, worldSize, heightScale)` generates an `n×n` lit/PBR-ready vertex grid with **central-finite-difference per-vertex normals** and a height-based vertex tint, no new shader required. It is compiled into both `hf_core`/`hf_engine` **and** the standalone `metal_headless` target from the **same** TU, so Windows/Vulkan and Apple/Metal generate a **bit-identical** mesh (the cross-backend golden contract). Unit-tested (`terrain_test`) and golden-captured (`--terrain-shot` / `--terrain`, the `terrain` golden); the showcase reports `n:128, verts:16384, tris:32258, peak:2.0972`.
-- **Streamed terrain + distance-banded LOD** — the open-world capstone ties the distance-based streaming (above) and the procedural heightmap together (`terrain::TerrainStreamWorld`, `engine/terrain/terrain_stream.*`): a fixed `T×T` grid of square terrain **tiles** covers the world, each tile meshed by `BuildTerrainTile` over its region using the **global** `Height(x,z)` so adjacent tiles meet seamlessly at equal LOD (shared-edge vertices are bit-identical). `Update(cameraPos)` runs the BD residency policy (load/unload radius + hysteresis + per-frame budget, nearest-first) and selects each resident tile's mesh resolution from a discrete distance band (LOD0 n=96 / LOD1 n=48 / LOD2 n=24) with **hysteresis** (refine immediately on approach; only coarsen past the band edge by a margin) so there's no float-threshold flicker. Pure CPU above the scene (zero RHI/backend symbols), compiled identically into `hf_core`/`hf_engine` **and** `metal_headless`, so the tile meshes are bit-identical cross-backend. Unit-tested (`terrain_stream_test`) and golden-captured (`--terrain-stream-shot` / `--terrain-stream`, the `terrain_stream` golden); the showcase reports `frame:45, resident:22, lod0:4, lod1:8, lod2:10`.
-
-### Runtime, editor, tooling
-
-- **Playable game sample** — `game::roll_game`: a deterministic roll-a-ball gameplay layer (player sphere on a scripted track + collectible pickups) driven by `MakeRollGame`/`StepGame` at the engine's fixed timestep. Pure C++ above the seam, unit-tested, and golden-captured (`game`) at a fixed mid-track frame; the deterministic end state is `score:3, won:true, steps:380` every run.
-- **Interactive runtime** — a fixed-timestep loop (`runtime::Clock`/`FixedTimestep`), a backend-agnostic flyable `runtime::Camera` (yaw/pitch → basis, `View`/`Proj`/`ViewProj`), and a `FlyCameraController`. The live windowed viewport (WASD + mouse-look) runs on **Vulkan/Windows** (`--fly`) **and on macOS/Metal** (windowed Metal present loop, below); the camera math itself is golden-verified on both backends.
-- **Live editor (pick / drag / gizmos / hot-reload)** — inside the live `--fly` viewport: mouse-ray **picking** (`editor::picking`: cursor-px → NDC → `ScreenRayThroughCamera`, `PickNearest` over world AABBs) selects entities, transform **gizmos** (`editor::gizmo`: translate/rotate/scale axis math + `ApplyDrag` driven by prev/cur rays) drag them, and a `FileWatcher` **hot-reloads** edited shaders/scenes (poll-based change detection). The deterministic logic under all of it is pure C++ and unit-tested (`editor_test`, `live_editor_test`); the interactive mouse manipulation in the window is manual, and the **goldens + unit tests prove the math beneath it**.
-- **Editor live edit-ops → scene_io round-trip** — `engine/editor/edit_ops.*` closes the **author → save → reload** loop for the editor: an `EditOp` (translate / set-material / … ) **mutates the live ECS `Registry`** in place, the edited scene is **serialized** through the existing `scene_io` writer and **reloaded** into a fresh registry, and the reloaded state is asserted **bit-identical** to the in-memory edited state — so an edit survives a save/load round-trip exactly. Pure CPU above the seam (only the ECS `Registry` + `scene_io` + `math`, **zero RHI/backend/ImGui symbols**), unit-tested (`edit_ops_test`) and golden-captured (`--editor-edit-shot` / `--editor-edit`, the `editor_edit` golden); the showcase applies a fixed edit script and reports a deterministic, two-run byte-identical `editor-edit: {edits:2, saved:true, reloadMatch:true}`.
-- **Docked editor shell (Dear ImGui)** — a docked editor UI draws **Scene Hierarchy**, **Inspector**, and **Stats** panels around a central scene **Viewport**, rendered through the RHI seam (`engine/editor/imgui_renderer.*` + `editor_panels.*`). The vendored Dear ImGui (1.91.8, the non-docking master branch — no `DockBuilder`) means the layout is a **deterministic, code-driven fixed-tile** split (`editor::DockLayout` fixed split ratios + `io.IniFilename = nullptr`, so it never loads a machine-dependent `imgui.ini`), making the panel geometry byte-stable run-to-run and identical across backends. The **panel data** (`editor::editor_panel_data.*`) is computed in a pure-CPU, ImGui-free seam (`BuildPanelData`: hierarchy rows / inspector view of the selected entity / stats counts, derived from the live ECS registry each frame — zero ImGui/rhi/backend symbols), so it lives in `hf_core` and is unit-tested headlessly (`editor_panels_test`). Golden-captured (`--editor-shot` / `--editor`, the `editor` golden) with a FIXED selected entity; the showcase prints a deterministic, two-run byte-identical `editor: {selected:9, entities:10}` stat line.
-- **Machine-readable engine-state introspection (for agents)** — `editor::DescribeEngine` emits a deterministic JSON document of the live engine state (engine/features/showcases/commands manifest + scene entities/transforms + camera/lights + stats; `backends == ["vulkan","metal"]`). Exposed via `--introspect <out.json>`; it is backend-agnostic (pure `hf_core`) and pinned by an **exact byte-match golden** (`tests/golden/introspect/default_scene.json`) so an agent can reliably observe — and, via the commands manifest, act on — the engine. A companion **material-graph introspection** (`--material-introspect`, `material::DescribeGraphJson` / `ToDot`) similarly dumps any `*.mat.json` material graph as deterministic JSON or Graphviz DOT, pinned by its own byte-match golden (`tests/golden/material/showcase3_graph.json`).
-- **Immediate-mode debug visualization** — `debug::DebugDraw` collects grids / AABBs / wire spheres / arrows / contact markers into a LINE_LIST and draws them in one call through a debug-line pipeline (`depthTest=true, depthWrite=false`).
-- **Headless GPU capture** — `CaptureNextFrame()` / `GetCapturedPixels()`: render a frame, read pixels back from the GPU, write a PNG/BMP. No visible desktop required — the primary verification path.
-- **Vulkan validation-clean invariant** — every showcase runs under the Khronos validation layer (core + **synchronization** validation) with **zero** `VUID-*` / `SYNC-HAZARD-*` / `UNASSIGNED-*` / `[ERROR]` lines; the render graph's auto-inserted barriers are proven hazard-free by the sync-validation layer. (Only a benign `[WARNING: Performance]` "vertex attribute not consumed" notice from the depth-only shadow pipelines remains, and is expected.) The validation layer is pulled in as a Conan dependency for debug builds.
-- **Cross-platform verification** — `scripts/verify.ps1` runs the Windows/Vulkan ctest **and** the introspection JSON-golden + audio-WAV-golden byte matches, **and** drives the bench Mac over SSH to build `metal_headless` and golden-compare all 76 Metal goldens at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
-- **AddressSanitizer** — an opt-in `HF_SANITIZE=address` build (`windows-msvc-asan` preset) instruments the backend-agnostic core (`hf_core`) and the pure-C++ unit tests so they run clean under MSVC `/fsanitize=address`.
-
-**Metal parity status:** The Metal backend renders **every** showcase headless on Apple Silicon (M4) and is verified against a committed golden at `DIFF 0.0000` for all 76 scenes (see below). The Metal shaders are **generated from the shared HLSL** at build time (HLSL → SPIR-V via `glslc` → MSL via `spirv-cross`), so there is no hand-written MSL to drift. A **windowed** Metal present loop now also exists on macOS: a SDL-free native Cocoa entry builds a `MetalDevice` from a `CAMetalLayer*` and runs the same interactive `--fly` viewport (pick / drag / gizmos). It is **build-verified** in CI/`verify.ps1` (the bench Mac compiles and headless-renders all 76 goldens); the interactive on-screen window itself is exercised manually — the user confirms the live viewport, while the deterministic logic under it (camera, picking, gizmo, file-watch) is golden- and unit-tested on both backends.
+> **Status:** active development — an in-progress engine, not a finished product, built slice by slice. The two
+> theses are both proven on real hardware:
+> 1. **One engine, two GPU backends, golden-verified.** The same engine code renders a full PBR / IBL /
+>    post-processed scene — and a modern GPU-driven pipeline — on a Vulkan RTX GPU (Windows) and on Apple Metal (M4,
+>    macOS).
+> 2. **Deterministic simulation beyond float engines.** A Q16.16 fixed-point physics/animation/AI stack produces
+>    *byte-identical* state on every platform and is replayable from inputs alone — the one guarantee UE5's float
+>    Chaos cannot make.
+>
+> Verified by **188 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three
+> byte-exact non-image goldens (engine-state JSON, material-graph JSON, audio WAV), a **105-test** ctest suite that
+> runs clean under AddressSanitizer, and a Vulkan-validation-clean (core + synchronization) invariant across every
+> showcase.
 
 ---
 
-## The 76 Metal goldens
+## The bet
 
-Each is produced by a distinct `metal_headless/visual_test` flag and compared against `tests/golden/metal/<name>.png` at threshold `0.0` (deterministic — two runs diff `0.0000`). Three further non-image goldens are byte-matched on the Windows side: the engine-state JSON (`tests/golden/introspect/default_scene.json`, from `--introspect`), the **material-graph introspection JSON** (`tests/golden/material/showcase3_graph.json`, from `--material-introspect`), and the audio WAV (`tests/golden/audio/scene.wav`, from `--audio-render`):
+**One engine layer above a clean seam, two GPU backends below it, verified headlessly by golden images.** No Vulkan
+symbol (`vk*`) leaks above `engine/rhi/`; no Metal symbol (`MTL*`) leaks above `engine/rhi_metal/`. The seam
+invariant is the architectural spine.
 
-| golden            | flag                          | what it proves                                            |
-| ----------------- | ----------------------------- | --------------------------------------------------------- |
-| `scene_shadow`    | *(default)*                   | lit scene + PCF shadows + procedural IBL + post (Slice F) |
-| `skinning`        | `--skinning`                  | GPU skeletal animation (Slice O)                          |
-| `pbr_helmet`      | `--pbr`                       | full glTF metallic-roughness PBR (Slice P)                |
-| `instanced`       | `--instanced`                 | GPU instancing, 144 spheres in one call (Slice Q)         |
-| `ibl_helmet`      | `--ibl`                       | HDR equirect environment IBL (Slice R)                    |
-| `physics`         | `--physics`                   | settled rigid-body sphere pyramid (Slice S)               |
-| `transparency`    | `--transparency`              | sorted alpha-blended glass (Slice T)                      |
-| `bloom`           | `--bloom`                     | HDR bloom chain (Slice U)                                 |
-| `scene_import`    | `--scene`                     | full glTF scene-graph import (Slice V)                    |
-| `debug_viz`       | `--debug`                     | immediate-mode debug-line overlay (Slice W)               |
-| `anim_blend`      | `--blend`                     | cross-clip animation blending (Slice X)                   |
-| `ssao`            | `--ssao`                      | screen-space ambient occlusion (Slice Y)                  |
-| `capstone`        | `--capstone`                  | integrated scene: every feature in one frame (Slice Z)    |
-| `camera_pose`     | `--camera 0.2,-0.1,0,3,10`    | scripted runtime-camera pose (Slice AA)                   |
-| `gizmo`           | `--gizmo 2`                   | editor selection + transform gizmo (Slice AB)             |
-| `csm`             | `--csm`                       | cascaded shadow maps over a receding plane (Slice AD)     |
-| `spot`            | `--spot`                      | spot light + perspective spot shadow (Slice AE)           |
-| `point_shadow`    | `--point-shadow`              | omnidirectional point-light 6-face cube shadows (Slice AF)|
-| `clustered`       | `--clustered`                 | clustered/Forward+ lighting, 192 lights, byte-identical to brute force (Slice AG) |
-| `clustered_lights`| `--clustered-lights`          | clustered light culling / Forward+: 96 lights, 16×9×24 grid, GPU==CPU assign, byte-identical to brute force (Slice CL) |
-| `ssr`             | `--ssr`                       | screen-space reflections off a reflective floor (Slice AH)|
-| `ssgi`            | `--ssgi`                      | screen-space global illumination, one indirect-diffuse bounce (Slice BP) |
-| `ssgi_denoise`    | `--ssgi-denoise`              | SSGI + edge-preserving bilateral spatial denoise (Slice BR) |
-| `ssgi_temporal`   | `--ssgi-temporal`             | temporal SSGI: N=8 golden-angle-jittered accumulation (Slice BV) |
-| `volumetric`      | `--volumetric`                | ray-marched volumetric fog / light shafts (Slice AJ)      |
-| `probe`           | `--probe`                     | reflection + irradiance probes / local cubemap GI (Slice AK) |
-| `taa`             | `--taa`                       | temporal anti-aliasing, Halton jitter + reprojection (Slice AP) |
-| `cull`            | `--cull`                      | CPU frustum culling, overview-camera visualization (Slice AQ) |
-| `gpu_cull`        | `--gpu-cull`                  | GPU-driven culling + compacted indirect draw (Slice AR)   |
-| `mt`              | `--mt`                        | multithreaded recording, byte-identical to single-threaded (Slice AU) |
-| `mat_graph`       | `--material`                  | data-driven material/shader graph, build-time codegen (Slice AV) |
-| `mat_graph2`      | `--material2`                 | second graph material via live runtime compile path (Slice AW) |
-| `mat_multi`       | `--material-multi`            | multi-material scene: 3 spheres, 3 distinct graph materials (Slice AZ) |
-| `mat_normal`      | `--material-normal`           | NormalMap graph node: tangent-space normal map → perturbed PBR shading (Slice BE) |
-| `game`            | `--game`                      | playable deterministic roll-a-ball game sample (Slice AX) |
-| `net`             | `--net`                       | replication: replica reconstructs + renders the scene from snapshot/delta bytes (Slice BQ) |
-| `netsim`          | `--netsim`                    | lossy transport + client jitter-buffer interpolation (Slice BU) |
-| `netpredict`      | `--netpredict`                | client-side prediction + server reconciliation (rewind/replay) (Slice BY) |
-| `hud`             | `--hud`                       | baked-font text / HUD screen-space overlay (Slice BA)     |
-| `game_hud`        | `--game-hud`                  | game sample with the score HUD overlaid (Slice BA)        |
-| `stream`          | `--stream`                    | distance-based scene streaming: resident cell subset (Slice BD) |
-| `terrain`         | `--terrain`                   | procedural terrain / heightmap, finite-difference normals (Slice BF) |
-| `decal`           | `--decal`                     | screen-space projected decals reusing the G-buffer (Slice BH) |
-| `terrain_stream`  | `--terrain-stream`            | streamed terrain tiles + distance-banded LOD (Slice BJ)   |
-| `anim_fsm`        | `--anim-fsm`                  | animation state machine: cross-fade walk→run FSM (Slice BL) |
-| `mdi`             | `--mdi`                       | GPU multi-draw-indirect: 144 objects in one indirect call, byte-identical to per-object (Slice BM) |
-| `bindless`        | `--bindless`                  | bindless textures: one descriptor-indexing array bind, byte-identical to per-material bound (Slice BZ) |
-| `gpudriven`       | `--gpudriven`                 | fully-GPU-driven combined pass: 1 MDI call + 1 bindless bind draw a multi-material scene, byte-identical to per-object bound (Slice CB) |
-| `gpucull_draw`    | `--gpucull-draw`              | fully-GPU-driven-CULLED pass: compute-cull → 1 MDI call + 1 bindless bind, byte-identical to CPU-culled per-object bound (Slice CD) |
-| `hiz_cull`        | `--hiz-cull`                  | Hi-Z occlusion culling: depth pre-pass → Hi-Z pyramid → frustum+occlusion cull, byte-identical to frustum-only (Slice CJ) |
-| `vfx`             | `--vfx`                       | CPU particle / VFX emitter: additive billboard fountain, lifetime curves (Slice CC) |
-| `poststack`       | `--poststack`                 | data-driven post-process stack: tonemap→grade→chromatic→vignette→grain (Slice BN) |
-| `editor`          | `--editor`                    | docked ImGui editor shell: Hierarchy / Inspector / Stats around a Viewport (Slice BT) |
-| `editor_edit`     | `--editor-edit`               | editor live edit-ops → scene_io save/reload round-trip, bit-identical (Slice BX) |
-| `water`           | `--water`                     | Gerstner-wave water surface + Fresnel reflect/refract (Slice CF) |
-| `dof`             | `--dof`                       | thin-lens depth of field: circle-of-confusion depth gather (Slice CG) |
-| `clouds`          | `--clouds`                    | raymarched volumetric cumulus + Beer-Lambert + HG phase (Slice CH) |
-| `cloud_shadows`   | `--cloud-shadows`             | cloud shadows on the ground: sun-ray density march → Beer transmittance dappling the lit scene (Slice CK) |
-| `motion_blur`     | `--motionblur`                | motion blur: velocity-gather post pass, zero-velocity byte-identical to un-blurred (Slice CN) |
-| `oit`             | `--oit`                       | order-independent transparency: Weighted Blended OIT, permuted draw order byte-identical to canonical (Slice CO) |
-| `pom`             | `--pom`                       | parallax occlusion mapping: tangent-space height-field march, heightScale=0 byte-identical to plain normal mapping (Slice CP) |
-| `gtao`            | `--gtao`                      | ground-truth ambient occlusion: horizon-search visibility integral (coexists with SSAO), radius=0 byte-identical to no-AO scene (Slice CR) |
-| `froxel_fog`      | `--froxelfog`                 | froxel volumetric fog: 3D view-space sun single-scattering (inject→integrate→apply), density=0 byte-identical to no-fog scene (Slice CS) |
-| `contact_shadows` | `--contactshadow`             | screen-space contact shadows: short depth-march toward the sun augmenting the CSM, maxDist=0 byte-identical to no-contact scene (Slice CT) |
-| `froxel_lights`   | `--froxellights`              | per-froxel clustered-light injection: 96 clustered lights scatter as colored fog shafts, lights-off byte-identical to CS sun-only fog (Slice CV) |
-| `auto_exposure`   | `--autoexposure`              | auto-exposure: integer-histogram luminance metering → key-value eye adaptation, adaptation-off byte-identical to fixed-exposure tonemap (Slice CW) |
-| `vol_shadows`     | `--volshadows`                | volumetric shadows: per-froxel CSM sample gates the sun in-scatter → foggy sun shafts, vol-shadows-off byte-identical to CV froxel-lights (Slice CX) |
-| `sss`             | `--sss`                       | subsurface scattering: screen-space separable depth-aware diffusion (skin/wax), sssStrength=0 byte-identical to non-SSS lit scene (Slice CZ) |
-| `refl_probe`      | `--reflprobe`                 | box-projected reflection probe: local cubemap reflections parallax-corrected to a probe box, parallaxStrength=0 byte-identical to standard infinite-cubemap reflection (Slice DA) |
-| `color_grade`     | `--colorgrade`                | color grading: lift/gamma/gain + ASC-CDL + luma-preserving saturation post-tonemap, identity grade byte-identical to ungraded tonemap (Slice DB) |
-| `capture_probe`   | `--captureprobe`              | dynamic cubemap-capture reflection probe: scene rendered into 6 cube faces, reflective surface samples the captured cube box-projected; captured face byte-identical to direct face render (Slice DD) |
-| `planar_reflection`| `--planar`                   | planar reflections: scene rendered through the camera reflected across the mirror plane into a 2D RT the floor samples, reflectivity=0 byte-identical to matte non-reflective render (Slice DE) |
-| `cas`             | `--cas`                       | contrast-adaptive sharpening (AMD FidelityFX CAS): adaptive 3×3-cross edge sharpen on the tonemapped SDR result, sharpness=0 byte-identical to the unsharpened tonemap (Slice DF) |
-| `probegi`         | `--probegi`                   | DDGI probe-grid ray-trace: 256 probes × 16 Fibonacci-sphere rays vs the view-space depth field as a flat SSBO; GPU ray-hit SSBO BIT-EXACT to the CPU `TraceRayToDepth` reference, probeCount=0 byte-identical to the cleared upload (Slice DH) |
-| `probe_capture`   | `--probecapture`              | DDGI probe radiance capture: a 2×2×2 = 8-probe grid, each probe's lit scene captured into 6 cube faces from its centre and read back into a per-probe radiance store; captured face byte-identical to the direct face render, probeCount=0 leaves the store at its cleared value (Slice DI) |
-| `probe_sh`        | `--probesh`                   | DDGI probe SH-encode: each captured cubemap encoded into 3rd-order real spherical harmonics (9 coeffs/RGB) by a pure compute pass; GPU per-probe SH SSBO BIT-EXACT to the CPU reference, zero-radiance encodes to zero-SH, probeCount=0 leaves the SH SSBO at its cleared value (Slice DJ) |
+Two consequences make the project unusual:
+
+- **Every rendering feature is simultaneously a Vulkan implementation and a specification** the Metal backend must
+  match — proven by a committed golden image that must diff `0.0000`. The Metal shaders are *generated from the
+  shared HLSL* at build time (HLSL → SPIR-V via `glslc` → MSL via `spirv-cross`), so there is no hand-written MSL to
+  drift.
+- **Every simulation feature is integer / fixed-point end to end**, so the same tick produces the same bytes on a
+  CPU reference, a Vulkan compute dispatch, and a Metal one. That makes the sims not just cross-platform-identical
+  but *lockstep-* and *rollback-replayable* — the foundation for deterministic netcode.
+
+It is also **built for agentic development**: headless capture is the primary path, the engine emits a
+machine-readable JSON description of its own state (`--introspect`), and a single command (`scripts/verify.ps1`)
+runs the whole cross-platform gate.
 
 ---
 
-## Architecture
+## At a glance
 
-Hazard Forge is organized in layers, all above the seam:
-
-1. **HAL** (`engine/hal/`) — SDL3 window + Vulkan surface creation.
-2. **RHI seam** (`engine/rhi/`) — pure C++ interfaces (`IRHIDevice`, `ICommandBuffer`, `IPipeline`, `IBuffer`, `ITexture`, `IRenderTarget`, `ISwapchain`, compute). Zero backend symbols.
-3. **Backends** — Vulkan (`engine/rhi_vulkan/`) and Metal (`engine/rhi_metal/`). Accessed via `rhi::CreateDevice(Backend::Vulkan, window)` or `rhi::mtl::CreateMetalDeviceHeadless(w, h)`.
-4. **Engine modules** — `scene/` (incl. distance-based `streaming`), `render/` (render graph + barrier solver + frustum/GPU-cull/TAA + screen-space decals + SSGI: raw/bilateral-denoise/temporal-accumulate + MDI batch + **bindless** texture-index table + **GPU-driven combined pass** (`gpu_driven`) + **GPU-driven-culled pass** (`gpu_culled`) + **Hi-Z occlusion cull** (`hiz`) + **clustered light culling / Forward+** (`cluster`) + the **sky/atmosphere suite** — Gerstner-wave `water` + thin-lens `dof` + raymarched `clouds` + ground `cloud-shadows` — + **velocity-gather motion blur** (`motion_blur`) + **Weighted-Blended OIT** (`oit`) + **parallax occlusion mapping** (`pom`) + **ground-truth AO** (`gtao`) + **froxel volumetric fog** (`froxel` — incl. **per-froxel clustered-light injection** + **volumetric shadows**) + **auto-exposure** (`auto_exposure`) + **screen-space contact shadows** (`contact_shadows`) + **subsurface scattering** (`sss`) + **box-projected reflection probe** (`reflection_probe`) + **color grading** (`color_grade`) + **dynamic cubemap-capture reflection probe** (`cubemap` — over the additive cubemap render-target RHI) + **planar reflections** (`planar_reflection`) + **contrast-adaptive sharpening** (`cas`) + the **DDGI dynamic-GI arc** — **probe-grid ray-trace** (`probe_gi`) + **per-probe radiance capture** (`probe_capture`, over the additive cubemap render-target RHI) + **3rd-order SH-encode** (`probe_sh`), all GPU==CPU bit-exact), `terrain/` (procedural heightmap + mesh gen + streamed-tile LOD), `asset/` (glTF + HDR env), `anim/`, `physics/`, `material/` (shader graph + NormalMap node + codegen + runtime compile + live authoring + graph introspection), `ui/` (baked-font text / HUD overlay), `audio/` (integer mixer + WAV writer), `vfx/` (**data-driven CPU particle / VFX emitter** — additive billboards + lifetime curves), `net/` (deterministic snapshot/delta replication + seeded lossy transport + client jitter-buffer interpolation + **client prediction + server reconciliation**), `game/` (roll_game), `runtime/`, `editor/` (incl. docked ImGui shell + **live edit-ops → scene_io round-trip**), `debug/`. All depend only on `rhi/` + `math/`; the backend-agnostic subset compiles into `hf_core` for the sanitized unit tests. The descriptor-indexing **bindless** implementation lives only below the seam in `rhi_vulkan/` (Metal inherits the bound-path default).
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the seam design, descriptor model, frame structure, the shared HLSL→MSL toolchain, and per-backend notes.
+| | |
+| --- | --- |
+| **Language / std** | C++20 |
+| **GPU backends** | Vulkan 1.3 (Windows, primary) · Apple Metal (macOS, Apple Silicon) |
+| **Verification** | 188 golden images @ `DIFF 0.0000` · 105 ctest tests · ASan-clean · Vulkan-validation-clean |
+| **Shaders** | one HLSL source → SPIR-V (Vulkan) + MSL (Metal), generated at build time |
+| **Determinism** | Q16.16 fixed-point sim, bit-identical CPU/Vulkan/Metal, lockstep + rollback replayable |
+| **Repo** | `github.com/hassard0/Hazard-Forge` |
 
 ---
 
-## Repo layout
+## Pillar 1 — Real-time rendering (Vulkan + Metal)
 
-```
-hazard-forge/
-├── CMakeLists.txt              Top-level C++20 build; HF_SANITIZE opt-in
-├── CMakePresets.json           windows-msvc-debug / -release / -asan / macos-arm64-debug
-├── conanfile.py                SDL3, vk-bootstrap, VMA, vulkan-headers/loader, validation layers (debug)
-├── cmake/                      HLSL→SPIR-V shader-compile CMake rule
-├── engine/
-│   ├── hal/                    SDL3 window + Vulkan surface
-│   ├── math/                   Vec3, Mat4, Quat (TRS, Inverse, slerp, ...)
-│   ├── rhi/                    THE SEAM — pure interfaces, zero backend symbols
-│   ├── rhi_vulkan/             Vulkan backend (vk-bootstrap, VMA, Vulkan 1.3 dynamic rendering) + vulkan_bindless (VK_EXT_descriptor_indexing array)
-│   ├── rhi_metal/              Metal backend (Obj-C++/ARC, runtime MSL compile)
-│   ├── render/                 RenderGraph + barrier solver + frustum / gpu_cull / hiz (Hi-Z occlusion) / taa + csm / spot / point_shadow / clustered / cluster (Forward+ light culling) / ssr / ssgi (+ bilateral denoise + temporal accum) / volumetric / probe / decal / mdi / bindless / gpu_driven (MDI+bindless combined) / gpu_culled (compute-cull→MDI+bindless) / water (Gerstner) / dof (thin-lens CoC) / clouds (raymarched + ground cloud-shadows) / motion_blur (velocity-gather) / oit (Weighted-Blended OIT) / pom (parallax occlusion mapping) / gtao (ground-truth AO horizon-search) / froxel (3D froxel volumetric fog + per-froxel clustered-light injection + volumetric shadows) / auto_exposure (integer-histogram eye adaptation) / contact_shadows (screen-space contact shadows) / sss (separable-diffusion subsurface scattering) / reflection_probe (box-projected cubemap parallax) / color_grade (analytic lift/gamma/gain + ASC-CDL + saturation) (header-only math)
-│   ├── scene/                  Vertex, Transform, Mesh, Renderable, scene_io, commands, instancing, streaming
-│   ├── terrain/                procedural heightmap (deterministic Height field) + finite-diff-normal mesh gen + streamed-tile distance-banded LOD (terrain_stream)
-│   ├── asset/                  glTF loader + scene-graph import + HDR env loader
-│   ├── anim/                   skeleton + animation sampling + blending
-│   ├── physics/                impulse rigid-body World
-│   ├── material/               shader_graph (+ NormalMap node) + codegen + material_loader + runtime_compile + live_material + graph_introspect (JSON/DOT)
-│   ├── ui/                     baked 8x8 font atlas + screen-space text/HUD layout (pure CPU)
-│   ├── audio/                  integer/fixed-point software mixer + canonical 16-bit PCM WAV writer
-│   ├── vfx/                     data-driven CPU particle / VFX emitter (lifetime curves + additive billboards, fixed-seed LCG, pure CPU)
-│   ├── net/                    deterministic snapshot/delta replication (authority/replica) + seeded lossy transport + client jitter-buffer interpolation (transport) + client prediction + server reconciliation (prediction)
-│   ├── game/                   roll_game: deterministic gameplay layer (sample)
-│   ├── runtime/                Clock/FixedTimestep, Camera, FlyCameraController, hot_reload (FileWatcher)
-│   ├── editor/                 picking, gizmo, introspect (engine-state JSON) + editor_panel_data (pure-CPU panel model) + docked ImGui editor shell + edit_ops (live edit-ops → scene_io round-trip)
-│   └── debug/                  DebugDraw collector + emitters
-├── shaders/                    Shared HLSL (lit/pbr/ibl/shadow/post/bloom/ssao/volumetric/probe/taa/sky/...) → SPIR-V & MSL
-│   └── generated/              build-time material-codegen output (mat_showcase*.frag.hlsl)
-├── tools/                      material_codegen: build-time HLSL generator from *.mat.json graphs
-├── mac_window/                 SDL-free native Cocoa entry: windowed Metal viewport from a CAMetalLayer*
-├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot headless capture + --fly + --introspect
-├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, 76 showcases)
-├── tests/                      Pure unit tests (math/ecs/render_graph/scene_io/commands/anim/anim_fsm/physics/
-│   │                           terrain/terrain_stream/streaming/runtime/editor/volumetric/probe/taa/frustum/
-│   │                           gpu_cull/hiz/mdi/bindless/gpu_driven/gpu_culled/cluster/vfx/parallel_record/decal/post_stack/ssgi/motion_blur/oit/pom/gtao/froxel/contact_shadows/shader_graph/runtime_material/
-│   │                           graph_introspect/roll_game/audio/replication/net_transport/prediction/introspect/
-│   │                           editor_panels/edit_ops/live_editor/text/...) + rhi_smoke
-│   ├── golden/metal/           The 76 committed Metal goldens
-│   ├── golden/introspect/      The engine-state JSON golden (default_scene.json)
-│   ├── golden/material/        The material-graph introspection JSON golden (showcase3_graph.json)
-│   └── golden/audio/           The audio WAV golden (scene.wav, from --audio-render)
-├── scripts/verify.ps1          Cross-platform gate: Windows ctest + JSON + audio goldens + Mac 76-golden compare
-├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
-└── docs/                       ARCHITECTURE.md + per-slice specs/plans
-```
+A full modern renderer, every feature golden-verified byte-for-byte against the Metal backend. Grouped by area:
+
+- **PBR & lighting** — glTF metallic-roughness Cook-Torrance shading (base color / metallic-roughness / tangent-space
+  normal / emissive / AO); procedural **and** HDR-equirectangular image-based lighting; **clustered / Forward+**
+  light culling scaling to hundreds of lights (proven byte-identical to brute force).
+- **Shadows** — directional PCF, **cascaded shadow maps**, perspective **spot** shadows, omnidirectional **point-light
+  cube** shadows, and screen-space **contact shadows**.
+- **Global illumination** — screen-space GI as the full `raw → edge-preserving bilateral denoise → temporal
+  accumulation` trilogy; baked reflection/irradiance probes; and a **DDGI dynamic-GI pillar** (probe-grid ray-trace →
+  per-probe radiance capture → 3rd-order SH encode → interpolation → probe occlusion → multi-bounce → GI composite),
+  each slice holding a **GPU==CPU bit-exact** compute proof.
+- **Reflections** — screen-space reflections, **box-projected** cubemap probes, **dynamic cubemap-capture** probes,
+  and **planar** mirror reflections.
+- **Atmosphere & volumetrics** — Gerstner-wave water, raymarched volumetric clouds + ground cloud-shadows, 2D light
+  shafts, and a true **3D froxel volumetric fog** (sun single-scatter + per-froxel clustered-light injection +
+  CSM-gated volumetric shadows).
+- **Post-processing** — HDR bloom, SSAO + **ground-truth AO** (horizon-search), **subsurface scattering**, depth of
+  field, motion blur, a data-driven post stack (tonemap / color-grade / chromatic aberration / vignette / grain),
+  **auto-exposure** (integer-histogram eye adaptation), **TAA**, and **contrast-adaptive sharpening**.
+- **Surface detail** — parallax occlusion mapping, order-independent transparency (Weighted Blended), screen-space
+  projected decals, GPU instancing.
+- **GPU-driven pipeline** — frustum + **Hi-Z occlusion** culling, **multi-draw-indirect** batching, **bindless**
+  textures, and a fully-GPU-driven *culled* combined pass (compute cull → ordered compaction → one indirect draw +
+  one bindless bind), each proven byte-identical to the per-object reference.
+- **Flagship GPU-compute arcs** (each multi-slice, bit-exact or golden-verified on both backends):
+  - **Nanite-style virtual geometry** — meshlet cluster-LOD, cluster cull + Hi-Z, a **visibility buffer** with
+    deferred resolve, and a compute **software rasterizer** (packed depth|id atomic-min).
+  - **Virtual Shadow Maps** — clipmap mark → render → sample → cache.
+  - **Runtime Virtual Texturing** — feedback → allocate → page-gen → sample → cache.
+  - **GPU Marching Cubes** — integer isosurface meshing (classify → count → emit → interp → render → smooth
+    normals), real-time procedural/destructible geometry.
+- **Foundations** — own `hf::math` (Vec3/Mat4/Quat, column-major, Vulkan `[0,1]` depth, CPU-side Metal NDC flip);
+  a render graph with an **automatic resource-state barrier solver** (Vulkan-synchronization-validation clean);
+  **multithreaded** command recording (byte-identical 1-vs-N workers); a data-driven **material/shader graph** with
+  live runtime authoring + JSON/Graphviz introspection.
+
+Plus engine services: glTF scene-graph import, GPU skeletal animation + blending + a cross-fade state machine, a
+deterministic integer **audio mixer** (byte-exact WAV), a deterministic **networking trilogy** (replication →
+seeded lossy transport + interpolation → client prediction + reconciliation), distance-based **scene/terrain
+streaming** with LOD, a baked-font **text/HUD** layer, a CPU **VFX** emitter, a playable game sample, and a docked
+**ImGui editor** shell (hierarchy / inspector / stats / viewport + live edit-ops → scene round-trip).
+
+---
+
+## Pillar 2 — Deterministic simulation (the differentiator)
+
+Above the renderer sits a suite of **fixed-point (Q16.16) simulations** that are *bit-identical across CPU, Vulkan,
+and Metal* and *replayable from inputs alone*. Where a typical engine's physics is float and non-deterministic
+(UE5's Chaos), Hazard Forge's sims are byte-reproducible and **lockstep + rollback** ready — the missing primitive
+for true cross-platform deterministic netcode.
+
+How it holds: integer Q16.16 math throughout (no `<cmath>`, no RNG, no clock in the sim loop); every ordering
+decision pinned (fixed broadphase / solver / tie-break order); GPU compute shaders that copy the CPU reference
+*verbatim*, proven equal by a tolerance-free `memcmp`. Integer-only kernels run natively on both backends (strict
+zero-differing-pixel); kernels needing 64-bit intermediates run as a Vulkan GPU pass plus a byte-identical Metal
+CPU reference.
+
+Each flagship is a 6-slice arc — `core physics → spatial structure → solve → the new physics → lockstep/rollback →
+lit 3D render` — and lands bit-identical on both backends:
+
+| # | Flagship | What it is |
+| --- | --- | --- |
+| 6 | **Fixed-point physics** (`hf::sim::fpx`) | Q16.16 rigid-body integrator + broadphase + 6-DOF contact solver; **proven lockstep + rollback** cross-platform — the deterministic core every later sim reuses |
+| 7 | **GPU navmesh + pathfinding** (`hf::nav`) | Recast/Detour-style span-raster → walkable filter → watershed regions → contour → polygonize → **deterministic integer A\*** |
+| 8 | **Cloth** (`hf::sim::cloth`) | Q16.16 position-based-dynamics cloth (the first deterministic deformable; UE5's Chaos Cloth is float) |
+| 9 | **Fluid** (`hf::sim::fluid`) | deterministic GPU position-based fluids (density-constraint solve) |
+| 10 | **Granular / sand** (`hf::sim::grain`) | deterministic granular media with dry Coulomb friction / angle-of-repose |
+| 11 | **Rigid↔fluid coupling** (`hf::sim::couple`) | a rigid body buoyed/dragged by + displacing the fluid, in one Q16.16 world |
+| 12 | **Rigid↔grain coupling** (`hf::sim::cgrain`) | a body sinking into + supported by + parting a frictional sand bed |
+| 13 | **Grain↔fluid coupling** (`hf::sim::cgf`) | wet sand / mud / slurry — the first particle↔particle two-phase coupling |
+| 14 | **Fracture / destruction** (`hf::sim::fract`) | Voronoi cell decomposition → bonded-cluster break → falling rubble (UE5's marquee Chaos feature, made bit-exact + replayable) |
+| 15 | **Articulated ragdoll** (`hf::sim::joint`) | ball / hinge / cone joints over the fixed-point solver → a bit-exact lockstep-replayable ragdoll that drives the GPU skinning path |
+| 16 | **Vehicle physics** (`hf::sim::vehicle`) | suspension springs + wheel hinges + Coulomb traction; rollback-netcode-ready (UE5's Chaos Vehicles are float) |
+| 17 | **Active ragdoll / physical animation** (`hf::sim::active`) | angular pose-drive blending physics with anim clips (UE5's Physical Animation Component, made deterministic) |
+| 18 | **GPU crowds** (`hf::sim::boids`) | grid-hashed steering + 3-rule flocking + A\*-corridor path-following, lockstep-replayable |
+| 19 | **Convex rigid-body contacts** (`hf::sim::convex`) | box-box SAT → contact manifold → inertia-tensor angular impulse → settling stack → lockstep → lit render *(in progress)* |
+
+Each lands its determinism headline as a hard proof — e.g. *two peers fed only an input stream converge
+byte-identical, and a rollback re-sims from a snapshot bit-for-bit* — and a lit 3D render capstone as the visual
+payoff.
+
+---
+
+## How correctness is verified
+
+- **Golden images (188).** Each is one `metal_headless/visual_test` flag compared to `tests/golden/metal/<name>.png`
+  at threshold `0.0` — deterministic, two runs diff `0.0000`. The same scene rendered on Windows/Vulkan must match
+  the committed Mac/Metal golden cross-vendor.
+- **Byte-exact non-image goldens (3).** The engine-state JSON (`--introspect`), the material-graph introspection
+  JSON, and the audio WAV (`--audio-render`) are matched byte-for-byte.
+- **Unit tests (105).** A ctest suite over the pure-C++ core (math, ECS, render-graph, every header-only render +
+  sim model, codegen, net, audio, editor). Runs clean under MSVC AddressSanitizer (`windows-msvc-asan`).
+- **Vulkan-validation-clean.** Every showcase runs under the Khronos core + synchronization validation layers with
+  zero `VUID-*` / `SYNC-HAZARD-*` / `UNASSIGNED-*` / `[ERROR]` lines; the render graph's auto-inserted barriers are
+  proven hazard-free.
+- **One-command cross-platform gate.** `scripts/verify.ps1` runs the Windows/Vulkan ctest + the JSON/audio byte
+  matches, then drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 188** Metal
+  goldens at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
 
 ---
 
@@ -282,7 +175,7 @@ conan install . -of=build/windows-msvc-debug `
 # 2. Configure + build + test (from a VS x64 developer shell):
 cmake --preset windows-msvc-debug
 cmake --build --preset windows-msvc-debug
-ctest --preset windows-msvc-debug          # 76 tests
+ctest --preset windows-msvc-debug          # 105 tests
 
 # 3. AddressSanitizer build of the pure-C++ core + tests:
 conan install . -of=build/windows-msvc-asan `
@@ -295,12 +188,14 @@ ctest --preset windows-msvc-asan
 
 ### macOS — Metal headless (no Conan, no SDL, no full Xcode required)
 
-`metal_headless/` is a standalone CMake project that compiles the real Metal backend + engine, generates MSL from the shared HLSL at build time, renders a showcase into an offscreen texture, and writes a PNG. Command Line Tools suffice.
+`metal_headless/` is a standalone CMake project that compiles the real Metal backend + engine, generates MSL from
+the shared HLSL at build time, renders a showcase into an offscreen texture, and writes a PNG. Command Line Tools
+suffice.
 
 ```sh
 cmake -S metal_headless -B build-metal -G Ninja
-cmake --build build-metal          # also generates *.gen.metal from the HLSL
-./build-metal/visual_test out.png  # default scene (one of 76 showcase flags)
+cmake --build build-metal           # also generates *.gen.metal from the HLSL
+./build-metal/visual_test out.png   # default scene; pass a showcase flag for others
 ```
 
 ### Full cross-platform verification (one command)
@@ -309,107 +204,102 @@ cmake --build build-metal          # also generates *.gen.metal from the HLSL
 scripts\verify.ps1
 ```
 
-Runs the Windows/Vulkan ctest (plus the engine-state JSON-golden and audio-WAV-golden byte matches) locally and drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 76** Metal goldens at threshold `0.0`. Prints a per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
+Runs the Windows/Vulkan ctest (plus the engine-state JSON-golden and audio-WAV-golden byte matches) locally and
+drives the bench Mac over SSH to build `metal_headless` once and golden-compare **all 188** Metal goldens at
+threshold `0.0`. Prints a per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac`
+run one half.)
 
 ---
 
-## Build & run the showcases
+## Running the showcases
 
-The same scenes render on both backends. On **Vulkan** (Windows sample), each is a `--*-shot` headless capture (or run `--fly` for the live navigable viewport); on **Metal** (`metal_headless/visual_test`), each is the matching flag below.
+The same scenes render on both backends. On **Vulkan** (the Windows `hello_triangle` sample) each is a `--<name>-shot
+out.bmp` headless capture (or `--fly` for the live navigable viewport); on **Metal** (`metal_headless/visual_test`)
+each is the matching `--<name> out.png` flag. There are ~190 showcase flags — the authoritative, always-current list
+is machine-readable:
 
-| showcase            | Vulkan (`hello_triangle.exe`)      | Metal (`visual_test`)              |
-| ------------------- | ---------------------------------- | ---------------------------------- |
-| default lit+shadow  | `--shot out.bmp`                   | `out.png`                          |
-| skinning            | `--skinning-shot out.bmp`          | `--skinning out.png`               |
-| PBR helmet          | `--pbr-shot out.bmp`               | `--pbr out.png`                    |
-| instancing          | `--instanced-shot out.bmp`         | `--instanced out.png`              |
-| HDR IBL             | `--ibl-shot out.bmp`               | `--ibl out.png`                    |
-| physics             | `--physics-shot out.bmp`           | `--physics out.png`                |
-| transparency        | `--transparency-shot out.bmp`      | `--transparency out.png`           |
-| bloom               | `--bloom-shot out.bmp`             | `--bloom out.png`                  |
-| glTF scene import   | `--scene-shot out.bmp`             | `--scene out.png`                  |
-| debug viz           | `--debug-shot out.bmp`             | `--debug out.png`                  |
-| animation blend     | `--blend-shot out.bmp`             | `--blend out.png`                  |
-| animation state machine | `--anim-fsm-shot out.bmp`      | `--anim-fsm out.png`               |
-| SSAO                | `--ssao-shot out.bmp`              | `--ssao out.png`                   |
-| capstone            | `--capstone-shot out.bmp`          | `--capstone out.png`               |
-| scripted camera     | `--camera-shot <yaw,pitch,x,y,z> out.bmp` | `--camera <yaw,pitch,x,y,z> out.png` |
-| editor gizmo        | `--gizmo-shot <objIndex> out.bmp`  | `--gizmo <objIndex> out.png`       |
-| cascaded shadows    | `--csm-shot out.bmp`               | `--csm out.png`                    |
-| spot-light shadows  | `--spot-shot out.bmp`              | `--spot out.png`                   |
-| point shadows       | `--point-shadow-shot out.bmp`      | `--point-shadow out.png`           |
-| clustered lighting  | `--clustered-shot out.bmp`         | `--clustered out.png`              |
-| clustered light culling (Forward+) | `--clustered-lights-shot out.bmp` | `--clustered-lights out.png` |
-| screen-space reflections | `--ssr-shot out.bmp`          | `--ssr out.png`                    |
-| screen-space GI (SSGI) | `--ssgi-shot out.bmp`           | `--ssgi out.png`                   |
-| SSGI + bilateral denoise | `--ssgi-denoise-shot out.bmp` | `--ssgi-denoise out.png`           |
-| SSGI temporal accumulation | `--ssgi-temporal-shot out.bmp` | `--ssgi-temporal out.png`     |
-| volumetric fog      | `--volumetric-shot out.bmp`        | `--volumetric out.png`             |
-| reflection/irradiance probes | `--probe-shot out.bmp`    | `--probe out.png`                  |
-| temporal AA (TAA)   | `--taa-shot out.bmp`               | `--taa out.png`                    |
-| frustum culling     | `--cull-shot out.bmp`              | `--cull out.png`                   |
-| GPU-driven culling  | `--gpu-cull-shot out.bmp`          | `--gpu-cull out.png`               |
-| GPU multi-draw-indirect | `--mdi-shot out.bmp`           | `--mdi out.png`                    |
-| bindless textures   | `--bindless-shot out.bmp`          | `--bindless out.png`               |
-| GPU-driven combined pass | `--gpudriven-shot out.bmp`     | `--gpudriven out.png`              |
-| GPU-driven-culled pass | `--gpucull-draw-shot out.bmp`   | `--gpucull-draw out.png`           |
-| Hi-Z occlusion culling | `--hiz-cull-shot out.bmp`       | `--hiz-cull out.png`               |
-| CPU particle / VFX emitter | `--vfx-shot out.bmp`        | `--vfx out.png`                    |
-| multithreaded record| `--mt-shot out.bmp [--workers N]`  | `--mt out.png`                     |
-| material graph      | `--material-shot out.bmp`          | `--material out.png`               |
-| material (live compile) | `--material-live-shot out.bmp [mat.json]` | `--material2 out.png`     |
-| multi-material scene | `--material-multi-shot out.bmp`   | `--material-multi out.png`         |
-| material normal-map node | `--material-normal-shot out.bmp` | `--material-normal out.png`      |
-| material graph introspect (JSON) | `--material-introspect <mat.json> [out.json]` | *(pure hf_core; same bytes)* |
-| scene / asset streaming | `--stream-shot out.bmp`        | `--stream out.png`                 |
-| procedural terrain  | `--terrain-shot out.bmp`           | `--terrain out.png`                |
-| streamed terrain + LOD | `--terrain-stream-shot out.bmp` | `--terrain-stream out.png`         |
-| screen-space decals | `--decal-shot out.bmp`             | `--decal out.png`                  |
-| post-process stack  | `--poststack-shot out.bmp`         | `--poststack out.png`              |
-| game sample         | `--game-shot out.bmp`              | `--game out.png`                   |
-| networking / replication | `--net-shot out.bmp`          | `--net out.png`                    |
-| networking transport + interp | `--netsim-shot out.bmp`  | `--netsim out.png`                 |
-| networking prediction + reconcile | `--netpredict-shot out.bmp` | `--netpredict out.png`         |
-| text / HUD overlay  | `--hud-shot out.bmp`               | `--hud out.png`                    |
-| game + score HUD    | `--game-hud-shot out.bmp`          | `--game-hud out.png`               |
-| docked editor shell | `--editor-shot out.bmp [objIndex]` | `--editor out.png`                 |
-| editor live edit-ops + round-trip | `--editor-edit-shot out.bmp` | `--editor-edit out.png`         |
-| Gerstner-wave water | `--water-shot out.bmp`             | `--water out.png`                  |
-| depth of field      | `--dof-shot out.bmp`               | `--dof out.png`                    |
-| volumetric clouds   | `--clouds-shot out.bmp`            | `--clouds out.png`                 |
-| cloud shadows       | `--cloud-shadows-shot out.bmp`     | `--cloud-shadows out.png`          |
-| motion blur         | `--motionblur-shot out.bmp`        | `--motionblur out.png`             |
-| order-independent transparency (OIT) | `--oit-shot out.bmp` | `--oit out.png`               |
-| parallax occlusion mapping (POM) | `--pom-shot out.bmp`   | `--pom out.png`                    |
-| ground-truth AO (GTAO) | `--gtao-shot out.bmp`           | `--gtao out.png`                   |
-| froxel volumetric fog | `--froxelfog-shot out.bmp`       | `--froxelfog out.png`              |
-| screen-space contact shadows | `--contactshadow-shot out.bmp` | `--contactshadow out.png`     |
-| per-froxel clustered-light injection | `--froxellights-shot out.bmp` | `--froxellights out.png` |
-| auto-exposure       | `--autoexposure-shot out.bmp`      | `--autoexposure out.png`           |
-| volumetric shadows  | `--volshadows-shot out.bmp`        | `--volshadows out.png`             |
-| subsurface scattering (SSS) | `--sss-shot out.bmp`       | `--sss out.png`                    |
-| box-projected reflection probe | `--reflprobe-shot out.bmp` | `--reflprobe out.png`           |
-| color grading       | `--colorgrade-shot out.bmp`        | `--colorgrade out.png`             |
-| cubemap-capture reflection probe | `--captureprobe-shot out.bmp` | `--captureprobe out.png`       |
-| planar reflections  | `--planar-shot out.bmp`            | `--planar out.png`                 |
-| contrast-adaptive sharpening (CAS) | `--cas-shot out.bmp`     | `--cas out.png`                    |
-| audio render (WAV)  | `--audio-render out.wav`           | *(pure hf_core; same bytes)*       |
-| engine-state JSON   | `--introspect out.json`            | *(pure hf_core; same bytes)*       |
-| live viewport       | `--fly` (WASD + mouse-look)        | `--fly` (windowed Metal viewport)  |
+```sh
+# the engine emits its own showcase / command / feature manifest as JSON:
+hello_triangle.exe --introspect manifest.json
+
+# verify.ps1 enumerates every golden + its flag; its per-golden table is the live index.
+```
+
+A few representative flags: `--pbr` (glTF PBR), `--ssgi-temporal` (the GI trilogy), `--gpudriven` (one indirect
+draw + bindless), `--fpx-lockstep` (deterministic physics rollback), `--cloth-render` / `--fluid-render` /
+`--grain-render` (the deterministic deformable / particle sims), `--fract-render` (destruction), `--joint-render`
+(ragdoll), `--vehicle-render`, `--boids-render` (crowds), `--convex-stack` (settling rigid bodies),
+`--audio-render out.wav`, `--introspect out.json`, and `--fly` (live viewport, windowed on both Vulkan and Metal).
+
+---
+
+## Architecture
+
+Layered, all above the seam:
+
+1. **HAL** (`engine/hal/`) — SDL3 window + Vulkan surface creation.
+2. **RHI seam** (`engine/rhi/`) — pure C++ interfaces (`IRHIDevice`, `ICommandBuffer`, `IPipeline`, `IBuffer`,
+   `ITexture`, `IRenderTarget`, `ISwapchain`, compute). Zero backend symbols.
+3. **Backends** — Vulkan (`engine/rhi_vulkan/`, vk-bootstrap + VMA + 1.3 dynamic rendering + descriptor-indexing
+   bindless) and Metal (`engine/rhi_metal/`, Obj-C++/ARC, runtime MSL compile).
+4. **Engine modules** — `render/` (render graph + barrier solver + every header-only render model), `sim/` (the
+   deterministic fixed-point simulation flagships: `fpx` / `cloth` / `fluid` / `grain` / `couple*` / `fract` /
+   `joint` / `vehicle` / `active` / `boids` / `convex`), `nav/` (deterministic GPU navmesh + A*), `scene/`,
+   `terrain/`, `asset/`, `anim/`, `physics/`, `material/`, `ui/`, `audio/`, `vfx/`, `net/`, `game/`, `runtime/`,
+   `editor/`, `debug/`. All depend only on `rhi/` + `math/`; the backend-agnostic subset compiles into `hf_core`
+   for the sanitized unit tests.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the seam design, descriptor model, frame structure, the
+shared HLSL→MSL toolchain, the deterministic-sim conventions, and per-backend notes.
+
+### Repo layout
+
+```
+hazard-forge/
+├── CMakeLists.txt              Top-level C++20 build; HF_SANITIZE opt-in
+├── CMakePresets.json           windows-msvc-debug / -release / -asan / macos-arm64-debug
+├── conanfile.py                SDL3, vk-bootstrap, VMA, vulkan-headers/loader, validation layers (debug)
+├── engine/
+│   ├── rhi/                    THE SEAM — pure interfaces, zero backend symbols
+│   ├── rhi_vulkan/             Vulkan backend (+ vulkan_bindless: VK_EXT_descriptor_indexing array)
+│   ├── rhi_metal/              Metal backend (Obj-C++/ARC, runtime MSL compile)
+│   ├── render/                 RenderGraph + barrier solver + all header-only render models
+│   ├── sim/                    Deterministic Q16.16 sims: fpx/cloth/fluid/grain/couple*/fract/joint/vehicle/active/boids/convex
+│   ├── nav/                    Deterministic GPU navmesh + integer A* pathfinding
+│   ├── scene/ terrain/ asset/ anim/ physics/ material/ ui/ audio/ vfx/ net/ game/ runtime/ editor/ debug/
+│   └── math/ hal/
+├── shaders/                    Shared HLSL → SPIR-V & MSL (+ generated/ material-codegen output)
+├── tools/                      material_codegen: build-time HLSL generator from *.mat.json graphs
+├── mac_window/                 SDL-free native Cocoa entry: windowed Metal viewport from a CAMetalLayer*
+├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot capture + --fly + --introspect
+├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, every showcase)
+├── tests/                      Pure unit tests + golden/{metal,introspect,material,audio}
+├── scripts/verify.ps1          Cross-platform gate: Windows ctest + JSON/audio goldens + Mac 188-golden compare
+├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
+└── docs/                       ARCHITECTURE.md + per-slice specs/plans
+```
+
+---
+
+## Roadmap
+
+Recent work has pushed well past the rendering breadth phase into two depth pillars: **GPU-compute rendering**
+(DDGI dynamic GI, Nanite-style virtual geometry, virtual shadow maps, runtime virtual texturing, GPU marching
+cubes) and **deterministic fixed-point simulation** (the physics / coupling / destruction / ragdoll / vehicle /
+crowd / convex-contact flagships above). Shipped since the early roadmap: a windowed Metal `--fly` viewport;
+broader physics (boxes/convex, joints, vehicles, ragdolls — all deterministic); the full SSGI + DDGI GI arc; and
+the deterministic networking trilogy.
+
+Open directions:
+
+- **Real sockets** (UDP/TCP) over the existing deterministic replication / transport / prediction API.
+- **World-space / reprojected temporal GI** under camera motion (beyond the static-camera SSGI accumulation).
+- **Simulation breadth** — friction refinements, general convex hulls (beyond boxes), multi-threaded solves, and
+  composing the deterministic-contact model back into the existing rigid-body flagships.
+- **Editor depth** — multi-select, surfaced undo/redo, an asset browser.
 
 ---
 
 ## Repository
 
 `github.com/hassard0/Hazard-Forge`
-
----
-
-## Roadmap
-
-- ~~Windowed Metal present loop for an interactive macOS viewport~~ — **shipped** (native Cocoa `--fly` viewport from a `CAMetalLayer*`; build-verified, manual on-screen confirmation).
-- Continued editor work (multi-select, undo/redo surfaced in the UI, asset browser).
-- Broader physics (boxes/convex, joints) and animation (state machines, IK).
-- ~~Real-time / dynamic GI beyond the baked reflection-probe path~~ — **shipped** (screen-space GI: one indirect-diffuse bounce, the full `raw → bilateral spatial denoise → temporal accumulation` trilogy); further real-time GI (multi-bounce, world-space, reprojected temporal under camera motion) still open.
-- ~~Networking transport beyond the in-process replication channel~~ — **the deterministic trilogy shipped** (a seeded lossy transport — latency / loss / reorder — + a client jitter-buffer with interpolation, **and** client-side prediction + server reconciliation via rewind/replay, all modeled without real sockets); **real sockets** (UDP/TCP) over the same API still open.
-```
