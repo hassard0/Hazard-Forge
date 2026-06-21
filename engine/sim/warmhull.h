@@ -467,5 +467,133 @@ inline HullKeyMeasure MeasureHullKeys(const std::vector<HullContactKey>& keys) {
     return m;
 }
 
+// =========================================================================================================
+// Slice WH2 — THE KEYED MANIFOLD + PERSISTENT CACHE (the structural store). APPENDED after MeasureHullKeys
+// (WH1's lines above + manifold.h/gjk.h/persist.h/convex.h/fric.h/broad.h/ccd.h/fpx.h BYTE-FROZEN). WH1 built
+// the deterministic hull contact feature ID (HullContactKey — the int32 MSL-native key that names a contact
+// across frames). WH2 builds the PERSISTENT STORE that key unlocks: a per-frame cache that matches THIS tick's
+// manifold points to LAST tick's ACCUMULATED contact impulses by key — so next tick's solver (WH3) can warm-
+// start each point from the impulse it carried last frame. This is the structural backbone of warm-starting
+// (no new physics yet — the PS2 step of the persist.h template). The control flow MIRRORS persist::MatchCache/
+// UpdateCache (persist.h:221-248) over the WH1 hull key + the multi-point hull manifold (persist's
+// BuildKeyedManifold is box-only — WH2's hull version is new, reusing manifold::HullContactMulti + WH1's
+// BuildHullContactKeysForPair).
+//
+// THE int64 REALITY (the WH1/MF3 lesson): the manifold WH2 caches is built by the int64 manifold::
+// HullContactMulti (GJK/EPA + the Sutherland-Hodgman clip), so shaders/warmhull_cache.comp.hlsl is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in the metal_headless hf_gen_msl list —
+// UNLIKE WH1's warmhull_key.comp (the KEY alone is pure int32 -> MSL-native). The Vulkan --wh2-cache-shot
+// dispatches warmhull_cache.comp (one thread per pair: it consumes the host-built keyed manifold points — the
+// int64-derived positions/depths/keys — and MATCHES the persistent cache SSBO in FIXED order, copying
+// MatchHullCache's body VERBATIM) -> the GPU matched KeyedHullManifoldWH2[] is memcmp'd BIT-EXACT vs the CPU
+// reference; the Metal --wh2-cache runs the CPU BuildKeyedHullManifold + MatchHullCache (byte-identical by
+// construction, the persist_cache.comp convention).
+
+// ----- KeyedHullManifoldWH2: a convex::ContactManifold + a PARALLEL HullContactKey + per-point normalImpulse ---
+// The frozen convex::ContactManifold (positions/depths/normal/count, manifold.h:292 — reused verbatim) +
+// keys[i] (the WH1 geometric-provenance key for manifold point i) + normalImpulse[i] (the per-point accumulated
+// NORMAL impulse, zeroed on cold-start, seeded from the cache on a warm match). std430-packable (the manifold
+// POD + 4 x (4-uint key) + 4 x fx). WH1 already defines a small KeyedHullManifold (count/pts/normal) used by
+// BuildHullContactKeysForPair; WH2 uses a DISTINCT name (KeyedHullManifoldWH2) so WH1's type stays byte-frozen.
+struct KeyedHullManifoldWH2 {
+    convex::ContactManifold manifold;          // positions/depths/normal/count — the frozen POD, reused verbatim
+    HullContactKey          keys[4];           // keys[i] <-> manifold.points[i] for i in [0, manifold.count)
+    fx                      normalImpulse[4] = {0, 0, 0, 0};   // per-point accumulated normal impulse (0 = cold)
+};
+
+// ----- BuildKeyedHullManifold(bodyAIdx, bodyA, hullA, bodyBIdx, bodyB, hullB) -> KeyedHullManifoldWH2 ----------
+// Run manifold::HullContactMulti (the FROZEN narrowphase — positions/depths/normal come from HERE) then tag each
+// of its 1-4 points with its WH1 key via BuildHullContactKeysForPair (the byte-identical tagged clip). The keys
+// are aligned index-for-index with the manifold points (BuildHullContactKeysForPair emits in the SAME deepest-
+// first reduce order HullManifoldFromEpa uses). normalImpulse starts 0 (the cold-start contract; MatchHullCache
+// fills the matched ones). Pure integer, FIXED order -> bit-identical CPU<->Vulkan<->Metal.
+inline KeyedHullManifoldWH2 BuildKeyedHullManifold(uint32_t bodyAIdx, const FxBody& bodyA, const FxHull& hullA,
+                                                   uint32_t bodyBIdx, const FxBody& bodyB, const FxHull& hullB) {
+    KeyedHullManifoldWH2 out;   // manifold count 0, keys zeroed, impulses 0
+    // The FROZEN manifold (the contract — positions/depths/normal).
+    out.manifold = manifold::HullContactMulti(bodyA, hullA, bodyB, hullB);
+    if (out.manifold.count == 0) return out;
+    // The WH1 keyed manifold (the SAME positions, plus the per-point geometric-provenance key).
+    const KeyedHullManifold km = BuildHullContactKeysForPair(bodyAIdx, bodyA, hullA, bodyBIdx, bodyB, hullB);
+    for (uint32_t i = 0; i < out.manifold.count && i < 4; ++i) {
+        out.keys[i] = (i < km.count) ? km.pts[i].key : HullContactKey{};
+        out.normalImpulse[i] = 0;   // cold-start
+    }
+    return out;
+}
+
+// ----- CachedHullContact: one cached hull contact's key + its persisted accumulated normal impulse -----------
+// key = the WH1 HullContactKey (the deterministic identity); normalImpulse = LAST tick's accumulated normal
+// impulse. std430-packable as 4 x uint32 (the key) + 1 x int32 (the impulse) = 5 x int32 (20 bytes) — the GPU
+// CachedHullContact mirror the warmhull_cache SSBO scan reads. (WH2 caches the NORMAL impulse only — hull
+// friction is a separate future flagship.)
+struct CachedHullContact {
+    HullContactKey key;
+    fx             normalImpulse = 0;
+};
+
+// ----- HullCache: the store — LAST tick's accumulated normal impulses keyed by HullContactKey ---------------
+// A flat vector + a FIXED linear scan (the contact sets are tiny; HullContactKeyHash is available for a bucket
+// optimization, but the deterministic baseline is the fixed-order scan — the persist.h PersistentCache shape).
+// UpdateHullCache rewrites it to EXACTLY this tick's contacts (so absent keys are evicted); MatchHullCache reads
+// it (read-only). FIXED order -> deterministic.
+struct HullCache {
+    std::vector<CachedHullContact> entries;
+};
+
+// ----- MatchHullCache(cache, keyed) -> mutates keyed.normalImpulse: inherit prior impulses by key ------------
+// For each manifold point i in FIXED order [0, keyed.manifold.count): scan the cache in FIXED order (entries[0..)
+// for the FIRST entry whose key equals keyed.keys[i] (HullContactKeysEqual); if found, copy the cached
+// normalImpulse into keyed.normalImpulse[i] (the WARM inherit); if not found, leave it 0 (a fresh contact cold-
+// starts — BuildKeyedHullManifold already zeroed it). FIXED scan order -> deterministic. The shader copies THIS
+// body VERBATIM (the GPU==CPU memcmp make-or-break).
+inline void MatchHullCache(const HullCache& cache, KeyedHullManifoldWH2& keyed) {
+    for (uint32_t i = 0; i < keyed.manifold.count && i < 4; ++i) {
+        for (size_t e = 0; e < cache.entries.size(); ++e) {
+            if (HullContactKeysEqual(cache.entries[e].key, keyed.keys[i])) {
+                keyed.normalImpulse[i] = cache.entries[e].normalImpulse;
+                break;   // the FIRST matching entry wins (fixed scan order)
+            }
+        }
+    }
+}
+
+// ----- UpdateHullCache(cache, keyed) -> rewrites cache: store THIS tick's contacts, evict absent keys --------
+// After a (future WH3) solve, REPLACE the cache with exactly this tick's contacts: clear it, then for each point
+// i in FIXED order append {keyed.keys[i], keyed.normalImpulse[i]}. Keys not present this tick are thereby EVICTED
+// (the new cache IS exactly this tick's set). FIXED order -> deterministic. (WH2 proves the match + the evict;
+// the impulses it stores are whatever the manifold carries — synthesized in WH2's showcase, the real solved
+// impulses in WH3.) Mirrors persist::UpdateCache (persist.h:240-248).
+inline void UpdateHullCache(HullCache& cache, const KeyedHullManifoldWH2& keyed) {
+    cache.entries.clear();
+    for (uint32_t i = 0; i < keyed.manifold.count && i < 4; ++i)
+        cache.entries.push_back(CachedHullContact{keyed.keys[i], keyed.normalImpulse[i]});
+}
+
+// ----- HullCacheMeasure: the deterministic match summary over one keyed manifold against a cache -------------
+// contacts = keyed.manifold.count; matched = the number of points whose key was found in the cache (inherited);
+// coldStart = the number NOT found (cold-started at zero) = contacts - matched. Pure integer, FIXED scan order
+// -> deterministic. The showcase prints + asserts (matched + coldStart == contacts). The persist.h CacheMeasure
+// twin.
+struct HullCacheMeasure {
+    uint32_t contacts  = 0;
+    uint32_t matched   = 0;
+    uint32_t coldStart = 0;
+};
+
+// MeasureHullCache(cache, keyed): count, in FIXED order, how many of keyed's points have a matching cache key.
+// Read-only (does NOT mutate keyed). Deterministic.
+inline HullCacheMeasure MeasureHullCache(const HullCache& cache, const KeyedHullManifoldWH2& keyed) {
+    HullCacheMeasure m;
+    m.contacts = keyed.manifold.count;
+    for (uint32_t i = 0; i < keyed.manifold.count && i < 4; ++i) {
+        bool found = false;
+        for (size_t e = 0; e < cache.entries.size(); ++e)
+            if (HullContactKeysEqual(cache.entries[e].key, keyed.keys[i])) { found = true; break; }
+        if (found) ++m.matched; else ++m.coldStart;
+    }
+    return m;
+}
+
 }  // namespace warmhull
 }  // namespace hf::sim

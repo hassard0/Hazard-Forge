@@ -470,6 +470,8 @@ int main() {
             bool sawPersistRenderFeature = false;
             // Slice WH1: the warmhull-contact-key capability is advertised.
             bool sawWarmhullKeyFeature = false;
+            // Slice WH2: the warmhull-cache capability is advertised.
+            bool sawWarmhullCacheFeature = false;
             // Slice GJ1: the deterministic-hull-support capability is advertised.
             bool sawHullSupportFeature = false;
             // Slice GJ2: the deterministic-gjk-distance capability is advertised.
@@ -713,6 +715,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-persist-lockstep") sawPersistLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-persist-render") sawPersistRenderFeature = true;
                     if (AsString(el->value) == "warmhull-contact-key") sawWarmhullKeyFeature = true;
+                    if (AsString(el->value) == "warmhull-cache") sawWarmhullCacheFeature = true;
                     if (AsString(el->value) == "deterministic-hull-support") sawHullSupportFeature = true;
                     if (AsString(el->value) == "deterministic-gjk-distance") sawGjkDistanceFeature = true;
                     if (AsString(el->value) == "deterministic-gjk-epa") sawGjkEpaFeature = true;
@@ -916,6 +919,7 @@ int main() {
         check(sawPersistLockstepFeature, "engine.features includes deterministic-persist-lockstep");
         check(sawPersistRenderFeature, "engine.features includes deterministic-persist-render");
         check(sawWarmhullKeyFeature, "engine.features includes warmhull-contact-key");
+        check(sawWarmhullCacheFeature, "engine.features includes warmhull-cache");
             check(sawHullSupportFeature, "engine.features includes deterministic-hull-support");
             check(sawGjkDistanceFeature, "engine.features includes deterministic-gjk-distance");
             check(sawGjkEpaFeature, "engine.features includes deterministic-gjk-epa");
@@ -1256,6 +1260,8 @@ int main() {
         bool sawPersistKeyShot = false;
         // Slice WH1: the --wh1-keys-shot showcase flag is listed in the showcase manifest.
         bool sawWh1KeysShot = false;
+        // Slice WH2: the --wh2-cache-shot showcase flag is listed in the showcase manifest.
+        bool sawWh2CacheShot = false;
         // Slice PS2: the --persist-cache-shot showcase flag is listed in the showcase manifest.
         bool sawPersistCacheShot = false;
         // Slice PS3: the --persist-warm-shot showcase flag is listed in the showcase manifest.
@@ -1505,6 +1511,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-basis-shot") sawFricBasisShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-key-shot") sawPersistKeyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh1-keys-shot") sawWh1KeysShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--wh2-cache-shot") sawWh2CacheShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-cache-shot") sawPersistCacheShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-warm-shot") sawPersistWarmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--persist-sleep-shot") sawPersistSleepShot = true;
@@ -1706,6 +1713,7 @@ int main() {
         check(sawFricBasisShot, "showcases manifest includes --fric-basis-shot");
         check(sawPersistKeyShot, "showcases manifest includes --persist-key-shot");
         check(sawWh1KeysShot, "showcases manifest includes --wh1-keys-shot");
+        check(sawWh2CacheShot, "showcases manifest includes --wh2-cache-shot");
         check(sawPersistCacheShot, "showcases manifest includes --persist-cache-shot");
         check(sawPersistWarmShot, "showcases manifest includes --persist-warm-shot");
         check(sawPersistSleepShot, "showcases manifest includes --persist-sleep-shot");

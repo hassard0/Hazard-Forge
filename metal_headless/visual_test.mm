@@ -29268,6 +29268,227 @@ static int RunPersistCacheShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice WH2 — Warm-Started Hull Contacts THE KEYED MANIFOLD + PERSISTENT CACHE showcase (--wh2-cache)
+// (the 2nd slice of FLAGSHIP #26). Like PS2's --persist-cache, the manifold it caches is int64 (manifold::
+// HullContactMulti's GJK/EPA + the Sutherland-Hodgman clip), so shaders/warmhull_cache.comp.hlsl is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list (UNLIKE WH1's
+// warmhull_key.comp which IS MSL-native, the KEY alone is pure int32); on Metal the --wh2-cache showcase runs the
+// CPU warmhull::BuildKeyedHullManifold + MatchHullCache — the EXACT bit-exact reference the Vulkan
+// --wh2-cache-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the Vulkan
+// GPU result BY CONSTRUCTION (the persist_cache.comp convention), while the Vulkan side carries the GPU==CPU
+// proof. So this builds the SAME synthesized TWO-FRAME match over the MF2/MF3 hull battery (frame t seeds the
+// cache via UpdateHullCache; frame t+1's sub-LSB nudge re-matches so persistent points inherit, a departed
+// contact evicts, a new one cold-starts), and CPU-colors the SAME 2D side-view inherited-impulse view -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match
+// the Vulkan side EXACTLY. New golden tests/golden/metal/wh2_cache.png (baked on the Mac by the controller); two
+// runs DIFF 0.0000.
+static int RunWh2CacheShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    namespace warmhull = hf::sim::warmhull;
+    using gjk::fx; using gjk::kOne; using gjk::FxVec3;
+
+    auto MakeBodyAt = [](fx px, fx py, fx pz) {
+        fpx::FxBody b; b.pos = {px, py, pz}; b.orient = {0, 0, 0, kOne}; return b;
+    };
+    const fx overlap = kOne / 8;
+
+    auto makePairs = [&](fx dxNudge, bool removePair2, bool addNewPair) {
+        std::vector<warmhull::HullKeyPair> pairs;
+        const gjk::FxHull boxH = gjk::MakeBox(kOne, kOne, kOne);
+        pairs.push_back({0u, MakeBodyAt(gjk::FromInt(-4) + dxNudge, 0, 0), boxH,
+                         1u, MakeBodyAt(gjk::FromInt(-4) + dxNudge, gjk::FromInt(2) - overlap, 0), boxH});
+        gjk::FxHull tetraH;
+        tetraH.verts[0] = FxVec3{0, kOne, 0};
+        tetraH.verts[1] = FxVec3{gjk::FromInt(1), -kOne, gjk::FromInt(1)};
+        tetraH.verts[2] = FxVec3{gjk::FromInt(1), -kOne, -gjk::FromInt(1)};
+        tetraH.verts[3] = FxVec3{-gjk::FromInt(1), -kOne, 0};
+        tetraH.count = 4;
+        pairs.push_back({2u, MakeBodyAt(dxNudge, 0, 0), boxH,
+                         3u, MakeBodyAt(dxNudge, gjk::FromInt(2) - overlap, 0), tetraH});
+        {
+            fpx::FxBody edgeB = MakeBodyAt(gjk::FromInt(4) + dxNudge,
+                                           (fx)((1.0 - 0.125 + 1.41421356) * 65536.0), 0);
+            edgeB.orient = {0, 0, (fx)(0.38268343f * 65536.0f), (fx)(0.92387953f * 65536.0f)};
+            if (removePair2) edgeB.pos.y += gjk::FromInt(20);
+            pairs.push_back({4u, MakeBodyAt(gjk::FromInt(4) + dxNudge, 0, 0), boxH, 5u, edgeB, boxH});
+        }
+        if (addNewPair) {
+            pairs.push_back({6u, MakeBodyAt(gjk::FromInt(8), gjk::FromInt(-6), 0), boxH,
+                             7u, MakeBodyAt(gjk::FromInt(8), gjk::FromInt(-4) + overlap, 0), boxH});
+        }
+        return pairs;
+    };
+
+    auto synthImpulse = [&](const warmhull::HullContactKey& k) -> fx {
+        const uint32_t h = warmhull::HullContactKeyHash(k);
+        return (fx)((int32_t)((h % 4096u) + 256u));
+    };
+
+    // ===== FRAME t: build the keyed manifolds + seed the cache =====
+    std::vector<warmhull::HullKeyPair> pairsT = makePairs(0, false, false);
+    warmhull::HullCache cache;
+    uint32_t frameTContacts = 0;
+    for (const warmhull::HullKeyPair& p : pairsT) {
+        warmhull::KeyedHullManifoldWH2 km = warmhull::BuildKeyedHullManifold(
+            p.bodyAIdx, p.bodyA, p.hullA, p.bodyBIdx, p.bodyB, p.hullB);
+        for (uint32_t i = 0; i < km.manifold.count && i < 4u; ++i) {
+            km.normalImpulse[i] = synthImpulse(km.keys[i]);
+            cache.entries.push_back(warmhull::CachedHullContact{km.keys[i], km.normalImpulse[i]});
+        }
+        frameTContacts += km.manifold.count;
+    }
+
+    // ===== FRAME t+1: nudge (inherit) + remove pair 2 (evict) + add pair 3 (cold) =====
+    std::vector<warmhull::HullKeyPair> pairsT1 = makePairs(1, true, true);
+    const uint32_t kPairCount = (uint32_t)pairsT1.size();
+
+    // The packed result form (== the Vulkan --wh2-cache-shot KeyedHullManifoldGpu).
+    struct HullContactKeyGpu { uint32_t bodyA, bodyB, refFaceId, incVertId; };
+    static_assert(sizeof(HullContactKeyGpu) == 16, "HullContactKeyGpu std430 layout");
+    struct ManifoldPointGpu { int32_t px, py, pz, depth; };
+    static_assert(sizeof(ManifoldPointGpu) == 16, "ManifoldPointGpu std430 layout");
+    struct KeyedHullManifoldGpu {
+        uint32_t count; ManifoldPointGpu pts[4]; int32_t nx, ny, nz, _pad0; HullContactKeyGpu keys[4];
+        int32_t normalImpulse[4];
+    };
+    static_assert(sizeof(KeyedHullManifoldGpu) == 164, "KeyedHullManifoldGpu std430 layout");
+    auto packKey = [&](const warmhull::HullContactKey& k) {
+        return HullContactKeyGpu{k.bodyA, k.bodyB, k.refFaceId, k.incVertId};
+    };
+    auto packManifold = [&](const warmhull::KeyedHullManifoldWH2& m) {
+        KeyedHullManifoldGpu g{};
+        g.count = m.manifold.count;
+        for (int k = 0; k < 4; ++k) {
+            g.pts[k] = ManifoldPointGpu{m.manifold.points[k].x, m.manifold.points[k].y,
+                                        m.manifold.points[k].z, m.manifold.depths[k]};
+            g.keys[k] = packKey(m.keys[k]);
+            g.normalImpulse[k] = m.normalImpulse[k];
+        }
+        g.nx = m.manifold.normal.x; g.ny = m.manifold.normal.y; g.nz = m.manifold.normal.z;
+        return g;
+    };
+
+    auto run = [&](std::vector<KeyedHullManifoldGpu>& out,
+                   std::vector<warmhull::KeyedHullManifoldWH2>& outKeyed,
+                   uint32_t& points, uint32_t& matched, uint32_t& cold) {
+        out.assign((size_t)kPairCount, KeyedHullManifoldGpu{});
+        outKeyed.assign((size_t)kPairCount, warmhull::KeyedHullManifoldWH2{});
+        points = 0; matched = 0; cold = 0;
+        for (uint32_t p = 0; p < kPairCount; ++p) {
+            const warmhull::HullKeyPair& kp = pairsT1[p];
+            warmhull::KeyedHullManifoldWH2 km = warmhull::BuildKeyedHullManifold(
+                kp.bodyAIdx, kp.bodyA, kp.hullA, kp.bodyBIdx, kp.bodyB, kp.hullB);
+            const warmhull::HullCacheMeasure cm = warmhull::MeasureHullCache(cache, km);
+            warmhull::MatchHullCache(cache, km);
+            outKeyed[p] = km;
+            out[p] = packManifold(km);
+            points += cm.contacts; matched += cm.matched; cold += cm.coldStart;
+        }
+    };
+
+    std::vector<KeyedHullManifoldGpu> results;
+    std::vector<warmhull::KeyedHullManifoldWH2> resultsKeyed;
+    uint32_t points = 0, matched = 0, cold = 0;
+    run(results, resultsKeyed, points, matched, cold);
+
+    if (matched + cold != points) return fail("wh2-cache: matched+cold != points");
+    std::printf("wh2-cache: {points:%u, matched:%u, cold:%u} matched+cold==points\n", points, matched, cold);
+
+    // Correctness: inheritedExact / freshColdStart.
+    bool inheritedExact = true, freshColdStart = true;
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        const warmhull::KeyedHullManifoldWH2& km = resultsKeyed[p];
+        for (uint32_t i = 0; i < km.manifold.count && i < 4u; ++i) {
+            fx cn = 0; bool inCache = false;
+            for (const warmhull::CachedHullContact& c : cache.entries)
+                if (warmhull::HullContactKeysEqual(c.key, km.keys[i])) { cn = c.normalImpulse; inCache = true; break; }
+            if (inCache) { if (km.normalImpulse[i] != cn) inheritedExact = false; }
+            else         { if (km.normalImpulse[i] != 0)  freshColdStart = false; }
+        }
+    }
+    if (!inheritedExact || !freshColdStart) return fail("wh2-cache: correctness failed");
+
+    // Eviction: the departed pair (bodies 4,5) is gone from the frame-t+1 cache; the new cache size == points.
+    warmhull::HullCache cacheT1;
+    for (uint32_t p = 0; p < kPairCount; ++p)
+        for (uint32_t i = 0; i < resultsKeyed[p].manifold.count && i < 4u; ++i)
+            cacheT1.entries.push_back(warmhull::CachedHullContact{
+                resultsKeyed[p].keys[i], resultsKeyed[p].normalImpulse[i]});
+    bool departedEvicted = (cacheT1.entries.size() == points);
+    for (const warmhull::CachedHullContact& c : cacheT1.entries)
+        if (c.key.bodyA == 4u && c.key.bodyB == 5u) departedEvicted = false;
+    bool wasInFrameT = false;
+    for (const warmhull::CachedHullContact& c : cache.entries)
+        if (c.key.bodyA == 4u && c.key.bodyB == 5u) wasInFrameT = true;
+    if (!departedEvicted || !wasInFrameT) return fail("wh2-cache: eviction failed");
+    std::printf("wh2-cache: departed key evicted (cacheSize:%u)\n", (uint32_t)cacheT1.entries.size());
+    std::printf("wh2-cache: GPU == CPU BIT-EXACT "
+                "[Metal: CPU warmhull::BuildKeyedHullManifold+MatchHullCache, byte-identical to the Vulkan GPU "
+                "result by construction]\n");
+
+    // Determinism: two runs byte-identical.
+    std::vector<KeyedHullManifoldGpu> results2;
+    std::vector<warmhull::KeyedHullManifoldWH2> resultsKeyed2;
+    uint32_t p2 = 0, m2 = 0, c2 = 0;
+    run(results2, resultsKeyed2, p2, m2, c2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(KeyedHullManifoldGpu)) != 0)
+        return fail("wh2-cache: two runs differ (nondeterministic)");
+    std::printf("wh2-cache determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) inherited-impulse view as the Vulkan --wh2-cache-shot.
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = imgH - 1 - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    int32_t maxJn = 1;
+    for (uint32_t p = 0; p < kPairCount; ++p)
+        for (uint32_t i = 0; i < results[p].count; ++i)
+            if (results[p].normalImpulse[i] > maxJn) maxJn = results[p].normalImpulse[i];
+    for (uint32_t p = 0; p < kPairCount; ++p) {
+        for (uint32_t i = 0; i < results[p].count; ++i) {
+            int cx, cy;
+            worldToPx(results[p].pts[i].px, results[p].pts[i].py, cx, cy);
+            Vec3 col;
+            if (results[p].normalImpulse[i] > 0) {
+                const float t = (float)results[p].normalImpulse[i] / (float)maxJn;
+                col = Vec3{0.45f + 0.55f * t, 0.30f + 0.45f * t, 0.10f + 0.10f * t};
+            } else {
+                col = Vec3{0.12f, 0.12f, 0.14f};
+            }
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx)
+                    putPx(cx + dx, cy + dy, col);
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — keyed-hull-cache inherited-impulse view (%u pairs, frameT:%u t+1:%u "
+                "contacts, %u matched)\n", outPath, imgW, imgH, kPairCount, frameTContacts, points, matched);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -54593,6 +54814,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--persist-cache") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_persist_cache.png";
             try { return RunPersistCacheShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wh2-cache <out.png>: render the Warm-Started Hull Contacts THE KEYED MANIFOLD + PERSISTENT CACHE
+        // showcase (Slice WH2, the 2nd slice of FLAGSHIP #26). On Metal this runs the CPU cache: the manifold it
+        // caches is int64 (manifold::HullContactMulti's GJK/EPA + the SH clip), so shaders/warmhull_cache.comp is
+        // VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl — UNLIKE WH1's warmhull_key.comp which IS, the KEY alone is pure
+        // int32); Metal runs the CPU warmhull::BuildKeyedHullManifold + MatchHullCache over the SAME synthesized
+        // two-frame hull battery -> the EXACT bit-exact reference the Vulkan --wh2-cache-shot GPU==CPU memcmp
+        // compares against; two runs byte-identical; persistent points inherit their frame-t impulse, the departed
+        // contact is evicted, a new one cold-starts. The image golden is a PURE-INTEGER 2D side-view inherited-
+        // impulse view, identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/wh2_cache.png.
+        if (argc > 1 && std::strcmp(argv[1], "--wh2-cache") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_wh2_cache.png";
+            try { return RunWh2CacheShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER

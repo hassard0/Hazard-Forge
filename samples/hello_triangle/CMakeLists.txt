@@ -1448,6 +1448,21 @@ hf_compile_shaders(
     # integer SSBO compute + ReadBuffer. NO new RHI; existing shaders + goldens untouched. warmhull.h is a NEW
     # additive sibling (#includes sim/manifold.h read-only).
     "shaders/warmhull_key.comp.hlsl:cs"
+    # Warm-Started Hull Contacts Slice 2 (Slice WH2): warmhull_cache.comp is THE KEYED MANIFOLD + PERSISTENT
+    # CACHE pass — ONE THREAD PER HULL PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) reads its
+    # HOST-BUILT keyed manifold (the int64-derived convex::ContactManifold positions/depths/normal + the WH1
+    # HullContactKey per point, computed host-side by manifold::HullContactMulti + warmhull::BuildKeyedHullManifold)
+    # then MATCHES the persistent cache (a small SSBO scanned in FIXED order, copying engine/sim/warmhull.h::
+    # MatchHullCache + HullContactKeysEqual VERBATIM) so a matched point INHERITS its prior accumulated normal
+    # impulse, writing its OWN gManifolds[pair] KeyedHullManifoldGpu (count + 4 ManifoldPoint + normal + 4 key +
+    # 4 normalImpulse). cacheEnabled=0 -> cleared. UNLIKE WH1's warmhull_key.comp (the KEY alone is pure int32 ->
+    # MSL-native) the MANIFOLD this caches is int64 (manifold::HullContactMulti's GJK/EPA + the SH clip Q16.16
+    # products run HOST-SIDE), so this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64 data layouts; glslc cannot)
+    # and is NOT MSL-gen'd — the Metal --wh2-cache showcase runs the CPU warmhull::BuildKeyedHullManifold +
+    # MatchHullCache instead (byte-identical by construction, the persist_cache.comp convention). Pure integer
+    # SSBO compute + ReadBuffer -> bit-exact GPU==CPU inherited-impulse keyed manifold array + cross-backend,
+    # proven memcmp. NO new RHI; WH1 + existing shaders + goldens untouched. warmhull.h is APPEND-only.
+    "shaders/warmhull_cache.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table
