@@ -594,5 +594,288 @@ inline convex::ContactManifold HullContactMulti(const FxBody& bodyA, const FxHul
     return HullManifoldFromEpa(hullA, bodyA, hullB, bodyB, e);
 }
 
+// =========================================================================================================
+// Slice MF4 — Hull Narrowphase Hardening: FULL INERTIA + THE RESTACKED-STABILITY STEP (the new-physics money
+// beat, the HEADLINE of FLAGSHIP #25). APPENDED after HullContactMulti (MF1/MF2/MF3's lines above are
+// BYTE-FROZEN; gjk/broad/ccd/convex/fpx + every sibling sim header BYTE-FROZEN). MF1 built the face topology;
+// MF2 the CPU multi-point manifold; MF3 lifted it onto the GPU. MF4 is the PAYOFF: it wires the hardened
+// manifold + a FULL convex inertia tensor into a stepped world, so a hull dropped FLAT on another SETTLES TO
+// REST where the frozen single-point step (gjk::StepHullWorld) leaves it TEETERING. StepHullWorldHardened is
+// the gjk::StepHullWorld 5-pass shell (gjk.h:1188) with EXACTLY TWO callee swaps and NOTHING else:
+//   (step 2 inertia) FxHullInvInertiaBody+WorldInvInertia -> FxHullInertiaBodyFull+WorldInvInertiaFull;
+//   (steps 3+4 contact) gjk::HullContact -> HullContactMulti (MF3).
+// The frozen convex::SolveManifoldImpulse (convex.h:651) ALREADY takes convex::FxMat3 invIaW/invIbW + already
+// loops 0..count over the manifold points, so it consumes the full tensor + the multi-point manifold with ZERO
+// change. The frozen gjk::StepHullWorld + its 224 goldens are UNTOUCHED (additivity by construction).
+//
+// THE FULL INERTIA (the new physics): FxHullInertiaBodyFull computes the canonical hull's full symmetric
+// inertia tensor I by SIGNED-TETRAHEDRON decomposition (a tetra fan from the hull centroid — at the origin for
+// the origin-symmetric canonical hulls — over each BuildCanonicalFaces face triangle, accumulating the
+// standard covariance integrals), in BODY-LOCAL space (the verts are bounded by the hull's local extents),
+// int64-accumulated, deferring the Q16.16 normalization; scaled by mass = 1/invMass; then FxMat3SymInverse.
+// THE CRUX (overflow + the cube cross-check): the tetra covariance integrals accumulate triple products of
+// vertex coordinates. We keep them BODY-LOCAL (bounded), accumulate in explicit int64, defer the scaling, and
+// the cube cross-check asserts FxMat3SymInverse(FxHullInertiaBodyFull(MakeBox)) == gjk::FxHullInvInertiaBody's
+// diagonal (the full tensor REDUCES to the AABB answer for a cube). WorldInvInertiaFull rotates the inverse
+// body tensor to world (R·M·Rᵀ, R = convex::BoxAxes) — generalizing convex::WorldInvInertia's outer-product.
+//
+// THE int64 GPU MIRROR (the GJ4/CX4 lesson): the whole step is int64 (the GJK/EPA + the inertia products +
+// the SH clip). DXC compiles int64 (Vulkan); glslc cannot. So shaders/hull_step_hardened.comp.hlsl is
+// VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --mf4-stack runs THIS CPU StepHullWorldHardenedN (byte-
+// identical to the Vulkan GPU result BY CONSTRUCTION), chunked 1 tick/dispatch (TDR-safe — heavier than the
+// single-point step). The Vulkan --mf4-stack-shot carries the GPU==CPU memcmp.
+// =========================================================================================================
+
+using convex::FxMat3;
+using fpx::fxmul;
+using fpx::fxdiv;
+
+// ----- FxMat3SymInverse(M): the deterministic integer inverse of a SYMMETRIC 3x3 (adjugate/determinant) -----
+// M is the 9-element FxMat3 (Q16.16); for a symmetric tensor only the upper triangle matters but we read all 9.
+// The cofactors + the determinant are computed with fxmul (int64 intermediate) in a FIXED order, then each
+// adjugate entry is fxdiv'd by the determinant (int64, fixed order). A DEGENERATE/zero determinant -> a
+// deterministic ZERO matrix (the caller falls back to the diagonal WorldInvInertia floor — see
+// FxHullInertiaBodyFull). Pure integer, deterministic, identical CPU/GPU.
+inline FxMat3 FxMat3SymInverse(const FxMat3& M) {
+    // Name the entries (row-major). M is symmetric so m01==m10 etc., but we read them generally.
+    const fx a = M.m[0], b = M.m[1], c = M.m[2];
+    const fx d = M.m[3], e = M.m[4], f = M.m[5];
+    const fx g = M.m[6], h = M.m[7], i = M.m[8];
+    // Cofactors (Q16.16; each term is fxmul of two Q16.16 -> Q16.16, the difference is Q16.16).
+    const fx A =  (fxmul(e, i) - fxmul(f, h));   // cofactor 00
+    const fx B = -(fxmul(d, i) - fxmul(f, g));   // cofactor 01
+    const fx C =  (fxmul(d, h) - fxmul(e, g));   // cofactor 02
+    const fx D = -(fxmul(b, i) - fxmul(c, h));   // cofactor 10
+    const fx E =  (fxmul(a, i) - fxmul(c, g));   // cofactor 11
+    const fx F = -(fxmul(a, h) - fxmul(b, g));   // cofactor 12
+    const fx G =  (fxmul(b, f) - fxmul(c, e));   // cofactor 20
+    const fx H = -(fxmul(a, f) - fxmul(c, d));   // cofactor 21
+    const fx I =  (fxmul(a, e) - fxmul(b, d));   // cofactor 22
+    // det = a*A + b*B + c*C (the first-row expansion; A,B,C are the row-0 cofactors).
+    const fx det = fxmul(a, A) + fxmul(b, B) + fxmul(c, C);
+    FxMat3 inv;   // zero-initialized -> the degenerate fallback by default
+    if (det == 0) return inv;
+    // inverse = adjugate / det = transpose(cofactor) / det. (For a symmetric M the inverse is symmetric.)
+    inv.m[0] = fxdiv(A, det); inv.m[1] = fxdiv(D, det); inv.m[2] = fxdiv(G, det);
+    inv.m[3] = fxdiv(B, det); inv.m[4] = fxdiv(E, det); inv.m[5] = fxdiv(H, det);
+    inv.m[6] = fxdiv(C, det); inv.m[7] = fxdiv(F, det); inv.m[8] = fxdiv(I, det);
+    return inv;
+}
+
+// ----- FxHullInertiaBodyFull(hull, faces, invMass): the FULL symmetric body-space INVERSE inertia FxMat3 -----
+// Computes the canonical hull's full inertia tensor I by signed-tetrahedron decomposition: a tetra fan from the
+// hull's LOCAL centroid (the origin for the origin-symmetric canonical hulls) over each BuildCanonicalFaces
+// face, triangulated as a FAN. For each tetra (origin O, a, b, c) the standard covariance integrals accumulate
+// (int64, body-local — the verts are bounded by a few kOne). The diagonal of I is Ixx = ∫(y²+z²)ρ dV etc.; the
+// off-diagonals are -∫xy ρ dV etc. We accumulate the UNIT-DENSITY volume V + the six unit-density second
+// moments, then density = mass/V (mass = 1/invMass), I = density·(moment tensor), then FxMat3SymInverse(I).
+// Static (invMass==0) -> the ZERO FxMat3 (takes no angular impulse). Degenerate (V<=0) -> the diagonal floor
+// (FxMat3Diagonal of gjk::FxHullInvInertiaBody — the deterministic fallback). Pure integer, deterministic.
+inline FxMat3 FxHullInertiaBodyFull(const FxHull& hull, const FxHullFaces& faces, fx invMass) {
+    if (invMass == 0) return FxMat3{};   // static -> zero (no angular response)
+
+    // The diagonal floor (the deterministic fallback for a degenerate/empty face table).
+    auto diagFloor = [&]() -> FxMat3 {
+        const FxVec3 d = gjk::FxHullInvInertiaBody(hull, invMass);
+        return convex::FxMat3Diagonal(d);
+    };
+    if (faces.faceCount == 0) return diagFloor();
+
+    // ----- Accumulate the unit-density volume + the unit-density second moments in int64 (BODY-LOCAL). -----
+    // Each tetra is (O=origin, a, b, c) where a,b,c are LOCAL face-fan verts. det = a·(b×c) = 6·tetraVolume.
+    // The canonical covariance for a tetra apex-at-origin: ∫ x_i x_j dV = (det/120)·S_ij with
+    //   S_ij = 2(a_i a_j + b_i b_j + c_i c_j) + (a_i b_j + a_j b_i) + (a_i c_j + a_j c_i) + (b_i c_j + b_j c_i).
+    // We DEFER the /120 + the density scaling to the very end. All products are Q16.16 (fxmul, int64 inside);
+    // the per-tetra contribution det·S_ij is Q16.16·Q16.16 -> we keep it in a Q16.16 fxmul and int64-SUM.
+    int64_t accVol = 0;                    // Σ det (Q16.16; == 6·volume)
+    int64_t accXX = 0, accYY = 0, accZZ = 0;   // Σ det·S_ii (Q16.16)
+    int64_t accXY = 0, accXZ = 0, accYZ = 0;   // Σ det·S_ij (Q16.16)
+
+    auto addTetra = [&](const FxVec3& a, const FxVec3& b, const FxVec3& c) {
+        // det = a·(b×c) (Q16.16; FxCross + FxDot are int64 inside).
+        const fx det = FxDot(a, FxCross(b, c));
+        accVol += (int64_t)det;
+        // S_ij (Q16.16). Helper: the symmetric covariance sum for axis pair (ai..ci, aj..cj).
+        auto Sij = [&](fx ai, fx bi, fx ci, fx aj, fx bj, fx cj) -> fx {
+            return 2 * (fxmul(ai, aj) + fxmul(bi, bj) + fxmul(ci, cj))
+                 + (fxmul(ai, bj) + fxmul(aj, bi))
+                 + (fxmul(ai, cj) + fxmul(aj, ci))
+                 + (fxmul(bi, cj) + fxmul(bj, ci));
+        };
+        const fx Sxx = Sij(a.x, b.x, c.x, a.x, b.x, c.x);
+        const fx Syy = Sij(a.y, b.y, c.y, a.y, b.y, c.y);
+        const fx Szz = Sij(a.z, b.z, c.z, a.z, b.z, c.z);
+        const fx Sxy = Sij(a.x, b.x, c.x, a.y, b.y, c.y);
+        const fx Sxz = Sij(a.x, b.x, c.x, a.z, b.z, c.z);
+        const fx Syz = Sij(a.y, b.y, c.y, a.z, b.z, c.z);
+        accXX += (int64_t)fxmul(det, Sxx);
+        accYY += (int64_t)fxmul(det, Syy);
+        accZZ += (int64_t)fxmul(det, Szz);
+        accXY += (int64_t)fxmul(det, Sxy);
+        accXZ += (int64_t)fxmul(det, Sxz);
+        accYZ += (int64_t)fxmul(det, Syz);
+    };
+
+    // Fan every polygon face from its first vertex -> the tetra apex at the LOCAL origin (centroid). FIXED order.
+    for (uint32_t f = 0; f < faces.faceCount; ++f) {
+        const uint32_t vc = faces.vertCount[f];
+        if (vc < 3) continue;
+        const FxVec3 v0 = hull.verts[faces.vertIdx[f][0]];
+        for (uint32_t k = 1; k + 1 < vc; ++k) {
+            const FxVec3 v1 = hull.verts[faces.vertIdx[f][k]];
+            const FxVec3 v2 = hull.verts[faces.vertIdx[f][k + 1]];
+            addTetra(v0, v1, v2);
+        }
+    }
+
+    if (accVol <= 0) return diagFloor();   // degenerate winding/volume -> the diagonal floor
+
+    // ----- Normalize: density = mass / volume; mass = 1/invMass; volume = accVol/6 (accVol is 6·V in Q16.16).
+    // The moment integrals are accVol-scaled by det (== 6V) and carry a deferred /120 (the tetra covariance
+    // constant). So ∫ x_i x_j ρ dV  =  density · (accXX_etc / 120). With density = mass / V = mass·6 / accVol
+    // (accVol in Q16.16 -> the /6 cancels into the constant): the unit-density second moment per axis pair is
+    //   moment_ij = accIJ / 120   (a Q16.16 value, deferred).
+    // Then the DENSITY scale: ρ = mass / V, V = accVol / (6·kOne)·kOne ... we do it with explicit fxdiv to stay
+    // deterministic. mass = fxdiv(kOne, invMass). VOL (Q16.16) = accVol / 6. moment_ij = accIJ / 120.
+    const fx mass = fxdiv(kOne, invMass);
+    const fx vol  = (fx)(accVol / 6);                       // Q16.16 volume (accVol == 6V)
+    if (vol == 0) return diagFloor();
+    const fx density = fxdiv(mass, vol);                    // ρ = mass / V (Q16.16)
+
+    // The unit-density second moments (Q16.16): momentIJ = accIJ / 120.
+    auto moment = [&](int64_t acc) -> fx { return (fx)(acc / 120); };
+    const fx mXX = moment(accXX), mYY = moment(accYY), mZZ = moment(accZZ);
+    const fx mXY = moment(accXY), mXZ = moment(accXZ), mYZ = moment(accYZ);
+
+    // The inertia tensor (Q16.16): Ixx = ρ(mYY+mZZ), Iyy = ρ(mXX+mZZ), Izz = ρ(mXX+mYY);
+    // Ixy = -ρ·mXY, Ixz = -ρ·mXZ, Iyz = -ρ·mYZ. (Symmetric.)
+    FxMat3 I;
+    I.m[0] = fxmul(density, mYY + mZZ);
+    I.m[4] = fxmul(density, mXX + mZZ);
+    I.m[8] = fxmul(density, mXX + mYY);
+    I.m[1] = I.m[3] = -fxmul(density, mXY);
+    I.m[2] = I.m[6] = -fxmul(density, mXZ);
+    I.m[5] = I.m[7] = -fxmul(density, mYZ);
+
+    const FxMat3 invI = FxMat3SymInverse(I);
+    // If the inverse degenerated (zero determinant), fall back to the diagonal floor (deterministic).
+    if (invI.m[0] == 0 && invI.m[4] == 0 && invI.m[8] == 0) return diagFloor();
+    return invI;
+}
+
+// ----- WorldInvInertiaFull(body, invIbodyFull): R · invIbodyFull · Rᵀ (the full-tensor world rotation) -------
+// Generalizes convex::WorldInvInertia's diagonal outer-product (convex.h:622) to a FULL symmetric body matrix:
+// R's columns are the body's WORLD face axes (convex::BoxAxes); the world inverse inertia is R·M·Rᵀ. We build
+// R column-major (axis k is column k) and compute R·M then (R·M)·Rᵀ via FxMat3MulVec row dots. Pure integer
+// (the products are fxmul, int64 inside). Static body -> M is the zero matrix -> R·0·Rᵀ = 0 (no angular impulse).
+inline FxMat3 WorldInvInertiaFull(const FxBody& body, const FxMat3& M) {
+    FxVec3 ax[3];
+    convex::BoxAxes(body, ax);   // ax[k] = the world k-th face axis (R's column k)
+    // R (column-major: R[r][k] = ax[k][r]). RM = R·M. Compute RM row by row.
+    // R = [ax0 ax1 ax2] as columns -> R rows: r0=(ax0.x,ax1.x,ax2.x), r1=(ax0.y,ax1.y,ax2.y), r2=(ax0.z,ax1.z,ax2.z).
+    auto Mcol = [&](int c) -> FxVec3 { return FxVec3{M.m[0 + c], M.m[3 + c], M.m[6 + c]}; };
+    // RM[r][c] = Rrow_r · Mcol_c.
+    const FxVec3 Rrow0{ax[0].x, ax[1].x, ax[2].x};
+    const FxVec3 Rrow1{ax[0].y, ax[1].y, ax[2].y};
+    const FxVec3 Rrow2{ax[0].z, ax[1].z, ax[2].z};
+    FxMat3 RM;
+    for (int c = 0; c < 3; ++c) {
+        const FxVec3 mc = Mcol(c);
+        RM.m[0 + c] = FxDot(Rrow0, mc);
+        RM.m[3 + c] = FxDot(Rrow1, mc);
+        RM.m[6 + c] = FxDot(Rrow2, mc);
+    }
+    // Out = RM · Rᵀ. Rᵀ's column c == R's row c == ax[*][c]; so Rᵀcol_c = (ax0[c]? ...) -> Rᵀ[r][c]=R[c][r]=ax[r][c].
+    // Rᵀ column c = (ax[c].x, ax[c].y, ax[c].z) == ax[c] (since Rᵀcol_c = R row c = ax[*] x-of... ) -> ax[c].
+    auto RTcol = [&](int c) -> FxVec3 { return ax[c]; };
+    const FxVec3 RMrow0{RM.m[0], RM.m[1], RM.m[2]};
+    const FxVec3 RMrow1{RM.m[3], RM.m[4], RM.m[5]};
+    const FxVec3 RMrow2{RM.m[6], RM.m[7], RM.m[8]};
+    FxMat3 out;
+    for (int c = 0; c < 3; ++c) {
+        const FxVec3 tc = RTcol(c);
+        out.m[0 + c] = FxDot(RMrow0, tc);
+        out.m[3 + c] = FxDot(RMrow1, tc);
+        out.m[6 + c] = FxDot(RMrow2, tc);
+    }
+    return out;
+}
+
+// ----- StepHullWorldHardened(world, cfg): ONE deterministic HARDENED tick — the gjk::StepHullWorld 5-pass shell
+// (gjk.h:1188) with EXACTLY TWO callee swaps: (step 2 inertia) the diagonal FxHullInvInertiaBody+WorldInvInertia
+// -> the full FxHullInertiaBodyFull+WorldInvInertiaFull; (steps 3+4 contact) gjk::HullContact -> HullContactMulti
+// (MF3). NOTHING else changes: the SAME integrate+damp, the SAME Gauss-Seidel order, the SAME de-pen using
+// m.depths[0]/m.normal. The shader copies THIS body VERBATIM. Pure integer, deterministic, identical CPU/GPU.
+inline void StepHullWorldHardened(HullWorld& world, const convex::ConvexStepConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // (1) predict-integrate dynamic bodies + per-tick damping (== gjk::StepHullWorld step 1, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != kOne) world.bodies[i].vel = convex::FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != kOne) world.bodies[i].angVel = convex::FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // (2 — SWAP) world inverse inertias once/tick — the FULL tensor (FxHullInertiaBodyFull + WorldInvInertiaFull),
+    // replacing the diagonal FxHullInvInertiaBody + convex::WorldInvInertia. Statics -> the zero matrix.
+    std::vector<convex::FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxHullFaces faces = BuildCanonicalFaces(world.hulls[i]);
+        const convex::FxMat3 invIbody = FxHullInertiaBodyFull(world.hulls[i], faces, world.bodies[i].invMass);
+        invIW[i] = WorldInvInertiaFull(world.bodies[i], invIbody);
+    }
+
+    // (3 — SWAP) impulse solve — world Gauss-Seidel over the all-pairs i<j list (FIXED order), ONE
+    // SolveManifoldImpulse sweep per pair, the manifold = HullContactMulti (MF3 multi-point) instead of
+    // gjk::HullContact. (== gjk::StepHullWorld step 3 with the single swap.)
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;
+                const convex::ContactManifold m = HullContactMulti(world.bodies[i], world.hulls[i],
+                                                                   world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                convex::SolveManifoldImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], m,
+                                             cfg.restitution, 1);
+            }
+        }
+    }
+
+    // (4 — SWAP) position de-penetration — cfg.posIters sweeps, FIXED i<j order, the SAME slop+beta linear push
+    // using m.depths[0] (MF2 guarantees points[0]/depths[0] is the DEEPEST) + m.normal, the manifold =
+    // HullContactMulti. (== gjk::StepHullWorld step 4 with the single swap.)
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;
+                const convex::ContactManifold m = HullContactMulti(world.bodies[i], world.hulls[i],
+                                                                   world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                FxVec3 nrm = m.normal;
+                if (FxDot(nrm, FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                const fx excess = m.depths[0] - cfg.slop;
+                if (excess <= 0) continue;
+                const fx corrected = fxmul(excess, cfg.beta);
+                const fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                const fx wj = kOne - wi;
+                const FxVec3 ci = convex::FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = convex::FxScale(nrm, fxmul(corrected, wj));
+                world.bodies[i].pos = FxSub(world.bodies[i].pos, ci);
+                world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+    // (5) orientation was already integrated in step (1).
+}
+
+// ----- StepHullWorldHardenedN(world, cfg, ticks): run `ticks` StepHullWorldHardened steps. ------------------
+inline void StepHullWorldHardenedN(HullWorld& world, const convex::ConvexStepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepHullWorldHardened(world, cfg);
+}
+
 }  // namespace manifold
 }  // namespace hf::sim

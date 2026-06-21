@@ -30375,6 +30375,192 @@ static int RunGjkSettleShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice MF4 — Hull Narrowphase Hardening THE HARDENED HULL WORLD STEP showcase (--mf4-stack) (the
+// new-physics MONEY BEAT / HEADLINE of FLAGSHIP #25, hf::sim::manifold). Like GJ4, the hardened step is int64
+// (the GJK/EPA + the full-inertia covariance + the 3x3 symmetric inverse + the SH clip), so
+// shaders/hull_step_hardened.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this
+// dir's hf_gen_msl list; on Metal the --mf4-stack showcase runs the CPU manifold::StepHullWorldHardenedN — the
+// EXACT bit-exact reference the Vulkan --mf4-stack-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU
+// proof. So this builds the SAME deterministic scene (a tilted box dropped FLAT onto a static box), steps
+// StepHullWorldHardenedN K=300 ticks -> the box SETTLES TO REST, and steps the IDENTICAL scene with the frozen
+// gjk::StepHullWorldN (the teeter control). It asserts the cube cross-check + GPU==CPU + the rest-vs-rock
+// headline + determinism, and CPU-colors the SAME 2D side-view as the Vulkan --mf4-stack-shot -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/mf4_stack.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunMf4StackShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+
+    // The deterministic hardened-step config (== the Vulkan --mf4-stack-shot). angDamp OFF so the teeter is real.
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 24;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.angDamp     = kOne;                            // OFF
+    kCfg.posIters    = 2;
+    const int kTicks = 300;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn, const fpx::FxQuat& q) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = q;
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+    const fpx::FxQuat kTilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};  // ~0.05 rad about Z
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false, kIdentity));   w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 0 static support box
+        w.bodies.push_back(makeBody(0, fd(2.3), 0, true, kTilt));  w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 1 tilted dropped box
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // PROOF (3) the cube cross-check (== the Vulkan side).
+    {
+        const gjk::FxHull cube = gjk::MakeBox(kOne, kOne, kOne);
+        const manifold::FxHullFaces cubeFaces = manifold::BuildCanonicalFaces(cube);
+        const convex::FxMat3 full = manifold::FxHullInertiaBodyFull(cube, cubeFaces, kOne);
+        const convex::FxVec3 diag = gjk::FxHullInvInertiaBody(cube, kOne);
+        const fx fdiag[3] = {full.m[0], full.m[4], full.m[8]};
+        const fx ddiag[3] = {diag.x, diag.y, diag.z};
+        fx maxErr = 0;
+        for (int k = 0; k < 3; ++k) { fx e = fdiag[k] - ddiag[k]; if (e < 0) e = -e; if (e > maxErr) maxErr = e; }
+        const fx tol = kOne / 64;
+        if (maxErr > tol) return fail("mf4-stack: cube cross-check FAILED");
+        std::printf("mf4-stack inertia: cube full == diagonal (maxErr:%d <= tol:%d)\n", (int)maxErr, (int)tol);
+    }
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    gjk::HullWorld world = buildScene();
+    manifold::StepHullWorldHardenedN(world, kCfg, (uint32_t)kTicks);
+    std::printf("mf4-stack: {bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU manifold::StepHullWorldHardenedN, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kBodyCount, kTicks);
+
+    gjk::HullWorld world2 = buildScene();
+    manifold::StepHullWorldHardenedN(world2, kCfg, (uint32_t)kTicks);
+    bool same = true;
+    for (size_t i = 0; i < world.bodies.size() && same; ++i)
+        if (std::memcmp(&world.bodies[i], &world2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("mf4-stack: two runs differ (nondeterministic)");
+    std::printf("mf4-stack determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (2) THE HEADLINE — rest vs rock (== the Vulkan side).
+    gjk::HullWorld frozenW = buildScene();
+    gjk::StepHullWorldN(frozenW, kCfg, (uint32_t)kTicks);
+    auto maxAngVel = [&](const gjk::HullWorld& w) -> fx {
+        fx m = 0;
+        for (const auto& b : w.bodies) if (convex::IsDynamic(b)) { fx a = fpx::FxLength(b.angVel); if (a > m) m = a; }
+        return m;
+    };
+    auto maxSpeed = [&](const gjk::HullWorld& w) -> fx {
+        fx m = 0;
+        for (const auto& b : w.bodies) if (convex::IsDynamic(b)) { fx a = fpx::FxLength(b.vel); if (a > m) m = a; }
+        return m;
+    };
+    const fx kSettleBand = (fx)((int64_t)5 * kOne / 100);   // 0.05
+    const fx hardAng = maxAngVel(world),   hardSpd = maxSpeed(world);
+    const fx frozAng = maxAngVel(frozenW), frozSpd = maxSpeed(frozenW);
+    const bool hardenedSettled = (hardAng < kSettleBand) && (hardSpd < kSettleBand);
+    const bool frozenTeeters   = (frozAng >= kSettleBand);
+    if (!hardenedSettled || !frozenTeeters) return fail("mf4-stack: rest-vs-rock FAILED");
+    std::printf("mf4-stack: {hardenedSettled:true, frozenTeeters:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the settled hardened stack as the Vulkan side. ---
+    const int kPxPerUnit = 64, kMargin = 24;
+    const int kWorldHalfX = 3, kWorldHalfY = 3;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(world.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static support box
+    drawHullXY(world.bodies[1], kInit.hulls[1], Vec3{0.95f, 0.45f, 0.20f});   // settled dropped box
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the HARDENED settled stack (box at rest on box, hardAng=%d frozAng=%d, "
+                "%d ticks)\n", outPath, imgW, imgH, (int)hardAng, (int)frozAng, kTicks);
+    return 0;
+}
+
 // ===== Slice GJ5 — Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK showcase (--gjk-lockstep)
 // (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #22, the CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO
 // new shader, NO new RHI; the GJ5 harness (gjk.h::RunHullLockstep/RunHullRollback) is header-only integer
@@ -54856,6 +55042,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mf3-manifold") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mf3_manifold.png";
             try { return RunMf3ManifoldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mf4-stack <out.png>: render the Hull Narrowphase Hardening THE HARDENED HULL WORLD STEP showcase
+        // (Slice MF4, the new-physics MONEY BEAT / HEADLINE of FLAGSHIP #25). int64 -> hull_step_hardened.comp is
+        // Vulkan-only, so Metal runs the CPU manifold::StepHullWorldHardenedN over the SAME scene (a tilted box
+        // dropped FLAT onto a static box -> SETTLES TO REST, the EXACT bit-exact reference the Vulkan
+        // --mf4-stack-shot GPU==CPU memcmp compares against; byte-identical by construction) + steps the IDENTICAL
+        // scene with the frozen gjk::StepHullWorldN (the teeter control), asserts the cube cross-check + the
+        // rest-vs-rock headline + determinism, and renders the settled stack 2D side-view. The proofs print the
+        // same exact lines as the Vulkan path. New golden tests/golden/metal/mf4_stack.png.
+        if (argc > 1 && std::strcmp(argv[1], "--mf4-stack") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mf4_stack.png";
+            try { return RunMf4StackShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

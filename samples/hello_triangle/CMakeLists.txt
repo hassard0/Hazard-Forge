@@ -1255,6 +1255,21 @@ hf_compile_shaders(
     # order-dependent (the Gauss-Seidel + in-place de-pen). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU final body world + cross-backend, proven memcmp. NO new RHI. THE SETTLING HULL WORLD.
     "shaders/hull_step.comp.hlsl:cs"
+    # Hull Narrowphase Hardening Slice 4 (Slice MF4, THE NEW-PHYSICS MONEY BEAT — the HEADLINE of FLAGSHIP #25):
+    # hull_step_hardened.comp is THE HARDENED HULL WORLD STEP — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE
+    # StepHullWorldHardenedN over the small hull set: K ticks of predict-integrate -> all-pairs narrowphase ->
+    # world Gauss-Seidel impulse -> POSITION de-penetration, copying engine/sim/manifold.h::StepHullWorldHardened
+    # VERBATIM. It IS the gjk::StepHullWorld shell (== hull_step.comp) with EXACTLY TWO swaps and NOTHING else:
+    # (step 2 inertia) the diagonal FxHullInvInertiaBody+WorldInvInertia -> the FULL signed-tetra
+    # FxHullInertiaBodyFull+WorldInvInertiaFull (R·M·Rᵀ); (steps 3+4 contact) the single-point HullContact ->
+    # the MF2/MF3 multi-point HullContactMulti. So a box dropped FLAT (tilted) onto a static box SETTLES TO REST
+    # where the single-point hull_step leaves it TEETERING. The GPU final body world is memcmp'd BIT-EXACT vs the
+    # CPU manifold::StepHullWorldHardenedN. CHUNKED 1 tick/dispatch (TDR-safe — heavier than the single-point
+    # step). Like hull_step.comp/hull_manifold.comp this is int64 (the GJK/EPA + the inertia covariance + the
+    # 3x3 symmetric inverse + the SH clip), so it is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is
+    # NOT MSL-gen'd — the Metal --mf4-stack runs the CPU StepHullWorldHardenedN (byte-identical by construction).
+    # Single-thread because the world step is order-dependent. NO new RHI. THE RESTACKED-STABILITY STEP.
+    "shaders/hull_step_hardened.comp.hlsl:cs"
     # Deterministic Integer Broadphase Slice 3 (Slice BP3, THE SCALING BEAT): broad_convex_step.comp is THE
     # BROADPHASE-DRIVEN BOX WORLD STEP — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE StepConvexWorldBPN over
     # a LARGE body set (a static floor + 256+ dynamic boxes): K ticks of predict-integrate -> per-tick

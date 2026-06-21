@@ -359,6 +359,136 @@ int main() {
         }
     }
 
+    // =================================================================================================
+    // Slice MF4 — FULL INERTIA + THE HARDENED RESTACKED-STABILITY STEP. Pins:
+    //   * (1) THE CUBE CROSS-CHECK: FxMat3SymInverse(FxHullInertiaBodyFull(MakeBox)) == gjk::FxHullInvInertiaBody
+    //     (the full signed-tetra tensor reduces to the AABB diagonal for a cube; off-diagonals zero).
+    //   * (2) FxMat3SymInverse round-trips a known symmetric matrix (M·M⁻¹ ≈ I within tol).
+    //   * (3) THE HEADLINE: a tilted box dropped flat onto a static box SETTLES under StepHullWorldHardenedN
+    //     (maxAngVel below a fixed band) while the SAME scene under the frozen gjk::StepHullWorldN TEETERS.
+    //   * (4) a tumbling tetra's trajectory is two-run byte-equal (deterministic).
+    //   * (5) the hardened step is deterministic (two runs byte-equal).
+    // =================================================================================================
+    {
+        // (1) THE CUBE CROSS-CHECK.
+        const gjk::FxHull cube = gjk::MakeBox(kOne, kOne, kOne);
+        const manifold::FxHullFaces cubeFaces = manifold::BuildCanonicalFaces(cube);
+        const convex::FxMat3 full = manifold::FxHullInertiaBodyFull(cube, cubeFaces, kOne);
+        const convex::FxVec3 diag = gjk::FxHullInvInertiaBody(cube, kOne);
+        const fx fdiag[3] = {full.m[0], full.m[4], full.m[8]};
+        const fx ddiag[3] = {diag.x, diag.y, diag.z};
+        fx maxErr = 0;
+        for (int k = 0; k < 3; ++k) { fx e = fdiag[k] - ddiag[k]; if (e < 0) e = -e; if (e > maxErr) maxErr = e; }
+        fx maxOff = 0;
+        const fx off[3] = {full.m[1], full.m[2], full.m[5]};
+        for (int k = 0; k < 3; ++k) { fx e = off[k]; if (e < 0) e = -e; if (e > maxOff) maxOff = e; }
+        const fx tol = kOne / 64;
+        check(maxErr <= tol, "MF4 cube cross-check: full inertia diagonal == AABB diagonal within tol");
+        check(maxOff <= tol, "MF4 cube cross-check: full inertia off-diagonals ~zero for a cube");
+
+        // A static body -> the zero matrix.
+        const convex::FxMat3 staticI = manifold::FxHullInertiaBodyFull(cube, cubeFaces, 0);
+        bool allZero = true;
+        for (int k = 0; k < 9; ++k) if (staticI.m[k] != 0) allZero = false;
+        check(allZero, "MF4 FxHullInertiaBodyFull: a static body (invMass==0) -> zero matrix");
+
+        // (2) FxMat3SymInverse round-trips a known symmetric matrix (M·M⁻¹ ≈ I).
+        convex::FxMat3 S;
+        S.m[0] = 2 * kOne; S.m[4] = 3 * kOne; S.m[8] = 4 * kOne;
+        S.m[1] = S.m[3] = kOne / 2; S.m[2] = S.m[6] = kOne / 4; S.m[5] = S.m[7] = kOne / 3;
+        const convex::FxMat3 Si = manifold::FxMat3SymInverse(S);
+        // P = S·Si (manual fixed-point matmul).
+        convex::FxMat3 P;
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) {
+                int64_t s = 0;
+                for (int k = 0; k < 3; ++k) s += ((int64_t)S.m[r * 3 + k] * (int64_t)Si.m[k * 3 + c]) >> 16;
+                P.m[r * 3 + c] = (fx)s;
+            }
+        const fx idTol = kOne / 256;   // ~0.004
+        bool roundtrip = true;
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) {
+                const fx want = (r == c) ? kOne : 0;
+                fx e = P.m[r * 3 + c] - want; if (e < 0) e = -e;
+                if (e > idTol) roundtrip = false;
+            }
+        check(roundtrip, "MF4 FxMat3SymInverse: M*Minv ~ identity (round-trip within tol)");
+
+        // The hardened-step config (== the showcases). angDamp OFF so the teeter is real.
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.dt          = kOne / 60;
+        cfg.solveIters  = 24;
+        cfg.restitution = 0;
+        cfg.slop        = kOne / 64;
+        cfg.beta        = (fx)((int64_t)2 * kOne / 10);
+        cfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp     = kOne;
+        cfg.posIters    = 2;
+        const uint32_t K = 300u;
+
+        auto makeDyn = [&](fx x, fx y, fx z, const fpx::FxQuat& q) {
+            fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+            b.vel = {0, 0, 0}; b.angVel = {0, 0, 0}; return b;
+        };
+        auto makeStat = [&](fx x, fx y, fx z) {
+            fpx::FxBody b; b.pos = {x, y, z}; b.orient = {0, 0, 0, kOne}; b.invMass = 0; b.flags = 0u;
+            b.vel = {0, 0, 0}; b.angVel = {0, 0, 0}; return b;
+        };
+        const fpx::FxQuat tilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};
+        auto buildStack = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeStat(0, 0, 0));                      w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            w.bodies.push_back(makeDyn(0, (fx)(2.3 * (double)kOne), 0, tilt)); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            return w;
+        };
+        auto maxAngVel = [&](const gjk::HullWorld& w) -> fx {
+            fx m = 0;
+            for (const auto& b : w.bodies) if (convex::IsDynamic(b)) { fx a = fpx::FxLength(b.angVel); if (a > m) m = a; }
+            return m;
+        };
+        auto maxSpeed = [&](const gjk::HullWorld& w) -> fx {
+            fx m = 0;
+            for (const auto& b : w.bodies) if (convex::IsDynamic(b)) { fx a = fpx::FxLength(b.vel); if (a > m) m = a; }
+            return m;
+        };
+
+        // (3) THE HEADLINE — hardened settles, frozen teeters.
+        gjk::HullWorld hard = buildStack(); manifold::StepHullWorldHardenedN(hard, cfg, K);
+        gjk::HullWorld froz = buildStack(); gjk::StepHullWorldN(froz, cfg, K);
+        const fx band = (fx)((int64_t)5 * kOne / 100);   // 0.05
+        check(maxAngVel(hard) < band && maxSpeed(hard) < band,
+              "MF4 headline: the hardened step SETTLES the tilted box (maxAngVel/maxSpeed below band)");
+        check(maxAngVel(froz) >= band,
+              "MF4 headline: the frozen single-point step TEETERS the SAME scene (maxAngVel above band)");
+
+        // (5) the hardened step is deterministic (two runs byte-equal).
+        gjk::HullWorld a = buildStack(); manifold::StepHullWorldHardenedN(a, cfg, K);
+        gjk::HullWorld b = buildStack(); manifold::StepHullWorldHardenedN(b, cfg, K);
+        bool det = (a.bodies.size() == b.bodies.size());
+        for (size_t i = 0; det && i < a.bodies.size(); ++i)
+            if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(fpx::FxBody)) != 0) det = false;
+        check(det, "MF4 StepHullWorldHardenedN: two runs BYTE-IDENTICAL (deterministic)");
+
+        // (4) a tumbling tetra's trajectory is two-run byte-equal (spin + gravity, deterministic).
+        auto buildTumble = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeStat(0, 0, 0));   w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            fpx::FxBody t = makeDyn(0, (fx)(3.0 * (double)kOne), 0, fpx::FxQuat{0, 0, 0, kOne});
+            t.angVel = {kOne / 2, kOne / 3, 0};   // a tumble
+            w.bodies.push_back(t);                   w.hulls.push_back(gjk::MakeTetra(kOne));
+            return w;
+        };
+        gjk::HullWorld t1 = buildTumble(); manifold::StepHullWorldHardenedN(t1, cfg, 120u);
+        gjk::HullWorld t2 = buildTumble(); manifold::StepHullWorldHardenedN(t2, cfg, 120u);
+        bool tumbleEq = (t1.bodies.size() == t2.bodies.size());
+        for (size_t i = 0; tumbleEq && i < t1.bodies.size(); ++i)
+            if (std::memcmp(&t1.bodies[i], &t2.bodies[i], sizeof(fpx::FxBody)) != 0) tumbleEq = false;
+        check(tumbleEq, "MF4 tumbling tetra: trajectory is two-run BYTE-EQUAL (deterministic)");
+    }
+
     if (g_fail == 0) std::printf("manifold_test: ALL PASS\n");
     else std::printf("manifold_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
