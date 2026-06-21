@@ -806,5 +806,105 @@ inline void StepHullWorldBPN(gjk::HullWorld& world, const BroadStepConfig& bcfg,
     for (uint32_t t = 0; t < ticks; ++t) StepHullWorldBP(world, bcfg);
 }
 
+// =========================================================================================================
+// Slice BP5 — Deterministic Integer Broadphase: LOCKSTEP + ROLLBACK (the netcode beat). APPENDED after
+// StepHullWorldBPN (BP1-BP4's lines above are BYTE-FROZEN). PURE CPU — NO shader, NO RHI. Because
+// StepHullWorldBP (BP4) is a fully deterministic integer tick whose ONLY mutable replayable state is the
+// `bodies` vector (the `hulls` are immutable/shared geometry, and the grid + candidate-pair list are
+// RE-DERIVED each tick from the CURRENT positions — so they are NOT state to snapshot, they are RECOMPUTED,
+// which is exactly why the lockstep holds THROUGH the broadphase), BP5 is the direct GJ5 twin: the SAME
+// command/snapshot/lockstep/rollback shapes gjk::RunHullLockstep/RunHullRollback use, with StepHullWorld ->
+// StepHullWorldBP. Two peers fed only an input-command stream re-derive the entire broadphase-driven hull
+// world byte-identical (re-broadphasing EACH tick to the SAME candidate-pair list), and a rollback re-sims
+// from a snapshot bit-for-bit.
+//
+// REUSE (do NOT redefine): the frozen gjk:: command/snapshot/equality machinery — gjk::ApplyHullCommands,
+// gjk::HullSnapshot / gjk::SnapshotHull / gjk::RestoreHull / gjk::HullBodiesEqual (bodies only, hulls
+// immutable), convex::ConvexCommand. The ONLY new thing is SimBroadTick (= ApplyHullCommands +
+// StepHullWorldBP) and the two harness functions over it. Both backends run THIS identical CPU harness ->
+// the converged-state golden is bit-identical BY CONSTRUCTION (cross-vendor 0 px).
+
+// ----- SimBroadTick(world, cfg, commands, tick): ONE broadphase-driven deterministic tick with its inputs --
+// (1) gjk::ApplyHullCommands(world, commands, tick) — this tick's perturbations, in array order, BEFORE the
+// step so the impulse/spin integrates this tick; (2) StepHullWorldBP(world, cfg) — the BP4 broadphase-driven
+// tick reused VERBATIM (re-broadphases from CURRENT positions). Pure integer, fixed order -> bit-identical on
+// every peer/platform. (The gjk::SimHullTick analog with StepHullWorld -> StepHullWorldBP.)
+inline void SimBroadTick(gjk::HullWorld& world, const BroadStepConfig& bcfg,
+                         const std::vector<hf::sim::convex::ConvexCommand>& commands, uint32_t tick) {
+    gjk::ApplyHullCommands(world, commands, tick);
+    StepHullWorldBP(world, bcfg);
+}
+
+// ----- RunBroadLockstep(world0, cfg, commands, ticks, outIdentical): two peers converge from inputs alone ---
+// THE peer entry point (the gjk::RunHullLockstep control flow over SimBroadTick). Two independent peers
+// (authority + replica) BOTH start from `world0`, BOTH run SimBroadTick for `ticks` with the SAME command
+// stream (INPUTS ONLY — no state shared; each RE-BROADPHASES each tick independently -> the SAME candidate
+// pair list -> byte-identical) -> sets *outIdentical (if non-null) to whether the two final body vectors are
+// byte-identical (the make-or-break lockstep-THROUGH-the-broadphase proof) + returns the converged AUTHORITY
+// world (for the golden). The peer step order is PINNED.
+inline gjk::HullWorld RunBroadLockstep(const gjk::HullWorld& world0, const BroadStepConfig& bcfg,
+                                       const std::vector<hf::sim::convex::ConvexCommand>& commands,
+                                       uint32_t ticks, bool* outIdentical = nullptr) {
+    gjk::HullWorld authority = world0;   // a fresh copy
+    gjk::HullWorld replica   = world0;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimBroadTick(authority, bcfg, commands, t);
+        SimBroadTick(replica,   bcfg, commands, t);
+    }
+    if (outIdentical) *outIdentical = gjk::HullBodiesEqual(authority.bodies, replica.bodies);
+    return authority;
+}
+
+// ----- RunBroadRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) ----------------
+// The rollback harness (the gjk::RunHullRollback control flow over SimBroadTick).
+// (1) advance ticks 0..rollbackAt from `world0` applying authStream; (2) SAVE a gjk::HullSnapshot AT
+// rollbackAt (SnapshotHull — the body world; the grid/pairs are recomputed, NOT stored); (2b) speculatively
+// advance a few ticks (<=3) with the MISPREDICTED stream (a WRONG/extra impulse — the client prediction that
+// diverges), capturing that diverged intermediate; (3) ROLLBACK — RestoreHull to the snapshot + RE-SIMULATE
+// rollbackAt..ticks with the CORRECT authStream -> the corrected final world. Returns the corrected world;
+// sets *outCorrectedEqAuthority (if non-null) to whether it == RunBroadLockstep(world0, cfg, authStream,
+// ticks) byte-for-byte, and *outMispredictDiverged (if non-null) to whether the speculative pre-rollback
+// state DIFFERED from the authority at the same tick (proving a REAL divergence was corrected, not a no-op).
+// cfg + the streams are CONSTANT, NOT snapshotted.
+inline gjk::HullWorld RunBroadRollback(const gjk::HullWorld& world0, const BroadStepConfig& bcfg,
+                                       const std::vector<hf::sim::convex::ConvexCommand>& authStream,
+                                       const std::vector<hf::sim::convex::ConvexCommand>& mispredictStream,
+                                       uint32_t ticks, uint32_t rollbackAt,
+                                       bool* outCorrectedEqAuthority = nullptr,
+                                       bool* outMispredictDiverged = nullptr) {
+    gjk::HullWorld w = world0;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimBroadTick(w, bcfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — just the body world).
+    const gjk::HullSnapshot snap = gjk::SnapshotHull(w, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimBroadTick(w, bcfg, mispredictStream, rollbackAt + s);
+    gjk::HullWorld speculative = w;   // the diverged pre-rollback intermediate (for the "real divergence" proof)
+    // (3) ROLLBACK: restore the snapshot (the body world) + re-sim rollbackAt..ticks with the authStream.
+    gjk::RestoreHull(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimBroadTick(w, bcfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        gjk::HullWorld authAtSpec = world0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimBroadTick(authAtSpec, bcfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !gjk::HullBodiesEqual(speculative.bodies, authAtSpec.bodies);
+        if (outCorrectedEqAuthority) {
+            const gjk::HullWorld authFinal = RunBroadLockstep(world0, bcfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = gjk::HullBodiesEqual(w.bodies, authFinal.bodies);
+        }
+    }
+    return w;
+}
+
 }  // namespace broad
 }  // namespace hf::sim

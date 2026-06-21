@@ -601,6 +601,132 @@ int main() {
         }
     }
 
+    // ===== Slice BP5 — Deterministic Integer Broadphase: LOCKSTEP + ROLLBACK (the netcode beat) =====
+    // PURE CPU. SimBroadTick (= gjk::ApplyHullCommands + StepHullWorldBP) + RunBroadLockstep +
+    // RunBroadRollback over the BP4 mixed-hull settle scene + a fixed command stream (launch-impulses knock
+    // the pile around -> it re-settles, re-broadphasing each tick). What this PINS:
+    //   * RunBroadLockstep: authority == replica BIT-IDENTICAL (two peers, inputs only).
+    //   * RunBroadRollback: corrected == authority BIT-EXACT AND the mispredicted intermediate DIVERGED.
+    //   * two RunBroadLockstep runs byte-identical (determinism).
+    //   * the command stream MOVED the pile non-trivially (re-broadphase exercised, not a frozen no-op).
+    {
+        namespace gjk = hf::sim::gjk;
+        namespace convex = hf::sim::convex;
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+
+        // The deterministic step config (== the BP4 hull config above / the --broad-lockstep showcase).
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        broad::BroadStepConfig bcfg;
+        bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        bcfg.cfg.dt          = kOne / 60;
+        bcfg.cfg.solveIters  = 20;
+        bcfg.cfg.restitution = 0;
+        bcfg.cfg.slop        = kOne / 64;
+        bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        bcfg.cfg.linDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+        bcfg.cfg.angDamp     = (fx)((int64_t)5 * kOne / 100);   // 0.05
+        bcfg.cfg.posIters    = 4;
+        bcfg.cellSize        = kOne * 4;
+        const uint32_t kTicks = 200u;
+        const uint32_t kRollbackAt = 30u;
+
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            b.radius  = 0;
+            return b;
+        };
+        const int kGrid = 7;
+        // THE SCENE (== the --broad-lockstep showcase + the BP4 hull scene): a static FLOOR + a 7x7 grid of
+        // dynamic MIXED hulls (tetra/octa/wedge/box) dropped just above it on a 1.6 spacing (50 bodies).
+        auto buildScene = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));
+            int idx = 0;
+            for (int gz = 0; gz < kGrid; ++gz)
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    const fx x = (fx)((int64_t)(gx - kGrid / 2) * 16 * kOne / 10);
+                    const fx z = (fx)((int64_t)(gz - kGrid / 2) * 16 * kOne / 10);
+                    w.bodies.push_back(makeBody(x, fd(1.7), z, true));
+                    switch (idx & 3) {
+                        case 0: w.hulls.push_back(gjk::MakeTetra(fd(0.6))); break;
+                        case 1: w.hulls.push_back(gjk::MakeOcta(fd(0.55))); break;
+                        case 2: w.hulls.push_back(gjk::MakeWedge(fd(0.55), fd(0.55), fd(0.55))); break;
+                        default: w.hulls.push_back(gjk::MakeBox(fd(0.5), fd(0.5), fd(0.5))); break;
+                    }
+                    ++idx;
+                }
+            return w;
+        };
+        const gjk::HullWorld kInit = buildScene();
+
+        // The scripted authoritative command stream: knock a few dynamic hulls with launch-impulses at fixed
+        // early ticks, then they re-settle (impulse = arg·invMass; statics unaffected). Bodies 1..49 dynamic.
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{4u,  convex::kConvexCmdAddImpulse, 1u,  convex::FxVec3{fi(2), 0, 0}},
+            convex::ConvexCommand{8u,  convex::kConvexCmdSetAngVel,  10u, convex::FxVec3{0, kOne, 0}},
+            convex::ConvexCommand{12u, convex::kConvexCmdAddImpulse, 25u, convex::FxVec3{-fi(2), fi(1), 0}},
+        };
+        // The MISPREDICTED stream: the auth stream + a WRONG strong impulse at rollbackAt.
+        std::vector<convex::ConvexCommand> mispredictStream = authStream;
+        mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 25u,
+                                                         convex::FxVec3{fi(30), 0, 0}});
+
+        // ----- RunBroadLockstep: authority == replica BIT-IDENTICAL (two peers, inputs only) -----
+        bool lockstepIdentical = false;
+        const gjk::HullWorld authority =
+            broad::RunBroadLockstep(kInit, bcfg, authStream, kTicks, &lockstepIdentical);
+        check(lockstepIdentical, "BP5: RunBroadLockstep authority==replica BIT-IDENTICAL (inputs-only)");
+        const gjk::HullWorld replica = broad::RunBroadLockstep(kInit, bcfg, authStream, kTicks);
+        bool authEqReplica = (authority.bodies.size() == replica.bodies.size());
+        for (size_t i = 0; i < authority.bodies.size() && authEqReplica; ++i)
+            if (std::memcmp(&authority.bodies[i], &replica.bodies[i], sizeof(fpx::FxBody)) != 0) authEqReplica = false;
+        check(authEqReplica, "BP5: RunBroadLockstep two peers byte-identical");
+
+        // ----- determinism: two RunBroadLockstep runs byte-identical -----
+        const gjk::HullWorld authority2 = broad::RunBroadLockstep(kInit, bcfg, authStream, kTicks);
+        bool det = (authority.bodies.size() == authority2.bodies.size());
+        for (size_t i = 0; i < authority.bodies.size() && det; ++i)
+            if (std::memcmp(&authority.bodies[i], &authority2.bodies[i], sizeof(fpx::FxBody)) != 0) det = false;
+        check(det, "BP5: RunBroadLockstep is deterministic (two runs byte-identical)");
+
+        // ----- snapshot round-trip is bit-exact -----
+        {
+            gjk::HullWorld w = broad::RunBroadLockstep(kInit, bcfg, authStream, kRollbackAt);
+            const gjk::HullSnapshot snap = gjk::SnapshotHull(w, kRollbackAt);
+            broad::SimBroadTick(w, bcfg, authStream, kRollbackAt);   // mutate
+            gjk::RestoreHull(w, snap);
+            check(gjk::HullBodiesEqual(w.bodies, snap.bodies),
+                  "BP5: SnapshotHull/RestoreHull round-trip is bit-exact");
+        }
+
+        // ----- RunBroadRollback: corrected == authority BIT-EXACT AND the mispredict DIVERGED -----
+        bool rollbackCorrected = false, mispredictDiverged = false;
+        const gjk::HullWorld rolledBack =
+            broad::RunBroadRollback(kInit, bcfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                    &rollbackCorrected, &mispredictDiverged);
+        check(rollbackCorrected, "BP5: RunBroadRollback corrected flag == authority BIT-EXACT");
+        bool rbEqAuth = (rolledBack.bodies.size() == authority.bodies.size());
+        for (size_t i = 0; i < rolledBack.bodies.size() && rbEqAuth; ++i)
+            if (std::memcmp(&rolledBack.bodies[i], &authority.bodies[i], sizeof(fpx::FxBody)) != 0) rbEqAuth = false;
+        check(rbEqAuth, "BP5: RunBroadRollback corrected world == authority byte-identical");
+        check(mispredictDiverged, "BP5: RunBroadRollback mispredict diverged before rollback (real divergence)");
+
+        // ----- the command stream MOVED the pile non-trivially (re-broadphase exercised, not a no-op) -----
+        // Compare the commanded settle vs a NO-command settle on the same scene: at least one body differs.
+        const gjk::HullWorld noCmd = broad::RunBroadLockstep(kInit, bcfg, {}, kTicks);
+        bool moved = false;
+        for (size_t i = 0; i < authority.bodies.size() && !moved; ++i)
+            if (std::memcmp(&authority.bodies[i], &noCmd.bodies[i], sizeof(fpx::FxBody)) != 0) moved = true;
+        check(moved, "BP5: the command stream moved the pile non-trivially (re-broadphase exercised)");
+    }
+
     if (g_fail == 0) std::printf("broad_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

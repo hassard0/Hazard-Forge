@@ -488,6 +488,8 @@ int main() {
             bool sawBroadphaseConvexStepFeature = false;
             // Slice BP4: the deterministic-broadphase-hull-step capability is advertised.
             bool sawBroadphaseHullStepFeature = false;
+            // Slice BP5: the deterministic-broadphase-lockstep capability is advertised.
+            bool sawBroadphaseLockstepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -692,6 +694,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-broadphase-pairs") sawBroadphasePairsFeature = true;
                     if (AsString(el->value) == "deterministic-broadphase-convex-step") sawBroadphaseConvexStepFeature = true;
                     if (AsString(el->value) == "deterministic-broadphase-hull-step") sawBroadphaseHullStepFeature = true;
+                    if (AsString(el->value) == "deterministic-broadphase-lockstep") sawBroadphaseLockstepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -880,6 +883,7 @@ int main() {
             check(sawBroadphasePairsFeature, "engine.features includes deterministic-broadphase-pairs");
             check(sawBroadphaseConvexStepFeature, "engine.features includes deterministic-broadphase-convex-step");
             check(sawBroadphaseHullStepFeature, "engine.features includes deterministic-broadphase-hull-step");
+            check(sawBroadphaseLockstepFeature, "engine.features includes deterministic-broadphase-lockstep");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
@@ -1054,6 +1058,8 @@ int main() {
         bool sawBroadPairShot = false;
         // Slice BP4: the --broad-hull-shot showcase flag is listed in the showcase manifest.
         bool sawBroadHullShot = false;
+        // Slice BP5: the --broad-lockstep-shot showcase flag is listed in the showcase manifest.
+        bool sawBroadLockstepShot = false;
         // Slice GR3: the --grain-contact-shot showcase flag is listed in the showcase manifest.
         bool sawGrainContactShot = false;
         // Slice GR4: the --grain-friction-shot showcase flag is listed in the showcase manifest.
@@ -1353,6 +1359,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--broad-cell-shot") sawBroadCellShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--broad-pair-shot") sawBroadPairShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--broad-hull-shot") sawBroadHullShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--broad-lockstep-shot") sawBroadLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-query-shot") sawCoupleQueryShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-buoyancy-shot") sawCoupleBuoyancyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-displace-shot") sawCoupleDisplaceShot = true;
@@ -1540,6 +1547,7 @@ int main() {
         check(sawBroadCellShot, "showcases manifest includes --broad-cell-shot");
         check(sawBroadPairShot, "showcases manifest includes --broad-pair-shot");
         check(sawBroadHullShot, "showcases manifest includes --broad-hull-shot");
+        check(sawBroadLockstepShot, "showcases manifest includes --broad-lockstep-shot");
         check(sawCoupleQueryShot, "showcases manifest includes --couple-query-shot");
         check(sawCoupleBuoyancyShot, "showcases manifest includes --couple-buoyancy-shot");
         check(sawCoupleDisplaceShot, "showcases manifest includes --couple-displace-shot");
