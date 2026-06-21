@@ -18,6 +18,7 @@
 // Pure C++ (hf_core), ASan-eligible like the other sim tests.
 #include "sim/warmhull.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -535,6 +536,107 @@ int main() {
             warmhull::StepWarmHullWorld(w, cache, cfg);       // one more tick
             check(cache.entries.size() == sizeAfterSettle,
                   "WH3: the cache carries the contact across ticks (size stable for a settled stack)");
+        }
+    }
+
+    // ================= Slice WH4 — SLEEPING ISLANDS -> THE STABLE STACK =================
+    // Pins (the new-physics headline): (1) a GENUINE N>=3 tower goes FULLY asleep under StepWarmSleepHullWorldN
+    // (asleep==dynamicCount, awake maxSpeed EXACTLY 0) and stands; (2) THE FALSIFIABLE DELTA — the IDENTICAL tower
+    // under the frozen manifold::StepHullWorldHardenedN (damping OFF) at the SAME tick budget does NOT stay in the
+    // rest band (assert the inequality — warm holds where frozen topples; do NOT fake it); (3) a wake-impulse wakes
+    // the WHOLE island atomically; (4) KineticEnergyHull monotonically gates sleep (a moving body is awake, a quiet
+    // body sleeps after the hysteresis window); (5) StepWarmSleepHullWorldN is deterministic (two runs byte-equal).
+    {
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+        auto tiltZ = [&](double rad) { double h = rad / 2.0; return fpx::FxQuat{0, 0, fd(std::sin(h)), fd(std::cos(h))}; };
+        const int N = 4;   // the DEMONSTRATED tower height (warm+sleep holds it; the frozen step topples it)
+        auto buildTower = [&]() {
+            gjk::HullWorld w;
+            { FxBody b = BodyAt(0, 0, 0); b.orient = {0,0,0,kOne}; b.invMass = 0; b.flags = 0u; w.bodies.push_back(b); }
+            w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+            for (int k = 0; k < N; ++k) {
+                FxBody b = BodyAt(0, fd(2.0 + 2.0 * k + 0.02 * (k + 1)), 0);
+                b.orient = tiltZ(0.02 * ((k % 2) ? 1.0 : -1.0));
+                b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+                w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            }
+            return w;
+        };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity = convex::FxVec3{0, kGravY, 0};
+        cfg.dt = kOne / 60; cfg.solveIters = 8; cfg.restitution = 0; cfg.slop = kOne / 64;
+        cfg.beta = (fx)((int64_t)2 * kOne / 10); cfg.linDamp = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp = kOne; cfg.posIters = 4;   // angDamp OFF — the headline
+        warmhull::HullSleepConfig scfg;
+        scfg.warm = cfg; scfg.sleepThreshold = kOne; scfg.wakeThreshold = (fx)(2 * (int)kOne); scfg.sleepTicks = 30;
+        const uint32_t K = 800;
+
+        auto towerStanding = [&](const gjk::HullWorld& w) -> bool {
+            const fx band = (fx)(kOne / 2);   // 0.5 rest band
+            auto absfx = [](fx v) { return v < 0 ? (fx)(-v) : v; };
+            for (size_t i = 1; i < w.bodies.size(); ++i) {
+                const fx expY = fd(2.0 + 2.0 * (double)(i - 1));
+                if (absfx(w.bodies[i].pos.x) >= band || absfx(w.bodies[i].pos.z) >= band ||
+                    absfx(w.bodies[i].pos.y - expY) >= band) return false;
+            }
+            return true;
+        };
+
+        // (1) the tower goes FULLY asleep + stands.
+        gjk::HullWorld w = buildTower();
+        warmhull::HullCache cache; std::vector<warmhull::HullSleepState> sleep;
+        warmhull::StepWarmSleepHullWorldN(w, cache, sleep, scfg, K);
+        const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(w, sleep);
+        check(sm.asleepCount == sm.dynamicCount, "WH4: the N-tower goes FULLY asleep (asleep == dynamicCount)");
+        check(sm.maxSpeed == 0, "WH4: the awake-body maxSpeed is EXACTLY 0 (the freeze — zero residual)");
+        check(towerStanding(w), "WH4: the warm+sleep tower STANDS (every body within its rest band)");
+        std::printf("wh4-stack: {tower:%d, asleep:%u, awakeMaxSpeed:%d} fully-asleep\n",
+                    N, sm.asleepCount, (int)sm.maxSpeed);
+
+        // (2) THE FALSIFIABLE DELTA: the IDENTICAL tower under the frozen #25 step at the SAME budget does NOT hold.
+        gjk::HullWorld frozenW = buildTower();
+        manifold::StepHullWorldHardenedN(frozenW, cfg, K);
+        const bool warmSleepHolds = (sm.asleepCount == sm.dynamicCount) && towerStanding(w);
+        const bool frozenTopples  = !towerStanding(frozenW);
+        check(warmSleepHolds, "WH4: warm+sleep HOLDS the N-tower (asleep + standing)");
+        check(frozenTopples, "WH4: the FROZEN #25 step TOPPLES the identical tower at the same budget (the delta)");
+        std::printf("wh4-stack: {warmSleepHolds:true, frozenTopples:true} at N:%d, ticks:%u\n", N, K);
+
+        // (3) a wake-impulse wakes the WHOLE island atomically.
+        gjk::HullWorld wakeW = w;   // the settled+asleep tower
+        warmhull::HullCache wakeCache = cache;
+        std::vector<warmhull::HullSleepState> wakeSleep = sleep;
+        wakeW.bodies[1].vel = convex::FxVec3{(fx)(6 * (int)kOne), 0, 0};   // a strong kick (>> wakeThreshold)
+        warmhull::StepWarmSleepHullWorld(wakeW, wakeCache, wakeSleep, scfg);
+        const warmhull::HullSleepMeasure wm = warmhull::MeasureHullSleep(wakeW, wakeSleep);
+        check(wm.awakeCount == wm.dynamicCount, "WH4: a wake-impulse wakes the WHOLE island atomically");
+        std::printf("wh4-stack wake: island re-energized atomically (awoke:%u)\n", wm.awakeCount);
+
+        // (4) KineticEnergyHull gates sleep: a fast body reads high energy + wakes; the settled tower reads zero.
+        {
+            FxBody fast = BodyAt(0, 0, 0); fast.invMass = kOne; fast.flags = fpx::kFlagDynamic;
+            fast.vel = convex::FxVec3{(fx)(5 * (int)kOne), 0, 0};
+            check(warmhull::KineticEnergyHull(fast) > scfg.wakeThreshold,
+                  "WH4: KineticEnergyHull of a fast body exceeds the wakeThreshold (it wakes)");
+            check(warmhull::KineticEnergyHull(w.bodies[1]) == 0,
+                  "WH4: KineticEnergyHull of a frozen asleep body is EXACTLY 0");
+        }
+
+        // (5) determinism: two runs byte-equal (bodies + sleep states).
+        {
+            gjk::HullWorld a = buildTower(); warmhull::HullCache ca; std::vector<warmhull::HullSleepState> sa;
+            warmhull::StepWarmSleepHullWorldN(a, ca, sa, scfg, K);
+            gjk::HullWorld b = buildTower(); warmhull::HullCache cb; std::vector<warmhull::HullSleepState> sb;
+            warmhull::StepWarmSleepHullWorldN(b, cb, sb, scfg, K);
+            bool eq = (a.bodies.size() == b.bodies.size());
+            for (size_t i = 0; i < a.bodies.size() && eq; ++i)
+                if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(FxBody)) != 0) eq = false;
+            for (size_t i = 0; i < sa.size() && eq; ++i)
+                if (sa[i].asleep != sb[i].asleep || sa[i].lowEnergyTicks != sb[i].lowEnergyTicks ||
+                    sa[i].energy != sb[i].energy) eq = false;
+            check(eq, "WH4: StepWarmSleepHullWorldN two runs BYTE-IDENTICAL (determinism)");
+            std::printf("wh4-stack determinism: two runs BYTE-IDENTICAL\n");
         }
     }
 

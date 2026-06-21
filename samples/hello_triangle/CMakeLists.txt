@@ -1480,6 +1480,24 @@ hf_compile_shaders(
     # gBodies+gCache memcmp-equals the CPU reference. NO new RHI; warmhull.h is APPEND-only; WH1/WH2 + all other
     # shaders + goldens UNCHANGED.
     "shaders/warmhull_warm.comp.hlsl:cs"
+    # Warm-Started Hull Contacts Slice 4 (Slice WH4): warmhull_sleep.comp is SLEEPING ISLANDS -> THE STABLE
+    # STACK (the new-physics HEADLINE of FLAGSHIP #26) — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE
+    # warmhull.h::StepWarmSleepHullWorldN over the small tower: K ticks of (1) per-body KineticEnergyHull + the
+    # hysteresis lowEnergyTicks update -> (2) the all-pairs HullContactMulti adjacency + the island wakefulness
+    # propagation -> (2b) FREEZE every asleep body (zero vel+angVel — exactly zero residual) -> (3) integrate
+    # ONLY awake bodies -> (4) the warm accumulated solve + de-penetration over ACTIVE pairs only -> (5) rebuild
+    # the cache (sleeping pairs keep their prior entries; active pairs store the fresh accumulators), copying
+    # StepWarmSleepHullWorld VERBATIM. It IS warmhull_warm.comp (== StepWarmHullWorld) with the persist.h PS4
+    # sleeping-island logic (per-body sleep state in gSleep, READ+WRITE, carried across the chunked
+    # 1-tick/dispatch boundaries) layered on. THE HEADLINE: a settled island freezes at EXACTLY zero residual
+    # before the within-band residual torque can topple it -> a deterministic STABLE STACK the frozen
+    # StepHullWorldHardenedN topples at the same budget. Chunked 1 tick/dispatch (TDR-safe — HEAVIER than WH3, a
+    # multi-body tower). The whole chain is int64 (GJK/EPA + the SH clip + the full inertia + the accumulated
+    # solve + the FxLength energy sqrt), so this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot)
+    # and is NOT MSL-gen'd — the Metal --wh4-stack runs the CPU StepWarmSleepHullWorldN instead (byte-identical
+    # by construction). The GPU final gBodies + gSleep + gCache memcmp-equals the CPU reference. NO new RHI;
+    # warmhull.h is APPEND-only; WH1/WH2/WH3 + all other shaders + goldens UNCHANGED.
+    "shaders/warmhull_sleep.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

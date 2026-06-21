@@ -31206,6 +31206,204 @@ static int RunWh3WarmShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice WH4 — Warm-Started Hull Contacts SLEEPING ISLANDS -> THE STABLE STACK showcase (--wh4-stack) (the
+// new-physics HEADLINE of FLAGSHIP #26). int64 -> warmhull_sleep.comp is VULKAN-SPIR-V-ONLY (NOT in the
+// metal_headless hf_gen_msl list); on Metal the --wh4-stack showcase runs the CPU warmhull::StepWarmSleepHullWorldN
+// — the EXACT bit-exact reference the Vulkan --wh4-stack-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION. Asserts the SAME stable-stack headline (the
+// N=4 tower goes fully asleep at exactly zero residual + stands) + the falsifiable DELTA (the frozen #25 step
+// topples the identical tower) + the wake (a wake-impulse wakes the whole island) + determinism, and CPU-colors
+// the SAME 2D side-view as the Vulkan --wh4-stack-shot -> the golden is identical both backends by construction.
+// New golden tests/golden/metal/wh4_stack.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunWh4StackShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    namespace warmhull = hf::sim::warmhull;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+
+    // The deterministic warm+sleep config (== the Vulkan --wh4-stack-shot). angDamp OFF.
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 8;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.angDamp     = kOne;                            // OFF
+    kCfg.posIters    = 4;
+    warmhull::HullSleepConfig kSleepCfg;
+    kSleepCfg.warm           = kCfg;
+    kSleepCfg.sleepThreshold = kOne;
+    kSleepCfg.wakeThreshold  = (fx)(2 * (int)kOne);
+    kSleepCfg.sleepTicks     = 30;
+    const int kTicks = 800;
+    const int kTowerN = 4;
+
+    auto tiltZ = [&](double rad) { double h = rad / 2.0; return fpx::FxQuat{0, 0, fd(std::sin(h)), fd(std::cos(h))}; };
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; w.bodies.push_back(b); }
+        w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+        for (int k = 0; k < kTowerN; ++k) {
+            fpx::FxBody b; b.pos = {0, fd(2.0 + 2.0 * k + 0.02 * (k + 1)), 0};
+            b.orient = tiltZ(0.02 * ((k % 2) ? 1.0 : -1.0));
+            b.invMass = kOne; b.flags = fpx::kFlagDynamic; b.vel = {0,0,0}; b.angVel = {0,0,0};
+            w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+        }
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    auto towerStanding = [&](const gjk::HullWorld& w) -> bool {
+        const fx kBand = (fx)(kOne / 2);
+        for (size_t i = 1; i < w.bodies.size(); ++i) {
+            const fx expY = fd(2.0 + 2.0 * (double)(i - 1));
+            const fx dx = w.bodies[i].pos.x; const fx dz = w.bodies[i].pos.z;
+            fx dy = w.bodies[i].pos.y - expY;
+            auto absfx = [](fx v){ return v < 0 ? (fx)(-v) : v; };
+            if (absfx(dx) >= kBand || absfx(dz) >= kBand || absfx(dy) >= kBand) return false;
+        }
+        return true;
+    };
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against.
+    gjk::HullWorld cpuW = buildScene();
+    warmhull::HullCache cpuCache;
+    std::vector<warmhull::HullSleepState> cpuSleep;
+    warmhull::StepWarmSleepHullWorldN(cpuW, cpuCache, cpuSleep, kSleepCfg, (uint32_t)kTicks);
+
+    // PROOF (1) THE STABLE STACK.
+    const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(cpuW, cpuSleep);
+    const bool fullyAsleep  = (sm.asleepCount == sm.dynamicCount);
+    const bool zeroResidual = (sm.maxSpeed == 0);
+    const bool wsStanding   = towerStanding(cpuW);
+    if (!fullyAsleep || !zeroResidual || !wsStanding) return fail("wh4-stack: STABLE STACK FAILED");
+    std::printf("wh4-stack: {tower:%d, asleep:%u, awakeMaxSpeed:%d} fully-asleep\n",
+                kTowerN, sm.asleepCount, (int)sm.maxSpeed);
+
+    // PROOF (2) THE FALSIFIABLE DELTA.
+    gjk::HullWorld frozenW = buildScene();
+    manifold::StepHullWorldHardenedN(frozenW, kCfg, (uint32_t)kTicks);
+    const bool warmSleepHolds = fullyAsleep && wsStanding;
+    const bool frozenTopples  = !towerStanding(frozenW);
+    if (!warmSleepHolds || !frozenTopples) return fail("wh4-stack: DELTA FAILED (warm must hold where frozen topples)");
+    std::printf("wh4-stack: {warmSleepHolds:true, frozenTopples:true} at N:%d, ticks:%d\n", kTowerN, kTicks);
+
+    // PROOF (3) WAKE.
+    gjk::HullWorld wakeW = cpuW;
+    warmhull::HullCache wakeCache = cpuCache;
+    std::vector<warmhull::HullSleepState> wakeSleep = cpuSleep;
+    wakeW.bodies[1].vel = convex::FxVec3{(fx)(6 * (int)kOne), 0, 0};
+    warmhull::StepWarmSleepHullWorld(wakeW, wakeCache, wakeSleep, kSleepCfg);
+    const warmhull::HullSleepMeasure wm = warmhull::MeasureHullSleep(wakeW, wakeSleep);
+    if (wm.awakeCount != wm.dynamicCount) return fail("wh4-stack: WAKE FAILED (island did not wake atomically)");
+    std::printf("wh4-stack wake: island re-energized atomically (awoke:%u)\n", wm.awakeCount);
+
+    std::printf("wh4-stack: GPU==CPU BIT-EXACT {bodies:%u, ticks:%d} "
+                "[Metal: CPU warmhull::StepWarmSleepHullWorldN, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kBodyCount, kTicks);
+
+    // PROOF (4) determinism: two runs byte-equal (bodies + sleep states).
+    gjk::HullWorld cpuW2 = buildScene();
+    warmhull::HullCache cpuCache2;
+    std::vector<warmhull::HullSleepState> cpuSleep2;
+    warmhull::StepWarmSleepHullWorldN(cpuW2, cpuCache2, cpuSleep2, kSleepCfg, (uint32_t)kTicks);
+    bool same = (cpuW.bodies.size() == cpuW2.bodies.size());
+    for (size_t i = 0; i < cpuW.bodies.size() && same; ++i)
+        if (std::memcmp(&cpuW.bodies[i], &cpuW2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    for (size_t i = 0; i < cpuSleep.size() && same; ++i)
+        if (cpuSleep[i].asleep != cpuSleep2[i].asleep || cpuSleep[i].lowEnergyTicks != cpuSleep2[i].lowEnergyTicks ||
+            cpuSleep[i].energy != cpuSleep2[i].energy) same = false;
+    if (!same) return fail("wh4-stack: two runs differ (nondeterministic)");
+    std::printf("wh4-stack determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the settled asleep tower as the Vulkan side. ---
+    const int kPxPerUnit = 32, kMargin = 24;
+    const int kWorldHalfX = 3, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f); dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f); dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cpuW.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static support box
+    for (uint32_t i = 1; i < kBodyCount; ++i) {
+        const Vec3 col = (i < cpuSleep.size() && cpuSleep[i].asleep) ? Vec3{0.40f, 0.62f, 0.82f}
+                                                                     : Vec3{0.88f, 0.62f, 0.28f};
+        drawHullXY(cpuW.bodies[i], kInit.hulls[i], col);
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the SETTLED ASLEEP tower (N=%d, asleep=%u, %d ticks); "
+                "the frozen #25 step topples it\n", outPath, imgW, imgH, kTowerN, sm.asleepCount, kTicks);
+    return 0;
+}
+
 // ===== Slice GJ5 — Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK showcase (--gjk-lockstep)
 // (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #22, the CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO
 // new shader, NO new RHI; the GJ5 harness (gjk.h::RunHullLockstep/RunHullRollback) is header-only integer
@@ -56253,6 +56451,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--wh3-warm") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_wh3_warm.png";
             try { return RunWh3WarmShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wh4-stack <out.png>: render the Warm-Started Hull Contacts SLEEPING ISLANDS -> THE STABLE STACK
+        // showcase (Slice WH4, the new-physics HEADLINE of FLAGSHIP #26). int64 -> warmhull_sleep.comp is
+        // Vulkan-only, so Metal runs the CPU warmhull::StepWarmSleepHullWorldN over the SAME N=4 tower (the EXACT
+        // bit-exact reference the Vulkan --wh4-stack-shot GPU==CPU memcmp compares against; byte-identical by
+        // construction), asserts the stable-stack headline (fully asleep at exactly zero residual + standing) +
+        // the falsifiable DELTA (the frozen #25 step topples the identical tower) + the wake + determinism, and
+        // renders the settled asleep tower 2D side-view. The proofs print the same exact lines as the Vulkan
+        // path. New golden tests/golden/metal/wh4_stack.png.
+        if (argc > 1 && std::strcmp(argv[1], "--wh4-stack") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_wh4_stack.png";
+            try { return RunWh4StackShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mf5-lockstep <out.png>: render the Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (Slice

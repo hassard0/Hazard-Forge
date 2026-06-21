@@ -813,5 +813,301 @@ inline HullStackMeasure WarmHullMeasure(const HullWorld& world) {
     return MeasureHullStack(world);
 }
 
+// =========================================================================================================
+// Slice WH4 — SLEEPING ISLANDS -> THE STABLE STACK (the new-physics beat, THE HEADLINE of FLAGSHIP #26).
+// APPENDED after WarmHullMeasure (WH1/WH2/WH3's lines above + manifold.h/gjk.h/persist.h/convex.h/fric.h/fpx.h
+// BYTE-FROZEN). WH3 built the accumulated warm solver (holds a SINGLE box with angDamp OFF, but the residual
+// torque still integrates over many ticks on a TALL tower). WH4 is the PAYOFF: generalize the persist.h #21
+// sleeping-island recipe (box-only) to the hardened HULL multi-point manifolds so a SETTLED island of hulls
+// FREEZES at EXACTLY zero residual velocity before the within-band residual torque can re-accumulate and topple
+// it. THE HEADLINE is a FALSIFIABLE STABILITY DELTA: at a fixed tick budget the warm+sleep step HOLDS an N-high
+// tower the frozen manifold::StepHullWorldHardenedN (#25, damping OFF) TOPPLES at the same budget. Honest scope:
+// a measured, reproducible, golden-verified stability INEQUALITY + provable rest to a DEMONSTRATED N (a specific
+// tower that goes fully asleep and stays asleep) — NOT unconditional unbounded stability. Bit-identical
+// CPU<->Vulkan<->Metal (the differentiator independent of the exact N).
+//
+// THE int64 REALITY (the WH3/persist PS4 lesson): the whole chain is int64 (GJK/EPA + the SH clip + the warm
+// solve + the FxLength energy sqrt). DXC compiles int64 (Vulkan); glslc cannot. So shaders/warmhull_sleep.comp
+// is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), single-thread over the small tower copying StepWarmSleepHullWorldN
+// VERBATIM (the same fixed orders, the same int64 ops, the same sleep state + island propagation + freeze +
+// skip), chunked 1 tick/dispatch (HEAVIER than WH3 — a multi-body tower -> the Windows ~2s TDR rule). The Metal
+// --wh4-stack runs the CPU StepWarmSleepHullWorldN (byte-identical by construction), while the Vulkan side
+// carries the GPU==CPU memcmp (the GPU final body world AND the per-body sleep states).
+
+// ----- HullSleepState: per-body sleep bookkeeping (a PARALLEL array — fpx::FxBody is byte-frozen, no sleep
+// field). energy = this tick's KineticEnergyHull (the latest measured value); lowEnergyTicks = the number of
+// consecutive ticks the body has been QUIET (energy < sleepThreshold), reset to 0 when energy > wakeThreshold; a
+// body is a sleep CANDIDATE when lowEnergyTicks >= cfg.sleepTicks. asleep = the FINAL per-body asleep flag after
+// island propagation. std430-packable as energy (int32) + lowEnergyTicks (uint32) + asleep (uint32) — the GPU
+// HullSleepState mirror (the persist::SleepState shape).
+struct HullSleepState {
+    fx       energy        = 0;
+    uint32_t lowEnergyTicks = 0;
+    bool     asleep        = false;
+};
+
+// ----- HullSleepConfig: the WH3 ConvexStepConfig knobs + the FIXED integer sleep-hysteresis constants ---------
+// warm = the WH3 warm-step config (gravity/dt/solveIters/restitution/slop/beta/linDamp/angDamp/posIters) —
+// reused VERBATIM for the awake bodies' warm solve. The thresholds are sized ABOVE the warm solver's documented
+// steady-state contact JITTER (the WH3 "accumulated GS residual is within-a-band" reality — a resting tower
+// churns a small per-tick velocity even though it rests POSITIONALLY): "quiet" means "below the resting-jitter
+// band", not literally zero. A body whose motion stays under sleepThreshold for sleepTicks ticks sleeps (and is
+// then FROZEN -> exactly zero residual). A genuinely disturbed body (a wake impulse) far exceeds wakeThreshold
+// and wakes its island. FIXED integer constants -> a deterministic heuristic (the persist.h honesty lineage),
+// bit-identical CPU/GPU.
+struct HullSleepConfig {
+    convex::ConvexStepConfig warm;
+    fx       sleepThreshold = kOne;                          // ~1.0 unit/s — above the resting-jitter band, "quiet"
+    fx       wakeThreshold  = (fx)(2 * (int)kOne);           // ~2.0 unit/s — the wake band top (>= sleepThreshold)
+    uint32_t sleepTicks     = 30;                            // ~0.5 s at 60 Hz of sustained quiet before sleeping
+};
+
+// ----- KineticEnergyHull(b): the deterministic integer motion magnitude (the sleep measure) ------------------
+// FxLength(vel) + FxLength(angVel) — an L2 motion sum in Q16.16 (the persist::KineticEnergy idiom, int64 sqrt).
+// PURE INTEGER, FIXED ops -> deterministic. (A static / non-dynamic body reads its stored zero vel/angVel.)
+inline fx KineticEnergyHull(const fpx::FxBody& b) {
+    return fpx::FxLength(b.vel) + fpx::FxLength(b.angVel);
+}
+
+// ----- UpdateHullQuietTicks(state, energy, cfg): the per-body hysteresis timer update ------------------------
+// Stores energy; then: if energy > wakeThreshold -> WAKE (lowEnergyTicks = 0); else if energy < sleepThreshold
+// -> quiet (lowEnergyTicks++ saturating); else (in the [sleep, wake] BAND) -> HOLD lowEnergyTicks (no increment,
+// no reset) so a body lingering in the band neither flickers awake nor accrues toward sleep. FIXED integer
+// compares -> deterministic. (The persist::UpdateQuietTicks twin.)
+inline void UpdateHullQuietTicks(HullSleepState& s, fx energy, const HullSleepConfig& cfg) {
+    s.energy = energy;
+    if (energy > cfg.wakeThreshold) {
+        s.lowEnergyTicks = 0;
+    } else if (energy < cfg.sleepThreshold) {
+        if (s.lowEnergyTicks != 0xFFFFFFFFu) ++s.lowEnergyTicks;   // saturating increment
+    }
+    // else: in the [sleepThreshold, wakeThreshold] band -> hold lowEnergyTicks (the no-flicker band).
+}
+
+// ----- PropagateWakeHull(world, sleep, sleepTicks): build the contact adjacency + propagate WAKEFULNESS -------
+// THE ISLAND PROPAGATION (fixed-order, union-find-free — the persist::PropagateWake recipe over HULL contacts):
+// a quiet dynamic body must STAY AWAKE if ANY body it contacts is awake (else a tower would half-sleep), so a
+// whole island sleeps or none of it does, and a wake event wakes the ENTIRE island atomically. The contact
+// adjacency is THIS tick's all-pairs manifold::HullContactMulti overlaps (the SAME overlap test the warm solve
+// + de-pen use). A STATIC body is NEVER an island-waker (the floor must not keep the tower awake) and is
+// reported asleep=true. Per-body seed "awake" = (dynamic AND lowEnergyTicks < sleepTicks). Then propagate (a
+// fixed bound of `n` passes — a chain of n bodies needs at most n-1 hops) in FIXED body order: a DYNAMIC body
+// becomes awake if any ADJACENT body is awake; statics never flip. Deterministic (fixed adjacency + fixed pass
+// bound + fixed body order). Writes the per-body asleep flag into sleep[].
+inline void PropagateWakeHull(const HullWorld& world, std::vector<HullSleepState>& sleep, uint32_t sleepTicks) {
+    const size_t n = world.bodies.size();
+    // (1) The contact adjacency from this tick's overlapping pairs (FIXED i<j scan, the HullContactMulti overlap).
+    std::vector<uint8_t> adj(n * n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+            const convex::ContactManifold m = HullContactMulti(world.bodies[i], world.hulls[i],
+                                                               world.bodies[j], world.hulls[j]);
+            if (m.count != 0) { adj[i * n + j] = 1; adj[j * n + i] = 1; }
+        }
+    }
+    // (2) Seed: a DYNAMIC body is awake iff its own lowEnergyTicks < sleepTicks (not yet a sleep candidate). A
+    // static body is inert (never awake -> never an island-waker -> the floor doesn't keep the tower awake).
+    std::vector<uint8_t> awake(n, 0);
+    for (size_t i = 0; i < n; ++i)
+        if (IsDynamic(world.bodies[i]) && sleep[i].lowEnergyTicks < sleepTicks) awake[i] = 1;
+    // (3) Propagate wakefulness to a fixed point — a fixed bound of `n` passes in FIXED body order; a DYNAMIC
+    // body becomes awake if any adjacent body is awake. (Statics never flip.) Stop early if a pass changes
+    // nothing (deterministic either way; the bound guarantees full propagation through a chain).
+    for (size_t pass = 0; pass < n; ++pass) {
+        bool changed = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (!IsDynamic(world.bodies[i]) || awake[i]) continue;
+            for (size_t j = 0; j < n; ++j) {
+                if (adj[i * n + j] && awake[j]) { awake[i] = 1; changed = true; break; }
+            }
+        }
+        if (!changed) break;
+    }
+    // (4) The final per-body asleep flag: a dynamic body sleeps iff NOT awake; a static body is always inert.
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) sleep[i].asleep = (awake[i] == 0);
+        else                            sleep[i].asleep = true;   // static -> inert (never moves)
+    }
+}
+
+// ----- StepWarmSleepHullWorld(world, cache, sleep, cfg): ONE deterministic WARM-started tick WITH sleeping ----
+// The WH3 StepWarmHullWorld tick, extended with sleeping (the persist::StepWarmSleepWorld 5-step recipe over the
+// HULL warm solve). ALL orders PINNED. The shader copies THIS body VERBATIM (the GPU final body world + sleep
+// states == CPU make-or-break):
+//   (0) sleep[] is sized to the body count (each entry persists across ticks, passed in/out).
+//   (1) Compute each body's KineticEnergyHull from the PRE-integrate state + update its lowEnergyTicks (hyst).
+//   (2) Build the contact adjacency (all-pairs HullContactMulti overlap) + PropagateWakeHull -> the asleep flag.
+//   (2b) FREEZE every asleep dynamic body: zero its vel + angVel (EXACTLY zero residual — persist.h:720-729).
+//   (3) Predict-integrate ONLY AWAKE dynamic bodies (asleep bodies stay EXACTLY put -> zero drift).
+//   (4) The warm impulse solve + the position de-penetration run ONLY over pairs with at least one AWAKE
+//       dynamic body (a fully-asleep pair is skipped — its cached impulses persist untouched).
+//   (5) Rebuild the cache: the SLEEPING pairs keep their prior cache entries (so a sleeping island's warm-start
+//       survives intact for the moment it wakes); the ACTIVE pairs store their freshly-converged accumulators.
+// The cache + sleep state are the per-tick mutable replayable state (carried in/out). Pure integer, FIXED order
+// -> identical CPU/GPU.
+inline void StepWarmSleepHullWorld(HullWorld& world, HullCache& cache,
+                                   std::vector<HullSleepState>& sleep, const HullSleepConfig& cfg) {
+    const size_t n = world.bodies.size();
+    if (sleep.size() != n) sleep.assign(n, HullSleepState{});
+    const convex::ConvexStepConfig& w = cfg.warm;
+
+    // (1) Per-body KineticEnergyHull (PRE-integrate) + the hysteresis lowEnergyTicks update.
+    for (size_t i = 0; i < n; ++i)
+        UpdateHullQuietTicks(sleep[i], KineticEnergyHull(world.bodies[i]), cfg);
+
+    // (2) The contact adjacency + island wakefulness propagation -> the per-body asleep flag.
+    PropagateWakeHull(world, sleep, cfg.sleepTicks);
+
+    // (2b) FREEZE every asleep dynamic body: zero its vel + angVel so it carries EXACTLY zero residual motion
+    // (persist.h:720-729 idiom). Asleep bodies are then skipped by integrate (step 3) so position is frozen too.
+    // Statics are already zero-velocity. FIXED order, pure copy -> deterministic.
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i]) && sleep[i].asleep) {
+            world.bodies[i].vel    = FxVec3{0, 0, 0};
+            world.bodies[i].angVel = FxVec3{0, 0, 0};
+        }
+    }
+
+    // (3) Predict-integrate ONLY AWAKE dynamic bodies (== WH3 step 1, gated by !asleep). Asleep bodies keep
+    // their EXACT pos/vel(=0)/orient/angVel(=0) (zero drift — the deterministic-rest headline).
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i]) && !sleep[i].asleep) {
+            fpx::IntegrateBodyFull(world.bodies[i], w.gravity, w.dt);
+            if (w.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, w.linDamp);
+            if (w.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, w.angDamp);
+        }
+    }
+
+    // (= WH3 step 2) The world inverse inertias once/tick — the FULL tensor (every body, statics -> zero matrix).
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxHullFaces faces = BuildCanonicalFaces(world.hulls[i]);
+        const FxMat3 invIbody = FxHullInertiaBodyFull(world.hulls[i], faces, world.bodies[i].invMass);
+        invIW[i] = WorldInvInertiaFull(world.bodies[i], invIbody);
+    }
+
+    // A pair is ACTIVE iff at least one of its bodies is an AWAKE dynamic body (a fully-asleep / static-only pair
+    // is skipped — its cached impulses persist). FIXED i<j order.
+    auto pairActive = [&](size_t i, size_t j) {
+        const bool ai = IsDynamic(world.bodies[i]) && !sleep[i].asleep;
+        const bool aj = IsDynamic(world.bodies[j]) && !sleep[j].asleep;
+        return ai || aj;
+    };
+
+    struct WarmPair { size_t i, j; KeyedHullManifoldWH2 keyed; };
+    std::vector<WarmPair> wp;
+
+    // (4a = WH3 step 3) the WARM-started accumulated solve over the active pairs only (FIXED i<j, in place).
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+            if (!pairActive(i, j)) continue;                                             // fully-asleep -> skip
+            KeyedHullManifoldWH2 keyed = BuildKeyedHullManifold(
+                (uint32_t)i, world.bodies[i], world.hulls[i],
+                (uint32_t)j, world.bodies[j], world.hulls[j]);
+            if (keyed.manifold.count == 0) continue;
+            MatchHullCache(cache, keyed);   // seed the accumulators from last tick (the warm-start)
+            SolveHullManifoldWarm(world.bodies[i], world.bodies[j], invIW[i], invIW[j],
+                                  keyed, w.restitution, w.solveIters);
+            wp.push_back(WarmPair{i, j, keyed});
+        }
+    }
+
+    // (4b = WH3 step 4) position de-penetration — over the active pairs only, posIters sweeps, FIXED i<j. An
+    // ASLEEP body must NOT be pushed (zero drift): split by invMass but ZERO the share of an asleep/static body
+    // so only the awake partner separates.
+    for (uint32_t pit = 0; pit < w.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;          // both static -> skip
+                if (!pairActive(i, j)) continue;    // fully-asleep -> skip (both stay exactly put)
+                const convex::ContactManifold m = HullContactMulti(world.bodies[i], world.hulls[i],
+                                                                   world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                FxVec3 nrm = m.normal;
+                if (FxDot(nrm, FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                const fx excess = m.depths[0] - w.slop;
+                if (excess <= 0) continue;
+                const fx corrected = fxmul(excess, w.beta);
+                const bool moveI = IsDynamic(world.bodies[i]) && !sleep[i].asleep;
+                const bool moveJ = IsDynamic(world.bodies[j]) && !sleep[j].asleep;
+                fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                fx wj = kOne - wi;
+                if (!moveI && moveJ)      { wi = 0;    wj = kOne; }
+                else if (moveI && !moveJ) { wi = kOne; wj = 0; }
+                else if (!moveI && !moveJ) continue;   // neither moves (both asleep/static) -> skip
+                const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+                if (moveI) world.bodies[i].pos = FxSub(world.bodies[i].pos, ci);
+                if (moveJ) world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+
+    // (5) Rebuild the cache: the SLEEPING (inactive) pairs keep their prior cache entries (so a sleeping island's
+    // warm-start survives), the ACTIVE pairs store their freshly-converged accumulators. Build the new cache as:
+    // first carry over every cache entry whose pair was NOT active this tick (its key persists untouched), then
+    // append the active pairs' converged accumulators. FIXED order -> deterministic.
+    HullCache next;
+    // (5a) Carry over the entries of pairs that were NOT solved this tick (sleeping / inactive). An entry's pair
+    // is (key.bodyA, key.bodyB); it was active iff pairActive(bodyA, bodyB) (those are re-stored in 5b).
+    for (const CachedHullContact& e : cache.entries) {
+        const size_t a = e.key.bodyA, b = e.key.bodyB;
+        const bool wasActive = (a < n && b < n) && pairActive(a, b);
+        if (!wasActive) next.entries.push_back(e);   // persist the sleeping pair's warm-start untouched
+    }
+    // (5b) Append the active pairs' converged accumulators (UpdateHullCache-style, FIXED i<j / point order).
+    for (const WarmPair& pa : wp) {
+        const uint32_t c = pa.keyed.manifold.count < 4u ? pa.keyed.manifold.count : 4u;
+        for (uint32_t pi = 0; pi < c; ++pi)
+            next.entries.push_back(CachedHullContact{pa.keyed.keys[pi], pa.keyed.normalImpulse[pi]});
+    }
+    cache.entries.swap(next.entries);
+}
+
+// ----- StepWarmSleepHullWorldN(world, cache, sleep, cfg, ticks): run `ticks` sleeping warm steps. ------------
+// The cache + sleep state carry across ticks (the warm-start that converges the island + the hysteresis that
+// sleeps it). The settled island freezes at exactly zero residual -> the stable stack.
+inline void StepWarmSleepHullWorldN(HullWorld& world, HullCache& cache,
+                                    std::vector<HullSleepState>& sleep, const HullSleepConfig& cfg,
+                                    uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepWarmSleepHullWorld(world, cache, sleep, cfg);
+}
+
+// ----- HullSleepMeasure: the deterministic sleep summary -----------------------------------------------------
+// asleepCount  = the number of DYNAMIC bodies asleep; awakeCount = the number of dynamic bodies awake; maxSpeed
+// = the max KineticEnergyHull over the AWAKE dynamic bodies (an all-asleep world reports 0 — the zero-residual
+// headline; asleep bodies don't move, so the awake max is the true residual); dynamicCount = the number of
+// dynamic bodies. Pure integer, FIXED scan order -> deterministic. (The persist::SleepMeasure twin.)
+struct HullSleepMeasure {
+    uint32_t asleepCount  = 0;
+    uint32_t awakeCount   = 0;
+    fx       maxSpeed     = 0;
+    uint32_t dynamicCount = 0;
+};
+
+// MeasureHullSleep(world, sleep): scan the dynamic bodies; count asleep/awake + the max awake KineticEnergyHull.
+// Read-only. Deterministic.
+inline HullSleepMeasure MeasureHullSleep(const HullWorld& world, const std::vector<HullSleepState>& sleep) {
+    HullSleepMeasure m;
+    const size_t n = world.bodies.size();
+    for (size_t i = 0; i < n; ++i) {
+        if (!IsDynamic(world.bodies[i])) continue;
+        ++m.dynamicCount;
+        const bool asleep = (i < sleep.size()) ? sleep[i].asleep : false;
+        if (asleep) {
+            ++m.asleepCount;
+        } else {
+            ++m.awakeCount;
+            const fx ke = KineticEnergyHull(world.bodies[i]);
+            if (ke > m.maxSpeed) m.maxSpeed = ke;
+        }
+    }
+    return m;
+}
+
 }  // namespace warmhull
 }  // namespace hf::sim
