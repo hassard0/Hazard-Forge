@@ -32185,6 +32185,264 @@ static int RunVd3WorldShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VD4 — Deterministic Gameplay / Netcode THE HETEROGENEOUS SNAPSHOT/RESTORE + EQUALITY showcase
+// (--vd4-snap) (the 4th slice of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
+// new RHI; the verdict.h SnapshotWorld/RestoreWorld/VerdictStatesEqual are header-only integer logic, so on
+// Metal it runs the IDENTICAL pure-CPU completeness scenario the Vulkan --vd4-snap-shot runs on Windows -> the
+// restored world golden is bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Builds the
+// SAME composed gameplay+physics world, advances N, SnapshotWorld (the heterogeneous TRIPLE-plus), advances M
+// (diverging), RestoreWorld, re-advances M, asserts the restored world == a never-diverged reference (the
+// COMPLETENESS crux) + the sim-third-necessity proof, and renders the RESTORED world. Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/vd4_snap.png (baked on the Mac by the controller); two runs
+// DIFF 0.0000. The sim third uses warmhull::Snapshot/Restore/StatesEqual VERBATIM.
+static int RunVd4SnapShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace verdict  = hf::game::verdict;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace warmhull = hf::sim::warmhull;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+    auto V  = [&](int x, int y, int z) { return convex::FxVec3{fi(x), fi(y), fi(z)}; };
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+
+    // The deterministic warm+sleep config (== the Vulkan --vd4-snap-shot; the WH4 lineage, angDamp OFF).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kStepCfg;
+    kStepCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kStepCfg.dt          = kOne / 60;
+    kStepCfg.solveIters  = 8;
+    kStepCfg.restitution = 0;
+    kStepCfg.slop        = kOne / 64;
+    kStepCfg.beta        = (fx)((int64_t)2 * kOne / 10);
+    kStepCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
+    kStepCfg.angDamp     = kOne;
+    kStepCfg.posIters    = 4;
+    warmhull::HullSleepConfig kCfg;
+    kCfg.warm           = kStepCfg;
+    kCfg.sleepThreshold = kOne;
+    kCfg.wakeThreshold  = (fx)(2 * (int)kOne);
+    kCfg.sleepTicks     = 30;
+
+    const verdict::HazardRegion kHazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y}; // empty
+    const fx kCollectR = kOne;
+    const uint32_t kN = 8u;
+    const uint32_t kM = 12u;
+    const int kStackN = 2;
+
+    auto buildSimScene = [&]() {
+        gjk::HullWorld sim;
+        { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+        sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support
+        { fpx::FxBody b; b.pos={0, fi(3), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+        sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 1 dynamic PLAYER body
+        for (int k = 0; k < kStackN; ++k) {
+            fpx::FxBody b; b.pos={0, fi(5 + 2 * k), 0}; b.orient={0,0,0,kOne};
+            b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0};
+            sim.bodies.push_back(b);
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+        }
+        return sim;
+    };
+    const std::vector<verdict::Command> kStream = {
+        verdict::Command{0u, verdict::kCmdImpulse, 2u /*player entity id*/, V(1,0,0)},
+    };
+    auto buildWorld = [&](verdict::VerdictWorld& w, verdict::EntityId& outPlayer) {
+        w = verdict::VerdictWorld{};
+        w.sim = buildSimScene();
+        const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), kIdentity});
+        verdict::BindBody(w, support, 0u);
+        const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), kIdentity},
+                                                              verdict::Health{77}, verdict::BodyRef{verdict::kNoBody});
+        w.reg.add<verdict::Score>(w.handle.at(player), verdict::Score{0});
+        verdict::BindBody(w, player, 1u);
+        const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(pk0), verdict::Pickup{5});
+        const verdict::EntityId pk1 = verdict::SpawnEntity(w, verdict::Transform2D{V(5,5,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(pk1), verdict::Pickup{3});
+        const verdict::EntityId mover = verdict::SpawnMover(w, verdict::Transform2D{V(4,4,0), kIdentity},
+                                                            verdict::Health{10}, verdict::Velocity2D{V(0,0,0)});
+        for (int k = 0; k < kStackN; ++k) {
+            const verdict::EntityId se = verdict::SpawnEntity(w, verdict::Transform2D{V(0, 5 + 2 * k, 0), kIdentity});
+            verdict::BindBody(w, se, (uint32_t)(2 + k));
+        }
+        (void)support; (void)pk0; (void)pk1; (void)mover;
+        outPlayer = player;
+    };
+
+    // PROOF (1) snapshot->restore round-trip BIT-EXACT.
+    {
+        verdict::VerdictWorld w; verdict::EntityId player; buildWorld(w, player);
+        verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kN);
+        const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(w);
+        verdict::VerdictWorld r; verdict::RestoreWorld(r, snap);
+        if (!verdict::VerdictStatesEqual(w, r))
+            return fail("vd4-snap: snapshot->restore round-trip NOT bit-exact");
+        std::printf("vd4-snap: snapshot->restore round-trip BIT-EXACT\n");
+    }
+
+    // PROOF (2) THE COMPLETENESS CRUX: advance N -> snapshot -> advance M (diverge) -> restore ->
+    // re-advance M == a reference that advanced N+M straight (nothing escapes the snapshot).
+    verdict::VerdictWorld restored; verdict::EntityId restoredPlayer;
+    {
+        verdict::VerdictWorld ref; verdict::EntityId refPlayer; buildWorld(ref, refPlayer);
+        verdict::StepWorldN(ref, kStream, 0u, kHazard, refPlayer, kCollectR, kCfg, kN + kM);
+
+        buildWorld(restored, restoredPlayer);
+        verdict::StepWorldN(restored, kStream, 0u, kHazard, restoredPlayer, kCollectR, kCfg, kN);
+        const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(restored);
+        // A kCmdImpulse on the player's BOUND body perturbs the sim TRIPLE (a kCmdMove on the body-bound
+        // Transform2D would be clobbered by SyncBodiesToComponents each tick).
+        const std::vector<verdict::Command> kBad = {
+            verdict::Command{kN, verdict::kCmdImpulse, restoredPlayer, V(-3,0,0)},
+        };
+        verdict::StepWorldN(restored, kBad, kN, kHazard, restoredPlayer, kCollectR, kCfg, kM);
+        const bool diverged = !verdict::VerdictStatesEqual(restored, ref);
+        verdict::RestoreWorld(restored, snap);
+        verdict::StepWorldN(restored, kStream, kN, kHazard, restoredPlayer, kCollectR, kCfg, kM);
+        const bool complete = verdict::VerdictStatesEqual(restored, ref);
+        if (!diverged || !complete)
+            return fail("vd4-snap: completeness FAILED — some mutable state escaped the snapshot");
+        std::printf("vd4-snap: completeness {advance:%u, restore@:%u, readvance:%u} == reference BIT-EXACT\n",
+                    kN + kM, kN, kM);
+    }
+
+    // PROOF (3) the necessity of the sim third: an OMITTING restore diverges; including it matches.
+    {
+        verdict::VerdictWorld ref; verdict::EntityId refPlayer; buildWorld(ref, refPlayer);
+        verdict::StepWorldN(ref, kStream, 0u, kHazard, refPlayer, kCollectR, kCfg, kN + kM);
+
+        verdict::VerdictWorld w; verdict::EntityId player; buildWorld(w, player);
+        verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kN);
+        const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(w);
+        const std::vector<verdict::Command> kBad = {
+            verdict::Command{kN, verdict::kCmdImpulse, player, V(-3,0,0)},
+        };
+        verdict::StepWorldN(w, kBad, kN, kHazard, player, kCollectR, kCfg, kM);
+        // OMITTING restore: entities/components from snap, but sim = the diverged TRIPLE -> diverges.
+        verdict::VerdictSnapshot noSim = snap;
+        noSim.simSnap = warmhull::SnapshotWarmHull(w.sim, w.cache, w.sleep, w.tick);
+        verdict::RestoreWorld(w, noSim);
+        verdict::StepWorldN(w, kStream, kN, kHazard, player, kCollectR, kCfg, kM);
+        const bool omitDiverges = !verdict::VerdictStatesEqual(w, ref);
+        verdict::RestoreWorld(w, snap);
+        verdict::StepWorldN(w, kStream, kN, kHazard, player, kCollectR, kCfg, kM);
+        const bool includeMatches = verdict::VerdictStatesEqual(w, ref);
+        if (!omitDiverges || !includeMatches)
+            return fail("vd4-snap: sim-third necessity FAILED");
+        std::printf("vd4-snap: sim-third necessary (omit -> diverge, include -> ==)\n");
+    }
+
+    // --- Golden: render the RESTORED world (the SAME PURE-INTEGER 2D side-view (XY) as --vd3-world). ---
+    verdict::VerdictWorld& world = restored;
+    const verdict::EntityId player = restoredPlayer;
+    const int32_t score = world.reg.get<verdict::Score>(world.handle.at(player)).points;
+    const uint32_t kBodies = (uint32_t)world.sim.bodies.size();
+    const int kPxPerUnit = 40, kMargin = 24;
+    const int kWorldHalfX = 5, kWorldHalfY = 7;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f); dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f); dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    for (uint32_t i = 0; i < kBodies; ++i) {
+        const bool dyn = convex::IsDynamic(world.sim.bodies[i]);
+        const Vec3 col = (i == 1) ? Vec3{0.90f, 0.55f, 0.20f}
+                       : dyn      ? Vec3{0.40f, 0.62f, 0.82f}
+                                  : Vec3{0.30f, 0.40f, 0.55f};
+        drawHullXY(world.sim.bodies[i], world.sim.hulls[i], col);
+    }
+    auto idTint = [&](verdict::EntityId id) {
+        const uint32_t hh = id * 2654435761u;
+        return Vec3{0.30f + ((hh >> 16) & 0xFF) / 360.0f, 0.30f + ((hh >> 8) & 0xFF) / 360.0f,
+                    0.30f + (hh & 0xFF) / 360.0f};
+    };
+    uint32_t drawn = 0;
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const verdict::EntityId id = world.order[i];
+        if (!verdict::IsLive(world, id)) continue;
+        const hf::ecs::Entity e = world.handle.at(id);
+        if (!world.reg.has<verdict::Transform2D>(e)) continue;
+        const verdict::Transform2D& xf = world.reg.get<verdict::Transform2D>(e);
+        int cx, cy; worldToPx(xf.pos.x, xf.pos.y, cx, cy);
+        const int kHalf = (id == player) ? 7 : 4;
+        const Vec3 col = idTint(id);
+        for (int dy = -kHalf; dy <= kHalf; ++dy)
+            for (int dx = -kHalf; dx <= kHalf; ++dx)
+                putPx(cx + dx, cy + dy, col);
+        ++drawn;
+    }
+    for (int s = 0; s < score; ++s) {
+        const int bx = kMargin + s * 10;
+        for (int dy = 0; dy < 8; ++dy) for (int dx = 0; dx < 8; ++dx) putPx(bx + dx, 10 + dy, Vec3{0.9f, 0.85f, 0.2f});
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vd4 restored gameplay+physics world (%u bodies, %u live entities, score %d)\n",
+                outPath, imgW, imgH, kBodies, drawn, score);
+    return 0;
+}
+
 // ===== Slice MF5 — Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (--mf5-lockstep) (the NETCODE
 // HEADLINE of FLAGSHIP #25, the GJ5/BP5/CD5 twin). PURE CPU — NO GPU compute, NO new shader, NO new RHI; the
 // MF5 harness (manifold.h::RunHullLockstepHardened/RunHullRollbackHardened) is header-only integer math, so on
@@ -57621,6 +57879,17 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vd3-world") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vd3_world.png";
             try { return RunVd3WorldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vd4-snap <out.png>: render the Deterministic Gameplay / Netcode THE HETEROGENEOUS SNAPSHOT/RESTORE
+        // + EQUALITY showcase (Slice VD4, the 4th slice of FLAGSHIP #27). PURE CPU — runs the IDENTICAL
+        // verdict.h SnapshotWorld/RestoreWorld completeness scenario (advance N -> snapshot -> advance M
+        // (diverge) -> restore -> re-advance M == reference) the Vulkan --vd4-snap-shot runs -> the restored
+        // world is bit-identical cross-backend BY CONSTRUCTION; the 3 proof lines (incl. the completeness crux)
+        // match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--vd4-snap") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vd4_snap.png";
+            try { return RunVd4SnapShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mf5-lockstep <out.png>: render the Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (Slice

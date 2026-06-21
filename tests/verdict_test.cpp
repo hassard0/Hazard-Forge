@@ -521,6 +521,184 @@ int main() {
         }
     }
 
+    // =============================================================================================
+    // Slice VD4 — THE HETEROGENEOUS SNAPSHOT/RESTORE + EQUALITY. Pure CPU integer. SnapshotWorld
+    // captures the ENTIRE heterogeneous world (entities + EVERY component pool in order[] sequence +
+    // the embedded sim TRIPLE bodies/cache/sleep); RestoreWorld REBUILDS it (handle churn irrelevant);
+    // VerdictStatesEqual compares the whole thing order[]-keyed. THE CRUX: completeness — advance ->
+    // snapshot -> advance (diverge) -> restore -> re-advance is byte-identical to a never-diverged
+    // reference (nothing escapes the snapshot), and a restore that OMITS the sim TRIPLE DIVERGES.
+    // =============================================================================================
+    {
+        // The same deterministic warm+sleep config + composed scene as VD3 (re-declared — the VD3
+        // block's locals are out of scope here).
+        auto makeCfg = []() {
+            const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            convex::ConvexStepConfig c;
+            c.gravity = FxVec3{0, kGravY, 0};
+            c.dt = kOne / 60; c.solveIters = 8; c.restitution = 0; c.slop = kOne / 64;
+            c.beta = (fx)((int64_t)2 * kOne / 10); c.linDamp = (fx)((int64_t)95 * kOne / 100);
+            c.angDamp = kOne; c.posIters = 4;
+            warmhull::HullSleepConfig sc;
+            sc.warm = c; sc.sleepThreshold = kOne; sc.wakeThreshold = (fx)(2 * (int)kOne); sc.sleepTicks = 30;
+            return sc;
+        };
+        const warmhull::HullSleepConfig kCfg = makeCfg();
+        const verdict::HazardRegion kHazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y}; // empty
+        const fx kCollectR = kOne;
+
+        auto buildSimScene = []() {
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));            // 0 static support
+            { fpx::FxBody b; b.pos={0, (fx)((int64_t)3*kOne), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));            // 1 dynamic player body
+            return sim;
+        };
+        // A command stream that nudges the player body (a sim verb) — exercises the sim TRIPLE evolution.
+        const std::vector<verdict::Command> kStream = {
+            verdict::Command{0u, verdict::kCmdImpulse, 2u /*player entity id*/, V(1,0,0)},
+        };
+        // Build the gameplay+physics world: a static-support entity (body 0), a player (body 1, Score),
+        // a couple of pickups (one near the player so a collect fires + despawns it), and a mover with a
+        // Velocity2D (so EVERY component type — Transform2D/Health/BodyRef/Velocity2D/Pickup/Score — is
+        // present in the snapshot).
+        auto buildWorld = [&](verdict::VerdictWorld& w, verdict::EntityId& outPlayer) {
+            w = verdict::VerdictWorld{};
+            w.sim = buildSimScene();
+            const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}});
+            verdict::BindBody(w, support, 0u);
+            const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), FxQuat{0,0,0,kOne}},
+                                                                  verdict::Health{77}, verdict::BodyRef{verdict::kNoBody});
+            w.reg.add<verdict::Score>(w.handle[player], verdict::Score{0});
+            verdict::BindBody(w, player, 1u);
+            const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), FxQuat{0,0,0,kOne}});
+            w.reg.add<verdict::Pickup>(w.handle[pk0], verdict::Pickup{5});
+            const verdict::EntityId mover = verdict::SpawnMover(w, verdict::Transform2D{V(4,4,0), FxQuat{0,0,0,kOne}},
+                                                               verdict::Health{10}, verdict::Velocity2D{V(0,0,0)});
+            (void)support; (void)pk0; (void)mover;
+            outPlayer = player;
+        };
+
+        const uint32_t kN = 6u;   // advance to the snapshot point
+        const uint32_t kM = 8u;   // diverge / re-advance length
+
+        // ---- PROOF (1) snapshot->restore round-trip is BIT-EXACT over the whole world ----
+        {
+            verdict::VerdictWorld w; verdict::EntityId player; buildWorld(w, player);
+            verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kN);
+            const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(w);
+            // Restore INTO A FRESH world (the ecs handles WILL differ — the contract is order[]-keyed).
+            verdict::VerdictWorld r;
+            verdict::RestoreWorld(r, snap);
+            const bool roundTrip = verdict::VerdictStatesEqual(w, r);
+            check(roundTrip, "vd4: snapshot->restore round-trip BIT-EXACT");
+            // And the restored snapshot equals the original snapshot (snapshot-level equality).
+            check(verdict::VerdictSnapshotsEqual(snap, verdict::SnapshotWorld(r)),
+                  "vd4: restored snapshot == original snapshot");
+            if (roundTrip) std::printf("vd4-snap: snapshot->restore round-trip BIT-EXACT\n");
+        }
+
+        // ---- PROOF (2) THE COMPLETENESS CRUX: advance N -> snapshot -> advance M (diverge) ->
+        // restore -> re-advance M == a reference that advanced N+M straight (nothing escapes) ----
+        {
+            // The reference: advance N+M straight through with the same inputs.
+            verdict::VerdictWorld ref; verdict::EntityId refPlayer; buildWorld(ref, refPlayer);
+            verdict::StepWorldN(ref, kStream, 0u, kHazard, refPlayer, kCollectR, kCfg, kN + kM);
+
+            // The rollback path: advance N, snapshot, advance M with a DIVERGING stream, restore, re-advance.
+            verdict::VerdictWorld w; verdict::EntityId player; buildWorld(w, player);
+            verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kN);
+            const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(w);
+            // A diverging mispredicted stream advances M ticks -> diverged. A kCmdImpulse on the player's
+            // BOUND body perturbs the sim TRIPLE (a kCmdMove on the player's Transform2D would be clobbered
+            // by SyncBodiesToComponents each tick — the body-bound transform is owned by the sim).
+            const std::vector<verdict::Command> kBad = {
+                verdict::Command{kN, verdict::kCmdImpulse, player, V(-3,0,0)},
+            };
+            verdict::StepWorldN(w, kBad, kN, kHazard, player, kCollectR, kCfg, kM);
+            const bool diverged = !verdict::VerdictStatesEqual(w, ref);   // the mispredict really diverged
+            // Restore the snapshot + re-advance the CORRECT stream for M ticks.
+            verdict::RestoreWorld(w, snap);
+            verdict::StepWorldN(w, kStream, kN, kHazard, player, kCollectR, kCfg, kM);
+            const bool complete = verdict::VerdictStatesEqual(w, ref);
+            check(diverged, "vd4: mispredicted stream genuinely diverged before restore");
+            check(complete, "vd4: completeness — restore+re-advance == reference BIT-EXACT");
+            if (complete)
+                std::printf("vd4-snap: completeness {advance:%u, restore@:%u, readvance:%u} == reference BIT-EXACT\n",
+                            kN + kM, kN, kM);
+        }
+
+        // ---- PROOF (3) the necessity of the sim third: a restore that OMITS the WarmHullSnapshot
+        // (bodies+cache+sleep) DIVERGES; including it matches (the WH5 TRIPLE lesson at the world level) ----
+        {
+            verdict::VerdictWorld ref; verdict::EntityId refPlayer; buildWorld(ref, refPlayer);
+            verdict::StepWorldN(ref, kStream, 0u, kHazard, refPlayer, kCollectR, kCfg, kN + kM);
+
+            verdict::VerdictWorld w; verdict::EntityId player; buildWorld(w, player);
+            verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kN);
+            const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(w);
+            // diverge M ticks
+            const std::vector<verdict::Command> kBad = {
+                verdict::Command{kN, verdict::kCmdImpulse, player, V(-3,0,0)},
+            };
+            verdict::StepWorldN(w, kBad, kN, kHazard, player, kCollectR, kCfg, kM);
+
+            // (a) An OMITTING restore: restore everything EXCEPT the sim TRIPLE (leave the diverged sim
+            // in place) — the rolled-back peer resumes with stale bodies/cache/sleep -> MUST diverge. We
+            // build a snapshot whose simSnap is the WRONG (diverged) sim TRIPLE, restore w with it, and
+            // re-advance (w already carries the diverged sim; RestoreWarmHull rewrites it with the diverged
+            // capture — a no-op equivalent, modelling "the sim third was NOT rolled back").
+            {
+                verdict::VerdictSnapshot noSim = snap;
+                noSim.simSnap = verdict::warmhull::SnapshotWarmHull(w.sim, w.cache, w.sleep, w.tick); // the WRONG (diverged) sim
+                verdict::RestoreWorld(w, noSim);   // entities/components from snap, but sim = diverged
+                verdict::StepWorldN(w, kStream, kN, kHazard, player, kCollectR, kCfg, kM);
+                const bool omitDiverges = !verdict::VerdictStatesEqual(w, ref);
+                check(omitDiverges, "vd4: sim-third OMITTED restore DIVERGES (the TRIPLE is necessary)");
+            }
+            // (b) The full restore (sim TRIPLE included) MATCHES.
+            verdict::RestoreWorld(w, snap);
+            verdict::StepWorldN(w, kStream, kN, kHazard, player, kCollectR, kCfg, kM);
+            const bool includeMatches = verdict::VerdictStatesEqual(w, ref);
+            check(includeMatches, "vd4: sim-third INCLUDED restore == reference (the TRIPLE captured)");
+            if (includeMatches)
+                std::printf("vd4-snap: sim-third necessary (omit -> diverge, include -> ==)\n");
+        }
+
+        // ---- VerdictStatesEqual compares in order[] order (order-stable, handle-independent) ----
+        {
+            // Two worlds built the SAME way are equal; a despawn (changing order[]) makes them unequal.
+            verdict::VerdictWorld a; verdict::EntityId pa; buildWorld(a, pa);
+            verdict::VerdictWorld b; verdict::EntityId pb; buildWorld(b, pb);
+            check(verdict::VerdictStatesEqual(a, b), "vd4: identically-built worlds are VerdictStatesEqual");
+            // Restore a from b's snapshot — handles differ, equality must still hold (order[]-keyed).
+            const verdict::VerdictSnapshot sb = verdict::SnapshotWorld(b);
+            verdict::RestoreWorld(a, sb);
+            check(verdict::VerdictStatesEqual(a, b), "vd4: restore re-derives id->value mapping despite handle churn");
+            // A despawn changes order[] -> NOT equal.
+            verdict::DespawnEntity(b, pb);
+            check(!verdict::VerdictStatesEqual(a, b), "vd4: a despawn (order[] change) breaks VerdictStatesEqual");
+        }
+
+        // ---- A despawn-then-restore preserves the retired-id contract (nextId survives) ----
+        {
+            verdict::VerdictWorld w; verdict::EntityId player; buildWorld(w, player);
+            verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kN);
+            // Despawn the player, then snapshot + restore. nextId must be unchanged; the next spawn must
+            // NOT reuse the retired id.
+            const verdict::EntityId nextBefore = w.nextId;
+            verdict::DespawnEntity(w, player);
+            const verdict::VerdictSnapshot snap = verdict::SnapshotWorld(w);
+            verdict::VerdictWorld r; verdict::RestoreWorld(r, snap);
+            check(r.nextId == nextBefore, "vd4: restore preserves nextId (the retired-id contract)");
+            check(!verdict::IsLive(r, player), "vd4: a despawned entity stays absent after restore");
+            const verdict::EntityId reborn = verdict::SpawnEntity(r, verdict::Transform2D{V(1,1,0), FxQuat{0,0,0,kOne}});
+            check(reborn == nextBefore && reborn != player,
+                  "vd4: next spawn after restore does NOT reuse the retired id");
+        }
+    }
+
     if (g_fail == 0) std::printf("verdict_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

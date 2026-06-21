@@ -591,5 +591,202 @@ inline void StepWorldN(VerdictWorld& world, const std::vector<Command>& commands
         StepWorld(world, commands, tick0 + t, hazard, player, collectRadius, cfg);
 }
 
+// =================================================================================================
+// Slice VD4 — THE HETEROGENEOUS SNAPSHOT/RESTORE + EQUALITY (APPEND-ONLY; VD1/VD2/VD3 above are
+// BYTE-FROZEN). The 4th slice of FLAGSHIP #27 (DETERMINISTIC GAMEPLAY / NETCODE, hf::game::verdict).
+//
+// VD1-VD3 built the entity world + command bus, the gameplay systems, and the one composed StepWorld
+// tick (gameplay + the frozen physics sim). VD4 builds the make-or-break primitive for rollback
+// netcode: ONE snapshot/restore that captures the ENTIRE heterogeneous world — the entities + every
+// component pool + the embedded sim's TRIPLE (bodies + cache + sleep) — under a single restore point,
+// plus a byte-equality over all of it. This is the prerequisite for VD5's world-level
+// lockstep/rollback.
+//
+// THE DETERMINISM CONTRACT IS order[]-KEYED. The component pools are captured / restored / compared
+// IN order[] SEQUENCE (NOT the ECS dense / insertion order, which renumbers under add/remove churn
+// and is non-deterministic). The EntityId is the pinned identity; the ecs::Entity handle may differ
+// after a restore — that is FINE; everything is keyed off EntityId + order[] + component values + the
+// sim TRIPLE, NEVER off the opaque ecs handle.
+//
+// THE CRUX (COMPLETENESS): a correct snapshot must capture ALL mutable state, or a rolled-back peer
+// resumes with stale entity / impulse-cache / sleep state and DIVERGES. VD4 proves COMPLETENESS:
+// advance N -> snapshot -> advance M (diverge) -> restore -> re-advance M is byte-identical to a
+// reference world that advanced N+M straight (nothing escapes the snapshot). A restore that OMITS the
+// warmhull::WarmHullSnapshot must DIVERGE (the WH5 TRIPLE lesson, proven at the world level).
+//
+// PURE CPU INTEGER (strict 0px): NO new render RHI, NO new shader, NO new compute. The sim third uses
+// warmhull::SnapshotWarmHull / RestoreWarmHull / WarmHullStatesEqual VERBATIM. warmhull.h / ecs.h +
+// ALL sim headers + ALL shaders BYTE-UNCHANGED; verdict.h is APPEND-ONLY.
+// =================================================================================================
+
+// ----- Per-component capture entry: {EntityId, component-value}, recorded IN order[] SEQUENCE -------
+// One std::vector<CompEntry<T>> per component type carries every live entity (in order[] order) that
+// HAS that component, paired with the component value. The EntityId is the pinned key (the ecs handle
+// is NOT stored — it is re-allocated on restore). All component types are POD integer.
+template <typename T>
+struct CompEntry {
+    EntityId id;
+    T        value;
+};
+
+// ----- VerdictSnapshot: the FULL heterogeneous restore point (entities + EVERY component pool + sim) -
+// The TRIPLE-plus: the entity bookkeeping (tick + nextId + a deep copy of order[]), every component
+// pool serialized IN order[] SEQUENCE (one CompEntry vector per type — capture EVERY component type
+// the world uses: Transform2D / Health / BodyRef / Velocity2D / Pickup / Score), and the embedded
+// sim's warmhull::WarmHullSnapshot (bodies + cache + sleep). A full value copy (a delta encoder is a
+// future optimization, out of scope). The ecs::Entity handles are deliberately NOT captured — restore
+// re-allocates them; the contract is order[]-keyed.
+struct VerdictSnapshot {
+    uint32_t                       tick   = 0;   // the world clock at snapshot time
+    EntityId                       nextId = 1u;  // the monotonic id allocator (NEVER recycled)
+    std::vector<EntityId>          order;        // a deep copy of the pinned spawn-order live-id list
+
+    // Every component pool, serialized in order[] sequence (NOT the ECS dense order).
+    std::vector<CompEntry<Transform2D>> transforms;
+    std::vector<CompEntry<Health>>      healths;
+    std::vector<CompEntry<BodyRef>>     bodyRefs;
+    std::vector<CompEntry<Velocity2D>>  velocities;
+    std::vector<CompEntry<Pickup>>      pickups;
+    std::vector<CompEntry<Score>>       scores;
+
+    warmhull::WarmHullSnapshot     simSnap;      // the sim third (bodies + cache + sleep), VERBATIM WH5
+};
+
+// ----- SnapshotWorld(world) -> VerdictSnapshot: deep-copy the ENTIRE heterogeneous world (pure read) -
+// Deep-copies order[] / nextId / tick; for each entity in order[] (the pinned sequence), captures each
+// component it has<T>() into that type's CompEntry vector (so the serialization is order[]-keyed, NOT
+// ECS-dense-keyed); delegates the sim third to warmhull::SnapshotWarmHull(sim, cache, sleep, tick).
+// A pure read — `world` is unchanged. The crux: capture EVERY component type, or the completeness
+// proof diverges on the one that escaped.
+inline VerdictSnapshot SnapshotWorld(const VerdictWorld& world) {
+    VerdictSnapshot snap;
+    snap.tick   = world.tick;
+    snap.nextId = world.nextId;
+    snap.order  = world.order;   // deep copy of the pinned id sequence
+
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const EntityId id = world.order[i];
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) continue;
+        const ecs::Entity e = it->second;
+        if (!world.reg.valid(e)) continue;
+        // Capture every component type the world uses, IN order[] sequence.
+        if (world.reg.has<Transform2D>(e)) snap.transforms.push_back({id, world.reg.get<Transform2D>(e)});
+        if (world.reg.has<Health>(e))      snap.healths.push_back({id, world.reg.get<Health>(e)});
+        if (world.reg.has<BodyRef>(e))     snap.bodyRefs.push_back({id, world.reg.get<BodyRef>(e)});
+        if (world.reg.has<Velocity2D>(e))  snap.velocities.push_back({id, world.reg.get<Velocity2D>(e)});
+        if (world.reg.has<Pickup>(e))      snap.pickups.push_back({id, world.reg.get<Pickup>(e)});
+        if (world.reg.has<Score>(e))       snap.scores.push_back({id, world.reg.get<Score>(e)});
+    }
+
+    // The sim third — delegate to the frozen WH5 snapshot (bodies + cache + sleep), VERBATIM.
+    snap.simSnap = warmhull::SnapshotWarmHull(world.sim, world.cache, world.sleep, world.tick);
+    return snap;
+}
+
+// ----- RestoreWorld(world, snap): REBUILD the world from the snapshot (handle churn irrelevant) ------
+// REBUILD: clear reg / handle / order, then for each EntityId in snap.order re-create a FRESH
+// ecs::Entity (reg.create() — the new handle may differ from the original; that is FINE) + map it in
+// handle[]. Re-add each captured component (in the CompEntry vectors, which are in order[] sequence).
+// Restore nextId / tick, and restore the sim third via warmhull::RestoreWarmHull (bodies + cache +
+// sleep). After this, VerdictStatesEqual(restored, snapshotted) holds (the contract is over EntityId +
+// order[] + component values + the sim TRIPLE, NOT the opaque handles).
+inline void RestoreWorld(VerdictWorld& world, const VerdictSnapshot& snap) {
+    // Clear the entity bookkeeping (a fresh registry drops every pool + free-list — the cleanest
+    // rebuild; the handle churn is invisible to the order[]-keyed contract).
+    world.reg = ecs::Registry{};
+    world.handle.clear();
+    world.order.clear();
+
+    // Re-create one fresh handle per EntityId, in order[] sequence, mapping id -> the new handle.
+    for (size_t i = 0; i < snap.order.size(); ++i) {
+        const EntityId id = snap.order[i];
+        const ecs::Entity e = world.reg.create();   // a fresh handle (may differ — irrelevant)
+        world.handle[id] = e;
+        world.order.push_back(id);
+    }
+
+    // Re-add every captured component to its owning entity's new handle. The CompEntry vectors are in
+    // order[] sequence; we re-add by EntityId -> handle (a defensive guard skips an unknown/dead id).
+    auto reAdd = [&](EntityId id, auto&& addFn) {
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) return;
+        const ecs::Entity e = it->second;
+        if (!world.reg.valid(e)) return;
+        addFn(e);
+    };
+    for (const auto& c : snap.transforms) reAdd(c.id, [&](ecs::Entity e) { world.reg.add<Transform2D>(e, c.value); });
+    for (const auto& c : snap.healths)    reAdd(c.id, [&](ecs::Entity e) { world.reg.add<Health>(e, c.value); });
+    for (const auto& c : snap.bodyRefs)   reAdd(c.id, [&](ecs::Entity e) { world.reg.add<BodyRef>(e, c.value); });
+    for (const auto& c : snap.velocities) reAdd(c.id, [&](ecs::Entity e) { world.reg.add<Velocity2D>(e, c.value); });
+    for (const auto& c : snap.pickups)    reAdd(c.id, [&](ecs::Entity e) { world.reg.add<Pickup>(e, c.value); });
+    for (const auto& c : snap.scores)     reAdd(c.id, [&](ecs::Entity e) { world.reg.add<Score>(e, c.value); });
+
+    world.nextId = snap.nextId;
+    world.tick   = snap.tick;
+
+    // Restore the sim third — delegate to the frozen WH5 restore (bodies + cache + sleep), VERBATIM.
+    // (world.sim.hulls are immutable/shared geometry — RestoreWarmHull leaves them untouched.)
+    warmhull::RestoreWarmHull(world.sim, world.cache, world.sleep, snap.simSnap);
+}
+
+// ----- The per-component value equality (field-wise — NO memcmp, padding-safe for the POD components) -
+inline bool TransformEq(const Transform2D& a, const Transform2D& b) {
+    return a.pos.x == b.pos.x && a.pos.y == b.pos.y && a.pos.z == b.pos.z &&
+           a.orient.x == b.orient.x && a.orient.y == b.orient.y && a.orient.z == b.orient.z &&
+           a.orient.w == b.orient.w;
+}
+inline bool HealthEq(const Health& a, const Health& b)       { return a.hp == b.hp; }
+inline bool BodyRefEq(const BodyRef& a, const BodyRef& b)    { return a.simBodyIndex == b.simBodyIndex; }
+inline bool Velocity2DEq(const Velocity2D& a, const Velocity2D& b) {
+    return a.vel.x == b.vel.x && a.vel.y == b.vel.y && a.vel.z == b.vel.z;
+}
+inline bool PickupEq(const Pickup& a, const Pickup& b)       { return a.value == b.value; }
+inline bool ScoreEq(const Score& a, const Score& b)          { return a.points == b.points; }
+
+// ----- CompEntriesEqual(a, b, eq): two CompEntry vectors are equal iff same {id, value} sequence ----
+// Both vectors are built in order[] sequence (by SnapshotWorld), so a POSITIONAL compare is exact: the
+// SAME EntityId at the SAME position with an equal component value. (The order[]-keyed contract.)
+template <typename T, typename Eq>
+inline bool CompEntriesEqual(const std::vector<CompEntry<T>>& a, const std::vector<CompEntry<T>>& b, Eq eq) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id != b[i].id) return false;
+        if (!eq(a[i].value, b[i].value)) return false;
+    }
+    return true;
+}
+
+// ----- VerdictSnapshotsEqual(a, b): byte-for-byte equality of two heterogeneous snapshots ------------
+// Equal iff: a.order == b.order (the same pinned id sequence) AND a.nextId == b.nextId AND every
+// component pool is equal in order[] sequence (CompEntriesEqual over each type) AND the sim TRIPLE
+// matches (warmhull::WarmHullStatesEqual over bodies + cache + sleep). This is the make-or-break
+// comparison VD5's rollback builds on. (tick is part of the snapshot but the equality is over the
+// determinism-relevant state — order[] + components + sim; we compare it too for completeness.)
+inline bool VerdictSnapshotsEqual(const VerdictSnapshot& a, const VerdictSnapshot& b) {
+    if (a.order  != b.order)  return false;
+    if (a.nextId != b.nextId) return false;
+    if (a.tick   != b.tick)   return false;
+    if (!CompEntriesEqual(a.transforms, b.transforms, TransformEq))   return false;
+    if (!CompEntriesEqual(a.healths,    b.healths,    HealthEq))      return false;
+    if (!CompEntriesEqual(a.bodyRefs,   b.bodyRefs,   BodyRefEq))     return false;
+    if (!CompEntriesEqual(a.velocities, b.velocities, Velocity2DEq))  return false;
+    if (!CompEntriesEqual(a.pickups,    b.pickups,    PickupEq))      return false;
+    if (!CompEntriesEqual(a.scores,     b.scores,     ScoreEq))       return false;
+    return warmhull::WarmHullStatesEqual(a.simSnap.bodies, a.simSnap.cache, a.simSnap.sleep,
+                                         b.simSnap.bodies, b.simSnap.cache, b.simSnap.sleep);
+}
+
+// ----- VerdictStatesEqual(a, b): two LIVE VerdictWorlds are equal over the whole heterogeneous state -
+// The make-or-break world-level comparison: snapshot BOTH worlds (which serializes the components in
+// order[] sequence + bundles the sim TRIPLE) and compare the snapshots (VerdictSnapshotsEqual). Two
+// worlds are equal iff the SAME order[] + nextId + every component pool (in order[] order) + the sim
+// TRIPLE (warmhull::WarmHullStatesEqual) — independent of the ecs::Entity handles (which may differ
+// after a restore). Note: this compares tick too (snapshots carry it); a caller comparing worlds at
+// the SAME logical tick (the completeness / round-trip proofs) is unaffected.
+inline bool VerdictStatesEqual(const VerdictWorld& a, const VerdictWorld& b) {
+    return VerdictSnapshotsEqual(SnapshotWorld(a), SnapshotWorld(b));
+}
+
 }  // namespace verdict
 }  // namespace hf::game
