@@ -415,6 +415,20 @@ hf_gen_msl(broad_cell_emit.comp      broad_cell_emit.comp.hlsl      comp broad_c
 hf_gen_msl(broad_pair_count.comp     broad_pair_count.comp.hlsl     comp broad_pair_count_main)
 hf_gen_msl(broad_pair_scan.comp      broad_pair_scan.comp.hlsl      comp broad_pair_scan_main)
 hf_gen_msl(broad_pair_emit.comp      broad_pair_emit.comp.hlsl      comp broad_pair_emit_main)
+# Deterministic Integer CCD Slice 2 (Slice CD2, FLAGSHIP #24): THE SWEPT-AABB BROADPHASE — the 27-cell-stencil
+# candidate-pair generator over the host-precomputed SWEPT AABBs (each body's box at the tick start UNION its box
+# at the integrated end pose). ccd_swept_count.comp (ONE thread per body i: scan i's 3x3x3 stencil over the
+# AABB-centre cell table, count j>i with the six-compare AabbOverlap over the explicit lo/hi swept boxes),
+# ccd_swept_scan.comp (SINGLE-THREAD exclusive prefix-sum -> perBodyOffset), ccd_swept_emit.comp (SINGLE-THREAD
+# ascending-body scatter of fpx::FxPair{i,j} into each body's disjoint slice — the per-i emit-order DET-CRUX). The
+# swept-AABB precompute (integrate end pose + 2x BuildHullAabb + union — the int64 part) is done HOST-side and the
+# int32 lo/hi AABBs are fed identically to the CPU ref + these shaders. ALL PURE INT32 (FloorDiv + integer compares
+# + an ascending scatter, NO int64/fxmul/sqrt) so these MSL-generate NATIVELY (a TRUE GPU pass on BOTH backends).
+# ReadBuffer reads pairsOut + offsets, PROVEN BIT-EXACT vs ccd.h::BuildSweptBroadphasePairs (memcmp) + the
+# swept⊇discrete superset proof. Behind --ccd-swept only; NO new RHI; all existing shaders + goldens untouched.
+hf_gen_msl(ccd_swept_count.comp      ccd_swept_count.comp.hlsl      comp ccd_swept_count_main)
+hf_gen_msl(ccd_swept_scan.comp       ccd_swept_scan.comp.hlsl       comp ccd_swept_scan_main)
+hf_gen_msl(ccd_swept_emit.comp       ccd_swept_emit.comp.hlsl       comp ccd_swept_emit_main)
 # Deterministic Persistent Contacts Slice 1 (Slice PS1, the BEACHHEAD of FLAGSHIP #21: DETERMINISTIC
 # WARM-STARTED CONTACT CACHING + SLEEPING ISLANDS, hf::sim::persist): persist_key.comp is THE CONTACT FEATURE
 # ID pass — ONE thread per contact point runs the order-normalized integer key (bodyA<bodyB swap) + the fixed

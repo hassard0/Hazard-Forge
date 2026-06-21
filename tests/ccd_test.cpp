@@ -192,6 +192,119 @@ int main() {
         check(m1.pairs == 2u && m1.hits == 1u, "MeasureCcdToi counts {pairs:2, hits:1}");
     }
 
+    // ===== Slice CD2 — THE SWEPT-AABB BROADPHASE ============================================================
+    // Helpers: a dynamic body with a velocity, a static body, and a HullWorld of unit boxes.
+    namespace gjk = hf::sim::gjk;
+    namespace broad = hf::sim::broad;
+    auto mkDyn = [&](fx x, fx y, fx z, fx vx) {
+        fpx::FxBody b = MakeBody(x, y, z);
+        b.vel = {vx, 0, 0};
+        b.invMass = kOne;
+        b.flags = fpx::kFlagDynamic;
+        return b;
+    };
+    auto mkStat = [&](fx x, fx y, fx z) {
+        fpx::FxBody b = MakeBody(x, y, z);   // invMass 0, no dynamic flag -> static (never sweeps)
+        return b;
+    };
+    // cellSize generous (>= the max swept-AABB diameter for these fast movers over dt=1).
+    const fx kSweptCell = FromInt(64);
+
+    // === (CD2.1) SweptHullAabb contains BOTH the start AND the end world hull verts. A unit box at x=0 moving
+    // +X at 6 u/s over dt=1: start box [-1,1] on X, end pose x=6 box [5,7] on X -> swept union [-1,7] on X. ===
+    {
+        fpx::FxBody mover = mkDyn(0, 0, 0, FromInt(6));
+        const fpx::FxAabb swept = ccd::SweptHullAabb(box, mover, dt);
+        const fpx::FxAabb startBox = broad::BuildHullAabb(box, mover);
+        fpx::FxBody endBody = mover;
+        ccd::IntegrateBodyFull(endBody, FxVec3{0, 0, 0}, dt);
+        const fpx::FxAabb endBox = broad::BuildHullAabb(box, endBody);
+        check(swept.lo.x <= startBox.lo.x && swept.hi.x >= startBox.hi.x, "SweptHullAabb contains the START box on X");
+        check(swept.lo.x <= endBox.lo.x && swept.hi.x >= endBox.hi.x, "SweptHullAabb contains the END box on X");
+        check(swept.lo.x == FromInt(-1) && swept.hi.x == FromInt(7), "swept X span is the union [-1,7] (start UNION end)");
+        // A STATIC body does not move -> its swept box == its instantaneous box (no sweep).
+        fpx::FxBody stat = mkStat(0, 0, 0);
+        const fpx::FxAabb sweptStat = ccd::SweptHullAabb(box, stat, dt);
+        const fpx::FxAabb statBox = broad::BuildHullAabb(box, stat);
+        check(std::memcmp(&sweptStat, &statBox, sizeof(fpx::FxAabb)) == 0, "a static body's swept AABB == its instantaneous AABB");
+    }
+
+    // === (CD2.2) BuildSweptBroadphasePairs is a canonical i<j set + matches the host CountSweptPairs total. A
+    // fast mover sweeping across two clustered obstacles. ===
+    {
+        gjk::HullWorld world;
+        world.bodies = { mkDyn(0, 0, 0, FromInt(10)),     // fast mover sweeps +X across x=5 and x=8
+                         mkStat(FromInt(5), 0, 0),        // obstacle 1 (mover's start box misses it)
+                         mkStat(FromInt(8), 0, 0) };       // obstacle 2
+        world.hulls = { box, box, box };
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> pairs;
+        ccd::BuildSweptBroadphasePairs(world, dt, kSweptCell, off, pairs);
+        bool canonical = true;
+        for (const fpx::FxPair& p : pairs) if (p.i >= p.j) canonical = false;
+        check(canonical, "BuildSweptBroadphasePairs emits canonical i<j pairs");
+        // The fast mover (body 0, swept [-1,11] on X) overlaps BOTH obstacles -> pairs (0,1) and (0,2).
+        check(pairs.size() == 2u, "the fast mover's sweep produces 2 candidate pairs (both obstacles)");
+        // Determinism: two builds byte-identical.
+        std::vector<uint32_t> off2; std::vector<fpx::FxPair> pairs2;
+        ccd::BuildSweptBroadphasePairs(world, dt, kSweptCell, off2, pairs2);
+        const bool detEq = off == off2 && pairs.size() == pairs2.size() &&
+            (pairs.empty() || std::memcmp(pairs.data(), pairs2.data(), pairs.size() * sizeof(fpx::FxPair)) == 0);
+        check(detEq, "BuildSweptBroadphasePairs is deterministic (byte-identical)");
+    }
+
+    // === (CD2.3) A FAST mover -> the swept set has a pair the DISCRETE set lacks (M>0). The discrete
+    // (instantaneous-AABB) broadphase keys on the start box [-1,1] which misses the obstacle at x=5; the swept
+    // box [-1,11] catches it. ===
+    {
+        gjk::HullWorld world;
+        world.bodies = { mkDyn(0, 0, 0, FromInt(10)),     // fast mover
+                         mkStat(FromInt(5), 0, 0) };       // obstacle the start box misses
+        world.hulls = { box, box };
+        std::vector<uint32_t> sOff, dOff;
+        std::vector<fpx::FxPair> swept, discrete;
+        ccd::BuildSweptBroadphasePairs(world, dt, kSweptCell, sOff, swept);
+        ccd::BuildDiscreteBroadphasePairs(world, kSweptCell, dOff, discrete);
+        check(swept.size() == 1u, "the swept set catches the fast-mover pair (1 pair)");
+        check(discrete.size() == 0u, "the discrete set MISSES the fast-mover pair (0 pairs — tunneling)");
+        uint32_t missed = 0;
+        const bool superset = ccd::SweptPairsSupersetOfDiscrete(world, dt, kSweptCell, &missed);
+        check(superset, "swept ⊇ discrete (trivially, discrete is empty)");
+        check(missed == 1u, "M>0: the swept set has 1 pair the discrete set misses (the fast-mover catch)");
+    }
+
+    // === (CD2.4) SweptPairsSupersetOfDiscrete is TRUE for several scenes (a slow cluster where swept==discrete,
+    // and a mixed fast+slow scene). The swept set ALWAYS contains every discrete pair (instantaneous ⊆ swept). ===
+    {
+        // Scene A: a slow tight cluster (tiny velocities) — swept ~= discrete, swept ⊇ discrete still holds.
+        gjk::HullWorld slow;
+        slow.bodies = { mkDyn(0, 0, 0, kOne / 8),
+                        mkDyn(kOne, 0, 0, kOne / 8),
+                        mkDyn(0, 0, kOne, kOne / 8) };
+        slow.hulls = { box, box, box };
+        uint32_t mSlow = 0;
+        check(ccd::SweptPairsSupersetOfDiscrete(slow, dt, kSweptCell, &mSlow), "swept ⊇ discrete for a slow cluster");
+
+        // Scene B: a fast mover + a slow cluster (mixed). swept ⊇ discrete AND M>0 (the fast mover adds pairs).
+        gjk::HullWorld mixed;
+        mixed.bodies = { mkDyn(0, 0, 0, FromInt(12)),       // fast mover across the row
+                         mkStat(FromInt(6), 0, 0),
+                         mkDyn(FromInt(20), 0, 0, kOne / 8),  // far slow body (no sweep reach)
+                         mkDyn(FromInt(20), 0, kOne, kOne / 8) };
+        mixed.hulls = { box, box, box, box };
+        uint32_t mMixed = 0;
+        const bool supMixed = ccd::SweptPairsSupersetOfDiscrete(mixed, dt, kSweptCell, &mMixed);
+        check(supMixed, "swept ⊇ discrete for a mixed fast+slow scene");
+        check(mMixed > 0u, "the fast mover makes the swept set a STRICT superset (M>0)");
+
+        // MeasureSweptPairs is a pure summary (two calls byte-equal) + reports the superset + M.
+        const ccd::SweptPairMeasure ms1 = ccd::MeasureSweptPairs(mixed, dt, kSweptCell);
+        const ccd::SweptPairMeasure ms2 = ccd::MeasureSweptPairs(mixed, dt, kSweptCell);
+        check(std::memcmp(&ms1, &ms2, sizeof(ccd::SweptPairMeasure)) == 0, "MeasureSweptPairs is a pure function (byte-equal)");
+        check(ms1.supersetOfDiscrete && ms1.missedByDiscrete > 0u, "MeasureSweptPairs reports {superset:true, M>0}");
+        check(ms1.sweptPairs >= ms1.discretePairs, "the swept pair count >= the discrete pair count");
+    }
+
     if (g_fail == 0) std::printf("ccd_test: ALL PASS\n");
     else std::printf("ccd_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

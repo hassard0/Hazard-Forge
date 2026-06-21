@@ -25324,6 +25324,283 @@ static int RunBroadPairShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CD2 — Deterministic Integer CCD THE SWEPT-AABB BROADPHASE showcase (--ccd-swept) ============
+// THE 2nd slice of FLAGSHIP #24. UNLIKE CD1's --ccd-toi (int64 ccd_toi.comp -> CPU on Metal), the swept-AABB
+// PAIR generation is PURE INT32 (the 27-cell stencil + the six-compare AabbOverlap over lo/hi + an ascending
+// scatter, NO int64/fxmul/sqrt), so the ccd_swept_{count,scan,emit} shaders MSL-gen natively and Metal
+// DISPATCHES THE GPU passes directly: the SAME fast-mover scene the Vulkan --ccd-swept-shot builds has its
+// swept AABBs precomputed HOST-side (each body's box at the tick start UNION its box at the integrated end
+// pose — the int64 part) and feeds the SAME three passes (count->scan->emit) over the BP1 cell table ->
+// ReadBuffer reads perBodyOffset + pairsOut, PROVEN BIT-EXACT vs the CPU ccd::BuildSweptBroadphasePairs (memcmp,
+// NO tol); the SUPERSET proof: swept ⊇ discrete AND M>0 (the swept set catches the fast-mover pairs the discrete
+// one would tunnel past); two runs byte-identical. The image golden is the integer top-down (XZ) swept-AABB-
+// footprint + swept-pair-segment viz, identical to the Vulkan path BY CONSTRUCTION (STRICT ZERO cross-vendor).
+// New golden tests/golden/metal/ccd_swept.png. NO new RHI.
+static int RunCcdSweptShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace ccd = hf::sim::ccd;
+    namespace broad = hf::sim::broad;
+    namespace gjk = hf::sim::gjk;
+    namespace fpx = hf::sim::fpx;
+
+    auto wu = [&](int n) { return (fpx::fx)(n * (int)fpx::kOne); };
+    const gjk::FxHull unitBox = gjk::MakeBox(fpx::kOne, fpx::kOne, fpx::kOne);  // half-extent 1
+    const fpx::fx kDt = fpx::kOne;
+    const fpx::fx kCellSize = wu(64);
+
+    auto mkDyn = [&](int x, int y, int z, int vx, int vz) {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{wu(x), wu(y), wu(z)};
+        b.vel = fpx::FxVec3{wu(vx), 0, wu(vz)};
+        b.invMass = fpx::kOne;
+        b.flags = fpx::kFlagDynamic;
+        return b;
+    };
+    auto mkStat = [&](int x, int y, int z) {
+        fpx::FxBody b;
+        b.pos = fpx::FxVec3{wu(x), wu(y), wu(z)};   // static (no kFlagDynamic) -> no sweep
+        return b;
+    };
+    // The fixed scene (== the Vulkan --ccd-swept-shot): fast movers + a slow cluster.
+    gjk::HullWorld world;
+    world.bodies.push_back(mkDyn(0, 0, 0, 10, 0));
+    world.bodies.push_back(mkStat(5, 0, 0));
+    world.bodies.push_back(mkStat(8, 0, 0));
+    world.bodies.push_back(mkDyn(20, 0, 0, 0, 9));
+    world.bodies.push_back(mkStat(20, 0, 4));
+    world.bodies.push_back(mkStat(20, 0, 7));
+    world.bodies.push_back(mkDyn(40, 0, 0, 0, 0));
+    world.bodies.push_back(mkDyn(41, 0, 0, 0, 0));
+    world.bodies.push_back(mkDyn(40, 0, 1, 0, 0));
+    for (size_t k = 0; k < world.bodies.size(); ++k) world.hulls.push_back(unitBox);
+    const int kBodyCount = (int)world.bodies.size();
+
+    // The host-side swept-AABB precompute (the int64 boundary) + the AABB-centre proxy grid.
+    std::vector<fpx::FxAabb> sweptAabbs;
+    ccd::BuildSweptAabbs(world, kDt, sweptAabbs);
+    std::vector<fpx::FxBody> proxies;
+    ccd::CenterProxyBodies(sweptAabbs, proxies);
+    const broad::BodyGrid grid = broad::MakeBodyGrid(proxies, kCellSize);
+    const uint32_t kCellCount = broad::BodyCellCount(grid);
+    const broad::BodyCellTable cpuTable = broad::BuildBodyCellTable(proxies, grid);
+
+    std::vector<uint32_t> cpuOffset;
+    std::vector<fpx::FxPair> cpuPairs;
+    ccd::BuildSweptBroadphasePairs(world, kDt, kCellSize, cpuOffset, cpuPairs);
+    const uint32_t kPairCount = (uint32_t)cpuPairs.size();
+    std::vector<uint32_t> cpuOffsetSentinel = cpuOffset;
+    cpuOffsetSentinel.push_back(kPairCount);
+
+    // Image dims (fixed integer top-down transform, == the Vulkan --ccd-swept-shot).
+    const int kPxPerUnit = 8;
+    const int kMargin = 16;
+    const int kWorldMinX = -2, kWorldMaxX = 44;
+    const int kWorldMinZ = -2, kWorldMaxZ = 12;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + (kWorldMaxX - kWorldMinX) * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + (kWorldMaxZ - kWorldMinZ) * kPxPerUnit);
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // std430 swept-AABB mirror (matches the ccd_swept shaders' SweptAabb: lo.xyz + hi.xyz = 24 bytes).
+    struct SweptAabbGpu { int32_t lox, loy, loz, hix, hiy, hiz; };
+    static_assert(sizeof(SweptAabbGpu) == 24, "SweptAabbGpu std430 layout");
+    std::vector<SweptAabbGpu> aabbsInit((size_t)kBodyCount);
+    for (int i = 0; i < kBodyCount; ++i)
+        aabbsInit[(size_t)i] = SweptAabbGpu{sweptAabbs[(size_t)i].lo.x, sweptAabbs[(size_t)i].lo.y,
+                                            sweptAabbs[(size_t)i].lo.z, sweptAabbs[(size_t)i].hi.x,
+                                            sweptAabbs[(size_t)i].hi.y, sweptAabbs[(size_t)i].hi.z};
+    rhi::BufferDesc aabbDesc;
+    aabbDesc.size = aabbsInit.size() * sizeof(SweptAabbGpu);
+    aabbDesc.initialData = aabbsInit.data();
+    aabbDesc.usage = rhi::BufferUsage::Storage;
+    auto aabbsBuf = device->CreateBuffer(aabbDesc);
+
+    struct BodyGridParams { int32_t grid[4]; int32_t dim[4]; int32_t cfg[4]; };
+    static_assert(sizeof(BodyGridParams) == 48, "BodyGridParams std430 layout");
+    auto makeGridParams = [&](int32_t enabled) {
+        BodyGridParams p{};
+        p.grid[0] = kCellSize; p.grid[1] = grid.cellMin.x; p.grid[2] = grid.cellMin.y;
+        p.grid[3] = grid.cellMin.z;
+        p.dim[0] = grid.gridDim.x; p.dim[1] = grid.gridDim.y; p.dim[2] = grid.gridDim.z;
+        p.dim[3] = kBodyCount;
+        p.cfg[0] = (int32_t)kCellCount; p.cfg[1] = enabled; p.cfg[2] = 0; p.cfg[3] = 0;
+        return p;
+    };
+
+    std::vector<uint32_t> cellStartInit = cpuTable.cellStart;
+    std::vector<uint32_t> cellBodiesInit = cpuTable.cellBodies;
+    std::vector<uint32_t> perBodyCountInit((size_t)kBodyCount, 0u);
+    std::vector<uint32_t> perBodyOffsetInit((size_t)kBodyCount + 1u, 0u);
+    std::vector<uint32_t> pairsInit((size_t)(kPairCount ? kPairCount : 1u) * 2u, 0u);
+    auto makeUintBuf = [&](const std::vector<uint32_t>& init) {
+        rhi::BufferDesc d; d.size = init.size() * sizeof(uint32_t);
+        d.initialData = init.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto cellStartBuf  = makeUintBuf(cellStartInit);
+    auto cellBodiesBuf = makeUintBuf(cellBodiesInit);
+
+    auto mkPipe = [&](const char* file, const char* entry, uint32_t ssbo, uint32_t threads) {
+        auto cs = loadMSL(file, entry);
+        rhi::ComputePipelineDesc d;
+        d.compute = cs.get(); d.storageBufferCount = ssbo; d.threadsPerGroupX = threads;
+        auto pipe = device->CreateComputePipeline(d);
+        return std::make_pair(std::move(cs), std::move(pipe));
+    };
+    // swept_count(5 SSBO,64t), swept_scan(3,1t), swept_emit(6,1t) — the ccd_swept MSL-native passes.
+    auto sweptCountPipe = mkPipe("ccd_swept_count.comp.gen.metal", "ccd_swept_count_main", 5, 64);
+    auto sweptScanPipe  = mkPipe("ccd_swept_scan.comp.gen.metal", "ccd_swept_scan_main", 3, 1);
+    auto sweptEmitPipe  = mkPipe("ccd_swept_emit.comp.gen.metal", "ccd_swept_emit_main", 6, 1);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kBodyGroups = ((uint32_t)kBodyCount + 63u) / 64u;
+
+    auto runPairs = [&](int32_t enabled, std::vector<uint32_t>& outOffset,
+                        std::vector<uint32_t>& outPairs) {
+        auto perBodyCountBuf  = makeUintBuf(perBodyCountInit);
+        auto perBodyOffsetBuf = makeUintBuf(perBodyOffsetInit);
+        auto pairsBuf         = makeUintBuf(pairsInit);
+        BodyGridParams params = makeGridParams(enabled);
+        rhi::BufferDesc pd; pd.size = sizeof(BodyGridParams); pd.initialData = &params;
+        pd.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pd);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("ccd_swept", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*sweptCountPipe.second);
+                cmd.BindStorageBuffer(*aabbsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellBodiesBuf, 2);
+                cmd.BindStorageBuffer(*perBodyCountBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kBodyGroups);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*sweptScanPipe.second);
+                cmd.BindStorageBuffer(*perBodyCountBuf, 0);
+                cmd.BindStorageBuffer(*perBodyOffsetBuf, 1);
+                cmd.BindStorageBuffer(*paramsBuf, 2);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToComputeBarrier();
+                cmd.BindComputePipeline(*sweptEmitPipe.second);
+                cmd.BindStorageBuffer(*aabbsBuf, 0);
+                cmd.BindStorageBuffer(*cellStartBuf, 1);
+                cmd.BindStorageBuffer(*cellBodiesBuf, 2);
+                cmd.BindStorageBuffer(*perBodyOffsetBuf, 3);
+                cmd.BindStorageBuffer(*pairsBuf, 4);
+                cmd.BindStorageBuffer(*paramsBuf, 5);
+                cmd.DispatchCompute(1);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outOffset.assign((size_t)kBodyCount + 1u, 0u);
+        device->ReadBuffer(*perBodyOffsetBuf, outOffset.data(), outOffset.size() * sizeof(uint32_t), 0);
+        outPairs.assign(pairsInit.size(), 0u);
+        device->ReadBuffer(*pairsBuf, outPairs.data(), outPairs.size() * sizeof(uint32_t), 0);
+    };
+
+    // === GPU swept-pair list (enabled) ===
+    std::vector<uint32_t> gOffset, gPairsRaw;
+    runPairs(1, gOffset, gPairsRaw);
+
+    // PROOF (1) GPU==CPU pairs + offsets BIT-EXACT.
+    bool offsetOk = (gOffset.size() == cpuOffsetSentinel.size()) &&
+        std::memcmp(gOffset.data(), cpuOffsetSentinel.data(),
+                    cpuOffsetSentinel.size() * sizeof(uint32_t)) == 0;
+    std::vector<uint32_t> cpuPairsRaw;
+    cpuPairsRaw.reserve((size_t)kPairCount * 2u);
+    for (const fpx::FxPair& p : cpuPairs) { cpuPairsRaw.push_back(p.i); cpuPairsRaw.push_back(p.j); }
+    bool pairsOk = (kPairCount == 0) ||
+        std::memcmp(gPairsRaw.data(), cpuPairsRaw.data(),
+                    (size_t)kPairCount * 2u * sizeof(uint32_t)) == 0;
+    if (!offsetOk || !pairsOk) return fail("ccd-swept: GPU != CPU BuildSweptBroadphasePairs");
+    std::printf("ccd-swept: {bodies:%d, pairs:%u} GPU==CPU BIT-EXACT\n", kBodyCount, kPairCount);
+
+    // PROOF (2) determinism: two full runs byte-identical.
+    {
+        std::vector<uint32_t> o2, p2;
+        runPairs(1, o2, p2);
+        if (o2 != gOffset || p2 != gPairsRaw)
+            return fail("ccd-swept: two runs differ (nondeterministic)");
+        std::printf("ccd-swept determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // PROOF (3) THE SUPERSET PROOF: swept ⊇ discrete AND M>0 (the fast-mover catch).
+    {
+        uint32_t missed = 0;
+        const bool superset = ccd::SweptPairsSupersetOfDiscrete(world, kDt, kCellSize, &missed);
+        if (!superset) return fail("ccd-swept: superset FAILED (swept does NOT contain discrete)");
+        if (missed == 0u) return fail("ccd-swept: superset M==0 (no fast-mover pair the discrete set misses)");
+        std::printf("ccd-swept superset: {sweptPairs:%u, fastMissedByDiscrete:%u} "
+                    "swept\xE2\x8A\x87""discrete BYTE-CHECKED\n", kPairCount, missed);
+    }
+
+    // --- Golden: a PURE-INTEGER top-down (XZ) view (== the Vulkan --ccd-swept-shot). swept-AABB footprints +
+    // a segment per emitted swept pair. CPU-drawn from the read-back integers -> identical both backends. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 12; bgra[p * 4 + 1] = 10; bgra[p * 4 + 2] = 8; bgra[p * 4 + 3] = 255;
+    }
+    auto toPx = [&](fpx::fx x, fpx::fx z, int& outX, int& outY) {
+        const float fxx = (float)x / (float)fpx::kOne;
+        const float fzz = (float)z / (float)fpx::kOne;
+        outX = kMargin + (int)((fxx - (float)kWorldMinX) * kPxPerUnit + 0.5f);
+        outY = (int)imgH - kMargin - (int)((fzz - (float)kWorldMinZ) * kPxPerUnit + 0.5f);
+    };
+    auto setPx = [&](int ix, int iy, uint8_t r, uint8_t gg, uint8_t b) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = b; dst[1] = gg; dst[2] = r; dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t r, uint8_t gg, uint8_t b) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            setPx(x0, y0, r, gg, b);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    for (const fpx::FxPair& p : cpuPairs) {
+        const fpx::FxVec3 ca = ccd::AabbCenter(sweptAabbs[p.i]);
+        const fpx::FxVec3 cb = ccd::AabbCenter(sweptAabbs[p.j]);
+        int ax, ay, bx, by;
+        toPx(ca.x, ca.z, ax, ay);
+        toPx(cb.x, cb.z, bx, by);
+        drawLine(ax, ay, bx, by, 70, 180, 200);
+    }
+    for (int i = 0; i < kBodyCount; ++i) {
+        const fpx::FxAabb& a = sweptAabbs[(size_t)i];
+        int loX, loY, hiX, hiY;
+        toPx(a.lo.x, a.lo.z, loX, loY);
+        toPx(a.hi.x, a.hi.z, hiX, hiY);
+        int x0 = std::min(loX, hiX), x1 = std::max(loX, hiX);
+        int y0 = std::min(loY, hiY), y1 = std::max(loY, hiY);
+        const bool dyn = (world.bodies[(size_t)i].flags & fpx::kFlagDynamic) != 0;
+        const uint8_t rr = dyn ? 235 : 120, gg = dyn ? 180 : 150, bb = dyn ? 90 : 210;
+        for (int x = x0; x <= x1; ++x) { setPx(x, y0, rr, gg, bb); setPx(x, y1, rr, gg, bb); }
+        for (int y = y0; y <= y1; ++y) { setPx(x0, y, rr, gg, bb); setPx(x1, y, rr, gg, bb); }
+        int cx, cy; toPx(world.bodies[(size_t)i].pos.x, world.bodies[(size_t)i].pos.z, cx, cy);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) setPx(cx + dx, cy + dy, 255, 255, 255);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — ccd-swept candidate pairs (%d bodies, %u pairs)\n",
+                outPath, imgW, imgH, kBodyCount, kPairCount);
+    return 0;
+}
+
 // ===== Slice CL2 — Deterministic GPU Cloth DISTANCE-CONSTRAINT GRAPH BUILD showcase (--cloth-edges) =====
 // UNLIKE CL1's --cloth-integrate (int64 cloth_integrate.comp -> CPU on Metal), the constraint-graph build
 // is PURE INT32 (CountOwnedEdges + the fixed emit order = index arithmetic + bounds compares, NO int64, NO
@@ -51894,6 +52171,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--broad-pair") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_broad_pair.png";
             try { return RunBroadPairShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ccd-swept <out.png>: render the Deterministic Integer CCD THE SWEPT-AABB BROADPHASE showcase (Slice
+        // CD2, FLAGSHIP #24). UNLIKE --ccd-toi (int64 -> CPU on Metal), the swept-AABB PAIR generation is PURE
+        // INT32 (the 27-cell stencil + the six-compare AabbOverlap over lo/hi + an ascending scatter), so the
+        // ccd_swept_{count,scan,emit} shaders MSL-gen natively and Metal DISPATCHES THE GPU passes: the SAME
+        // fast-mover scene the Vulkan --ccd-swept-shot builds has its swept AABBs precomputed HOST-side and feeds
+        // the SAME three passes (count->scan->emit) over the BP1 cell table -> ReadBuffer reads perBodyOffset +
+        // pairsOut, PROVEN BIT-EXACT vs the CPU ccd::BuildSweptBroadphasePairs (memcmp); the SUPERSET proof:
+        // swept ⊇ discrete AND M>0; two runs byte-identical. The image golden is the integer top-down (XZ)
+        // swept-AABB-footprint + swept-pair-segment viz, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/ccd_swept.png; two runs DIFF 0.0000. NO new RHI.
+        if (argc > 1 && std::strcmp(argv[1], "--ccd-swept") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ccd_swept.png";
+            try { return RunCcdSweptShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --couple-query <out.png>: render the Deterministic Rigid<->Fluid Coupling UNIFIED COUPLED WORLD +

@@ -1176,6 +1176,21 @@ hf_compile_shaders(
     # -> bit-exact GPU==CPU FxToi array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens
     # untouched.
     "shaders/ccd_toi.comp.hlsl:cs"
+    # Deterministic Integer CCD Slice 2 (Slice CD2, FLAGSHIP #24): THE SWEPT-AABB BROADPHASE — the 27-cell-stencil
+    # candidate-pair generator over the host-precomputed SWEPT AABBs (each body's box at the tick start UNION its
+    # box at the integrated end pose), so a FAST mover's sweep overlaps obstacles the discrete (instantaneous-AABB)
+    # broadphase MISSES. The swept-AABB precompute (integrate end pose + 2x BuildHullAabb + union — the int64 part)
+    # is done HOST-side; these THREE shaders take the int32 lo/hi swept AABBs + the BP1 grid as SSBO input and do
+    # the PURE INT32 grid+pair work: ccd_swept_count.comp (ONE thread per body i: scan i's 3x3x3 stencil over the
+    # AABB-centre cell table, count j>i with the six-compare AabbOverlap over lo/hi), ccd_swept_scan.comp
+    # (SINGLE-THREAD exclusive prefix-sum -> perBodyOffset + sentinel), ccd_swept_emit.comp (SINGLE-THREAD
+    # ascending-body scatter of fpx::FxPair{i,j} into each body's disjoint slice — the per-i emit-order DET-CRUX).
+    # ALL PURE INT32 (FloorDiv + integer compares + an ascending scatter, NO int64/fxmul/sqrt) so these MSL-GENERATE
+    # NATIVELY (in hf_gen_msl) and Metal dispatches the GPU passes. ReadBuffer reads pairsOut + offsets, PROVEN
+    # BIT-EXACT vs the CPU ccd.h::BuildSweptBroadphasePairs (memcmp) + the swept⊇discrete superset proof. NO new RHI.
+    "shaders/ccd_swept_count.comp.hlsl:cs"
+    "shaders/ccd_swept_scan.comp.hlsl:cs"
+    "shaders/ccd_swept_emit.comp.hlsl:cs"
     # Deterministic Convex Rigid-Body Contacts Slice 2 (Slice CX2): convex_manifold.comp is the box-box
     # CONTACT MANIFOLD pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
     # runs the 15-axis BoxSat then BuildManifold (the reference/incident face clip via Sutherland-Hodgman in
