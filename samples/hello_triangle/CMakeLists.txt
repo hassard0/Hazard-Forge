@@ -1165,6 +1165,17 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> bit-exact GPU==CPU EpaResult array + cross-backend, proven memcmp. NO new
     # RHI; existing shaders + goldens untouched.
     "shaders/gjk_epa.comp.hlsl:cs"
+    # Deterministic Integer CCD Slice 1 (Slice CD1, the BEACHHEAD of FLAGSHIP #24): ccd_toi.comp is the
+    # TIME-OF-IMPACT pass — ONE THREAD PER CANDIDATE PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
+    # runs the full conservative-advancement TOI loop (an embedded gjk::Gjk closest-distance query + the
+    # fxdiv(gap, closingSpeedBound) advance + IntegrateBodyFull sub-step with ZERO gravity, until the gap closes
+    # or t>=dt or the fixed iteration bound), copying ccd.h::ConservativeAdvance VERBATIM. int64 (the GJK
+    # sub-distance fxdiv + FxDot/FxCross/FxLength/FxNormalize/FxRotate/FxQuat products) -> VULKAN-SPIR-V-ONLY
+    # (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --ccd-toi showcase runs the CPU
+    # ccd::ConservativeAdvance instead (byte-identical by construction). Pure integer SSBO compute + ReadBuffer
+    # -> bit-exact GPU==CPU FxToi array + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens
+    # untouched.
+    "shaders/ccd_toi.comp.hlsl:cs"
     # Deterministic Convex Rigid-Body Contacts Slice 2 (Slice CX2): convex_manifold.comp is the box-box
     # CONTACT MANIFOLD pass — ONE THREAD PER BOX PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
     # runs the 15-axis BoxSat then BuildManifold (the reference/incident face clip via Sutherland-Hodgman in

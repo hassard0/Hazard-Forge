@@ -101,6 +101,7 @@
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
 #include "sim/convex.h"              // Slice CX1: deterministic convex contacts BOX-BOX SAT (FxMat3/FxCross/FxDot/FxBox/SatResult/BoxSat/MeasureSat, the 15-axis box-box separating-axis test) — shared verbatim with convex_sat.comp + the Vulkan --convex-sat-shot (int64 -> Vulkan-only; Metal --convex-sat runs the CPU BoxSat)
 #include "sim/gjk.h"                  // Slice GJ1: deterministic general convex-hull contacts THE SUPPORT FUNCTION (FxHull/SupportLocal/Support/SupportMinkowski/MeasureSupport + canonical hull builders) — shared verbatim with gjk_support.comp + the Vulkan --gjk-support-shot (int64 -> Vulkan-only; Metal --gjk-support runs the CPU Support)
+#include "sim/ccd.h"                  // Slice CD1: deterministic integer CCD THE TIME-OF-IMPACT PRIMITIVE (FxToi/kContactEps/kToiMaxIter/BodyMaxRadius/ClosingSpeedBound/ConservativeAdvance(Pose)/MeasureCcdToi, conservative advancement) — shared verbatim with ccd_toi.comp + the Vulkan --ccd-toi-shot (int64 -> Vulkan-only; Metal --ccd-toi runs the CPU ConservativeAdvance)
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
 #include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
@@ -27473,6 +27474,178 @@ static int RunGjkDistanceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CD1 — Deterministic Integer CCD THE TIME-OF-IMPACT PRIMITIVE showcase (--ccd-toi) ============
+// ====== The BEACHHEAD of FLAGSHIP #24 (hf::sim::ccd). Like the gjk slices, the conservative-advance loop is
+// int64 (the embedded gjk::Gjk + the advance fxdiv + the FxLength/FxNormalize/FxRotate/FxQuat products), so
+// shaders/ccd_toi.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) -> NOT in hf_gen_msl. The Metal
+// --ccd-toi showcase runs the CPU ccd::ConservativeAdvance — the EXACT bit-exact reference the Vulkan
+// --ccd-toi-shot GPU==CPU memcmp already compares against -> the Metal result is byte-identical to the Vulkan
+// GPU result BY CONSTRUCTION. It builds the SAME fixed pair set (straight-approach / receding / tangential /
+// rotating) as the Vulkan --ccd-toi-shot, runs ccd::ConservativeAdvance over it, and writes the SAME
+// PURE-INTEGER 2D top-down golden tests/golden/metal/ccd_toi.png (Mac-baked by the controller — do NOT
+// commit); two runs DIFF 0.0000.
+static int RunCcdToiShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace gjk = hf::sim::gjk;
+    namespace convex = hf::sim::convex;
+    namespace fpx = hf::sim::fpx;
+    namespace ccd = hf::sim::ccd;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+
+    // The single canonical hull (a unit box, half-extent 1), shared by every pair (== the Vulkan config).
+    std::vector<gjk::FxHull> hullSet;
+    hullSet.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0
+
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int)convex::kOne); };
+    auto mover = [&](int x, int y, int z, int vx, int vy, int vz, int wz) {
+        fpx::FxBody b;
+        b.pos = {fi(x), fi(y), fi(z)};
+        b.vel = {fi(vx), fi(vy), fi(vz)};
+        b.angVel = {0, 0, fi(wz)};
+        b.flags = fpx::kFlagDynamic;
+        return b;
+    };
+    auto staticAt = [&](int x, int y, int z) {
+        fpx::FxBody b; b.pos = {fi(x), fi(y), fi(z)}; return b;
+    };
+
+    const fx dt = kOne;
+
+    struct ScenePair { uint32_t a; fpx::FxBody ba; uint32_t b; fpx::FxBody bb; fx dt; };
+    std::vector<ScenePair> scene;
+    scene.push_back({0, mover(0, 0, 0, 4, 0, 0, 0), 0, staticAt(5, 0, 0), dt});   // 0 straight
+    scene.push_back({0, mover(0, 0, 0, -4, 0, 0, 0), 0, staticAt(5, 0, 0), dt});  // 1 receding
+    scene.push_back({0, mover(0, 0, 0, 4, 0, 0, 0), 0, staticAt(0, 0, 5), dt});   // 2 tangential
+    scene.push_back({0, mover(0, 0, 0, 2, 0, 0, 4), 0, staticAt(4, 0, 0), dt});   // 3 rotating
+    const uint32_t kPairCount = (uint32_t)scene.size();
+
+    // The FxToiGpu mirror (== the Vulkan packer): the memcmp-comparable packed result.
+    struct FxToiGpu { int32_t toi; uint32_t hit; uint32_t iterations; uint32_t pad; };
+    auto packToi = [&](const ccd::FxToi& r) {
+        FxToiGpu g; g.toi = r.toi; g.hit = r.hit; g.iterations = r.iterations; g.pad = 0; return g;
+    };
+
+    // CPU ccd::ConservativeAdvance (== the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    std::vector<ccd::FxToi> raw(kPairCount);
+    std::vector<FxToiGpu> results(kPairCount);
+    auto run = [&](std::vector<FxToiGpu>& out) {
+        out.assign((size_t)kPairCount, FxToiGpu{});
+        for (uint32_t i = 0; i < kPairCount; ++i) {
+            ccd::FxToi r = ccd::ConservativeAdvance(hullSet[scene[i].a], scene[i].ba,
+                                                    hullSet[scene[i].b], scene[i].bb, scene[i].dt);
+            raw[i] = r; out[i] = packToi(r);
+        }
+    };
+    run(results);
+
+    uint32_t nHits = 0;
+    for (uint32_t i = 0; i < kPairCount; ++i) if (results[i].hit) ++nHits;
+    std::printf("ccd-toi: {pairs:%u, hits:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU ccd::ConservativeAdvance, byte-identical to the Vulkan GPU result by construction]\n",
+                kPairCount, nHits);
+
+    // determinism: two runs byte-identical.
+    std::vector<FxToiGpu> results2;
+    run(results2);
+    if (results.size() != results2.size() ||
+        std::memcmp(results.data(), results2.data(), results.size() * sizeof(FxToiGpu)) != 0)
+        return fail("ccd-toi: two runs differ (nondeterministic)");
+    std::printf("ccd-toi determinism: two runs BYTE-IDENTICAL\n");
+
+    // correctness: the straight TOI matches the hand-computed 0.75 within band; the rotating pair does NOT
+    // overshoot (Gjk at the loop's OWN final pose reports the pair arrested at contact, NOT a deep overlap).
+    const fx kExpected = (kOne * 3) / 4;
+    const bool straightInBand = (raw[0].hit == 1u) &&
+                                (raw[0].toi <= kExpected + kOne / 64) &&
+                                (raw[0].toi >= kExpected - kOne / 8);
+    fpx::FxBody rPoseA, rPoseB;
+    const ccd::FxToi rRot = ccd::ConservativeAdvancePose(hullSet[scene[3].a], scene[3].ba,
+                                                         hullSet[scene[3].b], scene[3].bb, scene[3].dt,
+                                                         rPoseA, rPoseB);
+    bool rotatingNoOvershoot = true;
+    if (rRot.hit) {
+        const gjk::GjkResult gAt = gjk::Gjk(hullSet[scene[3].a], rPoseA, hullSet[scene[3].b], rPoseB);
+        const fx gapAt = gAt.overlap ? 0 : fpx::FxLength(gAt.separation);
+        rotatingNoOvershoot = (gapAt <= ccd::kContactEps);
+    } else {
+        rotatingNoOvershoot = (rRot.toi == scene[3].dt);
+    }
+    if (!straightInBand || !rotatingNoOvershoot) return fail("ccd-toi: correctness failed");
+    std::printf("ccd-toi correct: {straightInBand:true, rotatingNoOvershoot:true}\n");
+
+    // no false impact: the receding + tangential pairs return hit=0, toi=dt.
+    const bool recedingNoHit = (raw[1].hit == 0u) && (raw[1].toi == scene[1].dt) &&
+                               (raw[2].hit == 0u) && (raw[2].toi == scene[2].dt);
+    if (!recedingNoHit) return fail("ccd-toi: receding/tangential produced a false impact");
+    std::printf("ccd-toi receding: {hit:0}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D top-down (XZ) view as the Vulkan --ccd-toi-shot (identical by
+    // construction). Each pair: the obstacle footprint (grey), the mover start (cool), its swept path to the
+    // TOI pose, and the mover at the TOI pose (hot on a hit / green when it travelled free). ---
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalf = 10;
+    const int kWorldSpan = 2 * kWorldHalf;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + kWorldSpan * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 14; bgra[p * 4 + 1] = 12; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int64_t gx = ((int64_t)wx * kPxPerUnit) >> convex::kFrac;
+        const int64_t gz = ((int64_t)wz * kPxPerUnit) >> convex::kFrac;
+        ix = kMargin + kWorldHalf * kPxPerUnit + (int)gx;
+        iy = kMargin + kWorldHalf * kPxPerUnit + (int)gz;
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto putDot = [&](int ix, int iy, int rad, const Vec3& col) {
+        for (int dy = -rad; dy <= rad; ++dy)
+            for (int dx = -rad; dx <= rad; ++dx)
+                if (dx * dx + dy * dy <= rad * rad) putPx(ix + dx, iy + dy, col);
+    };
+    auto drawHull = [&](const gjk::FxHull& h, const fpx::FxBody& b, int rad, const Vec3& col) {
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 w = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int px, py; worldToPx(w.x, w.z, px, py); putDot(px, py, rad, col);
+        }
+    };
+    const Vec3 obsCol{0.45f, 0.45f, 0.50f};
+    const Vec3 startCol{0.40f, 0.55f, 0.85f};
+    const Vec3 pathCol{0.30f, 0.40f, 0.55f};
+    const Vec3 hitCol{0.95f, 0.45f, 0.20f};
+    const Vec3 freeCol{0.30f, 0.80f, 0.55f};
+    const convex::FxVec3 zeroG{0, 0, 0};
+    for (uint32_t i = 0; i < kPairCount; ++i) {
+        const gjk::FxHull& hA = hullSet[scene[i].a]; const fpx::FxBody& bA = scene[i].ba;
+        const gjk::FxHull& hB = hullSet[scene[i].b]; const fpx::FxBody& bB = scene[i].bb;
+        const bool hit = results[i].hit != 0;
+        const fx toi = results[i].toi;
+        drawHull(hB, bB, 1, obsCol);
+        drawHull(hA, bA, 1, startCol);
+        for (int s = 0; s <= 16; ++s) {
+            const fx ts = (fx)(((int64_t)toi * s) / 16);
+            fpx::FxBody bAt = bA;
+            fpx::IntegrateBodyFull(bAt, zeroG, ts);
+            int px, py; worldToPx(bAt.pos.x, bAt.pos.z, px, py); putDot(px, py, 0, pathCol);
+        }
+        fpx::FxBody bToi = bA;
+        fpx::IntegrateBodyFull(bToi, zeroG, toi);
+        drawHull(hA, bToi, 2, hit ? hitCol : freeCol);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — CCD time-of-impact top-down view (%u pairs, %u hits)\n",
+                outPath, imgW, imgH, kPairCount, nHits);
+    return 0;
+}
+
 // ===== Slice GJ3 — Deterministic General Convex-Hull Contacts THE EPA ALGORITHM showcase (--gjk-epa) ======
 // ====== THE CRUX, slice 3 of FLAGSHIP #22 (hf::sim::gjk). Like GJ1/GJ2, EPA is int64 (the FxNormalize/FxDot/
 // FxCross/fxdiv products), so shaders/gjk_epa.comp is VULKAN-SPIR-V-ONLY (glslc can't parse int64 in HLSL) ->
@@ -52228,6 +52401,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gjk-distance") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gjk_distance.png";
             try { return RunGjkDistanceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ccd-toi <out.png>: render the Deterministic Integer CCD THE TIME-OF-IMPACT PRIMITIVE showcase (Slice
+        // CD1, the BEACHHEAD of FLAGSHIP #24). On Metal this runs the CPU conservative advancement: ccd_toi.comp
+        // is int64/Vulkan-only (glslc can't parse the embedded Gjk + advance fxdiv/FxLength/FxRotate/FxQuat
+        // int64), so Metal runs the CPU ccd::ConservativeAdvance over the SAME fixed pair set (straight/receding/
+        // tangential/rotating) -> the EXACT bit-exact reference the Vulkan --ccd-toi-shot GPU==CPU memcmp
+        // compares against; two runs byte-identical; the straight TOI matches the hand-computed 0.75 + the
+        // rotating TOI does not overshoot. The image golden is a PURE-INTEGER 2D top-down view, identical to the
+        // Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/ccd_toi.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ccd-toi") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ccd_toi.png";
+            try { return RunCcdToiShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gjk-epa <out.png>: render the Deterministic General Convex-Hull Contacts THE EPA ALGORITHM showcase

@@ -703,6 +703,14 @@ hf_add_pure_test(persist_test)
 # Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(gjk_test)
 
+# Deterministic Integer CCD Slice 1 (Slice CD1, the BEACHHEAD of FLAGSHIP #24): the integer TIME-OF-IMPACT
+# primitive (engine/sim/ccd.h) the GPU shaders/ccd_toi.comp.hlsl copies VERBATIM + proves bit-identical.
+# Reuses the gjk/fpx Q16.16 toolbox read-only (via sim/broad.h). Pins ConservativeAdvance (straight-approach
+# TOI within the hand-computed band + non-overlapping at the TOI pose; rotating-approach does not overshoot;
+# receding/tangential -> hit=0,toi=dt; already-overlapping -> toi=0,hit=1), ClosingSpeedBound (conservative,
+# the angular term mandatory), and determinism (two calls byte-equal). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(ccd_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
