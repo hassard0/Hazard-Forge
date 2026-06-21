@@ -489,6 +489,94 @@ int main() {
         check(tumbleEq, "MF4 tumbling tetra: trajectory is two-run BYTE-EQUAL (deterministic)");
     }
 
+    // =================================================================================================
+    // Slice MF5 — LOCKSTEP + ROLLBACK over the hardened stack (the NETCODE HEADLINE). Pins (PURE CPU):
+    //   * (1) LOCKSTEP: RunHullLockstepHardened authority==replica BIT-IDENTICAL (inputs-only re-sim).
+    //   * (2) DETERMINISM: two full RunHullLockstepHardened runs byte-identical (+ snapshot round-trip).
+    //   * (3) ROLLBACK: RunHullRollbackHardened corrected==authority BIT-EXACT.
+    //   * (4) MISPREDICT REAL: the speculative pre-rollback state genuinely DIVERGED from the authority.
+    //   * (5) THE COMMAND STREAM MOVED THE STACK NON-TRIVIALLY (the hardened step + re-manifold actually
+    //     exercised — the converged world differs from the no-command settle; not a frozen no-op).
+    // =================================================================================================
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.dt          = kOne / 60;
+        cfg.solveIters  = 24;
+        cfg.restitution = 0;
+        cfg.slop        = kOne / 64;
+        cfg.beta        = (fx)((int64_t)2 * kOne / 10);
+        cfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp     = kOne;
+        cfg.posIters    = 2;
+        const uint32_t kTicks      = 240u;
+        const uint32_t kRollbackAt = 30u;
+
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn, const fpx::FxQuat& q) {
+            fpx::FxBody b; b.pos = {x, y, z}; b.orient = q;
+            b.invMass = dyn ? kOne : 0; b.flags = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0}; b.angVel = {0, 0, 0}; return b;
+        };
+        const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+        const fpx::FxQuat kTilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};
+        auto buildScene = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false, kIdentity));                  w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            w.bodies.push_back(makeBody(0, (fx)(2.3 * (double)kOne), 0, true, kTilt)); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            w.bodies.push_back(makeBody(0, (fx)(4.5 * (double)kOne), 0, true, kIdentity)); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            return w;
+        };
+        const gjk::HullWorld kInit = buildScene();
+
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{6u,  convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{2 * kOne, 0, 0}},
+            convex::ConvexCommand{10u, convex::kConvexCmdAddImpulse, 1u, convex::FxVec3{kOne, 0, 0}},
+            convex::ConvexCommand{14u, convex::kConvexCmdSetAngVel,  2u, convex::FxVec3{0, 0, kOne / 2}},
+        };
+        std::vector<convex::ConvexCommand> mispredictStream = authStream;
+        mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                         convex::FxVec3{30 * kOne, 0, 0}});
+
+        // (1) LOCKSTEP.
+        bool lockstepIdentical = false;
+        const gjk::HullWorld authority =
+            manifold::RunHullLockstepHardened(kInit, cfg, authStream, kTicks, &lockstepIdentical);
+        const gjk::HullWorld replica = manifold::RunHullLockstepHardened(kInit, cfg, authStream, kTicks);
+        check(lockstepIdentical && gjk::HullBodiesEqual(authority.bodies, replica.bodies),
+              "MF5 RunHullLockstepHardened: authority==replica BIT-IDENTICAL (inputs-only re-sim)");
+
+        // (2) DETERMINISM (+ snapshot round-trip).
+        const gjk::HullWorld authority2 = manifold::RunHullLockstepHardened(kInit, cfg, authStream, kTicks);
+        check(gjk::HullBodiesEqual(authority2.bodies, authority.bodies),
+              "MF5 RunHullLockstepHardened: two runs BYTE-IDENTICAL (deterministic)");
+        {
+            gjk::HullWorld w = manifold::RunHullLockstepHardened(kInit, cfg, authStream, kRollbackAt);
+            const gjk::HullSnapshot snap = gjk::SnapshotHull(w, kRollbackAt);
+            manifold::SimHullTickHardened(w, cfg, authStream, kRollbackAt);   // mutate
+            gjk::RestoreHull(w, snap);
+            check(gjk::HullBodiesEqual(w.bodies, snap.bodies),
+                  "MF5 SnapshotHull/RestoreHull: snapshot round-trip BIT-EXACT");
+        }
+
+        // (3) ROLLBACK + (4) MISPREDICT REAL.
+        bool rollbackCorrected = false, mispredictDiverged = false;
+        const gjk::HullWorld rolledBack =
+            manifold::RunHullRollbackHardened(kInit, cfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                              &rollbackCorrected, &mispredictDiverged);
+        check(rollbackCorrected && gjk::HullBodiesEqual(rolledBack.bodies, authority.bodies),
+              "MF5 RunHullRollbackHardened: corrected==authority BIT-EXACT");
+        check(mispredictDiverged,
+              "MF5 RunHullRollbackHardened: mispredict diverged before rollback (real divergence corrected)");
+
+        // (5) THE COMMAND STREAM MOVED THE STACK NON-TRIVIALLY — the commanded converged world differs from
+        // the no-command settle (the hardened step + re-manifold are actually exercised, not a frozen no-op).
+        const std::vector<convex::ConvexCommand> noCmds;
+        const gjk::HullWorld settled = manifold::RunHullLockstepHardened(kInit, cfg, noCmds, kTicks);
+        check(!gjk::HullBodiesEqual(authority.bodies, settled.bodies),
+              "MF5 command stream MOVED the stack non-trivially (commanded world != no-command settle)");
+    }
+
     if (g_fail == 0) std::printf("manifold_test: ALL PASS\n");
     else std::printf("manifold_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

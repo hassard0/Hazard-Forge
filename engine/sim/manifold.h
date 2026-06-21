@@ -877,5 +877,100 @@ inline void StepHullWorldHardenedN(HullWorld& world, const convex::ConvexStepCon
     for (uint32_t t = 0; t < ticks; ++t) StepHullWorldHardened(world, cfg);
 }
 
+// =========================================================================================================
+// Slice MF5 — Hull Narrowphase Hardening: LOCKSTEP + ROLLBACK over the hardened stack (the NETCODE HEADLINE
+// of FLAGSHIP #25). APPENDED after StepHullWorldHardenedN (MF1-MF4's lines above are BYTE-FROZEN). PURE CPU —
+// NO shader, NO RHI. The direct GJ5/BP5/CD5 twin: the SAME frozen lockstep harness with the step swapped from
+// gjk::StepHullWorld to StepHullWorldHardened (MF4). StepHullWorldHardened is a fully deterministic integer
+// tick whose ONLY mutable replayable state is the bodies vector — the `hulls` are immutable/shared, and the
+// faces, the full inertia tensors, and the per-pair multi-point manifolds are RE-DERIVED each tick from the
+// bodies/hulls (NOT state to snapshot — exactly why the lockstep holds THROUGH the hardened multi-point/full-
+// inertia solve). So MF5 REUSES the frozen gjk:: command/snapshot/equality machinery VERBATIM (no new snapshot
+// type): gjk::ApplyHullCommands, gjk::HullSnapshot/SnapshotHull/RestoreHull/HullBodiesEqual, convex::
+// ConvexCommand. Both backends run THIS identical CPU harness -> the golden is bit-identical BY CONSTRUCTION
+// (cross-vendor 0 px). gjk.h/convex.h/etc + MF1-MF4 BYTE-FROZEN.
+// =========================================================================================================
+
+// ----- SimHullTickHardened(world, cfg, commands, tick): ONE deterministic HARDENED tick with its inputs -----
+// (1) gjk::ApplyHullCommands(world, commands, tick) — this tick's perturbations, in array order, BEFORE the
+// step so the impulse/spin integrates this tick; (2) StepHullWorldHardened(world, cfg) — the MF4 hardened
+// 5-pass tick. The gjk::SimHullTick shape (gjk.h:1335) with StepHullWorld swapped for StepHullWorldHardened,
+// NOTHING else. Pure integer, fixed order -> bit-identical on every peer/platform.
+inline void SimHullTickHardened(HullWorld& world, const convex::ConvexStepConfig& cfg,
+                                const std::vector<convex::ConvexCommand>& commands, uint32_t tick) {
+    gjk::ApplyHullCommands(world, commands, tick);
+    StepHullWorldHardened(world, cfg);
+}
+
+// ----- RunHullLockstepHardened(world0, cfg, commands, ticks): two peers converge from inputs alone ----------
+// THE peer entry point (the gjk::RunHullLockstep control flow, gjk.h:1379, over SimHullTickHardened). Two
+// independent peers (authority + replica) BOTH start from `world0`, BOTH run SimHullTickHardened for `ticks`
+// with the SAME command stream (INPUTS ONLY — no state shared) -> BIT-IDENTICAL by determinism, each
+// re-deriving the multi-point manifolds + the full inertia every tick. Sets *outIdentical (if non-null) to
+// whether the two final body vectors are byte-identical (the make-or-break lockstep proof) + returns the
+// converged AUTHORITY world (for the golden). The peer step order is PINNED.
+inline HullWorld RunHullLockstepHardened(const HullWorld& world0, const convex::ConvexStepConfig& cfg,
+                                         const std::vector<convex::ConvexCommand>& commands, uint32_t ticks,
+                                         bool* outIdentical = nullptr) {
+    HullWorld authority = world0;   // a fresh copy
+    HullWorld replica   = world0;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimHullTickHardened(authority, cfg, commands, t);
+        SimHullTickHardened(replica,   cfg, commands, t);
+    }
+    if (outIdentical) *outIdentical = gjk::HullBodiesEqual(authority.bodies, replica.bodies);
+    return authority;
+}
+
+// ----- RunHullRollbackHardened(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) ----------
+// The rollback harness (the gjk::RunHullRollback control flow, gjk.h:1402, over SimHullTickHardened).
+// (1) advance ticks 0..rollbackAt from `world0` applying authStream; (2) SAVE a gjk::HullSnapshot AT
+// rollbackAt (gjk::SnapshotHull — the body world); (2b) speculatively advance a few ticks (<=3) with the
+// MISPREDICTED stream (a WRONG/extra impulse — the client prediction that diverges), capturing that diverged
+// intermediate; (3) ROLLBACK — gjk::RestoreHull to the snapshot + RE-SIMULATE rollbackAt..ticks with the
+// CORRECT authStream -> the corrected final world. Returns the corrected world; sets *outCorrectedEqAuthority
+// (if non-null) to whether it == RunHullLockstepHardened(world0, cfg, authStream, ticks) byte-for-byte, and
+// *outMispredictDiverged (if non-null) to whether the speculative pre-rollback state DIFFERED from the
+// authority at the same tick (proving a REAL divergence was corrected). cfg + the streams are CONSTANT.
+inline HullWorld RunHullRollbackHardened(const HullWorld& world0, const convex::ConvexStepConfig& cfg,
+                                         const std::vector<convex::ConvexCommand>& authStream,
+                                         const std::vector<convex::ConvexCommand>& mispredictStream,
+                                         uint32_t ticks, uint32_t rollbackAt,
+                                         bool* outCorrectedEqAuthority = nullptr,
+                                         bool* outMispredictDiverged = nullptr) {
+    HullWorld w = world0;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimHullTickHardened(w, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — just the body world).
+    const gjk::HullSnapshot snap = gjk::SnapshotHull(w, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimHullTickHardened(w, cfg, mispredictStream, rollbackAt + s);
+    HullWorld speculative = w;   // the diverged pre-rollback intermediate (for the "real divergence" proof)
+    // (3) ROLLBACK: restore the snapshot (the body world) + re-sim rollbackAt..ticks with the authStream.
+    gjk::RestoreHull(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimHullTickHardened(w, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        HullWorld authAtSpec = world0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimHullTickHardened(authAtSpec, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !gjk::HullBodiesEqual(speculative.bodies, authAtSpec.bodies);
+        if (outCorrectedEqAuthority) {
+            const HullWorld authFinal = RunHullLockstepHardened(world0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = gjk::HullBodiesEqual(w.bodies, authFinal.bodies);
+        }
+    }
+    return w;
+}
+
 }  // namespace manifold
 }  // namespace hf::sim

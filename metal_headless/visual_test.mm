@@ -30758,6 +30758,204 @@ static int RunGjkLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice MF5 — Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (--mf5-lockstep) (the NETCODE
+// HEADLINE of FLAGSHIP #25, the GJ5/BP5/CD5 twin). PURE CPU — NO GPU compute, NO new shader, NO new RHI; the
+// MF5 harness (manifold.h::RunHullLockstepHardened/RunHullRollbackHardened) is header-only integer math, so on
+// Metal it runs the IDENTICAL CPU harness the Vulkan --mf5-lockstep-shot runs on Windows -> the converged
+// authority-world golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS the
+// lockstep evidence). MAXIMAL REUSE: the MF4 StepHullWorldHardened is reused VERBATIM; MF5 only ADDS the command
+// + snapshot/restore + harness (reusing the frozen gjk:: command/snapshot machinery). Builds the SAME hardened-
+// stack scene + the SAME command stream as the Vulkan --mf5-lockstep-shot, runs RunHullLockstepHardened twice +
+// RunHullRollbackHardened once; asserts authority==replica + rollback==authority + mispredicted!=authority
+// BIT-EXACT; renders the converged authority world via the MF4 2D side-view render path. Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/mf5_lockstep.png (baked on the Mac by the controller); two
+// runs DIFF 0.0000. Each peer re-derives the multi-point manifolds + the full inertia each tick (NOT
+// snapshotted) — exactly why the lockstep holds THROUGH the hardened solve.
+static int RunMf5LockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)convex::kOne); };
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+
+    // The deterministic hardened-step config (== the Vulkan --mf5-lockstep-shot, the MF4 stack config).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 24;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.angDamp     = kOne;                            // OFF — the hardened step is the stabilizer
+    kCfg.posIters    = 2;
+    const uint32_t kTicks      = 240u;
+    const uint32_t kRollbackAt = 30u;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn, const fpx::FxQuat& q) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = q;
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        return b;
+    };
+    // THE SCENE (== the Vulkan --mf5-lockstep-shot): a hardened stack (static support + two dynamic boxes).
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+    const fpx::FxQuat kTilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};  // ~0.05 rad about Z
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false, kIdentity));       w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 0 static support
+        w.bodies.push_back(makeBody(0, fd(2.3), 0, true, kTilt));      w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 1 dynamic box A
+        w.bodies.push_back(makeBody(0, fd(4.5), 0, true, kIdentity));  w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));  // 2 dynamic box B (top)
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+    uint32_t kDynamic = 0;
+    for (const auto& b : kInit.bodies) if (b.flags & fpx::kFlagDynamic) ++kDynamic;
+
+    // The scripted authoritative command stream (== the Vulkan --mf5-lockstep-shot, verbatim).
+    const std::vector<convex::ConvexCommand> authStream = {
+        convex::ConvexCommand{6u,  convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{fi(2), 0, 0}},
+        convex::ConvexCommand{10u, convex::kConvexCmdAddImpulse, 1u, convex::FxVec3{fi(1), 0, 0}},
+        convex::ConvexCommand{14u, convex::kConvexCmdSetAngVel,  2u, convex::FxVec3{0, 0, kOne / 2}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+    std::vector<convex::ConvexCommand> mispredictStream = authStream;
+    mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                     convex::FxVec3{fi(30), 0, 0}});
+
+    // === The harness (PURE CPU) ===
+    bool lockstepIdentical = false;
+    const gjk::HullWorld authority =
+        manifold::RunHullLockstepHardened(kInit, kCfg, authStream, kTicks, &lockstepIdentical);
+    const gjk::HullWorld replica = manifold::RunHullLockstepHardened(kInit, kCfg, authStream, kTicks);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    const gjk::HullWorld rolledBack =
+        manifold::RunHullRollbackHardened(kInit, kCfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                          &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP.
+    if (!lockstepIdentical || !gjk::HullBodiesEqual(authority.bodies, replica.bodies))
+        return fail("mf5-lockstep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("mf5-lockstep: {bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL\n",
+                kBodyCount, kTicks, kCommandCount);
+
+    // PROOF (2) DETERMINISM (+ snapshot round-trip).
+    const gjk::HullWorld authority2 = manifold::RunHullLockstepHardened(kInit, kCfg, authStream, kTicks);
+    if (!gjk::HullBodiesEqual(authority2.bodies, authority.bodies))
+        return fail("mf5-lockstep: two runs differ (nondeterministic)");
+    {
+        gjk::HullWorld w = manifold::RunHullLockstepHardened(kInit, kCfg, authStream, kRollbackAt);
+        const gjk::HullSnapshot snap = gjk::SnapshotHull(w, kRollbackAt);
+        manifold::SimHullTickHardened(w, kCfg, authStream, kRollbackAt);
+        gjk::RestoreHull(w, snap);
+        if (!gjk::HullBodiesEqual(w.bodies, snap.bodies))
+            return fail("mf5-lockstep: snapshot round-trip != original");
+    }
+    std::printf("mf5-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK.
+    if (!rollbackCorrected || !gjk::HullBodiesEqual(rolledBack.bodies, authority.bodies))
+        return fail("mf5-lockstep: rollback != authority (misprediction not corrected)");
+    std::printf("mf5-lockstep rollback: corrected==authority BIT-EXACT\n");
+
+    // PROOF (4) mispredict real.
+    if (!mispredictDiverged)
+        return fail("mf5-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("mf5-lockstep mispredict: diverged before rollback (real divergence corrected)\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the converged authority world as the Vulkan
+    // --mf5-lockstep-shot (identical by construction — the same render math + the same monotone-chain outline). ---
+    const gjk::HullWorld& cw = authority;
+    const int kPxPerUnit = 48, kMargin = 24;
+    const int kWorldHalfX = 6, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cw.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 hullCol[2] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.40f, 0.85f, 0.55f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawHullXY(cw.bodies[i], kInit.hulls[i], hullCol[(i - 1) % 2]);
+
+    const gjk::HullStackMeasure ms = gjk::MeasureHullStack(cw);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — mf5 hardened lockstep+rollback converged hull-world side-view "
+                "(%u hulls, %u dynamic, %u ticks, maxSpeed=%d)\n",
+                outPath, imgW, imgH, kBodyCount, kDynamic, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice CD5 — Deterministic Integer CCD LOCKSTEP + ROLLBACK showcase (--ccd-lockstep) (the NETCODE
 // HEADLINE, the 5th slice of FLAGSHIP #24, the BP5/GJ5/CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the CD5 harness (ccd.h::RunCcdLockstep/RunCcdRollback) is header-only integer math, so on
@@ -55055,6 +55253,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mf4-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mf4_stack.png";
             try { return RunMf4StackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mf5-lockstep <out.png>: render the Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (Slice
+        // MF5, the NETCODE HEADLINE of FLAGSHIP #25). PURE CPU — runs the IDENTICAL manifold.h::
+        // RunHullLockstepHardened/RunHullRollbackHardened harness the Vulkan --mf5-lockstep-shot runs, over a
+        // hardened-stack scene + a fixed command stream -> the converged authority world is bit-identical
+        // cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side EXACTLY.
+        if (argc > 1 && std::strcmp(argv[1], "--mf5-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mf5_lockstep.png";
+            try { return RunMf5LockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice
