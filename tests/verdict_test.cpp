@@ -353,6 +353,174 @@ int main() {
               "schedule: swapping move/collect changes the result (order is pinned)");
     }
 
+    // =============================================================================================
+    // Slice VD3 — COMPOSING THE PHYSICS SUBSYSTEM — ONE WORLD TICK. Pure CPU integer. The embedded sim
+    // is the FROZEN warmhull warm+sleep hull world; StepWorld composes the gameplay systems + the sim
+    // via a deterministic bidirectional BodyRef sync. The make-or-break contract: the embedded sim is
+    // NEVER perturbed (byte-identical to a STANDALONE StepWarmSleepHullWorldN over the same scene).
+    // =============================================================================================
+    namespace warmhull = hf::sim::warmhull;
+    namespace gjk      = hf::sim::gjk;
+    {
+        // A shared deterministic warm+sleep config (the WH4 lineage; angDamp OFF).
+        auto makeCfg = []() {
+            const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+            convex::ConvexStepConfig c;
+            c.gravity = FxVec3{0, kGravY, 0};
+            c.dt = kOne / 60; c.solveIters = 8; c.restitution = 0; c.slop = kOne / 64;
+            c.beta = (fx)((int64_t)2 * kOne / 10); c.linDamp = (fx)((int64_t)95 * kOne / 100);
+            c.angDamp = kOne; c.posIters = 4;
+            warmhull::HullSleepConfig sc;
+            sc.warm = c; sc.sleepThreshold = kOne; sc.wakeThreshold = (fx)(2 * (int)kOne); sc.sleepTicks = 30;
+            return sc;
+        };
+        const warmhull::HullSleepConfig kCfg = makeCfg();
+        const verdict::HazardRegion kHazard{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y}; // empty
+        const fx kCollectR = kOne;
+        const uint32_t kTicks = 24u;
+
+        // The composed scene: a static support box (body 0) + a dynamic "player" hull body (body 1)
+        // above it. A player entity bound to body 1; a static-support entity bound to body 0; a couple
+        // of gameplay-only pickups. A kCmdImpulse nudges the player body; gameplay collects a pickup.
+        auto buildSimScene = []() {
+            gjk::HullWorld sim;
+            { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));            // 0 static support
+            { fpx::FxBody b; b.pos={0, (fx)((int64_t)3*kOne), 0}; b.orient={0,0,0,kOne}; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; sim.bodies.push_back(b); }
+            sim.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));            // 1 dynamic player body
+            return sim;
+        };
+        const std::vector<verdict::Command> kStream = {
+            verdict::Command{0u, verdict::kCmdImpulse, 2u /*player entity id*/, V(1,0,0)},
+        };
+        auto runWorld = [&](verdict::VerdictWorld& w, verdict::EntityId& outPlayer) {
+            w.sim = buildSimScene();
+            // entity 1 = static support bound to body 0; entity 2 = player bound to body 1.
+            const verdict::EntityId support = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}});
+            verdict::BindBody(w, support, 0u);
+            // The player is bound to body 1 + driven by the kCmdImpulse (a SIM verb) — NOT by a Velocity2D,
+            // so SyncComponentsToBodies does NOT overwrite the body's sim-evolved velocity (the body is driven
+            // purely by the impulse + the frozen sim -> the embedded sim matches the standalone reference).
+            const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), FxQuat{0,0,0,kOne}});
+            w.reg.add<verdict::Score>(w.handle[player], verdict::Score{0});
+            verdict::BindBody(w, player, 1u);
+            // gameplay-only pickups (unbound) near the player's start so a collect fires.
+            const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,3,0), FxQuat{0,0,0,kOne}});
+            w.reg.add<verdict::Pickup>(w.handle[pk0], verdict::Pickup{5});
+            (void)support; (void)pk0;
+            outPlayer = player;
+            verdict::StepWorldN(w, kStream, 0u, kHazard, player, kCollectR, kCfg, kTicks);
+        };
+
+        // ---- PROOF (1) the composed world is deterministic (whole world + sim TRIPLE two-run equal) ----
+        verdict::VerdictWorld w1, w2; verdict::EntityId p1, p2;
+        runWorld(w1, p1); runWorld(w2, p2);
+        {
+            const verdict::VerdictMeasure m1 = verdict::MeasureVerdict(w1);
+            const verdict::VerdictMeasure m2 = verdict::MeasureVerdict(w2);
+            const bool simEq = warmhull::WarmHullStatesEqual(w1.sim.bodies, w1.cache, w1.sleep,
+                                                             w2.sim.bodies, w2.cache, w2.sleep);
+            check(verdict::VerdictMeasuresEqual(m1, m2) && simEq,
+                  "vd3: StepWorld whole-world + sim TRIPLE two-run BYTE-IDENTICAL");
+            std::printf("vd3-world: {entities:%u, bodies:%zu, ticks:%u} two-run BYTE-IDENTICAL\n",
+                        m1.entities, w1.sim.bodies.size(), kTicks);
+        }
+
+        // ---- PROOF (2) Verdict did NOT perturb the frozen sim: embedded == STANDALONE ----
+        {
+            // The standalone path: build the SAME sim scene + feed the SAME lowered impulse stream
+            // through gjk::ApplyHullCommands BEFORE each StepWarmSleepHullWorld (NO sync, NO gameplay).
+            gjk::HullWorld sa = buildSimScene();
+            warmhull::HullCache saCache;
+            std::vector<warmhull::HullSleepState> saSleep;
+            // The lowered impulse: entity 2 (player) is bound to body 1 -> bodyId 1, kConvexCmdAddImpulse.
+            const std::vector<convex::ConvexCommand> saStream = {
+                convex::ConvexCommand{0u, convex::kConvexCmdAddImpulse, 1u, V(1,0,0)},
+            };
+            for (uint32_t t = 0; t < kTicks; ++t) {
+                gjk::ApplyHullCommands(sa, saStream, t);
+                warmhull::StepWarmSleepHullWorld(sa, saCache, saSleep, kCfg);
+            }
+            const bool unperturbed = warmhull::WarmHullStatesEqual(w1.sim.bodies, w1.cache, w1.sleep,
+                                                                   sa.bodies, saCache, saSleep);
+            check(unperturbed, "vd3: embedded sim == standalone StepWarmSleepHullWorldN (bodies BIT-EXACT)");
+            std::printf("vd3-world: embedded sim == standalone (bodies BIT-EXACT)\n");
+        }
+
+        // ---- PROOF (3) the syncs are pure functions + a body-bound entity tracks its body ----
+        {
+            // Calling each sync twice on the same world is byte-equal (no hidden state).
+            verdict::VerdictWorld wp; verdict::EntityId pp; runWorld(wp, pp);
+            const std::vector<fpx::FxBody> bodiesBefore = wp.sim.bodies;
+            verdict::SyncComponentsToBodies(wp);
+            const std::vector<fpx::FxBody> afterP2B1 = wp.sim.bodies;
+            verdict::SyncComponentsToBodies(wp);
+            const std::vector<fpx::FxBody> afterP2B2 = wp.sim.bodies;
+            const bool p2bPure = gjk::HullBodiesEqual(afterP2B1, afterP2B2);
+            // b2p twice: capture the player Transform2D after each call.
+            verdict::SyncBodiesToComponents(wp);
+            const verdict::Transform2D xf1 = wp.reg.get<verdict::Transform2D>(wp.handle[pp]);
+            verdict::SyncBodiesToComponents(wp);
+            const verdict::Transform2D xf2 = wp.reg.get<verdict::Transform2D>(wp.handle[pp]);
+            const bool b2pPure = (xf1.pos.x == xf2.pos.x && xf1.pos.y == xf2.pos.y && xf1.pos.z == xf2.pos.z);
+            check(p2bPure && b2pPure, "vd3: sync {p2b, b2p} two-call BYTE-EQUAL (pure functions)");
+            // A body-bound entity's Transform2D tracks its bound body's settled pos.
+            const fpx::FxBody& body1 = wp.sim.bodies[1];
+            const bool tracks = (xf2.pos.x == body1.pos.x && xf2.pos.y == body1.pos.y && xf2.pos.z == body1.pos.z);
+            check(tracks, "vd3: body-bound entity Transform2D tracks its bound body pos");
+            std::printf("vd3-world: sync pure {p2b, b2p} two-call BYTE-EQUAL\n");
+            (void)bodiesBefore;
+        }
+
+        // ---- An unbound (kNoBody) entity is a sync no-op (gameplay-only) ----
+        {
+            verdict::VerdictWorld w;
+            w.sim = buildSimScene();
+            const verdict::EntityId go = verdict::SpawnMover(w, verdict::Transform2D{V(7,7,0), FxQuat{0,0,0,kOne}},
+                                                             verdict::Health{0}, verdict::Velocity2D{V(2,2,0)});
+            // unbound BodyRef (SpawnMover leaves it kNoBody) — the sync must not touch any body.
+            const std::vector<fpx::FxBody> before = w.sim.bodies;
+            verdict::SyncComponentsToBodies(w);
+            check(gjk::HullBodiesEqual(before, w.sim.bodies), "vd3: unbound entity is a SyncComponentsToBodies no-op");
+            // And SyncBodiesToComponents must not move the unbound entity's transform.
+            const verdict::Transform2D bxf = w.reg.get<verdict::Transform2D>(w.handle[go]);
+            verdict::SyncBodiesToComponents(w);
+            const verdict::Transform2D axf = w.reg.get<verdict::Transform2D>(w.handle[go]);
+            check(bxf.pos.x == axf.pos.x && bxf.pos.y == axf.pos.y, "vd3: unbound entity is a SyncBodiesToComponents no-op");
+        }
+
+        // ---- The schedule order is pinned: swapping the sync halves changes the result ----
+        {
+            // Run the canonical schedule (push BEFORE step, read-back AFTER step) for ONE tick, vs the
+            // swapped schedule (read-back BEFORE step, push AFTER step). With a nonzero gameplay velocity
+            // driving the body, the canonical path integrates the pushed velocity this tick (body moves);
+            // the swapped path reads the pre-step pose into the transform + pushes too late.
+            auto build = [&](verdict::VerdictWorld& w, verdict::EntityId& player) {
+                w.sim = buildSimScene();
+                player = verdict::SpawnMover(w, verdict::Transform2D{V(0,3,0), FxQuat{0,0,0,kOne}},
+                                             verdict::Health{0}, verdict::Velocity2D{V(3,0,0)});  // a fast +X drive
+                w.reg.add<verdict::Score>(w.handle[player], verdict::Score{0});
+                verdict::BindBody(w, player, 1u);
+            };
+            const std::vector<verdict::Command> empty = {};
+            // canonical
+            verdict::VerdictWorld wc; verdict::EntityId pc; build(wc, pc);
+            verdict::SyncComponentsToBodies(wc);
+            warmhull::StepWarmSleepHullWorld(wc.sim, wc.cache, wc.sleep, kCfg);
+            verdict::SyncBodiesToComponents(wc);
+            const verdict::Transform2D xc = wc.reg.get<verdict::Transform2D>(wc.handle[pc]);
+            // swapped (read-back first, push after the step)
+            verdict::VerdictWorld ws; verdict::EntityId ps; build(ws, ps);
+            verdict::SyncBodiesToComponents(ws);
+            warmhull::StepWarmSleepHullWorld(ws.sim, ws.cache, ws.sleep, kCfg);
+            verdict::SyncComponentsToBodies(ws);
+            const verdict::Transform2D xs = ws.reg.get<verdict::Transform2D>(ws.handle[ps]);
+            check(!(xc.pos.x == xs.pos.x && xc.pos.y == xs.pos.y),
+                  "vd3: swapping the sync halves changes the result (schedule pinned)");
+            (void)empty;
+        }
+    }
+
     if (g_fail == 0) std::printf("verdict_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

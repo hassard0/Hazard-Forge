@@ -467,5 +467,129 @@ inline EntityId SpawnMover(VerdictWorld& world, const Transform2D& xf, const Hea
     return id;
 }
 
+// =================================================================================================
+// Slice VD3 — COMPOSING THE PHYSICS SUBSYSTEM — ONE WORLD TICK (APPEND-ONLY; VD1/VD2 above are
+// BYTE-FROZEN). The 3rd slice of FLAGSHIP #27 (DETERMINISTIC GAMEPLAY / NETCODE, hf::game::verdict).
+//
+// VD1 built the deterministic entity world + the command bus; VD2 the gameplay SYSTEMS on a pinned
+// schedule. VD3 makes it a *physics game*: ONE deterministic StepWorld tick that runs the gameplay
+// systems AND drives the embedded Q16.16 physics sim (the FROZEN warmhull warm+sleep hull world from
+// flagship #26) in a single pinned order, bridged by a deterministic bidirectional BodyRef sync.
+//
+// THE COMPOSITION (the embedded sim is NEVER modified — proof #2 below is the guard):
+//   * SyncComponentsToBodies(world) — for each order[]-bound entity, PUSH its gameplay-driven
+//     Velocity2D into world.sim.bodies[simBodyIndex].vel (gameplay -> sim). FIXED order, integer.
+//   * The sim commands (kCmdImpulse/kCmdSetAngVel) are LOWERED by LowerToHullCommands (VD1) and
+//     applied by gjk::ApplyHullCommands (frozen) BEFORE the step — the ApplyHullCommands-before-step
+//     contract every sim's lockstep tick uses.
+//   * warmhull::StepWarmSleepHullWorld(sim, cache, sleep, cfg) — the FROZEN WH4 step, called verbatim.
+//   * SyncBodiesToComponents(world) — for each order[]-bound entity, READ its settled body
+//     pos/orient back into its Transform2D (sim -> gameplay). FIXED order, integer.
+//
+// PURE CPU INTEGER (Q16.16, the strictest determinism tier, strict 0px): NO new render RHI, NO new
+// shader, NO new compute. warmhull.h / gjk.h / ALL sim headers + ecs.h are BYTE-UNCHANGED; the
+// warmhull step is CALLED verbatim, never re-implemented. VD3 composes EXACTLY ONE sim subsystem.
+// =================================================================================================
+
+// ----- BindBody(world, id, simBodyIndex): bind a gameplay entity to a sim body --------------------
+// Set the entity's BodyRef.simBodyIndex (adding the BodyRef component if absent). After binding, the
+// two syncs (below) push the entity's velocity into world.sim.bodies[simBodyIndex] and read the
+// body's settled pose back. simBodyIndex is a STABLE index into world.sim.bodies (sim bodies are NOT
+// recycled within a match). A dead/unknown id is a deterministic no-op. Pure integer.
+inline void BindBody(VerdictWorld& world, EntityId id, uint32_t simBodyIndex) {
+    auto it = world.handle.find(id);
+    if (it == world.handle.end()) return;          // unknown -> no-op (deterministic)
+    const ecs::Entity e = it->second;
+    if (!world.reg.valid(e)) return;               // dead handle -> no-op
+    if (world.reg.has<BodyRef>(e)) world.reg.get<BodyRef>(e).simBodyIndex = simBodyIndex;
+    else                          world.reg.add<BodyRef>(e, BodyRef{simBodyIndex});
+}
+
+// ----- SyncComponentsToBodies(world): the deterministic gameplay -> sim PUSH --------------------
+// For each entity (in order[] sequence) with a BOUND BodyRef (simBodyIndex != kNoBody AND in range)
+// AND a Velocity2D, WRITE that gameplay-driven velocity into world.sim.bodies[simBodyIndex].vel.
+// Unbound (kNoBody) / out-of-range BodyRefs + entities with no Velocity2D are deterministic no-ops
+// (a gameplay-only entity has no body to drive). FIXED order[] order, pure integer write -> a pure
+// function (calling it twice on the same world yields byte-equal sim bodies — proof #3).
+inline void SyncComponentsToBodies(VerdictWorld& world) {
+    const size_t nBodies = world.sim.bodies.size();
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const EntityId id = world.order[i];
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) continue;
+        const ecs::Entity e = it->second;
+        if (!world.reg.valid(e)) continue;
+        if (!world.reg.has<BodyRef>(e)) continue;
+        const uint32_t bi = world.reg.get<BodyRef>(e).simBodyIndex;
+        if (bi == kNoBody || (size_t)bi >= nBodies) continue;   // unbound / out-of-range -> no-op
+        if (!world.reg.has<Velocity2D>(e)) continue;            // no gameplay velocity -> no-op
+        world.sim.bodies[(size_t)bi].vel = world.reg.get<Velocity2D>(e).vel;   // gameplay drives the body
+    }
+}
+
+// ----- SyncBodiesToComponents(world): the deterministic sim -> gameplay READ-BACK ----------------
+// For each entity (in order[] sequence) with a BOUND BodyRef (simBodyIndex != kNoBody AND in range)
+// AND a Transform2D, READ the settled body's pos/orient back into that Transform2D. Unbound /
+// out-of-range BodyRefs + entities with no Transform2D are deterministic no-ops. FIXED order[]
+// order, pure integer copy -> a pure function (proof #3): a body-bound entity's Transform2D tracks
+// its bound body's settled pos.
+inline void SyncBodiesToComponents(VerdictWorld& world) {
+    const size_t nBodies = world.sim.bodies.size();
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const EntityId id = world.order[i];
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) continue;
+        const ecs::Entity e = it->second;
+        if (!world.reg.valid(e)) continue;
+        if (!world.reg.has<BodyRef>(e)) continue;
+        const uint32_t bi = world.reg.get<BodyRef>(e).simBodyIndex;
+        if (bi == kNoBody || (size_t)bi >= nBodies) continue;   // unbound / out-of-range -> no-op
+        if (!world.reg.has<Transform2D>(e)) continue;           // no transform to write -> no-op
+        Transform2D& xf = world.reg.get<Transform2D>(e);
+        xf.pos    = world.sim.bodies[(size_t)bi].pos;           // read the settled body pose back
+        xf.orient = world.sim.bodies[(size_t)bi].orient;
+    }
+}
+
+// ----- StepWorld(world, commands, tick, cfg): the FIXED pinned composed world tick ----------------
+// ONE deterministic world tick composing the gameplay systems AND the embedded warm+sleep hull sim.
+// THE SCHEDULE ORDER IS FIXED AND DOCUMENTED — commands + tick++ applied EXACTLY ONCE (this factors
+// StepGameplay's body so it does NOT double-apply commands or double-increment tick):
+//   1. ApplyCommands(world, commands, tick)              — the VD1 command bus (BEFORE the systems)
+//   2. SystemMovement / SystemDamage / SystemCollect     — the VD2 gameplay systems (gameplay FIRST)
+//   3. SyncComponentsToBodies(world)                     — gameplay -> sim PUSH (velocities)
+//   4. LowerToHullCommands -> gjk::ApplyHullCommands     — the lowered sim commands, BEFORE the step
+//   5. warmhull::StepWarmSleepHullWorld(sim,cache,sleep) — the FROZEN WH4 step, VERBATIM
+//   6. SyncBodiesToComponents(world)                     — sim -> gameplay READ-BACK (settled pose)
+//   7. ++world.tick                                      — advance the world clock (ONCE)
+// Gameplay runs BEFORE the sim so a collected pickup / moved player is reflected before the sim reads
+// bodies; the sync halves are pinned (swapping them changes the result). The embedded sim is NEVER
+// perturbed (the sync only reads/writes body fields; the step is verbatim — proof #2). Pure integer,
+// FIXED order -> bit-identical CPU/Vulkan/Metal by construction.
+inline void StepWorld(VerdictWorld& world, const std::vector<Command>& commands, uint32_t tick,
+                      const HazardRegion& hazard, EntityId player, fx collectRadius,
+                      const warmhull::HullSleepConfig& cfg) {
+    ApplyCommands(world, commands, tick);            // 1. the command bus (VD1) — applied ONCE
+    SystemMovement(world);                            // 2a. movement (VD2)
+    SystemDamage(world, hazard);                      // 2b. hazard damage (VD2)
+    SystemCollect(world, player, collectRadius);      // 2c. collect (sees the moved player) (VD2)
+    SyncComponentsToBodies(world);                    // 3. gameplay -> sim PUSH
+    const std::vector<convex::ConvexCommand> hullCmds = LowerToHullCommands(world, commands, tick);
+    gjk::ApplyHullCommands(world.sim, hullCmds, tick);  // 4. the lowered sim commands, BEFORE the step
+    warmhull::StepWarmSleepHullWorld(world.sim, world.cache, world.sleep, cfg);  // 5. FROZEN WH4 step
+    SyncBodiesToComponents(world);                    // 6. sim -> gameplay READ-BACK
+    ++world.tick;                                     // 7. advance the world clock (ONCE)
+}
+
+// ----- StepWorldN(world, commands, tick0, ..., ticks): run `ticks` composed world ticks ----------
+// Advance the composed world `ticks` steps from tick0 (each StepWorld applies the commands of its own
+// tick + steps the sim once). The gameplay state + the sim TRIPLE (bodies/cache/sleep) carry across.
+inline void StepWorldN(VerdictWorld& world, const std::vector<Command>& commands, uint32_t tick0,
+                       const HazardRegion& hazard, EntityId player, fx collectRadius,
+                       const warmhull::HullSleepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t)
+        StepWorld(world, commands, tick0 + t, hazard, player, collectRadius, cfg);
+}
+
 }  // namespace verdict
 }  // namespace hf::game
