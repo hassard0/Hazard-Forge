@@ -727,6 +727,101 @@ int main() {
         check(moved, "BP5: the command stream moved the pile non-trivially (re-broadphase exercised)");
     }
 
+    // ===== Slice BP6 — Deterministic Integer Broadphase: THE LIT 3D RENDER CAPSTONE (the money-shot) =====
+    // PURE CPU (render-only float bridge). BroadToRenderInstances delegates to the FROZEN GJ6
+    // gjk::HullToRenderInstances. Over the BP4/BP5 broadphase-settled mixed-hull pile, this PINS:
+    //   * PROVENANCE: two BroadToRenderInstances calls on the same world are byte-equal (a pure function of
+    //     the bit-exact world) AND == gjk::HullToRenderInstances (the verbatim delegate).
+    //   * the hull/triangle counts are correct (every meshed body present; triangles == verts/3 > 0).
+    //   * a render of the broadphase-settled world vs a PERTURBED world DIFFER (the render tracks the sim).
+    {
+        namespace gjk = hf::sim::gjk;
+        namespace convex = hf::sim::convex;
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+
+        // The deterministic step config (== the BP4/BP5 config / the --broad-render showcase).
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        broad::BroadStepConfig bcfg;
+        bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        bcfg.cfg.dt          = kOne / 60;
+        bcfg.cfg.solveIters  = 20;
+        bcfg.cfg.restitution = 0;
+        bcfg.cfg.slop        = kOne / 64;
+        bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        bcfg.cfg.linDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+        bcfg.cfg.angDamp     = (fx)((int64_t)5 * kOne / 100);   // 0.05
+        bcfg.cfg.posIters    = 4;
+        bcfg.cellSize        = kOne * 4;
+        const uint32_t kTicks = 200u;
+
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            b.radius  = 0;
+            return b;
+        };
+        const int kGrid = 7;
+        // THE SCENE (== the BP4 mixed-hull scene + the --broad-render showcase): a static FLOOR (box half-extent
+        // 4) + a 7x7 grid of dynamic MIXED hulls (tetra/octa/wedge/box) on a 1.2 spacing so the WHOLE 7x7 grid
+        // (spans +/-3.6) rests ON the +/-4 floor (50 bodies — the broadphase-settled render pile).
+        auto buildScene = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));  // 0 floor
+            int idx = 0;
+            for (int gz = 0; gz < kGrid; ++gz)
+                for (int gx = 0; gx < kGrid; ++gx) {
+                    const fx x = (fx)((int64_t)(gx - kGrid / 2) * 12 * kOne / 10);   // 1.2 spacing
+                    const fx z = (fx)((int64_t)(gz - kGrid / 2) * 12 * kOne / 10);
+                    w.bodies.push_back(makeBody(x, fd(1.7), z, true));
+                    switch (idx & 3) {
+                        case 0: w.hulls.push_back(gjk::MakeTetra(fd(0.6))); break;
+                        case 1: w.hulls.push_back(gjk::MakeOcta(fd(0.55))); break;
+                        case 2: w.hulls.push_back(gjk::MakeWedge(fd(0.55), fd(0.55), fd(0.55))); break;
+                        default: w.hulls.push_back(gjk::MakeBox(fd(0.5), fd(0.5), fd(0.5))); break;
+                    }
+                    ++idx;
+                }
+            return w;
+        };
+
+        // Settle the broadphase-driven mixed-hull pile (the bit-exact BP4 step).
+        gjk::HullWorld world = buildScene();
+        broad::StepHullWorldBPN(world, bcfg, kTicks);
+
+        // ----- PROVENANCE: two BroadToRenderInstances calls are byte-equal AND == the verbatim GJ6 delegate ----
+        const gjk::HullRenderMesh soup    = broad::BroadToRenderInstances(world);
+        const gjk::HullRenderMesh soup2   = broad::BroadToRenderInstances(world);
+        const gjk::HullRenderMesh gjkSoup = gjk::HullToRenderInstances(world);
+        check(gjk::HullRenderMeshEqual(soup, soup2),
+              "BP6: BroadToRenderInstances provenance (two calls byte-equal)");
+        check(gjk::HullRenderMeshEqual(soup, gjkSoup),
+              "BP6: BroadToRenderInstances == gjk::HullToRenderInstances (the verbatim GJ6 delegate)");
+
+        // ----- the hull/triangle counts are correct -----
+        check(soup.triangles == (uint32_t)(soup.verts.size() / 3),
+              "BP6: triangle count == verts/3");
+        check(soup.triangles > 0 && !soup.verts.empty(),
+              "BP6: the settled pile produced a non-empty triangle soup");
+        // every body is a canonical hull (tetra/octa/wedge/box) so each meshes -> the soup is non-trivial.
+        // 49 dynamic + 1 floor; the smallest per-hull tri count is 4 (tetra), so triangles >= bodies.
+        check(soup.triangles >= (uint32_t)world.bodies.size(),
+              "BP6: every body contributed faces (triangles >= body count)");
+
+        // ----- a render of the settled world vs a PERTURBED world DIFFER (the render tracks the sim) -----
+        gjk::HullWorld perturbed = world;
+        // nudge one dynamic body's position by a clearly-visible amount (render is a pure function of pos/orient).
+        perturbed.bodies[1].pos.x += fi(1);
+        const gjk::HullRenderMesh perturbedSoup = broad::BroadToRenderInstances(perturbed);
+        check(!gjk::HullRenderMeshEqual(soup, perturbedSoup),
+              "BP6: a render of a perturbed world DIFFERS from the settled world (render tracks the sim)");
+    }
+
     if (g_fail == 0) std::printf("broad_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

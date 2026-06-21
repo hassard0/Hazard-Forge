@@ -906,5 +906,25 @@ inline gjk::HullWorld RunBroadRollback(const gjk::HullWorld& world0, const Broad
     return w;
 }
 
+// =========================================================================================================
+// Slice BP6 — Deterministic Integer Broadphase: THE LIT 3D RENDER CAPSTONE (the money-shot). APPENDED after
+// BP5's RunBroadRollback (BP1-BP5's lines above are BYTE-FROZEN). The 6th and FINAL slice of FLAGSHIP #23.
+// PURE-FUNCTION render-only float bridge — NO shader, NO RHI. BP4 settles the broadphase-driven mixed-hull
+// pile (StepHullWorldBPN); BP6 renders that bit-exact gjk::HullWorld as LIT 3D polyhedra. Because the settled
+// world is a gjk::HullWorld, the whole render bridge is the FROZEN GJ6 one — BroadToRenderInstances delegates
+// VERBATIM to gjk::HullToRenderInstances (the FC6/GJ6 delegate idiom). The render is the ONE FLOAT crossing,
+// OUTSIDE the bit-exact integer loop; two calls on the same world produce byte-equal verts (the provenance
+// contract, gjk::HullRenderMeshEqual is the memcmp). MATTE (the GJ6 material) dodges the iridescence trap.
+
+// ----- BroadToRenderInstances(world): the spec-named entry — the render payload for the --broad-render
+// showcase. A ONE-LINE delegate to the BYTE-FROZEN gjk::HullToRenderInstances (the settled HullWorld -> a
+// FLOAT world-space TRIANGLE SOUP: per-canonical-hull face meshes transformed by each body's FxToFloat(pos)+
+// unit-quaternion rotation, per-triangle flat outward normals, per-hull-type matte colors). Provided in
+// broad:: for namespace symmetry; the actual mesh comes from the byte-unchanged GJ6 helper. A PURE FUNCTION of
+// the bit-exact world (two calls byte-equal — the provenance contract the showcase asserts). Render-only float.
+inline gjk::HullRenderMesh BroadToRenderInstances(const gjk::HullWorld& world) {
+    return gjk::HullToRenderInstances(world);
+}
+
 }  // namespace broad
 }  // namespace hf::sim
