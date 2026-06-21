@@ -438,6 +438,76 @@ int main() {
         check(ms.maxSpeed < kOne * 2, "CCD slow scene: the body came to REST");
     }
 
+    // ===== Slice CD4 — A BULLET THROUGH A THIN WALL STOPS (the new-physics HEADLINE beat) ===================
+    // The dedicated bullet-wall scene + the impact measurement + the discrete control. MakeBulletWallScene builds
+    // the expected wall + fast projectile (per-tick travel >> wall thickness); StepHullWorldCCDN over it ->
+    // tunneled=false (the projectile arrested on the approach side); the discrete broad::StepHullWorldBP over the
+    // SAME scene -> tunneled=true (the control); deterministic.
+
+    // === (CD4.1) MakeBulletWallScene builds the expected geometry: a fast +X projectile (body 0) + a thin static
+    // wall (body 1) whose per-tick travel (|vel|*kBulletDt) is MANY times the wall thickness. ===
+    {
+        const gjk::HullWorld w = ccd::MakeBulletWallScene();
+        check(w.bodies.size() == 5, "bullet-wall scene has the 5 fixed bodies (projectile/wall/2 drops/floor)");
+        // body 0 = the fast DYNAMIC projectile aimed +X.
+        check(convex::IsDynamic(w.bodies[0]), "bullet-wall body 0 (projectile) is dynamic");
+        check(w.bodies[0].vel.x > 0, "bullet-wall projectile moves in +X");
+        // body 1 = the thin STATIC wall (invMass 0, no dynamic flag).
+        check(!convex::IsDynamic(w.bodies[1]), "bullet-wall body 1 (wall) is static");
+        check(w.bodies[1].pos.x > w.bodies[0].pos.x, "bullet-wall wall is ahead of the projectile on +X");
+        // The per-tick travel >> the wall thickness (the guaranteed-tunnel-for-discrete condition). The wall's
+        // X half-extent is the max |localVert.x| over its hull verts; the projectile's per-tick travel is
+        // |vel|*dt. Assert travel is at least 5x the FULL wall thickness (2 * half-extent).
+        fx wallHalfX = 0;
+        for (uint32_t v = 0; v < w.hulls[1].count; ++v) {
+            const fx ax = w.hulls[1].verts[v].x < 0 ? -w.hulls[1].verts[v].x : w.hulls[1].verts[v].x;
+            if (ax > wallHalfX) wallHalfX = ax;
+        }
+        const fx travel = fpx::fxmul(w.bodies[0].vel.x, ccd::kBulletDt);   // |vel|*dt (vel is +X only)
+        check(travel > fpx::fxmul(wallHalfX * 2, FromInt(5)),
+              "bullet-wall per-tick travel is >> the wall thickness (a guaranteed discrete tunnel)");
+    }
+
+    // === (CD4.2) THE HEADLINE + THE DISCRETE CONTROL: StepHullWorldCCDN over MakeBulletWallScene arrests the
+    // projectile (tunneled=false); the discrete broad::StepHullWorldBP over the SAME scene TUNNELS it through
+    // (tunneled=true). The two final states DIFFER. ===
+    {
+        const ccd::CcdStepConfig cfg = ccd::MakeBulletWallConfig();
+        const uint32_t kTicks = 6;
+
+        gjk::HullWorld ccdW = ccd::MakeBulletWallScene();
+        ccd::StepHullWorldCCDN(ccdW, cfg, kTicks);
+        const ccd::BulletMeasure ccdM = ccd::MeasureBullet(ccdW, 1, 0);
+        check(ccdM.tunneled == 0u, "CCD bullet-wall: the projectile did NOT tunnel (arrested on the near side)");
+        check(ccdW.bodies[0].pos.x < ccdW.bodies[1].pos.x,
+              "CCD bullet-wall: the projectile centre is on the APPROACH side of the wall");
+
+        gjk::HullWorld disW = ccd::MakeBulletWallScene();
+        broad::StepHullWorldBPN(disW, cfg.bcfg, kTicks);
+        const ccd::BulletMeasure disM = ccd::MeasureBullet(disW, 1, 0);
+        check(disM.tunneled == 1u,
+              "discrete bullet-wall: broad::StepHullWorldBP TUNNELS the projectile through the wall");
+
+        check(ccdM.arrestX != disM.arrestX, "CCD and discrete bullet-wall final states DIFFER");
+
+        // The impactTick is reported (1-based, within the stepped ticks) for the CCD arrest.
+        gjk::HullWorld itW = ccd::MakeBulletWallScene();
+        const uint32_t impactTick = ccd::StepBulletImpactTick(itW, cfg, 1, 0, kTicks);
+        check(impactTick > 0u && impactTick <= kTicks, "CCD bullet-wall: impactTick is within the stepped ticks");
+        check(ccd::MeasureBullet(itW, 1, 0).tunneled == 0u, "CCD bullet-wall (impact-tick path): still no tunnel");
+    }
+
+    // === (CD4.3) DETERMINISM: two StepHullWorldCCDN runs over MakeBulletWallScene are byte-identical. ===
+    {
+        const ccd::CcdStepConfig cfg = ccd::MakeBulletWallConfig();
+        gjk::HullWorld a = ccd::MakeBulletWallScene(); ccd::StepHullWorldCCDN(a, cfg, 6);
+        gjk::HullWorld b = ccd::MakeBulletWallScene(); ccd::StepHullWorldCCDN(b, cfg, 6);
+        bool eq = (a.bodies.size() == b.bodies.size());
+        for (size_t i = 0; i < a.bodies.size() && eq; ++i)
+            if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(fpx::FxBody)) != 0) eq = false;
+        check(eq, "bullet-wall step determinism: two runs BYTE-IDENTICAL");
+    }
+
     if (g_fail == 0) std::printf("ccd_test: ALL PASS\n");
     else std::printf("ccd_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

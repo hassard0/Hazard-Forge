@@ -650,5 +650,132 @@ inline CcdMeasure MeasureCcd(const gjk::HullWorld& world) {
     return ms;
 }
 
+// ===== Slice CD4 — A BULLET THROUGH A THIN WALL STOPS (the new-physics HEADLINE beat) =======================
+// CD1-CD3 built the time-of-impact primitive, the swept-AABB broadphase, and the substepped CCD world step
+// (proven byte-identical + no-tunnel vs the discrete step). CD4 is the money-shot DEMONSTRATION: a fast
+// projectile fired at a thin static wall is ARRESTED at the wall's near face — the per-tick travel (|vel|*dt) is
+// MANY times the wall thickness, so a DISCRETE solver (broad::StepHullWorldBP) steps the projectile from before
+// the wall to past it in one move (a guaranteed tunnel), while the CCD step (StepHullWorldCCD) stops it exactly
+// at impact, deterministically and bit-identically CPU<->Vulkan<->Metal. CD4 REUSES CD3's StepHullWorldCCD +
+// ccd_step.comp ENTIRELY — it adds ONLY the dedicated bullet-wall SCENE + the impact measurement + the
+// side-by-side discrete control. NO new shader, NO new RHI. APPEND-only (CD1-CD3 byte-frozen).
+//
+// CAVEAT (honest, in scope): the projectile speed is chosen below the maxSubsteps budget (a projectile fast
+// enough to exceed the budget can still tunnel — a documented deterministic limit, the CD3 lineage); the CD1-CD3
+// within-band caveats are inherited. Convex hulls only.
+
+// ----- MakeBulletWallScene(): the deterministic bullet-wall world. A THIN static WALL (a box hull, small
+// thickness along the projectile's +X travel axis, large in Y/Z) centred at x=+5; a fast DYNAMIC PROJECTILE (a
+// small box) at x=0 with a +X velocity whose per-tick travel (|vel|*dt) is MANY times the wall thickness; plus a
+// wide static FLOOR + a couple of slow drops for context. Body indices are FIXED:
+//   0 = projectile (dynamic, fast +X), 1 = thin wall (static), 2-3 = slow drops (dynamic), 4 = floor (static).
+// The PROJECTILE/WALL geometry matches the showcase + the test (one canonical scene). All integer, fixed.
+// (The dt the scene is intended to be stepped at is kBulletDt — a big tick so |vel|*dt >> the wall thickness.)
+inline gjk::HullWorld MakeBulletWallScene() {
+    const fx kOneL = convex::kOne;
+    auto fi   = [&](int v)    { return (fx)((int64_t)v * (int64_t)kOneL); };
+    auto fd   = [&](double v) { return (fx)(v * (double)kOneL); };
+    auto from = [&](int v)    { return (fx)((int64_t)v << convex::kFrac); };
+
+    auto body = [&](fx x, fx y, fx z, fx vx, bool dyn) {
+        FxBody b;
+        b.pos    = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOneL};
+        b.invMass = dyn ? kOneL : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel    = {vx, 0, 0};
+        b.angVel = {0, 0, 0};
+        b.radius = 0;
+        return b;
+    };
+
+    gjk::HullWorld w;
+    // 0 = the fast PROJECTILE: a small box at x=0 moving +X at 100 u/s. At the intended dt=1/10 the per-tick
+    // travel is 10 world units — ~50x the 0.2-thick wall (a guaranteed discrete tunnel).
+    w.bodies.push_back(body(0, 0, 0, from(100), true));
+    w.hulls.push_back(gjk::MakeBox(fd(0.4), fd(0.4), fd(0.4)));
+    // 1 = the THIN static WALL: a box centred at x=5, half-extent 0.1 on X (0.2 thick), tall on Y/Z.
+    w.bodies.push_back(body(from(5), 0, 0, 0, false));
+    w.hulls.push_back(gjk::MakeBox(fd(0.1), fi(2), fi(2)));
+    // 2-3 = a couple of SLOW drops for context (no horizontal motion; they fall + settle on the floor).
+    w.bodies.push_back(body(from(-3), fd(1.7), 0, 0, true));
+    w.hulls.push_back(gjk::MakeBox(fd(0.5), fd(0.5), fd(0.5)));
+    w.bodies.push_back(body(from(-3), fd(3.0), 0, 0, true));
+    w.hulls.push_back(gjk::MakeOcta(fd(0.55)));
+    // 4 = a wide static FLOOR (box-hull half-extent 4) for the slow drops.
+    w.bodies.push_back(body(0, from(-2), 0, 0, false));
+    w.hulls.push_back(gjk::MakeBox(fi(4), kOneL, fi(4)));
+    return w;
+}
+
+// kBulletDt: the timestep MakeBulletWallScene is intended to be stepped at — a BIG tick (1/10 s) so the
+// projectile's per-tick travel (|vel|*dt = 10 world units) is ~50x the 0.2-thick wall: a guaranteed tunnel for
+// the discrete solver, the headline the CCD step prevents.
+inline constexpr fx kBulletDt = convex::kOne / 10;
+
+// MakeBulletWallConfig(): the CcdStepConfig the bullet-wall scene is stepped at — a PURE HORIZONTAL shot (zero
+// gravity so the projectile travels straight at the wall along +X) with dt = kBulletDt and the CD3 settling
+// params. maxSubsteps is the CD3 budget (8) — the projectile speed is chosen below it, so the CCD step arrests
+// it rather than tunneling (the documented deterministic limit).
+inline CcdStepConfig MakeBulletWallConfig() {
+    CcdStepConfig c;
+    c.bcfg.cfg.gravity     = convex::FxVec3{0, 0, 0};   // pure horizontal shot — isolate the tunnel mechanism
+    c.bcfg.cfg.dt          = kBulletDt;
+    c.bcfg.cfg.solveIters  = 20;
+    c.bcfg.cfg.restitution = 0;
+    c.bcfg.cfg.slop        = convex::kOne / 64;
+    c.bcfg.cfg.beta        = (fx)((int64_t)4 * convex::kOne / 10);    // 0.4
+    c.bcfg.cfg.linDamp     = (fx)((int64_t)90 * convex::kOne / 100);  // 0.90
+    c.bcfg.cfg.angDamp     = (fx)((int64_t)5 * convex::kOne / 100);   // 0.05
+    c.bcfg.cfg.posIters    = 4;
+    c.bcfg.cellSize        = (fx)((int64_t)64 << convex::kFrac);      // >= the max swept-AABB diameter
+    c.maxSubsteps          = 8;
+    return c;
+}
+
+// ----- BulletMeasure: the deterministic bullet-wall impact summary the showcase/test asserts. `tunneled` = did
+// the projectile pass through to the wall's FAR face (its centre on the far side of the wall centre)? `impactTick`
+// = the FIRST tick (1-based) at which the projectile's centre is within an impact band of the wall's near face
+// (the arrest tick; 0 == never reached the wall within the stepped ticks). `arrestX` = the projectile's final
+// centre x (the arrested pose). A PURE function of the inputs.
+struct BulletMeasure {
+    uint32_t tunneled    = 0;   // 0/1 — is the projectile past the wall's FAR face? (the headline: CCD -> 0)
+    uint32_t impactTick  = 0;   // the 1-based tick at which the projectile arrested at the wall (0 = none)
+    fx       arrestX     = 0;   // the projectile's final centre x (the arrested-at-wall pose)
+};
+
+// MeasureBullet(world, wallIndex, projectileIndex): given a stepped bullet-wall world, report whether the
+// projectile TUNNELED — its centre x past the wall centre x (the far side). The arrest pose is the projectile's
+// current centre. tunneled iff projectileCentreX > wallCentreX (it passed the wall). PURE integer.
+inline BulletMeasure MeasureBullet(const gjk::HullWorld& world, uint32_t wallIndex, uint32_t projectileIndex) {
+    BulletMeasure m;
+    const fx wallX = world.bodies[wallIndex].pos.x;
+    const fx projX = world.bodies[projectileIndex].pos.x;
+    m.arrestX  = projX;
+    m.tunneled = (projX > wallX) ? 1u : 0u;
+    return m;
+}
+
+// StepBulletImpactTick(world, cfg, wallIndex, projectileIndex, ticks): step the bullet-wall world `ticks` ticks
+// with StepHullWorldCCD, returning the 1-based tick at which the projectile FIRST comes to rest against the
+// wall (its centre stops advancing toward the wall AND it has not tunneled) — the impactTick — or 0 if it never
+// arrested. The world is mutated to its final stepped state. Pure integer, deterministic. Used to populate
+// BulletMeasure::impactTick for the showcase/test (the headline {tunneled:false, impactTick:<T>} line).
+inline uint32_t StepBulletImpactTick(gjk::HullWorld& world, const CcdStepConfig& cfg,
+                                     uint32_t wallIndex, uint32_t projectileIndex, uint32_t ticks) {
+    const fx wallX = world.bodies[wallIndex].pos.x;
+    uint32_t impactTick = 0;
+    fx prevX = world.bodies[projectileIndex].pos.x;
+    for (uint32_t t = 0; t < ticks; ++t) {
+        StepHullWorldCCD(world, cfg);
+        const fx nowX = world.bodies[projectileIndex].pos.x;
+        // The FIRST tick the projectile stops advancing toward the wall (its +X progress halts) on the near side
+        // -> the arrest tick. nowX <= prevX (no further +X progress) AND it has not passed the wall centre.
+        if (impactTick == 0 && nowX <= prevX && nowX < wallX) impactTick = t + 1u;
+        prevX = nowX;
+    }
+    return impactTick;
+}
+
 }  // namespace ccd
 }  // namespace hf::sim

@@ -480,6 +480,8 @@ int main() {
             bool sawCcdSweptFeature = false;
             // Slice CD3: the deterministic-ccd-step capability is advertised.
             bool sawCcdStepFeature = false;
+            // Slice CD4: the deterministic-ccd-bullet capability is advertised.
+            bool sawCcdBulletFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -698,6 +700,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-ccd-toi") sawCcdToiFeature = true;
                     if (AsString(el->value) == "deterministic-ccd-swept") sawCcdSweptFeature = true;
                     if (AsString(el->value) == "deterministic-ccd-step") sawCcdStepFeature = true;
+                    if (AsString(el->value) == "deterministic-ccd-bullet") sawCcdBulletFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -891,6 +894,7 @@ int main() {
             check(sawCcdToiFeature, "engine.features includes deterministic-ccd-toi");
             check(sawCcdSweptFeature, "engine.features includes deterministic-ccd-swept");
             check(sawCcdStepFeature, "engine.features includes deterministic-ccd-step");
+            check(sawCcdBulletFeature, "engine.features includes deterministic-ccd-bullet");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1224,6 +1228,8 @@ int main() {
         bool sawCcdSweptShot = false;
         // Slice CD3: the --ccd-step-shot showcase flag is listed in the showcase manifest.
         bool sawCcdStepShot = false;
+        // Slice CD4: the --ccd-bullet-shot showcase flag is listed in the showcase manifest.
+        bool sawCcdBulletShot = false;
         // Slice GJ4: the --gjk-settle-shot showcase flag is listed in the showcase manifest.
         bool sawGjkSettleShot = false;
         // Slice GJ5: the --gjk-lockstep-shot showcase flag is listed in the showcase manifest.
@@ -1451,6 +1457,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--ccd-toi-shot") sawCcdToiShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ccd-swept-shot") sawCcdSweptShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ccd-step-shot") sawCcdStepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ccd-bullet-shot") sawCcdBulletShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-settle-shot") sawGjkSettleShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-lockstep-shot") sawGjkLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gjk-render-shot") sawGjkRenderShot = true;
@@ -1643,6 +1650,7 @@ int main() {
         check(sawCcdToiShot, "showcases manifest includes --ccd-toi-shot");
         check(sawCcdSweptShot, "showcases manifest includes --ccd-swept-shot");
         check(sawCcdStepShot, "showcases manifest includes --ccd-step-shot");
+        check(sawCcdBulletShot, "showcases manifest includes --ccd-bullet-shot");
         check(sawGjkSettleShot, "showcases manifest includes --gjk-settle-shot");
         check(sawGjkLockstepShot, "showcases manifest includes --gjk-lockstep-shot");
         check(sawGjkRenderShot, "showcases manifest includes --gjk-render-shot");

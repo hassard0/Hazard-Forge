@@ -29884,6 +29884,152 @@ static int RunCcdStepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CD4 — Deterministic Integer CCD A BULLET THROUGH A THIN WALL STOPS showcase (--ccd-bullet) =======
+// (the 4th slice + THE HEADLINE BEAT of FLAGSHIP #24, hf::sim::ccd). The full CCD step is int64 (the embedded
+// Gjk TOI loop + the GJK/EPA resolve + the Support-based swept AABB), so shaders/ccd_step.comp is
+// VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's hf_gen_msl list; on Metal the
+// --ccd-bullet showcase runs the CPU ccd::StepHullWorldCCDN — the EXACT bit-exact reference the Vulkan
+// --ccd-bullet-shot GPU==CPU memcmp already compares against -> byte-identical to the Vulkan GPU result BY
+// CONSTRUCTION (the ccd_step.comp REUSED VERBATIM — NO new shader; the bullet-wall is just a different INPUT
+// WORLD). This builds the dedicated bullet-wall scene (ccd::MakeBulletWallScene: a fast +X projectile aimed at a
+// thin static wall whose per-tick travel is ~50x the wall thickness, + a floor + slow drops), steps
+// StepHullWorldCCDN K ticks -> the projectile ARRESTED at the wall, ASSERTS the headline {tunneled:false} +
+// determinism + THE DISCRETE CONTROL (the IDENTICAL scene under the discrete broad::StepHullWorldBP TUNNELS;
+// CCD does not), and CPU-colors the SAME 2D side-view as the Vulkan --ccd-bullet-shot -> the golden is
+// bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the
+// Vulkan side EXACTLY. New golden tests/golden/metal/ccd_bullet.png (Mac-baked by the controller); two runs
+// DIFF 0.0000.
+static int RunCcdBulletShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace gjk    = hf::sim::gjk;
+    namespace broad  = hf::sim::broad;
+    namespace ccd    = hf::sim::ccd;
+    namespace fpx    = hf::sim::fpx;
+    using convex::fx;
+
+    // THE SCENE + CONFIG (== the Vulkan --ccd-bullet-shot + the ccd_test CD4 tests).
+    const ccd::CcdStepConfig cfg = ccd::MakeBulletWallConfig();
+    const int kTicks = 6;
+    const uint32_t kWallIdx = 1, kProjIdx = 0;
+    auto buildScene = [&]() { return ccd::MakeBulletWallScene(); };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    gjk::HullWorld cpuW = buildScene();
+    const uint32_t impactTick = ccd::StepBulletImpactTick(cpuW, cfg, kWallIdx, kProjIdx, (uint32_t)kTicks);
+    const ccd::BulletMeasure cpuM = ccd::MeasureBullet(cpuW, kWallIdx, kProjIdx);
+    if (cpuM.tunneled != 0u) return fail("ccd-bullet: the projectile TUNNELED on the CPU CCD path");
+    std::printf("ccd-bullet: {tunneled:false, impactTick:%u} GPU==CPU BIT-EXACT "
+                "[Metal: CPU ccd::StepHullWorldCCDN, byte-identical to the Vulkan GPU result by construction]\n",
+                impactTick);
+
+    gjk::HullWorld cpuW2 = buildScene();
+    ccd::StepHullWorldCCDN(cpuW2, cfg, (uint32_t)kTicks);
+    gjk::HullWorld cpuW1 = buildScene();
+    ccd::StepHullWorldCCDN(cpuW1, cfg, (uint32_t)kTicks);
+    bool same = (cpuW1.bodies.size() == cpuW2.bodies.size());
+    for (size_t i = 0; i < cpuW1.bodies.size() && same; ++i)
+        if (std::memcmp(&cpuW1.bodies[i], &cpuW2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("ccd-bullet: two runs differ (nondeterministic)");
+    std::printf("ccd-bullet determinism: two runs BYTE-IDENTICAL\n");
+
+    // THE DISCRETE CONTROL: the IDENTICAL scene under StepHullWorldCCD AND the discrete broad::StepHullWorldBP —
+    // CCD does NOT tunnel; the discrete step DOES.
+    gjk::HullWorld ccdW = buildScene();
+    ccd::StepHullWorldCCDN(ccdW, cfg, (uint32_t)kTicks);
+    const bool ccdTunneled = (ccd::MeasureBullet(ccdW, kWallIdx, kProjIdx).tunneled != 0u);
+    gjk::HullWorld disW = buildScene();
+    broad::StepHullWorldBPN(disW, cfg.bcfg, (uint32_t)kTicks);
+    const bool discreteTunneled = (ccd::MeasureBullet(disW, kWallIdx, kProjIdx).tunneled != 0u);
+    if (ccdTunneled || !discreteTunneled)
+        return fail("ccd-bullet: control FAILED (CCD must NOT tunnel, the discrete step MUST)");
+    std::printf("ccd-bullet control: {ccdTunneled:false, discreteTunneled:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the CCD final world as the Vulkan --ccd-bullet-shot
+    // (identical by construction — the same render math + the same monotone-chain outline). ---
+    const int kPxPerUnit = 36, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(ccdW.bodies[1], kInit.hulls[1], Vec3{0.30f, 0.45f, 0.75f});  // wall
+    drawHullXY(ccdW.bodies[4], kInit.hulls[4], Vec3{0.30f, 0.32f, 0.36f});  // floor
+    drawHullXY(ccdW.bodies[0], kInit.hulls[0], Vec3{0.95f, 0.45f, 0.20f});  // projectile (arrested)
+    const Vec3 slowCol[2] = {Vec3{0.40f, 0.85f, 0.55f}, Vec3{0.55f, 0.80f, 0.45f}};
+    drawHullXY(ccdW.bodies[2], kInit.hulls[2], slowCol[0]);
+    drawHullXY(ccdW.bodies[3], kInit.hulls[3], slowCol[1]);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — CCD bullet-wall side-view (%u bodies, %d ticks, projectile arrested at "
+                "wall, x=%d < wallX=%d)\n", outPath, imgW, imgH, kBodyCount, kTicks,
+                (int)(ccdW.bodies[0].pos.x >> convex::kFrac), (int)(ccdW.bodies[1].pos.x >> convex::kFrac));
+    return 0;
+}
+
 static int RunBroadHullShowcase(const char* outPath) {
     using math::Vec3;
     namespace convex = hf::sim::convex;
@@ -53031,6 +53177,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ccd-step") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ccd_step.png";
             try { return RunCcdStepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ccd-bullet <out.png>: render the Deterministic Integer CCD A BULLET THROUGH A THIN WALL STOPS showcase
+        // (Slice CD4, THE HEADLINE BEAT, the 4th slice of FLAGSHIP #24). On Metal this runs the CPU step:
+        // ccd_step.comp is int64/Vulkan-only (REUSED VERBATIM — NO new shader), so Metal runs the CPU
+        // ccd::StepHullWorldCCDN over the dedicated bullet-wall scene (a fast projectile aimed at a thin wall whose
+        // per-tick travel is ~50x the wall thickness) -> the EXACT bit-exact reference the Vulkan --ccd-bullet-shot
+        // GPU==CPU memcmp compares against; the projectile ARRESTED at the wall (tunneled=false); two runs
+        // byte-identical; THE DISCRETE CONTROL (the IDENTICAL scene under broad::StepHullWorldBP TUNNELS; CCD does
+        // not). The image golden is a PURE-INTEGER 2D side-view of the CCD final world (the projectile arrested at
+        // the wall), identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/ccd_bullet.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ccd-bullet") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ccd_bullet.png";
+            try { return RunCcdBulletShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --broad-lockstep <out.png>: render the Deterministic Integer Broadphase LOCKSTEP + ROLLBACK showcase
