@@ -1233,6 +1233,26 @@ hf_compile_shaders(
     # tick-batches with a ComputeToComputeBarrier between (the GJ4 TDR fix; bit-identical to one big dispatch).
     # Pure integer SSBO compute + ReadBuffer. NO new RHI. THE BROADPHASE-DRIVEN SETTLING PILE.
     "shaders/broad_convex_step.comp.hlsl:cs"
+    # Deterministic Integer Broadphase Slice 4 (Slice BP4, THE NEW-CAPABILITY BEAT): broad_hull_step.comp is THE
+    # BROADPHASE-DRIVEN HULL WORLD STEP — the direct HULL TWIN of broad_convex_step (the GJ4 hull_step shell with
+    # the all-pairs solve/de-pen loops GATED on the hull-AABB broadphase predicate). ONE THREAD
+    # ([numthreads(1,1,1)]) runs the WHOLE StepHullWorldBPN over a MODERATE mixed-hull set (a static floor +
+    # ~48-64 dynamic tetra/octa/wedge/box): K ticks of predict-integrate -> per-tick re-broadphase (the
+    # hull-AABB candidate pairs, BuildHullAabb = the min/max over six Support(+/-X/Y/Z) queries, visited in
+    # (i,j)-ASCENDING order via a cube-proxy AABB gate that reproduces the CPU's sorted candidate list as a
+    # superset whose extras are HullContact no-ops) -> world Gauss-Seidel GJK/EPA impulse over the candidates ->
+    # POSITION de-penetration over the candidates, copying engine/sim/broad.h::StepHullWorldBP/StepHullWorldBPN.
+    # The make-or-break: the GPU final body world is BIT-EXACT vs the CPU broad::StepHullWorldBPN, which is itself
+    # BYTE-IDENTICAL to the all-pairs gjk::StepHullWorldN (the SCALE proof — the broadphase is bit-transparent
+    # for hulls too). stepEnabled=0 -> bodies UNCHANGED. Like hull_step.comp this is int64 (the GJK/EPA support +
+    # the inertia fxdiv + the FxDot/FxCross/FxRotate/quaternion products + the Support-based hull AABB), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --broad-hull runs
+    # the CPU StepHullWorldBPN instead (byte-identical by construction). Single-thread because the world step is
+    # order-dependent (the Gauss-Seidel + in-place de-pen). The host CHUNKS the K ticks at 1 TICK/DISPATCH from
+    # the start (the hull step is heavier than the box step; a 1-tick dispatch is provably << the ~2s TDR
+    # watchdog) with a ComputeToComputeBarrier between (bit-identical to one big dispatch). Pure integer SSBO
+    # compute + ReadBuffer. NO new RHI. THE BROADPHASE-DRIVEN SETTLING MIXED-HULL PILE.
+    "shaders/broad_hull_step.comp.hlsl:cs"
     # Deterministic Contact Friction Slice 1 (Slice FC1, the BEACHHEAD of FLAGSHIP #20: DETERMINISTIC
     # TANGENTIAL CONTACT FRICTION, hf::sim::fric): fric_basis.comp is THE TANGENT BASIS pass — ONE THREAD PER
     # INPUT NORMAL (per-normal INDEPENDENT, 64 threads/group, NO atomics) runs the fixed integer Gram-Schmidt

@@ -29220,6 +29220,194 @@ static int RunBroadConvexShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice BP4 — Deterministic Integer Broadphase THE BROADPHASE-DRIVEN HULL WORLD STEP showcase
+// (--broad-hull) (the 4th slice + NEW-CAPABILITY BEAT of FLAGSHIP #23, hf::sim::broad — the direct HULL TWIN of
+// BP3). Like hull_step/broad_convex_step the full step is int64 (the GJK/EPA support + the inertia fxdiv + the
+// FxDot/FxCross/FxRotate/quaternion Q16.16 products + the Support-based hull AABB), so
+// shaders/broad_hull_step.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's
+// hf_gen_msl list; on Metal the --broad-hull showcase runs the CPU broad::StepHullWorldBPN — the EXACT bit-exact
+// reference the Vulkan --broad-hull-shot GPU==CPU memcmp already compares against -> the Metal result is
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION (the hull_step.comp convention), while the Vulkan side
+// carries the GPU==CPU proof. So this builds the SAME deterministic MODERATE scene (a static floor box-hull +
+// ~48-64 dynamic MIXED hulls dropped into a settling pile), steps StepHullWorldBPN K=140 ticks over it -> a
+// coherent settled mixed-hull pile, ASSERTS the SCALE PROOF (StepHullWorldBPN == all-pairs gjk::StepHullWorldN
+// byte-for-byte — the broadphase is bit-transparent for hulls too), and CPU-colors the SAME 2D side-view as the
+// Vulkan --broad-hull-shot -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict
+// zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/broad_hull.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunBroadHullShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace gjk    = hf::sim::gjk;
+    namespace broad  = hf::sim::broad;
+    namespace fpx    = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)convex::kOne); };
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+
+    // The deterministic step config (== the Vulkan --broad-hull-shot + the broad_test BP4 config).
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    broad::BroadStepConfig bcfg;
+    bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    bcfg.cfg.dt          = kOne / 60;
+    bcfg.cfg.solveIters  = 20;
+    bcfg.cfg.restitution = 0;
+    bcfg.cfg.slop        = kOne / 64;
+    bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+    bcfg.cfg.linDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+    bcfg.cfg.angDamp     = (fx)((int64_t)5 * kOne / 100);   // 0.05
+    bcfg.cfg.posIters    = 4;
+    bcfg.cellSize        = kOne * 4;
+    const int kTicks = 200;
+
+    auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {0, 0, 0};
+        b.angVel = {0, 0, 0};
+        b.radius  = 0;
+        return b;
+    };
+    const int kGrid = 7;
+    // THE SCENE (== the Vulkan --broad-hull-shot): a static FLOOR (box-hull half-extent 4) + a 7x7 grid of
+    // dynamic MIXED hulls (tetra/octa/wedge/box, half-extent ~0.55) dropped just above it on a 1.6 spacing
+    // (non-overlapping at spawn) so they settle into a coherent mixed pile (50 bodies).
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, false)); w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));
+        int idx = 0;
+        for (int gz = 0; gz < kGrid; ++gz)
+            for (int gx = 0; gx < kGrid; ++gx) {
+                const fx x = (fx)((int64_t)(gx - kGrid / 2) * 16 * kOne / 10);
+                const fx z = (fx)((int64_t)(gz - kGrid / 2) * 16 * kOne / 10);
+                w.bodies.push_back(makeBody(x, fd(1.7), z, true));
+                switch (idx & 3) {
+                    case 0: w.hulls.push_back(gjk::MakeTetra(fd(0.6))); break;
+                    case 1: w.hulls.push_back(gjk::MakeOcta(fd(0.55))); break;
+                    case 2: w.hulls.push_back(gjk::MakeWedge(fd(0.55), fd(0.55), fd(0.55))); break;
+                    default: w.hulls.push_back(gjk::MakeBox(fd(0.5), fd(0.5), fd(0.5))); break;
+                }
+                ++idx;
+            }
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+    const uint32_t kDynamic = kBodyCount - 1u;
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    gjk::HullWorld world = buildScene();
+    broad::StepHullWorldBPN(world, bcfg, (uint32_t)kTicks);
+    std::printf("broad-hull: {bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU broad::StepHullWorldBPN, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kTicks);
+
+    gjk::HullWorld world2 = buildScene();
+    broad::StepHullWorldBPN(world2, bcfg, (uint32_t)kTicks);
+    bool same = (world.bodies.size() == world2.bodies.size());
+    for (size_t i = 0; i < world.bodies.size() && same; ++i)
+        if (std::memcmp(&world.bodies[i], &world2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("broad-hull: two runs differ (nondeterministic)");
+    std::printf("broad-hull determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) THE SCALE PROOF: StepHullWorldBPN == all-pairs gjk::StepHullWorldN byte-for-byte + rested.
+    gjk::HullWorld apW = buildScene();
+    gjk::StepHullWorldN(apW, bcfg.cfg, (uint32_t)kTicks);
+    bool scaleEqual = (world.bodies.size() == apW.bodies.size());
+    for (size_t i = 0; i < world.bodies.size() && scaleEqual; ++i)
+        if (std::memcmp(&world.bodies[i], &apW.bodies[i], sizeof(fpx::FxBody)) != 0) scaleEqual = false;
+    const gjk::HullStackMeasure ms = gjk::MeasureHullStack(world);
+    const bool rested = (ms.maxSpeed < kOne * 2) && (ms.maxPenetration < kOne / 2);   // kOne*2: single-pt rock band
+    if (!scaleEqual) return fail("broad-hull: SCALE proof FAILED — broadphase != all-pairs (a Gauss-Seidel "
+                                 "pair-ORDER mismatch? the sort is the fix)");
+    if (!rested) return fail("broad-hull: pile NOT rested (the pile scattered / sank)");
+    std::printf("broad-hull scale: {bodies:%u} broadphase==all-pairs BYTE-IDENTICAL\n", kDynamic);
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the settled mixed-hull pile as the Vulkan
+    // --broad-hull-shot (identical by construction — the same render math + the same monotone-chain outline). ---
+    const int kPxPerUnit = 36, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(world.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});
+    const Vec3 hullCol[4] = {Vec3{0.95f, 0.45f, 0.20f}, Vec3{0.40f, 0.85f, 0.55f},
+                             Vec3{0.55f, 0.55f, 0.65f}, Vec3{0.90f, 0.85f, 0.35f}};
+    for (uint32_t i = 1; i < kBodyCount; ++i)
+        drawHullXY(world.bodies[i], kInit.hulls[i], hullCol[(i - 1) % 4]);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — settled mixed-hull pile side-view (%u hulls, %d ticks, maxSpeed=%d)\n",
+                outPath, imgW, imgH, kBodyCount, kTicks, ms.maxSpeed);
+    return 0;
+}
+
 // ===== Slice GJ4 — Deterministic General Convex-Hull Contacts THE HULL WORLD STEP showcase (--gjk-settle)
 // (the 4th slice + new-physics beat of FLAGSHIP #22, hf::sim::gjk). Like CX4/GJ3, the full step is int64 (the
 // GJK/EPA support + the inertia fxdiv + the FxDot/FxCross/FxRotate/quaternion Q16.16 products), so
@@ -51624,6 +51812,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--broad-convex") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_broad_convex.png";
             try { return RunBroadConvexShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --broad-hull <out.png>: render the Deterministic Integer Broadphase THE BROADPHASE-DRIVEN HULL WORLD
+        // STEP showcase (Slice BP4, THE NEW-CAPABILITY BEAT, the 4th slice of FLAGSHIP #23, the direct HULL TWIN
+        // of BP3). On Metal this runs the CPU step: broad_hull_step.comp is int64/Vulkan-only (glslc can't parse
+        // the GJK/EPA/inertia/quaternion int64), so Metal runs the CPU broad::StepHullWorldBPN over the SAME
+        // scene (a static floor box-hull + ~48-64 dynamic mixed hulls dropped into a settling pile, stepped
+        // K=140 ticks) -> the EXACT bit-exact reference the Vulkan --broad-hull-shot GPU==CPU memcmp compares
+        // against; two runs byte-identical; the SCALE proof (StepHullWorldBPN == all-pairs gjk::StepHullWorldN
+        // byte-for-byte — the broadphase is bit-transparent for hulls too) + the pile rests. The image golden is
+        // a PURE-INTEGER 2D side-view of the settled mixed-hull pile, identical to the Vulkan path BY
+        // CONSTRUCTION. New golden tests/golden/metal/broad_hull.png.
+        if (argc > 1 && std::strcmp(argv[1], "--broad-hull") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_broad_hull.png";
+            try { return RunBroadHullShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --gjk-settle <out.png>: render the Deterministic General Convex-Hull Contacts THE HULL WORLD STEP

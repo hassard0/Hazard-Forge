@@ -554,5 +554,257 @@ inline void StepConvexWorldBPN(hf::sim::convex::ConvexWorld& world, const BroadS
     for (uint32_t t = 0; t < ticks; ++t) StepConvexWorldBP(world, bcfg);
 }
 
+// ===== Slice BP4 — THE BROADPHASE-DRIVEN HULL WORLD STEP (the new-capability beat) =====================
+// BP3 made the BOX world step broadphase-driven (StepConvexWorldBP) and proved it byte-identical to all-pairs
+// at 256 bodies. BP4 does the SAME for arbitrary convex HULLS: StepHullWorldBP reproduces gjk::StepHullWorld's
+// tick with the all-pairs O(n^2) GJK/EPA narrowphase loops REPLACED by iteration over the (i,j)-SORTED
+// broadphase candidate-pair list — so a large MIXED-HULL pile (tetra/octa/wedge/box) settles deterministically
+// and scales. The make-or-break is again the SCALE PROOF: byte-identical to the all-pairs gjk::StepHullWorldN
+// on the same scene (the broadphase is bit-transparent for hulls too). APPENDS to broad.h (BP1-BP3 +
+// gjk.h/convex.h/fric.h/persist.h/fpx.h/grain.h BYTE-FROZEN).
+//
+// THE ONLY DIFFERENCES FROM BP3 (StepConvexWorldBP): (a) the broadphase AABB is the hull's TRUE world AABB
+// (BuildHullAabb = the min/max over gjk::Support(±X/±Y/±Z), six support queries), not a body.radius sphere box;
+// (b) the narrowphase is gjk::HullContact (GJK->EPA->manifold), not BoxSatStable. The (i,j)-sorted Gauss-Seidel
+// order crux is identical to BP3: GS is order-dependent, so the candidate pairs MUST be visited (i,j)-ascending
+// to match the all-pairs visiting order (the candidate set ⊇ every GJK-overlapping pair, processed in the same
+// order -> byte-identical). Re-broadphase each tick from current positions.
+//
+// REUSE (read-only, byte-frozen): gjk::StepHullWorld (the shell mirrored line-for-line with the (3)+(4)
+// pair-loops swapped), gjk::HullContact / HullWorld / FxHull / Support / FxHullInvInertiaBody, convex::
+// SolveManifoldImpulse / WorldInvInertia / IsDynamic / ContactManifold; the BP1-BP3 grid + (i,j)-sort + the
+// dynamic-vs-static pass shape. broad.h APPENDS only (BP1-BP3 byte-frozen).
+
+// BuildHullAabb(hull, body): the hull's TIGHT world AABB = the min/max over gjk::Support(hull, body, ±X/±Y/±Z)
+// (six world support queries -> the tight axis-aligned box; int64 via gjk::Support/FxRotate/FxDot). Every world
+// vertex of the body-placed hull lies inside this AABB (a support along +axis gives the max coord on that axis,
+// along -axis the min). Pure deterministic integer. The BuildHullAabb-derived AABBs drive the broadphase grid +
+// the AabbOverlap candidate predicate (replacing fpx::BodyAabb for hulls).
+inline fpx::FxAabb BuildHullAabb(const gjk::FxHull& hull, const fpx::FxBody& body) {
+    const fpx::FxVec3 sPX = gjk::Support(hull, body, fpx::FxVec3{ fpx::kOne, 0, 0});
+    const fpx::FxVec3 sNX = gjk::Support(hull, body, fpx::FxVec3{-fpx::kOne, 0, 0});
+    const fpx::FxVec3 sPY = gjk::Support(hull, body, fpx::FxVec3{0,  fpx::kOne, 0});
+    const fpx::FxVec3 sNY = gjk::Support(hull, body, fpx::FxVec3{0, -fpx::kOne, 0});
+    const fpx::FxVec3 sPZ = gjk::Support(hull, body, fpx::FxVec3{0, 0,  fpx::kOne});
+    const fpx::FxVec3 sNZ = gjk::Support(hull, body, fpx::FxVec3{0, 0, -fpx::kOne});
+    return fpx::FxAabb{
+        fpx::FxVec3{sNX.x, sNY.y, sNZ.z},   // the min coord on each axis (the -axis support's that-axis coord)
+        fpx::FxVec3{sPX.x, sPY.y, sPZ.z},   // the max coord on each axis
+    };
+}
+
+// THE HULL-AABB BROADPHASE MARGIN (the GJK phantom-contact pad — the ONE difference from the box broadphase).
+// Unlike BoxSat (which NEVER reports overlap for AABB-disjoint boxes, so AABB-overlap ⊇ box-overlap is EXACT),
+// the integer GJK/EPA narrowphase can report a SPURIOUS count==1 contact (a tiny negative/within-band EPA depth)
+// for two hulls that are SEPARATED but nearly touching (the documented GJ2-GJ4 within-band caveat). The
+// all-pairs gjk::StepHullWorldN processes that phantom contact, so for the broadphase to be byte-identical (the
+// SCALE proof) its candidate set MUST include every such nearly-touching pair. We INFLATE each hull's broadphase
+// AABB by kHullAabbMargin (>> the sub-pixel phantom band, << the inter-hull spacing) so every phantom-overlapping
+// pair is a candidate; the extra far pairs the margin admits are genuinely separated -> HullContact count==0
+// no-ops -> still bit-transparent. The GPU broad_hull_step.comp inflates its snapshot AABBs by the SAME margin.
+inline constexpr fx kHullAabbMargin = fpx::kOne / 2;   // 0.5 unit (MUST match broad_hull_step.comp HF_HULL_MARGIN)
+
+// InflateAabb(a, m): expand an AABB outward by m on every axis (the broadphase phantom-contact pad). Pure int.
+inline fpx::FxAabb InflateAabb(const fpx::FxAabb& a, fx m) {
+    return fpx::FxAabb{fpx::FxVec3{a.lo.x - m, a.lo.y - m, a.lo.z - m},
+                       fpx::FxVec3{a.hi.x + m, a.hi.y + m, a.hi.z + m}};
+}
+
+// AabbCenterRadiusBody(aabb): a synthetic fpx::FxBody carrying the (margin-inflated) hull AABB as a pos-centred
+// radius box, so the frozen BP1-BP3 grid + AabbOverlap (which key on body.pos + body.radius) reproduce the
+// hull-AABB broadphase. pos = the AABB centre; radius = the max half-extent over the three axes (so
+// BodyAabb(synthetic) ⊇ the inflated hull AABB on every axis — a conservative cube box; the AabbOverlap
+// candidate set is a SUPERSET, exactly as the box-radius pad in BP3, and the narrowphase HullContact discards
+// the non-overlapping ones -> bit-transparent).
+inline fpx::FxBody AabbCenterRadiusBody(const fpx::FxAabb& aabb, const fpx::FxBody& src) {
+    fpx::FxBody b = src;   // carry invMass/flags (the dynamic vs static partition predicate) verbatim
+    b.pos = fpx::FxVec3{(aabb.lo.x + aabb.hi.x) / 2, (aabb.lo.y + aabb.hi.y) / 2, (aabb.lo.z + aabb.hi.z) / 2};
+    const fx hx = (aabb.hi.x - aabb.lo.x) / 2;
+    const fx hy = (aabb.hi.y - aabb.lo.y) / 2;
+    const fx hz = (aabb.hi.z - aabb.lo.z) / 2;
+    fx r = hx; if (hy > r) r = hy; if (hz > r) r = hz;
+    b.radius = r;
+    return b;
+}
+
+// BuildHullBroadphasePairsWithStatics(world, cellSize, pairsOut): the STATIC-AWARE broadphase pair list over a
+// gjk::HullWorld — the BP3 BuildBroadphasePairsWithStatics with the per-body AABB source swapped from
+// fpx::BodyAabb to BuildHullAabb (every other line is the same shape). (a) the BP2 grid stencil over the DYNAMIC
+// bodies' hull-AABB proxies (statics excluded from the grid, indices REMAPPED to world indices); (b) a
+// dynamic-vs-static all-pairs pass (each dynamic x each static, AabbOverlap over the hull AABBs). The combined
+// list is canonicalized i<j; the caller SORTS it by (i,j). Statics are invMass==0 (the convex.h convention).
+// cellSize >= the max hull-AABB diameter so the ±1 stencil stays exact for the dynamics.
+inline void BuildHullBroadphasePairsWithStatics(const gjk::HullWorld& world, fx cellSize,
+                                                std::vector<fpx::FxPair>& pairsOut) {
+    const uint32_t n = (uint32_t)world.bodies.size();
+    pairsOut.clear();
+
+    // Precompute every body's hull world AABB once (six gjk::Support queries each), INFLATED by the phantom
+    // margin so the candidate set covers the GJK near-touching phantom-contact range (see kHullAabbMargin).
+    std::vector<fpx::FxAabb> aabbs((size_t)n);
+    for (uint32_t i = 0; i < n; ++i)
+        aabbs[i] = InflateAabb(BuildHullAabb(world.hulls[i], world.bodies[i]), kHullAabbMargin);
+
+    // Partition into dynamic vs static world indices (invMass==0 <=> static, the convex.h convention) + build
+    // the dynamic-only AABB proxy set for the BP2 grid (pos = hull-AABB centre, radius = the AABB half-extent).
+    std::vector<fpx::FxBody> dynProxies;   // synthetic radius-box bodies for the BP1-BP3 grid
+    std::vector<uint32_t>    dynToWorld;   // dynProxies[d] -> world body index
+    std::vector<uint32_t>    statics;      // the world indices of static bodies
+    dynProxies.reserve(n);
+    dynToWorld.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (world.bodies[i].invMass != 0) {
+            dynProxies.push_back(AabbCenterRadiusBody(aabbs[i], world.bodies[i]));
+            dynToWorld.push_back(i);
+        } else {
+            statics.push_back(i);
+        }
+    }
+
+    // (a) the BP2 grid stencil over the DYNAMIC hull-AABB proxies; remap each emitted (di,dj) back to world
+    // indices, canonicalized i<j. The proxy BodyAabb (pos +/- radius) ⊇ the hull AABB, so this candidate set is
+    // a SUPERSET of the GJK-overlapping dynamic pairs (the narrowphase discards the rest -> bit-transparent).
+    if (!dynProxies.empty()) {
+        const BodyGrid grid = MakeBodyGrid(dynProxies, cellSize);
+        const BodyCellTable table = BuildBodyCellTable(dynProxies, grid);
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> dynPairs;
+        BuildBroadphasePairs(dynProxies, grid, table, off, dynPairs);
+        for (const fpx::FxPair& p : dynPairs) {
+            uint32_t wi = dynToWorld[p.i], wj = dynToWorld[p.j];
+            if (wi > wj) { uint32_t t = wi; wi = wj; wj = t; }
+            pairsOut.push_back(fpx::FxPair{wi, wj});
+        }
+    }
+
+    // (b) the dynamic-vs-static all-pairs pass: each dynamic x each static, hull-AABB-tested. O(n*k), k small.
+    for (uint32_t d = 0; d < (uint32_t)dynToWorld.size(); ++d) {
+        const uint32_t wd = dynToWorld[d];
+        for (uint32_t s = 0; s < (uint32_t)statics.size(); ++s) {
+            const uint32_t ws = statics[s];
+            if (!fpx::AabbOverlap(aabbs[wd], aabbs[ws])) continue;
+            uint32_t wi = wd, wj = ws;
+            if (wi > wj) { uint32_t t = wi; wi = wj; wj = t; }
+            pairsOut.push_back(fpx::FxPair{wi, wj});
+        }
+    }
+}
+
+// HullBroadphaseStepPairsEquivalentToAllPairs(world, cellSize): the BP4 carry of the equivalence proof onto the
+// HULL broadphase. Build the combined static-aware hull pair set, sort by (i,j); build the all-pairs reference
+// (every i<j over ALL bodies whose HULL AABBs overlap, minus static-static — the set the all-pairs solve's
+// HullContact actually touches as candidates), sort; byte-compare as SETS. Returns true iff byte-identical — the
+// hull static handling is provably complete (no GJK-overlapping pair missed). NOTE: the equivalence is over the
+// HULL-AABB-overlap set (the conservative cube proxy is a superset of the grid set, so the reference here is the
+// TRUE hull-AABB all-pairs set, matching what the static-aware builder emits once the proxy superset is culled
+// to genuine hull-AABB overlaps). EXACT byte memcmp of the sorted lists.
+inline bool HullBroadphaseStepPairsEquivalentToAllPairs(const gjk::HullWorld& world, fx cellSize) {
+    std::vector<fpx::FxPair> bp;
+    BuildHullBroadphasePairsWithStatics(world, cellSize, bp);
+    // The proxy grid emits a conservative SUPERSET (cube-padded). Cull to genuine (margin-inflated) hull-AABB
+    // overlaps so the set matches the inflated-hull-AABB all-pairs reference (the SAME inflated AABBs the builder
+    // uses; the narrowphase culls these same non-overlaps to no-ops). The margin covers the GJK phantom band.
+    const uint32_t n = (uint32_t)world.bodies.size();
+    std::vector<fpx::FxAabb> aabbs((size_t)n);
+    for (uint32_t i = 0; i < n; ++i)
+        aabbs[i] = InflateAabb(BuildHullAabb(world.hulls[i], world.bodies[i]), kHullAabbMargin);
+    std::vector<fpx::FxPair> bpCulled;
+    bpCulled.reserve(bp.size());
+    for (const fpx::FxPair& p : bp)
+        if (fpx::AabbOverlap(aabbs[p.i], aabbs[p.j])) bpCulled.push_back(p);
+    SortPairsCanonical(bpCulled);
+
+    std::vector<fpx::FxPair> ref;
+    for (uint32_t i = 0; i < n; ++i)
+        for (uint32_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static skip
+            if (fpx::AabbOverlap(aabbs[i], aabbs[j])) ref.push_back(fpx::FxPair{i, j});
+        }
+    SortPairsCanonical(ref);
+
+    if (bpCulled.size() != ref.size()) return false;
+    if (bpCulled.empty()) return true;
+    return std::memcmp(bpCulled.data(), ref.data(), bpCulled.size() * sizeof(fpx::FxPair)) == 0;
+}
+
+// StepHullWorldBP(world, cfg): ONE broadphase-driven deterministic HULL tick — gjk::StepHullWorld's shell with
+// the all-pairs (3) impulse-solve + (4) de-penetration loops REPLACED by iteration over the SORTED (i,j) hull
+// broadphase pair list (re-built each tick from CURRENT positions). Mirrors gjk::StepHullWorld LINE-FOR-LINE;
+// ONLY the pair source differs (the sorted candidate list vs the nested for i:for j>i). The narrowphase
+// (gjk::HullContact) + SolveManifoldImpulse + the inertia (gjk::FxHullInvInertiaBody + convex::WorldInvInertia)
+// + integrate/damp/orient are VERBATIM. Pure integer, FIXED order. See gjk.h::StepHullWorld (the reference).
+inline void StepHullWorldBP(gjk::HullWorld& world, const BroadStepConfig& bcfg) {
+    namespace convex = hf::sim::convex;
+    const hf::sim::convex::ConvexStepConfig& cfg = bcfg.cfg;
+    const size_t n = world.bodies.size();
+
+    // (1) predict-integrate dynamic bodies + per-tick velocity retention (VERBATIM StepHullWorld:1).
+    for (size_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != fpx::kOne) world.bodies[i].vel = convex::FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != fpx::kOne) world.bodies[i].angVel = convex::FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // (2) the world inverse inertias, once per tick from the post-integrate orient (VERBATIM StepHullWorld:2).
+    std::vector<convex::FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const convex::FxVec3 invIbody = gjk::FxHullInvInertiaBody(world.hulls[i], world.bodies[i].invMass);
+        invIW[i] = convex::WorldInvInertia(world.bodies[i], invIbody);
+    }
+
+    // (2.5) RE-BUILD the hull broadphase pair list from the CURRENT positions + SORT it by (i,j) — the GS-order
+    // crux (positions changed this tick, so the candidate set is re-derived; the per-tick re-broadphase realism).
+    std::vector<fpx::FxPair> pairs;
+    BuildHullBroadphasePairsWithStatics(world, bcfg.cellSize, pairs);
+    SortPairsCanonical(pairs);
+
+    // (3) impulse solve — solveIters world Gauss-Seidel sweeps over the SORTED pair list (VERBATIM the
+    // StepHullWorld:3 per-pair body, only the pair source swapped). Static-static skipped (never emitted, but
+    // keep the guard so the loop body is byte-identical to the all-pairs one). Mutation in place.
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        for (const fpx::FxPair& p : pairs) {
+            const size_t i = p.i, j = p.j;
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+            const convex::ContactManifold m = gjk::HullContact(world.bodies[i], world.hulls[i],
+                                                               world.bodies[j], world.hulls[j]);
+            if (m.count == 0) continue;
+            convex::SolveManifoldImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], m,
+                                         cfg.restitution, 1);   // ONE inner sweep — the outer loop is the GS
+        }
+    }
+
+    // (4) position de-penetration — posIters sweeps over the SORTED pair list (VERBATIM StepHullWorld:4).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (const fpx::FxPair& p : pairs) {
+            const size_t i = p.i, j = p.j;
+            const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+            if (invSum == 0) continue;   // both static -> skip
+            const convex::ContactManifold m = gjk::HullContact(world.bodies[i], world.hulls[i],
+                                                               world.bodies[j], world.hulls[j]);
+            if (m.count == 0) continue;
+            convex::FxVec3 nrm = m.normal;
+            if (convex::FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                nrm = convex::FxVec3{-nrm.x, -nrm.y, -nrm.z};
+            const fx excess = m.depths[0] - cfg.slop;
+            if (excess <= 0) continue;
+            const fx corrected = convex::fxmul(excess, cfg.beta);
+            const fx wi = convex::fxdiv(world.bodies[i].invMass, invSum);
+            const fx wj = fpx::kOne - wi;
+            const convex::FxVec3 ci = convex::FxScale(nrm, convex::fxmul(corrected, wi));
+            const convex::FxVec3 cj = convex::FxScale(nrm, convex::fxmul(corrected, wj));
+            world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+            world.bodies[j].pos = convex::FxAdd(world.bodies[j].pos, cj);
+        }
+    }
+    // (5) orientation was already integrated in step (1).
+}
+
+// StepHullWorldBPN(world, cfg, ticks): run `ticks` broadphase-driven hull steps -> a mixed-hull pile settles.
+inline void StepHullWorldBPN(gjk::HullWorld& world, const BroadStepConfig& bcfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepHullWorldBP(world, bcfg);
+}
+
 }  // namespace broad
 }  // namespace hf::sim

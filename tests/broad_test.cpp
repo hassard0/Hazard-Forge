@@ -471,6 +471,136 @@ int main() {
         }
     }
 
+    // ======================= Slice BP4 — THE BROADPHASE-DRIVEN HULL WORLD STEP =======================
+    // Pins the BP4 contracts the GPU broad_hull_step + the scale proof build on:
+    //   * BuildHullAabb bounds every world vertex of the body-placed hull (every vert inside the AABB).
+    //   * the hull static-aware broadphase pair set is equivalent to the hull-AABB all-pairs set over a
+    //     MIXED-hull scene WITH a static floor (self-policed by HullBroadphaseStepPairsEquivalentToAllPairs).
+    //   * StepHullWorldBPN == gjk::StepHullWorldN BYTE-IDENTICAL on a moderate mixed-hull scene (the
+    //     scale/bit-transparency proof, CPU-only); the pile rests; deterministic (two runs byte-equal).
+    namespace gjk = hf::sim::gjk;
+    {
+        // The deterministic step config (== the --broad-hull-shot / gjk-settle config).
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        broad::BroadStepConfig bcfg;
+        bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        bcfg.cfg.dt          = kOne / 60;
+        bcfg.cfg.solveIters  = 20;
+        bcfg.cfg.restitution = 0;
+        bcfg.cfg.slop        = kOne / 64;
+        bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        bcfg.cfg.linDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+        bcfg.cfg.angDamp     = (fx)((int64_t)5 * kOne / 100);   // 0.05
+        bcfg.cfg.posIters    = 4;
+        bcfg.cellSize        = kOne * 4;   // >= 2 * (max dynamic hull-AABB cube-proxy radius + the margin)
+
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            b.radius = 0;   // hulls drive the broadphase via BuildHullAabb (radius unused for the hull step)
+            return b;
+        };
+
+        // ----- BuildHullAabb bounds every world vertex of a (rotated) hull -----
+        {
+            gjk::FxHull h = gjk::MakeWedge(kOne, kOne, kOne);
+            fpx::FxBody b = makeBody(fi(2), fi(3), fd(-1.0), true);
+            // a non-identity orientation (a small spin about Y) so the AABB exercises FxRotate.
+            b.angVel = {0, fi(1), 0};
+            fpx::IntegrateBodyFull(b, convex::FxVec3{0, 0, 0}, kOne / 30);
+            const fpx::FxAabb a = broad::BuildHullAabb(h, b);
+            bool allInside = true;
+            for (uint32_t v = 0; v < h.count; ++v) {
+                const fpx::FxVec3 wv = fpx::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+                if (wv.x < a.lo.x || wv.x > a.hi.x || wv.y < a.lo.y || wv.y > a.hi.y ||
+                    wv.z < a.lo.z || wv.z > a.hi.z) allInside = false;
+            }
+            check(allInside, "BP4: BuildHullAabb bounds every world vertex of the body-placed hull");
+        }
+
+        // A moderate MIXED-hull scene: a wide static FLOOR (box-hull half-extent 4) + a small grid of dynamic
+        // mixed hulls (tetra/octa/wedge/box) dropped just above it on a 1.4 spacing so they settle.
+        auto buildModerate = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));  // 0 floor
+            int idx = 0;
+            for (int gz = -1; gz <= 1; ++gz)
+                for (int gx = -1; gx <= 1; ++gx) {
+                    const fx x = (fx)((int64_t)gx * 14 * kOne / 10);   // 1.4 spacing
+                    const fx z = (fx)((int64_t)gz * 14 * kOne / 10);
+                    w.bodies.push_back(makeBody(x, fd(1.8), z, true));
+                    switch (idx & 3) {
+                        case 0: w.hulls.push_back(gjk::MakeTetra(fd(0.7))); break;
+                        case 1: w.hulls.push_back(gjk::MakeOcta(fd(0.7))); break;
+                        case 2: w.hulls.push_back(gjk::MakeWedge(fd(0.7), fd(0.7), fd(0.7))); break;
+                        default: w.hulls.push_back(gjk::MakeBox(fd(0.6), fd(0.6), fd(0.6))); break;
+                    }
+                    ++idx;
+                }
+            return w;
+        };
+
+        // ----- the hull static-aware broadphase is equivalent to all-pairs (the floor's pairs found) -----
+        {
+            gjk::HullWorld w = buildModerate();
+            check(broad::HullBroadphaseStepPairsEquivalentToAllPairs(w, bcfg.cellSize),
+                  "BP4: hull static-aware broadphase == all-pairs (the static floor's pairs are found)");
+            broad::StepHullWorldBPN(w, bcfg, 20);
+            check(broad::HullBroadphaseStepPairsEquivalentToAllPairs(w, bcfg.cellSize),
+                  "BP4: hull static-aware broadphase == all-pairs after settling (re-broadphased positions)");
+        }
+
+        // ----- THE SCALE PROOF (CPU-only): StepHullWorldBPN == gjk::StepHullWorldN byte-for-byte -----
+        {
+            const uint32_t kTicks = 120;
+            gjk::HullWorld bp = buildModerate();
+            broad::StepHullWorldBPN(bp, bcfg, kTicks);
+            gjk::HullWorld ap = buildModerate();
+            gjk::StepHullWorldN(ap, bcfg.cfg, kTicks);   // the all-pairs reference, SAME scene
+            bool byteEqual = (bp.bodies.size() == ap.bodies.size());
+            for (size_t i = 0; i < bp.bodies.size() && byteEqual; ++i)
+                if (std::memcmp(&bp.bodies[i], &ap.bodies[i], sizeof(fpx::FxBody)) != 0) byteEqual = false;
+            check(byteEqual,
+                  "BP4: StepHullWorldBPN == gjk::StepHullWorldN BYTE-IDENTICAL (the scale/bit-transparency proof)");
+
+            // ----- the broadphase step brings the mixed-hull pile to REST (kOne*2: the documented single-point-
+            // manifold rock band — the pile is COHERENT + HELD, a small residual rock is the GJ4 stability limit) -----
+            const gjk::HullStackMeasure ms = gjk::MeasureHullStack(bp);
+            check(ms.maxSpeed < kOne * 2, "BP4: the broadphase-stepped mixed-hull pile came to REST (maxSpeed below band)");
+            check(ms.maxPenetration < kOne / 2, "BP4: the broadphase-stepped pile is HELD (maxPen within band)");
+
+            // ----- determinism: two BP runs byte-identical -----
+            gjk::HullWorld bp2 = buildModerate();
+            broad::StepHullWorldBPN(bp2, bcfg, kTicks);
+            bool det = (bp.bodies.size() == bp2.bodies.size());
+            for (size_t i = 0; i < bp.bodies.size() && det; ++i)
+                if (std::memcmp(&bp.bodies[i], &bp2.bodies[i], sizeof(fpx::FxBody)) != 0) det = false;
+            check(det, "BP4: StepHullWorldBPN is deterministic (two runs byte-identical)");
+        }
+
+        // ----- a single dynamic hull + the static floor: equivalence + scale (the minimal static case) -----
+        {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false)); w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));
+            w.bodies.push_back(makeBody(0, fd(3.0), 0, true)); w.hulls.push_back(gjk::MakeOcta(kOne));
+            check(broad::HullBroadphaseStepPairsEquivalentToAllPairs(w, bcfg.cellSize),
+                  "BP4: single dynamic hull + floor -> static-aware broadphase == all-pairs");
+            gjk::HullWorld bp = w;
+            broad::StepHullWorldBPN(bp, bcfg, 120);
+            gjk::HullWorld ap = w;
+            gjk::StepHullWorldN(ap, bcfg.cfg, 120);
+            check(std::memcmp(&bp.bodies[1], &ap.bodies[1], sizeof(fpx::FxBody)) == 0,
+                  "BP4: single dynamic hull + floor -> StepHullWorldBPN == all-pairs byte-identical");
+        }
+    }
+
     if (g_fail == 0) std::printf("broad_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }
