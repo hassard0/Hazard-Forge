@@ -972,5 +972,29 @@ inline HullWorld RunHullRollbackHardened(const HullWorld& world0, const convex::
     return w;
 }
 
+// =========================================================================================================
+// Slice MF6 — Hull Narrowphase Hardening: THE LIT 3D RENDER CAPSTONE (the money-shot, FLAGSHIP #25 FINAL).
+// APPENDED after RunHullRollbackHardened (MF1-MF5's lines above are BYTE-FROZEN). PURE host FLOAT, render-only
+// — the ONE float crossing of the whole flagship, OUTSIDE the bit-exact integer loop. Takes the bit-exact
+// hardened-SETTLED HullWorld (StepHullWorldHardenedN output — a stack of resting convex polyhedra the frozen
+// single-point step can't hold) and produces a FLOAT world-space TRIANGLE SOUP the showcase draws LIT 3D
+// through the EXISTING instanced-lit pipeline (lit.vert + lit.frag + shadow.vert, REUSED VERBATIM). NO new
+// shader, NO new RHI. The settled world is a gjk::HullWorld, so MF6 delegates VERBATIM to the FROZEN
+// BP6/GJ6/CD6 render bridge gjk::HullToRenderInstances (the BP6/CD6 one-line-delegate idiom). The integer sim
+// is NOT mutated; HardenedHullToRenderInstances is a PURE FUNCTION of the world (two calls byte-equal — the
+// provenance contract the showcase asserts). MATTE (the showcase sets metallic 0 / roughness 1) dodges the
+// documented GF6/FR6/JT6/PS6/CX6 iridescence trap. gjk.h/broad.h/ccd.h/convex.h/fpx.h + MF1-MF5 BYTE-FROZEN.
+// =========================================================================================================
+
+// ----- HardenedHullToRenderInstances(world): the spec-named entry — the render payload for the MF6 showcase.
+// A ONE-LINE delegate to the FROZEN BP6/GJ6/CD6 gjk::HullToRenderInstances (broad::BroadToRenderInstances /
+// ccd::CcdToRenderInstances twin) — the hardened-settled HullWorld -> a FLOAT world-space TRIANGLE SOUP
+// (per-canonical-hull face meshes, per-triangle outward normals + per-hull-type matte colors). Render-only
+// float, OUTSIDE the bit-exact loop. Provided in manifold:: for namespace symmetry; the mesh comes from the
+// byte-unchanged GJ6 helper. A PURE FUNCTION of `world` — two calls byte-equal (gjk::HullRenderMeshEqual).
+inline gjk::HullRenderMesh HardenedHullToRenderInstances(const gjk::HullWorld& world) {
+    return gjk::HullToRenderInstances(world);
+}
+
 }  // namespace manifold
 }  // namespace hf::sim

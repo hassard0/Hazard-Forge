@@ -496,6 +496,8 @@ int main() {
             bool sawManifoldHardenedStepFeature = false;
             // Slice MF5: the manifold-lockstep capability is advertised.
             bool sawManifoldLockstepFeature = false;
+            // Slice MF6: the manifold-render capability is advertised.
+            bool sawManifoldRenderFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -722,6 +724,7 @@ int main() {
                     if (AsString(el->value) == "manifold-gpu") sawManifoldGpuFeature = true;
                     if (AsString(el->value) == "manifold-hardened-step") sawManifoldHardenedStepFeature = true;
                     if (AsString(el->value) == "manifold-lockstep") sawManifoldLockstepFeature = true;
+                    if (AsString(el->value) == "manifold-render") sawManifoldRenderFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -923,6 +926,7 @@ int main() {
             check(sawManifoldGpuFeature, "engine.features includes manifold-gpu");
             check(sawManifoldHardenedStepFeature, "engine.features includes manifold-hardened-step");
             check(sawManifoldLockstepFeature, "engine.features includes manifold-lockstep");
+            check(sawManifoldRenderFeature, "engine.features includes manifold-render");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");

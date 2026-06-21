@@ -577,6 +577,75 @@ int main() {
               "MF5 command stream MOVED the stack non-trivially (commanded world != no-command settle)");
     }
 
+    // =================================================================================================
+    // Slice MF6 — THE LIT 3D RENDER CAPSTONE (the money-shot, FLAGSHIP #25 FINAL). Pure CPU. Pins:
+    //   * (1) PROVENANCE: HardenedHullToRenderInstances is a PURE function (two calls byte-equal).
+    //   * (2) COUNTS: the hardened-stack scene produces triangles; verts.size() == triangles*3.
+    //   * (3) the render REFLECTS the sim: the SETTLED (resting) world renders a DIFFERENT soup than a
+    //     PERTURBED world (the render is a function of the pose).
+    //   * (4) SIM-UNMUTATED: the render call does NOT mutate the bit-exact integer sim (bodies byte-equal
+    //     before vs after the render).
+    // =================================================================================================
+    {
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        cfg.dt          = kOne / 60;
+        cfg.solveIters  = 24;
+        cfg.restitution = 0;
+        cfg.slop        = kOne / 64;
+        cfg.beta        = (fx)((int64_t)2 * kOne / 10);
+        cfg.linDamp     = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp     = kOne;
+        cfg.posIters    = 2;
+        const uint32_t K = 300u;
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+
+        auto makeStat = [&](fx x, fx y, fx z) {
+            fpx::FxBody b; b.pos = {x, y, z}; b.orient = {0, 0, 0, kOne}; b.invMass = 0; b.flags = 0u;
+            b.vel = {0, 0, 0}; b.angVel = {0, 0, 0}; return b;
+        };
+        auto makeDyn = [&](fx x, fx y, fx z, const fpx::FxQuat& q) {
+            fpx::FxBody b; b.pos = {x, y, z}; b.orient = q; b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+            b.vel = {0, 0, 0}; b.angVel = {0, 0, 0}; return b;
+        };
+        const fpx::FxQuat tilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};
+        // The proven MF4 hardened-stack scene (a static support box + a tilted box that SETTLES TO REST).
+        auto buildStack = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeStat(0, 0, 0));              w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            w.bodies.push_back(makeDyn(0, fd(2.3), 0, tilt));   w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            return w;
+        };
+
+        gjk::HullWorld settled = buildStack();
+        manifold::StepHullWorldHardenedN(settled, cfg, K);
+
+        // (1) PROVENANCE — two calls byte-equal (pure function).
+        const gjk::HullRenderMesh soupA = manifold::HardenedHullToRenderInstances(settled);
+        const gjk::HullRenderMesh soupB = manifold::HardenedHullToRenderInstances(settled);
+        check(gjk::HullRenderMeshEqual(soupA, soupB),
+              "MF6 render: HardenedHullToRenderInstances two calls BYTE-EQUAL (pure function)");
+
+        // (2) COUNTS — the hardened-stack scene produced triangles; verts.size() == triangles*3.
+        check(soupA.triangles > 0u, "MF6 render: the hardened-stack scene produced triangles");
+        check(soupA.verts.size() == (size_t)soupA.triangles * 3u, "MF6 render: verts.size() == triangles*3");
+        // 2 boxes (static support + dynamic box) -> 12 tris each.
+        check(soupA.triangles == 24u, "MF6 render: triangle count == 24 (2 boxes x 12 tris)");
+
+        // (3) the render REFLECTS the sim — the SETTLED (resting) world renders a DIFFERENT soup than the
+        // PERTURBED (un-settled, initial) world.
+        gjk::HullWorld perturbed = buildStack();   // un-settled = a different pose
+        check(!gjk::HullRenderMeshEqual(soupA, manifold::HardenedHullToRenderInstances(perturbed)),
+              "MF6 render: the settled world renders a DIFFERENT soup than the perturbed world");
+
+        // (4) SIM-UNMUTATED — the render call is a PURE READ (bodies byte-equal before vs after).
+        gjk::HullWorld before = settled;
+        (void)manifold::HardenedHullToRenderInstances(settled);
+        check(gjk::HullBodiesEqual(before.bodies, settled.bodies),
+              "MF6 render: the render call does NOT mutate the bit-exact sim (bodies byte-equal)");
+    }
+
     if (g_fail == 0) std::printf("manifold_test: ALL PASS\n");
     else std::printf("manifold_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
