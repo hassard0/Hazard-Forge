@@ -166,6 +166,137 @@ int main() {
               "MF1 render: a moved hull renders a DIFFERENT soup (render reflects pose)");
     }
 
+    // =====================================================================================================
+    // Slice MF2 — SUTHERLAND-HODGMAN FACE CLIP -> THE MULTI-POINT MANIFOLD. The MF1 lines above are frozen;
+    // these tests PIN the MF2 contracts the showcase also asserts:
+    //   * (1) the teeter fix: HullManifoldFromEpa counts {boxOnBox:4, tetraOnFace:3, edgeOnFace:2}.
+    //   * (2) points valid + below the ref face: every kept point depth >= 0; count <= 4.
+    //   * (3) determinism / purity: the manifold POD over the battery is byte-equal across two runs.
+    //   * (4) consistency: the manifold normal agrees with the EPA seed normal (FxDot > 0).
+    //   * (5) a degenerate/edge case falls back to count==1 (never 0 for an overlapping pair).
+    // =====================================================================================================
+    {
+        auto makeBodyQ = [&](fx px, fx py, fx pz) -> fpx::FxBody { return MakeBody(px, py, pz); };
+
+        // ---- The three canonical contacts (the SAME scene the showcase builds). ----
+        // (a) box flat on box -> a unit box resting face-down on a static unit box, slightly overlapping in Y
+        //     -> the quad-on-quad clip = 4 corner contacts.
+        const gjk::FxHull boxA = gjk::MakeBox(kOne, kOne, kOne);
+        const gjk::FxHull boxB = gjk::MakeBox(kOne, kOne, kOne);
+        const fx overlap = kOne / 8;                 // a small penetration (0.125)
+        const fpx::FxBody boxStatic = makeBodyQ(0, 0, 0);
+        const fpx::FxBody boxTop = makeBodyQ(0, FromInt(2) - overlap, 0);   // 2*halfExtent=2, minus overlap
+
+        // (b) tetra face-down on a box -> a tetra with a FLAT triangular base at y=-1 (the bottom face) + an
+        //     apex at y=+1. BuildCanonicalFaces treats any 4-vert hull as a tetra (the face groupings are
+        //     fixed; FaceNormalWorld canonicalizes outward), so the flat base face = the reference clip ->
+        //     the box's top face clipped to the triangle = 3 contacts. Local base verts form a triangle.
+        gjk::FxHull tetraH;
+        tetraH.verts[0] = FxVec3{0, kOne, 0};                       // apex (up)
+        tetraH.verts[1] = FxVec3{FromInt(1), -kOne, FromInt(1)};    // base corner
+        tetraH.verts[2] = FxVec3{FromInt(1), -kOne, -FromInt(1)};   // base corner
+        tetraH.verts[3] = FxVec3{-FromInt(1), -kOne, 0};            // base corner
+        tetraH.count = 4;
+        const fpx::FxBody tetraBody = makeBodyQ(0, FromInt(2) - overlap, 0);   // base y=-1 -> world y=+1-overlap
+
+        // (c) edge-on-face -> a box rotated 45deg about Z so an EDGE points down onto the box top. The
+        //     down-facing incident face is a side quad; clipped against the box top it survives as a 2-point
+        //     edge contact (the box-corner-edge straddling the top face). Quaternion for 45deg about Z:
+        //     (0,0,sin(22.5),cos(22.5)). sin(22.5deg)=0.38268, cos=0.92388 in Q16.16.
+        const gjk::FxHull octaH = gjk::MakeBox(kOne, kOne, kOne);
+        // y_center = (+1 - overlap) + sqrt(2) so the rotated box's lowest edge dips `overlap` below the top.
+        fpx::FxBody octaBody = makeBodyQ(0, (fx)((1.0 - 0.125 + 1.41421356) * 65536.0), 0);
+        octaBody.orient = {0, 0, (fx)(0.38268343f * 65536.0f), (fx)(0.92387953f * 65536.0f)};
+        // The box rotated 45deg about Z has its lowest point a corner-edge at y = -sqrt(2) ~ -1.414; drop so
+        // it overlaps the static box's top (+1): place center so the lowest edge dips ~overlap below +1.
+
+        // Run gjk+epa+HullManifoldFromEpa for a pair, returning the manifold.
+        auto manifoldFor = [&](const gjk::FxHull& hA, const fpx::FxBody& bA,
+                               const gjk::FxHull& hB, const fpx::FxBody& bB) -> convex::ContactManifold {
+            const gjk::GjkResult g = gjk::Gjk(hA, bA, hB, bB);
+            if (!g.overlap) { convex::ContactManifold z; return z; }
+            const gjk::EpaResult e = gjk::Epa(hA, bA, hB, bB, g.simplex);
+            return manifold::HullManifoldFromEpa(hA, bA, hB, bB, e);
+        };
+
+        const convex::ContactManifold mBoxOnBox = manifoldFor(boxA, boxStatic, boxB, boxTop);
+        const convex::ContactManifold mTetra    = manifoldFor(boxA, boxStatic, tetraH, tetraBody);
+        const convex::ContactManifold mEdge     = manifoldFor(boxA, boxStatic, octaH, octaBody);
+
+        // === (1) THE TEETER FIX — counts {boxOnBox:4, tetraOnFace:3, edgeOnFace:2}. ===
+        check(mBoxOnBox.count == 4u, "MF2 clip: box-on-box manifold has 4 contact points");
+        check(mTetra.count    == 3u, "MF2 clip: tetra-face-down manifold has 3 contact points");
+        check(mEdge.count     == 2u, "MF2 clip: edge-on-face manifold has 2 contact points");
+
+        // === (2) POINTS VALID + BELOW THE REF FACE — every kept depth >= 0; count <= 4. ===
+        auto depthsOk = [&](const convex::ContactManifold& m) -> bool {
+            if (m.count == 0u || m.count > 4u) return false;
+            for (uint32_t k = 0; k < m.count; ++k) if (m.depths[k] < 0) return false;
+            return true;
+        };
+        check(depthsOk(mBoxOnBox), "MF2 depths: box-on-box all points depth >= 0, count <= 4");
+        check(depthsOk(mTetra),    "MF2 depths: tetra all points depth >= 0, count <= 4");
+        check(depthsOk(mEdge),     "MF2 depths: edge all points depth >= 0, count <= 4");
+
+        // === (4) CONSISTENCY — the manifold normal agrees with the EPA seed normal (FxDot > 0). ===
+        auto normalAgrees = [&](const gjk::FxHull& hA, const fpx::FxBody& bA,
+                                const gjk::FxHull& hB, const fpx::FxBody& bB,
+                                const convex::ContactManifold& m) -> bool {
+            const gjk::GjkResult g = gjk::Gjk(hA, bA, hB, bB);
+            const gjk::EpaResult e = gjk::Epa(hA, bA, hB, bB, g.simplex);
+            return convex::FxDot(m.normal, e.normal) > 0;
+        };
+        check(normalAgrees(boxA, boxStatic, boxB, boxTop, mBoxOnBox),
+              "MF2 normal: box-on-box manifold normal == EPA normal (dot > 0)");
+        check(normalAgrees(boxA, boxStatic, tetraH, tetraBody, mTetra),
+              "MF2 normal: tetra manifold normal == EPA normal (dot > 0)");
+        check(normalAgrees(boxA, boxStatic, octaH, octaBody, mEdge),
+              "MF2 normal: edge manifold normal == EPA normal (dot > 0)");
+
+        // === (3) DETERMINISM / PURITY — the manifold POD over the battery is byte-equal across two runs. ===
+        auto manifoldSum = [&]() -> uint64_t {
+            const convex::ContactManifold battery[3] = {
+                manifoldFor(boxA, boxStatic, boxB, boxTop),
+                manifoldFor(boxA, boxStatic, tetraH, tetraBody),
+                manifoldFor(boxA, boxStatic, octaH, octaBody),
+            };
+            uint64_t sum = 0;
+            for (int i = 0; i < 3; ++i) {
+                const convex::ContactManifold& m = battery[i];
+                sum = sum * 1000003ull + m.count;
+                for (uint32_t k = 0; k < 4; ++k) {
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.points[k].x;
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.points[k].y;
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.points[k].z;
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.depths[k];
+                }
+                sum = sum * 1000003ull + (uint64_t)(uint32_t)m.normal.x;
+                sum = sum * 1000003ull + (uint64_t)(uint32_t)m.normal.y;
+                sum = sum * 1000003ull + (uint64_t)(uint32_t)m.normal.z;
+            }
+            return sum;
+        };
+        const uint64_t ms1 = manifoldSum();
+        const uint64_t ms2 = manifoldSum();
+        check(ms1 == ms2, "MF2 purity: HullManifoldFromEpa battery is two-run BYTE-EQUAL (pure)");
+
+        // Also assert the manifold POD memcmp byte-equality directly (the strict guard).
+        {
+            const convex::ContactManifold a = manifoldFor(boxA, boxStatic, boxB, boxTop);
+            const convex::ContactManifold b = manifoldFor(boxA, boxStatic, boxB, boxTop);
+            check(std::memcmp(&a, &b, sizeof(convex::ContactManifold)) == 0,
+                  "MF2 purity: box-on-box ContactManifold POD memcmp byte-equal across two runs");
+        }
+
+        // === (5) DEGENERATE/EDGE FALLBACK — an overlapping pair whose faces don't clip cleanly never gives
+        //     count 0. Two deeply-coincident boxes (centers nearly the same) still yield count >= 1. ===
+        {
+            const fpx::FxBody coincident = makeBodyQ(kOne / 16, kOne / 16, kOne / 16);  // tiny offset overlap
+            const convex::ContactManifold mc = manifoldFor(boxA, boxStatic, boxB, coincident);
+            check(mc.count >= 1u, "MF2 fallback: a deeply-overlapping pair never yields count 0");
+        }
+    }
+
     if (g_fail == 0) std::printf("manifold_test: ALL PASS\n");
     else std::printf("manifold_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

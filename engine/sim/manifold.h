@@ -330,5 +330,243 @@ inline gjk::HullRenderMesh FacesToRenderInstances(const HullWorld& world) {
     return out;
 }
 
+// =========================================================================================================
+// Slice MF2 — Hull Narrowphase Hardening: SUTHERLAND-HODGMAN FACE CLIP -> THE MULTI-POINT MANIFOLD.
+// APPENDED after FacesToRenderInstances (MF1's lines above are BYTE-FROZEN; gjk/broad/ccd/convex/fpx +
+// every sibling sim header BYTE-FROZEN). MF1 built the per-hull POLYGON FACE topology; MF2 USES it to
+// GENERATE the multi-point contact manifold that fixes gjk::HullContact's documented single-point teeter:
+// given two overlapping hulls + the EPA contact normal, pick the REFERENCE face (most parallel to the
+// normal) and the INCIDENT face (most anti-parallel on the other hull), CLIP the incident polygon against
+// the reference face's side planes by deterministic Sutherland-Hodgman, and keep the clipped points below
+// the reference plane as the 1-4 contact points. This is the EXACT idiom convex::BuildManifold
+// (convex.h:352-399) runs for BOXES, GENERALIZED from box quads (2 axes -> 4 fixed side planes) to
+// arbitrary convex polygon faces (MF1's FxHullFaces -> one inward side-plane per face EDGE). The output is a
+// convex::ContactManifold VERBATIM (the frozen solver convex::SolveManifoldImpulse already loops 0..count,
+// convex.h:662 -> a count-4 manifold needs ZERO solver change). PURE INTEGER (int64 FxDot/FxCross/fxdiv/
+// fxmul); NO float, NO <cmath> in the clip math. THE CRUX (the convex::BuildManifold discipline): the SH
+// clip's keep/drop + intersection tie-breaks are bit-deterministic (FIXED edge order, STRICT integer sign,
+// NO tolerance band) so two runs are byte-equal — a 1-LSB flip changes count + cascades.
+//
+// HONEST SIMPLIFICATION (inherited from convex.h:280-284, documented + in scope): the 4-point reduction
+// keeps the DEEPEST point + the first 3 in CLIP ORDER (NOT the area-maximizing 4 a production solver keeps);
+// the face-clip contact point is the CLIPPED INCIDENT VERTEX position itself (not projected onto the
+// reference plane); its depth is the signed distance below the reference face. Canonical hulls only.
+
+using fpx::fxmul;   // the Q16.16 multiply (int64 intermediate) — the side-plane intersection lerp
+using fpx::fxdiv;   // the Q16.16 divide  (int64 intermediate) — the crossing-edge t parameter
+
+// kMaxClipVerts: a fixed-size scratch polygon ceiling. The incident face is <= kMaxFaceVerts (4); clipping a
+// 4-gon by <=4 side planes stays <= 8 (the convex.h:460 poly[8] bound). 8 covers every canonical face.
+constexpr uint32_t kMaxClipVerts = 8;
+
+// ----- ClipFaceAgainstFace: the deterministic Sutherland-Hodgman clip of the INCIDENT face polygon against
+// the REFERENCE face's side planes, GENERALIZING convex::BuildManifold's box quad-clip to arbitrary polygon
+// faces. Inputs are world-space face tables (MF1). The reference face has one inward SIDE PLANE per EDGE
+// (v[k] -> v[k+1]): the side-plane normal sideN = FxCross(refFaceNormal, edgeDir) is oriented INWARD toward
+// the face interior (flipped to AGREE with refFaceCentroid - v[k]); a point p is INSIDE iff
+// FxDot(sideN, p - v[k]) >= 0 (strict-integer sign; on-plane counts as inside; NO tolerance band). Edges are
+// clipped in FIXED order k = 0..refVertCount-1; a crossing edge (prev,cur) emits the fxdiv intersection in a
+// PINNED iteration order (== convex.h:480-513). Returns the surviving clipped polygon (<= kMaxClipVerts) in
+// outPts; outN is its vertex count (0 if the reference face is degenerate or the clip empties — the caller's
+// fallback floor). Pure integer (int64 FxDot/FxCross/fxdiv/fxmul), every order pinned.
+inline void ClipFaceAgainstFace(const FxHull& refHull, const FxBody& refBody, const FxHullFaces& refFaces,
+                                uint32_t refFace,
+                                const FxHull& incHull, const FxBody& incBody, const FxHullFaces& incFaces,
+                                uint32_t incFace,
+                                FxVec3 outPts[kMaxClipVerts], int& outN) {
+    outN = 0;
+    if (refFace >= refFaces.faceCount || incFace >= incFaces.faceCount) return;
+    const uint32_t refVc = refFaces.vertCount[refFace];
+    const uint32_t incVc = incFaces.vertCount[incFace];
+    if (refVc < 3 || incVc < 3) return;   // degenerate reference/incident face -> empty (the fallback floor)
+
+    // The reference face's world-space vertices (FIXED order) + its outward normal + its centroid.
+    FxVec3 refV[kMaxFaceVerts];
+    for (uint32_t k = 0; k < refVc; ++k) {
+        const uint32_t vi = refFaces.vertIdx[refFace][k];
+        refV[k] = FxAdd(fpx::FxRotate(refBody.orient, refHull.verts[vi]), refBody.pos);
+    }
+    const FxVec3 refN  = FaceNormalWorld(refHull, refFaces, refBody, refFace);
+    const FxVec3 refC  = FaceCentroidWorld(refHull, refFaces, refBody, refFace);
+
+    // The incident polygon (the thing we clip), world-space, FIXED order.
+    FxVec3 poly[kMaxClipVerts];
+    int polyN = (int)incVc;
+    for (uint32_t k = 0; k < incVc; ++k) {
+        const uint32_t vi = incFaces.vertIdx[incFace][k];
+        poly[k] = FxAdd(fpx::FxRotate(incBody.orient, incHull.verts[vi]), incBody.pos);
+    }
+
+    // Sutherland-Hodgman against each ref-face EDGE's inward side plane, in FIXED edge order k=0..refVc-1.
+    // For edge (a = refV[k], b = refV[(k+1)%refVc]): edgeDir = b - a; sideN = FxCross(refN, edgeDir) oriented
+    // INWARD (flipped to AGREE with refC - a). INSIDE test f(p) = FxDot(sideN, p - a) >= 0 (>= so on-plane
+    // counts as inside; NO tolerance band). A crossing edge emits the intersection at t = f(prev)/(f(prev)-
+    // f(cur)) (int64 fxdiv) -> prev + t*(cur-prev). Iteration PINNED (edge 0..polyN-1, prev=last).
+    for (uint32_t e = 0; e < refVc; ++e) {
+        const FxVec3 a    = refV[e];
+        const FxVec3 b    = refV[(e + 1u) % refVc];
+        const FxVec3 edge = FxSub(b, a);
+        FxVec3 sideN = FxCross(refN, edge);
+        // Orient INWARD: the face interior (refC) must be on the inside (f(refC) >= 0).
+        if (FxDot(sideN, FxSub(refC, a)) < 0) sideN = FxVec3{-sideN.x, -sideN.y, -sideN.z};
+
+        auto fside = [&](const FxVec3& p) -> fx { return FxDot(sideN, FxSub(p, a)); };
+
+        FxVec3 out[kMaxClipVerts];
+        int outNloc = 0;
+        if (polyN == 0) break;
+        FxVec3 prev = poly[polyN - 1];
+        fx fprev = fside(prev);
+        for (int k = 0; k < polyN; ++k) {
+            const FxVec3 cur = poly[k];
+            const fx fcur = fside(cur);
+            const bool curIn  = (fcur >= 0);
+            const bool prevIn = (fprev >= 0);
+            if (curIn) {
+                if (!prevIn && outNloc < (int)kMaxClipVerts) {
+                    // entering: emit the crossing point first, then cur.
+                    const fx denom = fprev - fcur;
+                    const fx tp = (denom != 0) ? fxdiv(fprev, denom) : 0;
+                    out[outNloc++] = FxVec3{prev.x + fxmul(cur.x - prev.x, tp),
+                                            prev.y + fxmul(cur.y - prev.y, tp),
+                                            prev.z + fxmul(cur.z - prev.z, tp)};
+                }
+                if (outNloc < (int)kMaxClipVerts) out[outNloc++] = cur;
+            } else if (prevIn && outNloc < (int)kMaxClipVerts) {
+                // leaving: emit the crossing point only.
+                const fx denom = fprev - fcur;
+                const fx tp = (denom != 0) ? fxdiv(fprev, denom) : 0;
+                out[outNloc++] = FxVec3{prev.x + fxmul(cur.x - prev.x, tp),
+                                        prev.y + fxmul(cur.y - prev.y, tp),
+                                        prev.z + fxmul(cur.z - prev.z, tp)};
+            }
+            prev = cur; fprev = fcur;
+        }
+        polyN = outNloc;
+        for (int k = 0; k < polyN; ++k) poly[k] = out[k];
+    }
+
+    outN = polyN;
+    for (int k = 0; k < polyN; ++k) outPts[k] = poly[k];
+}
+
+// ----- HullManifoldFromEpa: the multi-point contact manifold from an EPA result. The caller has already run
+// gjk::Gjk -> gjk::Epa; MF2 takes the gjk::EpaResult and does the reference/incident face selection + the
+// Sutherland-Hodgman clip, returning a convex::ContactManifold (count 1-4) VERBATIM (no new manifold type).
+//
+//   n = the EPA unit contact normal, SIGNED from A->B (epa.normal). The "reference" hull is the one whose
+//   SupportFace(n) is MOST PARALLEL to n (the better-aligned face owner): compare SupportFace(A,n)'s normal
+//   dot n against SupportFace(B,-n)'s normal dot -n (B's reference face points along -n toward A); tie-break
+//   A. The reference face = SupportFace(refHull, refDir); the incident face = IncidentFace(incHull, refN)
+//   (MF1). Clip the incident polygon against the reference face's side planes (ClipFaceAgainstFace). Keep
+//   clipped vertices with depth d = FxDot(n, refFaceCenter - vertex) >= 0 (below/inside the ref face);
+//   contact point = the vertex itself (the documented convex.h:282-284 simplification). Reduce to <=4
+//   keeping the DEEPEST (tie -> lowest clip-order index) then up to 3 more in clip order. normal = n.
+//   FALLBACK: if a selected face is degenerate or the clip yields 0 kept points, emit the single
+//   closest-point / EPA-witness midpoint as count==1 (NEVER count 0 for an overlapping pair).
+inline convex::ContactManifold HullManifoldFromEpa(const FxHull& hullA, const FxBody& bodyA,
+                                                   const FxHull& hullB, const FxBody& bodyB,
+                                                   const gjk::EpaResult& epa) {
+    convex::ContactManifold m;   // count 0, zeroed by the struct defaults
+    const FxVec3 n = epa.normal;   // UNIT, A->B
+
+    // The EPA-witness midpoint — the deterministic single-point floor (the gjk::HullContact behavior).
+    const FxVec3 witnessMid = FxVec3{(epa.contactA.x + epa.contactB.x) / 2,
+                                     (epa.contactA.y + epa.contactB.y) / 2,
+                                     (epa.contactA.z + epa.contactB.z) / 2};
+    auto fallbackOnePoint = [&]() -> convex::ContactManifold {
+        convex::ContactManifold f;
+        f.count = 1u;
+        f.points[0] = witnessMid;
+        f.depths[0] = epa.depth;
+        f.normal = n;
+        return f;
+    };
+
+    const FxHullFaces facesA = BuildCanonicalFaces(hullA);
+    const FxHullFaces facesB = BuildCanonicalFaces(hullB);
+    if (facesA.faceCount == 0 || facesB.faceCount == 0) return fallbackOnePoint();
+
+    // Choose the reference hull: the one whose SupportFace(toward the other) is MOST PARALLEL to its search
+    // direction. A's reference face is SupportFace(A, n) (points along +n toward B); B's reference face is
+    // SupportFace(B, -n) (points along -n toward A). Compare the two alignments; tie -> A (the lowest-index
+    // hull, the gjk::SupportLocal tie discipline).
+    const uint32_t sfA = SupportFace(hullA, facesA, bodyA, n);
+    const FxVec3   nfA = FaceNormalWorld(hullA, facesA, bodyA, sfA);
+    const fx       alignA = FxDot(nfA, n);
+    const FxVec3   negN = FxVec3{-n.x, -n.y, -n.z};
+    const uint32_t sfB = SupportFace(hullB, facesB, bodyB, negN);
+    const FxVec3   nfB = FaceNormalWorld(hullB, facesB, bodyB, sfB);
+    const fx       alignB = FxDot(nfB, negN);
+
+    const bool refIsA = (alignA >= alignB);   // tie-break A (>=)
+
+    const FxHull&      refHull  = refIsA ? hullA : hullB;
+    const FxBody&      refBody  = refIsA ? bodyA : bodyB;
+    const FxHullFaces& refFaces = refIsA ? facesA : facesB;
+    const uint32_t     refFace  = refIsA ? sfA : sfB;
+    const FxVec3       refN     = refIsA ? nfA : nfB;   // the reference face's OUTWARD world normal
+
+    const FxHull&      incHull  = refIsA ? hullB : hullA;
+    const FxBody&      incBody  = refIsA ? bodyB : bodyA;
+    const FxHullFaces& incFaces = refIsA ? facesB : facesA;
+    const uint32_t     incFace  = IncidentFace(incHull, incFaces, incBody, refN);
+
+    if (refFace >= refFaces.faceCount || incFace >= incFaces.faceCount) return fallbackOnePoint();
+
+    // The reference face center (the clip-keep reference plane passes through it, outward normal refN).
+    const FxVec3 refC = FaceCentroidWorld(refHull, refFaces, refBody, refFace);
+
+    // Sutherland-Hodgman clip the incident polygon against the reference face's side planes.
+    FxVec3 clipped[kMaxClipVerts];
+    int clipN = 0;
+    ClipFaceAgainstFace(refHull, refBody, refFaces, refFace,
+                        incHull, incBody, incFaces, incFace, clipped, clipN);
+    if (clipN == 0) return fallbackOnePoint();   // empty clip -> the single-point floor
+
+    // Keep the penetrating clipped vertices (depth d = FxDot(refN, refC - vertex) >= 0 == below/inside the
+    // reference face along its OUTWARD normal). The contact point = the vertex itself (documented), depth=d.
+    // refN is the reference face's outward normal; the EPA n agrees with it up to sign — d uses refN so the
+    // depth is the signed distance below the reference face regardless of which hull is reference.
+    FxVec3 candPts[kMaxClipVerts];
+    fx     candDepth[kMaxClipVerts];
+    int    candN = 0;
+    for (int k = 0; k < clipN; ++k) {
+        const FxVec3 rel = FxVec3{refC.x - clipped[k].x, refC.y - clipped[k].y, refC.z - clipped[k].z};
+        const fx d = FxDot(refN, rel);
+        if (d >= 0) { candPts[candN] = clipped[k]; candDepth[candN] = d; ++candN; }
+    }
+    if (candN == 0) return fallbackOnePoint();   // no clipped vertex penetrates -> the single-point floor
+
+    // Reduce to <=4: ALWAYS keep the DEEPEST (max depth, tie -> lowest clip-order index), then up to 3 MORE
+    // in clip order. Deterministic (== convex.h:539-552).
+    int deepest = 0;
+    for (int k = 1; k < candN; ++k) if (candDepth[k] > candDepth[deepest]) deepest = k;
+    m.points[0] = candPts[deepest];
+    m.depths[0] = candDepth[deepest];
+    uint32_t cnt = 1;
+    for (int k = 0; k < candN && cnt < 4; ++k) {
+        if (k == deepest) continue;
+        m.points[cnt] = candPts[k];
+        m.depths[cnt] = candDepth[k];
+        ++cnt;
+    }
+    m.count = cnt;
+    m.normal = n;   // the EPA normal, SIGNED A->B (the SolveManifoldImpulse / de-pen convention)
+    return m;
+}
+
+// ----- HullManifold(bodyA, hullA, bodyB, hullB): the convenience wrapper that runs the FROZEN gjk::Gjk ->
+// gjk::Epa narrowphase then HullManifoldFromEpa. Separated -> {count=0}. The MF2 multi-point counterpart of
+// gjk::HullContact (which hardcodes the single point). Pure integer.
+inline convex::ContactManifold HullManifold(const FxBody& bodyA, const FxHull& hullA,
+                                            const FxBody& bodyB, const FxHull& hullB) {
+    convex::ContactManifold m;   // count 0
+    const gjk::GjkResult g = gjk::Gjk(hullA, bodyA, hullB, bodyB);
+    if (!g.overlap) return m;
+    const gjk::EpaResult e = gjk::Epa(hullA, bodyA, hullB, bodyB, g.simplex);
+    return HullManifoldFromEpa(hullA, bodyA, hullB, bodyB, e);
+}
+
 }  // namespace manifold
 }  // namespace hf::sim
