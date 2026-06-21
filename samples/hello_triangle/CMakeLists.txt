@@ -1216,6 +1216,23 @@ hf_compile_shaders(
     # order-dependent (the Gauss-Seidel + in-place de-pen). Pure integer SSBO compute + ReadBuffer -> bit-exact
     # GPU==CPU final body world + cross-backend, proven memcmp. NO new RHI. THE SETTLING HULL WORLD.
     "shaders/hull_step.comp.hlsl:cs"
+    # Deterministic Integer Broadphase Slice 3 (Slice BP3, THE SCALING BEAT): broad_convex_step.comp is THE
+    # BROADPHASE-DRIVEN BOX WORLD STEP — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE StepConvexWorldBPN over
+    # a LARGE body set (a static floor + 256+ dynamic boxes): K ticks of predict-integrate -> per-tick
+    # re-broadphase (the candidate pairs, AABB-culled, visited in (i,j)-ASCENDING order) -> world Gauss-Seidel
+    # impulse over the candidates -> POSITION de-penetration over the candidates, copying
+    # engine/sim/broad.h::StepConvexWorldBP/StepConvexWorldBPN (the convex_step shell with the all-pairs
+    # solve/de-pen loops GATED on the fpx::AabbOverlap broadphase predicate -> the SAME sorted candidate set as
+    # the CPU grid+sort, BP2 equivalence). The make-or-break: the GPU final body world is BIT-EXACT vs the CPU
+    # broad::StepConvexWorldBPN, which is itself BYTE-IDENTICAL to the all-pairs convex::StepConvexWorldN (the
+    # SCALE proof — the broadphase is bit-transparent). stepEnabled=0 -> bodies UNCHANGED. Like convex_step.comp
+    # this is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec/quaternion Q16.16 products), so it is
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --broad-convex runs
+    # the CPU StepConvexWorldBPN instead (byte-identical by construction). Single-thread because the world step
+    # is order-dependent (the Gauss-Seidel + in-place de-pen). The host CHUNKS the K ticks into bounded
+    # tick-batches with a ComputeToComputeBarrier between (the GJ4 TDR fix; bit-identical to one big dispatch).
+    # Pure integer SSBO compute + ReadBuffer. NO new RHI. THE BROADPHASE-DRIVEN SETTLING PILE.
+    "shaders/broad_convex_step.comp.hlsl:cs"
     # Deterministic Contact Friction Slice 1 (Slice FC1, the BEACHHEAD of FLAGSHIP #20: DETERMINISTIC
     # TANGENTIAL CONTACT FRICTION, hf::sim::fric): fric_basis.comp is THE TANGENT BASIS pass — ONE THREAD PER
     # INPUT NORMAL (per-normal INDEPENDENT, 64 threads/group, NO atomics) runs the fixed integer Gram-Schmidt

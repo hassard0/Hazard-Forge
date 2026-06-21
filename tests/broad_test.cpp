@@ -363,6 +363,114 @@ int main() {
         check(std::memcmp(&m, &m2, sizeof(m)) == 0, "MeasureBroadphasePairs is a pure function (two calls equal)");
     }
 
+    // ======================= Slice BP3 — THE BROADPHASE-DRIVEN BOX WORLD STEP =======================
+    // Pins the BP3 contracts the GPU broad_convex_step + the scale proof build on:
+    //   * BuildBroadphasePairsWithStatics is equivalent to all-pairs over a scene WITH a large static floor
+    //     (the static-vs-dynamic pass self-policed by BroadphaseStepPairsEquivalentToAllPairs).
+    //   * StepConvexWorldBPN == convex::StepConvexWorldN BYTE-IDENTICAL on a moderate scene (the
+    //     scale/bit-transparency proof, CPU-only — the broadphase changes ONLY performance, not a bit).
+    //   * the broadphase step brings the pile to REST (MeasureStack); deterministic (two runs byte-equal).
+    namespace convex = hf::sim::convex;
+    {
+        // The deterministic step config (== the --broad-convex-shot / convex-stack config).
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        broad::BroadStepConfig bcfg;
+        bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        bcfg.cfg.dt          = kOne / 60;
+        bcfg.cfg.solveIters  = 12;
+        bcfg.cfg.restitution = 0;
+        bcfg.cfg.slop        = kOne / 64;
+        bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        bcfg.cfg.linDamp     = (fx)((int64_t)98 * kOne / 100);  // 0.98
+        bcfg.cfg.angDamp     = (fx)((int64_t)50 * kOne / 100);  // 0.5
+        bcfg.cfg.posIters    = 4;
+        bcfg.cellSize        = kOne * 2;   // >= 2*dynamic-radius (slabs fit; see below)
+
+        auto makeBody = [&](fx x, fx y, fx z, bool dyn, fx radius) {
+            fpx::FxBody b;
+            b.pos = {x, y, z};
+            b.orient = fpx::FxQuat{0, 0, 0, kOne};
+            b.invMass = dyn ? kOne : 0;
+            b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+            b.vel = {0, 0, 0};
+            b.angVel = {0, 0, 0};
+            b.radius = radius;
+            return b;
+        };
+        // A moderate scene: a wide static FLOOR (a large box, radius spans many cells -> exercises the
+        // static-vs-dynamic all-pairs pass) + a small grid of dynamic unit boxes dropped above it. The dynamic
+        // boxes are small (half-extent 0.5, radius ~0.87) so cellSize=2 keeps the ±1 stencil exact for them.
+        const convex::FxBox kFloorBox{convex::FxVec3{FromInt(6), kOne, FromInt(6)}};
+        const convex::FxBox kUnit{convex::FxVec3{kOne / 2, kOne / 2, kOne / 2}};
+        const fx kUnitRad = (fx)(0.87 * (double)kOne);   // > sqrt(3)/2 box diagonal, the broadphase AABB pad
+        const fx kFloorRad = FromInt(6);                      // the floor's broadphase half-extent (spans cells)
+        auto buildModerate = [&]() {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false, kFloorRad)); w.boxes.push_back(kFloorBox);  // 0 floor
+            // a 3x3 grid of dynamic boxes at two stacked layers (18 boxes), spaced 1 unit, dropped low so they
+            // settle quickly within the tick budget.
+            for (int layer = 0; layer < 2; ++layer)
+                for (int gz = -1; gz <= 1; ++gz)
+                    for (int gx = -1; gx <= 1; ++gx)
+                        w.bodies.push_back(makeBody(FromInt(gx), FromInt(1) + kOne / 2 + FromInt(layer), FromInt(gz), true, kUnitRad)),
+                        w.boxes.push_back(kUnit);
+            return w;
+        };
+
+        // ----- the static-aware broadphase is equivalent to all-pairs (the floor's pairs found) -----
+        {
+            convex::ConvexWorld w = buildModerate();
+            check(broad::BroadphaseStepPairsEquivalentToAllPairs(w, bcfg.cellSize),
+                  "BP3: static-aware broadphase == all-pairs (the large static floor's pairs are found)");
+            // Re-check after a few ticks (positions moved -> the candidate set is re-derived each tick).
+            broad::StepConvexWorldBPN(w, bcfg, 20);
+            check(broad::BroadphaseStepPairsEquivalentToAllPairs(w, bcfg.cellSize),
+                  "BP3: static-aware broadphase == all-pairs after settling (re-broadphased positions)");
+        }
+
+        // ----- THE SCALE PROOF (CPU-only, exhaustive): StepConvexWorldBPN == convex::StepConvexWorldN -----
+        {
+            const uint32_t kTicks = 120;
+            convex::ConvexWorld bp = buildModerate();
+            broad::StepConvexWorldBPN(bp, bcfg, kTicks);
+            convex::ConvexWorld ap = buildModerate();
+            convex::StepConvexWorldN(ap, bcfg.cfg, kTicks);   // the all-pairs reference, SAME scene
+            bool byteEqual = (bp.bodies.size() == ap.bodies.size());
+            for (size_t i = 0; i < bp.bodies.size() && byteEqual; ++i)
+                if (std::memcmp(&bp.bodies[i], &ap.bodies[i], sizeof(fpx::FxBody)) != 0) byteEqual = false;
+            check(byteEqual,
+                  "BP3: StepConvexWorldBPN == convex::StepConvexWorldN BYTE-IDENTICAL (the scale/bit-transparency proof)");
+
+            // ----- the broadphase step brings the pile to REST -----
+            const convex::StackMeasure ms = convex::MeasureStack(bp);
+            check(ms.maxSpeed < kOne, "BP3: the broadphase-stepped pile came to REST (maxSpeed below band)");
+            check(ms.maxPenetration < kOne / 4, "BP3: the broadphase-stepped pile is HELD (maxPen within slop+band)");
+
+            // ----- determinism: two BP runs byte-identical -----
+            convex::ConvexWorld bp2 = buildModerate();
+            broad::StepConvexWorldBPN(bp2, bcfg, kTicks);
+            bool det = (bp.bodies.size() == bp2.bodies.size());
+            for (size_t i = 0; i < bp.bodies.size() && det; ++i)
+                if (std::memcmp(&bp.bodies[i], &bp2.bodies[i], sizeof(fpx::FxBody)) != 0) det = false;
+            check(det, "BP3: StepConvexWorldBPN is deterministic (two runs byte-identical)");
+        }
+
+        // ----- a single dynamic box + the static floor: equivalence + rest (the minimal static case) -----
+        {
+            convex::ConvexWorld w;
+            w.bodies.push_back(makeBody(0, 0, 0, false, kFloorRad)); w.boxes.push_back(kFloorBox);
+            w.bodies.push_back(makeBody(0, FromInt(3), 0, true, kUnitRad)); w.boxes.push_back(kUnit);
+            check(broad::BroadphaseStepPairsEquivalentToAllPairs(w, bcfg.cellSize),
+                  "BP3: single dynamic + floor -> static-aware broadphase == all-pairs");
+            convex::ConvexWorld bp = w;
+            broad::StepConvexWorldBPN(bp, bcfg, 120);
+            convex::ConvexWorld ap = w;
+            convex::StepConvexWorldN(ap, bcfg.cfg, 120);
+            check(std::memcmp(&bp.bodies[1], &ap.bodies[1], sizeof(fpx::FxBody)) == 0,
+                  "BP3: single dynamic + floor -> StepConvexWorldBPN == all-pairs byte-identical");
+        }
+    }
+
     if (g_fail == 0) std::printf("broad_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

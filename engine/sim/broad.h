@@ -345,5 +345,214 @@ inline BroadphasePairMeasure MeasureBroadphasePairs(const std::vector<fpx::FxBod
     return m;
 }
 
+// ===== Slice BP3 — THE BROADPHASE-DRIVEN BOX WORLD STEP (the scaling beat) =============================
+// BP1 built the body grid, BP2 the candidate-pair generator (proven equivalent to all-pairs). BP3 puts it
+// to WORK: a broadphase-driven box world step (StepConvexWorldBP) that reproduces convex::StepConvexWorld's
+// 5-pass tick with the all-pairs O(n^2) impulse-solve + position de-penetration loops REPLACED by iteration
+// over the BP2 candidate-pair list — so a LARGE box scene (256+ bodies) settles deterministically. The
+// make-or-break is the SCALE PROOF: the broadphase-driven step settles a large scene BYTE-IDENTICAL to the
+// all-pairs reference on the SAME scene (the broadphase changes ONLY performance, not a single bit — provable
+// bit-transparency, extended from BP2's pair-set proof to the full dynamics).
+//
+// THE GAUSS-SEIDEL ORDER CRUX (the make-or-break). GS is ORDER-DEPENDENT (a pair sees earlier pairs'
+// mutations). For StepConvexWorldBP to be byte-identical to the all-pairs StepConvexWorld, it MUST visit the
+// candidate pairs in the SAME order the all-pairs loop visits the box-overlapping subset: (i,j) ASCENDING.
+// BP2's BuildBroadphasePairs emits i-ascending but j-in-stencil-order, so BP3 SORTS the broadphase pair list
+// by (i,j) (SortPairsCanonical) before the solve. Then: the all-pairs loop visits every i<j pair, skipping
+// non-overlapping ones (a box overlap => AABB overlap => in the candidate set); StepConvexWorldBP visits
+// exactly the AABB-candidate pairs in (i,j) order, processing the same box-overlapping subset in the same
+// order -> byte-identical GS result. The AABB-non-overlapping pairs the all-pairs loop visits are no-ops
+// (BoxSat finds no overlap), so omitting them changes nothing. This is WHY the scale proof holds.
+//
+// THE STATIC / LARGE-BODY HANDLING (deferred from BP2). A static floor is a LARGE box spanning many cells;
+// the BP2 27-cell stencil over center-cells would MISS its pairs. The fix: BuildBroadphasePairsWithStatics =
+// the BP2 grid stencil over the DYNAMIC bodies (statics excluded from the grid) UNION a dynamic-vs-static
+// all-pairs pass (each dynamic body x each static body, fpx::AabbOverlap-tested — O(n*k), k = #statics, small;
+// the floor is one body). The combined list is canonicalized i<j and the equivalence proof (carried into BP3)
+// self-polices it: the combined broadphase pair set (sorted) == fpx::BuildPairs all-pairs (sorted) over ALL
+// bodies — if the static handling misses a pair, the proof FAILS LOUDLY. This is the resolution of BP2's
+// deferred large-body caveat.
+//
+// REUSE (read-only, byte-frozen): convex::StepConvexWorld (the 5-pass shell mirrored line-for-line with ONLY
+// the (3)+(4) pair-loops swapped), convex::BoxSatStable / BuildManifold / SolveManifoldImpulse /
+// FxBoxInvInertiaBody / WorldInvInertia / IsDynamic / ConvexWorld / ConvexStepConfig, fpx::IntegrateBodyFull /
+// AabbOverlap / BodyAabb / FxPair. broad.h APPENDS only (BP1/BP2 byte-frozen).
+
+// BroadStepConfig = convex::ConvexStepConfig (reused) + the grid cell size (>= 2*maxDynamicRadius so the BP2
+// ±1 stencil is EXACT for the dynamic bodies). The static-vs-dynamic pass is all-pairs so statics need no
+// cellSize bound. cellSize is a Q16.16 length.
+struct BroadStepConfig {
+    hf::sim::convex::ConvexStepConfig cfg;   // the convex 5-pass parameters (gravity/dt/iters/slop/beta/damp)
+    fx                                cellSize = fpx::kOne * 2;   // the broadphase grid cell edge (Q16.16)
+};
+
+// BuildBroadphasePairsWithStatics(world, cellSize, pairsOut): the STATIC-AWARE broadphase pair list over a
+// convex::ConvexWorld. (a) the BP2 grid stencil over the DYNAMIC bodies only (statics excluded from the grid,
+// the body indices REMAPPED back to world indices); (b) a dynamic-vs-static all-pairs pass (each dynamic x
+// each static, fpx::AabbOverlap-tested). The combined list is canonicalized i<j (lower world index first) and
+// appended; the caller SORTS it by (i,j). NOT sorted here — the caller controls the canonical order. Statics
+// are bodies with invMass==0 (the convex.h convention; matches IsDynamic's invMass!=0 gate). The dynamic-only
+// grid keeps the bounded dense grid tight (a single far-flung static floor would NOT bloat the grid).
+inline void BuildBroadphasePairsWithStatics(const hf::sim::convex::ConvexWorld& world, fx cellSize,
+                                            std::vector<fpx::FxPair>& pairsOut) {
+    namespace convex = hf::sim::convex;
+    const uint32_t n = (uint32_t)world.bodies.size();
+    pairsOut.clear();
+
+    // Partition into dynamic vs static world indices (a static is invMass==0, the convex.h convention; a body
+    // with the dynamic flag cleared but invMass!=0 is treated as a movable participant — but the canonical
+    // scenes set invMass==0 <=> static). We use invMass==0 as the grid-exclusion + static-pass predicate so
+    // that ALL non-static bodies (the grid's stencil set) match exactly the i<j pairs fpx::BuildPairs visits
+    // that are NOT static-static. (The static-static pairs the all-pairs solve SKIPS; we never emit them.)
+    std::vector<fpx::FxBody> dynBodies;       // the dynamic-only body set (for the BP2 grid)
+    std::vector<uint32_t>    dynToWorld;      // dynBodies[d] -> world body index
+    std::vector<uint32_t>    statics;         // the world indices of static bodies
+    dynBodies.reserve(n);
+    dynToWorld.reserve(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (world.bodies[i].invMass != 0) { dynBodies.push_back(world.bodies[i]); dynToWorld.push_back(i); }
+        else                              { statics.push_back(i); }
+    }
+
+    // (a) the BP2 grid stencil over the DYNAMIC bodies; remap each emitted (di,dj) back to world indices,
+    // canonicalized i<j (dynToWorld is ASCENDING so di<dj => world i<j, but canonicalize defensively).
+    if (!dynBodies.empty()) {
+        const BodyGrid grid = MakeBodyGrid(dynBodies, cellSize);
+        const BodyCellTable table = BuildBodyCellTable(dynBodies, grid);
+        std::vector<uint32_t> off;
+        std::vector<fpx::FxPair> dynPairs;
+        BuildBroadphasePairs(dynBodies, grid, table, off, dynPairs);
+        for (const fpx::FxPair& p : dynPairs) {
+            uint32_t wi = dynToWorld[p.i], wj = dynToWorld[p.j];
+            if (wi > wj) { uint32_t t = wi; wi = wj; wj = t; }
+            pairsOut.push_back(fpx::FxPair{wi, wj});
+        }
+    }
+
+    // (b) the dynamic-vs-static all-pairs pass: each dynamic x each static, AABB-tested. O(n*k), k small.
+    // Canonical i<j over world indices.
+    for (uint32_t d = 0; d < (uint32_t)dynToWorld.size(); ++d) {
+        const uint32_t wd = dynToWorld[d];
+        const fpx::FxAabb ad = fpx::BodyAabb(world.bodies[wd]);
+        for (uint32_t s = 0; s < (uint32_t)statics.size(); ++s) {
+            const uint32_t ws = statics[s];
+            if (!fpx::AabbOverlap(ad, fpx::BodyAabb(world.bodies[ws]))) continue;
+            uint32_t wi = wd, wj = ws;
+            if (wi > wj) { uint32_t t = wi; wi = wj; wj = t; }
+            pairsOut.push_back(fpx::FxPair{wi, wj});
+        }
+    }
+}
+
+// BroadphaseStepPairsEquivalentToAllPairs(world, cellSize): the BP3 carry of BP2's equivalence proof onto the
+// STATIC-AWARE broadphase. Build the combined static-aware pair set, sort by (i,j); build the all-pairs
+// reference (fpx::BuildPairs over ALL bodies), DROP its static-static pairs (the solve skips them, the
+// static-aware broadphase never emits them), sort; byte-compare as SETS. Returns true iff byte-identical — the
+// static handling is provably complete (no pair missed, none duplicated). EXACT (a byte memcmp), the falsifiable
+// self-policing claim the spec requires.
+inline bool BroadphaseStepPairsEquivalentToAllPairs(const hf::sim::convex::ConvexWorld& world, fx cellSize) {
+    std::vector<fpx::FxPair> bp;
+    BuildBroadphasePairsWithStatics(world, cellSize, bp);
+    SortPairsCanonical(bp);
+
+    fpx::FxWorld fw;
+    fw.bodies = world.bodies;
+    std::vector<uint32_t> refOff;
+    std::vector<fpx::FxPair> refAll;
+    fpx::BuildPairs(fw, refOff, refAll);
+    std::vector<fpx::FxPair> ref;
+    ref.reserve(refAll.size());
+    for (const fpx::FxPair& p : refAll) {
+        if (world.bodies[p.i].invMass == 0 && world.bodies[p.j].invMass == 0) continue;  // static-static skip
+        ref.push_back(p);
+    }
+    SortPairsCanonical(ref);
+
+    if (bp.size() != ref.size()) return false;
+    if (bp.empty()) return true;
+    return std::memcmp(bp.data(), ref.data(), bp.size() * sizeof(fpx::FxPair)) == 0;
+}
+
+// StepConvexWorldBP(world, cfg): ONE broadphase-driven deterministic tick — convex::StepConvexWorld's 5-pass
+// shell with the all-pairs (3) impulse-solve + (4) de-penetration loops REPLACED by iteration over the SORTED
+// (i,j) broadphase pair list (re-built each tick from the CURRENT positions). Mirrors StepConvexWorld
+// LINE-FOR-LINE; ONLY the pair source differs (the sorted candidate list vs the nested for i:for j>i). Pure
+// integer, FIXED order. See convex.h:856-934 (the reference 5-pass body).
+inline void StepConvexWorldBP(hf::sim::convex::ConvexWorld& world, const BroadStepConfig& bcfg) {
+    namespace convex = hf::sim::convex;
+    const hf::sim::convex::ConvexStepConfig& cfg = bcfg.cfg;
+    const size_t n = world.bodies.size();
+
+    // (1) Predict-integrate every dynamic body + per-tick velocity retention (VERBATIM StepConvexWorld:1).
+    for (size_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != fpx::kOne) world.bodies[i].vel = convex::FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != fpx::kOne) world.bodies[i].angVel = convex::FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // (2) The world inverse inertias, once per tick from the post-integrate orient (VERBATIM:2).
+    std::vector<convex::FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const convex::FxVec3 invIbody = convex::FxBoxInvInertiaBody(world.boxes[i], world.bodies[i].invMass);
+        invIW[i] = convex::WorldInvInertia(world.bodies[i], invIbody);
+    }
+
+    // (2.5) RE-BUILD the broadphase pair list from the CURRENT positions + SORT it by (i,j) — the GS-order
+    // crux (positions changed this tick, so the candidate set is re-derived; the fpx.h SimTick realism).
+    std::vector<fpx::FxPair> pairs;
+    BuildBroadphasePairsWithStatics(world, bcfg.cellSize, pairs);
+    SortPairsCanonical(pairs);
+
+    // (3) Impulse solve — solveIters world Gauss-Seidel sweeps over the SORTED pair list (VERBATIM the
+    // StepConvexWorld:3 per-pair body, only the pair source swapped). Skip static-static (never emitted, but
+    // keep the guard so the loop body is byte-identical to the all-pairs one). Mutation in place.
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        for (const fpx::FxPair& p : pairs) {
+            const size_t i = p.i, j = p.j;
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+            const convex::SatResult sat = convex::BoxSatStable(world.bodies[i], world.boxes[i],
+                                                               world.bodies[j], world.boxes[j]);
+            if (!sat.overlap) continue;
+            const convex::ContactManifold m = convex::BuildManifold(world.bodies[i], world.boxes[i],
+                                                                    world.bodies[j], world.boxes[j], sat);
+            if (m.count == 0) continue;
+            convex::SolveManifoldImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], m,
+                                         cfg.restitution, 1);   // ONE inner sweep — the outer loop is the GS
+        }
+    }
+
+    // (4) Position de-penetration — posIters sweeps over the SORTED pair list (VERBATIM StepConvexWorld:4).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (const fpx::FxPair& p : pairs) {
+            const size_t i = p.i, j = p.j;
+            const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+            if (invSum == 0) continue;   // both static -> skip
+            const convex::SatResult sat = convex::BoxSatStable(world.bodies[i], world.boxes[i],
+                                                               world.bodies[j], world.boxes[j]);
+            if (!sat.overlap) continue;
+            convex::FxVec3 nrm = sat.axis;
+            if (convex::FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                nrm = convex::FxVec3{-nrm.x, -nrm.y, -nrm.z};
+            const fx excess = sat.penetration - cfg.slop;
+            if (excess <= 0) continue;
+            const fx corrected = convex::fxmul(excess, cfg.beta);
+            const fx wi = convex::fxdiv(world.bodies[i].invMass, invSum);
+            const fx wj = fpx::kOne - wi;
+            const convex::FxVec3 ci = convex::FxScale(nrm, convex::fxmul(corrected, wi));
+            const convex::FxVec3 cj = convex::FxScale(nrm, convex::fxmul(corrected, wj));
+            world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+            world.bodies[j].pos = convex::FxAdd(world.bodies[j].pos, cj);
+        }
+    }
+    // (5) Orientation was already integrated in step (1).
+}
+
+// StepConvexWorldBPN(world, cfg, ticks): run `ticks` broadphase-driven steps -> a LARGE scene settles.
+inline void StepConvexWorldBPN(hf::sim::convex::ConvexWorld& world, const BroadStepConfig& bcfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepConvexWorldBP(world, bcfg);
+}
+
 }  // namespace broad
 }  // namespace hf::sim

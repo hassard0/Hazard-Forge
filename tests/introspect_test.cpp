@@ -484,6 +484,8 @@ int main() {
             bool sawBroadphaseGridFeature = false;
             // Slice BP2: the deterministic-broadphase-pairs capability is advertised.
             bool sawBroadphasePairsFeature = false;
+            // Slice BP3: the deterministic-broadphase-convex-step capability is advertised.
+            bool sawBroadphaseConvexStepFeature = false;
             // Slice VT1: the runtime-virtual-texturing-feedback capability is advertised in the manifest.
             bool sawVtFeedbackFeature = false;
             // Slice VT2: the runtime-virtual-texturing-allocate capability is advertised in the manifest.
@@ -686,6 +688,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
                     if (AsString(el->value) == "deterministic-broadphase-grid") sawBroadphaseGridFeature = true;
                     if (AsString(el->value) == "deterministic-broadphase-pairs") sawBroadphasePairsFeature = true;
+                    if (AsString(el->value) == "deterministic-broadphase-convex-step") sawBroadphaseConvexStepFeature = true;
                     if (AsString(el->value) == "nanite-software-raster") sawSwRasterFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-gpu") sawSwRasterGpuFeature = true;
                     if (AsString(el->value) == "nanite-software-raster-resolve") sawSwRasterResolveFeature = true;
@@ -872,6 +875,7 @@ int main() {
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
             check(sawBroadphaseGridFeature, "engine.features includes deterministic-broadphase-grid");
             check(sawBroadphasePairsFeature, "engine.features includes deterministic-broadphase-pairs");
+            check(sawBroadphaseConvexStepFeature, "engine.features includes deterministic-broadphase-convex-step");
             check(sawSwRasterFeature, "engine.features includes nanite-software-raster");
             check(sawSwRasterGpuFeature, "engine.features includes nanite-software-raster-gpu");
             check(sawSwRasterResolveFeature, "engine.features includes nanite-software-raster-resolve");
