@@ -475,5 +475,180 @@ inline SweptPairMeasure MeasureSweptPairs(const gjk::HullWorld& world, fx dt, fx
     return m;
 }
 
+// ===== Slice CD3 — THE SUBSTEPPED CCD WORLD STEP (the mechanism beat: prevents tunneling) ==================
+// CD1 built the time-of-impact PRIMITIVE (ConservativeAdvance); CD2 built the swept-AABB BROADPHASE
+// (BuildSweptBroadphasePairs, a proven superset of the discrete candidate set). CD3 ASSEMBLES them into a
+// SUBSTEPPED CCD world step: each tick, sweep-broadphase the candidate pairs, compute each pair's TOI, advance
+// ALL bodies to the EARLIEST impact, resolve that contact via the FROZEN solver (gjk::HullContact ->
+// convex::SolveManifoldImpulse + position de-pen, reused VERBATIM from broad::StepHullWorldBP), then consume
+// the remaining dt and repeat — so a FAST body STOPS at the first thing it would hit instead of tunneling
+// through it in one big tick. Bounded by maxSubsteps. All integer, FIXED substep + pair + body order ->
+// bit-identical CPU<->Vulkan<->Metal.
+//
+// THE NO-TUNNEL HEADLINE: in a scene with a fast mover, StepHullWorldCCD lands the body on the CORRECT (near)
+// side of a thin wall, while the discrete broad::StepHullWorldBP on the SAME scene tunnels it through — the two
+// final states DIFFER, and the CCD one passes a noTunnel predicate (final pos on the approach side, gap >= 0).
+//
+// THE int64 REALITY (the CD1 lesson): a CCD tick = swept broadphase + N TOI loops (each an embedded gjk::Gjk)
+// + a resolve (gjk::HullContact = Gjk->Epa), all int64. DXC compiles int64 (the Vulkan path); glslc cannot.
+// So shaders/ccd_step.comp.hlsl is VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl); the Metal --ccd-step runs the CPU
+// StepHullWorldCCDN -> byte-identical to the Vulkan GPU result BY CONSTRUCTION. Because a CCD tick is the
+// HEAVIEST single-thread dispatch in the suite, the GPU shader CHUNKS at 1 TICK/DISPATCH from the start
+// (barrier between, TDR-safe by construction, bit-identical to one big dispatch).
+//
+// CAVEATS (honest, in scope): conservative advancement is within the CD1 TOI band; maxSubsteps is a bounded
+// budget (a very-fast body past the cap can still tunnel — a documented deterministic limit); the swept
+// broadphase inflates the candidate set; the GJ within-band caveats inherited (single-point manifold, diagonal
+// inertia). Convex hulls only.
+
+// CcdStepConfig = a broad::BroadStepConfig (the gravity/dt/iters/slop/beta/damp + cellSize) + the substep cap.
+struct CcdStepConfig {
+    broad::BroadStepConfig bcfg;            // the broadphase-driven hull step config (reused verbatim)
+    uint32_t               maxSubsteps = 8; // the bounded substep budget per tick (a body past the cap can tunnel)
+};
+
+// ----- ResolveTouchingPairCCD: the FROZEN at-TOI contact resolve over ONE candidate pair (i,j), reusing the
+// broad::StepHullWorldBP solve + de-pen machinery VERBATIM at the bodies' CURRENT (just-advanced-to-TOI) poses.
+// Runs solveIters impulse sweeps then posIters de-pen sweeps over the single pair. invIW are the per-body world
+// inverse inertias (computed once from the post-advance orient, exactly as StepHullWorldBP pass (2)). Identical
+// loop body to broad::StepHullWorldBP passes (3)+(4); only the pair source is this one pair. Mutates in place.
+inline void ResolveTouchingPairCCD(gjk::HullWorld& world, const broad::BroadStepConfig& bcfg,
+                                   const std::vector<convex::FxMat3>& invIW, uint32_t i, uint32_t j) {
+    const hf::sim::convex::ConvexStepConfig& cfg = bcfg.cfg;
+    // (3) impulse solve — solveIters Gauss-Seidel sweeps over THIS pair (== StepHullWorldBP pass 3 body).
+    for (uint32_t sweep = 0; sweep < cfg.solveIters; ++sweep) {
+        if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) break;  // static-static
+        const convex::ContactManifold m = gjk::HullContact(world.bodies[i], world.hulls[i],
+                                                           world.bodies[j], world.hulls[j]);
+        if (m.count == 0) continue;
+        convex::SolveManifoldImpulse(world.bodies[i], world.bodies[j], invIW[i], invIW[j], m,
+                                     cfg.restitution, 1);
+    }
+    // (4) position de-penetration — posIters sweeps over THIS pair (== StepHullWorldBP pass 4 body).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+        if (invSum == 0) break;   // both static -> skip
+        const convex::ContactManifold m = gjk::HullContact(world.bodies[i], world.hulls[i],
+                                                           world.bodies[j], world.hulls[j]);
+        if (m.count == 0) continue;
+        convex::FxVec3 nrm = m.normal;
+        if (convex::FxDot(nrm, fpx::FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+            nrm = convex::FxVec3{-nrm.x, -nrm.y, -nrm.z};
+        const fx excess = m.depths[0] - cfg.slop;
+        if (excess <= 0) continue;
+        const fx corrected = convex::fxmul(excess, cfg.beta);
+        const fx wi = convex::fxdiv(world.bodies[i].invMass, invSum);
+        const fx wj = fpx::kOne - wi;
+        const convex::FxVec3 ci = convex::FxScale(nrm, convex::fxmul(corrected, wi));
+        const convex::FxVec3 cj = convex::FxScale(nrm, convex::fxmul(corrected, wj));
+        world.bodies[i].pos = fpx::FxSub(world.bodies[i].pos, ci);
+        world.bodies[j].pos = convex::FxAdd(world.bodies[j].pos, cj);
+    }
+}
+
+// ----- StepHullWorldCCD(world, cfg): ONE CCD tick, bounded by cfg.maxSubsteps. The substep loop:
+//   (1) BuildSweptBroadphasePairs(world, remainingDt, cellSize) -> the (i,j)-sorted candidate list.
+//   (2) per candidate pair ConservativeAdvance(hullA, bodyA, hullB, bodyB, remainingDt) -> FxToi; track the
+//       GLOBAL-MIN TOI over hit pairs (deterministic min; ties -> the lowest pair index, the first encountered).
+//   (3a) NO pair hit within remainingDt -> integrate ALL dynamic bodies by the FULL remainingDt (fpx::
+//        IntegrateBodyFull, the tick's gravity) + per-tick damping -> the tick is done.
+//   (3b) else -> integrate ALL dynamic bodies by minToi (sub-dt = minToi, the tick's gravity) + damping.
+//   (4)  RESOLVE at minToi: compute the per-body world inverse inertias (once, post-advance), then run the
+//        frozen solve over every candidate pair whose ConservativeAdvance HIT (the touching pairs).
+//   (5)  remainingDt -= minToi; loop from (1) until remainingDt <= 0 or maxSubsteps is hit.
+// All integer, FIXED substep + pair + body order. The candidate pairs are re-derived each substep from the
+// CURRENT positions (the broadphase is bit-transparent / not snapshotted state). NOTE the per-substep damping
+// matches StepHullWorldBP pass (1): velocity retention applied ONCE per substep advance.
+inline void StepHullWorldCCD(gjk::HullWorld& world, const CcdStepConfig& cfg) {
+    const hf::sim::convex::ConvexStepConfig& scfg = cfg.bcfg.cfg;
+    const uint32_t n = (uint32_t)world.bodies.size();
+    fx remainingDt = scfg.dt;
+
+    for (uint32_t sub = 0; sub < cfg.maxSubsteps && remainingDt > 0; ++sub) {
+        // (1) swept broadphase over the remaining dt -> the (i,j)-sorted candidate pairs.
+        std::vector<uint32_t> offsets;
+        std::vector<fpx::FxPair> pairs;
+        BuildSweptBroadphasePairs(world, remainingDt, cfg.bcfg.cellSize, offsets, pairs);
+
+        // (2) per-pair TOI -> the global-minimum TOI over hit pairs (lowest-pair-index tie-break = first seen).
+        fx minToi = remainingDt;
+        bool anyHit = false;
+        std::vector<uint8_t> pairHit((size_t)pairs.size(), 0u);
+        for (uint32_t p = 0; p < (uint32_t)pairs.size(); ++p) {
+            const uint32_t i = pairs[p].i, j = pairs[p].j;
+            const FxToi r = ConservativeAdvance(world.hulls[i], world.bodies[i],
+                                                world.hulls[j], world.bodies[j], remainingDt);
+            if (r.hit) {
+                pairHit[p] = 1u;
+                if (!anyHit || r.toi < minToi) { minToi = r.toi; }   // strict-less keeps the lowest-index tie
+                anyHit = true;
+            }
+        }
+
+        // (3) advance ALL dynamic bodies by the advance step (minToi on a hit, the full remainingDt otherwise) +
+        // per-substep velocity retention (== StepHullWorldBP pass 1). The tick's gravity is applied over the step.
+        const fx advance = anyHit ? minToi : remainingDt;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (convex::IsDynamic(world.bodies[i])) {
+                fpx::IntegrateBodyFull(world.bodies[i], scfg.gravity, advance);
+                if (scfg.linDamp != fpx::kOne) world.bodies[i].vel = convex::FxScale(world.bodies[i].vel, scfg.linDamp);
+                if (scfg.angDamp != fpx::kOne) world.bodies[i].angVel = convex::FxScale(world.bodies[i].angVel, scfg.angDamp);
+            }
+        }
+
+        if (!anyHit) { remainingDt = 0; break; }   // no impact this tick -> the full step was consumed.
+
+        // (4) resolve at minToi: the per-body world inverse inertias once (post-advance orient), then the frozen
+        // solve over every TOUCHING (hit) candidate pair, in the (i,j)-ascending pair order.
+        std::vector<convex::FxMat3> invIW((size_t)n);
+        for (uint32_t i = 0; i < n; ++i) {
+            const convex::FxVec3 invIbody = gjk::FxHullInvInertiaBody(world.hulls[i], world.bodies[i].invMass);
+            invIW[i] = convex::WorldInvInertia(world.bodies[i], invIbody);
+        }
+        for (uint32_t p = 0; p < (uint32_t)pairs.size(); ++p) {
+            if (!pairHit[p]) continue;
+            ResolveTouchingPairCCD(world, cfg.bcfg, invIW, pairs[p].i, pairs[p].j);
+        }
+
+        // (5) consume the substep + loop.
+        remainingDt -= minToi;
+    }
+}
+
+// ----- StepHullWorldCCDN(world, cfg, ticks): run `ticks` CCD ticks. The shader runs THIS verbatim (chunked).
+inline void StepHullWorldCCDN(gjk::HullWorld& world, const CcdStepConfig& cfg, uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepHullWorldCCD(world, cfg);
+}
+
+// ----- CcdMeasure + MeasureCcd: a deterministic rest/no-tunnel summary of a CCD-stepped world. maxSpeed = max
+// FxLength(vel) over the dynamic bodies (the rest test); maxPenetration = max HullContact depth over all i<j
+// pairs (the held test); dynamicCount. Pure integer, fixed order (the gjk::MeasureHullStack analog over a
+// HullWorld). Two MeasureCcd calls over the same world are byte-equal.
+struct CcdMeasure {
+    fx       maxSpeed       = 0;
+    fx       maxPenetration = 0;
+    uint32_t dynamicCount   = 0;
+};
+
+inline CcdMeasure MeasureCcd(const gjk::HullWorld& world) {
+    CcdMeasure ms;
+    const uint32_t n = (uint32_t)world.bodies.size();
+    for (uint32_t i = 0; i < n; ++i) {
+        if (convex::IsDynamic(world.bodies[i])) {
+            ++ms.dynamicCount;
+            const fx sp = fpx::FxLength(world.bodies[i].vel);
+            if (sp > ms.maxSpeed) ms.maxSpeed = sp;
+        }
+    }
+    for (uint32_t i = 0; i < n; ++i)
+        for (uint32_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;
+            const convex::ContactManifold m = gjk::HullContact(world.bodies[i], world.hulls[i],
+                                                               world.bodies[j], world.hulls[j]);
+            if (m.count != 0 && m.depths[0] > ms.maxPenetration) ms.maxPenetration = m.depths[0];
+        }
+    return ms;
+}
+
 }  // namespace ccd
 }  // namespace hf::sim

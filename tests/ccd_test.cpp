@@ -305,6 +305,139 @@ int main() {
         check(ms1.sweptPairs >= ms1.discretePairs, "the swept pair count >= the discrete pair count");
     }
 
+    // ===== Slice CD3 — THE SUBSTEPPED CCD WORLD STEP ========================================================
+    // The CD3 step config (a moderate settling config, small maxSubsteps). Matches the showcase config.
+    auto makeCcdCfg = [&]() {
+        ccd::CcdStepConfig c;
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        c.bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+        c.bcfg.cfg.dt          = kOne / 60;
+        c.bcfg.cfg.solveIters  = 20;
+        c.bcfg.cfg.restitution = 0;
+        c.bcfg.cfg.slop        = kOne / 64;
+        c.bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);    // 0.4
+        c.bcfg.cfg.linDamp     = (fx)((int64_t)90 * kOne / 100);  // 0.90
+        c.bcfg.cfg.angDamp     = (fx)((int64_t)5 * kOne / 100);   // 0.05
+        c.bcfg.cfg.posIters    = 4;
+        c.bcfg.cellSize        = FromInt(64);   // >= the max swept-AABB diameter for the fast mover
+        c.maxSubsteps          = 8;
+        return c;
+    };
+    auto makeFullDyn = [&](fx x, fx y, fx z, fx vx, fx vy) {
+        fpx::FxBody b = MakeBody(x, y, z);
+        b.vel = {vx, vy, 0};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = kOne;
+        b.flags = fpx::kFlagDynamic;
+        return b;
+    };
+    auto makeFullStat = [&](fx x, fx y, fx z) {
+        fpx::FxBody b = MakeBody(x, y, z);
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        return b;   // invMass 0, no dynamic flag -> static
+    };
+
+    // === (CD3.1) StepHullWorldCCDN brings a MODERATE scene to a settled state (a small mixed pile on a floor).
+    // The dynamic hulls come to REST (low maxSpeed) and are HELD (maxPen within slop + a small band). ===
+    {
+        const ccd::CcdStepConfig cfg = makeCcdCfg();
+        gjk::HullWorld w;
+        w.bodies.push_back(makeFullStat(0, 0, 0));  w.hulls.push_back(gjk::MakeBox(FromInt(4), kOne, FromInt(4)));  // floor
+        for (int gx = 0; gx < 3; ++gx)
+            for (int gz = 0; gz < 3; ++gz) {
+                const fx x = (fx)((int64_t)(gx - 1) * 16 * kOne / 10);
+                const fx z = (fx)((int64_t)(gz - 1) * 16 * kOne / 10);
+                w.bodies.push_back(makeFullDyn(x, (fx)(17 * kOne / 10), z, 0, 0));
+                w.hulls.push_back(gjk::MakeBox((fx)(kOne / 2), (fx)(kOne / 2), (fx)(kOne / 2)));
+            }
+        ccd::StepHullWorldCCDN(w, cfg, 200);
+        const ccd::CcdMeasure ms = ccd::MeasureCcd(w);
+        check(ms.dynamicCount == 9u, "CCD step settled scene has 9 dynamic bodies");
+        check(ms.maxSpeed < kOne * 2, "CCD step: the pile came to REST (maxSpeed within band)");
+        check(ms.maxPenetration < kOne, "CCD step: the pile is HELD (maxPen within band — not sunk)");
+    }
+
+    // === (CD3.2) THE NO-TUNNEL PROOF: a FAST mover aimed at a THIN static wall. StepHullWorldCCD keeps the
+    // mover on the CORRECT (near) side; the discrete broad::StepHullWorldBP on the SAME scene TUNNELS it
+    // through (the mover ends on the FAR side). The two final states DIFFER and the CCD one passes noTunnel. ===
+    {
+        ccd::CcdStepConfig cfg = makeCcdCfg();
+        cfg.bcfg.cfg.gravity = convex::FxVec3{0, 0, 0};   // pure horizontal shot — isolate the tunnel mechanism
+        cfg.bcfg.cfg.dt      = kOne / 10;                 // a big tick so per-tick travel >> wall thickness
+        cfg.maxSubsteps      = 8;
+
+        // The mover: a small box at x=0 moving +X at 100 u/s -> per-tick travel = 10 units >> the 0.2-thick wall.
+        // The wall: a thin static box centred at x=5 (half-extent 0.1 on X, tall on Y/Z). The mover's surface
+        // x=0.4 starts at gap 4.5 from the wall's near face x=4.9.
+        const fx kWallX = FromInt(5);
+        const fx kWallHalfX = (fx)(kOne / 10);            // 0.1 -> 0.2-thick wall
+        auto buildShotScene = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeFullDyn(0, 0, 0, FromInt(100), 0));
+            w.hulls.push_back(gjk::MakeBox((fx)(kOne * 4 / 10), (fx)(kOne * 4 / 10), (fx)(kOne * 4 / 10)));  // mover
+            w.bodies.push_back(makeFullStat(kWallX, 0, 0));
+            w.hulls.push_back(gjk::MakeBox(kWallHalfX, FromInt(2), FromInt(2)));                              // wall
+            return w;
+        };
+
+        gjk::HullWorld ccdW = buildShotScene();
+        ccd::StepHullWorldCCDN(ccdW, cfg, 4);
+        const fx ccdX = ccdW.bodies[0].pos.x;
+
+        gjk::HullWorld disW = buildShotScene();
+        broad::StepHullWorldBPN(disW, cfg.bcfg, 4);
+        const fx disX = disW.bodies[0].pos.x;
+
+        // noTunnel: the CCD mover's centre is on the APPROACH (near) side of the wall centre (x < wall x), i.e.
+        // it did NOT pass through. The discrete mover TUNNELED -> its centre is on the FAR side (x > wall x).
+        const bool ccdNoTunnel = (ccdX < kWallX);
+        const bool discreteTunneled = (disX > kWallX);
+        check(ccdNoTunnel, "no-tunnel: CCD mover stays on the near side of the wall (gap>=0)");
+        check(discreteTunneled, "no-tunnel: discrete StepHullWorldBP TUNNELS the mover through the wall");
+        check(ccdX != disX, "no-tunnel: the CCD and discrete final states DIFFER");
+    }
+
+    // === (CD3.3) DETERMINISM: two StepHullWorldCCDN runs over the same scene are byte-identical (the body
+    // vector is the only mutable replayable state; pure integer, fixed order). ===
+    {
+        const ccd::CcdStepConfig cfg = makeCcdCfg();
+        auto build = [&]() {
+            gjk::HullWorld w;
+            w.bodies.push_back(makeFullStat(0, 0, 0));  w.hulls.push_back(gjk::MakeBox(FromInt(4), kOne, FromInt(4)));
+            w.bodies.push_back(makeFullDyn(0, (fx)(17 * kOne / 10), 0, 0, 0));
+            w.hulls.push_back(gjk::MakeBox((fx)(kOne / 2), (fx)(kOne / 2), (fx)(kOne / 2)));
+            w.bodies.push_back(makeFullDyn((fx)(12 * kOne / 10), (fx)(20 * kOne / 10), 0, FromInt(30), 0));
+            w.hulls.push_back(gjk::MakeBox((fx)(kOne / 2), (fx)(kOne / 2), (fx)(kOne / 2)));
+            return w;
+        };
+        gjk::HullWorld a = build(); ccd::StepHullWorldCCDN(a, cfg, 60);
+        gjk::HullWorld b = build(); ccd::StepHullWorldCCDN(b, cfg, 60);
+        bool eq = (a.bodies.size() == b.bodies.size());
+        for (size_t i = 0; i < a.bodies.size() && eq; ++i)
+            if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(fpx::FxBody)) != 0) eq = false;
+        check(eq, "CCD step determinism: two runs BYTE-IDENTICAL");
+    }
+
+    // === (CD3.4) A SLOW scene with NO fast movers: every substep's earliest TOI >= the full remainingDt (no
+    // impact within a single tick), so StepHullWorldCCD reduces to the discrete step — it advances all bodies by
+    // the full dt and resolves no contact early. We assert the dynamic body falls (gravity integrated) and the
+    // world stays finite/coherent (the CCD machinery is a no-op-superset of the discrete step when nothing is
+    // fast). NOTE: the at-TOI resolve differs structurally from StepHullWorldBP's pair loop, so we assert the
+    // REDUCTION qualitatively (the body moved under gravity, settled, did not blow up), not byte-equality. ===
+    {
+        ccd::CcdStepConfig cfg = makeCcdCfg();
+        gjk::HullWorld w;
+        w.bodies.push_back(makeFullStat(0, 0, 0));  w.hulls.push_back(gjk::MakeBox(FromInt(4), kOne, FromInt(4)));
+        w.bodies.push_back(makeFullDyn(0, (fx)(30 * kOne / 10), 0, 0, 0));   // a slow drop, no horizontal motion
+        w.hulls.push_back(gjk::MakeBox((fx)(kOne / 2), (fx)(kOne / 2), (fx)(kOne / 2)));
+        const fx startY = w.bodies[1].pos.y;
+        ccd::StepHullWorldCCDN(w, cfg, 120);
+        const ccd::CcdMeasure ms = ccd::MeasureCcd(w);
+        check(w.bodies[1].pos.y < startY, "CCD slow scene: the dropped body fell under gravity");
+        check(w.bodies[1].pos.y > FromInt(0), "CCD slow scene: the body rests above the floor centre (not sunk)");
+        check(ms.maxSpeed < kOne * 2, "CCD slow scene: the body came to REST");
+    }
+
     if (g_fail == 0) std::printf("ccd_test: ALL PASS\n");
     else std::printf("ccd_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

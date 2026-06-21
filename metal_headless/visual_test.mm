@@ -29685,6 +29685,205 @@ static int RunBroadConvexShowcase(const char* outPath) {
 // Vulkan --broad-hull-shot -> the golden is bit-identical cross-backend BY CONSTRUCTION (the strict
 // zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY. New golden
 // tests/golden/metal/broad_hull.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+// ===== Slice CD3 — Deterministic Integer CCD THE SUBSTEPPED CCD WORLD STEP showcase (--ccd-step) ===========
+// (the 3rd slice + MECHANISM BEAT of FLAGSHIP #24, hf::sim::ccd). Like broad_hull_step the full CCD step is
+// int64 (the embedded Gjk TOI loop + the GJK/EPA resolve + the Support-based swept AABB), so
+// shaders/ccd_step.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's
+// hf_gen_msl list; on Metal the --ccd-step showcase runs the CPU ccd::StepHullWorldCCDN — the EXACT bit-exact
+// reference the Vulkan --ccd-step-shot GPU==CPU memcmp already compares against -> the Metal result is
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION (the broad_hull_step.comp convention), while the
+// Vulkan side carries the GPU==CPU proof. So this builds the SAME deterministic MODERATE scene (a fast mover
+// aimed at a thin static wall + a few slow settling hulls), steps StepHullWorldCCDN K ticks over it -> the fast
+// mover ARRESTED at the wall, ASSERTS the NO-TUNNEL PROOF (CCD on the near side; the discrete StepHullWorldBP
+// tunnels through; the two differ), and CPU-colors the SAME 2D side-view as the Vulkan --ccd-step-shot -> the
+// golden is bit-identical cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines
+// match the Vulkan side EXACTLY. New golden tests/golden/metal/ccd_step.png (baked on the Mac by the
+// controller); two runs DIFF 0.0000.
+static int RunCcdStepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace gjk    = hf::sim::gjk;
+    namespace broad  = hf::sim::broad;
+    namespace ccd    = hf::sim::ccd;
+    namespace fpx    = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)convex::kOne); };
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+    auto fromInt = [&](int v) { return (fx)((int64_t)v << convex::kFrac); };
+
+    // The CCD step config (== the Vulkan --ccd-step-shot + the ccd_test makeCcdCfg).
+    ccd::CcdStepConfig cfg;
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    cfg.bcfg.cfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    cfg.bcfg.cfg.dt          = kOne / 60;
+    cfg.bcfg.cfg.solveIters  = 20;
+    cfg.bcfg.cfg.restitution = 0;
+    cfg.bcfg.cfg.slop        = kOne / 64;
+    cfg.bcfg.cfg.beta        = (fx)((int64_t)4 * kOne / 10);
+    cfg.bcfg.cfg.linDamp     = (fx)((int64_t)90 * kOne / 100);
+    cfg.bcfg.cfg.angDamp     = (fx)((int64_t)5 * kOne / 100);
+    cfg.bcfg.cfg.posIters    = 4;
+    cfg.bcfg.cellSize        = fromInt(64);
+    cfg.maxSubsteps          = 8;
+    const int kTicks = 8;
+
+    auto makeBody = [&](fx x, fx y, fx z, fx vx, bool dyn) {
+        fpx::FxBody b;
+        b.pos = {x, y, z};
+        b.orient = fpx::FxQuat{0, 0, 0, kOne};
+        b.invMass = dyn ? kOne : 0;
+        b.flags   = dyn ? fpx::kFlagDynamic : 0u;
+        b.vel = {vx, 0, 0};
+        b.angVel = {0, 0, 0};
+        b.radius  = 0;
+        return b;
+    };
+    // THE SCENE (== the Vulkan --ccd-step-shot): a fast mover + a thin static wall + a few slow settling hulls.
+    const fx kWallX = fromInt(5);
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, fromInt(60), true));
+        w.hulls.push_back(gjk::MakeBox(fd(0.4), fd(0.4), fd(0.4)));                 // 0 fast mover
+        w.bodies.push_back(makeBody(kWallX, 0, 0, 0, false));
+        w.hulls.push_back(gjk::MakeBox(fd(0.1), fi(2), fi(2)));                     // 1 thin wall
+        w.bodies.push_back(makeBody(fromInt(-3), fd(1.7), 0, 0, true));
+        w.hulls.push_back(gjk::MakeBox(fd(0.5), fd(0.5), fd(0.5)));                 // 2 slow drop
+        w.bodies.push_back(makeBody(fromInt(-3), fd(3.0), 0, 0, true));
+        w.hulls.push_back(gjk::MakeOcta(fd(0.55)));                                 // 3 slow drop
+        w.bodies.push_back(makeBody(fromInt(2), fd(1.7), 0, 0, true));
+        w.hulls.push_back(gjk::MakeBox(fd(0.5), fd(0.5), fd(0.5)));                 // 4 slow drop
+        w.bodies.push_back(makeBody(0, fromInt(-2), 0, 0, false));
+        w.hulls.push_back(gjk::MakeBox(fi(4), kOne, fi(4)));                        // 5 floor
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    gjk::HullWorld cpuW = buildScene();
+    ccd::StepHullWorldCCDN(cpuW, cfg, (uint32_t)kTicks);
+    std::printf("ccd-step: {bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU ccd::StepHullWorldCCDN, byte-identical to the Vulkan GPU result by construction]\n",
+                kBodyCount, kTicks);
+
+    gjk::HullWorld cpuW2 = buildScene();
+    ccd::StepHullWorldCCDN(cpuW2, cfg, (uint32_t)kTicks);
+    bool same = (cpuW.bodies.size() == cpuW2.bodies.size());
+    for (size_t i = 0; i < cpuW.bodies.size() && same; ++i)
+        if (std::memcmp(&cpuW.bodies[i], &cpuW2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("ccd-step: two runs differ (nondeterministic)");
+    std::printf("ccd-step determinism: two runs BYTE-IDENTICAL\n");
+
+    // THE NO-TUNNEL PROOF: the SAME fast-mover-vs-thin-wall scene through StepHullWorldCCD AND the discrete
+    // broad::StepHullWorldBP — CCD keeps the mover on the near side; the discrete step tunnels it through.
+    ccd::CcdStepConfig ntCfg = cfg;
+    ntCfg.bcfg.cfg.gravity = convex::FxVec3{0, 0, 0};
+    ntCfg.bcfg.cfg.dt      = kOne / 10;
+    const fx kNtWallX = fromInt(5);
+    auto buildShot = [&]() {
+        gjk::HullWorld w;
+        w.bodies.push_back(makeBody(0, 0, 0, fromInt(100), true));
+        w.hulls.push_back(gjk::MakeBox(fd(0.4), fd(0.4), fd(0.4)));
+        w.bodies.push_back(makeBody(kNtWallX, 0, 0, 0, false));
+        w.hulls.push_back(gjk::MakeBox(fd(0.1), fi(2), fi(2)));
+        return w;
+    };
+    gjk::HullWorld ntCcd = buildShot();
+    ccd::StepHullWorldCCDN(ntCcd, ntCfg, 4);
+    const fx ccdX = ntCcd.bodies[0].pos.x;
+    gjk::HullWorld ntDis = buildShot();
+    broad::StepHullWorldBPN(ntDis, ntCfg.bcfg, 4);
+    const fx disX = ntDis.bodies[0].pos.x;
+    if (!(ccdX < kNtWallX) || !(disX > kNtWallX) || ccdX == disX)
+        return fail("ccd-step: no-tunnel FAILED (CCD did not stay near-side / discrete did not tunnel / states "
+                    "match)");
+    std::printf("ccd-step no-tunnel: {ccdSide:correct, discreteTunneled:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the final world as the Vulkan --ccd-step-shot
+    // (identical by construction — the same render math + the same monotone-chain outline). ---
+    const int kPxPerUnit = 36, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cpuW.bodies[1], kInit.hulls[1], Vec3{0.30f, 0.45f, 0.75f});  // wall
+    drawHullXY(cpuW.bodies[5], kInit.hulls[5], Vec3{0.30f, 0.32f, 0.36f});  // floor
+    drawHullXY(cpuW.bodies[0], kInit.hulls[0], Vec3{0.95f, 0.45f, 0.20f});  // fast mover (arrested)
+    const Vec3 slowCol[3] = {Vec3{0.40f, 0.85f, 0.55f}, Vec3{0.55f, 0.80f, 0.45f}, Vec3{0.45f, 0.75f, 0.65f}};
+    drawHullXY(cpuW.bodies[2], kInit.hulls[2], slowCol[0]);
+    drawHullXY(cpuW.bodies[3], kInit.hulls[3], slowCol[1]);
+    drawHullXY(cpuW.bodies[4], kInit.hulls[4], slowCol[2]);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — CCD-stepped world side-view (%u bodies, %d ticks, mover arrested at "
+                "wall x=%d)\n", outPath, imgW, imgH, kBodyCount, kTicks,
+                (int)(cpuW.bodies[0].pos.x >> convex::kFrac));
+    return 0;
+}
+
 static int RunBroadHullShowcase(const char* outPath) {
     using math::Vec3;
     namespace convex = hf::sim::convex;
@@ -52818,6 +53017,20 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--broad-hull") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_broad_hull.png";
             try { return RunBroadHullShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ccd-step <out.png>: render the Deterministic Integer CCD THE SUBSTEPPED CCD WORLD STEP showcase (Slice
+        // CD3, THE MECHANISM BEAT, the 3rd slice of FLAGSHIP #24). On Metal this runs the CPU step: ccd_step.comp
+        // is int64/Vulkan-only (glslc can't parse the embedded Gjk TOI loop + the GJK/EPA resolve + the swept-AABB
+        // Support int64), so Metal runs the CPU ccd::StepHullWorldCCDN over the SAME scene (a fast mover aimed at a
+        // thin wall + a few slow settling hulls, stepped K ticks) -> the EXACT bit-exact reference the Vulkan
+        // --ccd-step-shot GPU==CPU memcmp compares against; two runs byte-identical; the NO-TUNNEL proof (CCD on
+        // the near side, the discrete StepHullWorldBP tunnels through, the two differ). The image golden is a
+        // PURE-INTEGER 2D side-view of the final world (the mover arrested at the wall), identical to the Vulkan
+        // path BY CONSTRUCTION. New golden tests/golden/metal/ccd_step.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ccd-step") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ccd_step.png";
+            try { return RunCcdStepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --broad-lockstep <out.png>: render the Deterministic Integer Broadphase LOCKSTEP + ROLLBACK showcase

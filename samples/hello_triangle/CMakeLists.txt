@@ -1279,6 +1279,22 @@ hf_compile_shaders(
     # watchdog) with a ComputeToComputeBarrier between (bit-identical to one big dispatch). Pure integer SSBO
     # compute + ReadBuffer. NO new RHI. THE BROADPHASE-DRIVEN SETTLING MIXED-HULL PILE.
     "shaders/broad_hull_step.comp.hlsl:cs"
+    # Deterministic Integer CCD Slice 3 (Slice CD3, THE MECHANISM BEAT): ccd_step.comp is THE SUBSTEPPED CCD
+    # WORLD STEP — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE StepHullWorldCCDN over a MODERATE scene (a
+    # fast mover aimed at a thin wall + a few slow settling hulls): each tick a bounded substep loop that
+    # swept-broadphases the candidates (all-pairs swept-AABB gate reproducing the CPU grid set), per-pair
+    # conservative-advancement TOI -> the GLOBAL-MIN TOI, advances ALL dynamic bodies to that earliest impact,
+    # then resolves the touching pairs via the frozen GJK/EPA narrowphase + impulse + de-pen, consumes the
+    # remaining dt and repeats — so a fast body STOPS at the wall instead of tunneling through it. Copies
+    # engine/sim/ccd.h::StepHullWorldCCD/StepHullWorldCCDN VERBATIM; the GPU final body world is BIT-EXACT vs the
+    # CPU ccd::StepHullWorldCCDN. Like broad_hull_step.comp this is int64 (the embedded Gjk TOI loop + the GJK/EPA
+    # resolve + the Support-based swept AABB), so it is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and
+    # is NOT MSL-gen'd — the Metal --ccd-step runs the CPU StepHullWorldCCDN instead (byte-identical by
+    # construction). Single-thread because the substepped world step is order-dependent. The host CHUNKS the K
+    # ticks at 1 TICK/DISPATCH from the start (the heaviest single-thread dispatch in the suite; a 1-tick dispatch
+    # is provably << the ~2s TDR watchdog) with a ComputeToComputeBarrier between (bit-identical to one big
+    # dispatch). Pure integer SSBO compute + ReadBuffer. NO new RHI. THE NO-TUNNEL SUBSTEPPED CCD WORLD STEP.
+    "shaders/ccd_step.comp.hlsl:cs"
     # Deterministic Contact Friction Slice 1 (Slice FC1, the BEACHHEAD of FLAGSHIP #20: DETERMINISTIC
     # TANGENTIAL CONTACT FRICTION, hf::sim::fric): fric_basis.comp is THE TANGENT BASIS pass — ONE THREAD PER
     # INPUT NORMAL (per-normal INDEPENDENT, 64 threads/group, NO atomics) runs the fixed integer Gram-Schmidt
