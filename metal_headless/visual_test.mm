@@ -41135,6 +41135,344 @@ static int RunMf2ClipShowcase(const char* outPath) {
     return 0;
 }
 
+// (--mf3-manifold) ===== Slice MF3 — Hull Narrowphase Hardening THE MULTI-POINT MANIFOLD GPU SHADER (the int64
+// GPU==CPU beat, the 3rd slice of FLAGSHIP #25). int64 -> hull_manifold.comp is NOT in the Metal hf_gen_msl
+// list; on Metal the --mf3-manifold showcase runs the CPU manifold::HullContactMulti over the SAME battery (the
+// EXACT bit-exact reference the Vulkan --mf3-manifold-shot GPU==CPU memcmp already compares against) -> the
+// Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the
+// GPU==CPU bit-identity proof (the gjk_epa.comp/convex_manifold.comp split). Mirrors the --mf2-clip render
+// EXACTLY (same scene, same lit 3D + contact markers); the 4 PROOFS print the SAME exact stdout lines as the
+// Vulkan --mf3-manifold-shot path. New golden tests/golden/metal/mf3_manifold.png (Mac-baked by the controller).
+// NO new shader.
+static int RunMf3ManifoldShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    using gjk::fx; using gjk::kOne; using gjk::FxVec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // === The deterministic contact scene (== the Vulkan --mf3-manifold-shot scene). Pure integer. ===
+    auto MakeBodyAt = [](fx px, fx py, fx pz) {
+        fpx::FxBody b; b.pos = {px, py, pz}; b.orient = {0, 0, 0, kOne}; return b;
+    };
+    const fx overlap = kOne / 8;   // 0.125 penetration
+
+    const gjk::FxHull boxStaticH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxStaticB = MakeBodyAt(gjk::FromInt(-4), 0, 0);
+    const gjk::FxHull boxTopH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxTopB = MakeBodyAt(gjk::FromInt(-4), gjk::FromInt(2) - overlap, 0);
+
+    gjk::FxHull tetraH;
+    tetraH.verts[0] = FxVec3{0, kOne, 0};
+    tetraH.verts[1] = FxVec3{gjk::FromInt(1), -kOne, gjk::FromInt(1)};
+    tetraH.verts[2] = FxVec3{gjk::FromInt(1), -kOne, -gjk::FromInt(1)};
+    tetraH.verts[3] = FxVec3{-gjk::FromInt(1), -kOne, 0};
+    tetraH.count = 4;
+    const gjk::FxHull boxMidH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxMidB = MakeBodyAt(0, 0, 0);
+    const fpx::FxBody tetraB  = MakeBodyAt(0, gjk::FromInt(2) - overlap, 0);
+
+    const gjk::FxHull boxEdgeBaseH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxEdgeBaseB = MakeBodyAt(gjk::FromInt(4), 0, 0);
+    const gjk::FxHull boxEdgeH = gjk::MakeBox(kOne, kOne, kOne);
+    fpx::FxBody boxEdgeB = MakeBodyAt(gjk::FromInt(4), (fx)((1.0 - 0.125 + 1.41421356) * 65536.0), 0);
+    boxEdgeB.orient = {0, 0, (fx)(0.38268343f * 65536.0f), (fx)(0.92387953f * 65536.0f)};
+
+    // The CPU HullContactMulti over the ORDERED battery (body-first args == the Vulkan packing). The Metal path
+    // is the CPU reference the Vulkan GPU==CPU memcmp compares against -> byte-identical by construction.
+    struct ManifoldPair { gjk::FxHull hA; fpx::FxBody bA; gjk::FxHull hB; fpx::FxBody bB; };
+    const ManifoldPair pairs[3] = {
+        {boxStaticH, boxStaticB, boxTopH, boxTopB},        // box-on-box -> 4
+        {boxMidH, boxMidB, tetraH, tetraB},                // tetra-on-face -> 3
+        {boxEdgeBaseH, boxEdgeBaseB, boxEdgeH, boxEdgeB},  // edge-on-face -> 2
+    };
+    convex::ContactManifold man[3];
+    for (int i = 0; i < 3; ++i)
+        man[i] = manifold::HullContactMulti(pairs[i].bA, pairs[i].hA, pairs[i].bB, pairs[i].hB);
+
+    // === PROOF (1): GPU==CPU (Metal = CPU HullContactMulti, byte-identical to the Vulkan GPU by construction). ===
+    if (man[0].count != 4u || man[1].count != 3u || man[2].count != 2u)
+        return fail("mf3-manifold wrong counts");
+    std::printf("mf3-manifold: {pairs:3, counts:[%u,%u,%u]} GPU==CPU BIT-EXACT "
+                "[Metal: CPU HullContactMulti, byte-identical to the Vulkan GPU result by construction]\n",
+                man[0].count, man[1].count, man[2].count);
+
+    // === PROOF (2): determinism — two runs of the CPU manifold over the battery are byte-equal. ===
+    auto runBattery = [&](convex::ContactManifold out[3]) {
+        for (int i = 0; i < 3; ++i)
+            out[i] = manifold::HullContactMulti(pairs[i].bA, pairs[i].hA, pairs[i].bB, pairs[i].hB);
+    };
+    convex::ContactManifold a3[3], b3[3];
+    runBattery(a3); runBattery(b3);
+    if (std::memcmp(a3, b3, sizeof(a3)) != 0)
+        return fail("mf3-manifold: two runs differ (nondeterministic)");
+    std::printf("mf3-manifold determinism: two runs BYTE-IDENTICAL\n");
+
+    // === PROOF (3): counts + validity — {4,3,2} + every depth >= 0. ===
+    fx minDepth = 0; bool firstD = true;
+    for (int i = 0; i < 3; ++i) {
+        const convex::ContactManifold& m = man[i];
+        if (m.count == 0u || m.count > 4u) return fail("mf3-manifold bad count");
+        for (uint32_t k = 0; k < m.count; ++k)
+            if (firstD || m.depths[k] < minDepth) { minDepth = m.depths[k]; firstD = false; }
+    }
+    if (!(minDepth >= 0)) return fail("mf3-manifold a depth < 0 (a point above the ref face)");
+    std::printf("mf3-manifold: {boxOnBox:%u, tetraOnFace:%u, edgeOnFace:%u} depthsOK\n",
+                man[0].count, man[1].count, man[2].count);
+
+    // === PROOF (4): consistency — the manifold normal matches the EPA seed normal (dot > 0). ===
+    bool normalsOk = true;
+    for (int i = 0; i < 3; ++i) {
+        const gjk::GjkResult g = gjk::Gjk(pairs[i].hA, pairs[i].bA, pairs[i].hB, pairs[i].bB);
+        const gjk::EpaResult e = gjk::Epa(pairs[i].hA, pairs[i].bA, pairs[i].hB, pairs[i].bB, g.simplex);
+        if (convex::FxDot(man[i].normal, e.normal) <= 0) normalsOk = false;
+    }
+    if (!normalsOk) return fail("mf3-manifold manifold normal disagrees with EPA normal");
+    std::printf("mf3-manifold normal: GPU == EPA normal\n");
+
+    // === The FLOAT render: the hulls LIT 3D + a small cube marker at each manifold contact point. ===
+    gjk::HullWorld world;
+    world.hulls  = {boxStaticH, boxTopH, boxMidH, tetraH, boxEdgeBaseH, boxEdgeH};
+    world.bodies = {boxStaticB, boxTopB, boxMidB, tetraB, boxEdgeBaseB, boxEdgeB};
+    const gjk::HullRenderMesh soup = manifold::FacesToRenderInstances(world);
+    {
+        const gjk::HullRenderMesh rebuild = manifold::FacesToRenderInstances(world);
+        if (!gjk::HullRenderMeshEqual(soup, rebuild))
+            return fail("mf3-manifold render provenance two-calls NOT byte-equal");
+    }
+
+    std::vector<scene::Vertex> verts;
+    verts.reserve(soup.verts.size() + 256);
+    for (const gjk::HullRenderVertex& hv : soup.verts) {
+        scene::Vertex v{};
+        v.pos[0] = hv.pos[0]; v.pos[1] = hv.pos[1]; v.pos[2] = hv.pos[2];
+        v.color[0] = hv.color[0]; v.color[1] = hv.color[1]; v.color[2] = hv.color[2];
+        v.uv[0] = 0.0f; v.uv[1] = 0.0f;
+        v.normal[0] = hv.normal[0]; v.normal[1] = hv.normal[1]; v.normal[2] = hv.normal[2];
+        v.tangent[0] = 1.0f; v.tangent[1] = 0.0f; v.tangent[2] = 0.0f;
+        verts.push_back(v);
+    }
+    auto addMarker = [&](float cx, float cy, float cz) {
+        const float r = 0.10f;
+        const float corners[8][3] = {
+            {cx-r,cy-r,cz-r},{cx+r,cy-r,cz-r},{cx-r,cy+r,cz-r},{cx+r,cy+r,cz-r},
+            {cx-r,cy-r,cz+r},{cx+r,cy-r,cz+r},{cx-r,cy+r,cz+r},{cx+r,cy+r,cz+r}};
+        const int faces[6][4] = {{0,1,3,2},{4,5,7,6},{0,1,5,4},{2,3,7,6},{0,2,6,4},{1,3,7,5}};
+        for (int f = 0; f < 6; ++f) {
+            const int* q = faces[f];
+            const int tri[2][3] = {{q[0],q[1],q[2]},{q[0],q[2],q[3]}};
+            const float* A = corners[q[0]]; const float* B = corners[q[1]]; const float* C = corners[q[2]];
+            float e1[3] = {B[0]-A[0],B[1]-A[1],B[2]-A[2]};
+            float e2[3] = {C[0]-A[0],C[1]-A[1],C[2]-A[2]};
+            float nrm[3] = {e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]};
+            const float nl = std::sqrt(nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2]);
+            if (nl > 0.0f) { nrm[0]/=nl; nrm[1]/=nl; nrm[2]/=nl; }
+            for (int t = 0; t < 2; ++t) {
+                for (int j = 0; j < 3; ++j) {
+                    const float* P = corners[tri[t][j]];
+                    scene::Vertex v{};
+                    v.pos[0]=P[0]; v.pos[1]=P[1]; v.pos[2]=P[2];
+                    v.color[0]=0.95f; v.color[1]=0.95f; v.color[2]=0.98f;
+                    v.uv[0]=0.0f; v.uv[1]=0.0f;
+                    v.normal[0]=nrm[0]; v.normal[1]=nrm[1]; v.normal[2]=nrm[2];
+                    v.tangent[0]=1.0f; v.tangent[1]=0.0f; v.tangent[2]=0.0f;
+                    verts.push_back(v);
+                }
+            }
+        }
+    };
+    uint32_t markerCount = 0;
+    for (int mi = 0; mi < 3; ++mi) {
+        const convex::ContactManifold& m = man[mi];
+        for (uint32_t k = 0; k < m.count; ++k) {
+            addMarker(fpx::FxToFloat(m.points[k].x), fpx::FxToFloat(m.points[k].y),
+                      fpx::FxToFloat(m.points[k].z));
+            ++markerCount;
+        }
+    }
+    const uint32_t kTris = (uint32_t)(verts.size() / 3);
+    std::printf("mf3-manifold render: {hulls:%u, contacts:%u, tris:%u}\n",
+                (uint32_t)world.hulls.size(), markerCount, kTris);
+
+    std::vector<uint32_t> indices(verts.size());
+    for (uint32_t k = 0; k < (uint32_t)verts.size(); ++k) indices[k] = k;
+    const uint32_t kIndexCount = (uint32_t)indices.size();
+
+    std::unique_ptr<rhi::IBuffer> soupVb, soupIb;
+    if (!verts.empty()) {
+        rhi::BufferDesc vd; vd.size = (uint64_t)verts.size() * sizeof(scene::Vertex);
+        vd.initialData = verts.data(); vd.usage = rhi::BufferUsage::Vertex;
+        soupVb = device->CreateBuffer(vd);
+        rhi::BufferDesc id; id.size = (uint64_t)indices.size() * sizeof(uint32_t);
+        id.initialData = indices.data(); id.usage = rhi::BufferUsage::Index;
+        soupIb = device->CreateBuffer(id);
+    }
+
+    // === Reuse the EXISTING NON-instanced lit pipeline (== --mf2-clip). ===
+    auto litVs = loadMSL("lit.vert.gen.metal", "vertex_main");
+    auto litFs = loadMSL("lit.frag.gen.metal", "fragment_main");
+    rhi::GraphicsPipelineDesc litDesc;
+    litDesc.vertex = litVs.get(); litDesc.fragment = litFs.get();
+    litDesc.vertexLayout = scene::MeshVertexLayout();
+    litDesc.colorFormat = device->Swapchain().ColorFormat();
+    litDesc.depthTest = true; litDesc.usesFrameUniforms = true;
+    litDesc.usesTexture = true; litDesc.pushConstantSize = sizeof(float) * 20;
+    auto litPipeline = device->CreateGraphicsPipeline(litDesc);
+
+    auto staticShadowVs = loadMSL("shadow.vert.gen.metal", "shadow_vertex");
+    rhi::GraphicsPipelineDesc stShDesc;
+    stShDesc.vertex = staticShadowVs.get(); stShDesc.fragment = nullptr;
+    stShDesc.vertexLayout = scene::MeshVertexLayout();
+    stShDesc.depthTest = true; stShDesc.depthOnly = true;
+    stShDesc.usesFrameUniforms = true; stShDesc.pushConstantSize = sizeof(float) * 16;
+    auto staticShadowPipeline = device->CreateGraphicsPipeline(stShDesc);
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky.frag.gen.metal", "sky_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+    auto shadowMap = device->CreateShadowMap(2048);
+    device->SetShadowMap(*shadowMap);
+
+    const uint8_t whitePx[4] = {255, 255, 255, 255};
+    const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+    auto whiteTex   = device->CreateTexture({1, 1, rhi::Format::RGBA8_UNorm, whitePx, sizeof(whitePx)});
+    auto flatNormal = device->CreateTexture(
+        {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+    const Vec3 eye{0.0f, 5.0f, 13.0f};
+    const Vec3 center{0.0f, 1.0f, 0.0f};
+    const float aspect = (float)W / (float)H;
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(1.04719755f, aspect, 0.1f, 100.0f));
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = 0.3f; fd.lightDir[1] = -0.8f; fd.lightDir[2] = -0.5f;
+        fd.lightColor[0] = 1.0f; fd.lightColor[1] = 0.97f; fd.lightColor[2] = 0.9f; fd.lightColor[3] = 1.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        fd.ptCount[0] = 0.0f;
+        Vec3 lightDir = math::normalize(Vec3{0.3f, -0.8f, -0.5f});
+        Vec3 sc{0.0f, 0.0f, 0.0f};
+        Vec3 lightEye = sc - lightDir * 20.0f;
+        Mat4 lightView = Mat4::LookAt(lightEye, sc, {0, 1, 0});
+        Mat4 lightOrtho = FlipProjY(Mat4::Ortho(-12.0f, 12.0f, -12.0f, 12.0f, 1.0f, 48.0f));
+        Mat4 lightVP = lightOrtho * lightView;
+        for (int k = 0; k < 16; ++k) fd.lightViewProj[k] = lightVP.m[k];
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * 1.04719755f);
+        fd.skyParams[1] = aspect;
+    }
+
+    Mat4 identity = Mat4::Identity();
+
+    render::RenderGraph graph;
+    render::RgResource rgShadow = graph.ImportTarget(
+        "shadowMap", render::RgResourceKind::ShadowMap, *shadowMap);
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("shadow", {}, {rgShadow},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            if (kIndexCount > 0) {
+                cmd.BindPipeline(*staticShadowPipeline);
+                cmd.PushConstants(identity.m, sizeof(float) * 16);
+                cmd.BindVertexBuffer(*soupVb);
+                cmd.BindIndexBuffer(*soupIb);
+                cmd.DrawIndexed(kIndexCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("scene", {rgShadow}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0.02f, 0.02f, 0.05f, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            if (kIndexCount > 0) {
+                cmd.BindPipeline(*litPipeline);
+                float pc[20];
+                for (int k = 0; k < 16; ++k) pc[k] = identity.m[k];
+                pc[16] = 0.0f; pc[17] = 1.0f; pc[18] = 0.0f; pc[19] = 0.0f;
+                cmd.PushConstants(pc, sizeof(pc));
+                cmd.BindMaterial(*whiteTex, *flatNormal);
+                cmd.BindVertexBuffer(*soupVb);
+                cmd.BindIndexBuffer(*soupIb);
+                cmd.DrawIndexed(kIndexCount);
+            }
+            cmd.EndRenderPass();
+        });
+
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+    std::vector<uint8_t> bgra2; uint32_t cw2 = 0, ch2 = 0;
+    if (!device->GetCapturedPixels(bgra2, cw2, ch2)) return fail("no captured pixels (2nd render)");
+    if (bgra.size() != bgra2.size() || std::memcmp(bgra.data(), bgra2.data(), bgra.size()) != 0)
+        return fail("mf3-manifold two renders DIFFER (nondeterministic)");
+
+    uint32_t shaded = 0;
+    for (size_t p = 0; p + 3 < bgra.size(); p += 4)
+        if ((int)bgra[p] + (int)bgra[p + 1] + (int)bgra[p + 2] > 60) ++shaded;
+    std::printf("mf3-manifold shaded: {nonBlackPixels:%u}\n", shaded);
+    const uint32_t kShadedFloor = 5000u;
+    if (shaded < kShadedFloor) return fail("mf3-manifold shaded below floor (blank/scrambled frame)");
+    if (shaded == (uint32_t)(bgra.size() / 4)) return fail("mf3-manifold uniform image (no coherent scene)");
+
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — the GPU multi-point manifold (box-on-box 4 / tetra 3 / edge 2), "
+                "GPU==CPU bit-exact, lit 3D with contacts marked (%u tris)\n", outPath, cw, ch, kTris);
+    return 0;
+}
+
 // ===== Slice MF1 — Hull Narrowphase Hardening HULL FACE TOPOLOGY (--mf1-faces) =====
 // The new primitive, the BEACHHEAD of FLAGSHIP #25 (DETERMINISTIC HULL NARROWPHASE HARDENING, hf::sim::manifold
 // — the GJ6/BP6/CD6 render-bridge twin). Mirrors the Vulkan --mf1-faces-shot path EXACTLY: builds the four
@@ -54506,6 +54844,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mf2-clip") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mf2_clip.png";
             try { return RunMf2ClipShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --mf3-manifold <out.png>: render the Hull Narrowphase Hardening THE MULTI-POINT MANIFOLD GPU SHADER
+        // showcase (Slice MF3, the 3rd slice of FLAGSHIP #25). int64 -> hull_manifold.comp is Vulkan-only, so
+        // Metal runs the CPU manifold::HullContactMulti over the SAME battery (box-on-box=4, tetra-on-face=3,
+        // edge-on-face=2 — the EXACT bit-exact reference the Vulkan --mf3-manifold-shot GPU==CPU memcmp compares
+        // against; byte-identical by construction) and renders the hulls LIT 3D with each manifold CONTACT POINT
+        // marked through the EXISTING lit pipeline (NO new shader/RHI). The 4 proofs print the same exact lines
+        // as the Vulkan path. New golden tests/golden/metal/mf3_manifold.png.
+        if (argc > 1 && std::strcmp(argv[1], "--mf3-manifold") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_mf3_manifold.png";
+            try { return RunMf3ManifoldShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

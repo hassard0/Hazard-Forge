@@ -1165,6 +1165,19 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> bit-exact GPU==CPU EpaResult array + cross-backend, proven memcmp. NO new
     # RHI; existing shaders + goldens untouched.
     "shaders/gjk_epa.comp.hlsl:cs"
+    # Hull Narrowphase Hardening Slice 3 (Slice MF3, the 3rd slice of FLAGSHIP #25: DETERMINISTIC HULL
+    # NARROWPHASE HARDENING, hf::sim::manifold): hull_manifold.comp is THE MULTI-POINT MANIFOLD GPU generator —
+    # ONE THREAD PER PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics) runs gjk::Gjk -> gjk::Epa -> MF2's
+    # HullManifoldFromEpa (the Sutherland-Hodgman hull-face clip), copying manifold.h::HullContactMulti's call
+    # chain VERBATIM (the SAME int64 FxDot/FxCross/fxdiv/fxmul ops, the SAME fixed orders + strict-integer
+    # tie-breaks), writing its OWN convex::ContactManifold slot (count 1-4; separated -> count 0). Like
+    # gjk_epa.comp / convex_manifold.comp this is int64 (the GJK sub-distance + the EPA face math + the SH clip
+    # Q16.16 products), so it is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the
+    # Metal --mf3-manifold showcase runs the CPU manifold::HullContactMulti instead (byte-identical by
+    # construction, the gjk_epa.comp/convex_manifold.comp split). Per-pair BOUNDED work (GJK <= kGjkMaxIter, EPA
+    # <= kEpaMaxIter, clip <= 8 verts) so a modest battery is TDR-safe. Pure integer SSBO compute + ReadBuffer ->
+    # bit-exact GPU==CPU ContactManifold array + cross-backend, proven memcmp. NO new RHI.
+    "shaders/hull_manifold.comp.hlsl:cs"
     # Deterministic Integer CCD Slice 1 (Slice CD1, the BEACHHEAD of FLAGSHIP #24): ccd_toi.comp is the
     # TIME-OF-IMPACT pass — ONE THREAD PER CANDIDATE PAIR (per-pair INDEPENDENT, 64 threads/group, NO atomics)
     # runs the full conservative-advancement TOI loop (an embedded gjk::Gjk closest-distance query + the

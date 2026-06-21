@@ -490,6 +490,8 @@ int main() {
             bool sawManifoldHullFacesFeature = false;
             // Slice MF2: the manifold-face-clip capability is advertised.
             bool sawManifoldFaceClipFeature = false;
+            // Slice MF3: the manifold-gpu capability is advertised.
+            bool sawManifoldGpuFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -713,6 +715,7 @@ int main() {
                     if (AsString(el->value) == "deterministic-ccd-render") sawCcdRenderFeature = true;
                     if (AsString(el->value) == "manifold-hull-faces") sawManifoldHullFacesFeature = true;
                     if (AsString(el->value) == "manifold-face-clip") sawManifoldFaceClipFeature = true;
+                    if (AsString(el->value) == "manifold-gpu") sawManifoldGpuFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -911,6 +914,7 @@ int main() {
             check(sawCcdRenderFeature, "engine.features includes deterministic-ccd-render");
             check(sawManifoldHullFacesFeature, "engine.features includes manifold-hull-faces");
             check(sawManifoldFaceClipFeature, "engine.features includes manifold-face-clip");
+            check(sawManifoldGpuFeature, "engine.features includes manifold-gpu");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1104,6 +1108,8 @@ int main() {
         bool sawMf1FacesShot = false;
         // Slice MF2: the --mf2-clip-shot showcase flag is listed in the showcase manifest.
         bool sawMf2ClipShot = false;
+        // Slice MF3: the --mf3-manifold-shot showcase flag is listed in the showcase manifest.
+        bool sawMf3ManifoldShot = false;
         // Slice GR3: the --grain-contact-shot showcase flag is listed in the showcase manifest.
         bool sawGrainContactShot = false;
         // Slice GR4: the --grain-friction-shot showcase flag is listed in the showcase manifest.
@@ -1418,6 +1424,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--ccd-render-shot") sawCcdRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mf1-faces-shot") sawMf1FacesShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--mf2-clip-shot") sawMf2ClipShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--mf3-manifold-shot") sawMf3ManifoldShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-query-shot") sawCoupleQueryShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-buoyancy-shot") sawCoupleBuoyancyShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--couple-displace-shot") sawCoupleDisplaceShot = true;
@@ -1615,6 +1622,7 @@ int main() {
         check(sawCcdRenderShot, "showcases manifest includes --ccd-render-shot");
         check(sawMf1FacesShot, "showcases manifest includes --mf1-faces-shot");
         check(sawMf2ClipShot, "showcases manifest includes --mf2-clip-shot");
+        check(sawMf3ManifoldShot, "showcases manifest includes --mf3-manifold-shot");
         check(sawCoupleQueryShot, "showcases manifest includes --couple-query-shot");
         check(sawCoupleBuoyancyShot, "showcases manifest includes --couple-buoyancy-shot");
         check(sawCoupleDisplaceShot, "showcases manifest includes --couple-displace-shot");

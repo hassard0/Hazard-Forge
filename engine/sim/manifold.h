@@ -568,5 +568,31 @@ inline convex::ContactManifold HullManifold(const FxBody& bodyA, const FxHull& h
     return HullManifoldFromEpa(hullA, bodyA, hullB, bodyB, e);
 }
 
+// =========================================================================================================
+// Slice MF3 — Hull Narrowphase Hardening: THE MULTI-POINT MANIFOLD GPU SHADER (the int64 GPU==CPU beat).
+// APPENDED after HullManifold (MF1/MF2's lines above are BYTE-FROZEN; gjk/broad/ccd/convex/fpx + every sibling
+// sim header BYTE-FROZEN). MF2 built the CPU multi-point manifold (HullManifoldFromEpa, the Sutherland-Hodgman
+// face clip); MF3 lifts it ONTO THE GPU. shaders/hull_manifold.comp.hlsl is the GPU generator — one thread per
+// overlapping pair runs the SAME gjk::Gjk -> gjk::Epa -> HullManifoldFromEpa call chain and writes the SAME
+// 1-4 point convex::ContactManifold, and the proof is the GPU manifold array is BYTE-IDENTICAL to the CPU
+// HullContactMulti over a fixed pair battery. HullContactMulti is the single named function the shader mirrors
+// VERBATIM (the SAME int64 FxDot/FxCross/fxdiv ops, the SAME fixed orders, the SAME strict-integer tie-breaks).
+// =========================================================================================================
+
+// ----- HullContactMulti(bodyA, hullA, bodyB, hullB): the HARDENED multi-point drop-in for gjk::HullContact
+// (gjk.h:1155, which hardcodes count 1). Runs the FROZEN gjk::Gjk -> gjk::Epa narrowphase, then MF2's
+// HullManifoldFromEpa, returning a convex::ContactManifold (count 1-4; separated -> count 0). It is the same
+// call chain as HullManifold (it simply IS that function — the MF3 point is that the SHADER copies THIS body
+// VERBATIM, so HullContactMulti is the NAMED hardened entry the GPU mirror is checked against). Pure integer,
+// deterministic, identical CPU/GPU.
+inline convex::ContactManifold HullContactMulti(const FxBody& bodyA, const FxHull& hullA,
+                                                const FxBody& bodyB, const FxHull& hullB) {
+    convex::ContactManifold m;   // count 0, zeroed by the struct defaults
+    const gjk::GjkResult g = gjk::Gjk(hullA, bodyA, hullB, bodyB);
+    if (!g.overlap) return m;     // separated -> empty manifold (count 0)
+    const gjk::EpaResult e = gjk::Epa(hullA, bodyA, hullB, bodyB, g.simplex);
+    return HullManifoldFromEpa(hullA, bodyA, hullB, bodyB, e);
+}
+
 }  // namespace manifold
 }  // namespace hf::sim

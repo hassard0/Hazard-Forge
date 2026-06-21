@@ -295,6 +295,68 @@ int main() {
             const convex::ContactManifold mc = manifoldFor(boxA, boxStatic, boxB, coincident);
             check(mc.count >= 1u, "MF2 fallback: a deeply-overlapping pair never yields count 0");
         }
+
+        // =================================================================================================
+        // Slice MF3 — THE MULTI-POINT MANIFOLD GPU SHADER. The CPU test of the NAMED hardened entry
+        // manifold::HullContactMulti (the gjk::HullContact counterpart the GPU shader mirrors VERBATIM). The
+        // GPU==CPU bit-identity is the showcase's job (--mf3-manifold-shot); this test PINS the CPU entry:
+        //   * HullContactMulti over the SAME battery returns counts {4,3,2}.
+        //   * it equals HullManifold/HullManifoldFromEpa (the SAME result — it IS the same call chain).
+        //   * a separated pair -> count 0 (gjk::HullContact's empty-manifold contract).
+        //   * two runs are byte-equal (pure).
+        // =================================================================================================
+        {
+            const convex::ContactManifold cmBoxOnBox = manifold::HullContactMulti(boxStatic, boxA, boxTop, boxB);
+            const convex::ContactManifold cmTetra    = manifold::HullContactMulti(boxStatic, boxA, tetraBody, tetraH);
+            const convex::ContactManifold cmEdge     = manifold::HullContactMulti(boxStatic, boxA, octaBody, octaH);
+
+            // (1) THE COUNTS {boxOnBox:4, tetraOnFace:3, edgeOnFace:2} (the MF2 multi-point manifold on GPU-entry).
+            check(cmBoxOnBox.count == 4u, "MF3 HullContactMulti: box-on-box manifold has 4 contact points");
+            check(cmTetra.count    == 3u, "MF3 HullContactMulti: tetra-face-down manifold has 3 contact points");
+            check(cmEdge.count     == 2u, "MF3 HullContactMulti: edge-on-face manifold has 2 contact points");
+
+            // (2) it equals HullManifold (the convenience wrapper) AND HullManifoldFromEpa (the MF2 core) —
+            //     HullContactMulti IS the same call chain, so the ContactManifold POD memcmp byte-equals.
+            const convex::ContactManifold hm = manifold::HullManifold(boxStatic, boxA, boxTop, boxB);
+            check(std::memcmp(&cmBoxOnBox, &hm, sizeof(convex::ContactManifold)) == 0,
+                  "MF3 HullContactMulti == HullManifold (same call chain, POD memcmp byte-equal)");
+            const convex::ContactManifold fromEpa = manifoldFor(boxA, boxStatic, boxB, boxTop);
+            // manifoldFor uses A=boxStatic-as-hullA order matching HullContactMulti(boxStatic,boxA,...).
+            check(std::memcmp(&cmBoxOnBox, &fromEpa, sizeof(convex::ContactManifold)) == 0,
+                  "MF3 HullContactMulti == HullManifoldFromEpa (same result)");
+
+            // (3) a SEPARATED pair -> count 0 (the gjk::HullContact empty-manifold contract).
+            {
+                const fpx::FxBody farAway = makeBodyQ(FromInt(20), FromInt(20), FromInt(20));
+                const convex::ContactManifold mc = manifold::HullContactMulti(boxStatic, boxA, farAway, boxB);
+                check(mc.count == 0u, "MF3 HullContactMulti: a separated pair -> count 0");
+            }
+
+            // (4) PURITY — the manifold POD over the battery is byte-equal across two runs.
+            auto multiSum = [&]() -> uint64_t {
+                const convex::ContactManifold battery[3] = {
+                    manifold::HullContactMulti(boxStatic, boxA, boxTop, boxB),
+                    manifold::HullContactMulti(boxStatic, boxA, tetraBody, tetraH),
+                    manifold::HullContactMulti(boxStatic, boxA, octaBody, octaH),
+                };
+                uint64_t sum = 0;
+                for (int i = 0; i < 3; ++i) {
+                    const convex::ContactManifold& m = battery[i];
+                    sum = sum * 1000003ull + m.count;
+                    for (uint32_t k = 0; k < 4; ++k) {
+                        sum = sum * 1000003ull + (uint64_t)(uint32_t)m.points[k].x;
+                        sum = sum * 1000003ull + (uint64_t)(uint32_t)m.points[k].y;
+                        sum = sum * 1000003ull + (uint64_t)(uint32_t)m.points[k].z;
+                        sum = sum * 1000003ull + (uint64_t)(uint32_t)m.depths[k];
+                    }
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.normal.x;
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.normal.y;
+                    sum = sum * 1000003ull + (uint64_t)(uint32_t)m.normal.z;
+                }
+                return sum;
+            };
+            check(multiSum() == multiSum(), "MF3 HullContactMulti: battery is two-run BYTE-EQUAL (pure)");
+        }
     }
 
     if (g_fail == 0) std::printf("manifold_test: ALL PASS\n");
