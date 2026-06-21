@@ -30571,6 +30571,176 @@ static int RunGjkLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice CD5 — Deterministic Integer CCD LOCKSTEP + ROLLBACK showcase (--ccd-lockstep) (the NETCODE
+// HEADLINE, the 5th slice of FLAGSHIP #24, the BP5/GJ5/CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO new
+// shader, NO new RHI; the CD5 harness (ccd.h::RunCcdLockstep/RunCcdRollback) is header-only integer math, so on
+// Metal it runs the IDENTICAL CPU harness the Vulkan --ccd-lockstep-shot runs on Windows -> the converged
+// authority-world golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform bit-identity IS
+// the lockstep evidence). THE CD5 HEADLINE: each peer re-derives the swept broadphase + the per-substep TOIs
+// each tick from the current positions/velocities -> the SAME impact times -> the lockstep holds THROUGH the
+// swept continuous solve. MAXIMAL REUSE: the CD3 StepHullWorldCCD is reused VERBATIM; CD5 only ADDS SimCcdTick
+// (= gjk::ApplyHullCommands + StepHullWorldCCD) + the harness (reusing the frozen gjk:: command/snapshot
+// machinery). Builds the SAME CD4 bullet-wall scene + the SAME command stream as the Vulkan --ccd-lockstep-shot,
+// runs RunCcdLockstep twice + RunCcdRollback once; asserts authority==replica + rollback==authority +
+// mispredicted!=authority BIT-EXACT; renders the converged authority world via the CD3/CD4 2D side-view render
+// path. Proof lines match the Vulkan side EXACTLY. New golden tests/golden/metal/ccd_lockstep.png (baked on the
+// Mac by the controller); two runs DIFF 0.0000.
+static int RunCcdLockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex = hf::sim::convex;
+    namespace gjk    = hf::sim::gjk;
+    namespace ccd    = hf::sim::ccd;
+    namespace fpx    = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)convex::kOne); };
+
+    // THE SCENE + CONFIG (== the Vulkan --ccd-lockstep-shot + the ccd_test CD5 tests).
+    const ccd::CcdStepConfig cfg = ccd::MakeBulletWallConfig();
+    const uint32_t kTicks = 8u;
+    const uint32_t kRollbackAt = 3u;
+    const gjk::HullWorld kInit = ccd::MakeBulletWallScene();   // 0=projectile,1=wall,2-3=drops,4=floor
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+    uint32_t kDynamic = 0;
+    for (const auto& b : kInit.bodies) if (b.flags & fpx::kFlagDynamic) ++kDynamic;
+
+    // The scripted authoritative command stream (== the Vulkan --ccd-lockstep-shot, verbatim).
+    const std::vector<convex::ConvexCommand> authStream = {
+        convex::ConvexCommand{1u, convex::kConvexCmdAddImpulse, 0u, convex::FxVec3{fi(20), 0, 0}},
+        convex::ConvexCommand{2u, convex::kConvexCmdSetAngVel,  2u, convex::FxVec3{0, kOne, 0}},
+        convex::ConvexCommand{4u, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{-fi(3), 0, 0}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+    std::vector<convex::ConvexCommand> mispredictStream = authStream;
+    mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                     convex::FxVec3{fi(40), 0, 0}});
+
+    // === The harness (PURE CPU) ===
+    bool lockstepIdentical = false;
+    const gjk::HullWorld authority =
+        ccd::RunCcdLockstep(kInit, cfg, authStream, kTicks, &lockstepIdentical);
+    const gjk::HullWorld replica = ccd::RunCcdLockstep(kInit, cfg, authStream, kTicks);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    const gjk::HullWorld rolledBack =
+        ccd::RunCcdRollback(kInit, cfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                            &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP.
+    if (!lockstepIdentical || !gjk::HullBodiesEqual(authority.bodies, replica.bodies))
+        return fail("ccd-lockstep: authority != replica (inputs-only re-sim diverged)");
+    std::printf("ccd-lockstep: {bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL\n",
+                kBodyCount, kTicks, kCommandCount);
+
+    // PROOF (2) DETERMINISM (+ snapshot round-trip).
+    const gjk::HullWorld authority2 = ccd::RunCcdLockstep(kInit, cfg, authStream, kTicks);
+    if (!gjk::HullBodiesEqual(authority2.bodies, authority.bodies))
+        return fail("ccd-lockstep: two runs differ (nondeterministic)");
+    {
+        gjk::HullWorld w = ccd::RunCcdLockstep(kInit, cfg, authStream, kRollbackAt);
+        const gjk::HullSnapshot snap = gjk::SnapshotHull(w, kRollbackAt);
+        ccd::SimCcdTick(w, cfg, authStream, kRollbackAt);
+        gjk::RestoreHull(w, snap);
+        if (!gjk::HullBodiesEqual(w.bodies, snap.bodies))
+            return fail("ccd-lockstep: snapshot round-trip != original");
+    }
+    std::printf("ccd-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK.
+    if (!rollbackCorrected || !gjk::HullBodiesEqual(rolledBack.bodies, authority.bodies))
+        return fail("ccd-lockstep: rollback != authority (misprediction not corrected)");
+    std::printf("ccd-lockstep rollback: corrected==authority BIT-EXACT\n");
+
+    // PROOF (4) mispredict real.
+    if (!mispredictDiverged)
+        return fail("ccd-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("ccd-lockstep mispredict: diverged before rollback (real divergence corrected)\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the converged authority world as the Vulkan
+    // --ccd-lockstep-shot (identical by construction — the same render math + the same monotone-chain outline). ---
+    const gjk::HullWorld& cw = authority;
+    const int kPxPerUnit = 36, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 5;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    // wall (cool blue) + floor (grey) + projectile (hot orange, arrested) + slow drops (greens).
+    drawHullXY(cw.bodies[1], kInit.hulls[1], Vec3{0.30f, 0.45f, 0.75f});  // wall
+    drawHullXY(cw.bodies[4], kInit.hulls[4], Vec3{0.30f, 0.32f, 0.36f});  // floor
+    drawHullXY(cw.bodies[0], kInit.hulls[0], Vec3{0.95f, 0.45f, 0.20f});  // projectile (arrested)
+    const Vec3 slowCol[2] = {Vec3{0.40f, 0.85f, 0.55f}, Vec3{0.55f, 0.80f, 0.45f}};
+    drawHullXY(cw.bodies[2], kInit.hulls[2], slowCol[0]);
+    drawHullXY(cw.bodies[3], kInit.hulls[3], slowCol[1]);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — CCD lockstep+rollback converged bullet-wall side-view (%u bodies, %u "
+                "dynamic, %u ticks, projectile x=%d < wallX=%d)\n",
+                outPath, imgW, imgH, kBodyCount, kDynamic, kTicks,
+                (int)(cw.bodies[0].pos.x >> convex::kFrac), (int)(cw.bodies[1].pos.x >> convex::kFrac));
+    return 0;
+}
+
 // ===== Slice BP5 — Deterministic Integer Broadphase LOCKSTEP + ROLLBACK showcase (--broad-lockstep) (the
 // NETCODE HEADLINE, the 5th slice of FLAGSHIP #23, the GJ5/CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO
 // new shader, NO new RHI; the BP5 harness (broad.h::RunBroadLockstep/RunBroadRollback) is header-only integer
@@ -53191,6 +53361,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ccd-bullet") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ccd_bullet.png";
             try { return RunCcdBulletShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ccd-lockstep <out.png>: render the Deterministic Integer CCD LOCKSTEP + ROLLBACK showcase (Slice CD5,
+        // the NETCODE HEADLINE, the 5th slice of FLAGSHIP #24, the BP5/GJ5/CX5/FR5/PS5 twin). PURE CPU — the CD5
+        // harness (ccd.h::RunCcdLockstep/RunCcdRollback) is header-only integer math, so on Metal it runs the
+        // IDENTICAL CPU harness the Vulkan --ccd-lockstep-shot runs on Windows over the SAME CD4 bullet-wall scene
+        // + command stream -> the converged authority-world golden is bit-identical cross-backend BY CONSTRUCTION
+        // (that cross-platform bit-identity IS the lockstep evidence; the lockstep holds THROUGH the swept solve —
+        // each peer re-derives the per-substep TOI each tick to the SAME impact times). Asserts authority==replica
+        // + rollback==authority + mispredicted!=authority BIT-EXACT; two runs byte-identical. The image golden is
+        // a PURE-INTEGER 2D side-view of the converged bullet-wall world (the projectile arrested at the wall),
+        // identical to the Vulkan path BY CONSTRUCTION. NO GPU compute, NO new shader, NO new RHI. New golden
+        // tests/golden/metal/ccd_lockstep.png.
+        if (argc > 1 && std::strcmp(argv[1], "--ccd-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ccd_lockstep.png";
+            try { return RunCcdLockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --broad-lockstep <out.png>: render the Deterministic Integer Broadphase LOCKSTEP + ROLLBACK showcase

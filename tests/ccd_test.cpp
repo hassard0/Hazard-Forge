@@ -508,6 +508,67 @@ int main() {
         check(eq, "bullet-wall step determinism: two runs BYTE-IDENTICAL");
     }
 
+    // === (CD5) LOCKSTEP + ROLLBACK — the netcode headline (pure CPU; the BP5/GJ5 twin over StepHullWorldCCD). ==
+    // The bullet-wall scene + a deterministic command stream: a launch-impulse fires the projectile, the wall
+    // arrests it, a later command perturbs a slow drop. Two peers fed only the inputs re-derive the world
+    // byte-identical (re-deriving the swept broadphase + per-substep TOIs each tick), and a rollback re-sims
+    // from a snapshot bit-for-bit.
+    {
+        namespace broad = hf::sim::broad;
+        const ccd::CcdStepConfig cfg = ccd::MakeBulletWallConfig();
+        const uint32_t kTicks = 8u;
+        const uint32_t kRollbackAt = 3u;
+        const gjk::HullWorld kInit = ccd::MakeBulletWallScene();   // bodies: 0=projectile,1=wall,2-3=drops,4=floor
+
+        // The authoritative command stream: re-fire the projectile (+X impulse) early, then perturb a slow drop.
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{1u, convex::kConvexCmdAddImpulse, 0u, convex::FxVec3{FromInt(20), 0, 0}},
+            convex::ConvexCommand{2u, convex::kConvexCmdSetAngVel,  2u, convex::FxVec3{0, kOne, 0}},
+            convex::ConvexCommand{4u, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{-FromInt(3), 0, 0}},
+        };
+
+        // (1) LOCKSTEP: authority == replica BIT-IDENTICAL (inputs only).
+        bool identical = false;
+        const gjk::HullWorld authority = ccd::RunCcdLockstep(kInit, cfg, authStream, kTicks, &identical);
+        const gjk::HullWorld replica   = ccd::RunCcdLockstep(kInit, cfg, authStream, kTicks);
+        check(identical, "ccd lockstep: authority==replica reported BIT-IDENTICAL");
+        check(gjk::HullBodiesEqual(authority.bodies, replica.bodies),
+              "ccd lockstep: authority==replica final bodies BYTE-IDENTICAL");
+
+        // (2) DETERMINISM: two full runs byte-identical.
+        const gjk::HullWorld authority2 = ccd::RunCcdLockstep(kInit, cfg, authStream, kTicks);
+        check(gjk::HullBodiesEqual(authority2.bodies, authority.bodies),
+              "ccd lockstep determinism: two runs BYTE-IDENTICAL");
+
+        // (2b) The command stream MOVED the scene non-trivially (not a frozen no-op): the projectile advanced.
+        check(!gjk::HullBodiesEqual(authority.bodies, kInit.bodies),
+              "ccd lockstep: command stream moved the scene (final != initial)");
+        check(authority.bodies[0].pos.x != kInit.bodies[0].pos.x,
+              "ccd lockstep: the projectile travelled under the command stream");
+
+        // (3) ROLLBACK: a WRONG strong impulse arrives at rollbackAt; corrected==authority BIT-EXACT.
+        std::vector<convex::ConvexCommand> mispredictStream = authStream;
+        mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 2u,
+                                                         convex::FxVec3{FromInt(40), 0, 0}});
+        bool corrected = false, diverged = false;
+        const gjk::HullWorld rolledBack = ccd::RunCcdRollback(kInit, cfg, authStream, mispredictStream,
+                                                              kTicks, kRollbackAt, &corrected, &diverged);
+        check(corrected && gjk::HullBodiesEqual(rolledBack.bodies, authority.bodies),
+              "ccd rollback: corrected==authority BIT-EXACT");
+        // (4) the misprediction was REAL (the speculative pre-rollback state diverged from authority).
+        check(diverged, "ccd rollback: mispredicted state diverged before rollback (real divergence corrected)");
+
+        // Snapshot round-trip is bit-exact (the rollback restore-point contract).
+        {
+            gjk::HullWorld w = ccd::RunCcdLockstep(kInit, cfg, authStream, kRollbackAt);
+            const gjk::HullSnapshot snap = gjk::SnapshotHull(w, kRollbackAt);
+            ccd::SimCcdTick(w, cfg, authStream, kRollbackAt);   // mutate
+            gjk::RestoreHull(w, snap);
+            check(gjk::HullBodiesEqual(w.bodies, snap.bodies),
+                  "ccd lockstep: snapshot round-trip == original BYTE-IDENTICAL");
+        }
+    }
+
     if (g_fail == 0) std::printf("ccd_test: ALL PASS\n");
     else std::printf("ccd_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;

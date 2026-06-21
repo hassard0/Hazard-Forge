@@ -777,5 +777,108 @@ inline uint32_t StepBulletImpactTick(gjk::HullWorld& world, const CcdStepConfig&
     return impactTick;
 }
 
+// =========================================================================================================
+// Slice CD5 — Deterministic Integer CCD: LOCKSTEP + ROLLBACK (the netcode headline). APPENDED after CD4's
+// MeasureBullet/StepBulletImpactTick (CD1-CD4's lines above are BYTE-FROZEN). PURE CPU — NO shader, NO RHI.
+// Because StepHullWorldCCD (CD3) is a fully deterministic integer tick whose ONLY mutable replayable state is
+// the `bodies` vector (the `hulls` are immutable/shared geometry, and the swept grid + candidate-pair list +
+// the per-substep time-of-impact are RE-DERIVED each tick from the CURRENT positions/velocities — so they are
+// NOT state to snapshot, they are RECOMPUTED, which is exactly why the lockstep holds THROUGH the swept
+// continuous solve), CD5 is the direct BP5/GJ5 twin: the SAME command/snapshot/lockstep/rollback shapes
+// broad::RunBroadLockstep/RunBroadRollback use, with StepHullWorldBP -> StepHullWorldCCD. Two peers fed only an
+// input-command stream re-derive the entire CCD-driven hull world byte-identical (re-deriving the swept
+// broadphase + the per-substep TOIs EACH tick), and a rollback re-sims from a snapshot bit-for-bit. THE
+// HEADLINE: mainstream float engines' CCD is non-deterministic root-finding (DISABLED in lockstep netcode);
+// HF's is bit-identical and replayable.
+//
+// REUSE (do NOT redefine): the frozen gjk:: command/snapshot/equality machinery — gjk::ApplyHullCommands,
+// gjk::HullSnapshot / gjk::SnapshotHull / gjk::RestoreHull / gjk::HullBodiesEqual (bodies only, hulls
+// immutable), convex::ConvexCommand. The ONLY new thing is SimCcdTick (= ApplyHullCommands + StepHullWorldCCD)
+// and the two harness functions over it. Both backends run THIS identical CPU harness -> the converged-state
+// golden is bit-identical BY CONSTRUCTION (cross-vendor 0 px).
+
+// ----- SimCcdTick(world, cfg, commands, tick): ONE CCD-driven deterministic tick with its inputs -----------
+// (1) gjk::ApplyHullCommands(world, commands, tick) — this tick's perturbations, in array order, BEFORE the
+// step so the impulse/spin integrates this tick; (2) StepHullWorldCCD(world, cfg) — the CD3 substepped CCD
+// tick reused VERBATIM (re-derives the swept broadphase + per-substep TOIs from CURRENT positions/velocities).
+// Pure integer, fixed order -> bit-identical on every peer/platform. (The broad::SimBroadTick analog with
+// StepHullWorldBP -> StepHullWorldCCD.)
+inline void SimCcdTick(gjk::HullWorld& world, const CcdStepConfig& cfg,
+                       const std::vector<convex::ConvexCommand>& commands, uint32_t tick) {
+    gjk::ApplyHullCommands(world, commands, tick);
+    StepHullWorldCCD(world, cfg);
+}
+
+// ----- RunCcdLockstep(world0, cfg, commands, ticks, outIdentical): two peers converge from inputs alone -----
+// THE peer entry point (the broad::RunBroadLockstep control flow over SimCcdTick). Two independent peers
+// (authority + replica) BOTH start from `world0`, BOTH run SimCcdTick for `ticks` with the SAME command stream
+// (INPUTS ONLY — no state shared; each re-derives the swept broadphase + per-substep TOIs each tick
+// independently -> the SAME impact times -> byte-identical) -> sets *outIdentical (if non-null) to whether the
+// two final body vectors are byte-identical (the make-or-break lockstep-THROUGH-the-swept-solve proof) +
+// returns the converged AUTHORITY world (for the golden). The peer step order is PINNED.
+inline gjk::HullWorld RunCcdLockstep(const gjk::HullWorld& world0, const CcdStepConfig& cfg,
+                                     const std::vector<convex::ConvexCommand>& commands,
+                                     uint32_t ticks, bool* outIdentical = nullptr) {
+    gjk::HullWorld authority = world0;   // a fresh copy
+    gjk::HullWorld replica   = world0;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimCcdTick(authority, cfg, commands, t);
+        SimCcdTick(replica,   cfg, commands, t);
+    }
+    if (outIdentical) *outIdentical = gjk::HullBodiesEqual(authority.bodies, replica.bodies);
+    return authority;
+}
+
+// ----- RunCcdRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) -------------------
+// The rollback harness (the broad::RunBroadRollback control flow over SimCcdTick).
+// (1) advance ticks 0..rollbackAt from `world0` applying authStream; (2) SAVE a gjk::HullSnapshot AT
+// rollbackAt (SnapshotHull — the body world; the swept grid/pairs/TOIs are recomputed, NOT stored); (2b)
+// speculatively advance a few ticks (<=3) with the MISPREDICTED stream (a WRONG/extra impulse — the client
+// prediction that diverges), capturing that diverged intermediate; (3) ROLLBACK — RestoreHull to the snapshot
+// + RE-SIMULATE rollbackAt..ticks with the CORRECT authStream -> the corrected final world. Returns the
+// corrected world; sets *outCorrectedEqAuthority (if non-null) to whether it == RunCcdLockstep(world0, cfg,
+// authStream, ticks) byte-for-byte, and *outMispredictDiverged (if non-null) to whether the speculative
+// pre-rollback state DIFFERED from the authority at the same tick (proving a REAL divergence was corrected,
+// not a no-op). cfg + the streams are CONSTANT, NOT snapshotted.
+inline gjk::HullWorld RunCcdRollback(const gjk::HullWorld& world0, const CcdStepConfig& cfg,
+                                     const std::vector<convex::ConvexCommand>& authStream,
+                                     const std::vector<convex::ConvexCommand>& mispredictStream,
+                                     uint32_t ticks, uint32_t rollbackAt,
+                                     bool* outCorrectedEqAuthority = nullptr,
+                                     bool* outMispredictDiverged = nullptr) {
+    gjk::HullWorld w = world0;
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimCcdTick(w, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — just the body world).
+    const gjk::HullSnapshot snap = gjk::SnapshotHull(w, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimCcdTick(w, cfg, mispredictStream, rollbackAt + s);
+    gjk::HullWorld speculative = w;   // the diverged pre-rollback intermediate (for the "real divergence" proof)
+    // (3) ROLLBACK: restore the snapshot (the body world) + re-sim rollbackAt..ticks with the authStream.
+    gjk::RestoreHull(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimCcdTick(w, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        gjk::HullWorld authAtSpec = world0;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimCcdTick(authAtSpec, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !gjk::HullBodiesEqual(speculative.bodies, authAtSpec.bodies);
+        if (outCorrectedEqAuthority) {
+            const gjk::HullWorld authFinal = RunCcdLockstep(world0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = gjk::HullBodiesEqual(w.bodies, authFinal.bodies);
+        }
+    }
+    return w;
+}
+
 }  // namespace ccd
 }  // namespace hf::sim
