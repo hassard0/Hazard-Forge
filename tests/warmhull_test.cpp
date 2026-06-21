@@ -787,6 +787,81 @@ int main() {
         }
     }
 
+    // ---- Slice WH6 — THE LIT 3D RENDER CAPSTONE (the money-shot): warmhull::WarmHullToRenderInstances over the
+    // warm+sleep-SETTLED N=4 tower (the BP6/CD6/MF6 render-capstone twin). PURE CPU. Pins: (1) provenance — two
+    // WarmHullToRenderInstances calls on the same bit-exact world are BYTE-EQUAL (gjk::HullRenderMeshEqual); the
+    // render is a pure function of the deterministic sim. (2) the hull/triangle counts are correct (every body
+    // meshed; tris == verts/3). (3) the render of the SETTLED (asleep) tower vs a PERTURBED world DIFFER (the
+    // render reflects the actual body world). (4) the sim world is byte-UNMUTATED by the render call (a pure read,
+    // gjk::HullBodiesEqual). The render is the ONE FLOAT crossing (outside the bit-exact integer loop); this test
+    // pins the render-only invariants, NOT the pixel image (that is the showcase/golden's job).
+    {
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+        auto tiltZ = [&](double rad) { double hh = rad / 2.0; return fpx::FxQuat{0, 0, fd(std::sin(hh)), fd(std::cos(hh))}; };
+        const int N = 4;   // the WH4 DEMONSTRATED tower (goes fully asleep) — the scene WH6 renders
+        auto buildTower = [&]() {
+            gjk::HullWorld w;
+            { FxBody b = BodyAt(0, 0, 0); b.orient = {0,0,0,kOne}; b.invMass = 0; b.flags = 0u; w.bodies.push_back(b); }
+            w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+            for (int k = 0; k < N; ++k) {
+                FxBody b = BodyAt(0, fd(2.0 + 2.0 * k + 0.02 * (k + 1)), 0);
+                b.orient = tiltZ(0.02 * ((k % 2) ? 1.0 : -1.0));
+                b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+                w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            }
+            return w;
+        };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity = convex::FxVec3{0, kGravY, 0};
+        cfg.dt = kOne / 60; cfg.solveIters = 8; cfg.restitution = 0; cfg.slop = kOne / 64;
+        cfg.beta = (fx)((int64_t)2 * kOne / 10); cfg.linDamp = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp = kOne; cfg.posIters = 4;
+        warmhull::HullSleepConfig scfg;
+        scfg.warm = cfg; scfg.sleepThreshold = kOne; scfg.wakeThreshold = (fx)(2 * (int)kOne); scfg.sleepTicks = 30;
+        const uint32_t kTicks = 800u;
+
+        // Settle the tower to the converged asleep stable stack.
+        gjk::HullWorld world = buildTower();
+        warmhull::HullCache cache; std::vector<warmhull::HullSleepState> sleep;
+        warmhull::StepWarmSleepHullWorldN(world, cache, sleep, scfg, kTicks);
+
+        // The headline state: the tower went fully asleep (the stable stack the render shows).
+        const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(world, sleep);
+        check(sm.asleepCount == (uint32_t)N && sm.awakeCount == 0,
+              "WH6: the rendered tower is the warm+sleep-settled stack (all N dynamic bodies asleep)");
+
+        // A snapshot of the bodies BEFORE the render call (the sim-unmutated proof).
+        const std::vector<fpx::FxBody> bodiesBefore = world.bodies;
+
+        // (1)+(2) PROVENANCE + counts: two WarmHullToRenderInstances calls are BYTE-EQUAL; the counts are right.
+        const gjk::HullRenderMesh meshA = warmhull::WarmHullToRenderInstances(world);
+        const gjk::HullRenderMesh meshB = warmhull::WarmHullToRenderInstances(world);
+        check(gjk::HullRenderMeshEqual(meshA, meshB),
+              "WH6: WarmHullToRenderInstances provenance — two calls BYTE-EQUAL (pure function of the bit-exact world)");
+        check(meshA.triangles == (uint32_t)(meshA.verts.size() / 3) && !meshA.verts.empty(),
+              "WH6: render mesh triangle count == verts/3 (and non-empty — every body meshed)");
+        // Every box hull -> 12 triangles; 1 static + N dynamic boxes -> 12*(N+1) tris (the canonical box mesh).
+        check(meshA.triangles == (uint32_t)(12 * (N + 1)),
+              "WH6: render mesh has the expected box-tower triangle count (12 tris/box)");
+
+        // (3) the render of the SETTLED tower vs a PERTURBED world DIFFER (the render reflects the body world).
+        {
+            gjk::HullWorld perturbed = world;
+            perturbed.bodies[1].pos.x += fd(0.5);   // shove the bottom dynamic box sideways
+            const gjk::HullRenderMesh meshP = warmhull::WarmHullToRenderInstances(perturbed);
+            check(!gjk::HullRenderMeshEqual(meshA, meshP),
+                  "WH6: a perturbed world renders DIFFERENTLY (the render tracks the actual body positions)");
+        }
+
+        // (4) SIM-UNMUTATED: the render call did not touch the bit-exact integer sim (a pure read).
+        check(gjk::HullBodiesEqual(world.bodies, bodiesBefore),
+              "WH6: the sim world is byte-UNMUTATED by the render call (WarmHullToRenderInstances is a pure read)");
+
+        std::printf("wh6-render: {hulls:%u, tris:%u} provenance byte-equal + sim byte-unmutated (CPU)\n",
+                    (uint32_t)world.bodies.size(), meshA.triangles);
+    }
+
     if (g_fail == 0) std::printf("warmhull_test: ALL PASS\n");
     else             std::printf("warmhull_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

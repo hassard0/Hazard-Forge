@@ -1318,5 +1318,31 @@ inline HullWorld RunWarmHullRollback(const HullWorld& world0, const HullSleepCon
     return w;
 }
 
+// =========================================================================================================
+// Slice WH6 — Warm-Started Hull Contacts: THE LIT 3D RENDER CAPSTONE (the money-shot). APPENDED after
+// RunWarmHullRollback (WH1-WH5's lines above + manifold.h/gjk.h/persist.h/convex.h/fric.h/fpx.h BYTE-FROZEN).
+// The SIXTH and FINAL slice of FLAGSHIP #26. WH1-WH5 built the feature ID, the cache, the warm solver, the
+// sleeping-island STABLE STACK (a deterministic N=4 hull tower the frozen #25 step topples), and the
+// lockstep/rollback netcode. WH6 is the money-shot: it renders the bit-exact warm+sleep-SETTLED tower as a LIT
+// 3D scene — a stable, resting stack of convex polyhedra (the thing the single-point/non-accumulated #25 step
+// cannot hold) drawn as true lit polyhedra under directional light. The render is the ONE FLOAT crossing
+// (outside the bit-exact integer loop), so its bar is the FLOAT visresolve in-band metric, NOT strict-zero.
+// PURE REUSE: the settled world is a gjk::HullWorld, so WH6 delegates VERBATIM to the FROZEN BP6/CD6/MF6 render
+// bridge gjk::HullToRenderInstances (the existing instanced-lit pipeline). ZERO new render shader, ZERO new
+// RHI. The integer sim is NOT mutated; WarmHullToRenderInstances is a PURE FUNCTION of the world (two calls
+// byte-equal — the provenance contract the showcase asserts). MATTE (the showcase sets metallic 0 / roughness
+// 1) dodges the documented GF6/FR6/JT6/PS6/CX6/MF6 iridescence trap.
+// =========================================================================================================
+
+// ----- WarmHullToRenderInstances(world): the spec-named entry — the render payload for the WH6 showcase. A
+// ONE-LINE delegate to the FROZEN BP6/CD6/MF6 gjk::HullToRenderInstances (the manifold::HardenedHullToRender-
+// Instances twin) — the warm+sleep-settled HullWorld -> a FLOAT world-space TRIANGLE SOUP (per-canonical-hull
+// face meshes, per-triangle outward normals + per-hull-type matte colors). Render-only float, OUTSIDE the
+// bit-exact loop. Provided in warmhull:: for namespace symmetry; the mesh comes from the byte-unchanged GJ6
+// helper. A PURE FUNCTION of `world` — two calls byte-equal (gjk::HullRenderMeshEqual).
+inline gjk::HullRenderMesh WarmHullToRenderInstances(const gjk::HullWorld& world) {
+    return gjk::HullToRenderInstances(world);
+}
+
 }  // namespace warmhull
 }  // namespace hf::sim
