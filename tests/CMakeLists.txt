@@ -734,6 +734,18 @@ hf_add_pure_test(manifold_test)
 # (hf_core), ASan-eligible.
 hf_add_pure_test(warmhull_test)
 
+# Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
+# PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
+# over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h
+# READ-ONLY). Pins SpawnEntity (monotonic EntityIds start 1 + order[] spawn-order + component get/has round-trip),
+# DespawnEntity (removes from order[] + frees the ecs handle but the next spawn does NOT reuse the id — the pinned-
+# identity contract: spawn->despawn->spawn re-derives the SAME monotonic next id regardless of the ecs free-list
+# recycle), ApplyCommands (tick-filtered + fixed array order + dead/out-of-range target deterministic no-op),
+# LowerToHullCommands (the kCmdImpulse/kCmdSetAngVel subset == a hand-written convex::ConvexCommand stream,
+# byte-equal, targeting the BodyRef.simBodyIndex), and the two-run byte-equality of the whole world over a fixed
+# spawn/despawn/command script (the 4 spec proof lines). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(verdict_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

@@ -106,6 +106,7 @@
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
 #include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
 #include "sim/warmhull.h"            // Slice WH1: warm-started hull contacts THE HULL CONTACT FEATURE ID (HullContactKey/MakeHullContactKey/HullContactKeysEqual/HullContactKeyHash/ClipFaceAgainstFaceTagged/BuildHullContactKeys/MeasureHullKeys, the PURE-INT32 geometric-provenance key + the byte-identical tagged clip) — shared verbatim with warmhull_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --wh1-keys runs the GPU SHADER (NOT a CPU reference)
+#include "game/verdict.h"            // Slice VD1: deterministic gameplay / netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS (EntityId/VerdictWorld/Transform2D/Health/BodyRef/Command/SpawnEntity/DespawnEntity/LowerToHullCommands/ApplyCommands/MeasureVerdict) — a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h read-only; the Metal --vd1-world runs the IDENTICAL pure-CPU script the Vulkan --vd1-world-shot runs (strict-zero cross-backend BY CONSTRUCTION)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -31601,6 +31602,170 @@ static int RunGjkLockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VD1 — Deterministic Gameplay / Netcode THE ENTITY WORLD + THE INPUT-COMMAND BUS showcase
+// (--vd1-world) (the BEACHHEAD of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO
+// new RHI; the verdict.h entity world + command bus is header-only integer math, so on Metal it runs the IDENTICAL
+// pure-CPU script the Vulkan --vd1-world-shot runs on Windows -> the converged entity-world golden is bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Builds the SAME deterministic spawn/despawn +
+// command script as the Vulkan side (spawn 3 entities with components, fire move/ability commands over a few
+// ticks, DESPAWN one, then SPAWN one more which does NOT reuse the despawned id), runs verdict::ApplyCommands per
+// tick, asserts the 4 proofs (proof lines match the Vulkan side EXACTLY), and renders the PURE-INTEGER world-state
+// 2D side-view (id-tinted entity markers at Transform2D.pos>>kFrac; the despawned one absent). New golden
+// tests/golden/metal/vd1_world.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunVd1WorldShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace verdict = hf::game::verdict;
+    namespace convex  = hf::sim::convex;
+    namespace fpx     = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+    auto V  = [&](int x, int y, int z) { return convex::FxVec3{fi(x), fi(y), fi(z)}; };
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+
+    // THE SCRIPT (== the Vulkan --vd1-world-shot + verdict_test RunScript): spawn 3, command over ticks, despawn
+    // one, spawn one more (id NOT recycled).
+    auto runScript = [&]() {
+        verdict::VerdictWorld w;
+        verdict::SpawnEntity(w, verdict::Transform2D{V(-3, 0, 0), kIdentity}, verdict::Health{100},
+                             verdict::BodyRef{verdict::kNoBody});  // id 1
+        verdict::SpawnEntity(w, verdict::Transform2D{V(0, 0, 0), kIdentity}, verdict::Health{100},
+                             verdict::BodyRef{verdict::kNoBody});  // id 2
+        verdict::SpawnEntity(w, verdict::Transform2D{V(3, 0, 0), kIdentity}, verdict::Health{100},
+                             verdict::BodyRef{verdict::kNoBody});  // id 3
+        const std::vector<verdict::Command> stream = {
+            verdict::Command{0u, verdict::kCmdMove,    1u, V(1, 0, 0)},
+            verdict::Command{0u, verdict::kCmdMove,    2u, V(0, 1, 0)},
+            verdict::Command{1u, verdict::kCmdAbility, 3u, V(-25, 0, 0)},
+            verdict::Command{1u, verdict::kCmdMove,    1u, V(0, 0, 2)},
+            verdict::Command{2u, verdict::kCmdDespawn, 2u, convex::FxVec3{}},
+            verdict::Command{3u, verdict::kCmdSpawn,   verdict::kNoEntity, V(5, 3, 0)},  // id 4
+            verdict::Command{4u, verdict::kCmdMove,    2u, V(9, 9, 9)},   // DEAD target -> no-op
+            verdict::Command{4u, verdict::kCmdAbility, 1u, V(10, 0, 0)},
+        };
+        for (uint32_t t = 0; t <= 4; ++t) { verdict::ApplyCommands(w, stream, t); ++w.tick; }
+        return w;
+    };
+    const verdict::VerdictWorld world = runScript();
+
+    // PROOF (1) two-run BYTE-IDENTICAL.
+    const verdict::VerdictMeasure m1 = verdict::MeasureVerdict(world);
+    const verdict::VerdictMeasure m2 = verdict::MeasureVerdict(runScript());
+    if (!verdict::VerdictMeasuresEqual(m1, m2)) return fail("vd1-world: two runs differ (nondeterministic)");
+    std::printf("vd1-world: {entities:%u, order:[", m1.entities);
+    for (size_t i = 0; i < world.order.size(); ++i) std::printf("%s%u", i ? "," : "", world.order[i]);
+    std::printf("], nextId:%u} two-run BYTE-IDENTICAL\n", m1.nextId);
+
+    // PROOF (2) id alloc churn-independent.
+    {
+        verdict::VerdictWorld c;
+        const verdict::EntityId a = verdict::SpawnEntity(c, verdict::Transform2D{V(0, 0, 0), kIdentity});
+        verdict::SpawnEntity(c, verdict::Transform2D{V(0, 0, 0), kIdentity});  // id 2
+        verdict::DespawnEntity(c, a);
+        const verdict::EntityId nxt = verdict::SpawnEntity(c, verdict::Transform2D{V(0, 0, 0), kIdentity});
+        if (nxt != 3u || c.nextId != 4u || nxt == a)
+            return fail("vd1-world: id recycled (pinned-identity contract violated)");
+        std::printf("vd1-world: id alloc churn-independent (nextId:%u)\n", c.nextId);
+    }
+
+    // PROOF (3) ApplyCommands guard.
+    {
+        verdict::VerdictWorld g;
+        const verdict::EntityId a = verdict::SpawnEntity(g, verdict::Transform2D{V(0, 0, 0), kIdentity});
+        const std::vector<verdict::Command> s = {
+            verdict::Command{0u, verdict::kCmdMove, a, V(1, 0, 0)},
+            verdict::Command{5u, verdict::kCmdMove, a, V(0, 100, 0)},
+            verdict::Command{0u, verdict::kCmdMove, a, V(3, 0, 0)},
+        };
+        verdict::ApplyCommands(g, s, 0u);
+        const auto& xf = g.reg.get<verdict::Transform2D>(g.handle[a]);
+        const bool tickFiltered = (xf.pos.y == 0);
+        const bool fixedOrder   = (xf.pos.x == V(4, 0, 0).x);
+        const verdict::VerdictMeasure before = verdict::MeasureVerdict(g);
+        verdict::ApplyCommands(g, std::vector<verdict::Command>{
+            verdict::Command{0u, verdict::kCmdMove, 9999u, V(1, 1, 1)}}, 0u);
+        const bool deadNoOp = verdict::VerdictMeasuresEqual(before, verdict::MeasureVerdict(g));
+        if (!tickFiltered || !fixedOrder || !deadNoOp) return fail("vd1-world: ApplyCommands guard failed");
+        std::printf("vd1-world: ApplyCommands {tickFiltered, fixedOrder, deadTargetNoOp} OK\n");
+    }
+
+    // PROOF (4) LowerToHullCommands == hand-written stream.
+    {
+        verdict::VerdictWorld l;
+        verdict::SpawnEntity(l, verdict::Transform2D{V(0, 0, 0), kIdentity}, verdict::Health{0},
+                             verdict::BodyRef{7u});
+        verdict::SpawnEntity(l, verdict::Transform2D{V(0, 0, 0), kIdentity}, verdict::Health{0},
+                             verdict::BodyRef{11u});
+        const std::vector<verdict::Command> s = {
+            verdict::Command{3u, verdict::kCmdImpulse,   1u, V(2, 0, 0)},
+            verdict::Command{3u, verdict::kCmdMove,      2u, V(9, 9, 9)},
+            verdict::Command{3u, verdict::kCmdSetAngVel, 2u, V(0, 0, 1)},
+            verdict::Command{3u, verdict::kCmdImpulse,   9999u, V(1, 0, 0)},
+        };
+        const std::vector<convex::ConvexCommand> lowered = verdict::LowerToHullCommands(l, s, 3u);
+        const std::vector<convex::ConvexCommand> hand = {
+            convex::ConvexCommand{3u, convex::kConvexCmdAddImpulse, 7u,  V(2, 0, 0)},
+            convex::ConvexCommand{3u, convex::kConvexCmdSetAngVel,  11u, V(0, 0, 1)},
+        };
+        bool eq = lowered.size() == hand.size();
+        if (eq) eq = std::memcmp(lowered.data(), hand.data(), hand.size() * sizeof(convex::ConvexCommand)) == 0;
+        if (!eq) return fail("vd1-world: LowerToHullCommands != hand-written stream");
+        std::printf("vd1-world: LowerToHullCommands == hand-written stream (cmds:%u)\n", (unsigned)lowered.size());
+    }
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the converged entity world as the Vulkan
+    // --vd1-world-shot (identical by construction). Each LIVE entity an id-tinted filled square at its
+    // Transform2D.pos>>kFrac; the despawned one absent. ---
+    const int kPxPerUnit = 48, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto idTint = [&](verdict::EntityId id) {
+        const uint32_t h = id * 2654435761u;
+        return Vec3{0.30f + ((h >> 16) & 0xFF) / 360.0f,
+                    0.30f + ((h >> 8) & 0xFF) / 360.0f,
+                    0.30f + (h & 0xFF) / 360.0f};
+    };
+    const int kHalf = 7;
+    uint32_t drawn = 0;
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const verdict::EntityId id = world.order[i];
+        if (!verdict::IsLive(world, id)) continue;
+        const hf::ecs::Entity e = world.handle.at(id);
+        if (!world.reg.has<verdict::Transform2D>(e)) continue;
+        const verdict::Transform2D& xf = world.reg.get<verdict::Transform2D>(e);
+        int cx, cy; worldToPx(xf.pos.x, xf.pos.y, cx, cy);
+        const Vec3 col = idTint(id);
+        for (int dy = -kHalf; dy <= kHalf; ++dy)
+            for (int dx = -kHalf; dx <= kHalf; ++dx)
+                putPx(cx + dx, cy + dy, col);
+        ++drawn;
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vd1 entity-world state side-view (%u live entities, nextId %u)\n",
+                outPath, imgW, imgH, drawn, world.nextId);
+    return 0;
+}
+
 // ===== Slice MF5 — Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (--mf5-lockstep) (the NETCODE
 // HEADLINE of FLAGSHIP #25, the GJ5/BP5/CD5 twin). PURE CPU — NO GPU compute, NO new shader, NO new RHI; the
 // MF5 harness (manifold.h::RunHullLockstepHardened/RunHullRollbackHardened) is header-only integer math, so on
@@ -57006,6 +57171,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--wh4-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_wh4_stack.png";
             try { return RunWh4StackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vd1-world <out.png>: render the Deterministic Gameplay / Netcode ENTITY WORLD + INPUT-COMMAND BUS
+        // showcase (Slice VD1, the BEACHHEAD of FLAGSHIP #27). PURE CPU — runs the IDENTICAL verdict.h entity-world
+        // + command-bus script the Vulkan --vd1-world-shot runs (spawn/despawn + commands over a few ticks) -> the
+        // converged entity world is bit-identical cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan
+        // side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--vd1-world") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vd1_world.png";
+            try { return RunVd1WorldShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mf5-lockstep <out.png>: render the Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (Slice
