@@ -31799,6 +31799,212 @@ static int RunMf5LockstepShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice WH5 — Warm-Started Hull Contacts LOCKSTEP + ROLLBACK over the warm+sleep TRIPLE showcase
+// (--wh5-lockstep) (the NETCODE HEADLINE of FLAGSHIP #26, the GJ5/MF5/PS5 twin). PURE CPU — NO GPU compute, NO
+// new shader, NO new RHI; the WH5 harness (warmhull.h::RunWarmHullLockstep/RunWarmHullRollback) is header-only
+// integer math, so on Metal it runs the IDENTICAL CPU harness the Vulkan --wh5-lockstep-shot runs on Windows ->
+// the converged authority-world golden is bit-identical cross-backend BY CONSTRUCTION (that cross-platform
+// bit-identity IS the lockstep evidence). THE NEW WRINKLE: the replayable state is a TRIPLE (bodies + the WH2
+// impulse cache + the WH4 per-body sleep state); the snapshot/restore/equality span ALL THREE, so a rollback
+// resumes with the right warm-start impulses + sleep timers (the PS5 lesson). MAXIMAL REUSE: the WH4
+// StepWarmSleepHullWorld is reused VERBATIM; WH5 only ADDS SimWarmHullTick (= gjk::ApplyHullCommands +
+// StepWarmSleepHullWorld) + the triple snapshot/restore/equality + the harness (reusing the frozen
+// convex::ConvexCommand + gjk::ApplyHullCommands/HullBodiesEqual). Builds the SAME WH4 tower scene + the SAME
+// command stream as the Vulkan --wh5-lockstep-shot (an impulse WAKES the asleep tower, it re-settles + re-sleeps;
+// a later command perturbs), runs RunWarmHullLockstep twice + RunWarmHullRollback once; asserts authority==
+// replica + rollback==authority + mispredicted!=authority BIT-EXACT over the TRIPLE; renders the converged
+// authority world via the WH4 2D side-view render path. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/wh5_lockstep.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunWh5LockstepShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace warmhull = hf::sim::warmhull;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)convex::kOne); };
+
+    // The deterministic warm+sleep config (== the Vulkan --wh5-lockstep-shot, the WH4 tower config). angDamp OFF.
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 8;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.angDamp     = kOne;                            // OFF
+    kCfg.posIters    = 4;
+    warmhull::HullSleepConfig kSleepCfg;
+    kSleepCfg.warm           = kCfg;
+    kSleepCfg.sleepThreshold = kOne;
+    kSleepCfg.wakeThreshold  = (fx)(2 * (int)kOne);
+    kSleepCfg.sleepTicks     = 30;
+    const int kTowerN = 4;
+    const uint32_t kTicks      = 480u;
+    const uint32_t kRollbackAt = 150u;
+
+    auto tiltZ = [&](double rad) { double h = rad / 2.0; return fpx::FxQuat{0, 0, fd(std::sin(h)), fd(std::cos(h))}; };
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        { fpx::FxBody b; b.pos={0,0,0}; b.orient={0,0,0,kOne}; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; w.bodies.push_back(b); }
+        w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+        for (int k = 0; k < kTowerN; ++k) {
+            fpx::FxBody b; b.pos = {0, fd(2.0 + 2.0 * k + 0.02 * (k + 1)), 0};
+            b.orient = tiltZ(0.02 * ((k % 2) ? 1.0 : -1.0));
+            b.invMass = kOne; b.flags = fpx::kFlagDynamic; b.vel = {0,0,0}; b.angVel = {0,0,0};
+            w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+        }
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The scripted authoritative command stream (== the Vulkan --wh5-lockstep-shot, verbatim): a strong impulse
+    // at tick 120 WAKES the asleep island (>> wakeThreshold), then a second nudge at 360 — so the sleep
+    // transitions ARE part of the replayed state.
+    const std::vector<convex::ConvexCommand> authStream = {
+        convex::ConvexCommand{120u, convex::kConvexCmdAddImpulse, 1u, convex::FxVec3{fi(5), 0, 0}},
+        convex::ConvexCommand{360u, convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{fi(3), 0, 0}},
+    };
+    const uint32_t kCommandCount = (uint32_t)authStream.size();
+    std::vector<convex::ConvexCommand> mispredictStream = authStream;
+    mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, (uint32_t)kTowerN,
+                                                     convex::FxVec3{fi(20), 0, 0}});
+
+    // === The harness (PURE CPU) ===
+    bool lockstepIdentical = false;
+    const warmhull::WarmHullState authority =
+        warmhull::RunWarmHullLockstep(kInit, kSleepCfg, authStream, kTicks, &lockstepIdentical);
+    const warmhull::WarmHullState replica = warmhull::RunWarmHullLockstep(kInit, kSleepCfg, authStream, kTicks);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    const gjk::HullWorld rolledBack =
+        warmhull::RunWarmHullRollback(kInit, kSleepCfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                      &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP over the TRIPLE.
+    if (!lockstepIdentical ||
+        !warmhull::WarmHullStatesEqual(authority.world.bodies, authority.cache, authority.sleep,
+                                       replica.world.bodies, replica.cache, replica.sleep))
+        return fail("wh5-lockstep: authority != replica (inputs-only re-sim diverged over the triple)");
+    std::printf("wh5-lockstep: {bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL (triple)\n",
+                kBodyCount, kTicks, kCommandCount);
+
+    // PROOF (2) DETERMINISM (+ TRIPLE snapshot round-trip).
+    const warmhull::WarmHullState authority2 = warmhull::RunWarmHullLockstep(kInit, kSleepCfg, authStream, kTicks);
+    if (!warmhull::WarmHullStatesEqual(authority2.world.bodies, authority2.cache, authority2.sleep,
+                                       authority.world.bodies, authority.cache, authority.sleep))
+        return fail("wh5-lockstep: two runs differ (nondeterministic)");
+    {
+        warmhull::WarmHullState mid = warmhull::RunWarmHullLockstep(kInit, kSleepCfg, authStream, kRollbackAt);
+        const warmhull::WarmHullSnapshot snap =
+            warmhull::SnapshotWarmHull(mid.world, mid.cache, mid.sleep, kRollbackAt);
+        warmhull::SimWarmHullTick(mid.world, mid.cache, mid.sleep, kSleepCfg, authStream, kRollbackAt);
+        warmhull::RestoreWarmHull(mid.world, mid.cache, mid.sleep, snap);
+        if (!warmhull::WarmHullStatesEqual(mid.world.bodies, mid.cache, mid.sleep,
+                                           snap.bodies, snap.cache, snap.sleep))
+            return fail("wh5-lockstep: triple snapshot round-trip != original");
+    }
+    std::printf("wh5-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK over the TRIPLE.
+    if (!rollbackCorrected || !gjk::HullBodiesEqual(rolledBack.bodies, authority.world.bodies))
+        return fail("wh5-lockstep: rollback != authority (misprediction not corrected over the triple)");
+    std::printf("wh5-lockstep rollback: corrected==authority BIT-EXACT (triple)\n");
+
+    // PROOF (4) mispredict real.
+    if (!mispredictDiverged)
+        return fail("wh5-lockstep: mispredicted state == authority (vacuous rollback proof)");
+    std::printf("wh5-lockstep mispredict: diverged before rollback (triple) (real divergence corrected)\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the converged authority world as the Vulkan
+    // --wh5-lockstep-shot (the WH4 render path; identical by construction). ---
+    const gjk::HullWorld& cw = authority.world;
+    const std::vector<warmhull::HullSleepState>& cwSleep = authority.sleep;
+    const int kPxPerUnit = 32, kMargin = 24;
+    const int kWorldHalfX = 3, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cw.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static support box
+    for (uint32_t i = 1; i < kBodyCount; ++i) {
+        const Vec3 col = (i < cwSleep.size() && cwSleep[i].asleep) ? Vec3{0.40f, 0.62f, 0.82f}
+                                                                   : Vec3{0.88f, 0.62f, 0.28f};
+        drawHullXY(cw.bodies[i], kInit.hulls[i], col);
+    }
+
+    const warmhull::HullSleepMeasure sm = warmhull::MeasureHullSleep(cw, cwSleep);
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — wh5 warm+sleep lockstep+rollback converged tower side-view "
+                "(N=%d, asleep=%u, %u ticks)\n", outPath, imgW, imgH, kTowerN, sm.asleepCount, kTicks);
+    return 0;
+}
+
 // ===== Slice CD5 — Deterministic Integer CCD LOCKSTEP + ROLLBACK showcase (--ccd-lockstep) (the NETCODE
 // HEADLINE, the 5th slice of FLAGSHIP #24, the BP5/GJ5/CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO new
 // shader, NO new RHI; the CD5 harness (ccd.h::RunCcdLockstep/RunCcdRollback) is header-only integer math, so on
@@ -56474,6 +56680,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mf5-lockstep") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mf5_lockstep.png";
             try { return RunMf5LockstepShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wh5-lockstep <out.png>: render the Warm-Started Hull Contacts LOCKSTEP + ROLLBACK over the warm+sleep
+        // TRIPLE showcase (Slice WH5, the NETCODE HEADLINE of FLAGSHIP #26, the GJ5/MF5/PS5 twin). PURE CPU —
+        // runs the IDENTICAL warmhull.h::RunWarmHullLockstep/RunWarmHullRollback harness the Vulkan
+        // --wh5-lockstep-shot runs, over the WH4 tower scene + a fixed command stream (an impulse WAKES the
+        // asleep tower, it re-settles + re-sleeps) -> the converged authority world is bit-identical
+        // cross-backend BY CONSTRUCTION; the 4 proof lines match the Vulkan side EXACTLY. The replayable state is
+        // the TRIPLE (bodies + the WH2 cache + the WH4 sleep state); the snapshot/restore/equality span all three.
+        if (argc > 1 && std::strcmp(argv[1], "--wh5-lockstep") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_wh5_lockstep.png";
+            try { return RunWh5LockstepShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --active-drive <out.png>: render the Deterministic Active Ragdoll ANGULAR POSE-DRIVE showcase (Slice

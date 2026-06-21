@@ -640,6 +640,153 @@ int main() {
         }
     }
 
+    // ===== Slice WH5 — LOCKSTEP + ROLLBACK over the warm+sleep TRIPLE (the netcode headline, the GJ5/MF5/PS5
+    // twin). PURE CPU. Pins: (1) RunWarmHullLockstep authority==replica BIT-IDENTICAL over the TRIPLE
+    // (bodies+cache+sleep); (2) two runs byte-identical (determinism); (3) RunWarmHullRollback
+    // corrected==authority over the TRIPLE AND the mispredict genuinely diverged; (4) THE TRIPLE-NECESSITY
+    // PROOF — a bodies-ONLY snapshot/restore (omitting the cache + sleep) makes the rollback DIVERGE from
+    // authority, while restoring the full TRIPLE makes it ==; (5) the command stream genuinely exercises the
+    // sleep state (an impulse WAKES the asleep tower so sleep transitions are part of the replayed state).
+    {
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+        auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+        auto tiltZ = [&](double rad) { double h = rad / 2.0; return fpx::FxQuat{0, 0, fd(std::sin(h)), fd(std::cos(h))}; };
+        const int N = 4;   // the WH4 DEMONSTRATED tower (goes fully asleep) — its lockstep is the scene
+        auto buildTower = [&]() {
+            gjk::HullWorld w;
+            { FxBody b = BodyAt(0, 0, 0); b.orient = {0,0,0,kOne}; b.invMass = 0; b.flags = 0u; w.bodies.push_back(b); }
+            w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+            for (int k = 0; k < N; ++k) {
+                FxBody b = BodyAt(0, fd(2.0 + 2.0 * k + 0.02 * (k + 1)), 0);
+                b.orient = tiltZ(0.02 * ((k % 2) ? 1.0 : -1.0));
+                b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+                w.bodies.push_back(b); w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));
+            }
+            return w;
+        };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity = convex::FxVec3{0, kGravY, 0};
+        cfg.dt = kOne / 60; cfg.solveIters = 8; cfg.restitution = 0; cfg.slop = kOne / 64;
+        cfg.beta = (fx)((int64_t)2 * kOne / 10); cfg.linDamp = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp = kOne; cfg.posIters = 4;
+        warmhull::HullSleepConfig scfg;
+        scfg.warm = cfg; scfg.sleepThreshold = kOne; scfg.wakeThreshold = (fx)(2 * (int)kOne); scfg.sleepTicks = 30;
+
+        const gjk::HullWorld kInit = buildTower();
+        const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+        // Enough ticks to: settle + fully sleep, then a WAKE impulse at tick 120 (the asleep tower wakes,
+        // re-settles + re-sleeps), then a second perturb at tick 360 — so sleep transitions ARE the replayed
+        // state, not a frozen no-op. The rollback fires at 150 (just AFTER the wake, while waking/re-settling).
+        const uint32_t kTicks      = 480u;
+        const uint32_t kRollbackAt = 150u;
+        // The authoritative command stream: a strong horizontal impulse on the bottom box at tick 120 WAKES the
+        // asleep island (>> wakeThreshold), then a second nudge at 360. True IMPULSEs -> velocity (statics
+        // unaffected). These genuinely move the tower + flip the sleep state (the warm+sleep step is exercised).
+        const std::vector<convex::ConvexCommand> authStream = {
+            convex::ConvexCommand{120u, convex::kConvexCmdAddImpulse, 1u, convex::FxVec3{fi(5), 0, 0}},
+            convex::ConvexCommand{360u, convex::kConvexCmdAddImpulse, 2u, convex::FxVec3{fi(3), 0, 0}},
+        };
+        const uint32_t kCommandCount = (uint32_t)authStream.size();
+        // The MISPREDICTED stream: auth + a WRONG extra strong impulse at rollbackAt on the top box.
+        std::vector<convex::ConvexCommand> mispredictStream = authStream;
+        mispredictStream.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, (uint32_t)N,
+                                                         convex::FxVec3{fi(20), 0, 0}});
+
+        // (5) the command stream genuinely exercises the sleep state: run to JUST before the wake (asleep) then
+        // ONE tick past it (awake) and confirm the asleep flag actually flips (not a frozen no-op).
+        {
+            gjk::HullWorld w = buildTower();
+            warmhull::HullCache c; std::vector<warmhull::HullSleepState> s;
+            for (uint32_t t = 0; t < 120u; ++t) warmhull::SimWarmHullTick(w, c, s, scfg, authStream, t);
+            const warmhull::HullSleepMeasure before = warmhull::MeasureHullSleep(w, s);
+            warmhull::SimWarmHullTick(w, c, s, scfg, authStream, 120u);   // the wake impulse fires this tick
+            const warmhull::HullSleepMeasure after = warmhull::MeasureHullSleep(w, s);
+            check(before.asleepCount == before.dynamicCount,
+                  "WH5: the tower is FULLY asleep just before the wake impulse (sleep state engaged)");
+            check(after.awakeCount == after.dynamicCount,
+                  "WH5: the wake impulse WAKES the whole island (sleep transition is replayed, not a no-op)");
+        }
+
+        // (1) LOCKSTEP: replica (fed INPUTS ONLY, fresh cache+sleep) == authority over the TRIPLE.
+        bool lockstepIdentical = false;
+        const warmhull::WarmHullState authority =
+            warmhull::RunWarmHullLockstep(kInit, scfg, authStream, kTicks, &lockstepIdentical);
+        const warmhull::WarmHullState replica = warmhull::RunWarmHullLockstep(kInit, scfg, authStream, kTicks);
+        check(lockstepIdentical, "WH5: RunWarmHullLockstep sets outIdentical (authority==replica TRIPLE)");
+        check(warmhull::WarmHullStatesEqual(authority.world.bodies, authority.cache, authority.sleep,
+                                            replica.world.bodies, replica.cache, replica.sleep),
+              "WH5: authority==replica BIT-IDENTICAL over the TRIPLE (bodies+cache+sleep)");
+        std::printf("wh5-lockstep: {bodies:%u, ticks:%u, commands:%u} authority==replica BIT-IDENTICAL (triple)\n",
+                    kBodyCount, kTicks, kCommandCount);
+
+        // (2) DETERMINISM: two full runs byte-identical over the TRIPLE (+ a snapshot round-trip).
+        const warmhull::WarmHullState authority2 = warmhull::RunWarmHullLockstep(kInit, scfg, authStream, kTicks);
+        check(warmhull::WarmHullStatesEqual(authority2.world.bodies, authority2.cache, authority2.sleep,
+                                            authority.world.bodies, authority.cache, authority.sleep),
+              "WH5: two runs BYTE-IDENTICAL over the TRIPLE (determinism)");
+        {
+            // snapshot round-trip: capture the TRIPLE, mutate one tick, restore -> back to the snapshot exactly.
+            warmhull::WarmHullState mid = warmhull::RunWarmHullLockstep(kInit, scfg, authStream, kRollbackAt);
+            const warmhull::WarmHullSnapshot snap =
+                warmhull::SnapshotWarmHull(mid.world, mid.cache, mid.sleep, kRollbackAt);
+            warmhull::SimWarmHullTick(mid.world, mid.cache, mid.sleep, scfg, authStream, kRollbackAt);   // mutate
+            warmhull::RestoreWarmHull(mid.world, mid.cache, mid.sleep, snap);
+            check(warmhull::WarmHullStatesEqual(mid.world.bodies, mid.cache, mid.sleep,
+                                                snap.bodies, snap.cache, snap.sleep),
+                  "WH5: SnapshotWarmHull/RestoreWarmHull TRIPLE round-trip is exact");
+        }
+        std::printf("wh5-lockstep determinism: two runs BYTE-IDENTICAL\n");
+
+        // (3) ROLLBACK: restore the TRIPLE + re-sim the auth stream == authority; the mispredict genuinely diverged.
+        bool rollbackCorrected = false, mispredictDiverged = false;
+        const gjk::HullWorld rolledBack =
+            warmhull::RunWarmHullRollback(kInit, scfg, authStream, mispredictStream, kTicks, kRollbackAt,
+                                          &rollbackCorrected, &mispredictDiverged);
+        check(rollbackCorrected, "WH5: RunWarmHullRollback corrected==authority over the TRIPLE");
+        check(gjk::HullBodiesEqual(rolledBack.bodies, authority.world.bodies),
+              "WH5: the rolled-back body world == authority (bodies)");
+        std::printf("wh5-lockstep rollback: corrected==authority BIT-EXACT (triple)\n");
+        check(mispredictDiverged, "WH5: the mispredicted state DIVERGED before rollback (real divergence)");
+        std::printf("wh5-lockstep mispredict: diverged before rollback (triple) (real divergence corrected)\n");
+
+        // (4) THE TRIPLE-NECESSITY PROOF (the PS5 lesson): a bodies-ONLY snapshot/restore (omitting the cache +
+        // sleep) makes the rollback DIVERGE from authority — because the warm-start impulses + the sleep timers
+        // resume WRONG. Then restoring the full TRIPLE makes it ==. This proves the cache+sleep MUST be in the
+        // snapshot. We reproduce the RunWarmHullRollback control flow here but with a BODIES-ONLY restore, and
+        // assert the corrected TRIPLE != authority; then the full-TRIPLE restore (above) == authority.
+        {
+            const warmhull::WarmHullState authFinal =
+                warmhull::RunWarmHullLockstep(kInit, scfg, authStream, kTicks);
+            // Advance to rollbackAt with a fresh cache+sleep (the authoritative path).
+            gjk::HullWorld w = kInit;
+            warmhull::HullCache cache; std::vector<warmhull::HullSleepState> sleep;
+            for (uint32_t t = 0; t < kRollbackAt; ++t)
+                warmhull::SimWarmHullTick(w, cache, sleep, scfg, authStream, t);
+            // Snapshot ALL THREE, but on RESTORE deliberately restore ONLY the bodies (the WRONG, GJ5/MF5-style
+            // bodies-only rollback) — the cache + sleep keep whatever they drifted to during the misprediction.
+            const warmhull::WarmHullSnapshot snap = warmhull::SnapshotWarmHull(w, cache, sleep, kRollbackAt);
+            // Speculatively mispredict (<=3 ticks) to dirty the cache + sleep (and the bodies).
+            uint32_t specTicks = kTicks - kRollbackAt; if (specTicks > 3u) specTicks = 3u;
+            for (uint32_t s = 0; s < specTicks; ++s)
+                warmhull::SimWarmHullTick(w, cache, sleep, scfg, mispredictStream, kRollbackAt + s);
+            // BODIES-ONLY restore (the bug): bodies back to the snapshot, but cache + sleep stay mispredicted.
+            w.bodies = snap.bodies;   // <-- ONLY the bodies (NOT cache, NOT sleep) — the necessity-proof bug
+            // Re-sim the CORRECT stream from rollbackAt with the dirty cache+sleep.
+            for (uint32_t t = kRollbackAt; t < kTicks; ++t)
+                warmhull::SimWarmHullTick(w, cache, sleep, scfg, authStream, t);
+            const bool bodiesOnlyEq = warmhull::WarmHullStatesEqual(
+                w.bodies, cache, sleep, authFinal.world.bodies, authFinal.cache, authFinal.sleep);
+            check(!bodiesOnlyEq,
+                  "WH5: a BODIES-ONLY rollback (omitting the cache+sleep) DIVERGES from authority (the triple "
+                  "is NECESSARY)");
+            // And the full-TRIPLE rollback (rolledBack, above) DID equal authority — proving the fix.
+            check(rollbackCorrected && gjk::HullBodiesEqual(rolledBack.bodies, authFinal.world.bodies),
+                  "WH5: restoring the full TRIPLE makes the rollback == authority (the fix)");
+            std::printf("wh5-lockstep triple-necessity: bodies-only rollback DIVERGES, triple rollback ==authority\n");
+        }
+    }
+
     if (g_fail == 0) std::printf("warmhull_test: ALL PASS\n");
     else             std::printf("warmhull_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;

@@ -1109,5 +1109,214 @@ inline HullSleepMeasure MeasureHullSleep(const HullWorld& world, const std::vect
     return m;
 }
 
+// =========================================================================================================
+// Slice WH5 — LOCKSTEP + ROLLBACK over the warm+sleep TRIPLE (the netcode headline). APPENDED after
+// MeasureHullSleep (WH1/WH2/WH3/WH4's lines above + manifold.h/gjk.h/persist.h/convex.h/fric.h/fpx.h
+// BYTE-FROZEN). WH4 built the warm+sleep STABLE STACK (a deterministic N=4 hull tower that goes fully asleep
+// at exactly zero residual). WH5 proves that whole sim is LOCKSTEP- and ROLLBACK-replayable — the netcode
+// payoff, the GJ5/MF5/PS5 twin. THE NEW WRINKLE vs the earlier lockstep slices (GJ5/CD5/MF5, which snapshot
+// the bodies ALONE): the replayable state here is a TRIPLE — the body world PLUS the persistent impulse cache
+// (HullCache, WH2) PLUS the per-body sleep state (HullSleepState[], WH4). A correct rollback must snapshot AND
+// restore ALL THREE, or a peer that mispredicts and rolls back would resume with the wrong warm-start impulses
+// or the wrong sleep timers and DIVERGE. This is the persist.h PS5 lesson (the box version snapshots
+// bodies+cache+sleep) generalized to hulls. Because StepWarmSleepHullWorld (WH4) is a pure deterministic
+// integer function whose mutable state is exactly that triple, WH5 falls out by retargeting the frozen
+// lockstep harness over it — PURE CPU, NO shader, NO RHI -> both backends run the IDENTICAL harness -> the
+// golden is bit-identical BY CONSTRUCTION (cross-vendor 0 px). Reuses the frozen convex::ConvexCommand +
+// gjk::ApplyHullCommands (the WH-line / MF5 verbatim) + gjk::HullBodiesEqual.
+
+// ----- SimWarmHullTick(world, cache, sleep, cfg, commands, tick): ONE deterministic warm+sleep tick + inputs --
+// (1) gjk::ApplyHullCommands(world, commands, tick) — this tick's perturbations (impulse/spin) in FIXED array
+// order, BEFORE the step so they integrate this tick (a command that WAKES the asleep tower makes the wake/
+// re-settle the replayed state); (2) StepWarmSleepHullWorld(world, cache, sleep, cfg) — the WH4 warm+sleep
+// tick. The manifold::SimHullTickHardened shape (manifold.h:899) with StepHullWorldHardened swapped for
+// StepWarmSleepHullWorld, NOTHING else; the cache + sleep are the per-tick mutable replayable state carried
+// in/out. Pure integer, fixed order -> bit-identical on every peer/platform.
+inline void SimWarmHullTick(HullWorld& world, HullCache& cache, std::vector<HullSleepState>& sleep,
+                            const HullSleepConfig& cfg,
+                            const std::vector<convex::ConvexCommand>& commands, uint32_t tick) {
+    gjk::ApplyHullCommands(world, commands, tick);
+    StepWarmSleepHullWorld(world, cache, sleep, cfg);
+}
+
+// ----- WarmHullSnapshot: the FULL replayable state at a tick (the rollback restore point) — the TRIPLE -------
+// Unlike gjk::HullSnapshot (bodies only — manifold.h:1345), the warm+sleep sim's replayable state is THREE
+// things: the body world, the persistent impulse cache (WH2 — last tick's accumulated impulses the warm-start
+// reads), and the per-body HullSleepState[] (WH4 — energy/lowEnergyTicks/asleep). A peer that only restored the
+// bodies would resume with the wrong warm-start impulses / sleep timers and DIVERGE. All three are deep-copied
+// (std::vector copies). Bit-exact round-trip with RestoreWarmHull. (The persist::PersistSnapshot twin.)
+struct WarmHullSnapshot {
+    std::vector<fpx::FxBody>    bodies;   // a deep-copy of the body world (vel/pos/orient/angVel/invMass/flags)
+    HullCache                   cache;    // a deep-copy of the persistent impulse cache (the warm-start inputs)
+    std::vector<HullSleepState> sleep;    // a deep-copy of the per-body sleep state (energy/lowEnergyTicks/asleep)
+    uint32_t                    tick = 0; // the tick this snapshot was taken at (the rollback restore point)
+};
+
+// ----- SnapshotWarmHull(world, cache, sleep, tick): deep-copy the (bodies, cache, sleep) TRIPLE -------------
+// Value copies -> deep-copies all three vectors. Bit-exact round-trip with RestoreWarmHull.
+inline WarmHullSnapshot SnapshotWarmHull(const HullWorld& world, const HullCache& cache,
+                                         const std::vector<HullSleepState>& sleep, uint32_t tick) {
+    WarmHullSnapshot snap;
+    snap.bodies = world.bodies;   // deep copy
+    snap.cache  = cache;          // deep copy (the entries vector)
+    snap.sleep  = sleep;          // deep copy
+    snap.tick   = tick;
+    return snap;
+}
+
+// ----- RestoreWarmHull(world, cache, sleep, snap): restore the (bodies, cache, sleep) TRIPLE ----------------
+// Memberwise copies — restores all three exactly. Bit-exact round-trip with SnapshotWarmHull. The `hulls` are
+// immutable/shared geometry, so they are left untouched. (The persist::RestorePersist twin.)
+inline void RestoreWarmHull(HullWorld& world, HullCache& cache, std::vector<HullSleepState>& sleep,
+                            const WarmHullSnapshot& snap) {
+    world.bodies = snap.bodies;   // restore the deep-copied body world (hulls untouched)
+    cache        = snap.cache;    // restore the deep-copied cache (the warm-start inputs)
+    sleep        = snap.sleep;    // restore the deep-copied sleep state
+}
+
+// ----- HullCacheEntriesEqual(a, b): field equality of two hull caches (the cache third of the memcmp) -------
+// Equal iff the same number of entries AND each entry's HullContactKey (4 x uint32) + the accumulated
+// normalImpulse (fx) match, in FIXED order. The cache is rebuilt in a FIXED order each tick
+// (StepWarmSleepHullWorld step 5), so two peers that ran the same inputs produce the cache in the SAME order —
+// a positional field-compare is exact. (The persist::CacheEntriesEqual twin over the hull cache.)
+inline bool HullCacheEntriesEqual(const HullCache& a, const HullCache& b) {
+    if (a.entries.size() != b.entries.size()) return false;
+    for (size_t i = 0; i < a.entries.size(); ++i) {
+        if (!HullContactKeysEqual(a.entries[i].key, b.entries[i].key)) return false;
+        if (a.entries[i].normalImpulse != b.entries[i].normalImpulse) return false;
+    }
+    return true;
+}
+
+// ----- HullSleepStatesEqual(a, b): field equality of two sleep-state arrays (the sleep third of the memcmp) --
+// Equal iff the same length AND each HullSleepState's energy (fx) + lowEnergyTicks (uint32) + asleep (bool)
+// match. (The persist::SleepStatesEqual twin.)
+inline bool HullSleepStatesEqual(const std::vector<HullSleepState>& a, const std::vector<HullSleepState>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].energy         != b[i].energy)         return false;
+        if (a[i].lowEnergyTicks != b[i].lowEnergyTicks) return false;
+        if (a[i].asleep         != b[i].asleep)         return false;
+    }
+    return true;
+}
+
+// ----- WarmHullStatesEqual(bodiesA,cacheA,sleepA, bodiesB,cacheB,sleepB): the make-or-break TRIPLE memcmp ----
+// Two warm+sleep states are equal ONLY if ALL THREE match: the bodies (gjk::HullBodiesEqual — a flat-POD
+// memcmp), the persistent cache (HullCacheEntriesEqual), and the per-body sleep state (HullSleepStatesEqual).
+// This is the comparison the lockstep + rollback proofs build on — a peer that re-derived the bodies but
+// diverged on the cache or the sleep timing is NOT equal. (The persist::PersistStatesEqual twin over hulls.)
+inline bool WarmHullStatesEqual(const std::vector<fpx::FxBody>& bodiesA, const HullCache& cacheA,
+                                const std::vector<HullSleepState>& sleepA,
+                                const std::vector<fpx::FxBody>& bodiesB, const HullCache& cacheB,
+                                const std::vector<HullSleepState>& sleepB) {
+    return gjk::HullBodiesEqual(bodiesA, bodiesB)
+        && HullCacheEntriesEqual(cacheA, cacheB)
+        && HullSleepStatesEqual(sleepA, sleepB);
+}
+
+// ----- WarmHullState: the small bundle RunWarmHullLockstep returns (the converged authority TRIPLE) ---------
+// The showcase needs the authority WORLD to render + the cache/sleep to prove equality; bundling the three
+// keeps the entry-point signature clean. (The persist::PersistState twin.)
+struct WarmHullState {
+    HullWorld                   world;
+    HullCache                   cache;
+    std::vector<HullSleepState> sleep;
+};
+
+// ----- RunWarmHullLockstep(world0, cfg, commands, ticks, outIdentical): two peers converge from inputs alone --
+// THE peer entry point (the manifold::RunHullLockstepHardened control flow, manifold.h:912, over
+// SimWarmHullTick, with the cache+sleep added to the replayable state). Two independent peers (authority +
+// replica) BOTH start from `world0` with a FRESH empty cache + sleep, BOTH run SimWarmHullTick for `ticks`
+// with the SAME command stream (INPUTS ONLY — no state shared; each peer carries its OWN cache+sleep copies
+// through the loop) -> BIT-IDENTICAL by determinism, each re-deriving the multi-point manifolds + the full
+// inertia + the sleeping-island propagation every tick. Sets *outIdentical (if non-null) to whether the two
+// final (bodies, cache, sleep) TRIPLES are byte-identical (WarmHullStatesEqual — the make-or-break lockstep
+// proof) + returns the converged AUTHORITY triple (for the golden render + the equality proofs). The peer step
+// order is PINNED.
+inline WarmHullState RunWarmHullLockstep(const HullWorld& world0, const HullSleepConfig& cfg,
+                                         const std::vector<convex::ConvexCommand>& commands, uint32_t ticks,
+                                         bool* outIdentical = nullptr) {
+    HullWorld                   authWorld = world0;   // a fresh copy
+    HullCache                   authCache;            // fresh empty cache (cold-start)
+    std::vector<HullSleepState> authSleep;            // fresh empty sleep state
+    HullWorld                   repWorld = world0;    // the second peer fed the SAME inputs
+    HullCache                   repCache;
+    std::vector<HullSleepState> repSleep;
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimWarmHullTick(authWorld, authCache, authSleep, cfg, commands, t);
+        SimWarmHullTick(repWorld,  repCache,  repSleep,  cfg, commands, t);
+    }
+    if (outIdentical)
+        *outIdentical = WarmHullStatesEqual(authWorld.bodies, authCache, authSleep,
+                                            repWorld.bodies,  repCache,  repSleep);
+    WarmHullState out;
+    out.world = std::move(authWorld);
+    out.cache = std::move(authCache);
+    out.sleep = std::move(authSleep);
+    return out;
+}
+
+// ----- RunWarmHullRollback(world0, cfg, authStream, mispredictStream, ticks, rollbackAt, ...) ---------------
+// The rollback harness (the manifold::RunHullRollbackHardened control flow, manifold.h:935, over
+// SimWarmHullTick, with the cache+sleep added to the snapshot — the persist::RunPersistRollback shape).
+// (1) advance ticks 0..rollbackAt from `world0` with a FRESH cache+sleep applying authStream (carrying the
+// cache+sleep); (2) SnapshotWarmHull AT rollbackAt (ALL THREE — bodies + cache + sleep); (2b) speculatively
+// advance a few ticks (<=3) with the MISPREDICTED stream (a WRONG/extra impulse that wakes/perturbs the tower
+// — the client prediction that diverges), capturing that diverged triple; (3) ROLLBACK — RestoreWarmHull to
+// the snapshot (ALL THREE) + RE-SIMULATE rollbackAt..ticks with the CORRECT authStream -> the corrected final
+// triple. Returns the corrected world; sets *outCorrectedEqAuthority (if non-null) to whether the corrected
+// triple == RunWarmHullLockstep(world0, cfg, authStream, ticks) byte-for-byte over ALL THREE, and
+// *outMispredictDiverged (if non-null) to whether the speculative pre-rollback triple DIFFERED (in at least one
+// of bodies/cache/sleep) from the authority at the same tick (proving a REAL divergence was corrected, not a
+// no-op). cfg + the streams are CONSTANT, NOT snapshotted.
+inline HullWorld RunWarmHullRollback(const HullWorld& world0, const HullSleepConfig& cfg,
+                                     const std::vector<convex::ConvexCommand>& authStream,
+                                     const std::vector<convex::ConvexCommand>& mispredictStream,
+                                     uint32_t ticks, uint32_t rollbackAt,
+                                     bool* outCorrectedEqAuthority = nullptr,
+                                     bool* outMispredictDiverged = nullptr) {
+    HullWorld                   w = world0;
+    HullCache                   cache;   // fresh empty (cold-start)
+    std::vector<HullSleepState> sleep;
+    // (1) advance 0..rollbackAt with the authoritative stream (carrying the cache+sleep).
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimWarmHullTick(w, cache, sleep, cfg, authStream, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — the FULL bodies+cache+sleep TRIPLE).
+    const WarmHullSnapshot snap = SnapshotWarmHull(w, cache, sleep, rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged triple.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimWarmHullTick(w, cache, sleep, cfg, mispredictStream, rollbackAt + s);
+    HullWorld                   specWorld = w;       // the diverged pre-rollback intermediate (the "real divergence" proof)
+    HullCache                   specCache = cache;
+    std::vector<HullSleepState> specSleep = sleep;
+    // (3) ROLLBACK: restore the snapshot (the full TRIPLE) + re-sim rollbackAt..ticks with the authStream.
+    RestoreWarmHull(w, cache, sleep, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimWarmHullTick(w, cache, sleep, cfg, authStream, t);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        HullWorld                   authWorld = world0;
+        HullCache                   authCache;
+        std::vector<HullSleepState> authSleep;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimWarmHullTick(authWorld, authCache, authSleep, cfg, authStream, t);
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !WarmHullStatesEqual(specWorld.bodies, specCache, specSleep,
+                                                          authWorld.bodies, authCache, authSleep);
+        if (outCorrectedEqAuthority) {
+            const WarmHullState authFinal = RunWarmHullLockstep(world0, cfg, authStream, ticks, nullptr);
+            *outCorrectedEqAuthority = WarmHullStatesEqual(w.bodies, cache, sleep,
+                                                           authFinal.world.bodies, authFinal.cache, authFinal.sleep);
+        }
+    }
+    return w;
+}
+
 }  // namespace warmhull
 }  // namespace hf::sim
