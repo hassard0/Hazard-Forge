@@ -1,0 +1,471 @@
+#pragma once
+// Slice WH1 — Warm-Started Hull Contacts: THE HULL CONTACT FEATURE ID (the int32 MSL-native BEACHHEAD of
+// FLAGSHIP #26: WARM-STARTED HULL CONTACTS + ROBUST DETERMINISTIC STACKING, hf::sim::warmhull). Flagship #25
+// hardened the hull narrowphase (multi-point manifolds + full inertia) so a single hull settles on a support,
+// but documented that TALL stacks destabilize: the non-accumulated Gauss-Seidel + the fixed-point 4-point
+// manifold leave a per-tick residual torque that integrates into a spurious spin and topples the tower. #26
+// removes the SOURCE of that torque by generalizing the box-only warm-start + sleeping-islands machinery
+// (persist.h, #21) to the hardened hull multi-point manifolds — an accumulated, warm-started solver that
+// converges to a consistent island equilibrium instead of re-deriving a slightly-inconsistent impulse each
+// tick. WH1 is the BEACHHEAD: the deterministic HULL CONTACT FEATURE ID that names a contact across frames so
+// next tick's manifold points can inherit last tick's accumulated impulses.
+//
+// THE CRUX: a hull manifold has no discrete SAT axis (EPA gives a continuous normal + a Sutherland-Hodgman
+// clip), and the clip-ORDER slot renumbers under sub-LSB motion — so the key must be a GEOMETRIC PROVENANCE
+// (reference face, incident source feature), NOT an array slot. The provenance is computed inside a tagged
+// parallel clip (ClipFaceAgainstFaceTagged) that mirrors the frozen manifold::ClipFaceAgainstFace BYTE-FOR-BYTE
+// (same fixed edge order, same strict-integer inside test, same fxdiv crossing in the same pinned order) and
+// additionally carries a per-output-vertex provenance tag.
+//
+// THE PURE-INT32 WIN (the STRONGEST proof tier, persist.h's PS1 split): the KEY itself is PURE int32 (small
+// face/vertex/edge indices + shift/xor/avalanche hashing — NO Q16.16 products, NO int64, NO float), so
+// shaders/warmhull_key.comp.hlsl is MSL-NATIVE (it goes IN the metal_headless hf_gen_msl list, NOT the
+// Vulkan-only list) — a TRUE GPU pass on BOTH backends, strict zero-differing-pixel cross-vendor. The MANIFOLD
+// that PRODUCES the indices is int64 (GJK/EPA + the SH clip), but that runs HOST-SIDE; the shader only packs
+// the already-computed int32 indices into keys (exactly persist_key.comp's role). The shader copies
+// MakeHullContactKey + HullContactKeyHash VERBATIM so the GPU HullContactKey[]+hash[] is byte-identical to the
+// CPU reference (the Vulkan GPU==CPU memcmp + the Metal GPU strict-zero are the proofs).
+//
+// THE ORDER-NORMALIZATION (the persist.h determinism crux): a contact between bodies (i,j) and (j,i) is the
+// SAME contact — so the key STORES bodyA < bodyB ALWAYS. Plus a refIsA/role bit folded into refFaceId so the
+// key is identity-stable when the bodies swap (the reference face belongs to one specific hull regardless of
+// iteration order). The key legitimately CHANGES when the contact feature changes (a face sliding to a new
+// reference face, or a ref/incident flip) — the documented "warm-start misses at sliding contacts" caveat
+// (in scope: the key changes -> a safe cold-start, NOT a bug).
+//
+// Header-only, namespace hf::sim::warmhull, #include "sim/manifold.h" READ-ONLY (transitively gjk/broad/ccd/
+// convex/fric/persist/fpx — ALL BYTE-FROZEN; warmhull.h is a brand-new additive sibling that NEVER edits a
+// frozen header). manifold.h gives HullContactMulti/HullManifoldFromEpa/ClipFaceAgainstFace/SupportFace/
+// IncidentFace/BuildCanonicalFaces/FxHullFaces + the Q16.16 toolbox.
+
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+#include "sim/manifold.h"   // read-only: manifold::HullContactMulti/HullManifoldFromEpa/ClipFaceAgainstFace/
+                            // SupportFace/IncidentFace/BuildCanonicalFaces/FxHullFaces/FaceNormalWorld/
+                            // FaceCentroidWorld + gjk/convex/fpx (the frozen Q16.16 toolbox), transitively.
+
+namespace hf::sim {
+namespace warmhull {
+
+// Pull the frozen helpers into this namespace (REUSE, do NOT redefine).
+using gjk::fx;
+using gjk::kOne;
+using gjk::FxVec3;
+using gjk::FxHull;
+using gjk::FxBody;
+using gjk::HullWorld;
+using convex::FxDot;
+using convex::FxCross;
+using fpx::FxAdd;
+using fpx::FxSub;
+using fpx::fxmul;
+using fpx::fxdiv;
+using manifold::FxHullFaces;
+using manifold::kMaxClipVerts;
+using manifold::kMaxFaceVerts;
+using manifold::kMaxHullFaces;
+
+// ----- The provenance tag bit layout (PURE int32) ----------------------------------------------------------
+// A clip output vertex is either an ORIGINAL surviving incident-polygon vertex (it keeps the incident hull's
+// LOCAL vertex index — a small uint invariant under rigid motion) or a clip INTERSECTION point (an edge
+// crossing of a reference-face edge against an incident-polygon edge — packed (refEdge, incEdge), both
+// FIXED-order small integers from the SH loop). A high TAG BIT distinguishes the two so the encodings NEVER
+// collide. Pure int32 (shifts + ors, NO products) so the shader can pack the resulting key MSL-natively.
+constexpr uint32_t kTagIntersectBit = 0x80000000u;   // high bit: 1 == intersection, 0 == original vertex
+constexpr uint32_t kTagRefEdgeShift  = 8u;           // refEdge in bits [8..15]
+constexpr uint32_t kTagIncEdgeMask   = 0xFFu;        // incEdge in bits [0..7]
+
+// EncodeVertexTag(incLocalVertIdx): an ORIGINAL incident vertex -> its small local vertex index, high bit 0.
+inline uint32_t EncodeVertexTag(uint32_t incLocalVertIdx) {
+    return incLocalVertIdx & 0x7FFFFFFFu;            // mask off the tag bit (local idx < kMaxHullVerts << 0x80..)
+}
+// EncodeIntersectTag(refEdge, incEdge): a clip crossing -> (refEdge, incEdge) packed under the intersect bit.
+inline uint32_t EncodeIntersectTag(uint32_t refEdge, uint32_t incEdge) {
+    return kTagIntersectBit | ((refEdge & 0xFFu) << kTagRefEdgeShift) | (incEdge & kTagIncEdgeMask);
+}
+inline bool TagIsIntersection(uint32_t tag) { return (tag & kTagIntersectBit) != 0u; }
+
+// =========================================================================================================
+// ClipFaceAgainstFaceTagged — THE DETERMINISM CONTRACT. A NEW provenance-carrying parallel clip that MIRRORS
+// the frozen manifold::ClipFaceAgainstFace (manifold.h:372) EXACTLY: the SAME FIXED edge order (e=0..refVc-1,
+// k=0..polyN-1, prev=last), the SAME strict-integer inside test (FxDot(sideN, p-a) >= 0, on-plane = inside,
+// NO tolerance band), the SAME fxdiv crossing formula in the SAME pinned iteration order. Additionally it
+// carries, per polygon vertex, a provenance TAG through the clip:
+//   - an ORIGINAL incident vertex keeps its incident hull LOCAL vertex index (EncodeVertexTag);
+//   - a clip CROSSING gets (refEdge=e, incEdge=the incident-boundary edge the crossing segment lies on)
+//     (EncodeIntersectTag); the segment's incEdge is the incEdge of the SOURCE vertex `prev` (each vertex
+//     carries the incident-face edge LEAVING it along the current polygon boundary — original vertex at
+//     original slot k leaves along incident edge k; a crossing inherits the segment's edge), which keeps the
+//     crossing's incident-edge identity GEOMETRIC + invariant under sub-LSB motion (NOT the renumbering slot).
+// THE CONTRACT: the tagged clip's OUTPUT POSITIONS are byte-equal to the frozen clip's (run both, memcmp the
+// positions — asserted in the showcase + test). The tags are a deterministic function of the SAME integer
+// signs (the 1-LSB-flip discipline applied to the tag). Pure integer (int64 FxDot/FxCross/fxdiv/fxmul).
+// =========================================================================================================
+
+// A tagged polygon vertex: its world-space position (the SAME bits the frozen clip computes) + its provenance
+// tag + `incEdgeOut` = the incident-face edge index of the segment LEAVING this vertex along the current
+// polygon boundary (so a crossing on segment (prev,cur) inherits prev.incEdgeOut as its incident edge).
+struct TaggedVert {
+    FxVec3   pos;
+    uint32_t tag       = 0;   // EncodeVertexTag / EncodeIntersectTag
+    uint32_t incEdgeOut = 0;  // the incident-boundary edge index of the outgoing segment (for crossing provenance)
+};
+
+inline void ClipFaceAgainstFaceTagged(const FxHull& refHull, const FxBody& refBody, const FxHullFaces& refFaces,
+                                      uint32_t refFace,
+                                      const FxHull& incHull, const FxBody& incBody, const FxHullFaces& incFaces,
+                                      uint32_t incFace,
+                                      TaggedVert outVerts[kMaxClipVerts], int& outN) {
+    outN = 0;
+    if (refFace >= refFaces.faceCount || incFace >= incFaces.faceCount) return;
+    const uint32_t refVc = refFaces.vertCount[refFace];
+    const uint32_t incVc = incFaces.vertCount[incFace];
+    if (refVc < 3 || incVc < 3) return;   // degenerate -> empty (== frozen)
+
+    // The reference face's world-space vertices (FIXED order) + outward normal + centroid (== frozen).
+    FxVec3 refV[kMaxFaceVerts];
+    for (uint32_t k = 0; k < refVc; ++k) {
+        const uint32_t vi = refFaces.vertIdx[refFace][k];
+        refV[k] = FxAdd(fpx::FxRotate(refBody.orient, refHull.verts[vi]), refBody.pos);
+    }
+    const FxVec3 refN = manifold::FaceNormalWorld(refHull, refFaces, refBody, refFace);
+    const FxVec3 refC = manifold::FaceCentroidWorld(refHull, refFaces, refBody, refFace);
+
+    // The incident polygon (the thing we clip), world-space, FIXED order. Each vertex carries its LOCAL vertex
+    // index as the original-vertex tag, and incEdgeOut = k (the incident edge LEAVING slot k along the boundary).
+    TaggedVert poly[kMaxClipVerts];
+    int polyN = (int)incVc;
+    for (uint32_t k = 0; k < incVc; ++k) {
+        const uint32_t vi = incFaces.vertIdx[incFace][k];
+        poly[k].pos = FxAdd(fpx::FxRotate(incBody.orient, incHull.verts[vi]), incBody.pos);
+        poly[k].tag = EncodeVertexTag(vi);
+        poly[k].incEdgeOut = k;   // edge (k -> k+1) of the incident face
+    }
+
+    // Sutherland-Hodgman against each ref-face EDGE's inward side plane, FIXED order e=0..refVc-1 (== frozen).
+    for (uint32_t e = 0; e < refVc; ++e) {
+        const FxVec3 a    = refV[e];
+        const FxVec3 b    = refV[(e + 1u) % refVc];
+        const FxVec3 edge = FxSub(b, a);
+        FxVec3 sideN = FxCross(refN, edge);
+        if (FxDot(sideN, FxSub(refC, a)) < 0) sideN = FxVec3{-sideN.x, -sideN.y, -sideN.z};
+
+        auto fside = [&](const FxVec3& p) -> fx { return FxDot(sideN, FxSub(p, a)); };
+
+        TaggedVert out[kMaxClipVerts];
+        int outNloc = 0;
+        if (polyN == 0) break;
+        TaggedVert prev = poly[polyN - 1];
+        fx fprev = fside(prev.pos);
+        for (int k = 0; k < polyN; ++k) {
+            const TaggedVert cur = poly[k];
+            const fx fcur = fside(cur.pos);
+            const bool curIn  = (fcur >= 0);
+            const bool prevIn = (fprev >= 0);
+            if (curIn) {
+                if (!prevIn && outNloc < (int)kMaxClipVerts) {
+                    // entering: emit the crossing point first, then cur (== frozen position math).
+                    const fx denom = fprev - fcur;
+                    const fx tp = (denom != 0) ? fxdiv(fprev, denom) : 0;
+                    TaggedVert xv;
+                    xv.pos = FxVec3{prev.pos.x + fxmul(cur.pos.x - prev.pos.x, tp),
+                                    prev.pos.y + fxmul(cur.pos.y - prev.pos.y, tp),
+                                    prev.pos.z + fxmul(cur.pos.z - prev.pos.z, tp)};
+                    // The crossing lies on the segment LEAVING prev -> its incident edge is prev.incEdgeOut;
+                    // it is cut by reference edge e. The crossing's outgoing segment continues toward cur, so
+                    // its own incEdgeOut stays prev.incEdgeOut (still on the same incident boundary edge).
+                    xv.tag = EncodeIntersectTag(e, prev.incEdgeOut);
+                    xv.incEdgeOut = prev.incEdgeOut;
+                    out[outNloc++] = xv;
+                }
+                if (outNloc < (int)kMaxClipVerts) out[outNloc++] = cur;
+            } else if (prevIn && outNloc < (int)kMaxClipVerts) {
+                // leaving: emit the crossing point only (== frozen position math).
+                const fx denom = fprev - fcur;
+                const fx tp = (denom != 0) ? fxdiv(fprev, denom) : 0;
+                TaggedVert xv;
+                xv.pos = FxVec3{prev.pos.x + fxmul(cur.pos.x - prev.pos.x, tp),
+                                prev.pos.y + fxmul(cur.pos.y - prev.pos.y, tp),
+                                prev.pos.z + fxmul(cur.pos.z - prev.pos.z, tp)};
+                xv.tag = EncodeIntersectTag(e, prev.incEdgeOut);
+                xv.incEdgeOut = prev.incEdgeOut;
+                out[outNloc++] = xv;
+            }
+            prev = cur; fprev = fcur;
+        }
+        polyN = outNloc;
+        for (int k = 0; k < polyN; ++k) poly[k] = out[k];
+    }
+
+    outN = polyN;
+    for (int k = 0; k < polyN; ++k) outVerts[k] = poly[k];
+}
+
+// ----- HullContactKey: the deterministic integer identity of one hull contact POINT -------------------------
+// bodyA < bodyB ALWAYS (order-normalized — the same pair yields the same key regardless of iteration order);
+// refFaceId = the reference-face provenance: the FIXED face index manifold::SupportFace chose, with the
+// refIsA/role bit folded in the high bit (so the key names a SPECIFIC hull's face independent of iteration
+// order); incVertId = the clipped point's provenance tag (an original incident LOCAL vertex index, or a packed
+// (refEdge, incEdge) crossing under the intersect bit). bodyRole records which stored body owns the reference
+// face (0 == bodyA owns it, 1 == bodyB owns it) — folded into refFaceId so a body swap leaves the key bit-equal.
+// std430-packable as 4 x uint32 (16 bytes) — the GPU HullContactKey mirror the warmhull_key.comp memcmp compares.
+struct HullContactKey {
+    uint32_t bodyA     = 0;
+    uint32_t bodyB     = 0;
+    uint32_t refFaceId = 0;   // (refIsAStored << 31) | refFace  — the reference-face identity (hull + index)
+    uint32_t incVertId = 0;   // the incident source-feature provenance tag (vertex idx OR (refEdge,incEdge))
+};
+
+constexpr uint32_t kRefFaceRoleBit = 0x80000000u;   // high bit of refFaceId: 1 == the STORED bodyB owns the ref face
+
+// ----- MakeHullContactKey(bodyAIdx, bodyBIdx, refIsA, refFace, incTag) -> HullContactKey --------------------
+// Order-normalize the body indices (swap so bodyA < bodyB). refIsA is "the RAW-order body A owns the reference
+// face" (manifold.h:502's refIsA). We fold WHICH STORED body owns the reference face into refFaceId's high bit
+// so the key is invariant under a body swap: if the raw order is already normalized (bodyAIdx <= bodyBIdx) the
+// stored owner == refIsA-A; if swapped, the stored owner flips. PURE INT32 (a compare + a swap + shifts/ors —
+// NO products). The shader copies THIS body VERBATIM.
+inline HullContactKey MakeHullContactKey(uint32_t bodyAIdx, uint32_t bodyBIdx,
+                                         bool refIsA, uint32_t refFace, uint32_t incTag) {
+    HullContactKey k;
+    bool swapped;
+    if (bodyAIdx <= bodyBIdx) { k.bodyA = bodyAIdx; k.bodyB = bodyBIdx; swapped = false; }
+    else                      { k.bodyA = bodyBIdx; k.bodyB = bodyAIdx; swapped = true; }
+    // Which STORED body owns the reference face? The reference face belongs to RAW body A iff refIsA. After the
+    // order-normalize swap, RAW-A is STORED-B and vice-versa — so the stored owner is bodyB iff (refIsA XOR
+    // swapped) is FALSE... work it out: storedOwnerIsB == (refIsA && swapped) || (!refIsA && !swapped)
+    //   == (refIsA == swapped). Fold that single bit into refFaceId's high bit; the low bits are the face index.
+    const bool storedOwnerIsB = (refIsA == swapped);
+    k.refFaceId = (storedOwnerIsB ? kRefFaceRoleBit : 0u) | (refFace & 0x7FFFFFFFu);
+    k.incVertId = incTag;
+    return k;
+}
+
+// ----- HullContactKeysEqual(a, b) -> bool: field-by-field equality (the cache match predicate). PURE INT32. ---
+inline bool HullContactKeysEqual(const HullContactKey& a, const HullContactKey& b) {
+    return a.bodyA == b.bodyA && a.bodyB == b.bodyB
+        && a.refFaceId == b.refFaceId && a.incVertId == b.incVertId;
+}
+
+// ----- HullContactKeyHash(k) -> uint32_t: a deterministic integer hash of the four fields -------------------
+// A FIXED bit-mix over the four small uint32 fields (bodyA/bodyB < a few thousand, refFaceId a small index +
+// the high role bit, incVertId a small vertex idx OR a packed (refEdge,incEdge) + the intersect bit). PURE
+// INT32 — only shifts + xors + adds, NO products, NO int64, NO float -> MSL-native. This is persist.h:84-94's
+// ContactKeyHash avalanche idiom (the same (a<<20)^(b<<8)^(c<<4)^d packing skeleton, adapted to the hull
+// fields) so the GPU shader copies it VERBATIM. The final xor-shift avalanche spreads the bits for buckets.
+inline uint32_t HullContactKeyHash(const HullContactKey& k) {
+    // The packing of the four fields (the persist.h shift/xor mix; refFaceId/incVertId carry their high tag bits).
+    uint32_t h = (k.bodyA << 20) ^ (k.bodyB << 8) ^ (k.refFaceId << 4) ^ k.incVertId;
+    // The fixed avalanche (xorshift-style; shifts + xor + add only — no products), copied from persist.h.
+    h ^= h >> 15;
+    h += (h << 7);
+    h ^= h >> 11;
+    return h;
+}
+
+// ----- KeyedHullContact: one tagged manifold contact POINT (its world position + depth + its HullContactKey) --
+// The output of BuildHullContactKeys per manifold point. point/depth mirror the convex::ContactManifold WH1
+// tags (BYTE-EQUAL to manifold::HullContactMulti by construction); key is the geometric-provenance feature ID.
+struct KeyedHullContact {
+    FxVec3         point;
+    fx             depth = 0;
+    HullContactKey key;
+    // The RAW provenance (the order-UN-normalized inputs the GPU warmhull_key.comp consumes + order-normalizes;
+    // the showcase feeds THESE to the shader + checks MakeHullContactKey(raw) == key). bodyAIdx/bodyBIdx are the
+    // caller's GLOBAL body indices in raw order; refIsA/refFace/incTag are the geometric provenance.
+    uint32_t bodyAIdx = 0;
+    uint32_t bodyBIdx = 0;
+    uint32_t refIsA   = 0;   // 0/1 (the RAW-order body A owns the reference face)
+    uint32_t refFace  = 0;
+    uint32_t incTag   = 0;
+};
+
+// ----- KeyedHullManifold: the per-pair tagged manifold (count 0-4 KeyedHullContact + the EPA normal) ---------
+struct KeyedHullManifold {
+    uint32_t         count = 0;
+    KeyedHullContact pts[4];
+    FxVec3           normal;
+};
+
+// =========================================================================================================
+// BuildHullContactKeysForPair — run the FROZEN narrowphase + HullContactMulti for ONE pair, then TAG each
+// manifold point with its HullContactKey. It MIRRORS manifold::HullManifoldFromEpa's reference/incident face
+// selection + clip + keep + reduce EXACTLY (the SAME refIsA, refFace, incFace, the SAME candidate-keep depth
+// test, the SAME deepest-first reduce) but runs ClipFaceAgainstFaceTagged instead of the frozen clip so it can
+// carry the provenance tag through the identical control flow. The OUTPUT POSITIONS are byte-equal to
+// HullContactMulti's (asserted in the showcase/test); the tags name the (refFace, incident source feature)
+// provenance. bodyAIdx/bodyBIdx are the GLOBAL body indices feeding the order-normalized key.
+// =========================================================================================================
+inline KeyedHullManifold BuildHullContactKeysForPair(uint32_t bodyAIdx, const FxBody& bodyA, const FxHull& hullA,
+                                                     uint32_t bodyBIdx, const FxBody& bodyB, const FxHull& hullB) {
+    KeyedHullManifold out;   // count 0
+    // The FROZEN manifold (the contract reference WH1 tags — positions/depths/normal come from HERE).
+    const convex::ContactManifold m = manifold::HullContactMulti(bodyA, hullA, bodyB, hullB);
+    if (m.count == 0) return out;
+    out.normal = m.normal;
+
+    // Re-derive the SAME reference/incident selection HullManifoldFromEpa made (== manifold.h:486-513), so the
+    // tagged clip runs over the SAME faces. We re-run gjk::Gjk -> gjk::Epa (the FROZEN narrowphase) to get the
+    // SAME EPA normal n the manifold used.
+    const gjk::GjkResult g = gjk::Gjk(hullA, bodyA, hullB, bodyB);
+    const FxHullFaces facesA = manifold::BuildCanonicalFaces(hullA);
+    const FxHullFaces facesB = manifold::BuildCanonicalFaces(hullB);
+
+    // If the FROZEN manifold fell back to the single-point witness (non-canonical hull / degenerate / empty
+    // clip), there is no clip provenance: tag the point with a sentinel refFace/incTag (a deterministic
+    // cold-start key). We detect the fallback by: no overlap, or no face tables, or the clip yields nothing.
+    bool haveClip = g.overlap && facesA.faceCount != 0 && facesB.faceCount != 0;
+
+    // Per-manifold-point tag (index-aligned with m.points[]); default = the fallback sentinel.
+    uint32_t pointTag[4]   = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    bool     refIsA        = true;
+    uint32_t refFaceIdx    = 0xFFFFu;   // sentinel (fallback) until the clip path fills it
+
+    if (haveClip) {
+        const gjk::EpaResult epa = gjk::Epa(hullA, bodyA, hullB, bodyB, g.simplex);
+        const FxVec3 n = epa.normal;   // UNIT, A->B (== HullManifoldFromEpa)
+
+        // Reference-hull selection (== manifold.h:494-513), pure integer, the SAME compares.
+        const uint32_t sfA = manifold::SupportFace(hullA, facesA, bodyA, n);
+        const FxVec3   nfA = manifold::FaceNormalWorld(hullA, facesA, bodyA, sfA);
+        const fx       alignA = FxDot(nfA, n);
+        const FxVec3   negN = FxVec3{-n.x, -n.y, -n.z};
+        const uint32_t sfB = manifold::SupportFace(hullB, facesB, bodyB, negN);
+        const FxVec3   nfB = manifold::FaceNormalWorld(hullB, facesB, bodyB, sfB);
+        const fx       alignB = FxDot(nfB, negN);
+        refIsA = (alignA >= alignB);   // tie-break A (>=) — IDENTICAL to manifold.h:502
+
+        const FxHull&      refHull  = refIsA ? hullA : hullB;
+        const FxBody&      refBody  = refIsA ? bodyA : bodyB;
+        const FxHullFaces& refFaces = refIsA ? facesA : facesB;
+        const uint32_t     refFace  = refIsA ? sfA : sfB;
+        const FxVec3       refN     = refIsA ? nfA : nfB;
+
+        const FxHull&      incHull  = refIsA ? hullB : hullA;
+        const FxBody&      incBody  = refIsA ? bodyB : bodyA;
+        const FxHullFaces& incFaces = refIsA ? facesB : facesA;
+        const uint32_t     incFace  = manifold::IncidentFace(incHull, incFaces, incBody, refN);
+
+        if (refFace < refFaces.faceCount && incFace < incFaces.faceCount) {
+            refFaceIdx = refFace;
+            const FxVec3 refC = manifold::FaceCentroidWorld(refHull, refFaces, refBody, refFace);
+
+            // The TAGGED clip (positions byte-equal to the frozen clip HullManifoldFromEpa ran).
+            TaggedVert clipped[kMaxClipVerts];
+            int clipN = 0;
+            ClipFaceAgainstFaceTagged(refHull, refBody, refFaces, refFace,
+                                      incHull, incBody, incFaces, incFace, clipped, clipN);
+
+            // The candidate-keep (== manifold.h:531-538): keep clipped verts with depth d = FxDot(refN, refC -
+            // vertex) >= 0, in clip order, carrying the tag.
+            FxVec3   candPts[kMaxClipVerts];
+            fx       candDepth[kMaxClipVerts];
+            uint32_t candTag[kMaxClipVerts];
+            int      candN = 0;
+            for (int k = 0; k < clipN; ++k) {
+                const FxVec3 rel = FxVec3{refC.x - clipped[k].pos.x, refC.y - clipped[k].pos.y,
+                                          refC.z - clipped[k].pos.z};
+                const fx d = FxDot(refN, rel);
+                if (d >= 0) { candPts[candN] = clipped[k].pos; candDepth[candN] = d;
+                              candTag[candN] = clipped[k].tag; ++candN; }
+            }
+            if (candN > 0) {
+                // The deepest-first reduce (== manifold.h:543-554), carrying the tag with each kept point.
+                int deepest = 0;
+                for (int k = 1; k < candN; ++k) if (candDepth[k] > candDepth[deepest]) deepest = k;
+                uint32_t orderTag[4];
+                orderTag[0] = candTag[deepest];
+                uint32_t cnt = 1;
+                for (int k = 0; k < candN && cnt < 4; ++k) {
+                    if (k == deepest) continue;
+                    orderTag[cnt] = candTag[k];
+                    ++cnt;
+                }
+                // The reduce order here is IDENTICAL to HullManifoldFromEpa's, so orderTag[i] aligns with
+                // m.points[i] (the byte-equal positions). Copy the tags into pointTag[].
+                for (uint32_t i = 0; i < cnt && i < 4; ++i) pointTag[i] = orderTag[i];
+            }
+        }
+    }
+
+    // Emit the keyed contacts: positions/depths come from the FROZEN manifold m (the contract); the key is the
+    // geometric provenance (refIsA + refFaceIdx + pointTag). A fallback point (no clip provenance) carries the
+    // sentinel refFace/tag -> a deterministic distinct cold-start key.
+    out.count = m.count;
+    for (uint32_t i = 0; i < m.count && i < 4; ++i) {
+        out.pts[i].point = m.points[i];
+        out.pts[i].depth = m.depths[i];
+        out.pts[i].key   = MakeHullContactKey(bodyAIdx, bodyBIdx, refIsA, refFaceIdx, pointTag[i]);
+        out.pts[i].bodyAIdx = bodyAIdx;
+        out.pts[i].bodyBIdx = bodyBIdx;
+        out.pts[i].refIsA   = refIsA ? 1u : 0u;
+        out.pts[i].refFace  = refFaceIdx;
+        out.pts[i].incTag   = pointTag[i];
+    }
+    return out;
+}
+
+// ----- BuildHullContactKeys(pairs): the per-pair battery -> the flat list of KeyedHullContact ----------------
+// A pair is (bodyAIdx, bodyA, hullA, bodyBIdx, bodyB, hullB). Runs BuildHullContactKeysForPair per pair in
+// FIXED order and flattens every manifold point into one list (the deterministic key set the showcase/shader
+// pack + measure). Pure integer (the int64 manifold + the int32 key), fixed scan order -> deterministic.
+struct HullKeyPair {
+    uint32_t bodyAIdx; FxBody bodyA; FxHull hullA;
+    uint32_t bodyBIdx; FxBody bodyB; FxHull hullB;
+};
+
+inline std::vector<KeyedHullContact> BuildHullContactKeys(const std::vector<HullKeyPair>& pairs) {
+    std::vector<KeyedHullContact> out;
+    for (const HullKeyPair& p : pairs) {
+        const KeyedHullManifold km = BuildHullContactKeysForPair(p.bodyAIdx, p.bodyA, p.hullA,
+                                                                 p.bodyBIdx, p.bodyB, p.hullB);
+        for (uint32_t i = 0; i < km.count && i < 4; ++i) out.push_back(km.pts[i]);
+    }
+    return out;
+}
+
+// ----- HullKeyMeasure: the deterministic summary over a set of hull contact keys ----------------------------
+// totalKeys = the total number of keys measured; distinctKeys = the number of DISTINCT keys (the SAME contact
+// re-derived collapses); maxHashCollisions = the largest number of DISTINCT keys sharing one hash (0 == every
+// distinct key hashed uniquely). Pure integer, fixed scan order -> deterministic. The persist.h KeyMeasure twin.
+struct HullKeyMeasure {
+    uint32_t totalKeys         = 0;
+    uint32_t distinctKeys      = 0;
+    uint32_t maxHashCollisions = 0;
+};
+
+// MeasureHullKeys(keys): scan the key array; count total, distinct (by field tuple), and the max number of
+// distinct keys colliding on a single hash. Pure integer, FIXED O(n^2) scan order (the contact sets are tiny)
+// -> deterministic (two runs byte-identical). The persist.h MeasureKeys twin.
+inline HullKeyMeasure MeasureHullKeys(const std::vector<HullContactKey>& keys) {
+    HullKeyMeasure m;
+    m.totalKeys = (uint32_t)keys.size();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j)
+            if (HullContactKeysEqual(keys[i], keys[j])) { seen = true; break; }
+        if (!seen) ++m.distinctKeys;
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        bool firstOcc = true;
+        for (size_t j = 0; j < i; ++j)
+            if (HullContactKeysEqual(keys[i], keys[j])) { firstOcc = false; break; }
+        if (!firstOcc) continue;
+        const uint32_t hi = HullContactKeyHash(keys[i]);
+        uint32_t sharing = 0;
+        for (size_t j = 0; j < keys.size(); ++j) {
+            bool jFirst = true;
+            for (size_t p = 0; p < j; ++p)
+                if (HullContactKeysEqual(keys[j], keys[p])) { jFirst = false; break; }
+            if (!jFirst) continue;
+            if (HullContactKeyHash(keys[j]) == hi) ++sharing;
+        }
+        const uint32_t collisions = sharing > 0 ? sharing - 1u : 0u;
+        if (collisions > m.maxHashCollisions) m.maxHashCollisions = collisions;
+    }
+    return m;
+}
+
+}  // namespace warmhull
+}  // namespace hf::sim

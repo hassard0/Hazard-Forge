@@ -105,6 +105,7 @@
 #include "sim/manifold.h"             // Slice MF1: hull narrowphase hardening HULL FACE TOPOLOGY (FxHullFaces/BuildCanonicalFaces/FaceNormalWorld/FaceCentroidWorld/SupportFace/IncidentFace + render-only FacesToRenderInstances) — the new primitive, the BEACHHEAD of FLAGSHIP #25; #includes sim/ccd.h read-only (gjk/broad/convex/fpx BYTE-FROZEN); NO new shader (the Metal --mf1-faces render reuses the lit pipeline)
 #include "sim/fric.h"                // Slice FC1: deterministic contact friction THE TANGENT BASIS (TangentBasis/LeastAlignedAxis/MakeTangentBasis/MeasureBasis, the fixed integer Gram-Schmidt) — shared verbatim with fric_basis.comp + the Vulkan --fric-basis-shot (int64 -> Vulkan-only; Metal --fric-basis runs the CPU MakeTangentBasis)
 #include "sim/persist.h"             // Slice PS1: deterministic persistent contacts THE CONTACT FEATURE ID (ContactKey/MakeContactKey/ContactKeysEqual/ContactKeyHash/MeasureKeys, the PURE-INT32 order-normalized integer key) — shared verbatim with persist_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --persist-key runs the GPU SHADER (NOT a CPU reference)
+#include "sim/warmhull.h"            // Slice WH1: warm-started hull contacts THE HULL CONTACT FEATURE ID (HullContactKey/MakeHullContactKey/HullContactKeysEqual/HullContactKeyHash/ClipFaceAgainstFaceTagged/BuildHullContactKeys/MeasureHullKeys, the PURE-INT32 geometric-provenance key + the byte-identical tagged clip) — shared verbatim with warmhull_key.comp (MSL-NATIVE, IN hf_gen_msl); Metal --wh1-keys runs the GPU SHADER (NOT a CPU reference)
 #include "sim/boids.h"               // Slice BD1: deterministic GPU crowds INTEGER STEERING (Agent/BoidsConfig/SteerSeek/SteerSeparation/StepBoids/MeasureBoids) — shared verbatim with boids_steer.comp + the Vulkan --boids-steer-shot (int64 steer/integrate -> Vulkan-only; Metal --boids-steer runs the CPU StepBoids byte-identical by construction)
 #include "nav/navmesh.h"            // Slice NAV1: deterministic GPU navmesh integer heightfield span rasterization (Heightfield/Span/NavTri/RasterizeTriangleSpans/PointInTriXZ/TriYSpan/MakeShowcaseTriangles) — shared verbatim with nav_raster_count/scan/emit.comp + the Vulkan --nav-raster-shot
 #include "render/hiz.h"             // Slice CJ: Hi-Z occlusion cull math (pure CPU; bit-identical cross-backend)
@@ -16991,6 +16992,260 @@ static int RunPersistKeyShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — contact-feature-ID key-color view (%u pairs, %u contacts)\n",
+                outPath, imgW, imgH, kPairCount, kContactCount);
+    return 0;
+}
+
+// --- Warm-Started Hull Contacts THE HULL CONTACT FEATURE ID showcase (Slice WH1, the int32 MSL-native
+// BEACHHEAD of FLAGSHIP #26: WARM-STARTED HULL CONTACTS + ROBUST DETERMINISTIC STACKING, hf::sim::warmhull).
+// The TRUE pass is identical on both backends because the contact KEY is PURE INT32 (compares + shifts + xors,
+// NO Q16.16 products, NO int64, NO float): UNLIKE the int64 hull MATH (hull_manifold/hull_step_hardened are
+// Vulkan-SPIR-V-only), shaders/warmhull_key.comp IS MSL-NATIVE (in hf_gen_msl) — so the Metal --wh1-keys runs
+// the GPU SHADER (NOT a CPU reference). The MF2/MF3 hull battery (a box-on-box flat contact=4 + a
+// tetra-on-face=3 + an edge contact=2) is run through the FROZEN narrowphase (manifold::HullContactMulti) +
+// warmhull::BuildHullContactKeys (the byte-identical TAGGED clip tags each manifold point with its
+// geometric-provenance HullContactKey) to produce the per-contact (bodyA, bodyB, refIsA, refFace, incTag)
+// inputs; one GPU thread per contact runs warmhull_key.comp.gen.metal (copies warmhull.h::MakeHullContactKey +
+// HullContactKeyHash VERBATIM), ReadBuffer reads the GPU HullContactKey[]+hash[], PROVEN BIT-EXACT vs the CPU
+// warmhull::MakeHullContactKey/HullContactKeyHash (memcmp, NO tol — the same GPU==CPU proof the Vulkan
+// --wh1-keys-shot runs). THE CRUX proof: the tagged clip's output positions are byte-equal to the frozen
+// manifold::ClipFaceAgainstFace's. The image golden is a PURE-INTEGER 2D side-view (XY): the contact points
+// colored by HullContactKeyHash, identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB).
+// New golden tests/golden/metal/wh1_keys.png; two runs DIFF 0.0000. NO new RHI.
+static int RunWh1KeysShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    namespace warmhull = hf::sim::warmhull;
+    using gjk::fx; using gjk::kOne; using gjk::FxVec3;
+
+    auto MakeBodyAt = [](fx px, fx py, fx pz) {
+        fpx::FxBody b; b.pos = {px, py, pz}; b.orient = {0, 0, 0, kOne}; return b;
+    };
+    const fx overlap = kOne / 8;
+
+    const gjk::FxHull boxStaticH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxStaticB = MakeBodyAt(gjk::FromInt(-4), 0, 0);
+    const gjk::FxHull boxTopH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxTopB = MakeBodyAt(gjk::FromInt(-4), gjk::FromInt(2) - overlap, 0);
+
+    gjk::FxHull tetraH;
+    tetraH.verts[0] = FxVec3{0, kOne, 0};
+    tetraH.verts[1] = FxVec3{gjk::FromInt(1), -kOne, gjk::FromInt(1)};
+    tetraH.verts[2] = FxVec3{gjk::FromInt(1), -kOne, -gjk::FromInt(1)};
+    tetraH.verts[3] = FxVec3{-gjk::FromInt(1), -kOne, 0};
+    tetraH.count = 4;
+    const gjk::FxHull boxMidH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxMidB = MakeBodyAt(0, 0, 0);
+    const fpx::FxBody tetraB  = MakeBodyAt(0, gjk::FromInt(2) - overlap, 0);
+
+    const gjk::FxHull boxEdgeBaseH = gjk::MakeBox(kOne, kOne, kOne);
+    const fpx::FxBody boxEdgeBaseB = MakeBodyAt(gjk::FromInt(4), 0, 0);
+    const gjk::FxHull boxEdgeH = gjk::MakeBox(kOne, kOne, kOne);
+    fpx::FxBody boxEdgeB = MakeBodyAt(gjk::FromInt(4), (fx)((1.0 - 0.125 + 1.41421356) * 65536.0), 0);
+    boxEdgeB.orient = {0, 0, (fx)(0.38268343f * 65536.0f), (fx)(0.92387953f * 65536.0f)};
+
+    std::vector<warmhull::HullKeyPair> pairs;
+    pairs.push_back({0u, boxStaticB, boxStaticH, 1u, boxTopB, boxTopH});
+    pairs.push_back({2u, boxMidB, boxMidH, 3u, tetraB, tetraH});
+    pairs.push_back({4u, boxEdgeBaseB, boxEdgeBaseH, 5u, boxEdgeB, boxEdgeH});
+    const uint32_t kPairCount = (uint32_t)pairs.size();
+
+    // THE CRUX: tagged clip == frozen clip (positions BYTE-EQUAL) over the battery.
+    bool taggedEqualsFrozen = true;
+    for (const warmhull::HullKeyPair& p : pairs) {
+        const gjk::GjkResult gg = gjk::Gjk(p.hullA, p.bodyA, p.hullB, p.bodyB);
+        if (!gg.overlap) continue;
+        const manifold::FxHullFaces fA = manifold::BuildCanonicalFaces(p.hullA);
+        const manifold::FxHullFaces fB = manifold::BuildCanonicalFaces(p.hullB);
+        if (fA.faceCount == 0 || fB.faceCount == 0) continue;
+        const gjk::EpaResult epa = gjk::Epa(p.hullA, p.bodyA, p.hullB, p.bodyB, gg.simplex);
+        const FxVec3 n = epa.normal;
+        const uint32_t sfA = manifold::SupportFace(p.hullA, fA, p.bodyA, n);
+        const FxVec3   nfA = manifold::FaceNormalWorld(p.hullA, fA, p.bodyA, sfA);
+        const fx       alA = convex::FxDot(nfA, n);
+        const FxVec3   negN = FxVec3{-n.x, -n.y, -n.z};
+        const uint32_t sfB = manifold::SupportFace(p.hullB, fB, p.bodyB, negN);
+        const FxVec3   nfB = manifold::FaceNormalWorld(p.hullB, fB, p.bodyB, sfB);
+        const fx       alB = convex::FxDot(nfB, negN);
+        const bool refIsA = (alA >= alB);
+        const gjk::FxHull& rH = refIsA ? p.hullA : p.hullB;
+        const fpx::FxBody& rB = refIsA ? p.bodyA : p.bodyB;
+        const manifold::FxHullFaces& rF = refIsA ? fA : fB;
+        const uint32_t rFace = refIsA ? sfA : sfB;
+        const FxVec3 rN = refIsA ? nfA : nfB;
+        const gjk::FxHull& iH = refIsA ? p.hullB : p.hullA;
+        const fpx::FxBody& iB = refIsA ? p.bodyB : p.bodyA;
+        const manifold::FxHullFaces& iF = refIsA ? fB : fA;
+        const uint32_t iFace = manifold::IncidentFace(iH, iF, iB, rN);
+        if (rFace >= rF.faceCount || iFace >= iF.faceCount) continue;
+        FxVec3 frozenPts[manifold::kMaxClipVerts]; int frozenN = 0;
+        manifold::ClipFaceAgainstFace(rH, rB, rF, rFace, iH, iB, iF, iFace, frozenPts, frozenN);
+        warmhull::TaggedVert taggedPts[manifold::kMaxClipVerts]; int taggedN = 0;
+        warmhull::ClipFaceAgainstFaceTagged(rH, rB, rF, rFace, iH, iB, iF, iFace, taggedPts, taggedN);
+        if (taggedN != frozenN) { taggedEqualsFrozen = false; continue; }
+        for (int k = 0; k < frozenN; ++k)
+            if (std::memcmp(&taggedPts[k].pos, &frozenPts[k], sizeof(FxVec3)) != 0)
+                taggedEqualsFrozen = false;
+    }
+    if (!taggedEqualsFrozen) return fail("wh1-keys: tagged clip != frozen clip (a position diverged)");
+    std::printf("wh1-keys: tagged clip == frozen clip (points BYTE-EQUAL)\n");
+
+    const std::vector<warmhull::KeyedHullContact> keyed = warmhull::BuildHullContactKeys(pairs);
+    const uint32_t kContactCount = (uint32_t)keyed.size();
+    if (kContactCount == 0) return fail("wh1-keys: the hull battery produced NO contact points");
+
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    struct HullKeyInputGpu { uint32_t bodyA, bodyB, refIsA, refFace, incTag, p0, p1, p2; };
+    static_assert(sizeof(HullKeyInputGpu) == 32, "HullKeyInputGpu std430 layout");
+    struct HullContactKeyGpu { uint32_t bodyA, bodyB, refFaceId, incVertId; };
+    static_assert(sizeof(HullContactKeyGpu) == 16, "HullContactKeyGpu std430 layout");
+    struct WarmhullParams { int32_t cfg[4]; };
+    static_assert(sizeof(WarmhullParams) == 16, "WarmhullParams std430 layout");
+
+    std::vector<HullKeyInputGpu> contacts((size_t)kContactCount);
+    std::vector<HullContactKeyGpu> cpuKeys((size_t)kContactCount);
+    std::vector<uint32_t> cpuHashes((size_t)kContactCount);
+    std::vector<warmhull::HullContactKey> cpuKeyObjs((size_t)kContactCount);
+    for (uint32_t i = 0; i < kContactCount; ++i) {
+        const warmhull::KeyedHullContact& kc = keyed[i];
+        contacts[i] = HullKeyInputGpu{kc.bodyAIdx, kc.bodyBIdx, kc.refIsA, kc.refFace, kc.incTag, 0, 0, 0};
+        cpuKeyObjs[i] = kc.key;
+        cpuKeys[i] = HullContactKeyGpu{kc.key.bodyA, kc.key.bodyB, kc.key.refFaceId, kc.key.incVertId};
+        cpuHashes[i] = warmhull::HullContactKeyHash(kc.key);
+    }
+
+    rhi::BufferDesc cDesc;
+    cDesc.size = contacts.size() * sizeof(HullKeyInputGpu); cDesc.initialData = contacts.data();
+    cDesc.usage = rhi::BufferUsage::Storage;
+    auto contactsBuf = device->CreateBuffer(cDesc);
+
+    auto keyCs = loadMSL("warmhull_key.comp.gen.metal", "warmhull_key_main");
+    rhi::ComputePipelineDesc keyCd;
+    keyCd.compute = keyCs.get(); keyCd.storageBufferCount = 4; keyCd.threadsPerGroupX = 64;
+    auto keyCompute = device->CreateComputePipeline(keyCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+
+    auto runKeys = [&](std::vector<HullContactKeyGpu>& outKeys, std::vector<uint32_t>& outHashes) {
+        std::vector<HullContactKeyGpu> keysInit((size_t)kContactCount, HullContactKeyGpu{});
+        rhi::BufferDesc kDesc;
+        kDesc.size = keysInit.size() * sizeof(HullContactKeyGpu); kDesc.initialData = keysInit.data();
+        kDesc.usage = rhi::BufferUsage::Storage;
+        auto keysBuf = device->CreateBuffer(kDesc);
+        std::vector<uint32_t> hashesInit((size_t)kContactCount, 0u);
+        rhi::BufferDesc hDesc;
+        hDesc.size = hashesInit.size() * sizeof(uint32_t); hDesc.initialData = hashesInit.data();
+        hDesc.usage = rhi::BufferUsage::Storage;
+        auto hashesBuf = device->CreateBuffer(hDesc);
+        WarmhullParams params{}; params.cfg[0] = (int32_t)kContactCount; params.cfg[1] = 1;
+        rhi::BufferDesc pDesc;
+        pDesc.size = sizeof(WarmhullParams); pDesc.initialData = &params;
+        pDesc.usage = rhi::BufferUsage::Storage;
+        auto paramsBuf = device->CreateBuffer(pDesc);
+
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("warmhull_key", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*keyCompute);
+                cmd.BindStorageBuffer(*contactsBuf, 0);
+                cmd.BindStorageBuffer(*keysBuf, 1);
+                cmd.BindStorageBuffer(*hashesBuf, 2);
+                cmd.BindStorageBuffer(*paramsBuf, 3);
+                cmd.DispatchCompute((kContactCount + 63u) / 64u);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outKeys.assign((size_t)kContactCount, HullContactKeyGpu{});
+        device->ReadBuffer(*keysBuf, outKeys.data(), outKeys.size() * sizeof(HullContactKeyGpu), 0);
+        outHashes.assign((size_t)kContactCount, 0u);
+        device->ReadBuffer(*hashesBuf, outHashes.data(), outHashes.size() * sizeof(uint32_t), 0);
+    };
+
+    std::vector<HullContactKeyGpu> gpuKeys; std::vector<uint32_t> gpuHashes;
+    runKeys(gpuKeys, gpuHashes);
+
+    bool bitExact = std::memcmp(gpuKeys.data(), cpuKeys.data(),
+                                (size_t)kContactCount * sizeof(HullContactKeyGpu)) == 0
+                 && std::memcmp(gpuHashes.data(), cpuHashes.data(),
+                                (size_t)kContactCount * sizeof(uint32_t)) == 0;
+    if (!bitExact) return fail("wh1-keys: GPU HullContactKey[]/hash[] != CPU MakeHullContactKey/HullContactKeyHash");
+
+    std::vector<warmhull::HullContactKey> keyObjsForMeasure = cpuKeyObjs;
+    const warmhull::HullKeyMeasure km = warmhull::MeasureHullKeys(keyObjsForMeasure);
+    bool distinctDistinct = (km.distinctKeys == km.totalKeys);
+    std::vector<warmhull::HullKeyPair> nudged = pairs;
+    for (auto& kp : nudged) { kp.bodyA.pos.x += 1; kp.bodyB.pos.x += 1; }
+    const std::vector<warmhull::KeyedHullContact> keyed2 = warmhull::BuildHullContactKeys(nudged);
+    bool matchedUnderNudge = (keyed.size() == keyed2.size());
+    for (size_t i = 0; i < keyed.size() && matchedUnderNudge; ++i)
+        if (!warmhull::HullContactKeysEqual(keyed[i].key, keyed2[i].key)) matchedUnderNudge = false;
+    if (!distinctDistinct || !matchedUnderNudge)
+        return fail("wh1-keys: discrimination wrong (distinctDistinct/matchedUnderNudge)");
+    std::printf("wh1-keys: {pairs:%u, keys:%u} distinct contacts -> distinct keys (matchedUnderNudge:%s)\n",
+                kPairCount, km.totalKeys, matchedUnderNudge ? "true" : "false");
+    std::printf("wh1-keys: GPU == CPU BIT-EXACT\n");
+
+    std::vector<HullContactKeyGpu> gpuKeys2; std::vector<uint32_t> gpuHashes2;
+    runKeys(gpuKeys2, gpuHashes2);
+    bool det = std::memcmp(gpuKeys.data(), gpuKeys2.data(), gpuKeys.size() * sizeof(HullContactKeyGpu)) == 0
+            && std::memcmp(gpuHashes.data(), gpuHashes2.data(), gpuHashes.size() * sizeof(uint32_t)) == 0;
+    if (!det) return fail("wh1-keys: two dispatches differ (nondeterministic)");
+    std::printf("wh1-keys determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the PURE-INTEGER 2D side-view (XY) (IDENTICAL to the Vulkan --wh1-keys-shot). ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = imgH - 1 - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto hashColor = [&](uint32_t hh) {
+        const float r = ((hh >>  0) & 0xFFu) / 255.0f;
+        const float g = ((hh >>  8) & 0xFFu) / 255.0f;
+        const float b = ((hh >> 16) & 0xFFu) / 255.0f;
+        return Vec3{0.35f + 0.65f * r, 0.35f + 0.65f * g, 0.35f + 0.65f * b};
+    };
+    for (uint32_t c = 0; c < kContactCount; ++c) {
+        int cx, cy;
+        worldToPx(keyed[c].point.x, keyed[c].point.y, cx, cy);
+        const Vec3 col = hashColor(gpuHashes[c]);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+                putPx(cx + dx, cy + dy, col);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — hull-contact-feature-ID key-color view (%u pairs, %u contacts)\n",
                 outPath, imgW, imgH, kPairCount, kContactCount);
     return 0;
 }
@@ -54308,6 +54563,22 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--persist-key") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_persist_key.png";
             try { return RunPersistKeyShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wh1-keys <out.png>: render the Warm-Started Hull Contacts THE HULL CONTACT FEATURE ID showcase
+        // (Slice WH1, the int32 MSL-native BEACHHEAD of FLAGSHIP #26). The MF2/MF3 hull battery -> the FROZEN
+        // narrowphase (manifold::HullContactMulti) + warmhull::BuildHullContactKeys (the byte-identical tagged
+        // clip) -> per contact point a (bodyA, bodyB, refIsA, refFace, incTag) feeds
+        // shaders/warmhull_key.comp.gen.metal — a PURE-INT32 MSL-NATIVE shader (a TRUE GPU pass on Metal, NOT a
+        // CPU fallback): one thread per contact runs the order-normalized MakeHullContactKey + the fixed-mix
+        // HullContactKeyHash. ReadBuffer reads the GPU HullContactKey[]+hash[], PROVEN BIT-EXACT vs the CPU
+        // warmhull.h reference (the same GPU==CPU proof the Vulkan --wh1-keys-shot runs). THE CRUX proof: the
+        // tagged clip == the frozen clip (positions byte-equal). The image golden is the contact points colored
+        // by HullContactKeyHash, identical to the Vulkan path BY CONSTRUCTION. New golden
+        // tests/golden/metal/wh1_keys.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--wh1-keys") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_wh1_keys.png";
+            try { return RunWh1KeysShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-cache <out.png>: render the Deterministic Persistent Contacts THE PERSISTENT MANIFOLD CACHE

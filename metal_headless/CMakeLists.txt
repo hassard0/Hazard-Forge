@@ -442,6 +442,20 @@ hf_gen_msl(ccd_swept_emit.comp       ccd_swept_emit.comp.hlsl       comp ccd_swe
 # --persist-key-shot runs) -> cross-backend strict zero-differing-pixel. Behind --persist-key only; every
 # existing shader + golden untouched. NO new RHI; persist.h is a NEW additive sibling.
 hf_gen_msl(persist_key.comp         persist_key.comp.hlsl         comp persist_key_main)
+# Warm-Started Hull Contacts Slice 1 (Slice WH1, the int32 MSL-native BEACHHEAD of FLAGSHIP #26: WARM-STARTED
+# HULL CONTACTS + ROBUST DETERMINISTIC STACKING, hf::sim::warmhull): warmhull_key.comp is THE HULL CONTACT
+# FEATURE ID pass — ONE thread per contact point runs the order-normalized integer key (bodyA<bodyB swap + the
+# refIsA/role fold into refFaceId's high bit) + the fixed (bodyA<<20)^(bodyB<<8)^(refFaceId<<4)^incVertId
+# packing + avalanche xor-shift hash, copying engine/sim/warmhull.h::MakeHullContactKey + HullContactKeyHash
+# VERBATIM, writing its OWN HullContactKey + hash per contact. The (refFace, incTag) provenance is produced
+# HOST-SIDE by the int64 manifold + the tagged clip; the SHADER is PURE INT32 (compares + shifts + xors, NO
+# Q16.16 products, NO int64, NO float), so UNLIKE the int64 hull MATH (hull_manifold / hull_step_hardened —
+# Vulkan-SPIR-V-only because glslc cannot parse int64_t) the default MSL gen suffices (the persist_key tier) —
+# a TRUE GPU pass on Metal, NOT a CPU fallback. The Metal --wh1-keys runs THIS shader; ReadBuffer reads the GPU
+# HullContactKey[]+hash[], PROVEN BIT-EXACT vs the CPU warmhull.h::MakeHullContactKey/HullContactKeyHash (the
+# same proof the Vulkan --wh1-keys-shot runs) -> cross-backend strict zero-differing-pixel. Behind --wh1-keys
+# only; every existing shader + golden untouched. NO new RHI; warmhull.h is a NEW additive sibling.
+hf_gen_msl(warmhull_key.comp        warmhull_key.comp.hlsl        comp warmhull_key_main)
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new

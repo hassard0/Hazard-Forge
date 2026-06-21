@@ -1431,6 +1431,23 @@ hf_compile_shaders(
     # boxes, params, sleep) + ReadBuffer -> bit-exact GPU==CPU + cross-backend, proven memcmp. NO new RHI;
     # PS1/PS2/PS3 + existing shaders + goldens untouched. persist.h is APPEND-only.
     "shaders/persist_sleep.comp.hlsl:cs"
+    # Warm-Started Hull Contacts Slice 1 (Slice WH1, the int32 MSL-native BEACHHEAD of FLAGSHIP #26: WARM-
+    # STARTED HULL CONTACTS + ROBUST DETERMINISTIC STACKING, hf::sim::warmhull): warmhull_key.comp is THE HULL
+    # CONTACT FEATURE ID pass — ONE THREAD PER CONTACT POINT (per-contact INDEPENDENT, 64 threads/group, NO
+    # atomics) runs the order-normalized integer key (bodyA<bodyB swap + the refIsA/role fold into refFaceId's
+    # high bit) + the fixed (bodyA<<20)^(bodyB<<8)^(refFaceId<<4)^incVertId packing + avalanche xor-shift hash,
+    # copying engine/sim/warmhull.h::MakeHullContactKey + HullContactKeyHash VERBATIM, writing its OWN
+    # gKeys[contact] HullContactKey + gHashes[contact] hash. keyEnabled=0 -> cleared key + hash 0. The
+    # (refFace, incTag) provenance the key packs is produced HOST-SIDE by the int64 manifold + the tagged clip
+    # (ClipFaceAgainstFaceTagged, byte-identical to manifold::ClipFaceAgainstFace); the SHADER itself is PURE
+    # INT32 (compares + shifts + xors, NO Q16.16 products, NO int64, NO float) — so UNLIKE the int64 hull MATH
+    # (hull_manifold / hull_step_hardened, Vulkan-only) this shader IS MSL-gen'd (in the metal_headless
+    # hf_gen_msl list — the persist_key tier) — a TRUE GPU pass on BOTH backends with strict zero-differing-pixel
+    # cross-vendor (the Metal --wh1-keys runs THIS shader, NOT a CPU reference). The Vulkan --wh1-keys-shot
+    # memcmp's GPU HullContactKey[]+hash[] BIT-EXACT vs the CPU MakeHullContactKey/HullContactKeyHash. Pure
+    # integer SSBO compute + ReadBuffer. NO new RHI; existing shaders + goldens untouched. warmhull.h is a NEW
+    # additive sibling (#includes sim/manifold.h read-only).
+    "shaders/warmhull_key.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

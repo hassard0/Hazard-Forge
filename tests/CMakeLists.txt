@@ -722,6 +722,18 @@ hf_add_pure_test(ccd_test)
 # byte-equal). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(manifold_test)
 
+# Warm-Started Hull Contacts Slice 1 (Slice WH1, the int32 MSL-native BEACHHEAD of FLAGSHIP #26: WARM-STARTED
+# HULL CONTACTS + ROBUST DETERMINISTIC STACKING, hf::sim::warmhull): the pure-CPU integer HULL CONTACT FEATURE
+# ID core (engine/sim/warmhull.h) the GPU shaders/warmhull_key.comp.hlsl copies VERBATIM + proves bit-identical.
+# warmhull.h #includes sim/manifold.h read-only (gjk/convex/fpx BYTE-FROZEN). Pins THE CRUX
+# (ClipFaceAgainstFaceTagged's OUTPUT POSITIONS BYTE-EQUAL to the frozen manifold::ClipFaceAgainstFace over the
+# box-on-box/tetra-on-face/edge-on-face battery), distinct contacts -> distinct keys, sub-LSB nudge -> SAME key
+# (the warm-start match), a sliding/flipping contact -> the key CHANGES (the honest warm-start-miss boundary),
+# order-normalization (swap bodyA/bodyB + flip refIsA -> SAME key), the tag encodings never collide, and
+# MeasureHullKeys determinism. The KEY is PURE INT32 (compares/shifts/xors, NO products) -> MSL-native. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(warmhull_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
