@@ -880,5 +880,27 @@ inline gjk::HullWorld RunCcdRollback(const gjk::HullWorld& world0, const CcdStep
     return w;
 }
 
+// =========================================================================================================
+// Slice CD6 — Deterministic Integer CCD: THE LIT 3D RENDER CAPSTONE (the money-shot). APPENDED after CD5's
+// RunCcdRollback (CD1-CD5's lines above are BYTE-FROZEN). The 6th and FINAL slice of FLAGSHIP #24.
+// PURE-FUNCTION render-only float bridge — NO shader, NO RHI. CD3/CD4 settle the bullet-wall world via the
+// substepped CCD step (StepHullWorldCCDN — the projectile ARRESTED at the thin wall's near face, the thing a
+// discrete solver tunnels through); CD6 renders that bit-exact gjk::HullWorld as LIT 3D polyhedra. Because the
+// settled world is a gjk::HullWorld, the whole render bridge is the FROZEN BP6/GJ6 one — CcdToRenderInstances
+// delegates VERBATIM to gjk::HullToRenderInstances (the BP6/FC6/GJ6 delegate idiom). The render is the ONE
+// FLOAT crossing, OUTSIDE the bit-exact integer loop; two calls on the same world produce byte-equal verts (the
+// provenance contract, gjk::HullRenderMeshEqual is the memcmp). MATTE (the GJ6 material) dodges the iridescence
+// trap. The money-shot: the bullet stopped at the wall — the deterministic continuous-contact payoff — lit 3D.
+
+// ----- CcdToRenderInstances(world): the spec-named entry — the render payload for the --ccd-render showcase.
+// A ONE-LINE delegate to the BYTE-FROZEN gjk::HullToRenderInstances (the settled HullWorld -> a FLOAT
+// world-space TRIANGLE SOUP: per-canonical-hull face meshes transformed by each body's FxToFloat(pos)+
+// unit-quaternion rotation, per-triangle flat outward normals, per-hull-type matte colors). Provided in ccd::
+// for namespace symmetry; the actual mesh comes from the byte-unchanged GJ6 helper. A PURE FUNCTION of the
+// bit-exact world (two calls byte-equal — the provenance contract the showcase asserts). Render-only float.
+inline gjk::HullRenderMesh CcdToRenderInstances(const gjk::HullWorld& world) {
+    return gjk::HullToRenderInstances(world);
+}
+
 }  // namespace ccd
 }  // namespace hf::sim

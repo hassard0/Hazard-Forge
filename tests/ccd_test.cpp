@@ -569,6 +569,47 @@ int main() {
         }
     }
 
+    // === (CD6) THE LIT 3D RENDER CAPSTONE — the render bridge (pure CPU; the BP6/GJ6 delegate twin). ==========
+    // CcdToRenderInstances delegates VERBATIM to gjk::HullToRenderInstances: the bit-exact CCD-settled
+    // bullet-wall world -> a FLOAT world-space triangle soup, render-only. PURE FUNCTION (two calls byte-equal),
+    // the counts are correct, and the settled (arrested) world renders DIFFERENTLY from a perturbed world.
+    {
+        const ccd::CcdStepConfig cfg = ccd::MakeBulletWallConfig();
+        const uint32_t kTicks = 6;
+
+        // Build + CPU-settle the bullet-wall world (the projectile arrests at the wall's near face).
+        gjk::HullWorld world = ccd::MakeBulletWallScene();
+        ccd::StepHullWorldCCDN(world, cfg, kTicks);
+        check(ccd::MeasureBullet(world, 1, 0).tunneled == 0u,
+              "CD6 render scene: the settled projectile did NOT tunnel (arrested at the wall)");
+
+        // (1) PROVENANCE: two CcdToRenderInstances calls on the bit-exact world are BYTE-EQUAL (pure function).
+        const gjk::HullRenderMesh soupA = ccd::CcdToRenderInstances(world);
+        const gjk::HullRenderMesh soupB = ccd::CcdToRenderInstances(world);
+        check(gjk::HullRenderMeshEqual(soupA, soupB),
+              "CD6 render: two CcdToRenderInstances calls BYTE-EQUAL (provenance — pure function of the world)");
+
+        // (1b) The delegate is VERBATIM the frozen gjk:: bridge (byte-equal to the direct call).
+        check(gjk::HullRenderMeshEqual(soupA, gjk::HullToRenderInstances(world)),
+              "CD6 render: CcdToRenderInstances == gjk::HullToRenderInstances (the one-line delegate)");
+
+        // (2) COUNTS: every meshed body contributes its canonical hull's triangles. The 5-body bullet-wall scene
+        // is all boxes + one octa (projectile/wall/drop0/floor = box=12 tris each; drop1 = octa=8 tris). The soup
+        // is a non-empty multiple of 3 verts; triangles == verts/3; > 0.
+        check(soupA.triangles > 0u, "CD6 render: the settled bullet-wall world produced triangles");
+        check(soupA.verts.size() == (size_t)soupA.triangles * 3u, "CD6 render: verts.size() == triangles * 3");
+        // Box=12, octa=8: bodies 0(box),1(box),2(box),3(octa),4(box) -> 12*4 + 8 = 56 tris.
+        check(soupA.triangles == 56u, "CD6 render: triangle count == 56 (4 boxes @12 + 1 octa @8)");
+
+        // (3) The render REFLECTS the sim: a PERTURBED world (the projectile shoved past the wall) renders a
+        // DIFFERENT soup than the arrested world (the render is a function of the bit-exact pose, not constant).
+        gjk::HullWorld perturbed = world;
+        perturbed.bodies[0].pos.x = perturbed.bodies[1].pos.x + FromInt(2);   // shove the projectile past the wall
+        const gjk::HullRenderMesh soupP = ccd::CcdToRenderInstances(perturbed);
+        check(!gjk::HullRenderMeshEqual(soupA, soupP),
+              "CD6 render: the arrested world and a perturbed world render DIFFERENT soups");
+    }
+
     if (g_fail == 0) std::printf("ccd_test: ALL PASS\n");
     else std::printf("ccd_test: %d FAILURE(S)\n", g_fail);
     return g_fail == 0 ? 0 : 1;
