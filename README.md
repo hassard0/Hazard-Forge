@@ -14,7 +14,7 @@ backends, no per-platform drift.
 > 2. **Determinism as a first-class feature.** A fixed-point (Q16.16) physics / animation / AI stack produces
 >    *byte-identical* state on every platform and replays from inputs alone.
 >
-> Backed by **227 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three byte-exact
+> Backed by **233 deterministic golden-image regression tests** (each diffs `0.0000` cross-vendor), three byte-exact
 > data goldens (engine-state JSON, material-graph JSON, audio WAV), a **105-test** suite that runs clean under
 > AddressSanitizer, and a graphics-validation-clean (core + synchronization) invariant across every showcase.
 
@@ -53,7 +53,7 @@ backends, no per-platform drift.
 | **Language / std** | C++20 |
 | **GPU backends** | Vulkan 1.3 (Windows) · Apple Metal (macOS, Apple Silicon) — one HLSL source → SPIR-V + MSL |
 | **Determinism** | Q16.16 fixed-point simulation, bit-identical CPU / Vulkan / Metal, lockstep + rollback replayable |
-| **Verification** | 227 golden images @ `DIFF 0.0000` · 111-test suite · AddressSanitizer-clean · graphics-validation-clean |
+| **Verification** | 233 golden images @ `DIFF 0.0000` · 112-test suite · AddressSanitizer-clean · graphics-validation-clean |
 | **Footprint** | header-only simulation models, slice-by-slice growth, zero backend symbols above the RHI seam |
 | **Repo** | `github.com/hassard0/Hazard-Forge` |
 
@@ -149,7 +149,7 @@ makes one deliberate, uncommon set of guarantees its whole reason for being:
 | Capability | Unreal Engine 5 (typical) | Hazard Forge |
 | --- | --- | --- |
 | Simulation determinism | Floating-point; varies run-to-run and machine-to-machine | Integer fixed-point; bit-identical every run and every platform |
-| Cross-platform reproducibility | Not guaranteed at the byte level | Byte-identical CPU ↔ Vulkan ↔ Metal, proven by 227 golden images |
+| Cross-platform reproducibility | Not guaranteed at the byte level | Byte-identical CPU ↔ Vulkan ↔ Metal, proven by 233 golden images |
 | Lockstep / rollback netcode | Hard — float simulations diverge across peers | Built in — every simulation replays from inputs; rollback re-sims bit-for-bit |
 | Scope of determinism | Mostly gameplay logic | The whole simulation stack: rigid bodies, cloth, fluid, granular media, fracture, ragdolls, vehicles, crowds, convex contacts |
 | Headless / CI verification | Manual and limited | First-class: every feature is a golden-image regression that must diff `0.0000` |
@@ -164,7 +164,7 @@ you need a turnkey AAA content pipeline today, a mature engine is the pragmatic 
 
 ## How correctness is verified
 
-- **Golden images (227).** Each is one headless `visual_test` flag compared to its committed reference at
+- **Golden images (233).** Each is one headless `visual_test` flag compared to its committed reference at
   threshold `0.0` — deterministic, two runs diff `0.0000`. The same scene on Windows/Vulkan must match the macOS/
   Metal reference cross-vendor.
 - **Byte-exact data goldens (3).** The engine-state JSON (`--introspect`), the material-graph JSON, and the audio
@@ -174,7 +174,7 @@ you need a turnkey AAA content pipeline today, a mature engine is the pragmatic 
 - **Graphics-validation-clean.** Every showcase runs under the core + synchronization validation layers with zero
   errors; the render graph's auto-inserted barriers are proven hazard-free.
 - **One-command cross-platform gate.** `scripts/verify.ps1` runs the Windows/Vulkan tests + the data-golden byte
-  matches, then drives a macOS machine over SSH to build the Metal target once and compare **all 227** references
+  matches, then drives a macOS machine over SSH to build the Metal target once and compare **all 233** references
   at `DIFF 0.0000`, printing a per-golden table and an overall `VERIFY: PASS/FAIL`.
 
 ---
@@ -194,7 +194,7 @@ conan install . -of=build/windows-msvc-debug `
 # 2. Configure + build + test (from a VS x64 developer shell):
 cmake --preset windows-msvc-debug
 cmake --build --preset windows-msvc-debug
-ctest --preset windows-msvc-debug          # 111 tests
+ctest --preset windows-msvc-debug          # 112 tests
 
 # 3. AddressSanitizer build of the pure-C++ core + tests:
 conan install . -of=build/windows-msvc-asan `
@@ -224,7 +224,7 @@ scripts\verify.ps1
 ```
 
 Runs the Windows/Vulkan tests (plus the engine-state-JSON and audio-WAV byte matches) locally and drives a macOS
-machine over SSH to build the Metal target once and compare **all 227** references at threshold `0.0`. Prints a
+machine over SSH to build the Metal target once and compare **all 233** references at threshold `0.0`. Prints a
 per-golden DIFF table and an overall `VERIFY: PASS/FAIL`. (`-SkipWindows` / `-SkipMac` run one half.)
 
 ---
@@ -292,7 +292,7 @@ hazard-forge/
 ├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot capture + --fly + --introspect
 ├── metal_headless/             Standalone no-Conan/no-SDL Metal target (visual_test, every showcase)
 ├── tests/                      Pure unit tests + golden/{metal,introspect,material,audio}
-├── scripts/verify.ps1          Cross-platform gate: Windows tests + data goldens + Mac 227-image compare
+├── scripts/verify.ps1          Cross-platform gate: Windows tests + data goldens + Mac 233-image compare
 ├── ci/                         Staged GitHub Actions workflow (see ci/README.md)
 └── docs/                       ARCHITECTURE.md + per-slice specs/plans
 ```
