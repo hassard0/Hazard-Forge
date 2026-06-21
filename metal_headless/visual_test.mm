@@ -31037,6 +31037,175 @@ static int RunMf4StackShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice WH3 — Warm-Started Hull Contacts THE ACCUMULATED WARM-STARTED SOLVER showcase (--wh3-warm) (the
+// core-solve money beat of FLAGSHIP #26). int64 -> warmhull_warm.comp is VULKAN-SPIR-V-ONLY (NOT in the
+// metal_headless hf_gen_msl list); on Metal the --wh3-warm showcase runs the CPU warmhull::StepWarmHullWorldN —
+// the EXACT bit-exact reference the Vulkan --wh3-warm-shot GPU==CPU memcmp already compares against -> the Metal
+// result is byte-identical to the Vulkan GPU result BY CONSTRUCTION. Asserts the SAME convergence headline (warm
+// residual < cold residual at equal low iters) + the damping-off settle + determinism, and CPU-colors the SAME
+// 2D side-view as the Vulkan --wh3-warm-shot -> the golden is identical both backends by construction. New golden
+// tests/golden/metal/wh3_warm.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunWh3WarmShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace manifold = hf::sim::manifold;
+    namespace warmhull = hf::sim::warmhull;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fd = [&](double v) { return (fx)(v * (double)convex::kOne); };
+
+    // The deterministic warm-step config (== the Vulkan --wh3-warm-shot). LOW solveIters=2; angDamp OFF.
+    const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+    convex::ConvexStepConfig kCfg;
+    kCfg.gravity     = convex::FxVec3{0, kGravY, 0};
+    kCfg.dt          = kOne / 60;
+    kCfg.solveIters  = 2;
+    kCfg.restitution = 0;
+    kCfg.slop        = kOne / 64;
+    kCfg.beta        = (fx)((int64_t)2 * kOne / 10);    // 0.2
+    kCfg.linDamp     = (fx)((int64_t)95 * kOne / 100);  // 0.95
+    kCfg.angDamp     = kOne;                            // OFF
+    kCfg.posIters    = 2;
+    const int kTicks = 300;
+    const uint32_t kWindow = 20;
+
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+    const fpx::FxQuat kTilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};  // ~0.05 rad
+    auto buildScene = [&]() {
+        gjk::HullWorld w;
+        { fpx::FxBody b; b.pos={0,0,0}; b.orient=kIdentity; b.invMass=0; b.flags=0u; b.vel={0,0,0}; b.angVel={0,0,0}; w.bodies.push_back(b); }
+        w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+        { fpx::FxBody b; b.pos={0,fd(2.3),0}; b.orient=kTilt; b.invMass=kOne; b.flags=fpx::kFlagDynamic; b.vel={0,0,0}; b.angVel={0,0,0}; w.bodies.push_back(b); }
+        w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 1 tilted dropped box
+        return w;
+    };
+    const gjk::HullWorld kInit = buildScene();
+    const uint32_t kBodyCount = (uint32_t)kInit.bodies.size();
+
+    // The windowed ANGULAR residual (the residual-torque metric). mode 0 = WARM (the cache persists); mode 1 =
+    // the FROZEN non-accumulated hardened step (the COLD reference). == the Vulkan --wh3-warm-shot.
+    auto windowedAng = [&](int mode) -> fx {
+        gjk::HullWorld w = buildScene();
+        warmhull::HullCache cache;
+        int64_t sum = 0;
+        for (int t = 0; t < kTicks; ++t) {
+            if (mode == 0) warmhull::StepWarmHullWorld(w, cache, kCfg);
+            else           manifold::StepHullWorldHardened(w, kCfg);
+            if (t >= kTicks - (int)kWindow) {
+                fx a = 0;
+                for (const auto& b : w.bodies) if (convex::IsDynamic(b)) { fx aa = fpx::FxLength(b.angVel); if (aa > a) a = aa; }
+                sum += (int64_t)a;
+            }
+        }
+        return (fx)(sum / (int64_t)kWindow);
+    };
+
+    // The Metal CPU path IS the reference the Vulkan GPU==CPU memcmp compares against -> "GPU==CPU BIT-EXACT".
+    gjk::HullWorld cpuW = buildScene();
+    warmhull::HullCache cpuCache;
+    warmhull::StepWarmHullWorldN(cpuW, cpuCache, kCfg, (uint32_t)kTicks);
+    std::printf("wh3-warm: {bodies:%u, ticks:%d} GPU==CPU BIT-EXACT "
+                "[Metal: CPU warmhull::StepWarmHullWorldN, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kBodyCount, kTicks);
+
+    gjk::HullWorld cpuW2 = buildScene();
+    warmhull::HullCache cpuCache2;
+    warmhull::StepWarmHullWorldN(cpuW2, cpuCache2, kCfg, (uint32_t)kTicks);
+    bool same = true;
+    for (size_t i = 0; i < cpuW.bodies.size() && same; ++i)
+        if (std::memcmp(&cpuW.bodies[i], &cpuW2.bodies[i], sizeof(fpx::FxBody)) != 0) same = false;
+    if (!same) return fail("wh3-warm: two runs differ (nondeterministic)");
+    std::printf("wh3-warm determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (1) the convergence headline + (3) the damping-off hold (== the Vulkan side): warm residual torque <
+    // cold (frozen hardened) residual torque at equal low iters, AND the warm stack settles where cold does not.
+    const fx warmRes = windowedAng(0);
+    const fx coldRes = windowedAng(1);
+    if (!(warmRes < coldRes)) return fail("wh3-warm: convergence FAILED (warm >= cold)");
+    std::printf("wh3-warm: warm residual < cold residual {warm:%d, cold:%d} at iters:%u\n",
+                (int)warmRes, (int)coldRes, kCfg.solveIters);
+
+    const fx kBand = (fx)((int64_t)5 * kOne / 100);   // 0.05
+    if (!(warmRes < kBand && coldRes >= kBand)) return fail("wh3-warm: settle FAILED");
+    std::printf("wh3-warm: {angDampOff:true, settled:true}\n");
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) of the settled warm stack as the Vulkan side. ---
+    const int kPxPerUnit = 64, kMargin = 24;
+    const int kWorldHalfX = 3, kWorldHalfY = 3;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f); dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f); dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    drawHullXY(cpuW.bodies[0], kInit.hulls[0], Vec3{0.30f, 0.40f, 0.55f});   // static support box
+    drawHullXY(cpuW.bodies[1], kInit.hulls[1], Vec3{0.35f, 0.85f, 0.55f});   // settled warm box (green = warm)
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — the WARM settled stack (warmRes=%d < coldRes=%d, %d ticks)\n",
+                outPath, imgW, imgH, (int)warmRes, (int)coldRes, kTicks);
+    return 0;
+}
+
 // ===== Slice GJ5 — Deterministic General Convex-Hull Contacts LOCKSTEP + ROLLBACK showcase (--gjk-lockstep)
 // (the NETCODE HEADLINE, the 5th slice of FLAGSHIP #22, the CX5/FR5/PS5 twin). PURE CPU — NO GPU compute, NO
 // new shader, NO new RHI; the GJ5 harness (gjk.h::RunHullLockstep/RunHullRollback) is header-only integer
@@ -56072,6 +56241,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--mf4-stack") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_mf4_stack.png";
             try { return RunMf4StackShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --wh3-warm <out.png>: render the Warm-Started Hull Contacts THE ACCUMULATED WARM-STARTED SOLVER showcase
+        // (Slice WH3, the core-solve money beat of FLAGSHIP #26). int64 -> warmhull_warm.comp is Vulkan-only, so
+        // Metal runs the CPU warmhull::StepWarmHullWorldN over the SAME scene (a tilted box settling on a static
+        // support, the EXACT bit-exact reference the Vulkan --wh3-warm-shot GPU==CPU memcmp compares against;
+        // byte-identical by construction), asserts the convergence headline (warm residual < cold residual at
+        // equal low iters) + the damping-off settle + determinism, and renders the settled stack 2D side-view. The
+        // proofs print the same exact lines as the Vulkan path. New golden tests/golden/metal/wh3_warm.png.
+        if (argc > 1 && std::strcmp(argv[1], "--wh3-warm") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_wh3_warm.png";
+            try { return RunWh3WarmShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mf5-lockstep <out.png>: render the Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (Slice

@@ -595,5 +595,223 @@ inline HullCacheMeasure MeasureHullCache(const HullCache& cache, const KeyedHull
     return m;
 }
 
+// =========================================================================================================
+// Slice WH3 — THE ACCUMULATED WARM-STARTED SOLVER (the core solve). APPENDED after MeasureHullCache (WH1/WH2's
+// lines above + manifold.h/gjk.h/persist.h/convex.h/fric.h/fpx.h BYTE-FROZEN). WH1 built the hull contact
+// feature ID; WH2 the persistent cache that matches THIS tick's manifold points to LAST tick's accumulated
+// impulses by key. WH3 is the ENGINE of the flagship: an ACCUMULATED, warm-started NORMAL sequential-impulse
+// solver that primes each contact point from its cached impulse (WH2) + applies only the per-iteration DELTA
+// (clamping the ACCUMULATED total >= 0). This is the direct hull-normal generalization of persist::
+// SolveFrictionWarm (persist.h:335) — the accumulated form convex::SolveManifoldImpulse (the NON-accumulated
+// per-point kernel, convex.h:651) "cannot be warm-started" (persist.h:284-290) because it keeps no running
+// total. The accumulated form converges to a consistent island equilibrium across ticks, removing the residual-
+// torque SOURCE the #25 tower-collapse note (convex.h:758-763) damps with the global angular crutch.
+//
+// THE int64 REALITY (the MF4/WH2 lesson): the manifold it solves is built by the int64 manifold::
+// HullContactMulti (GJK/EPA + the SH clip), so shaders/warmhull_warm.comp.hlsl is VULKAN-SPIR-V-ONLY (NOT in
+// hf_gen_msl), single-thread over the small world copying StepWarmHullWorldN VERBATIM, chunked 1 tick/dispatch
+// (the StepWarmHullWorld step is HEAVIER than the hardened step -> the documented Windows ~2s TDR rule). The
+// Metal --wh3-warm runs the CPU StepWarmHullWorldN (byte-identical by construction), while the Vulkan side
+// carries the GPU==CPU memcmp.
+
+// Pull the world-step helpers WH3 uses (REUSE — convex.h/manifold.h/fpx.h read-only/byte-frozen).
+using convex::FxScale;
+using convex::FxMat3;
+using convex::FxMat3MulVec;
+using convex::IsDynamic;
+using convex::ConvexStepConfig;
+using fpx::FxLength;
+using manifold::FxHullFaces;
+using manifold::BuildCanonicalFaces;
+using manifold::FxHullInertiaBodyFull;
+using manifold::WorldInvInertiaFull;
+using manifold::HullContactMulti;
+using gjk::MeasureHullStack;
+using gjk::HullStackMeasure;
+
+// ----- SolveHullManifoldWarm: the ACCUMULATED normal sequential-impulse solver with the warm-start prime ----
+// Mutates bodyA/bodyB vel+angVel AND keyed.normalImpulse[] (the accumulators). The accumulators ARRIVE SEEDED
+// (from MatchHullCache for a matched contact, or zero for a cold one). The PINNED steps (the shader copies THIS
+// body VERBATIM):
+//   (0) SIGN-CORRECT the manifold normal to point A->B ONCE (== convex::SolveManifoldImpulse's flip).
+//   (1) PRIME ONCE: for each point apply the seeded TOTAL normal impulse J = n*normalImpulse[p] to both bodies
+//       (re-inject last tick's converged impulse so velocities start near the solved state). A zero seed primes
+//       nothing (a cold contact).
+//   (2) `iters` Gauss-Seidel sweeps; per point in FIXED order, ACCUMULATED (the convex.h:645-651 effective-mass
+//       k + the contact-point velocity math, with the full WorldInvInertiaFull tensor):
+//       vn = (vpB-vpA).n; k = invMa+invMb + n·((invIaW·(rA×n))×rA) + n·((invIbW·(rB×n))×rB);
+//       jnTotal = normalImpulse[p] + fxdiv(-(1+e)·vn, k); CLAMP jnTotal >= 0 (a contact only PUSHES);
+//       apply the DELTA dJ = n*(jnTotal - normalImpulse[p]); normalImpulse[p] = jnTotal.
+//   (3) the converged accumulators stay in keyed.normalImpulse[] -> UpdateHullCache persists them for next tick.
+// PURE INTEGER, FIXED order -> bit-identical CPU<->Vulkan<->Metal. (NOTE: UNLIKE the NON-accumulated kernel,
+// the warm form does NOT early-skip on vn>=0 — the accumulated clamp >= 0 already prevents a pull, and skipping
+// would discard the persisted total; this is exactly the persist::SolveFrictionWarm normal-branch shape.)
+inline void SolveHullManifoldWarm(fpx::FxBody& bodyA, fpx::FxBody& bodyB,
+                                  const FxMat3& invIaW, const FxMat3& invIbW,
+                                  KeyedHullManifoldWH2& keyed, fx restitution, uint32_t iters) {
+    if (keyed.manifold.count == 0) return;
+
+    // (0) sign-correct the normal A->B ONCE (== convex::SolveManifoldImpulse).
+    FxVec3 n = keyed.manifold.normal;
+    if (FxDot(n, FxSub(bodyB.pos, bodyA.pos)) < 0) n = FxVec3{-n.x, -n.y, -n.z};
+
+    const fx invMassA = bodyA.invMass;
+    const fx invMassB = bodyB.invMass;
+    const uint32_t cnt = keyed.manifold.count < 4u ? keyed.manifold.count : 4u;
+
+    // (1) PRIME ONCE: re-inject the seeded TOTAL normal impulse at every point (the warm-start kick).
+    for (uint32_t pi = 0; pi < cnt; ++pi) {
+        const fx seed = keyed.normalImpulse[pi];
+        if (seed == 0) continue;   // a cold contact primes nothing
+        const FxVec3 p  = keyed.manifold.points[pi];
+        const FxVec3 rA = FxSub(p, bodyA.pos);
+        const FxVec3 rB = FxSub(p, bodyB.pos);
+        const FxVec3 J  = FxScale(n, seed);
+        bodyA.vel    = FxSub(bodyA.vel, FxScale(J, invMassA));
+        bodyA.angVel = FxSub(bodyA.angVel, FxMat3MulVec(invIaW, FxCross(rA, J)));
+        bodyB.vel    = FxAdd(bodyB.vel, FxScale(J, invMassB));
+        bodyB.angVel = FxAdd(bodyB.angVel, FxMat3MulVec(invIbW, FxCross(rB, J)));
+    }
+
+    // (2) the accumulated Gauss-Seidel sweeps (apply only the DELTA each time; clamp the ACCUMULATED total >= 0).
+    for (uint32_t it = 0; it < iters; ++it) {
+        for (uint32_t pi = 0; pi < cnt; ++pi) {
+            const FxVec3 p  = keyed.manifold.points[pi];
+            const FxVec3 rA = FxSub(p, bodyA.pos);
+            const FxVec3 rB = FxSub(p, bodyB.pos);
+            const FxVec3 vpA = FxAdd(bodyA.vel, FxCross(bodyA.angVel, rA));
+            const FxVec3 vpB = FxAdd(bodyB.vel, FxCross(bodyB.angVel, rB));
+            const fx vn = FxDot(FxSub(vpB, vpA), n);
+            const FxVec3 raxn = FxCross(rA, n);
+            const FxVec3 rbxn = FxCross(rB, n);
+            const fx angA = FxDot(n, FxCross(FxMat3MulVec(invIaW, raxn), rA));
+            const fx angB = FxDot(n, FxCross(FxMat3MulVec(invIbW, rbxn), rB));
+            const fx k = invMassA + invMassB + angA + angB;
+            if (k <= 0) continue;   // degenerate -> skip (== the kernel)
+            fx jnTotal = keyed.normalImpulse[pi] + fxdiv(-fxmul(kOne + restitution, vn), k);
+            if (jnTotal < 0) jnTotal = 0;                    // clamp the ACCUMULATED total >= 0
+            const fx applied = jnTotal - keyed.normalImpulse[pi];
+            const FxVec3 J = FxScale(n, applied);            // apply only the DELTA
+            bodyA.vel    = FxSub(bodyA.vel, FxScale(J, invMassA));
+            bodyA.angVel = FxSub(bodyA.angVel, FxMat3MulVec(invIaW, FxCross(rA, J)));
+            bodyB.vel    = FxAdd(bodyB.vel, FxScale(J, invMassB));
+            bodyB.angVel = FxAdd(bodyB.angVel, FxMat3MulVec(invIbW, FxCross(rB, J)));
+            keyed.normalImpulse[pi] = jnTotal;               // write back the converged accumulated total
+        }
+    }
+}
+
+// ----- WarmHullStepConfig: a thin alias of convex::ConvexStepConfig (same knobs; WH3 adds none) -------------
+using WarmHullStepConfig = convex::ConvexStepConfig;
+
+// ----- StepWarmHullWorld(world, cache, cfg): ONE deterministic WARM-started hardened tick -------------------
+// manifold::StepHullWorldHardened (manifold.h:809) with EXACTLY step (3) — the impulse solve — replaced by the
+// warm-started accumulated solve over the persistent cache. Steps (1) integrate+damp, (2) FULL inertia, (4)
+// position de-penetration are UNCHANGED from the hardened step (copied VERBATIM). Step (3) — per overlapping
+// pair in the FIXED i<j order (the persist::StepWarmWorld shape):
+//   - BuildKeyedHullManifold (re-derived from the CURRENT positions — WH2);
+//   - MatchHullCache to warm-seed each point's normalImpulse from `cache` (last tick's accumulated totals);
+//   - SolveHullManifoldWarm with cfg.solveIters ACCUMULATED sweeps (the iteration lives INSIDE the solver —
+//     prime ONCE + accumulated Gauss-Seidel; the mutation is IN PLACE so later pairs see earlier updates);
+//   - capture the CONVERGED keyed manifolds, then rewrite `cache` to EXACTLY this tick's solved contacts
+//     (UpdateHullCache semantics over ALL active pairs) so the accumulated impulses persist for next tick +
+//     absent keys are evicted.
+// The cache is the per-tick mutable replayable state (carried in/out). Pure integer, FIXED order -> identical
+// CPU/GPU. The headline: with cfg.angDamp = kOne (OFF) the warm solve HOLDS the stack (the removed-torque-source
+// proof) where the frozen hardened step with damping OFF does NOT.
+inline void StepWarmHullWorld(HullWorld& world, HullCache& cache, const convex::ConvexStepConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // (1) predict-integrate dynamic bodies + per-tick damping (== StepHullWorldHardened step 1, VERBATIM).
+    for (size_t i = 0; i < n; ++i) {
+        if (IsDynamic(world.bodies[i])) {
+            fpx::IntegrateBodyFull(world.bodies[i], cfg.gravity, cfg.dt);
+            if (cfg.linDamp != kOne) world.bodies[i].vel = FxScale(world.bodies[i].vel, cfg.linDamp);
+            if (cfg.angDamp != kOne) world.bodies[i].angVel = FxScale(world.bodies[i].angVel, cfg.angDamp);
+        }
+    }
+
+    // (2) world inverse inertias once/tick — the FULL tensor (== StepHullWorldHardened step 2, VERBATIM).
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxHullFaces faces = BuildCanonicalFaces(world.hulls[i]);
+        const FxMat3 invIbody = FxHullInertiaBodyFull(world.hulls[i], faces, world.bodies[i].invMass);
+        invIW[i] = WorldInvInertiaFull(world.bodies[i], invIbody);
+    }
+
+    // (3 — THE SWAP) the WARM-started accumulated solve over the persistent cache, in the FIXED i<j order — per
+    // pair: BuildKeyedHullManifold (re-derived from the CURRENT positions) -> MatchHullCache (seed each point's
+    // accumulator from LAST tick — the warm-start) -> SolveHullManifoldWarm with cfg.solveIters ACCUMULATED
+    // sweeps (prime ONCE + the accumulated Gauss-Seidel — the iteration lives INSIDE the solver, the natural
+    // per-pair analog of persist::StepWarmWorld; the mutation is IN PLACE so later pairs see earlier updates).
+    // The CONVERGED keyed manifolds are captured to rebuild the cache (step 5 below). Skip static-static.
+    struct WarmPair { KeyedHullManifoldWH2 keyed; };
+    std::vector<WarmPair> wp;
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;  // static-static
+            KeyedHullManifoldWH2 keyed = BuildKeyedHullManifold(
+                (uint32_t)i, world.bodies[i], world.hulls[i],
+                (uint32_t)j, world.bodies[j], world.hulls[j]);
+            if (keyed.manifold.count == 0) continue;
+            MatchHullCache(cache, keyed);   // seed the accumulators from last tick (the warm-start)
+            SolveHullManifoldWarm(world.bodies[i], world.bodies[j], invIW[i], invIW[j],
+                                  keyed, cfg.restitution, cfg.solveIters);   // prime once + solveIters accum sweeps
+            wp.push_back(WarmPair{keyed});
+        }
+    }
+
+    // (5) Rewrite the cache to EXACTLY this tick's solved contacts (the converged accumulated impulses) — absent
+    // keys are thereby evicted (the new cache IS this tick's set). FIXED i<j pair / point order (== UpdateHullCache
+    // over ALL active pairs). The accumulators carry the warm-start to next tick.
+    cache.entries.clear();
+    for (const WarmPair& w : wp) {
+        const uint32_t c = w.keyed.manifold.count < 4u ? w.keyed.manifold.count : 4u;
+        for (uint32_t pi = 0; pi < c; ++pi)
+            cache.entries.push_back(CachedHullContact{w.keyed.keys[pi], w.keyed.normalImpulse[pi]});
+    }
+
+    // (4) position de-penetration (== StepHullWorldHardened step 4, VERBATIM — re-derives HullContactMulti).
+    for (uint32_t pit = 0; pit < cfg.posIters; ++pit) {
+        for (size_t i = 0; i < n; ++i) {
+            for (size_t j = i + 1; j < n; ++j) {
+                const fx invSum = world.bodies[i].invMass + world.bodies[j].invMass;
+                if (invSum == 0) continue;
+                const convex::ContactManifold m = HullContactMulti(world.bodies[i], world.hulls[i],
+                                                                   world.bodies[j], world.hulls[j]);
+                if (m.count == 0) continue;
+                FxVec3 nrm = m.normal;
+                if (FxDot(nrm, FxSub(world.bodies[j].pos, world.bodies[i].pos)) < 0)
+                    nrm = FxVec3{-nrm.x, -nrm.y, -nrm.z};
+                const fx excess = m.depths[0] - cfg.slop;
+                if (excess <= 0) continue;
+                const fx corrected = fxmul(excess, cfg.beta);
+                const fx wi = fxdiv(world.bodies[i].invMass, invSum);
+                const fx wj = kOne - wi;
+                const FxVec3 ci = FxScale(nrm, fxmul(corrected, wi));
+                const FxVec3 cj = FxScale(nrm, fxmul(corrected, wj));
+                world.bodies[i].pos = FxSub(world.bodies[i].pos, ci);
+                world.bodies[j].pos = FxAdd(world.bodies[j].pos, cj);
+            }
+        }
+    }
+    // (5) orientation was already integrated in step (1).
+}
+
+// ----- StepWarmHullWorldN(world, cache, cfg, ticks): run `ticks` StepWarmHullWorld steps -> the stack settles.
+// The cache carries the accumulated impulses ACROSS ticks (the warm-start that converges the island equilibrium).
+inline void StepWarmHullWorldN(HullWorld& world, HullCache& cache, const convex::ConvexStepConfig& cfg,
+                               uint32_t ticks) {
+    for (uint32_t t = 0; t < ticks; ++t) StepWarmHullWorld(world, cache, cfg);
+}
+
+// ----- WarmHullMeasure(world): the residual metric — DELEGATES to manifold::MeasureHullStack ----------------
+// The deterministic rest (max dynamic speed) + interpenetration (max HullContact depth) summary the convergence
+// proof compares (warm residual < cold residual at equal iters). A thin alias so the showcase/test name the WH3
+// metric explicitly while reusing the frozen MeasureHullStack VERBATIM.
+inline HullStackMeasure WarmHullMeasure(const HullWorld& world) {
+    return MeasureHullStack(world);
+}
+
 }  // namespace warmhull
 }  // namespace hf::sim

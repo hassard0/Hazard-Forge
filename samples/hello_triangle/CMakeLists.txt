@@ -1463,6 +1463,23 @@ hf_compile_shaders(
     # SSBO compute + ReadBuffer -> bit-exact GPU==CPU inherited-impulse keyed manifold array + cross-backend,
     # proven memcmp. NO new RHI; WH1 + existing shaders + goldens untouched. warmhull.h is APPEND-only.
     "shaders/warmhull_cache.comp.hlsl:cs"
+    # Warm-Started Hull Contacts Slice 3 (Slice WH3): warmhull_warm.comp is THE ACCUMULATED WARM-STARTED SOLVER
+    # — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE warmhull.h::StepWarmHullWorldN over the small hull set:
+    # K ticks of predict-integrate -> FULL inertia -> build-keyed-manifold (the WH1 tagged-clip key derivation
+    # ported VERBATIM) -> MATCH the persistent cache (warm-seed each point's accumulated normal impulse) -> the
+    # ACCUMULATED warm normal Gauss-Seidel solve (SolveHullManifoldWarm: prime the seed, then DELTA-apply each
+    # sweep clamping the ACCUMULATED total >= 0) -> REWRITE the cache (UpdateHullCache, evict absent keys) ->
+    # POSITION de-penetration, copying StepWarmHullWorld VERBATIM. It IS hull_step_hardened.comp with EXACTLY
+    # step (3) — the impulse solve — replaced by the warm-started accumulated solve over the cache; steps (1)
+    # integrate, (2) full inertia, (4) de-pen UNCHANGED. The cache persists ACROSS ticks in gCache (a flat
+    # CachedHullContactGpu list + a live count in gParams.c2.w), READ+WRITE, surviving the chunked
+    # 1-tick/dispatch boundaries exactly like the body buffer. Chunked 1 tick/dispatch (TDR-safe — HEAVIER than
+    # the hardened step). The whole chain is int64 (GJK/EPA + the SH clip + the full inertia + the accumulated
+    # solve), so this shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the
+    # Metal --wh3-warm runs the CPU StepWarmHullWorldN instead (byte-identical by construction). The GPU final
+    # gBodies+gCache memcmp-equals the CPU reference. NO new RHI; warmhull.h is APPEND-only; WH1/WH2 + all other
+    # shaders + goldens UNCHANGED.
+    "shaders/warmhull_warm.comp.hlsl:cs"
     # GPU Isosurface Meshing Slice 2 (Slice MC2): mc_count.comp counts the triangles each voxel CELL emits
     # — ONE thread per cell gathers its 8 cube-CORNER scalars, runs CaseIndex (copied VERBATIM from
     # render/mc.h), looks up triCount = gTriCount[caseIdx] from the host-uploaded 256-entry count table

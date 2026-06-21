@@ -442,6 +442,102 @@ int main() {
         }
     }
 
+    // ================= Slice WH3 — THE ACCUMULATED WARM-STARTED SOLVER =================
+    // Pins: (1) SolveHullManifoldWarm keeps the accumulated total >= 0 + converges (residual decreases vs the
+    // non-accumulated solve at equal iters); (2) a warm-seeded settle reaches a LOWER residual than a cold one at
+    // the SAME low iters (the convergence headline); (3) StepWarmHullWorldN is deterministic (two runs byte-equal);
+    // (4) the cache carries the converged impulse across ticks (a settled stack's impulses stabilize).
+    {
+        const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+        const fpx::FxQuat kTilt{0, 0, (fx)(0.024997 * (double)kOne), (fx)(0.999688 * (double)kOne)};  // ~0.05 rad
+        auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+        auto buildScene = [&]() {
+            gjk::HullWorld w;
+            { FxBody b = BodyAt(0, 0, 0); b.orient = kIdentity; b.invMass = 0; b.flags = 0u; w.bodies.push_back(b); }
+            w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 0 static support box
+            { FxBody b = BodyAt(0, fd(2.3), 0); b.orient = kTilt; b.invMass = kOne; b.flags = fpx::kFlagDynamic;
+              w.bodies.push_back(b); }
+            w.hulls.push_back(gjk::MakeBox(kOne, kOne, kOne));   // 1 tilted dropped box
+            return w;
+        };
+        const fx kGravY = (fx)(-9.8 * (double)kOne + (-9.8 < 0 ? -0.5 : 0.5));
+        convex::ConvexStepConfig cfg;
+        cfg.gravity = convex::FxVec3{0, kGravY, 0};
+        cfg.dt = kOne / 60; cfg.solveIters = 2; cfg.restitution = 0; cfg.slop = kOne / 64;
+        cfg.beta = (fx)((int64_t)2 * kOne / 10); cfg.linDamp = (fx)((int64_t)95 * kOne / 100);
+        cfg.angDamp = kOne; cfg.posIters = 2;   // angDamp OFF — the headline
+        const uint32_t K = 300, WIN = 20;
+
+        // The residual = the windowed ANGULAR speed (the residual-TORQUE metric — the quantity the accumulated
+        // warm form removes; the #25 tower-collapse note is a residual TORQUE, not linear). Averaged over the last
+        // WIN ticks to smooth the documented within-band jitter. mode: 0 = WARM (the cache persists across ticks);
+        // 1 = the FROZEN non-accumulated hardened step (manifold::StepHullWorldHardened — the COLD reference, which
+        // re-derives a fresh inconsistent impulse each tick and leaks the residual torque).
+        auto windowedAng = [&](int mode) -> fx {
+            gjk::HullWorld w = buildScene();
+            warmhull::HullCache cache;
+            int64_t sum = 0;
+            for (uint32_t t = 0; t < K; ++t) {
+                if (mode == 0) warmhull::StepWarmHullWorld(w, cache, cfg);
+                else           manifold::StepHullWorldHardened(w, cfg);
+                if (t >= K - WIN) {
+                    fx a = 0;
+                    for (const auto& b : w.bodies) if (convex::IsDynamic(b)) { fx aa = fpx::FxLength(b.angVel); if (aa > a) a = aa; }
+                    sum += (int64_t)a;
+                }
+            }
+            return (fx)(sum / (int64_t)WIN);
+        };
+
+        // (1) accumulated total >= 0 after a warm solve.
+        {
+            gjk::HullWorld w = buildScene();
+            warmhull::HullCache cache;
+            warmhull::StepWarmHullWorldN(w, cache, cfg, 60);   // settle a bit -> populate the cache
+            bool allNonNeg = !cache.entries.empty();
+            for (const auto& e : cache.entries) if (e.normalImpulse < 0) allNonNeg = false;
+            check(allNonNeg, "WH3: the accumulated normal impulse stays >= 0 (a contact only pushes)");
+        }
+
+        // (2) the convergence headline + (3) the damping-off hold: at the SAME low iters with angDamp OFF, the
+        // WARM solver's residual torque is strictly LESS than the non-accumulated COLD (frozen hardened) step's,
+        // AND the warm stack settles (residual < band) where the cold step does NOT (the removed-torque-source proof).
+        {
+            const fx warmRes = windowedAng(0);
+            const fx coldRes = windowedAng(1);
+            const fx band = (fx)((int64_t)5 * kOne / 100);   // 0.05
+            check(warmRes < coldRes, "WH3: warm residual < cold residual at equal iters (warm-start converges faster)");
+            check(warmRes < band, "WH3: the warm stack SETTLES with angDamp OFF (residual torque < band)");
+            check(coldRes >= band, "WH3: the cold (non-accumulated) step does NOT settle (the removed-torque-source proof)");
+            std::printf("wh3-warm: warm residual < cold residual {warm:%d, cold:%d} at iters:%u\n",
+                        (int)warmRes, (int)coldRes, cfg.solveIters);
+        }
+
+        // (4) StepWarmHullWorldN determinism: two runs byte-equal.
+        {
+            gjk::HullWorld a = buildScene(); warmhull::HullCache ca; warmhull::StepWarmHullWorldN(a, ca, cfg, K);
+            gjk::HullWorld b = buildScene(); warmhull::HullCache cb; warmhull::StepWarmHullWorldN(b, cb, cfg, K);
+            bool byteEqual = (a.bodies.size() == b.bodies.size());
+            for (size_t i = 0; i < a.bodies.size() && byteEqual; ++i)
+                if (std::memcmp(&a.bodies[i], &b.bodies[i], sizeof(FxBody)) != 0) byteEqual = false;
+            check(byteEqual, "WH3: StepWarmHullWorldN two runs BYTE-IDENTICAL (determinism)");
+            std::printf("wh3-warm determinism: two runs BYTE-IDENTICAL\n");
+        }
+
+        // (5) the cache carries the converged impulse across ticks: a settled stack's cache is non-empty + stable
+        // (two consecutive ticks of a settled stack leave the cache size unchanged — the contact persists).
+        {
+            gjk::HullWorld w = buildScene();
+            warmhull::HullCache cache;
+            warmhull::StepWarmHullWorldN(w, cache, cfg, K);   // settle
+            const size_t sizeAfterSettle = cache.entries.size();
+            check(sizeAfterSettle > 0, "WH3: the cache is non-empty for a settled resting contact");
+            warmhull::StepWarmHullWorld(w, cache, cfg);       // one more tick
+            check(cache.entries.size() == sizeAfterSettle,
+                  "WH3: the cache carries the contact across ticks (size stable for a settled stack)");
+        }
+    }
+
     if (g_fail == 0) std::printf("warmhull_test: ALL PASS\n");
     else             std::printf("warmhull_test: %d FAILURE(S)\n", g_fail);
     return g_fail ? 1 : 0;
