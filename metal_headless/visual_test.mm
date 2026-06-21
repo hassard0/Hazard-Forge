@@ -31766,6 +31766,176 @@ static int RunVd1WorldShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice VD2 — Deterministic Gameplay / Netcode THE SYSTEM SCHEDULE + THE GAMEPLAY TICK showcase
+// (--vd2-tick) (the 2nd slice of FLAGSHIP #27, hf::game::verdict). PURE CPU — NO GPU compute, NO new shader, NO new
+// RHI; the verdict.h gameplay systems + schedule are header-only integer math, so on Metal it runs the IDENTICAL
+// pure-CPU gameplay script the Vulkan --vd2-tick-shot runs on Windows -> the converged gameplay-world golden is
+// bit-identical cross-backend BY CONSTRUCTION (strict zero-differing-pixel). Builds the SAME deterministic scene (a
+// player + 3 pickups + a hazard band), runs verdict::StepGameplay N ticks over the order[]-pinned OrderedView with
+// a fixed command stream, asserts the 3 proofs (incl. the OrderedView determinism contract — proof lines match the
+// Vulkan side EXACTLY), and renders the PURE-INTEGER world state (player + remaining pickups + score bar). New
+// golden tests/golden/metal/vd2_tick.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunVd2TickShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace verdict = hf::game::verdict;
+    namespace convex  = hf::sim::convex;
+    namespace fpx     = hf::sim::fpx;
+    using convex::fx;
+    const fx kOne = convex::kOne;
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+    auto V  = [&](int x, int y, int z) { return convex::FxVec3{fi(x), fi(y), fi(z)}; };
+    const fpx::FxQuat kIdentity{0, 0, 0, kOne};
+    const verdict::HazardRegion kHazard{V(-2,-1,0).x, V(-2,-1,0).y, V(-1,1,0).x, V(-1,1,0).y};
+    const fx kCollectR = kOne;
+    const uint32_t kTicks = 8u;
+
+    // THE SCENE/SCRIPT (== the Vulkan --vd2-tick-shot + verdict_test RunGameplay).
+    auto runScript = [&]() {
+        verdict::VerdictWorld w;
+        const verdict::EntityId player = verdict::SpawnMover(
+            w, verdict::Transform2D{V(-5,0,0), kIdentity}, verdict::Health{20}, verdict::Velocity2D{V(1,0,0)});
+        w.reg.add<verdict::Score>(w.handle.at(player), verdict::Score{0});
+        const verdict::EntityId k0 = verdict::SpawnEntity(w, verdict::Transform2D{V(-1,0,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(k0), verdict::Pickup{5});
+        const verdict::EntityId k1 = verdict::SpawnEntity(w, verdict::Transform2D{V(1,0,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(k1), verdict::Pickup{8});
+        const verdict::EntityId k2 = verdict::SpawnEntity(w, verdict::Transform2D{V(3,0,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(k2), verdict::Pickup{3});
+        (void)k0; (void)k1; (void)k2;
+        const std::vector<verdict::Command> stream = {
+            verdict::Command{0u, verdict::kCmdMove, player, V(1,0,0)},
+            verdict::Command{1u, verdict::kCmdMove, player, V(1,0,0)},
+            verdict::Command{2u, verdict::kCmdMove, player, V(1,0,0)},
+        };
+        for (uint32_t t = 0; t < kTicks; ++t)
+            verdict::StepGameplay(w, stream, t, kHazard, player, kCollectR);
+        return std::pair<verdict::VerdictWorld, verdict::EntityId>(std::move(w), player);
+    };
+    auto r1 = runScript();
+    verdict::VerdictWorld& world = r1.first;
+    const verdict::EntityId player = r1.second;
+    const int32_t score = world.reg.get<verdict::Score>(world.handle.at(player)).points;
+
+    // PROOF (1) THE DETERMINISM CONTRACT: OrderedView == order[] AND != raw reg.view under churn.
+    {
+        verdict::VerdictWorld w;
+        const verdict::EntityId a = verdict::SpawnMover(w, verdict::Transform2D{V(0,0,0), kIdentity},
+                                                        verdict::Health{1}, verdict::Velocity2D{V(0,0,0)});
+        const verdict::EntityId b = verdict::SpawnMover(w, verdict::Transform2D{V(0,0,0), kIdentity},
+                                                        verdict::Health{1}, verdict::Velocity2D{V(0,0,0)});
+        verdict::SpawnMover(w, verdict::Transform2D{V(0,0,0), kIdentity}, verdict::Health{1}, verdict::Velocity2D{V(0,0,0)});
+        verdict::SpawnMover(w, verdict::Transform2D{V(0,0,0), kIdentity}, verdict::Health{1}, verdict::Velocity2D{V(0,0,0)});
+        verdict::SpawnMover(w, verdict::Transform2D{V(0,0,0), kIdentity}, verdict::Health{1}, verdict::Velocity2D{V(0,0,0)});
+        verdict::DespawnEntity(w, b);   // despawn id 2 -> pool swap-pops the last (id 5) into its slot
+        (void)a;
+        const std::vector<verdict::EntityId> ov =
+            verdict::OrderedView<verdict::Transform2D, verdict::Velocity2D>(w);
+        bool matchesOrder = (ov.size() == w.order.size());
+        for (size_t i = 0; matchesOrder && i < ov.size(); ++i) matchesOrder = (ov[i] == w.order[i]);
+        std::vector<verdict::EntityId> raw;
+        for (auto&& [e, xf, vel] : w.reg.view<verdict::Transform2D, verdict::Velocity2D>()) {
+            (void)xf; (void)vel;
+            for (auto& kv : w.handle) if (kv.second == e) { raw.push_back(kv.first); break; }
+        }
+        bool rawDiffers = (raw.size() == ov.size());
+        if (rawDiffers) { rawDiffers = false; for (size_t i = 0; i < raw.size(); ++i) if (raw[i] != ov[i]) rawDiffers = true; }
+        if (!matchesOrder || !rawDiffers)
+            return fail("vd2-tick: OrderedView != order[] OR == reg.view (determinism contract broken)");
+        std::printf("vd2-tick: OrderedView order-stable (order[] != reg.view churn)\n");
+    }
+
+    // PROOF (2) deterministic gameplay: two runs byte-identical.
+    {
+        const verdict::VerdictMeasure m1 = verdict::MeasureVerdict(world);
+        auto r2 = runScript();
+        const verdict::VerdictMeasure m2 = verdict::MeasureVerdict(r2.first);
+        if (!verdict::VerdictMeasuresEqual(m1, m2)) return fail("vd2-tick: two runs differ (nondeterministic)");
+        std::printf("vd2-tick: {ticks:%u, entities:%u, score:%d} two-run BYTE-IDENTICAL\n",
+                    kTicks, m1.entities, score);
+    }
+
+    // PROOF (3) hand-checked move + collect rule.
+    {
+        verdict::VerdictWorld w;
+        const verdict::EntityId pl = verdict::SpawnMover(w, verdict::Transform2D{V(2,3,0), kIdentity},
+                                                         verdict::Health{0}, verdict::Velocity2D{V(1,-1,0)});
+        const convex::FxVec3 p0 = w.reg.get<verdict::Transform2D>(w.handle.at(pl)).pos;
+        verdict::SystemMovement(w);
+        const convex::FxVec3 p1 = w.reg.get<verdict::Transform2D>(w.handle.at(pl)).pos;
+        const bool moveExact = (p1.x == V(3,2,0).x && p1.y == V(3,2,0).y);
+        w.reg.add<verdict::Score>(w.handle.at(pl), verdict::Score{0});
+        const verdict::EntityId on  = verdict::SpawnEntity(w, verdict::Transform2D{p1, kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(on), verdict::Pickup{7});
+        const verdict::EntityId off = verdict::SpawnEntity(w, verdict::Transform2D{V(9,9,0), kIdentity});
+        w.reg.add<verdict::Pickup>(w.handle.at(off), verdict::Pickup{99});
+        verdict::SystemCollect(w, pl, kCollectR);
+        const bool collectOk = !verdict::IsLive(w, on) && verdict::IsLive(w, off) &&
+                               w.reg.get<verdict::Score>(w.handle.at(pl)).points == 7;
+        if (!moveExact || !collectOk) return fail("vd2-tick: move/collect rule failed");
+        std::printf("vd2-tick: move rule {start:(%d,%d), end:(%d,%d)} exact\n",
+                    (int)(p0.x >> convex::kFrac), (int)(p0.y >> convex::kFrac),
+                    (int)(p1.x >> convex::kFrac), (int)(p1.y >> convex::kFrac));
+    }
+
+    // --- Golden: the SAME PURE-INTEGER 2D side-view (XY) as the Vulkan --vd2-tick-shot. ---
+    const int kPxPerUnit = 48, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfY = 6;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t pp = 0; pp < (size_t)imgW * imgH; ++pp) {
+        bgra[pp * 4 + 0] = 14; bgra[pp * 4 + 1] = 12; bgra[pp * 4 + 2] = 10; bgra[pp * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    {
+        int x0, y0, x1, y1; worldToPx(kHazard.minX, kHazard.minY, x0, y0); worldToPx(kHazard.maxX, kHazard.maxY, x1, y1);
+        if (x0 > x1) std::swap(x0, x1); if (y0 > y1) std::swap(y0, y1);
+        for (int yy = y0; yy <= y1; ++yy) for (int xx = x0; xx <= x1; ++xx) putPx(xx, yy, Vec3{0.35f, 0.10f, 0.10f});
+    }
+    auto idTint = [&](verdict::EntityId id) {
+        const uint32_t h = id * 2654435761u;
+        return Vec3{0.30f + ((h >> 16) & 0xFF) / 360.0f, 0.30f + ((h >> 8) & 0xFF) / 360.0f,
+                    0.30f + (h & 0xFF) / 360.0f};
+    };
+    uint32_t drawn = 0;
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const verdict::EntityId id = world.order[i];
+        if (!verdict::IsLive(world, id)) continue;
+        const hf::ecs::Entity e = world.handle.at(id);
+        if (!world.reg.has<verdict::Transform2D>(e)) continue;
+        const verdict::Transform2D& xf = world.reg.get<verdict::Transform2D>(e);
+        int cx, cy; worldToPx(xf.pos.x, xf.pos.y, cx, cy);
+        const int kHalf = (id == player) ? 10 : 6;
+        const Vec3 col = idTint(id);
+        for (int dy = -kHalf; dy <= kHalf; ++dy)
+            for (int dx = -kHalf; dx <= kHalf; ++dx)
+                putPx(cx + dx, cy + dy, col);
+        ++drawn;
+    }
+    for (int s = 0; s < score; ++s) {
+        const int bx = kMargin + s * 10;
+        for (int dy = 0; dy < 8; ++dy) for (int dx = 0; dx < 8; ++dx) putPx(bx + dx, 10 + dy, Vec3{0.9f, 0.85f, 0.2f});
+    }
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — vd2 gameplay-tick world state (%u live entities, score %d)\n",
+                outPath, imgW, imgH, drawn, score);
+    return 0;
+}
+
 // ===== Slice MF5 — Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (--mf5-lockstep) (the NETCODE
 // HEADLINE of FLAGSHIP #25, the GJ5/BP5/CD5 twin). PURE CPU — NO GPU compute, NO new shader, NO new RHI; the
 // MF5 harness (manifold.h::RunHullLockstepHardened/RunHullRollbackHardened) is header-only integer math, so on
@@ -57181,6 +57351,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--vd1-world") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_vd1_world.png";
             try { return RunVd1WorldShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --vd2-tick <out.png>: render the Deterministic Gameplay / Netcode SYSTEM SCHEDULE + GAMEPLAY TICK
+        // showcase (Slice VD2, the 2nd slice of FLAGSHIP #27). PURE CPU — runs the IDENTICAL verdict.h gameplay
+        // systems + schedule the Vulkan --vd2-tick-shot runs (a player + pickups + a hazard, StepGameplay N ticks
+        // over the order[]-pinned OrderedView) -> the converged gameplay world is bit-identical cross-backend BY
+        // CONSTRUCTION; the 3 proof lines match the Vulkan side EXACTLY. NO shader added.
+        if (argc > 1 && std::strcmp(argv[1], "--vd2-tick") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_vd2_tick.png";
+            try { return RunVd2TickShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --mf5-lockstep <out.png>: render the Hull Narrowphase Hardening LOCKSTEP + ROLLBACK showcase (Slice

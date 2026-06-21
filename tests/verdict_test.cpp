@@ -191,6 +191,168 @@ int main() {
         std::printf("], nextId:%u} two-run BYTE-IDENTICAL\n", m1.nextId);
     }
 
+    // =============================================================================================
+    // Slice VD2 — THE SYSTEM SCHEDULE + THE GAMEPLAY TICK. OrderedView/ForEachOrdered iterate in
+    // order[] sequence (the determinism contract — NOT the raw reg.view smallest-pool/insertion order
+    // that renumbers under churn); the systems are pure integer (Q16.16, distance² compare, NO sqrt);
+    // the schedule order is FIXED (swapping two systems changes the result).
+    // =============================================================================================
+
+    // ---- OrderedView yields order[] sequence AND differs from a churned raw reg.view (the contract) ----
+    {
+        // Build a CHURNED world: spawn 5 movers, despawn an EARLY one. The ecs pool's swap-pop moves the
+        // LAST dense element into the freed slot, so the raw reg.view<>'s dense (insertion) iteration order
+        // is RENUMBERED and does NOT match order[] (which keeps spawn order of the survivors). OrderedView
+        // MUST follow order[] regardless — the determinism contract.
+        verdict::VerdictWorld w;
+        const verdict::EntityId a = verdict::SpawnMover(w, verdict::Transform2D{V(0, 0, 0), FxQuat{0,0,0,kOne}},
+                                                        verdict::Health{10}, verdict::Velocity2D{V(1,0,0)});  // 1
+        const verdict::EntityId b = verdict::SpawnMover(w, verdict::Transform2D{V(1, 0, 0), FxQuat{0,0,0,kOne}},
+                                                        verdict::Health{10}, verdict::Velocity2D{V(1,0,0)});  // 2
+        verdict::SpawnMover(w, verdict::Transform2D{V(2, 0, 0), FxQuat{0,0,0,kOne}},
+                            verdict::Health{10}, verdict::Velocity2D{V(1,0,0)});  // 3
+        verdict::SpawnMover(w, verdict::Transform2D{V(3, 0, 0), FxQuat{0,0,0,kOne}},
+                            verdict::Health{10}, verdict::Velocity2D{V(1,0,0)});  // 4
+        verdict::SpawnMover(w, verdict::Transform2D{V(4, 0, 0), FxQuat{0,0,0,kOne}},
+                            verdict::Health{10}, verdict::Velocity2D{V(1,0,0)});  // 5
+        verdict::DespawnEntity(w, b);                         // despawn id 2 -> pool swap-pops id 5 into its slot
+        (void)a;
+
+        // OrderedView is EXACTLY order[]-filtered (here every live entity has Transform2D+Velocity2D).
+        const std::vector<verdict::EntityId> ov = verdict::OrderedView<verdict::Transform2D, verdict::Velocity2D>(w);
+        check(ov.size() == w.order.size(), "OrderedView: size == live count");
+        bool matchesOrder = (ov.size() == w.order.size());
+        for (size_t i = 0; matchesOrder && i < ov.size(); ++i) matchesOrder = (ov[i] == w.order[i]);
+        check(matchesOrder, "OrderedView: yields the EXACT order[] sequence");
+        check(ov.size() == 4 && ov[0] == 1u && ov[1] == 3u && ov[2] == 4u && ov[3] == 5u,
+              "OrderedView: order[] is [1,3,4,5] after despawning id 2");
+
+        // The raw reg.view<> visits entities in dense (insertion, index-recycled) order — here the
+        // recycled slot puts id 4 in id 2's old dense position, so the raw view order is [1,4,3] which
+        // DIFFERS from order[] = [1,3,4]. Falsify the contract against it.
+        std::vector<verdict::EntityId> raw;
+        for (auto&& [e, xf, vel] : w.reg.view<verdict::Transform2D, verdict::Velocity2D>()) {
+            (void)xf; (void)vel;
+            // map the ecs handle back to its EntityId via the handle map (linear — tiny scene)
+            for (auto& kv : w.handle) if (kv.second == e) { raw.push_back(kv.first); break; }
+        }
+        check(raw.size() == ov.size(), "OrderedView: raw view sees the same entity SET");
+        bool rawDiffers = (raw.size() == ov.size());
+        if (rawDiffers) { rawDiffers = false; for (size_t i = 0; i < raw.size(); ++i) if (raw[i] != ov[i]) rawDiffers = true; }
+        check(rawDiffers, "OrderedView: raw reg.view order DIFFERS from order[] under churn (the contract)");
+        std::printf("vd2-tick: OrderedView order-stable (order[] != reg.view churn)\n");
+    }
+
+    // ---- SystemMovement: exact Q16.16 move rule ----
+    {
+        verdict::VerdictWorld w;
+        const verdict::EntityId p = verdict::SpawnMover(w, verdict::Transform2D{V(2, 3, 0), FxQuat{0,0,0,kOne}},
+                                                        verdict::Health{0}, verdict::Velocity2D{V(1, -1, 0)});
+        const FxVec3 start = w.reg.get<verdict::Transform2D>(w.handle[p]).pos;
+        verdict::SystemMovement(w);
+        const FxVec3 end = w.reg.get<verdict::Transform2D>(w.handle[p]).pos;
+        check(end.x == V(3, 2, 0).x && end.y == V(3, 2, 0).y, "SystemMovement: pos = FxAdd(pos, vel) exact Q16.16");
+        std::printf("vd2-tick: move rule {start:(%d,%d), end:(%d,%d)} exact\n",
+                    (int)(start.x >> fpx::kFrac), (int)(start.y >> fpx::kFrac),
+                    (int)(end.x >> fpx::kFrac),   (int)(end.y >> fpx::kFrac));
+    }
+
+    // ---- SystemCollect: removes the overlapping pickup + bumps score by value; leaves non-overlapping ----
+    {
+        verdict::VerdictWorld w;
+        // Player at origin with a Score; one pickup ON the player (overlap), one far away (no overlap).
+        const verdict::EntityId player = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}},
+                                                              verdict::Health{0}, verdict::BodyRef{verdict::kNoBody});
+        w.reg.add<verdict::Score>(w.handle[player], verdict::Score{0});
+        const verdict::EntityId near = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}});
+        w.reg.add<verdict::Pickup>(w.handle[near], verdict::Pickup{7});
+        const verdict::EntityId far = verdict::SpawnEntity(w, verdict::Transform2D{V(5,5,0), FxQuat{0,0,0,kOne}});
+        w.reg.add<verdict::Pickup>(w.handle[far], verdict::Pickup{99});
+
+        verdict::SystemCollect(w, player, kOne);   // radius 1.0 in Q16.16
+        check(!verdict::IsLive(w, near), "SystemCollect: overlapping pickup despawned");
+        check(verdict::IsLive(w, far), "SystemCollect: non-overlapping pickup left alive");
+        check(w.reg.get<verdict::Score>(w.handle[player]).points == 7, "SystemCollect: score bumped by pickup.value (7)");
+    }
+
+    // ---- SystemDamage: deterministic integer hazard decay ----
+    {
+        verdict::VerdictWorld w;
+        const verdict::HazardRegion hz{V(-1,-1,0).x, V(-1,-1,0).y, V(1,1,0).x, V(1,1,0).y};
+        const verdict::EntityId inH  = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}},
+                                                            verdict::Health{5}, verdict::BodyRef{verdict::kNoBody});
+        const verdict::EntityId outH = verdict::SpawnEntity(w, verdict::Transform2D{V(5,5,0), FxQuat{0,0,0,kOne}},
+                                                            verdict::Health{5}, verdict::BodyRef{verdict::kNoBody});
+        verdict::SystemDamage(w, hz);
+        check(w.reg.get<verdict::Health>(w.handle[inH]).hp == 4, "SystemDamage: -1 hp inside the hazard");
+        check(w.reg.get<verdict::Health>(w.handle[outH]).hp == 5, "SystemDamage: untouched outside the hazard");
+        // Decay clamps at 0 — apply enough ticks.
+        for (int i = 0; i < 10; ++i) verdict::SystemDamage(w, hz);
+        check(w.reg.get<verdict::Health>(w.handle[inH]).hp == 0, "SystemDamage: clamps at 0 (deterministic)");
+    }
+
+    // ---- StepGameplay deterministic over a fixed script (two runs byte-equal) ----
+    auto RunGameplay = []() {
+        verdict::VerdictWorld w;
+        const verdict::HazardRegion hz{V(-1,-1,0).x, V(-2,-2,0).y, V(1,1,0).x, V(2,2,0).y};
+        // Player at (-3,0) moving +X each tick toward two pickups at (0,0) and (2,0); carries a Score.
+        const verdict::EntityId player = verdict::SpawnMover(w, verdict::Transform2D{V(-3,0,0), FxQuat{0,0,0,kOne}},
+                                                             verdict::Health{20}, verdict::Velocity2D{V(1,0,0)});
+        w.reg.add<verdict::Score>(w.handle[player], verdict::Score{0});
+        const verdict::EntityId pk0 = verdict::SpawnEntity(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}});
+        w.reg.add<verdict::Pickup>(w.handle[pk0], verdict::Pickup{5});
+        const verdict::EntityId pk1 = verdict::SpawnEntity(w, verdict::Transform2D{V(2,0,0), FxQuat{0,0,0,kOne}});
+        w.reg.add<verdict::Pickup>(w.handle[pk1], verdict::Pickup{8});
+        (void)pk0; (void)pk1;
+        const std::vector<verdict::Command> stream = {};   // movement is driven by Velocity2D
+        for (uint32_t t = 0; t < 6; ++t)
+            verdict::StepGameplay(w, stream, t, hz, player, kOne);
+        return std::pair<verdict::VerdictWorld, verdict::EntityId>(std::move(w), player);
+    };
+    {
+        auto r1 = RunGameplay();
+        auto r2 = RunGameplay();
+        const verdict::VerdictMeasure m1 = verdict::MeasureVerdict(r1.first);
+        const verdict::VerdictMeasure m2 = verdict::MeasureVerdict(r2.first);
+        check(verdict::VerdictMeasuresEqual(m1, m2), "StepGameplay: fixed script two runs BYTE-IDENTICAL");
+        const int32_t score = r1.first.reg.get<verdict::Score>(r1.first.handle[r1.second]).points;
+        check(score == 13, "StepGameplay: both pickups collected (score 5+8=13)");
+        std::printf("vd2-tick: {ticks:6, entities:%u, score:%d} two-run BYTE-IDENTICAL\n", m1.entities, score);
+    }
+
+    // ---- The schedule order is FIXED: swapping two systems changes the result ----
+    {
+        // A player crosses a pickup that sits exactly where the player ARRIVES after one move. With the
+        // fixed schedule (move THEN collect) the player reaches the pickup and collects it. If collect ran
+        // BEFORE move, the player would still be at the start and NOT overlap -> no collect. Proving order
+        // matters and is pinned.
+        verdict::HazardRegion hz{V(-9,-9,0).x, V(-9,-9,0).y, V(-9,-9,0).x, V(-9,-9,0).y};  // empty hazard
+        auto build = [&](verdict::VerdictWorld& w) {
+            const verdict::EntityId player = verdict::SpawnMover(w, verdict::Transform2D{V(0,0,0), FxQuat{0,0,0,kOne}},
+                                                                 verdict::Health{0}, verdict::Velocity2D{V(1,0,0)});
+            w.reg.add<verdict::Score>(w.handle[player], verdict::Score{0});
+            const verdict::EntityId pk = verdict::SpawnEntity(w, verdict::Transform2D{V(1,0,0), FxQuat{0,0,0,kOne}});
+            w.reg.add<verdict::Pickup>(w.handle[pk], verdict::Pickup{4});
+            return player;
+        };
+        // Radius 0.5 (Q16.16): a pickup at distance 0 collects, at distance 1.0 does NOT (the swap case).
+        const fx kR = kOne / 2;
+        // Fixed schedule: move (0->1) then collect (player AT pickup, dist 0) -> collected.
+        verdict::VerdictWorld wFixed;
+        const verdict::EntityId pF = build(wFixed);
+        verdict::SystemMovement(wFixed);
+        verdict::SystemCollect(wFixed, pF, kR);
+        const int32_t fixedScore = wFixed.reg.get<verdict::Score>(wFixed.handle[pF]).points;
+        // Swapped: collect (player still at 0, pickup at 1 -> dist 1.0 > 0.5, no overlap) then move -> NOT collected.
+        verdict::VerdictWorld wSwap;
+        const verdict::EntityId pS = build(wSwap);
+        verdict::SystemCollect(wSwap, pS, kR);
+        verdict::SystemMovement(wSwap);
+        const int32_t swapScore = wSwap.reg.get<verdict::Score>(wSwap.handle[pS]).points;
+        check(fixedScore == 4 && swapScore == 0,
+              "schedule: swapping move/collect changes the result (order is pinned)");
+    }
+
     if (g_fail == 0) std::printf("verdict_test: ALL PASS\n");
     return g_fail == 0 ? 0 : 1;
 }

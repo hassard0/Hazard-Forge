@@ -298,5 +298,174 @@ inline bool VerdictMeasuresEqual(const VerdictMeasure& a, const VerdictMeasure& 
            a.stateHash == b.stateHash;
 }
 
+// =================================================================================================
+// Slice VD2 — THE SYSTEM SCHEDULE + THE GAMEPLAY TICK (APPEND-ONLY; VD1 above is BYTE-FROZEN).
+//
+// VD1 built the deterministic entity world (a pinned monotonic EntityId, a fixed order[], integer-only
+// components) + the unified input-command bus (ApplyCommands). VD2 adds the part that makes it a GAME:
+// deterministic gameplay SYSTEMS running on a PINNED schedule over a PINNED iteration order.
+//
+// THE DETERMINISM CRUX VD2 FIXES: the raw ecs::Registry::view<>() (ecs.h:248 View::Resolve) drives off
+// the SMALLEST matching pool in dense (insertion) order, which renumbers under entity add/remove churn —
+// so two peers iterating that way could visit entities in a DIFFERENT sequence and diverge when a system
+// mutates state while iterating. VD2's OrderedView/ForEachOrdered iterate STRICTLY in world.order[]
+// (spawn order — the VD1 pinned live-id list), so every system visits every entity in the IDENTICAL
+// sequence on every peer/platform. The gameplay rules are PURE INTEGER (Q16.16, NO float, NO sqrt — a
+// distance² compare). The schedule order is a FIXED, hand-ordered, documented sequence. PURE CPU.
+// =================================================================================================
+
+// ----- VD2 integer-only gameplay components (Q16.16 / integer ONLY — NO float in any world state) ------------
+// Velocity2D — a per-entity Q16.16 velocity DELTA the movement system integrates into Transform2D.pos
+// each tick (pos = FxAdd(pos, vel)). Integer; default zero.
+struct Velocity2D {
+    FxVec3 vel;             // Q16.16 per-tick position delta
+};
+
+// Pickup — marks an entity as a collectible worth `value` score points (an integer gameplay scalar).
+struct Pickup {
+    int32_t value = 0;
+};
+
+// Score — an integer score accumulator (the player carries one; SystemCollect bumps it by pickup.value).
+struct Score {
+    int32_t points = 0;
+};
+
+// ----- ForEachOrdered<Ts...>(world, fn): the DETERMINISM CONTRACT — iterate live entities in order[] ----------
+// Walk world.order[] (the VD1 spawn-order live-id list) IN SEQUENCE; for each id, resolve its ecs::Entity
+// handle and invoke fn(id, e) IFF reg.valid(e) && (reg.has<Ts>(e) && ...). The iteration order is
+// EXACTLY order[] — identical on every peer/platform, independent of pool sizes / add-remove churn. This
+// is a THIN range/callback over order[] + reg.get<> (NOT a new container). It is the deterministic
+// alternative to ecs::Registry::view<>() (whose smallest-pool/insertion order renumbers under churn) —
+// and it does NOT modify ecs.h. `fn` is invoked as fn(EntityId, ecs::Entity).
+template <typename... Ts, typename Fn>
+inline void ForEachOrdered(VerdictWorld& world, Fn&& fn) {
+    for (size_t i = 0; i < world.order.size(); ++i) {
+        const EntityId id = world.order[i];
+        auto it = world.handle.find(id);
+        if (it == world.handle.end()) continue;
+        const ecs::Entity e = it->second;
+        if (!world.reg.valid(e)) continue;
+        if (!(world.reg.has<Ts>(e) && ...)) continue;   // require ALL of Ts...
+        fn(id, e);
+    }
+}
+
+// ----- OrderedView<Ts...>(world): collect the order[]-sequence ids matching ALL of Ts... ----------------------
+// A small materialized view over the SAME contract as ForEachOrdered: returns the live entity ids that
+// have ALL of Ts..., IN order[] SEQUENCE. Handy where the proof wants the explicit id list to compare
+// against order[] (and to contrast with a raw reg.view<> that yields a DIFFERENT, churn-renumbered
+// order). Pure read; the order is order[] by construction.
+template <typename... Ts>
+inline std::vector<EntityId> OrderedView(VerdictWorld& world) {
+    std::vector<EntityId> ids;
+    ForEachOrdered<Ts...>(world, [&](EntityId id, ecs::Entity) { ids.push_back(id); });
+    return ids;
+}
+
+// ----- The hazard region: a fixed integer AABB in the XY plane (SystemDamage's deterministic hazard) ---------
+// A simple pinned, integer world-space band; an entity whose Transform2D.pos is inside it takes -1 hp per
+// tick. Pure integer position test — NO float. Centred low-left so the player crosses it on its way to the
+// pickups in the showcase scene.
+struct HazardRegion {
+    fx minX, minY, maxX, maxY;   // Q16.16 inclusive AABB bounds in the XY plane
+};
+
+inline bool InHazard(const HazardRegion& hz, const FxVec3& p) {
+    return p.x >= hz.minX && p.x <= hz.maxX && p.y >= hz.minY && p.y <= hz.maxY;
+}
+
+// ----- SystemMovement(world): integrate each entity's Transform2D by its Velocity2D (pure Q16.16) ------------
+// For each entity (in order[] sequence) with BOTH Transform2D and Velocity2D: pos = FxAdd(pos, vel). The
+// integer move rule — deterministic, no float. Entities without a Velocity2D are unaffected.
+inline void SystemMovement(VerdictWorld& world) {
+    ForEachOrdered<Transform2D, Velocity2D>(world, [&](EntityId, ecs::Entity e) {
+        Transform2D& xf = world.reg.get<Transform2D>(e);
+        const Velocity2D& v = world.reg.get<Velocity2D>(e);
+        xf.pos = fpx::FxAdd(xf.pos, v.vel);
+    });
+}
+
+// ----- SystemDamage(world, hazard): deterministic integer hazard decay over Health -----------------------
+// For each entity (in order[] sequence) with BOTH Transform2D and Health: if its position is inside the
+// fixed hazard AABB (an integer position test), apply -1 hp (clamped at 0). Deterministic, pure integer.
+inline void SystemDamage(VerdictWorld& world, const HazardRegion& hazard) {
+    ForEachOrdered<Transform2D, Health>(world, [&](EntityId, ecs::Entity e) {
+        const Transform2D& xf = world.reg.get<Transform2D>(e);
+        if (!InHazard(hazard, xf.pos)) return;
+        Health& h = world.reg.get<Health>(e);
+        if (h.hp > 0) h.hp -= 1;   // deterministic integer hazard decay
+    });
+}
+
+// ----- FxDist2(a, b): the Q16.16 squared distance between two points, in int64 (NO float, NO sqrt) -----------
+// Each component delta is Q16.16; its square is Q32.32; the sum is the squared distance in Q32.32 held in
+// an int64 (never overflows for in-world coordinates). Compared against a Q32.32 squared-radius formed the
+// SAME way — a pure-integer overlap test with NO sqrt.
+inline int64_t FxDist2(const FxVec3& a, const FxVec3& b) {
+    const FxVec3 d = fpx::FxSub(a, b);
+    return (int64_t)d.x * (int64_t)d.x + (int64_t)d.y * (int64_t)d.y + (int64_t)d.z * (int64_t)d.z;
+}
+
+// ----- SystemCollect(world, player, radius): integer overlap collect (Q16.16 distance², NO sqrt) -------------
+// For the given player entity (which must carry a Transform2D + a Score): test every Pickup entity (in
+// order[] sequence) for overlap with the player by a Q16.16 distance² compare against `radius`² — NO
+// float, NO sqrt. On overlap: bump the player's Score by the pickup's value and DESPAWN the pickup. A
+// dead/unbound player is a deterministic no-op. (Despawn mutates order[]/handle[]; we collect the hits in
+// order[] sequence FIRST, then despawn — so the iteration is not disturbed mid-walk.)
+inline void SystemCollect(VerdictWorld& world, EntityId player, fx radius) {
+    auto pit = world.handle.find(player);
+    if (pit == world.handle.end()) return;                 // unknown player -> no-op
+    const ecs::Entity pe = pit->second;
+    if (!world.reg.valid(pe) || !world.reg.has<Transform2D>(pe) || !world.reg.has<Score>(pe)) return;
+    const FxVec3 pp = world.reg.get<Transform2D>(pe).pos;
+    const int64_t r2 = (int64_t)radius * (int64_t)radius;  // Q32.32 squared radius (NO sqrt)
+
+    // Collect overlapping pickups in order[] sequence, then despawn them (deterministic, fixed order).
+    std::vector<EntityId> hits;
+    ForEachOrdered<Transform2D, Pickup>(world, [&](EntityId id, ecs::Entity e) {
+        if (id == player) return;
+        if (FxDist2(world.reg.get<Transform2D>(e).pos, pp) <= r2) hits.push_back(id);
+    });
+    Score& sc = world.reg.get<Score>(pe);
+    for (size_t i = 0; i < hits.size(); ++i) {
+        auto hit = world.handle.find(hits[i]);
+        if (hit == world.handle.end() || !world.reg.valid(hit->second)) continue;
+        sc.points += world.reg.get<Pickup>(hit->second).value;   // bump score by the pickup value
+        DespawnEntity(world, hits[i]);                            // remove the collected pickup
+    }
+}
+
+// ----- StepGameplay(world, commands, tick, hazard, player, collectRadius): the FIXED gameplay schedule -------
+// ONE deterministic gameplay tick. The SCHEDULE ORDER IS FIXED AND DOCUMENTED (later systems see earlier
+// systems' mutations — a single deterministic pass, the Gauss-Seidel-in-fixed-order discipline the sims
+// use):
+//   1. ApplyCommands(world, commands, tick)   — the VD1 input-command bus (BEFORE the systems)
+//   2. SystemMovement(world)                  — integrate Transform2D by Velocity2D
+//   3. SystemDamage(world, hazard)            — hazard decay over Health
+//   4. SystemCollect(world, player, radius)   — overlap-collect pickups (sees the moved player)
+//   5. world.tick++
+// Swapping any two systems changes the result (e.g. collect-before-move would test the pre-move player
+// position) — order MATTERS and is PINNED. Pure integer; bit-identical CPU/Vulkan/Metal by construction.
+inline void StepGameplay(VerdictWorld& world, const std::vector<Command>& commands, uint32_t tick,
+                         const HazardRegion& hazard, EntityId player, fx collectRadius) {
+    ApplyCommands(world, commands, tick);   // 1. the command bus (VD1)
+    SystemMovement(world);                   // 2. movement
+    SystemDamage(world, hazard);             // 3. hazard damage
+    SystemCollect(world, player, collectRadius);  // 4. collect (sees the moved player)
+    ++world.tick;                            // 5. advance the world clock
+}
+
+// ----- A SpawnEntity overload that also attaches a Velocity2D (the VD2 movement spawn) -----------------------
+// Convenience for the VD2 showcase/tests: spawn at `xf` with `health`, an unbound BodyRef, AND a
+// Velocity2D. Reuses the VD1 SpawnEntity (id alloc + order[] + Transform2D/Health/BodyRef), then adds the
+// velocity component to the ecs pool. Returns the new EntityId.
+inline EntityId SpawnMover(VerdictWorld& world, const Transform2D& xf, const Health& health,
+                           const Velocity2D& vel) {
+    const EntityId id = SpawnEntity(world, xf, health, BodyRef{kNoBody});
+    world.reg.add<Velocity2D>(world.handle.at(id), vel);
+    return id;
+}
+
 }  // namespace verdict
 }  // namespace hf::game
