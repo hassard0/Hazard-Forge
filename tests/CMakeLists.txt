@@ -711,6 +711,17 @@ hf_add_pure_test(gjk_test)
 # the angular term mandatory), and determinism (two calls byte-equal). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(ccd_test)
 
+# Deterministic Hull Narrowphase Hardening Slice 1 (Slice MF1, the BEACHHEAD of FLAGSHIP #25): the pure-CPU
+# integer HULL FACE TOPOLOGY primitive (engine/sim/manifold.h) — per-hull POLYGON face tables
+# (BuildCanonicalFaces: tetra4/box6/octa8/wedge5) promoted from gjk::HullTriIndices' canonical triangle
+# groupings, outward-canonicalized FaceNormalWorld (the gjk::EpaAddFace idiom), and the SupportFace/IncidentFace
+# reference/incident selectors (FxDot rank, strict-greater lowest-index tie-break) + the render-only float
+# FacesToRenderInstances. manifold.h #includes sim/ccd.h read-only (gjk/broad/convex/fpx BYTE-FROZEN). Pins the
+# 4 proofs: face counts {4,6,8,5}; every face outward-wound (minDot>0) + valid indices; SupportFace/IncidentFace
+# battery two-run byte-equal + box +X/-X opposing-face relation; FacesToRenderInstances pure (two calls
+# byte-equal). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(manifold_test)
+
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): the Q16.16 fixed-point
 # cloth PARTICLE LATTICE INTEGRATOR + grid build core (engine/sim/cloth.h) the GPU
 # shaders/cloth_integrate.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
