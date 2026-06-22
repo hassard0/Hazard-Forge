@@ -624,6 +624,16 @@ hf_add_pure_test(mc_test)
 # classifies byte-identical). Pure C++ (hf_core), ASan-eligible. fract.h #includes sim/fpx.h read-only.
 hf_add_pure_test(fract_test)
 
+# Deterministic IK Control-Rig Slice 1 (Slice IK1, the BEACHHEAD of FLAGSHIP #32): the host-baked Q16.16
+# ANGLE LUT integer core (engine/anim/ik.h) the GPU shaders/ik_angle.comp copies VERBATIM + proves
+# bit-identical. Pins FxAcosLut within an LSB band vs std::acos over a dense cosine sweep + endpoints
+# (acos(kOne)==0, acos(-kOne)==pi-snap, acos(0)==pi/2-snap) + monotonicity; FxSinLut/FxCosLut known angles
+# (sin0=0, cos0=kOne, sin(pi/2)=kOne) + the sin^2+cos^2 round-trip within band; FxAtan2Lut quadrant
+# correctness (four quadrants + axes) within band vs std::atan2; and determinism (every lookup is a pure
+# function). Pure C++ (hf_core), ASan-eligible. ik.h #includes sim/fpx.h + sim/joint.h + anim/skeleton.h +
+# anim/animation.h read-only.
+hf_add_pure_test(ik_angle_test)
+
 # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
 # GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
 # shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

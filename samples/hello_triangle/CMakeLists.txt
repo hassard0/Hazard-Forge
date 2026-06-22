@@ -469,6 +469,13 @@ hf_compile_shaders(
     # coords -> max d2 ~3.1M fits int32, NO int64) over an SSBO + ReadBuffer -> bit-exact GPU==CPU cell
     # set + cross-backend, proven memcmp. NO new RHI; existing shaders + goldens untouched.
     "shaders/fract_classify.comp.hlsl:cs"
+    # Deterministic IK Control-Rig Slice 1 (Slice IK1, the BEACHHEAD of FLAGSHIP #32): ik_angle.comp
+    # evaluates the host-baked Q16.16 ANGLE LUTs (acos/sin/cos) over a fixed sweep — one thread per sample
+    # reads the uploaded tables + runs the PURE-INT32 bin index + fixed-point lerp copied VERBATIM from
+    # engine/anim/ik.h, writing 3 Q16.16 results per sample. PURE INT32 -> MSL-native (in hf_gen_msl).
+    # ReadBuffer reads the sweep, PROVEN BIT-EXACT vs the CPU ik.h lookups (memcmp, no tol). Behind
+    # --ik1-angle-shot only; existing shaders + goldens untouched.
+    "shaders/ik_angle.comp.hlsl:cs"
     # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — the GR2/FL2
     # count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment reduction. PURE
     # INT32 -> MSL-native, a TRUE GPU pass on both backends. fract_emit_count (ONE thread per sample:

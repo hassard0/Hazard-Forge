@@ -103,6 +103,7 @@
 #include "sim/couple_grain.h"       // Slice CG1: deterministic rigid<->grain coupling unified bodies+grains world + body->grain grid-hash query (CGrainWorld/GatherBodyGrains/BodyGrainAccept) — shared verbatim with cgrain_body_{count,scan,emit}.comp + the Vulkan --cgrain-query-shot
 #include "sim/couple_gf.h"           // Slice GF1: deterministic grain<->fluid coupling unified two-pool world + shared-grid cross query (CGFWorld/MakeCGFGrid/BuildCGFNeighbors) — shared verbatim with cgf_gf/cgf_fg_{count,scan,emit}.comp + the Vulkan --cgf-query-shot
 #include "sim/fract.h"               // Slice FR1: deterministic rigid-body fracture cell pre-fracture / Voronoi decomposition (FractField/FractSeed/ClassifyFractCells) — shared verbatim with fract_classify.comp + the Vulkan --fract-cells-shot
+#include "anim/ik.h"                 // Slice IK1: deterministic IK control-rig fixed-point ANGLE LUT (FxAcosLut/FxSinLut/FxCosLut/FxAtan2Lut) — shared verbatim with ik_angle.comp + the Vulkan --ik1-angle-shot
 #include "sim/joint.h"               // Slice JT1: deterministic articulated-body ragdoll JOINT GRAPH + BALL-JOINT constraint (FxJoint/WorldAnchor/SolveBallJoint/StepJointWorld) — shared verbatim with joint_ball_solve.comp + the Vulkan --joint-ball-shot
 #include "sim/vehicle.h"             // Slice VH1: deterministic vehicle physics SUSPENSION SPRING JOINT (FxSpringJoint/SolveSpringJoint/SpringLength/StepSpringWorld) — shared verbatim with vehicle_spring_solve.comp + the Vulkan --vehicle-spring-shot (int64 solve -> Vulkan-only; Metal --vehicle-spring runs the CPU StepSpringWorld)
 #include "sim/active.h"              // Slice AC1: deterministic active ragdoll ANGULAR POSE-DRIVE (FxAngularDrive/SolveAngularDrive/StepDriveWorld/DriveAngleCos) — shared verbatim with active_drive_solve.comp + the Vulkan --active-drive-shot (int64 solve -> Vulkan-only; Metal --active-drive runs the CPU StepDriveWorld)
@@ -16561,6 +16562,192 @@ static int RunMcClassifyShowcase(const char* outPath) {
 // grid of Z-slices (hashColor(cellId) per sample -> the Voronoi cell mosaic; 16 slices tiled 4x4) ->
 // identical to the Vulkan path BY CONSTRUCTION (same integer bits -> same RGB). New golden
 // tests/golden/metal/fract_cells.png; two runs DIFF 0.0000. NO rendering, NO new RHI.
+// --- Deterministic IK Control-Rig THE FIXED-POINT ANGLE LUT showcase (Slice IK1, the BEACHHEAD of
+// FLAGSHIP #32). The TRUE pass is identical on both backends: a fixed deterministic sweep of N=512 samples
+// feeds the SAME shaders/ik_angle.comp (here ik_angle.comp.gen.metal — PURE INT32 -> MSL-NATIVE, a TRUE
+// GPU pass on Metal, NOT a CPU fallback). One thread per sample reads the host-baked acos/sin/cos Q16.16
+// LUTs (the SAME tables engine/anim/ik.h builds + snaps once) + evaluates the integer bin-index + fixed-
+// point lerp lookups (copied VERBATIM from ik.h), writing 3 Q16.16 results per sample. ReadBuffer reads the
+// sweep and it is PROVEN BIT-EXACT vs the CPU ik.h lookups (memcmp, NO tolerance — the same GPU==CPU proof
+// the Vulkan --ik1-angle-shot runs); enabled=false -> all-zero; two runs byte-identical; acos within band +
+// monotone. atan2 (which needs the int64 fxdiv ratio) is the CPU part (ik::FxAtan2Lut), proven by the CPU
+// ik_angle_test. The image golden is a PURE-INTEGER LUT curve plot (the monotone acos curve + sin/cos waves
+// as integer-plotted pixel columns) -> identical to the Vulkan path BY CONSTRUCTION (same integer bits ->
+// same RGB). New golden tests/golden/metal/ik1_angle.png; two runs DIFF 0.0000. NO new RHI.
+static int RunIk1AngleShowcase(const char* outPath) {
+    namespace ik = hf::anim::ik;
+
+    const int kSweep = 512;
+    const uint32_t imgW = (uint32_t)kSweep;
+    const uint32_t imgH = 288;
+
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(imgW, imgH);
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+
+    // Upload the host-baked LUTs (the SAME tables ik.h builds), Q16.16 int32.
+    const ik::AcosTable& acosT = ik::AcosLut();
+    const ik::TrigTable& sinT  = ik::SinLut();
+    const ik::TrigTable& cosT  = ik::CosLut();
+    std::vector<int32_t> acosVec(acosT.begin(), acosT.end());
+    std::vector<int32_t> sinVec(sinT.begin(), sinT.end());
+    std::vector<int32_t> cosVec(cosT.begin(), cosT.end());
+    auto makeStorage = [&](const void* data, size_t bytes) {
+        rhi::BufferDesc d; d.size = bytes; d.initialData = data; d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+    auto acosBuf = makeStorage(acosVec.data(), acosVec.size() * sizeof(int32_t));
+    auto sinBuf  = makeStorage(sinVec.data(),  sinVec.size()  * sizeof(int32_t));
+    auto cosBuf  = makeStorage(cosVec.data(),  cosVec.size()  * sizeof(int32_t));
+
+    std::vector<int32_t> outInit((size_t)kSweep * 3, 0);
+    auto makeOutBuf = [&]() {
+        rhi::BufferDesc d; d.size = outInit.size() * sizeof(int32_t);
+        d.initialData = outInit.data(); d.usage = rhi::BufferUsage::Storage;
+        return device->CreateBuffer(d);
+    };
+
+    struct IkParams { int32_t cfg[4]; };
+    static_assert(sizeof(IkParams) == 16, "IkParams std430 layout");
+    auto makeParams = [&](int32_t enabled) {
+        IkParams p{}; p.cfg[0] = kSweep; p.cfg[1] = enabled; return p;
+    };
+
+    auto ikCs = loadMSL("ik_angle.comp.gen.metal", "ik_angle_main");
+    rhi::ComputePipelineDesc ikCd;
+    ikCd.compute = ikCs.get(); ikCd.storageBufferCount = 5; ikCd.threadsPerGroupX = 64;
+    auto ikCompute = device->CreateComputePipeline(ikCd);
+
+    auto rt = device->CreateRenderTarget(imgW, imgH);
+    const uint32_t kGroups = ((uint32_t)kSweep + 63u) / 64u;
+
+    auto runSweep = [&](int32_t enabled, std::vector<int32_t>& outVals) {
+        auto outBuf = makeOutBuf();
+        IkParams params = makeParams(enabled);
+        auto paramsBuf = makeStorage(&params, sizeof(IkParams));
+        render::RenderGraph graph;
+        render::RgResource rgScene = graph.ImportTarget(
+            "sceneColor", render::RgResourceKind::SceneColor, *rt);
+        graph.AddPass("ik_angle", {}, {rgScene},
+            [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+                cmd.BindComputePipeline(*ikCompute);
+                cmd.BindStorageBuffer(*acosBuf, 0);
+                cmd.BindStorageBuffer(*sinBuf, 1);
+                cmd.BindStorageBuffer(*cosBuf, 2);
+                cmd.BindStorageBuffer(*outBuf, 3);
+                cmd.BindStorageBuffer(*paramsBuf, 4);
+                cmd.DispatchCompute(kGroups);
+                cmd.ComputeToFragmentBarrier();
+                cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+                cmd.EndRenderPass();
+            });
+        graph.Execute(*device);
+        device->WaitIdle();
+        outVals.assign((size_t)kSweep * 3, 0);
+        device->ReadBuffer(*outBuf, outVals.data(), outVals.size() * sizeof(int32_t), 0);
+    };
+
+    // GPU sweep (enabled).
+    std::vector<int32_t> gpuVals;
+    runSweep(1, gpuVals);
+
+    // CPU reference over the SAME deterministic sweep inputs (verbatim the shader's input map).
+    std::vector<int32_t> cpuVals((size_t)kSweep * 3, 0);
+    const int denom = kSweep > 1 ? (kSweep - 1) : 1;
+    for (int t = 0; t < kSweep; ++t) {
+        const ik::fx xcos  = (ik::fx)(-ik::kOne + ((2 * ik::kOne) * t) / denom);
+        const ik::fx theta = (ik::fx)((ik::kTwoPi * t) / denom);
+        cpuVals[(size_t)t * 3 + 0] = ik::FxAcosLut(xcos);
+        cpuVals[(size_t)t * 3 + 1] = ik::FxSinLut(theta);
+        cpuVals[(size_t)t * 3 + 2] = ik::FxCosLut(theta);
+    }
+
+    if (gpuVals.size() != cpuVals.size() ||
+        std::memcmp(gpuVals.data(), cpuVals.data(), gpuVals.size() * sizeof(int32_t)) != 0)
+        return fail("ik1-angle: GPU sweep != CPU ik.h lookups (a non-int32 crept into the LUT?)");
+    std::printf("ik1-angle: {bins:%d, sweep:%d} GPU==CPU angle-LUT BYTE-EQUAL\n", ik::kAcosBins, kSweep);
+
+    // acos within band + sin/cos round-trip (CPU-side analytic comparison over the read-back field).
+    {
+        int32_t acosInterior = 0; int32_t rt2 = 0;
+        const double endpointX = 1.0 - 2.0 / (double)ik::kAcosBins;
+        for (int t = 0; t < kSweep; ++t) {
+            const double xc = -1.0 + 2.0 * (double)t / (double)denom;
+            const int32_t got = gpuVals[(size_t)t * 3 + 0];
+            const int32_t want = (int32_t)std::llround(std::acos(
+                xc < -1.0 ? -1.0 : (xc > 1.0 ? 1.0 : xc)) * (double)ik::kOne);
+            const int32_t e = std::abs(got - want);
+            if (std::fabs(xc) <= endpointX && e > acosInterior) acosInterior = e;
+            const int32_t s = gpuVals[(size_t)t * 3 + 1];
+            const int32_t c = gpuVals[(size_t)t * 3 + 2];
+            const int64_t s2 = ((int64_t)s * s) >> 16, c2 = ((int64_t)c * c) >> 16;
+            const int32_t rtE = (int32_t)std::abs((int64_t)(s2 + c2) - ik::kOne);
+            if (rtE > rt2) rt2 = rtE;
+        }
+        if (acosInterior > 96 || rt2 > 700)
+            return fail("ik1-angle: within-band check failed");
+        std::printf("ik1-angle: acos within band (maxErrLsb:%d <= tol) over [-1,1]; "
+                    "sin/cos round-trip |q|=kOne+/-%d\n", acosInterior, rt2);
+    }
+
+    // acos monotone + two-run byte-identical.
+    {
+        bool mono = true;
+        for (int t = 1; t < kSweep; ++t)
+            if (gpuVals[(size_t)t * 3 + 0] > gpuVals[(size_t)(t - 1) * 3 + 0]) { mono = false; break; }
+        std::vector<int32_t> gpuVals2;
+        runSweep(1, gpuVals2);
+        const bool twoRun = (gpuVals.size() == gpuVals2.size()) &&
+            std::memcmp(gpuVals.data(), gpuVals2.data(), gpuVals.size() * sizeof(int32_t)) == 0;
+        if (!mono || !twoRun) return fail("ik1-angle: acos non-monotone or two runs differ");
+        std::printf("ik1-angle: acos monotone non-increasing (table by construction); "
+                    "two-run BYTE-IDENTICAL\n");
+    }
+
+    // (sanity) enabled=false -> all-zero.
+    {
+        std::vector<int32_t> disabled;
+        runSweep(0, disabled);
+        for (int32_t v : disabled) if (v != 0) return fail("ik1-angle: disabled path not zero");
+    }
+    std::printf("ik1-angle: determinism — pure-integer LUT viz "
+                "(strict cross-vendor 0.0000 expected at the controller bake)\n");
+
+    // --- Golden: the PURE-INTEGER LUT curve plot (IDENTICAL to the Vulkan --ik1-angle-shot by
+    // construction). acos amber, sin green, cos cyan. ---
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 18; bgra[p * 4 + 1] = 14; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto plot = [&](int x, int y, uint8_t b, uint8_t g, uint8_t r) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+    };
+    const int trigMid = (int)(imgH * 3 / 4);
+    for (int x = 0; x < (int)imgW; ++x) plot(x, trigMid, 40, 40, 40);
+    for (int t = 0; t < kSweep; ++t) {
+        const int x = t;
+        const int32_t a = gpuVals[(size_t)t * 3 + 0];
+        const int ay = (int)(((int64_t)(ik::kPi - a) * (imgH / 2 - 1)) / ik::kPi);
+        plot(x, ay, 40, 170, 240);
+        const int32_t s = gpuVals[(size_t)t * 3 + 1];
+        const int32_t c = gpuVals[(size_t)t * 3 + 2];
+        const int amp = (int)(imgH / 4 - 4);
+        const int sy = trigMid - (int)(((int64_t)s * amp) / ik::kOne);
+        const int cy = trigMid - (int)(((int64_t)c * amp) / ik::kOne);
+        plot(x, sy, 90, 220, 90);
+        plot(x, cy, 230, 200, 60);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — IK1 angle-LUT curve plot (acos amber, sin green, cos cyan; "
+                "%d samples)\n", outPath, imgW, imgH, kSweep);
+    return 0;
+}
+
 static int RunFractCellsShowcase(const char* outPath) {
     using math::Vec3;
     namespace fract = hf::sim::fract;
@@ -59990,6 +60177,21 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--fract-cells") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_fract_cells.png";
             try { return RunFractCellsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ik1-angle <out.png>: render the Deterministic IK Control-Rig THE FIXED-POINT ANGLE LUT showcase
+        // (Slice IK1, the BEACHHEAD of FLAGSHIP #32). A fixed deterministic sweep (N=512) feeds the SAME
+        // ik_angle.comp (PURE INT32 -> MSL-NATIVE, a true GPU pass: one thread per sample reads the host-
+        // baked acos/sin/cos Q16.16 LUTs + evaluates the integer bin-index + fixed-point lerp lookups,
+        // verbatim engine/anim/ik.h) -> ReadBuffer reads the 3-Q16.16-per-sample sweep, PROVEN BIT-EXACT vs
+        // the CPU ik.h lookups (memcmp, no tol — the same GPU==CPU proof the Vulkan --ik1-angle-shot runs);
+        // enabled=false -> all-zero; two runs byte-identical; acos within band + monotone. atan2 (int64
+        // fxdiv) is the CPU part (FxAtan2Lut), proven by the CPU ik_angle_test. The image golden is a
+        // pure-integer LUT curve plot (the monotone acos curve + sin/cos waves), identical to the Vulkan
+        // path BY CONSTRUCTION. New golden tests/golden/metal/ik1_angle.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--ik1-angle") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ik1_angle.png";
+            try { return RunIk1AngleShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-fragments <out.png>: render the Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION

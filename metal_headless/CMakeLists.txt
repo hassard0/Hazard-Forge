@@ -248,6 +248,18 @@ hf_gen_msl(mc_classify.comp      mc_classify.comp.hlsl      comp mc_classify_mai
 # cell set is bit-exact GPU==CPU + cross-backend by construction. Behind --fract-cells only; existing
 # shaders + goldens untouched.
 hf_gen_msl(fract_classify.comp   fract_classify.comp.hlsl   comp fract_classify_main)
+# Deterministic IK Control-Rig Slice 1 (Slice IK1, the BEACHHEAD of FLAGSHIP #32: DETERMINISTIC IK
+# CONTROL-RIG): ik_angle.comp evaluates the host-baked Q16.16 ANGLE LUTs (acos/sin/cos) over a fixed
+# sweep — ONE thread per sample reads the uploaded tables + runs the PURE-INT32 bin index + fixed-point
+# lerp copied VERBATIM from engine/anim/ik.h::FxAcosLut/FxSinLut/FxCosLut/FxReducePhaseBin, writing the 3
+# Q16.16 results per sample (an order-independent per-sample integer write — race-free, NO atomics). The
+# acos power-of-two index, the sin/cos modulo-reduce + nested base-256 frac, and the bounded diff*frac lerp
+# are ALL PURE INT32 (NO int64) -> the default MSL gen suffices (NO --msl-version 20200, the
+# fract_classify/fpx_pair lesson), a TRUE GPU pass on both backends. The acos/sin/cos sweep is bit-exact
+# GPU==CPU + cross-backend by construction; atan2 (which needs the int64 fxdiv ratio) is the CPU/Vulkan
+# part (engine/anim/ik.h::FxAtan2Lut) and is NOT in this sweep. Behind --ik1-angle / --ik1-angle-shot only;
+# existing shaders + goldens untouched.
+hf_gen_msl(ik_angle.comp         ik_angle.comp.hlsl         comp ik_angle_main)
 # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — turns each non-empty FR1
 # Voronoi cell into a FRAGMENT RECORD (integer centroid, AABB, boundRadiusSq/boundRadius, volume, cellId,
 # invMass) via the GR2/FL2 count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment
