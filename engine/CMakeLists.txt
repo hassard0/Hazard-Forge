@@ -76,6 +76,7 @@ else()
     rhi_vulkan/vulkan_texture.cpp
     rhi_vulkan/vulkan_pbr_material.cpp
     rhi_vulkan/vulkan_bindless.cpp
+    rhi_vulkan/vulkan_accel.cpp
     rhi_vulkan/vulkan_render_target.cpp
     rhi_vulkan/vulkan_cubemap_target.cpp
   )

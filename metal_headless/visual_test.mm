@@ -18117,6 +18117,90 @@ static int RunRt1TraceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice RT2 — Hardware Ray Tracing DETERMINISTIC HW INLINE RAY QUERY showcase (--rt2-query) (the
+// moat proof, FLAGSHIP #28). The Vulkan --rt2-query-shot wires REAL HW inline ray query (RayQuery over a
+// TLAS draining every candidate procedural primitive, then the FROZEN fx Q16.16 intersection + (t,primIndex)
+// min) and memcmp's HW==SW-GPU==CPU. rt_query.comp uses HLSL RayQuery + int64 -> Vulkan-SPIR-V-ONLY (glslc/
+// spirv-cross can't lower to MSL), so on Metal --rt2-query runs the CPU rtrace::RenderScene reference (the
+// SAME bit-exact reference the Vulkan HW==SW==CPU memcmp compares against) -> the Metal image is
+// byte-identical to the Vulkan HW image BY CONSTRUCTION. Builds the SAME richer RT2 scene (a ground AABB +
+// a 4x4 sphere grid at varied depths + two boxes) at 320x240 as the Vulkan side, renders the integer
+// Lambert RGBA8 scene, writes the PNG. Because the shade is INTEGER, the rt2_query golden is STRICT-ZERO
+// cross-vendor. (Metal HARDWARE ray query over an MTLAccelerationStructure is the deliberate follow-on
+// RT2b.) New golden tests/golden/metal/rt2_query.png.
+static int RunRt2QueryShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+
+    const uint32_t kRtW = 320, kRtH = 240;
+
+    // The RT2 scene (the SAME primitives + camera the Vulkan --rt2-query-shot defines; rtrace.h is frozen).
+    std::vector<rt::RtSphere> spheresV;
+    std::vector<rt::RtAabb>   aabbsV;
+    uint32_t nextPrim = 0;
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)},
+                                FxVec3{F(20,1),  F(-1,1), F(20,1)}, nextPrim++});
+    for (int gz = 0; gz < 4; ++gz) {
+        for (int gx = 0; gx < 4; ++gx) {
+            fx cx = F(2 * gx - 3, 1);
+            fx cz = F(2 + 2 * gz, 1);
+            fx cy = F(0, 1);
+            fx rad = (gz & 1) ? F(3, 4) : F(1, 1);
+            spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, rad, nextPrim++});
+        }
+    }
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-9,2), F(-1,1), F(1,1)},
+                                FxVec3{F(-5,2), F(3,2),  F(5,2)}, nextPrim++});
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(5,2),  F(-1,1), F(2,1)},
+                                FxVec3{F(9,2),  F(2,1),  F(7,2)}, nextPrim++});
+
+    rt::RtScene scene{};
+    scene.spheres = std::span<const rt::RtSphere>(spheresV);
+    scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+    scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+    scene.background = rt::PackRGBA8(34, 40, 56, 255);
+
+    rt::RtCamera cam{};
+    cam.eye     = FxVec3{F(0,1), F(2,1), F(-9,1)};
+    cam.right   = FxVec3{kOne, 0, 0};
+    cam.up      = FxVec3{0, kOne, 0};
+    cam.forward = FxVec3{0, 0, kOne};
+    cam.halfW   = F(7, 10);
+    cam.halfH   = F(7, 10);
+
+    const size_t kPixels = (size_t)kRtW * kRtH;
+    const uint32_t kPrimCount = (uint32_t)(spheresV.size() + aabbsV.size());
+
+    // CPU reference render (the bit-exact image the Vulkan --rt2-query-shot proves the HW shader equal to).
+    std::vector<uint32_t> image(kPixels, 0);
+    uint32_t hits = rt::RenderScene(scene, cam, kRtW, kRtH, std::span<uint32_t>(image));
+    std::printf("rt2-query: {rays:%zu, prims:%u, candidates:%u} [Metal: CPU rtrace::RenderScene, "
+                "byte-identical to the Vulkan HW result by construction]\n", kPixels, kPrimCount, kPrimCount);
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        rt::RenderScene(scene, cam, kRtW, kRtH, std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rt2-query: two CPU renders differ (nondeterministic)");
+        std::printf("rt2-query determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic HW-ray-query scene [CPU SW reference] (%u hits)\n",
+                outPath, kRtW, kRtH, hits);
+    return 0;
+}
+
 static int RunFpxShowcase(const char* outPath) {
     using math::Vec3;
     namespace fpx = hf::sim::fpx;
@@ -57355,6 +57439,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt1-trace") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt1_trace.png";
             try { return RunRt1TraceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rt2-query <out.png>: render the Hardware Ray Tracing DETERMINISTIC HW INLINE RAY QUERY showcase
+        // (Slice RT2, FLAGSHIP #28). rt_query.comp uses HLSL RayQuery + int64 -> Vulkan-SPIR-V-ONLY, so
+        // Metal runs the CPU rtrace::RenderScene reference (byte-identical to the Vulkan HW result by
+        // construction). New golden tests/golden/metal/rt2_query.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt2-query") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt2_query.png";
+            try { return RunRt2QueryShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--fpx") == 0) {

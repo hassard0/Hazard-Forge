@@ -120,6 +120,12 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     f12.descriptorBindingPartiallyBound = VK_TRUE;
     f12.descriptorBindingVariableDescriptorCount = VK_TRUE;
     f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    // Slice RT2 (Hardware Ray Tracing): the VK_KHR_acceleration_structure extension requires
+    // bufferDeviceAddress (the accel buffers / scratch / instance buffer are referenced by GPU device
+    // address). It is a core VK 1.2 capability available on the engine's VK 1.3 target GPUs (NVIDIA RTX,
+    // Apple via MoltenVK); enabling it is additive — no existing pipeline uses a device address, so every
+    // existing golden is byte-for-byte unchanged.
+    f12.bufferDeviceAddress = VK_TRUE;
 
     vkb::PhysicalDeviceSelector selector{vkbInstance_};
     auto physRet = selector
@@ -137,6 +143,26 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     vkb::PhysicalDevice physForDevice = physRet.value();
     physForDevice.enable_extension_if_present(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
+    // Slice RT2 (Hardware Ray Tracing) — capability-gated, EXACTLY like push-descriptor above: the RT
+    // extensions/features are enabled ONLY IF PRESENT (never in the REQUIRED set), so a device WITHOUT
+    // hardware ray query still creates fine and SupportsHardwareRayQuery() reports false (the showcase
+    // falls back to the SW path). VK_KHR_ray_query + VK_KHR_acceleration_structure (+ its dep
+    // VK_KHR_deferred_host_operations) are enabled if-present; the matching feature structs (rayQuery,
+    // accelerationStructure) are added to the device pNext chain only when the device advertises them.
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeat{};
+    accelFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    accelFeat.accelerationStructure = VK_TRUE;
+    VkPhysicalDeviceRayQueryFeaturesKHR rqFeat{};
+    rqFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rqFeat.rayQuery = VK_TRUE;
+
+    const bool extAccel = physForDevice.enable_extension_if_present(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    const bool extRayQuery = physForDevice.enable_extension_if_present(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    physForDevice.enable_extension_if_present(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);  // accel-struct dep
+    const bool featAccel = physForDevice.enable_extension_features_if_present(accelFeat);
+    const bool featRayQuery = physForDevice.enable_extension_features_if_present(rqFeat);
+    hwRayQuery_ = extAccel && extRayQuery && featAccel && featRayQuery;
+
     vkb::DeviceBuilder db{physForDevice};
     auto devRet = db.build();
     if (!devRet) throw std::runtime_error("Device build failed: " + devRet.error().message());
@@ -151,12 +177,39 @@ VulkanDevice::VulkanDevice(hf::hal::Window& window) : window_(window) {
     vkCmdPushDescriptorSetKHR_ = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
         vkGetDeviceProcAddr(device_, "vkCmdPushDescriptorSetKHR"));
 
+    // Slice RT2 — load the 5 acceleration-structure entry points ONLY when hardware ray query is supported
+    // (the push-descriptor PFN precedent). On a no-RT device these stay null and CreateBlas/CreateTlas
+    // return nullptr. If any PFN fails to load, drop hwRayQuery_ to false (defensive — a driver that
+    // advertised the feature but not the entry point would otherwise crash on first build).
+    if (hwRayQuery_) {
+        vkCreateAccelerationStructureKHR_ = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+            vkGetDeviceProcAddr(device_, "vkCreateAccelerationStructureKHR"));
+        vkDestroyAccelerationStructureKHR_ = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+            vkGetDeviceProcAddr(device_, "vkDestroyAccelerationStructureKHR"));
+        vkGetAccelerationStructureBuildSizesKHR_ = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetAccelerationStructureBuildSizesKHR"));
+        vkCmdBuildAccelerationStructuresKHR_ = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+            vkGetDeviceProcAddr(device_, "vkCmdBuildAccelerationStructuresKHR"));
+        vkGetAccelerationStructureDeviceAddressKHR_ = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetAccelerationStructureDeviceAddressKHR"));
+        if (!vkCreateAccelerationStructureKHR_ || !vkGetAccelerationStructureBuildSizesKHR_ ||
+            !vkCmdBuildAccelerationStructuresKHR_ || !vkGetAccelerationStructureDeviceAddressKHR_ ||
+            !vkDestroyAccelerationStructureKHR_) {
+            hwRayQuery_ = false;
+        }
+    }
+
     // --- VMA ---
     VmaAllocatorCreateInfo aci{};
     aci.physicalDevice = physical_;
     aci.device = device_;
     aci.instance = instance_;
     aci.vulkanApiVersion = VK_API_VERSION_1_3;
+    // Slice RT2: when hardware ray query is enabled, the accel-struct / scratch / instance buffers are
+    // created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT — VMA requires this allocator flag to accept
+    // device-address buffers (and we enabled f12.bufferDeviceAddress for the device). Additive: gated on
+    // hwRayQuery_ so a non-RT device's allocator is byte-for-byte unchanged.
+    if (hwRayQuery_) aci.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     Check(vmaCreateAllocator(&aci, &allocator_), "vmaCreateAllocator");
 
     // --- Swapchain (owns the depth attachment; needs the VMA allocator) ---

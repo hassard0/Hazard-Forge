@@ -184,6 +184,13 @@ struct ComputePipelineDesc {
     // dispatch via ICommandBuffer::BindShadowMapCompute. Default false -> existing compute pipelines keep
     // the storage-buffer-only layout byte-for-byte unchanged.
     bool sampledShadowMap = false;
+    // Slice RT2 (ADDITIVE): when >= 0, the compute descriptor layout adds a
+    // VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR binding at this slot so an inline-ray-query kernel
+    // (shaders/rt_query.comp) can RayQuery the TLAS bound via ICommandBuffer::BindAccelStructure. Default
+    // -1 -> existing compute pipelines keep the storage-buffer-only layout byte-for-byte unchanged (no
+    // accel binding, no ray-query). The Vulkan backend reserves a RaytracingAccelerationStructure binding
+    // at this slot; the Metal backend ignores it (rt_query is Vulkan-only).
+    int accelStructureBinding = -1;
 };
 
 struct TextureDesc {

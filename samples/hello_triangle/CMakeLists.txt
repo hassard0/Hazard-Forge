@@ -509,6 +509,18 @@ hf_compile_shaders(
     # --rt1-trace showcase runs the CPU rtrace::RenderScene (byte-identical by construction). NO new RHI on
     # the trace path (the accel-struct RHI seam is additive + INERT in RT1); existing shaders/goldens untouched.
     "shaders/rt_trace.comp.hlsl:cs"
+    # Hardware Ray Tracing Slice 2 (Slice RT2, FLAGSHIP #28): rt_query.comp is the DETERMINISTIC HW INLINE
+    # RAY QUERY kernel — ONE thread per pixel opens a RayQuery over the TLAS (binding 4), DRAINS every
+    # candidate procedural primitive via Proceed() (NO commit, NO tMax shrink), runs the FROZEN fx Q16.16
+    # IntersectSphere/IntersectAabb on each candidate, folds into the closest by the total order
+    # (t, primIndex), and writes the integer Lambert RGBA8 — bit-identical to rt_trace.comp (SW GPU) and the
+    # CPU rtrace::RenderScene. The HW BVH is ONLY a candidate-AABB generator (margin-inflated -> a strict
+    # superset); OUR fx math owns the closest hit -> vendor/BVH-order-independent, hence byte-identical to
+    # the SW no-cull reference. The :csrq stage compiles it cs_6_5 + SPV_KHR_ray_query (HLSL RayQuery -> DXC
+    # SPIR-V RayQueryKHR). It is VULKAN-SPIR-V-ONLY (RayQuery + int64 -> glslc/spirv-cross can't lower to
+    # MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt2-query runs the CPU rtrace::RenderScene
+    # (byte-identical by construction). The Vulkan side carries the HW==SW-GPU==CPU memcmp proof.
+    "shaders/rt_query.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

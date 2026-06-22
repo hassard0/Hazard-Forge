@@ -62,9 +62,31 @@ public:
                            uint32_t& width, uint32_t& height) override;
     void ReadBuffer(IBuffer& buffer, void* dst, size_t size, size_t offset) override;
 
+    // Slice RT2 — the Vulkan hardware ray-query backend behind the RT1 accel-struct seam. CreateBlas builds
+    // a bottom-level accel structure from AABB-procedural geometry (each AABB inflated by kRtAabbMargin so
+    // the driver's FLOAT BVH overlap is a strict SUPERSET of every true fx hit); CreateTlas builds a
+    // top-level accel structure of those instances (instanceCustomIndex = instanceId). Both build
+    // synchronously (one-shot cmd buffer + vkQueueWaitIdle, the staging-upload pattern). On a device
+    // WITHOUT RT support (no rayQuery/accelerationStructure feature+extension) they return nullptr and
+    // SupportsHardwareRayQuery() is false -> the showcase falls back to the SW path.
+    std::unique_ptr<IAccelStructure> CreateBlas(const BlasDesc&) override;
+    std::unique_ptr<IAccelStructure> CreateTlas(const TlasDesc&) override;
+    bool SupportsHardwareRayQuery() const override { return hwRayQuery_; }
+
     // Accessors used by sibling Vulkan objects.
     VkDevice device() const { return device_; }
+    VkPhysicalDevice physicalDevice() const { return physical_; }
     VmaAllocator allocator() const { return allocator_; }
+    VkQueue graphicsQueue() const { return graphicsQueue_; }
+    uint32_t graphicsQueueFamily() const { return graphicsQueueFamily_; }
+    VkCommandPool rtCommandPool() const { return rtPool_; }
+
+    // Slice RT2 — the acceleration-structure entry points loaded from the device (null if RT unsupported).
+    PFN_vkCreateAccelerationStructureKHR        createAccelStructFn() const { return vkCreateAccelerationStructureKHR_; }
+    PFN_vkDestroyAccelerationStructureKHR       destroyAccelStructFn() const { return vkDestroyAccelerationStructureKHR_; }
+    PFN_vkGetAccelerationStructureBuildSizesKHR getAccelStructBuildSizesFn() const { return vkGetAccelerationStructureBuildSizesKHR_; }
+    PFN_vkCmdBuildAccelerationStructuresKHR     cmdBuildAccelStructsFn() const { return vkCmdBuildAccelerationStructuresKHR_; }
+    PFN_vkGetAccelerationStructureDeviceAddressKHR getAccelStructDeviceAddressFn() const { return vkGetAccelerationStructureDeviceAddressKHR_; }
     VkSampler defaultSampler() const { return defaultSampler_; }
     // Slice CX: the clamp-to-edge depth sampler the lit pass uses for the shadow map, exposed so the
     // froxel inject compute can sample the SAME map via BindShadowMapCompute.
@@ -182,6 +204,16 @@ private:
 
     // Loaded from the device (VK_KHR_push_descriptor); used to bind compute storage buffers inline.
     PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR_ = nullptr;
+
+    // Slice RT2 — hardware ray query. hwRayQuery_ is true iff BOTH the rayQuery + accelerationStructure
+    // features were advertised AND both extensions enabled (queried at device creation). The 5 accel-struct
+    // entry points are loaded only when supported (else null -> CreateBlas/CreateTlas return nullptr).
+    bool hwRayQuery_ = false;
+    PFN_vkCreateAccelerationStructureKHR           vkCreateAccelerationStructureKHR_ = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR          vkDestroyAccelerationStructureKHR_ = nullptr;
+    PFN_vkGetAccelerationStructureBuildSizesKHR    vkGetAccelerationStructureBuildSizesKHR_ = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR        vkCmdBuildAccelerationStructuresKHR_ = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR vkGetAccelerationStructureDeviceAddressKHR_ = nullptr;
 
     // Texture support: one default sampler + a shared image+sampler set layout (set 1) + pool.
     VkSampler             defaultSampler_    = VK_NULL_HANDLE;

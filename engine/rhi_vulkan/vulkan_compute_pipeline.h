@@ -21,6 +21,7 @@ public:
     uint32_t storageBufferCount() const { return storageBufferCount_; }
     uint32_t pushConstantSize() const { return pushConstantSize_; }
     bool sampledShadowMap() const { return sampledShadowMap_; }
+    int accelStructureBinding() const { return accelStructureBinding_; }
 
 private:
     VkDevice device_;
@@ -30,6 +31,7 @@ private:
     uint32_t storageBufferCount_ = 0;
     uint32_t pushConstantSize_ = 0;
     bool sampledShadowMap_ = false;
+    int accelStructureBinding_ = -1;  // Slice RT2: TLAS descriptor slot, or -1 if none
 };
 
 } // namespace hf::rhi::vk

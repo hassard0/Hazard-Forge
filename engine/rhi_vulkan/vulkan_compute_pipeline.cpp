@@ -10,7 +10,8 @@ VulkanComputePipeline::VulkanComputePipeline(VulkanDevice& device, const Compute
     : device_(device.device()),
       storageBufferCount_(desc.storageBufferCount),
       pushConstantSize_(desc.pushConstantSize),
-      sampledShadowMap_(desc.sampledShadowMap) {
+      sampledShadowMap_(desc.sampledShadowMap),
+      accelStructureBinding_(desc.accelStructureBinding) {
     auto* cs = static_cast<VulkanShaderModule*>(desc.compute);
 
     // Descriptor set layout: `storageBufferCount` STORAGE_BUFFER bindings (0..N-1), compute stage.
@@ -37,6 +38,18 @@ VulkanComputePipeline::VulkanComputePipeline(VulkanDevice& device, const Compute
         smp.descriptorCount = 1;
         smp.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         bindings.push_back(smp);
+    }
+    // Slice RT2 (ADDITIVE): an ACCELERATION_STRUCTURE_KHR binding at accelStructureBinding_ so the inline-
+    // ray-query kernel (rt_query.comp) can RayQuery the TLAS bound via BindAccelStructure. Reserved ONLY
+    // when accelStructureBinding_ >= 0 (the rt_query pipeline); every other compute pipeline keeps the
+    // storage-buffer-only layout byte-for-byte unchanged (default -1 -> no accel binding).
+    if (accelStructureBinding_ >= 0) {
+        VkDescriptorSetLayoutBinding as{};
+        as.binding = (uint32_t)accelStructureBinding_;
+        as.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        as.descriptorCount = 1;
+        as.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings.push_back(as);
     }
     VkDescriptorSetLayoutCreateInfo slci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     // PUSH_DESCRIPTOR: the storage buffers are bound inline via vkCmdPushDescriptorSetKHR (no pool).

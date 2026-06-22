@@ -7,6 +7,7 @@
 #include "rhi_vulkan/vulkan_render_target.h"
 #include "rhi_vulkan/vulkan_cubemap_target.h"
 #include "rhi_vulkan/vulkan_bindless.h"
+#include "rhi_vulkan/vulkan_accel.h"
 #include "rhi_vulkan/vulkan_sampled.h"
 #include "rhi_vulkan/vk_common.h"
 
@@ -377,6 +378,29 @@ void VulkanCommandBuffer::BindStorageBuffer(IBuffer& buffer, uint32_t index) {
     write.descriptorCount = 1;
     write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     write.pBufferInfo = &info;
+    device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
+                               /*set=*/0, 1, &write);
+}
+
+void VulkanCommandBuffer::BindAccelStructure(IAccelStructure& tlas, uint32_t slot) {
+    // Slice RT2: push the TLAS into the compute set at `slot` (ACCELERATION_STRUCTURE_KHR) so the bound
+    // inline-ray-query kernel (rt_query.comp) can RayQuery it. The TLAS handle goes in a
+    // VkWriteDescriptorSetAccelerationStructureKHR chained into the write's pNext (the API contract for an
+    // accel-struct descriptor). The pipeline's compute layout reserved this binding via
+    // ComputePipelineDesc::accelStructureBinding.
+    auto& a = static_cast<VulkanAccelStructure&>(tlas);
+    VkAccelerationStructureKHR handle = a.handle();
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    asInfo.accelerationStructureCount = 1;
+    asInfo.pAccelerationStructures = &handle;
+
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.pNext = &asInfo;
+    write.dstBinding = slot;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     device_.pushDescriptorFn()(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, boundComputeLayout_,
                                /*set=*/0, 1, &write);
 }

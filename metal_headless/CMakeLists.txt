@@ -294,6 +294,17 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # bit-exact reference the Vulkan GPU==CPU proof compares against) -> the Metal result is byte-identical to
 # the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the GPU==CPU bit-identity proof. So
 # rt_trace.comp gets NO hf_gen_msl line.
+# Hardware Ray Tracing Slice 2 (Slice RT2, FLAGSHIP #28): rt_query.comp is the DETERMINISTIC HW INLINE
+# RAY QUERY kernel (HLSL inline RayQuery over the TLAS draining every candidate procedural primitive, then
+# the FROZEN fx Q16.16 intersection + (t,primIndex) min). It is VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd
+# here: (a) HLSL RayQuery lowers (via DXC) to SPIR-V RayQueryKHR (the SPV_KHR_ray_query extension), which
+# glslc/spirv-cross — the Metal HLSL->SPIR-V->MSL chain — cannot lower; (b) it also uses the int64 fxmul/
+# fxdiv/FxISqrt math glslc can't parse anyway. Same Vulkan-only convention as rt_trace.comp /
+# fpx_integrate.comp: on Metal the --rt2-query showcase runs the CPU rtrace::RenderScene (the SAME bit-exact
+# reference the Vulkan HW==SW==CPU memcmp compares against) -> the Metal result is byte-identical to the
+# Vulkan HW result BY CONSTRUCTION, while the Vulkan side carries the HW-ray-query == SW == CPU proof. So
+# rt_query.comp gets NO hf_gen_msl line. (Metal HARDWARE ray query — rt_query.metal over an
+# MTLAccelerationStructure — is the deliberate follow-on slice RT2b.)
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

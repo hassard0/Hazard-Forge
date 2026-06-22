@@ -57,6 +57,7 @@ public:
 
     void BindComputePipeline(IComputePipeline& pipeline) override;
     void BindStorageBuffer(IBuffer& buffer, uint32_t index) override;
+    void BindAccelStructure(IAccelStructure& tlas, uint32_t slot) override;
     void BindShadowMapCompute(IRenderTarget& shadowMap) override;
     void ComputePushConstants(const void* data, uint32_t size) override;
     void DispatchCompute(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) override;

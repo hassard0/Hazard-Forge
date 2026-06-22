@@ -671,6 +671,17 @@ hf_add_pure_test(fpx_test)
 # rtrace.h #includes sim/fpx.h read-only.
 hf_add_pure_test(rt_test)
 
+# Hardware Ray Tracing Slice 2 (Slice RT2, FLAGSHIP #28): the CPU-side invariants the HW inline-ray-query
+# kernel (shaders/rt_query.comp) rests on. The HW==SW-GPU==CPU memcmp proof lives in the --rt2-query-shot
+# showcase (needs a GPU); this pure-CPU test pins the deterministic-reconciliation contract: the RT2 scene's
+# rtrace::RenderScene is two-run byte-identical; the AABB-MARGIN INVARIANT (every true fx hit point produced
+# by the frozen intersection lies inside its float bounding AABB inflated by kRtAabbMargin = 1/64 — the
+# candidate-completeness guarantee that the driver's float BVH overlap never skips a true hit); and the
+# per-pixel HIT MASK + closest-prim shade match an independent brute-force no-cull reference (the oracle the
+# HW path is reconciled against). Defines the RT2 scene locally with the frozen rtrace:: types (rtrace.h is
+# BYTE-FROZEN, #included read-only). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(rt_query_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/
