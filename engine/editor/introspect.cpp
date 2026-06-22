@@ -553,6 +553,7 @@ const char* kFeatures[] = {
     "verdict-render",
     "rt1-trace",
     "rt2-query",
+    "rt2-query-hw",
 };
 
 // One scriptable command verb (the commands.cpp ops) + its argument shape. An agent reads this to

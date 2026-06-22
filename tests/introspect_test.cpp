@@ -526,6 +526,8 @@ int main() {
             bool sawRt1TraceFeature = false;
             // Slice RT2: the rt2-query capability is advertised (HW inline ray query).
             bool sawRt2QueryFeature = false;
+            // Slice RT2b: the rt2-query-hw capability is advertised (Metal HW ray query).
+            bool sawRt2QueryHwFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -767,6 +769,7 @@ int main() {
                     if (AsString(el->value) == "verdict-render") sawVerdictRenderFeature = true;
                     if (AsString(el->value) == "rt1-trace") sawRt1TraceFeature = true;
                     if (AsString(el->value) == "rt2-query") sawRt2QueryFeature = true;
+                    if (AsString(el->value) == "rt2-query-hw") sawRt2QueryHwFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -983,6 +986,7 @@ int main() {
             check(sawVerdictRenderFeature, "engine.features includes verdict-render");
             check(sawRt1TraceFeature, "engine.features includes rt1-trace");
             check(sawRt2QueryFeature, "engine.features includes rt2-query");
+            check(sawRt2QueryHwFeature, "engine.features includes rt2-query-hw");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");

@@ -21,6 +21,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <Metal/Metal.h>   // Slice RT2b: direct Metal for HW ray query (MTLAccelerationStructure + intersection_query)
 
 #include "platform/crash_dialogs.h"     // hf::platform::DisableCrashDialogs() -- no-op on Apple/clang
 #include "rhi/rhi.h"
@@ -18197,6 +18198,192 @@ static int RunRt2QueryShowcase(const char* outPath) {
     }
     if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — deterministic HW-ray-query scene [CPU SW reference] (%u hits)\n",
+                outPath, kRtW, kRtH, hits);
+    return 0;
+}
+
+// ===== Slice RT2b — Hardware Ray Tracing METAL HW RAY QUERY showcase (--rt2-query-hw) (cross-platform HW-RT
+// parity, FLAGSHIP #28). The Apple-Metal twin of the Vulkan --rt2-query-shot: a metal::raytracing::
+// intersection_query over an MTLAccelerationStructure of margin-inflated bounding boxes, draining every
+// candidate + running the FROZEN fx Q16.16 intersection (shaders/rt_query.metal, the FIRST hand-authored .metal),
+// proving Metal-HW == CPU rtrace::RenderScene byte-identical (and therefore == the Vulkan HW image). Self-
+// contained Metal (its own MTLCreateSystemDefaultDevice — does NOT use the RHI device, since accel structures
+// aren't exposed through the RHI seam). On a Mac without HW ray tracing (M1/M2) it falls back to the CPU
+// reference. New golden tests/golden/metal/rt2_hwquery.png (byte-identical to rt2_query.png, produced by HW).
+struct HwPrim { int kind; int cx, cy, cz; int hx, hy, hz; int radius; uint primIndex; uint pad0, pad1, pad2; }; // 48 B
+struct HwParams { int eye[4]; int right[4]; int up[4]; int forward[4]; int light[4]; int plane[4]; uint counts[4]; }; // 112 B
+
+static int RunRt2QueryHwShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::F;
+    const uint32_t kRtW = 320, kRtH = 240;
+
+    // The SAME RT2 scene as RunRt2QueryShowcase (rtrace.h frozen).
+    std::vector<rt::RtSphere> spheresV;
+    std::vector<rt::RtAabb>   aabbsV;
+    uint32_t nextPrim = 0;
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-20,1), F(-3,1), F(-20,1)}, FxVec3{F(20,1), F(-1,1), F(20,1)}, nextPrim++});
+    for (int gz = 0; gz < 4; ++gz) for (int gx = 0; gx < 4; ++gx) {
+        fx cx = F(2 * gx - 3, 1); fx cz = F(2 + 2 * gz, 1); fx cy = F(0, 1);
+        fx rad = (gz & 1) ? F(3, 4) : F(1, 1);
+        spheresV.push_back(rt::RtSphere{FxVec3{cx, cy, cz}, rad, nextPrim++});
+    }
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(-9,2), F(-1,1), F(1,1)}, FxVec3{F(-5,2), F(3,2), F(5,2)}, nextPrim++});
+    aabbsV.push_back(rt::RtAabb{FxVec3{F(5,2), F(-1,1), F(2,1)}, FxVec3{F(9,2), F(2,1), F(7,2)}, nextPrim++});
+
+    rt::RtScene scene{};
+    scene.spheres = std::span<const rt::RtSphere>(spheresV);
+    scene.aabbs   = std::span<const rt::RtAabb>(aabbsV);
+    scene.lightDir = rt::RtNormalize(FxVec3{F(4,10), F(8,10), F(-3,10)});
+    scene.background = rt::PackRGBA8(34, 40, 56, 255);
+    rt::RtCamera cam{};
+    cam.eye = FxVec3{F(0,1), F(2,1), F(-9,1)};
+    cam.right = FxVec3{kOne, 0, 0}; cam.up = FxVec3{0, kOne, 0}; cam.forward = FxVec3{0, 0, kOne};
+    cam.halfW = F(7, 10); cam.halfH = F(7, 10);
+
+    const size_t kPixels = (size_t)kRtW * kRtH;
+    const uint32_t kPrimCount = (uint32_t)(spheresV.size() + aabbsV.size());
+
+    // CPU reference (the bit-exact oracle).
+    std::vector<uint32_t> cpuImage(kPixels, 0);
+    uint32_t hits = rt::RenderScene(scene, cam, kRtW, kRtH, std::span<uint32_t>(cpuImage));
+
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if (!dev) return fail("rt2-query-hw: no Metal device");
+
+    auto writeImage = [&](const std::vector<uint32_t>& img) -> bool {
+        std::vector<uint8_t> bgra(kPixels * 4, 0);
+        for (size_t p = 0; p < kPixels; ++p) {
+            uint32_t px = img[p];
+            bgra[p*4+0] = (uint8_t)((px >> 16) & 0xFF); bgra[p*4+1] = (uint8_t)((px >> 8) & 0xFF);
+            bgra[p*4+2] = (uint8_t)(px & 0xFF);          bgra[p*4+3] = (uint8_t)((px >> 24) & 0xFF);
+        }
+        return WritePNG(outPath, bgra, kRtW, kRtH);
+    };
+
+    if (!dev.supportsRaytracing) {
+        std::printf("rt2-query-hw: {rays:%zu, prims:%u} supportsRaytracing:false -> SW (CPU rtrace::RenderScene)\n",
+                    kPixels, kPrimCount);
+        if (!writeImage(cpuImage)) return fail("PNG write failed");
+        std::printf("OK wrote %s (%ux%u) — CPU SW fallback (%u hits)\n", outPath, kRtW, kRtH, hits);
+        return 0;
+    }
+
+    // ---- Build the HwPrim info buffer + the (margin-inflated) bounding-box buffer (spheres then aabbs). ----
+    const float kMargin = (float)(kOne / 64) / (float)kOne;   // == kRtAabbMargin in world units (1/64)
+    std::vector<HwPrim> prims;
+    std::vector<MTLAxisAlignedBoundingBox> boxes;
+    auto fxf = [](fx v) -> float { return (float)v / (float)kOne; };
+    for (const auto& s : spheresV) {
+        prims.push_back(HwPrim{0, s.center.x, s.center.y, s.center.z, 0,0,0, s.radius, s.primIndex, 0,0,0});
+        float cx = fxf(s.center.x), cy = fxf(s.center.y), cz = fxf(s.center.z), r = fxf(s.radius) + kMargin;
+        MTLAxisAlignedBoundingBox bb;
+        bb.min.x = cx - r; bb.min.y = cy - r; bb.min.z = cz - r;
+        bb.max.x = cx + r; bb.max.y = cy + r; bb.max.z = cz + r;
+        boxes.push_back(bb);
+    }
+    for (const auto& a : aabbsV) {
+        prims.push_back(HwPrim{1, a.lo.x, a.lo.y, a.lo.z, a.hi.x, a.hi.y, a.hi.z, 0, a.primIndex, 0,0,0});
+        MTLAxisAlignedBoundingBox bb;
+        bb.min.x = fxf(a.lo.x)-kMargin; bb.min.y = fxf(a.lo.y)-kMargin; bb.min.z = fxf(a.lo.z)-kMargin;
+        bb.max.x = fxf(a.hi.x)+kMargin; bb.max.y = fxf(a.hi.y)+kMargin; bb.max.z = fxf(a.hi.z)+kMargin;
+        boxes.push_back(bb);
+    }
+    const uint32_t N = (uint32_t)prims.size();
+
+    id<MTLCommandQueue> queue = [dev newCommandQueue];
+    id<MTLBuffer> primBuf = [dev newBufferWithBytes:prims.data() length:prims.size()*sizeof(HwPrim)
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bboxBuf = [dev newBufferWithBytes:boxes.data() length:boxes.size()*sizeof(MTLAxisAlignedBoundingBox)
+                                            options:MTLResourceStorageModeShared];
+
+    // ---- Build the primitive acceleration structure (bounding-box geometry). ----
+    MTLAccelerationStructureBoundingBoxGeometryDescriptor* geo =
+        [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
+    geo.boundingBoxBuffer = bboxBuf;
+    geo.boundingBoxCount = N;
+    MTLPrimitiveAccelerationStructureDescriptor* asDesc =
+        [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+    asDesc.geometryDescriptors = @[geo];
+    MTLAccelerationStructureSizes sizes = [dev accelerationStructureSizesWithDescriptor:asDesc];
+    id<MTLAccelerationStructure> accel = [dev newAccelerationStructureWithSize:sizes.accelerationStructureSize];
+    id<MTLBuffer> scratch = [dev newBufferWithLength:sizes.buildScratchBufferSize
+                                            options:MTLResourceStorageModePrivate];
+    {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLAccelerationStructureCommandEncoder> enc = [cb accelerationStructureCommandEncoder];
+        [enc buildAccelerationStructure:accel descriptor:asDesc scratchBuffer:scratch scratchBufferOffset:0];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.error) return fail("rt2-query-hw: accel build failed");
+    }
+
+    // ---- Compile the hand-authored MSL kernel + pipeline. ----
+    std::string src = LoadText(std::string(HF_SHADER_DIR) + "/rt_query.metal");
+    if (src.empty()) return fail("rt2-query-hw: could not read shaders/rt_query.metal");
+    NSError* err = nil;
+    MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
+    opts.languageVersion = MTLLanguageVersion2_4;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()]
+                                          options:opts error:&err];
+    if (!lib) return fail(std::string("rt2-query-hw: MSL compile failed: ") +
+                          (err ? err.localizedDescription.UTF8String : "?"));
+    id<MTLFunction> fn = [lib newFunctionWithName:@"rt_query_main"];
+    if (!fn) return fail("rt2-query-hw: kernel rt_query_main not found");
+    id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) return fail(std::string("rt2-query-hw: pipeline failed: ") +
+                          (err ? err.localizedDescription.UTF8String : "?"));
+
+    // ---- Params buffer. ----
+    HwParams hp{};
+    hp.eye[0]=cam.eye.x; hp.eye[1]=cam.eye.y; hp.eye[2]=cam.eye.z;
+    hp.right[0]=cam.right.x; hp.right[1]=cam.right.y; hp.right[2]=cam.right.z;
+    hp.up[0]=cam.up.x; hp.up[1]=cam.up.y; hp.up[2]=cam.up.z;
+    hp.forward[0]=cam.forward.x; hp.forward[1]=cam.forward.y; hp.forward[2]=cam.forward.z;
+    hp.light[0]=scene.lightDir.x; hp.light[1]=scene.lightDir.y; hp.light[2]=scene.lightDir.z;
+    hp.plane[0]=cam.halfW; hp.plane[1]=cam.halfH; hp.plane[2]=(int)kRtW; hp.plane[3]=(int)kRtH;
+    hp.counts[0]=N; hp.counts[2]=scene.background;
+    id<MTLBuffer> paramBuf = [dev newBufferWithBytes:&hp length:sizeof(HwParams) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> imageBuf = [dev newBufferWithLength:kPixels*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+
+    auto dispatchHw = [&]() {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:pso];
+        [ce setBuffer:primBuf offset:0 atIndex:0];
+        [ce setBuffer:paramBuf offset:0 atIndex:1];
+        [ce setBuffer:imageBuf offset:0 atIndex:2];
+        [ce setAccelerationStructure:accel atBufferIndex:3];
+        [ce useResource:accel usage:MTLResourceUsageRead];
+        MTLSize grid = MTLSizeMake(kRtW, kRtH, 1);
+        MTLSize tg = MTLSizeMake(8, 8, 1);
+        [ce dispatchThreads:grid threadsPerThreadgroup:tg];
+        [ce endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    };
+
+    dispatchHw();
+    std::vector<uint32_t> hwImage(kPixels, 0);
+    std::memcpy(hwImage.data(), imageBuf.contents, kPixels * sizeof(uint32_t));
+
+    // PROOF 1: Metal-HW == CPU byte-equal.
+    if (std::memcmp(hwImage.data(), cpuImage.data(), kPixels * sizeof(uint32_t)) != 0)
+        return fail("rt2-query-hw: Metal-HW image != CPU rtrace::RenderScene (divergence)");
+    std::printf("rt2-query-hw: {rays:%zu, prims:%u} Metal-HW==CPU image BYTE-EQUAL (supportsRaytracing:true)\n",
+                kPixels, kPrimCount);
+
+    // PROOF 2: HW determinism (two dispatches byte-identical).
+    dispatchHw();
+    std::vector<uint32_t> hwImage2(kPixels, 0);
+    std::memcpy(hwImage2.data(), imageBuf.contents, kPixels * sizeof(uint32_t));
+    if (std::memcmp(hwImage.data(), hwImage2.data(), kPixels * sizeof(uint32_t)) != 0)
+        return fail("rt2-query-hw: two HW dispatches differ (nondeterministic)");
+    std::printf("rt2-query-hw determinism: HW two runs BYTE-IDENTICAL\n");
+
+    if (!writeImage(hwImage)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic METAL HW ray-query scene (%u hits)\n",
                 outPath, kRtW, kRtH, hits);
     return 0;
 }
@@ -57448,6 +57635,13 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt2-query") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt2_query.png";
             try { return RunRt2QueryShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rt2-query-hw <out.png>: render the Slice RT2b Metal HARDWARE ray query (intersection_query over an
+        // MTLAccelerationStructure) -> Metal-HW==CPU byte-equal proof. New golden tests/golden/metal/rt2_hwquery.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt2-query-hw") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt2_hwquery.png";
+            try { return RunRt2QueryHwShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         if (argc > 1 && std::strcmp(argv[1], "--fpx") == 0) {

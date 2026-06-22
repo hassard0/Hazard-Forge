@@ -240,7 +240,8 @@
       "verdict-lockstep",
       "verdict-render",
       "rt1-trace",
-      "rt2-query"
+      "rt2-query",
+      "rt2-query-hw"
     ]
   },
   "showcases": [
