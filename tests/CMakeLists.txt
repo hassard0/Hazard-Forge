@@ -775,6 +775,19 @@ hf_add_pure_test(gi_interp_test)
 # ASan-eligible.
 hf_add_pure_test(gi_bounce_test)
 
+# Deterministic Lumen-class GI Slice 5 (Slice GI5, INTEGER CHEBYSHEV OCCLUSION WEIGHTING — the probe-volume
+# light-leak fix of FLAGSHIP #29): the pure-CPU validation of the INTEGER Chebyshev occlusion weighting
+# (engine/render/gi.h::FxProbeMoments_All / FxChebyshevVisibility / FxInterpolateIrradianceOcc the
+# gi_occ.comp shader runs VERBATIM). Settles the leak-fix before any GPU trust: the per-probe distance
+# moments are deterministic + a VALID variance (meanDist2 >= meanDist²); the Chebyshev visibility is kOne for
+# d<=meanDist, STRICTLY decreasing for d>meanDist, bounded to [0,kOne]; occStrength==0 -> the occlusion-
+# weighted interp is BYTE-IDENTICAL to the unoccluded GI3 FxInterpolateIrradiance (the no-op contract); the
+# re-normalized weights sum to kOne EXACTLY (partition of unity preserved); a behind-occluder query is
+# ATTENUATED vs the unoccluded blend (the leak reduced); two-run determinism + the empty-query no-op. gi.h
+# #includes render/rtrace.h read-only (byte-frozen), rtrace.h #includes sim/fpx.h read-only. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(gi_occ_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

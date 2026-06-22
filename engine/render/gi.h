@@ -853,4 +853,223 @@ inline fx GiMaxIrradiance(std::span<const FxProbeSH> sh, const FxVec3& normal) {
     return maxIrr;
 }
 
+// =====================================================================================================
+// ===== Slice GI5 — INTEGER CHEBYSHEV OCCLUSION WEIGHTING (the probe-volume light-leak fix) ============
+// =====================================================================================================
+// APPEND-ONLY (everything above this banner is GI1+GI2+GI3+GI4, BYTE-FROZEN). GI5 fixes the classic
+// probe-volume artifact — LIGHT LEAK: the unoccluded GI3 trilinear blend (FxInterpolateIrradiance) lets a
+// probe on the FAR side of a wall contribute to a query point in FRONT of it, so light bleeds through
+// geometry. The fix is the variance-shadow-map CHEBYSHEV VISIBILITY (Majercik et al. 2019 / DDGI): capture
+// per-probe distance MOMENTS (mean + mean-squared distance — which the GI1 RT probe trace yields FOR FREE
+// from rtrace::TraceClosest's RtHit.t, NO separate distance-cube pass) and weight each of the 8 trilinear
+// corners by the probability the query point is VISIBLE to that corner probe. STRICT INTEGER -> byte-exact
+// GPU==CPU, strict-zero cross-vendor. The integer twin of probe_dist.h::MomentsFromDistance (167) +
+// ChebyshevVisibility (294) — but in Q16.16, accumulated wide and quantized once (the GI2 discipline).
+//
+// THE MOMENTS COME FREE (the design win, vs the float DDGI's separate distance-cube render pass): the GI1
+// probe trace already calls rtrace::TraceClosest, whose RtHit.t IS the per-ray hit distance (in units of
+// |dir|; the 16 kGiProbeDirs are unit to < 2e-5, so t is the world distance to the bit). Per probe:
+// meanDist = (1/16) Σ t_d, meanDist2 = (1/16) Σ t_d² — accumulate t and t² in int64 (t² is a Q16.16*Q16.16
+// = Q32.32 product overflowing int32; meanDist2 = (Σ t²)/16 >> kFrac, the GI2 stay-wide-narrow-once). A
+// ray that MISSES (primIndex == kRtMiss) sees no occluder -> its distance is a LARGE SENTINEL (kGiMomFar)
+// so the probe reads as fully visible at any realistic query distance (no spurious occlusion from open
+// directions). The means are quantized EXACTLY ONCE.
+//
+// THE CHEBYSHEV INEQUALITY (the integer VSM, FxChebyshevVisibility): for a query at distance d from probe p
+// with moments {meanDist, meanDist2}:
+//   * d <= meanDist                 -> vis = kOne (the query is at/closer than the average occluder -> fully
+//                                       visible; the surface in front of the wall is NOT behind the probe's
+//                                       average occluder).
+//   * else: variance = meanDist2 - meanDist² (>= 0 by Jensen; a small bias kGiVarFloor avoids div-by-zero +
+//     softens a near-flat face); vis = variance / (variance + (d - meanDist)²)  (Chebyshev's upper bound on
+//     P(dist >= d)), clamped to [0,kOne]. The divide is fxdiv (int64-widen + integer divide, the rtrace
+//     idiom). variance ↓ as the occluder distance is sharply defined -> vis ↓ for a query BEYOND the wall.
+//
+// THE OCCLUSION-WEIGHTED BLEND (FxInterpolateIrradianceOcc): take the GI3 FxNearestProbes 8 corners; scale
+// each corner weight w_c *= lerp(kOne, FxChebyshevVisibility(moments[corner], distToCorner), occStrength);
+// then RE-NORMALIZE so Σ w_c == kOne EXACTLY (partition of unity preserved — no energy gain/loss, the GI3
+// invariant), then FxInterpolateSH + FxSHEvaluate VERBATIM. occStrength == 0 -> every lerp factor is kOne
+// -> every weight unchanged -> Σ already kOne -> the re-normalize is the identity -> BYTE-IDENTICAL to
+// FxInterpolateIrradiance (the falsifiable NO-OP contract). All integer -> strict-zero.
+
+// ----- FxProbeMoments — the per-probe distance moments {meanDist, meanDist2} (Q16.16). ----------------
+// The integer twin of probe_dist.h::ProbeDistMoments. meanDist = avg hit distance over the 16 probe rays;
+// meanDist2 = avg of the squared hit distance (so variance = meanDist2 - meanDist² >= 0). std430-tight
+// (two contiguous fx == 8 bytes), a clean GPU mirror. A miss contributes the kGiMomFar sentinel.
+struct FxProbeMoments {
+    fx meanDist = 0;    // (1/16) Σ_d hitDist_d   (Q16.16)
+    fx meanDist2 = 0;   // (1/16) Σ_d hitDist_d²  (Q16.16)
+};
+static_assert(sizeof(FxProbeMoments) == 8, "FxProbeMoments must be std430-tight (two fx == 8 bytes)");
+
+// The far / miss-sentinel distance a probe ray writes where it hits NO geometry (no occluder in that
+// direction). Large enough that any realistic query distance d <= meanDist -> fully visible, but small
+// enough that meanDist² + the int64 t² accumulation never overflow (16 * (256*kOne)² fits int64 easily).
+// 256 world units in Q16.16 (256 << kFrac).
+inline constexpr fx kGiMomFar = (fx)(256 * (int64_t)kOne);
+
+// A small integer variance floor (the band-softener + div-by-zero guard, the probe_dist.h kVarFloorAbs
+// integer analog): a near-flat face has ~0 variance, so var/(var+dd²) would collapse to a hard step; we
+// clamp variance UP to at least this. kOne/4096 ~= 16 LSB of Q16.16 (a tiny absolute floor; the transition
+// stays sharp but never divides by zero).
+inline constexpr fx kGiVarFloor = (fx)(kOne / 4096);
+
+// ----- FxProbeMoments_All — trace the 16 probe rays per probe, fold t/t² into the moments. ------------
+// Per probe p: cast the 16 baked kGiProbeDirs via rtrace::TraceClosest; a HIT contributes its RtHit.t, a
+// MISS contributes kGiMomFar (no occluder -> far). Accumulate t (int64, Q16.16) and t² (int64, Q32.32 —
+// a single ~dist² product overflows int32 for dist>~256, so STAY WIDE) over the 16 rays; quantize the two
+// means EXACTLY ONCE: meanDist = (Σt)/16, meanDist2 = ((Σt²)/16) >> kFrac (Q32.32 average -> Q16.16). PURE
+// INTEGER, deterministic. `out` must be ProbeCount(grid) long; a 0-probe grid writes nothing (the no-op).
+inline void FxProbeMoments_All(const GiProbeGrid& grid, const RtScene& scene, std::span<FxProbeMoments> out) {
+    int probes = ProbeCount(grid);
+    for (int p = 0; p < probes; ++p) {
+        FxVec3 origin = ProbePos(grid, p);
+        int64_t sumT = 0, sumT2 = 0;
+        for (int d = 0; d < kGiRaysPerProbe; ++d) {
+            RtRay ray{origin, kGiProbeDirs[d]};
+            RtHit hit = TraceClosest(ray, scene);
+            int64_t dist = (hit.primIndex != kRtMiss) ? (int64_t)hit.t : (int64_t)kGiMomFar;
+            sumT  += dist;
+            sumT2 += dist * dist;   // Q32.32 term — WIDE, no narrow yet
+        }
+        FxProbeMoments m{};
+        m.meanDist  = (fx)(sumT / kGiRaysPerProbe);                       // Q16.16 average, quantize once
+        m.meanDist2 = (fx)((sumT2 / kGiRaysPerProbe) >> kFrac);           // Q32.32 average -> Q16.16, once
+        out[p] = m;
+    }
+}
+
+// ----- FxChebyshevVisibility — the integer variance-shadow (Chebyshev) visibility weight. -------------
+// vis(m, d) in [0,kOne]: the probability the surface at distance d from the probe is VISIBLE to it (not
+// behind the probe's average occluder). d <= meanDist -> kOne (in front of / at the occluder). Else
+// variance = meanDist2 - meanDist² (clamped >= kGiVarFloor — the bias avoids div0 + softens a flat face);
+// vis = variance / (variance + (d-meanDist)²) via fxdiv (int64). The integer twin of
+// probe_dist.h::ChebyshevVisibility. PURE INTEGER, deterministic, no div-by-zero (denom >= kGiVarFloor>0).
+inline fx FxChebyshevVisibility(const FxProbeMoments& m, fx queryDist) {
+    if (queryDist <= m.meanDist) return kOne;                 // at/closer than the average occluder
+    fx variance = (fx)(m.meanDist2 - fxmul(m.meanDist, m.meanDist));   // meanDist2 - meanDist² (Q16.16)
+    if (variance < kGiVarFloor) variance = kGiVarFloor;       // bias: avoid div0 + soften a near-flat face
+    fx dd = (fx)(queryDist - m.meanDist);                     // > 0 here
+    fx dd2 = fxmul(dd, dd);                                   // (d - meanDist)² (Q16.16)
+    fx denom = (fx)(variance + dd2);                          // > 0 strictly (variance >= kGiVarFloor)
+    fx vis = rtrace::fxdiv(variance, denom);                  // Chebyshev upper bound, Q16.16 in [0,1]
+    if (vis < 0) vis = 0;
+    if (vis > kOne) vis = kOne;
+    return vis;
+}
+
+// ----- GiFxLerp — the integer lerp a + (b-a)*t, t in [0,kOne] (the occStrength blend). ----------------
+// lerp(a, b, t) = a + fxmul(b - a, t). t == 0 -> a EXACTLY (a + fxmul(b-a, 0) == a + 0); t == kOne -> b
+// (within Q16.16). PURE INTEGER, deterministic. (Named GiFxLerp to avoid colliding with sim lerp helpers.)
+inline fx GiFxLerp(fx a, fx b, fx t) {
+    return (fx)(a + fxmul((fx)(b - a), t));
+}
+
+// ----- FxInterpolateIrradianceOcc — the GI3 blend with Chebyshev occlusion weighting (the leak fix). --
+// = FxNearestProbes(grid, point) corners, each weight scaled by lerp(kOne, FxChebyshevVisibility(moments
+// [corner], distToCorner), occStrength), RE-NORMALIZED so Σ == kOne, then FxInterpolateSH + FxSHEvaluate
+// (the GI3 path VERBATIM). distToCorner = the Q16.16 length from `point` to that corner PROBE's world
+// position (fpx::FxLength via the sum-of-squares int64 sqrt — the SAME integer length the RT uses). When
+// occStrength == 0: every visibility factor is lerp(kOne, vis, 0) == kOne -> every weight unchanged ->
+// Σ w == kOne already -> the re-normalize is a pure identity -> the result is BYTE-IDENTICAL to
+// FxInterpolateIrradiance (the no-op contract). PURE INTEGER, deterministic, cross-backend exact.
+//
+// THE RE-NORMALIZE (partition of unity preserved, no energy gain/loss): scale each weight, sum them (int64,
+// Q16.16), then w_c <- fxdiv(w_c, sumW) for the first 7 corners and assign corner 7 the EXACT leftover
+// (kOne - Σ_{c<7}) so Σ == kOne EXACTLY (the GI3 leftover discipline). A degenerate sumW <= 0 (all corners
+// fully occluded — impossible since the corner AT/nearest the point has d<=meanDist -> vis kOne, but
+// guarded) falls back to the unweighted GI3 weights.
+inline GiRadiance FxInterpolateIrradianceOcc(const GiProbeGrid& grid, std::span<const FxProbeSH> shBuffer,
+                                             std::span<const FxProbeMoments> moments, const FxVec3& point,
+                                             const FxVec3& normal, fx occStrength) {
+    FxProbeWeights t = FxNearestProbes(grid, point);
+    // Scale each corner weight by its lerped Chebyshev visibility. occStrength==0 -> factor kOne -> unchanged.
+    fx scaled[8];
+    int64_t sumW = 0;
+    bool haveMoments = !moments.empty() && !shBuffer.empty();
+    for (int c = 0; c < 8; ++c) {
+        fx w = t.w[c];
+        if (haveMoments && occStrength != 0) {
+            FxVec3 cornerPos = ProbePos(grid, t.idx[c]);
+            FxVec3 delta{(fx)(point.x - cornerPos.x), (fx)(point.y - cornerPos.y),
+                         (fx)(point.z - cornerPos.z)};
+            int64_t sx = (int64_t)delta.x * (int64_t)delta.x;
+            int64_t sy = (int64_t)delta.y * (int64_t)delta.y;
+            int64_t sz = (int64_t)delta.z * (int64_t)delta.z;
+            fx distToCorner = (fx)rtrace::FxISqrt(sx + sy + sz);   // Q16.16 length (the RT integer sqrt)
+            fx vis = FxChebyshevVisibility(moments[(size_t)t.idx[c]], distToCorner);
+            fx factor = GiFxLerp(kOne, vis, occStrength);          // lerp(kOne, vis, occStrength)
+            w = fxmul(w, factor);
+        }
+        scaled[c] = w;
+        sumW += (int64_t)w;
+    }
+    // Re-normalize so Σ == kOne EXACTLY (partition of unity). occStrength==0 -> scaled==t.w, sumW==kOne ->
+    // fxdiv(w, kOne) == w and the leftover corner is the exact original -> a TRUE byte-identity no-op.
+    FxProbeWeights norm = t;
+    if (sumW > 0) {
+        int64_t accum = 0;
+        for (int c = 0; c < 7; ++c) {
+            fx w = rtrace::fxdiv(scaled[c], (fx)sumW);   // w / sumW in Q16.16 (== w when sumW==kOne)
+            norm.w[c] = w;
+            accum += (int64_t)w;
+        }
+        norm.w[7] = (fx)(kOne - accum);                  // exact leftover -> Σ == kOne
+    }
+    // Blend + reconstruct (the GI3 path VERBATIM).
+    return FxSHEvaluate(FxInterpolateSH(norm, shBuffer), normal);
+}
+
+// ----- InterpolateFieldOcc — the occlusion-weighted irradiance field over a set of query points. ------
+// One query per output element (matching the shader's one-thread-per-query). `points`/`normals`/`out` are
+// parallel spans; out[i] = FxInterpolateIrradianceOcc(grid, shBuffer, moments, points[i], normals[i],
+// occStrength). An empty query set writes nothing (the no-op). occStrength==0 -> == InterpolateField
+// BYTE-for-BYTE. PURE INTEGER, deterministic.
+inline void InterpolateFieldOcc(const GiProbeGrid& grid, std::span<const FxProbeSH> shBuffer,
+                                std::span<const FxProbeMoments> moments, std::span<const FxVec3> points,
+                                std::span<const FxVec3> normals, fx occStrength,
+                                std::span<GiRadiance> out) {
+    size_t n = points.size();
+    for (size_t i = 0; i < n; ++i)
+        out[i] = FxInterpolateIrradianceOcc(grid, shBuffer, moments, points[i], normals[i], occStrength);
+}
+
+// ----- GiOccFieldToImage — the occlusion-fixed interpolated-irradiance-field viz (the GI5 golden). ----
+// The GiFieldToImage 2D slice (a horizontal plane at the grid's vertical midplane, +Y receiver normal,
+// PINNED slice + resolution) but evaluated with FxInterpolateIrradianceOcc — light behind an occluder wall
+// is DARKER than the leaky GI3 blend. Strict integer -> identical both backends. `img` is row-major RGBA8
+// (top row first), size == w*h. A 0-probe / empty-SH grid -> the image is left as the background fill.
+inline void GiOccFieldToImage(const GiProbeGrid& grid, std::span<const FxProbeSH> shBuffer,
+                              std::span<const FxProbeMoments> moments, fx occStrength,
+                              std::span<uint32_t> img, uint32_t w, uint32_t h) {
+    const uint32_t kBg = PackRGBA8(18, 18, 22, 255);
+    for (uint32_t i = 0; i < w * h; ++i) img[i] = kBg;
+
+    int probes = ProbeCount(grid);
+    if (probes <= 0 || shBuffer.empty() || w == 0 || h == 0) return;
+
+    const fx spanX = fxmul((fx)((int64_t)(grid.nx - 1) * kOne), grid.spacing);
+    const fx spanZ = fxmul((fx)((int64_t)(grid.nz - 1) * kOne), grid.spacing);
+    const fx sliceY = (fx)(grid.origin.y + (fxmul((fx)((int64_t)(grid.ny - 1) * kOne), grid.spacing) >> 1));
+    const FxVec3 nrm{0, kOne, 0};
+
+    auto q = [](fx v) -> int32_t {
+        int64_t t = ((int64_t)v * 255) >> kFrac;
+        if (t < 0) t = 0; if (t > 255) t = 255;
+        return (int32_t)t;
+    };
+
+    for (uint32_t py = 0; py < h; ++py) {
+        fx vfr = (h > 1) ? (fx)(((int64_t)py * kOne) / (int64_t)(h - 1)) : 0;
+        fx z = (fx)(grid.origin.z + (int64_t)(((int64_t)spanZ * vfr) >> kFrac));
+        for (uint32_t px = 0; px < w; ++px) {
+            fx ufr = (w > 1) ? (fx)(((int64_t)px * kOne) / (int64_t)(w - 1)) : 0;
+            fx x = (fx)(grid.origin.x + (int64_t)(((int64_t)spanX * ufr) >> kFrac));
+            GiRadiance irr = FxInterpolateIrradianceOcc(grid, shBuffer, moments,
+                                                        FxVec3{x, sliceY, z}, nrm, occStrength);
+            img[(size_t)py * w + px] = PackRGBA8(q(irr.r), q(irr.g), q(irr.b), 255);
+        }
+    }
+}
+
 }  // namespace hf::render::gi

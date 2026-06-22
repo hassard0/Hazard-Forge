@@ -18573,6 +18573,125 @@ static int RunGi4BounceShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GI5 — Deterministic Lumen-class GI INTEGER CHEBYSHEV OCCLUSION WEIGHTING showcase (--gi5-occlusion)
+// (the probe-volume LIGHT-LEAK FIX of FLAGSHIP #29). The Vulkan --gi5-occlusion-shot dispatches
+// shaders/gi_occ.comp (the int64 SH-blend + Chebyshev occlusion weighting, one thread per query point) and
+// memcmp's the GPU GiRadiance field == CPU gi::InterpolateFieldOcc. gi_occ.comp uses an int64 SH-blend +
+// int64 Chebyshev fxdiv/t²/FxISqrt -> Vulkan-SPIR-V-ONLY (glslc can't parse int64_t), so on Metal
+// --gi5-occlusion runs the CPU gi::InterpolateFieldOcc + GiOccFieldToImage reference (the SAME bit-exact
+// reference the Vulkan GPU==CPU memcmp compares against) -> the Metal image is byte-identical to the Vulkan
+// GPU image BY CONSTRUCTION. Builds the SAME gi::BuildGi1Scene enclosure (its occluder box separates a lit +
+// a shadowed region) + 4x4x4 GiProbeGrid, CPU-traces the GI1 radiance, encodes the GI2 SH, captures the GI5
+// per-probe distance moments (gi::FxProbeMoments_All, the RT-trace-t by-product), proves the occStrength=0
+// no-op (== GI3's InterpolateField, byte-exact) + the leak attenuation (behind-occluder occ<unocc) +
+// determinism, renders gi::GiOccFieldToImage (the leak-fixed field at the midplane, normal +Y) at 256x256,
+// writes the PNG. Because the occlusion weighting is INTEGER, the gi5_occlusion golden is STRICT-ZERO
+// cross-vendor. New golden tests/golden/metal/gi5_occlusion.png (Mac-baked by the CONTROLLER).
+static int RunGi5OcclusionShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace gi = hf::render::gi;
+    using rt::fx; using rt::FxVec3; using rt::kOne; using rt::kFrac;
+
+    const uint32_t kImgW = 256, kImgH = 256;
+    const fx kOccStrength = kOne;   // full Chebyshev occlusion weighting
+
+    gi::GiScene1 sc = gi::BuildGi1Scene();
+    gi::GiProbeGrid grid;
+    grid.origin  = FxVec3{gi::GiF(-2,1), gi::GiF(1,1), gi::GiF(0,1)};
+    grid.spacing = gi::GiF(1,1);
+    grid.nx = 4; grid.ny = 4; grid.nz = 4;
+    const uint32_t kProbes = (uint32_t)gi::ProbeCount(grid);
+    const uint32_t kRays   = (uint32_t)gi::kGiRaysPerProbe;
+
+    // CPU radiance (GI1) -> SH (GI2) + moments (GI5) — the SAME bit-exact buffers the Vulkan GPU==CPU memcmp proves.
+    std::vector<gi::GiRadiance> rad((size_t)kProbes * kRays);
+    gi::TraceProbeRays(grid, sc.scene, std::span<gi::GiRadiance>(rad));
+    std::vector<gi::FxProbeSH> sh(kProbes);
+    gi::EncodeAllProbes(grid, std::span<const gi::GiRadiance>(rad), std::span<gi::FxProbeSH>(sh));
+    std::span<const gi::FxProbeSH> shSpan(sh);
+    std::vector<gi::FxProbeMoments> mom(kProbes);
+    gi::FxProbeMoments_All(grid, sc.scene, std::span<gi::FxProbeMoments>(mom));
+    std::span<const gi::FxProbeMoments> momSpan(mom);
+    std::printf("gi5-occlusion: {probes:%u} [Metal: CPU gi::InterpolateFieldOcc, byte-identical to the Vulkan GPU "
+                "result by construction]\n", kProbes);
+
+    // Build a dense query field (the GiOccFieldToImage slice points + a +Y normal each).
+    const int QW = 128, QH = 128;
+    const size_t kPoints = (size_t)QW * QH;
+    const fx spanX = rt::fxmul((fx)((int64_t)(grid.nx - 1) * kOne), grid.spacing);
+    const fx spanZ = rt::fxmul((fx)((int64_t)(grid.nz - 1) * kOne), grid.spacing);
+    const fx sliceY = (fx)(grid.origin.y + (rt::fxmul((fx)((int64_t)(grid.ny - 1) * kOne), grid.spacing) >> 1));
+    std::vector<FxVec3> pts(kPoints), nrm(kPoints, FxVec3{0, kOne, 0});
+    for (int qz = 0; qz < QH; ++qz)
+        for (int qx = 0; qx < QW; ++qx) {
+            fx u = (fx)(((int64_t)qx * kOne) / (QW - 1));
+            fx v = (fx)(((int64_t)qz * kOne) / (QH - 1));
+            fx x = (fx)(grid.origin.x + (((int64_t)spanX * u) >> kFrac));
+            fx z = (fx)(grid.origin.z + (((int64_t)spanZ * v) >> kFrac));
+            pts[(size_t)qz * QW + qx] = FxVec3{x, sliceY, z};
+        }
+
+    // No-op (occStrength=0 == GI3's InterpolateField, byte-exact).
+    {
+        std::vector<gi::GiRadiance> occZero(kPoints), gi3Field(kPoints);
+        gi::InterpolateFieldOcc(grid, shSpan, momSpan, std::span<const FxVec3>(pts),
+                                std::span<const FxVec3>(nrm), /*occStrength*/0,
+                                std::span<gi::GiRadiance>(occZero));
+        gi::InterpolateField(grid, shSpan, std::span<const FxVec3>(pts), std::span<const FxVec3>(nrm),
+                             std::span<gi::GiRadiance>(gi3Field));
+        if (std::memcmp(occZero.data(), gi3Field.data(), kPoints*sizeof(gi::GiRadiance)) != 0)
+            return fail("gi5-occlusion: occStrength=0 != GI3 (the lerp/renormalize is not a true identity)");
+        std::printf("gi5-occlusion: occStrength=0 == GI3 (unoccluded) BYTE-IDENTICAL\n");
+    }
+
+    // Leak fixed (behind-occluder irr occ<unocc, attenuated:N pts).
+    std::vector<gi::GiRadiance> occON(kPoints);
+    {
+        gi::InterpolateFieldOcc(grid, shSpan, momSpan, std::span<const FxVec3>(pts),
+                                std::span<const FxVec3>(nrm), kOccStrength,
+                                std::span<gi::GiRadiance>(occON));
+        std::vector<gi::GiRadiance> gi3Field(kPoints);
+        gi::InterpolateField(grid, shSpan, std::span<const FxVec3>(pts), std::span<const FxVec3>(nrm),
+                             std::span<gi::GiRadiance>(gi3Field));
+        int attenuated = 0;
+        for (size_t i = 0; i < kPoints; ++i) {
+            const gi::GiRadiance& o = occON[i];
+            const gi::GiRadiance& u = gi3Field[i];
+            if ((o.r < u.r) || (o.g < u.g) || (o.b < u.b)) ++attenuated;
+        }
+        if (attenuated < 1)
+            return fail("gi5-occlusion: leak NOT attenuated (the Chebyshev or moments are wrong)");
+        std::printf("gi5-occlusion: leak fixed (behind-occluder irr occ<unocc, attenuated:%d pts)\n", attenuated);
+    }
+
+    // Two-run determinism (the CPU interp is a pure function).
+    {
+        std::vector<gi::GiRadiance> o2(kPoints);
+        gi::InterpolateFieldOcc(grid, shSpan, momSpan, std::span<const FxVec3>(pts),
+                                std::span<const FxVec3>(nrm), kOccStrength,
+                                std::span<gi::GiRadiance>(o2));
+        if (std::memcmp(occON.data(), o2.data(), kPoints*sizeof(gi::GiRadiance)) != 0)
+            return fail("gi5-occlusion: two CPU runs differ (nondeterministic)");
+        std::printf("gi5-occlusion determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Render the leak-fixed interpolated-irradiance-field slice + write the image. ---
+    std::vector<uint32_t> img((size_t)kImgW * kImgH, 0);
+    gi::GiOccFieldToImage(grid, shSpan, momSpan, kOccStrength, std::span<uint32_t>(img), kImgW, kImgH);
+    std::vector<uint8_t> bgra((size_t)kImgW * kImgH * 4, 0);
+    for (size_t p = 0; p < (size_t)kImgW * kImgH; ++p) {
+        uint32_t px = img[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kImgW, kImgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic integer occlusion-fixed irradiance field [CPU reference] "
+                "(%u probes)\n", outPath, kImgW, kImgH, kProbes);
+    return 0;
+}
+
 // ===== Slice RT3 — Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase (--rt3-shadow) (FLAGSHIP
 // #28). The Vulkan --rt3-shadow-shot wires REAL HW inline ray query: a PRIMARY RayQuery closest-hit THEN a
 // SECOND any-hit shadow ray (toward the directional light) whose order-independent occlusion OR GATES the
@@ -58411,6 +58530,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gi4-bounce") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gi4_bounce.png";
             try { return RunGi4BounceShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gi5-occlusion <out.png>: render the Deterministic Lumen-class GI INTEGER CHEBYSHEV OCCLUSION
+        // WEIGHTING showcase (Slice GI5, the probe-volume LIGHT-LEAK FIX of FLAGSHIP #29). gi_occ.comp uses an
+        // int64 SH-blend + int64 Chebyshev -> Vulkan-SPIR-V-ONLY (glslc can't parse int64_t), so Metal runs the
+        // CPU gi::InterpolateFieldOcc + GiOccFieldToImage reference (byte-identical to the Vulkan GPU result by
+        // construction). New golden tests/golden/metal/gi5_occlusion.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gi5-occlusion") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gi5_occlusion.png";
+            try { return RunGi5OcclusionShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt3-shadow <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase

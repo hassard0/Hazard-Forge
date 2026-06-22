@@ -607,6 +607,20 @@ hf_compile_shaders(
     # Metal hf_gen_msl list; on Metal --gi4-bounce runs the CPU gi::BounceProbes (byte-identical by
     # construction). The Vulkan side carries the HW==CPU final-SH memcmp proof.
     "shaders/gi_bounce.comp.hlsl:csrq"
+    # Deterministic Lumen-class GI Slice 5 (Slice GI5, INTEGER CHEBYSHEV OCCLUSION WEIGHTING — the probe-volume
+    # LIGHT-LEAK FIX of FLAGSHIP #29): gi_occ.comp is the DETERMINISTIC INTEGER OCCLUSION-WEIGHTED interpolation
+    # kernel — ONE thread per QUERY POINT runs FxInterpolateIrradianceOcc VERBATIM: the GI3 trilinear blend, but
+    # each of the 8 corner weights is scaled by the variance-shadow CHEBYSHEV VISIBILITY of that corner probe
+    # (from the per-probe distance moments gMoments — gi::FxProbeMoments, the RT-trace-t by-product the CPU
+    # FxProbeMoments_All computes + uploads, NO GPU distance pass) and the 8 weights are RE-NORMALIZED to Σ ==
+    # kOne -> FxInterpolateSH (int64 8-corner blend) -> FxSHEvaluate — bit-identical to the CPU
+    # gi::InterpolateFieldOcc (the GPU==CPU irradiance memcmp proof; occStrength==0 -> byte-identical to the GI3
+    # unoccluded blend, the no-op contract). NO RayQuery / NO accel structure (pure-integer compute over the GI2
+    # SH + GI5 moments buffers), so the :cs stage compiles it cs_6_x; but the int64 SH-blend + the int64
+    # Chebyshev fxdiv/t² make it VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal
+    # hf_gen_msl list; on Metal the --gi5-occlusion showcase runs the CPU gi::InterpolateFieldOcc (byte-identical
+    # by construction, the gi_interp.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact.
+    "shaders/gi_occ.comp.hlsl:cs"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

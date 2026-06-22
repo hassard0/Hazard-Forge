@@ -376,6 +376,16 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # SAME bit-exact reference the Vulkan HW==CPU memcmp compares against) -> the Metal result is byte-identical to
 # the Vulkan HW result BY CONSTRUCTION, while the Vulkan side carries the HW final-SH == CPU proof. So
 # gi_bounce.comp gets NO hf_gen_msl line.
+# Deterministic Lumen-class GI Slice 5 (Slice GI5, INTEGER CHEBYSHEV OCCLUSION WEIGHTING — the probe-volume
+# LIGHT-LEAK FIX of FLAGSHIP #29): gi_occ.comp is the DETERMINISTIC INTEGER OCCLUSION-WEIGHTED interpolation
+# kernel — ONE thread per QUERY POINT runs FxInterpolateIrradianceOcc (the GI3 trilinear blend, but each of
+# the 8 corner weights is scaled by the variance-shadow CHEBYSHEV VISIBILITY of that corner probe from the
+# per-probe distance moments gMoments, the 8 weights RE-NORMALIZED to Σ == kOne). Like gi_interp.comp it is
+# VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: the int64 SH-blend accumulator PLUS the int64 Chebyshev
+# fxdiv / t² / FxISqrt glslc cannot lower to MSL. On Metal the --gi5-occlusion showcase runs the CPU
+# gi::InterpolateFieldOcc (the SAME bit-exact reference the Vulkan GPU==CPU memcmp compares against) -> the
+# Metal result is byte-identical to the Vulkan GPU result BY CONSTRUCTION, while the Vulkan side carries the
+# GPU==CPU irradiance proof. So gi_occ.comp gets NO hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul
