@@ -1,0 +1,86 @@
+[
+  {
+    "request": {
+      "op": "query",
+      "select": "entity",
+      "entity": 1,
+      "fields": [
+        "transform",
+        "material"
+      ]
+    },
+    "response": {
+      "index": 1,
+      "transform": {
+        "position": [-1.8, 0.55, -1.8],
+        "euler": [0, 0, 0],
+        "scale": [0.55, 0.55, 0.55]
+      },
+      "material": {
+        "metallic": 1,
+        "roughness": 0.15,
+        "baseColor": "checker",
+        "normalMap": "flat_normal"
+      }
+    }
+  },
+  {
+    "request": {
+      "op": "query",
+      "select": "entity",
+      "entity": 9
+    },
+    "response": {
+      "index": 9,
+      "transform": {
+        "position": [0, 1.35, 0],
+        "euler": [0, 2.3, 0],
+        "scale": [0.022, 0.022, 0.022]
+      },
+      "material": {
+        "metallic": 0,
+        "roughness": 1,
+        "baseColor": "duck_basecolor",
+        "normalMap": "flat_normal"
+      },
+      "mesh": "duck"
+    }
+  },
+  {
+    "request": {
+      "op": "query",
+      "select": "stats"
+    },
+    "response": {
+      "entities": 10,
+      "meshes": 4,
+      "textures": 4
+    }
+  },
+  {
+    "request": {
+      "op": "query",
+      "select": "entities"
+    },
+    "response": [
+      { "index": 0, "mesh": "plane" },
+      { "index": 1, "mesh": "sphere" },
+      { "index": 2, "mesh": "cube" },
+      { "index": 3, "mesh": "cube" },
+      { "index": 4, "mesh": "cube" },
+      { "index": 5, "mesh": "cube" },
+      { "index": 6, "mesh": "cube" },
+      { "index": 7, "mesh": "cube" },
+      { "index": 8, "mesh": "sphere" },
+      { "index": 9, "mesh": "duck" }
+    ]
+  },
+  {
+    "request": {
+      "op": "query",
+      "select": "entity",
+      "entity": 99
+    },
+    "response": { "error": "out-of-range", "entity": 99, "count": 10 }
+  }
+]

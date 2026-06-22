@@ -7,3 +7,8 @@ tests/golden/introspect/*.json text eol=lf
 # --material-introspect dump (material::DescribeGraphJson), which is written LF-only (no BOM). Pin to
 # LF so a CRLF-default Windows checkout does not rewrite it and break the exact-match verify + test.
 tests/golden/material/*.json text eol=lf
+
+# The agent query-responses golden (Slice DX2) is compared BYTE-FOR-BYTE against a fresh --agent-query
+# (scene::RunQueries), which is written LF-only (no BOM). Pin to LF so a CRLF-default Windows checkout
+# does not rewrite it and break the exact-match verify step + the in-exe byte-golden proof.
+tests/golden/agent/*.json text eol=lf

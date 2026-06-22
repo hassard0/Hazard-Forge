@@ -425,6 +425,33 @@ if (-not `$agentOk) {
 }
 Write-Host 'agent-api JSON golden: exact match'
 
+# --- Agent query-responses JSON golden (Slice DX2, FLAGSHIP #31): an EXACT byte-for-byte match of a
+# fresh --agent-query (scene::RunQueries over assets/agent/dx2_queries.json against the default scene)
+# against the committed text golden. This is the agent-OBSERVE READ artifact (the selective,
+# index-addressed, field-selectable scene query — the read half of the request/response SDK loop). Like
+# the --introspect / --agent-api goldens it is backend-AGNOSTIC (pure hf_core, no vk*/Metal symbols, the
+# bytes are identical on Vulkan and Metal), so it is verified once here on the Windows/Vulkan build and
+# is NOT in `$Goldens`/`$vkShots` (the Mac IMAGE set). RunQueries is deterministic + side-effect-free, so
+# this rebakes only when the query script or the default scene changes. The --agent-query exe ALSO runs
+# the 4 DX2 proofs internally (byte-golden / stats-match / determinism / out-of-range) and fails loudly. ---
+Write-Host '--- agent query-responses JSON golden ---'
+`$aqExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$aqScript = 'assets/agent/dx2_queries.json'
+`$aqGolden = 'tests/golden/agent/query_responses.json'
+`$aqLive = Join-Path `$env:TEMP 'hf_agent_query_live.json'
+& `$aqExe --agent-query `$aqScript `$aqLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'agent-query run failed (proofs or byte-golden mismatch)'; exit 30 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$aqgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$aqGolden).Path)
+`$aqlBytes = [System.IO.File]::ReadAllBytes(`$aqLive)
+`$aqOk = (`$aqgBytes.Length -eq `$aqlBytes.Length)
+if (`$aqOk) { for (`$qi = 0; `$qi -lt `$aqgBytes.Length; `$qi++) { if (`$aqgBytes[`$qi] -ne `$aqlBytes[`$qi]) { `$aqOk = `$false; break } } }
+if (-not `$aqOk) {
+    Write-Host 'agent query-responses JSON golden MISMATCH (tests/golden/agent/query_responses.json)'
+    exit 31
+}
+Write-Host 'agent query-responses JSON golden: exact match'
+
 # --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
 # fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
 # INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered

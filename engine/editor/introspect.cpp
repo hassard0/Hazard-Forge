@@ -640,6 +640,9 @@ const AgentArg kArgsRemove[]     = {{"entity", "int"}};
 const AgentArg kArgsCapture[]    = {{"path", "string"}};
 const AgentArg kArgsSaveScene[]  = {{"path", "string"}};
 const AgentArg kArgsIntrospect[] = {{"path", "string?"}};
+// DX2: the selective read op. select picks entity/stats/entities; entity + fields qualify select:entity.
+const AgentArg kArgsQuery[]      = {
+    {"select", "string"}, {"entity", "int?"}, {"fields", "[string]?"}};
 
 const AgentCommand kAgentCommands[] = {
     {"dump",          "observe", nullptr,           0},
@@ -651,6 +654,7 @@ const AgentCommand kAgentCommands[] = {
     {"capture",       "observe", kArgsCapture,       std::size(kArgsCapture)},
     {"save_scene",    "observe", kArgsSaveScene,     std::size(kArgsSaveScene)},
     {"introspect",    "observe", kArgsIntrospect,    std::size(kArgsIntrospect)},
+    {"query",         "observe", kArgsQuery,         std::size(kArgsQuery)},
 };
 
 // FNV-1a 64-bit — the fixed, integer/bit-exact digest the contentHash is built from (the same fixed-

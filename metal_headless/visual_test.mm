@@ -59295,6 +59295,66 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
+        // --agent-query <cmds.json> <out.json> (Slice DX2, FLAGSHIP #31): build the SAME default scene
+        // the Vulkan sample loads (the named resources + assets/scenes/default.json), then run the JSON
+        // query array via scene::RunQueries and write the {request,response} array. RunQueries is pure
+        // CPU above the RHI seam (a string read of the live ECS), so the bytes are IDENTICAL to the
+        // Windows/Vulkan --agent-query by construction. The authoritative byte-golden compare is
+        // Windows-only (verify.ps1); here we just emit the artifact so the Metal showcase set mirrors
+        // the Vulkan one. (A Metal device is created only to build the named GPU resources the scene
+        // refers to by name — the query output depends on the NAMES + transforms, not the pixels.)
+        if (argc > 2 && std::strcmp(argv[1], "--agent-query") == 0) {
+            const char* cmds = argv[2];
+            const char* out = (argc > 3) ? argv[3] : nullptr;
+            if (!out) { std::fprintf(stderr, "FATAL: --agent-query needs <cmds.json> <out.json>\n"); return 1; }
+            try {
+                const uint32_t W = 1280, H = 720;
+                auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+
+                std::vector<uint8_t> checker = MakeCheckerboard();
+                auto texture = device->CreateTexture(
+                    {256, 256, rhi::Format::RGBA8_UNorm, checker.data(), checker.size()});
+                std::vector<uint8_t> normalPixels = MakeBumpyNormalMap();
+                auto bumpNormal = device->CreateTexture(
+                    {256, 256, rhi::Format::RGBA8_UNorm, normalPixels.data(), normalPixels.size()});
+                const uint8_t flatNormalPx[4] = {128, 128, 255, 255};
+                auto flatNormal = device->CreateTexture(
+                    {1, 1, rhi::Format::RGBA8_UNorm, flatNormalPx, sizeof(flatNormalPx)});
+
+                scene::Mesh cube = scene::Mesh::Cube(*device);
+                scene::Mesh plane = scene::Mesh::Plane(*device);
+                scene::Mesh sphere = scene::Mesh::Sphere(*device);
+                hf::asset::GltfModel duckModel = hf::asset::LoadGltfModel(*device, HF_MODEL_PATH);
+                scene::Mesh& duck = duckModel.mesh;
+
+                scene::SceneResources resources;
+                resources.AddMesh("cube", &cube);
+                resources.AddMesh("plane", &plane);
+                resources.AddMesh("sphere", &sphere);
+                resources.AddMesh("duck", &duck);
+                resources.AddTexture("checker", texture.get());
+                resources.AddTexture("normalmap", bumpNormal.get());
+                resources.AddTexture("duck_basecolor", duckModel.baseColor.get());
+                resources.AddTexture("flat_normal", flatNormal.get());
+
+                ecs::Registry registry;
+                scene::LoadScene(registry, resources, HF_SCENE_PATH);
+
+                std::ifstream qf(cmds, std::ios::binary);
+                if (!qf) { std::fprintf(stderr, "FATAL: --agent-query cannot open '%s'\n", cmds); return 1; }
+                std::string queriesJson((std::istreambuf_iterator<char>(qf)),
+                                        std::istreambuf_iterator<char>());
+
+                std::string text = scene::RunQueries(registry, resources, queriesJson.c_str());
+                std::ofstream f(out, std::ios::binary);  // LF-only, no BOM.
+                if (!f) { std::fprintf(stderr, "FATAL: cannot write agent-query output '%s'\n", out); return 1; }
+                f << text;
+                std::printf("agent-query: wrote %s\n", out);
+                return 0;
+            } catch (const std::exception& e) {
+                return fail(std::string("exception: ") + e.what());
+            }
+        }
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
         if (argc > 1 && std::strcmp(argv[1], "--clustered") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clustered.png";

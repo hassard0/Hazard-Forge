@@ -30,6 +30,9 @@ hf_add_pure_test(render_graph_barriers_test)
 hf_add_pure_test(ecs_test)
 hf_add_pure_test(scene_io_test)
 hf_add_pure_test(commands_test)
+# DX2: the selective scene-query read protocol (scene::RunQueries). Pure CPU JSON over the command
+# bus — determinism, field-selection + canonical order, stats counts, out-of-range error object.
+hf_add_pure_test(agent_query_test)
 # Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
 # ASan-eligible like the others.
 hf_add_pure_test(anim_test)

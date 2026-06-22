@@ -114,6 +114,167 @@ bool EntityAtIndex(ecs::Registry& reg, int index, ecs::Entity& out) {
     return false;
 }
 
+// --- DX2 query response builders -----------------------------------------------------------------
+//
+// These build the JSON read of the scene that the "query" op prints + RunQueries returns. The float
+// formatting mirrors scene_io's AppendFloat (%g, double-promoted) so a query:entity response is the
+// SAME bytes DumpScene emits for that entity's components — the house JSON style, backend-identical.
+
+void AppendFloatQ(std::string& os, float f) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(f));
+    os += buf;
+}
+
+void AppendVec3Q(std::string& os, const math::Vec3& v) {
+    os += "[";
+    AppendFloatQ(os, v.x); os += ", ";
+    AppendFloatQ(os, v.y); os += ", ";
+    AppendFloatQ(os, v.z);
+    os += "]";
+}
+
+// The "transform"/"material"/"mesh" component fragments for an entity, indented at `ind` spaces.
+// Each appends a single `"key": <value>` (NO leading indent, NO trailing comma/newline) so the caller
+// joins them with ",\n" + indent in the canonical order.
+void AppendTransformField(std::string& os, const TransformC& tc, const std::string& ind) {
+    os += "\"transform\": {\n";
+    os += ind + "  \"position\": "; AppendVec3Q(os, tc.t.position); os += ",\n";
+    os += ind + "  \"euler\": ";    AppendVec3Q(os, tc.t.eulerRadians); os += ",\n";
+    os += ind + "  \"scale\": ";    AppendVec3Q(os, tc.t.scale); os += "\n";
+    os += ind + "}";
+}
+
+void AppendMaterialField(std::string& os, const MaterialC& mat, const SceneResources& res,
+                         const std::string& ind) {
+    std::string baseName   = mat.base   ? res.NameOfTexture(mat.base)   : std::string();
+    std::string normalName = mat.normal ? res.NameOfTexture(mat.normal) : std::string();
+    os += "\"material\": {\n";
+    os += ind + "  \"metallic\": ";  AppendFloatQ(os, mat.metallic);  os += ",\n";
+    os += ind + "  \"roughness\": "; AppendFloatQ(os, mat.roughness); os += ",\n";
+    os += ind + "  \"baseColor\": ";
+    if (baseName.empty()) os += "null"; else { os += "\""; os += baseName; os += "\""; }
+    os += ",\n";
+    os += ind + "  \"normalMap\": ";
+    if (normalName.empty()) os += "null"; else { os += "\""; os += normalName; os += "\""; }
+    os += "\n";
+    os += ind + "}";
+}
+
+void AppendMeshField(std::string& os, const MeshC& mc, const SceneResources& res) {
+    std::string meshName = mc.mesh ? res.NameOfMesh(mc.mesh) : std::string();
+    os += "\"mesh\": \""; os += meshName; os += "\"";
+}
+
+// Collect the requested field-set from a query object's optional "fields" array. Returns the
+// recognized fields as three booleans (in canonical order) + any UNKNOWN names (in request order,
+// for a deterministic "unknownFields" echo). "fields" absent -> all three recognized, no unknowns.
+struct FieldSelect {
+    bool transform = true, material = true, mesh = true;
+    bool explicitFields = false;
+    std::vector<std::string> unknown;
+};
+FieldSelect ParseFields(const json_object_s* obj) {
+    FieldSelect sel;
+    const json_value_s* v = MemberOf(obj, "fields");
+    if (!v || v->type != json_type_array) return sel;  // absent/malformed -> all fields
+    sel.explicitFields = true;
+    sel.transform = sel.material = sel.mesh = false;
+    const json_array_s* arr = static_cast<const json_array_s*>(v->payload);
+    for (const json_array_element_s* el = arr->start; el; el = el->next) {
+        if (el->value->type != json_type_string) continue;
+        const json_string_s* s = static_cast<const json_string_s*>(el->value->payload);
+        std::string name(s->string, s->string_size);
+        if (name == "transform")      sel.transform = true;
+        else if (name == "material")  sel.material = true;
+        else if (name == "mesh")      sel.mesh = true;
+        else                          sel.unknown.push_back(name);
+    }
+    return sel;
+}
+
+// Build the response object for a single query, indented to start at column `base` (the spaces the
+// caller has already placed before the opening '{'). Deterministic + side-effect-free.
+std::string QueryResponse(ecs::Registry& reg, SceneResources& res, const json_object_s* obj,
+                          const std::string& base) {
+    std::string select = StringMember(obj, "select");
+    std::string out;
+    const std::string ind = base + "  ";  // member indent inside the response object
+
+    if (select == "stats") {
+        // Live entity count (view order) + the named mesh/texture resource counts.
+        int entities = 0;
+        for (auto [e, tc, mc, mat] : reg.view<TransformC, MeshC, MaterialC>()) {
+            (void)e; (void)tc; (void)mc; (void)mat; ++entities;
+        }
+        out += "{\n";
+        out += ind + "\"entities\": " + std::to_string(entities) + ",\n";
+        out += ind + "\"meshes\": " + std::to_string(res.meshes.size()) + ",\n";
+        out += ind + "\"textures\": " + std::to_string(res.textures.size()) + "\n";
+        out += base + "}";
+        return out;
+    }
+
+    if (select == "entities") {
+        out += "[";
+        int i = 0;
+        bool first = true;
+        for (auto [e, tc, mc, mat] : reg.view<TransformC, MeshC, MaterialC>()) {
+            (void)e; (void)tc; (void)mat;
+            if (!first) out += ",";
+            first = false;
+            std::string meshName = mc.mesh ? res.NameOfMesh(mc.mesh) : std::string();
+            out += "\n" + ind + "{ \"index\": " + std::to_string(i) + ", \"mesh\": \"" + meshName + "\" }";
+            ++i;
+        }
+        if (!first) out += "\n" + base;
+        out += "]";
+        return out;
+    }
+
+    // select:"entity" (the default + only remaining recognized select).
+    int index = IntMember(obj, "entity", -1);
+    ecs::Entity e;
+    bool found = false;
+    int count = 0;
+    {
+        int i = 0;
+        for (auto [ent, tc, mc, mat] : reg.view<TransformC, MeshC, MaterialC>()) {
+            (void)tc; (void)mc; (void)mat;
+            if (i == index && index >= 0) { e = ent; found = true; }
+            ++i;
+        }
+        count = i;
+    }
+    if (!found) {
+        out += "{ \"error\": \"out-of-range\", \"entity\": " + std::to_string(index) +
+               ", \"count\": " + std::to_string(count) + " }";
+        return out;
+    }
+
+    FieldSelect sel = ParseFields(obj);
+    const auto& tc  = reg.get<TransformC>(e);
+    const auto& mc  = reg.get<MeshC>(e);
+    const auto& mat = reg.get<MaterialC>(e);
+
+    out += "{\n";
+    out += ind + "\"index\": " + std::to_string(index);
+    // Canonical field order: transform, material, mesh (REGARDLESS of request order).
+    if (sel.transform) { out += ",\n" + ind; AppendTransformField(out, tc, ind); }
+    if (sel.material)  { out += ",\n" + ind; AppendMaterialField(out, mat, res, ind); }
+    if (sel.mesh)      { out += ",\n" + ind; AppendMeshField(out, mc, res); }
+    if (!sel.unknown.empty()) {
+        out += ",\n" + ind + "\"unknownFields\": [";
+        for (size_t u = 0; u < sel.unknown.size(); ++u) {
+            if (u) out += ", ";
+            out += "\""; out += sel.unknown[u]; out += "\"";
+        }
+        out += "]";
+    }
+    out += "\n" + base + "}";
+    return out;
+}
+
 // --- Individual ops ------------------------------------------------------------------------------
 
 bool OpDump(ecs::Registry& reg, SceneResources& res) {
@@ -255,6 +416,64 @@ bool OpIntrospect(ecs::Registry& reg, SceneResources& res, const json_object_s* 
     return true;
 }
 
+// Pretty-print an arbitrary parsed json.h value (used to echo a query's "request" verbatim into the
+// RunQueries response array). Deterministic: object member ORDER is preserved as parsed, numbers are
+// emitted from their original literal, strings re-quoted, 2-space indent — the house JSON style.
+void AppendJsonValue(std::string& os, const json_value_s* v, const std::string& base) {
+    const std::string ind = base + "  ";
+    switch (v->type) {
+        case json_type_object: {
+            const json_object_s* o = static_cast<const json_object_s*>(v->payload);
+            if (!o->start) { os += "{}"; return; }
+            os += "{\n";
+            for (const json_object_element_s* el = o->start; el; el = el->next) {
+                os += ind + "\"" + std::string(el->name->string, el->name->string_size) + "\": ";
+                AppendJsonValue(os, el->value, ind);
+                os += el->next ? ",\n" : "\n";
+            }
+            os += base + "}";
+            return;
+        }
+        case json_type_array: {
+            const json_array_s* a = static_cast<const json_array_s*>(v->payload);
+            if (!a->start) { os += "[]"; return; }
+            os += "[";
+            for (const json_array_element_s* el = a->start; el; el = el->next) {
+                os += "\n" + ind;
+                AppendJsonValue(os, el->value, ind);
+                if (el->next) os += ",";
+            }
+            os += "\n" + base + "]";
+            return;
+        }
+        case json_type_string: {
+            const json_string_s* s = static_cast<const json_string_s*>(v->payload);
+            os += "\""; os += std::string(s->string, s->string_size); os += "\"";
+            return;
+        }
+        case json_type_number: {
+            const json_number_s* n = static_cast<const json_number_s*>(v->payload);
+            os += std::string(n->number, n->number_size);
+            return;
+        }
+        case json_type_true:  os += "true";  return;
+        case json_type_false: os += "false"; return;
+        case json_type_null:  os += "null";  return;
+        default:              os += "null";  return;
+    }
+}
+
+// {"op":"query","select":...} -> print the SELECTIVE JSON read of the scene to stdout (the live
+// --commands form of the DX2 read). The response bytes are the SAME QueryResponse RunQueries returns
+// (column-0 indented for the standalone print). Always "succeeds" (an out-of-range entity is a valid
+// deterministic {"error":"out-of-range"} response, not a command failure).
+bool OpQuery(ecs::Registry& reg, SceneResources& res, const json_object_s* obj) {
+    std::string response = QueryResponse(reg, res, obj, "");
+    std::fputs(response.c_str(), stdout);
+    std::fputc('\n', stdout);
+    return true;
+}
+
 // --- Driver --------------------------------------------------------------------------------------
 
 bool RunParsed(json_value_s* root, ecs::Registry& reg, SceneResources& res,
@@ -283,6 +502,7 @@ bool RunParsed(json_value_s* root, ecs::Registry& reg, SceneResources& res,
         else if (op == "capture")      ok = OpCapture(obj, capture);
         else if (op == "save_scene")   ok = OpSaveScene(reg, res, obj);
         else if (op == "introspect")   ok = OpIntrospect(reg, res, obj);
+        else if (op == "query")        ok = OpQuery(reg, res, obj);
         else {
             std::fprintf(stderr, "command %d: unknown op '%s'\n", cmdIndex, op.c_str());
             ok = false;
@@ -318,6 +538,43 @@ bool RunCommands(ecs::Registry& reg, SceneResources& resources, const char* comm
 bool RunCommandsFromText(ecs::Registry& reg, SceneResources& resources, const char* commandsJson,
                          const CaptureFn& capture) {
     return RunFromString(commandsJson, std::strlen(commandsJson), reg, resources, capture);
+}
+
+std::string RunQueries(ecs::Registry& reg, SceneResources& resources, const char* queriesJson) {
+    json_parse_result_s err{};
+    json_value_s* root = json_parse_ex(queriesJson, std::strlen(queriesJson),
+                                       json_parse_flags_default, nullptr, nullptr, &err);
+    if (!root) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "RunQueries: JSON parse error %u at line %zu, row %zu",
+                      static_cast<unsigned>(err.error), err.error_line_no, err.error_row_no);
+        throw std::runtime_error(msg);
+    }
+    struct FreeGuard { void* p; ~FreeGuard() { std::free(p); } } guard{root};
+
+    if (root->type != json_type_array)
+        throw std::runtime_error("RunQueries: top-level JSON must be an array of query objects");
+
+    const json_array_s* arr = static_cast<const json_array_s*>(root->payload);
+    std::string out = "[";
+    bool first = true;
+    for (const json_array_element_s* el = arr->start; el; el = el->next) {
+        if (el->value->type != json_type_object) continue;  // skip non-object query entries
+        const json_object_s* obj = static_cast<const json_object_s*>(el->value->payload);
+        if (!first) out += ",";
+        first = false;
+        out += "\n  {\n";
+        out += "    \"request\": ";
+        AppendJsonValue(out, el->value, "    ");
+        out += ",\n";
+        out += "    \"response\": ";
+        out += QueryResponse(reg, resources, obj, "    ");
+        out += "\n  }";
+    }
+    if (!first) out += "\n";
+    out += "]\n";
+    return out;
 }
 
 }  // namespace hf::scene

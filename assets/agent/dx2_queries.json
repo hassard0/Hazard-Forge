@@ -1,0 +1,7 @@
+[
+  { "op": "query", "select": "entity", "entity": 1, "fields": ["transform", "material"] },
+  { "op": "query", "select": "entity", "entity": 9 },
+  { "op": "query", "select": "stats" },
+  { "op": "query", "select": "entities" },
+  { "op": "query", "select": "entity", "entity": 99 }
+]

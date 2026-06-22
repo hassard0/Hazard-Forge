@@ -35,9 +35,28 @@
 //                                             (editor::DescribeEngine) to a file (or stdout if no
 //                                             path): engine/features/showcases/commands + scene +
 //                                             stats. The agent-facing OBSERVE call.
+//   {"op":"query","select":"entity",       -> print the SELECTIVE JSON read of one entity (the
+//        "entity":N,"fields":[..]?}            transform/material/mesh object DumpScene emits for it,
+//                                             optionally narrowed to "fields"; addressed by view-order
+//                                             index). The read half of the request/response loop.
+//   {"op":"query","select":"stats"}        -> print {entities, meshes, textures} resource counts.
+//   {"op":"query","select":"entities"}     -> print a terse ordered [{index, mesh}] list.
 //
 // A baseColor/normalMap of JSON null (or "") clears the texture; an unknown texture name is an
 // error, as is an unknown mesh name on "add" or an out-of-range entity index.
+//
+// query op (DX2) — a DETERMINISTIC, index-addressed, field-selectable JSON read of the scene:
+//   select:"entity" — the requested entity's components. "fields" (optional) is any subset of
+//     ["transform","material","mesh"]; ALL three are emitted (in that FIXED canonical order) when
+//     "fields" is omitted, REGARDLESS of the request array's order. An out-of-range / negative
+//     "entity" yields a deterministic {"error":"out-of-range","entity":N,"count":C} response (no
+//     crash, no abort — the bus's bad-command-keeps-going contract). Unknown field names are listed
+//     once under an "unknownFields" array (the recognized fields still emit).
+//   select:"stats" — {"entities":E,"meshes":M,"textures":T}: the live entity count and the named
+//     mesh/texture resource counts.
+//   select:"entities" — a terse ordered list [{"index":i,"mesh":"name"}, ...] of every entity.
+// The component shapes mirror DumpScene (scene_io's %g floats, 2-space indent) so responses match
+// the house JSON style and are backend-identical.
 
 #include "ecs/ecs.h"
 #include "scene/scene_io.h"
@@ -63,5 +82,14 @@ bool RunCommands(ecs::Registry& reg, SceneResources& resources, const char* comm
 // used by the unit test (no file needed). Throws std::runtime_error on a malformed array.
 bool RunCommandsFromText(ecs::Registry& reg, SceneResources& resources, const char* commandsJson,
                          const CaptureFn& capture);
+
+// Run a JSON array of "query" objects (DX2 — the read half of the request/response SDK loop) against
+// the live scene and return a DETERMINISTIC, pretty-printed JSON array of {"request":<query obj>,
+// "response":<result>} pairs (scene_io's %g floats, 2-space indent). Each element's "request" is the
+// verbatim query object; its "response" is the entity/stats/entities read (or the deterministic
+// {"error":"out-of-range",...} for a bad index). File-free + side-effect-free (no stdout, no mutate)
+// — the clean byte-golden artifact AND the unit-test entry. Throws std::runtime_error on a malformed
+// top-level array. The same per-query response is what the live "query" op prints to stdout.
+std::string RunQueries(ecs::Registry& reg, SceneResources& resources, const char* queriesJson);
 
 }  // namespace hf::scene
