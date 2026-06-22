@@ -728,6 +728,17 @@ hf_add_pure_test(rt_hero_test)
 # #included read-only. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(rt_simrender_test)
 
+# Deterministic Lumen-class GI Slice 1 (Slice GI1, the BEACHHEAD of FLAGSHIP #29): the CPU-side invariants
+# the HW probe-trace kernel (shaders/gi_probe_trace.comp) rests on. The HW==CPU memcmp proof lives in the
+# --gi1-probe-shot showcase (needs a GPU); this pure-CPU test pins the deterministic GI contract: the 16
+# baked Fibonacci-sphere directions (gi::kGiProbeDirs) are unit-length within an fx epsilon AND distinct;
+# the integer ProbePos lattice round-trips; TraceProbeRays is analytic (a probe facing a lit surface sees
+# radiance>0, a shadowed probe-ray is darker, an open-space probe -> sky/background); TraceProbeRays is
+# two-run byte-identical; and ProbeCount==0 -> the radiance buffer is UNTOUCHED (the dispatch-0 no-op).
+# Uses the pinned gi::BuildGi1Scene enclosure; gi.h #includes render/rtrace.h read-only (byte-frozen),
+# rtrace.h #includes sim/fpx.h read-only. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(gi_probe_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

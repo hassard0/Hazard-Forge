@@ -89,6 +89,7 @@
 #include "render/vt.h"              // Slice VT1: runtime virtual texturing mip page table + page-needed FEEDBACK marking (VtTexture/PageId/SelectMipLevel/VtPageId/MarkFeedbackPages) — shared verbatim with vt_feedback.comp + the Vulkan --vt-feedback-shot
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
 #include "render/rtrace.h"          // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — Metal runs the CPU reference (rt_trace.comp is int64/Vulkan-only) + the Vulkan --rt1-trace-shot
+#include "render/gi.h"              // Slice GI1: deterministic integer RT probe trace + shade (GiProbeGrid/kGiProbeDirs/TraceProbeRays/GiProbesToImage/BuildGi1Scene) — Metal runs the CPU reference (gi_probe_trace.comp is int64/Vulkan-only) + the Vulkan --gi1-probe-shot
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
 #include "rt5_simrender_scene.h"    // Slice RT5: the SHARED sim->RT bridge (rt5::BuildRt5World/BuildRt5Stream/BodiesToRtScene) used by --rt5-simrender (here) + the Vulkan --rt5-simrender-shot + rt_simrender_test — lives under tests/ to keep rtrace.h sim-free + fpx.h render-free
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
@@ -18200,6 +18201,72 @@ static int RunRt2QueryShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — deterministic HW-ray-query scene [CPU SW reference] (%u hits)\n",
                 outPath, kRtW, kRtH, hits);
+    return 0;
+}
+
+// ===== Slice GI1 — Deterministic Lumen-class GI INTEGER RT PROBE TRACE + SHADE showcase (--gi1-probe) (the
+// BEACHHEAD of FLAGSHIP #29). The Vulkan --gi1-probe-shot wires REAL HW inline ray query (a closest-hit
+// RayQuery + a shadow RayQuery per probe ray over a TLAS, the FROZEN fx Q16.16 intersection + ShadeHitShadowed)
+// and memcmp's the HW per-probe radiance buffer == CPU gi::TraceProbeRays. gi_probe_trace.comp uses HLSL
+// RayQuery + int64 -> Vulkan-SPIR-V-ONLY (glslc/spirv-cross can't lower to MSL), so on Metal --gi1-probe runs
+// the CPU gi::TraceProbeRays reference (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares
+// against) -> the Metal image is byte-identical to the Vulkan HW image BY CONSTRUCTION. Builds the SAME
+// gi::BuildGi1Scene enclosure + 4x4x4 GiProbeGrid the Vulkan side defines, computes the per-probe-per-ray
+// integer radiance, renders gi::GiProbesToImage (a deterministic 2D tile grid colored by each probe's mean
+// radiance) at 256x256, writes the PNG. Because the trace + shade are INTEGER, the gi1_probe golden is
+// STRICT-ZERO cross-vendor. New golden tests/golden/metal/gi1_probe.png.
+static int RunGi1ProbeShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace gi = hf::render::gi;
+    using rt::FxVec3;
+
+    const uint32_t kImgW = 256, kImgH = 256;
+
+    // The GI1 scene + probe grid (the SAME the Vulkan --gi1-probe-shot defines; gi.h is frozen).
+    gi::GiScene1 sc = gi::BuildGi1Scene();
+    gi::GiProbeGrid grid;
+    grid.origin  = FxVec3{gi::GiF(-2,1), gi::GiF(1,1), gi::GiF(0,1)};
+    grid.spacing = gi::GiF(1,1);
+    grid.nx = 4; grid.ny = 4; grid.nz = 4;
+    const uint32_t kProbes = (uint32_t)gi::ProbeCount(grid);
+    const uint32_t kRays   = (uint32_t)gi::kGiRaysPerProbe;
+    const size_t   kRadCount = (size_t)kProbes * kRays;
+
+    // CPU reference (the bit-exact buffer the Vulkan --gi1-probe-shot proves the HW shader equal to).
+    std::vector<gi::GiRadiance> rad(kRadCount);
+    gi::TraceProbeRays(grid, sc.scene, std::span<gi::GiRadiance>(rad));
+
+    gi::GiRadiance bg = gi::UnpackRadiance(sc.scene.background);
+    int64_t bglum = (int64_t)bg.r + bg.g + bg.b;
+    uint32_t lit = 0;
+    for (const gi::GiRadiance& g : rad) if ((int64_t)g.r + g.g + g.b > bglum) ++lit;
+    std::printf("gi1-probe: {probes:%u, rays:%u, lit:%u} [Metal: CPU gi::TraceProbeRays, "
+                "byte-identical to the Vulkan HW result by construction]\n", kProbes, kRays, lit);
+
+    // Two-run determinism (the CPU reference is a pure function).
+    {
+        std::vector<gi::GiRadiance> rad2(kRadCount);
+        gi::TraceProbeRays(grid, sc.scene, std::span<gi::GiRadiance>(rad2));
+        if (std::memcmp(rad.data(), rad2.data(), kRadCount * sizeof(gi::GiRadiance)) != 0)
+            return fail("gi1-probe: two CPU runs differ (nondeterministic)");
+        std::printf("gi1-probe determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Render the probe-radiance tile-grid viz + write the image. ---
+    std::vector<uint32_t> img((size_t)kImgW * kImgH, 0);
+    gi::GiProbesToImage(grid, std::span<const gi::GiRadiance>(rad),
+                        std::span<uint32_t>(img), kImgW, kImgH);
+    std::vector<uint8_t> bgra((size_t)kImgW * kImgH * 4, 0);
+    for (size_t p = 0; p < (size_t)kImgW * kImgH; ++p) {
+        uint32_t px = img[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kImgW, kImgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic integer RT probe-radiance grid [CPU reference] "
+                "(%u probes, lit:%u)\n", outPath, kImgW, kImgH, kProbes, lit);
     return 0;
 }
 
@@ -58002,6 +58069,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt2-query") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt2_query.png";
             try { return RunRt2QueryShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gi1-probe <out.png>: render the Deterministic Lumen-class GI INTEGER RT PROBE TRACE + SHADE
+        // showcase (Slice GI1, the BEACHHEAD of FLAGSHIP #29). gi_probe_trace.comp uses HLSL RayQuery + int64
+        // -> Vulkan-SPIR-V-ONLY, so Metal runs the CPU gi::TraceProbeRays + GiProbesToImage reference
+        // (byte-identical to the Vulkan HW result by construction). New golden tests/golden/metal/gi1_probe.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gi1-probe") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gi1_probe.png";
+            try { return RunGi1ProbeShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt3-shadow <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase

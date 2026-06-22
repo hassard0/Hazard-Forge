@@ -536,6 +536,8 @@ int main() {
             bool sawRt5SimrenderFeature = false;
             // Slice RT6: the rt6-hero capability is advertised (the lit hero capstone — the FLAGSHIP #28 money-shot).
             bool sawRt6HeroFeature = false;
+            // Slice GI1: the gi1-probe capability is advertised (the integer RT probe trace — the FLAGSHIP #29 beachhead).
+            bool sawGi1ProbeFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -782,6 +784,7 @@ int main() {
                     if (AsString(el->value) == "rt4-reflect") sawRt4ReflectFeature = true;
                     if (AsString(el->value) == "rt5-simrender") sawRt5SimrenderFeature = true;
                     if (AsString(el->value) == "rt6-hero") sawRt6HeroFeature = true;
+                    if (AsString(el->value) == "gi1-probe") sawGi1ProbeFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1003,6 +1006,7 @@ int main() {
             check(sawRt4ReflectFeature, "engine.features includes rt4-reflect");
             check(sawRt5SimrenderFeature, "engine.features includes rt5-simrender");
             check(sawRt6HeroFeature, "engine.features includes rt6-hero");
+            check(sawGi1ProbeFeature, "engine.features includes gi1-probe");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1394,6 +1398,8 @@ int main() {
         bool sawRt5SimrenderShot = false;
         // Slice RT6: the --rt6-hero-shot showcase flag is listed in the showcase manifest.
         bool sawRt6HeroShot = false;
+        // Slice GI1: the --gi1-probe-shot showcase flag is listed in the showcase manifest.
+        bool sawGi1ProbeShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1644,6 +1650,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--rt4-reflect-shot") sawRt4ReflectShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--rt5-simrender-shot") sawRt5SimrenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--rt6-hero-shot") sawRt6HeroShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gi1-probe-shot") sawGi1ProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1862,6 +1869,7 @@ int main() {
         check(sawRt4ReflectShot, "showcases manifest includes --rt4-reflect-shot");
         check(sawRt5SimrenderShot, "showcases manifest includes --rt5-simrender-shot");
         check(sawRt6HeroShot, "showcases manifest includes --rt6-hero-shot");
+        check(sawGi1ProbeShot, "showcases manifest includes --gi1-probe-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");

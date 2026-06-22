@@ -335,6 +335,15 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # --rt6-hero showcase runs the CPU rtrace::RenderSceneHero (the SAME bit-exact reference the Vulkan HW==CPU
 # memcmp compares against) -> the Metal result is byte-identical to the Vulkan HW result BY CONSTRUCTION. So
 # rt_hero.comp gets NO hf_gen_msl line.
+# Deterministic Lumen-class GI Slice 1 (Slice GI1, the BEACHHEAD of FLAGSHIP #29): gi_probe_trace.comp is the
+# DETERMINISTIC INTEGER RT PROBE-TRACE kernel — ONE thread per PROBE loops the 16 baked Fibonacci-sphere
+# directions, a closest-hit RayQuery (the rt_query.comp candidate-drain VERBATIM) + a shadow RayQuery + the
+# inline ShadeHitShadowed, writing the unpacked GiRadiance per (probe,ray). Like rt_query.comp it is
+# VULKAN-SPIR-V-ONLY and is NOT MSL-gen'd here: HLSL inline RayQuery lowers (via DXC) to SPIR-V RayQueryKHR
+# which glslc/spirv-cross cannot lower, plus int64 fx math glslc can't parse. On Metal the --gi1-probe
+# showcase runs the CPU gi::TraceProbeRays (the SAME bit-exact reference the Vulkan HW==CPU memcmp compares
+# against) -> the Metal result is byte-identical to the Vulkan HW result BY CONSTRUCTION, while the Vulkan
+# side carries the HW probe-radiance == CPU proof. So gi_probe_trace.comp gets NO hf_gen_msl line.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

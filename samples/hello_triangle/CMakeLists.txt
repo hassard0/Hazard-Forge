@@ -557,6 +557,18 @@ hf_compile_shaders(
     # int64 -> glslc/spirv-cross can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal --rt6-hero
     # runs the CPU rtrace::RenderSceneHero (byte-identical by construction). The Vulkan side carries HW==CPU.
     "shaders/rt_hero.comp.hlsl:csrq"
+    # Deterministic Lumen-class GI Slice 1 (Slice GI1, the BEACHHEAD of FLAGSHIP #29): gi_probe_trace.comp is
+    # the DETERMINISTIC INTEGER RT PROBE-TRACE kernel — ONE thread per PROBE loops the 16 baked Fibonacci-sphere
+    # directions, opens a RayQuery over the TLAS (binding 4) draining every candidate procedural primitive (the
+    # rt_query.comp contract VERBATIM), runs the FROZEN fx Q16.16 IntersectSphere/IntersectAabb + (t,primIndex)
+    # min for the closest hit, casts a SECOND RayQuery (the shadow ray) for occlusion, shades with the inline
+    # ShadeHitShadowed (the integer Lambert with the diffuse GATED by the shadow), and writes the unpacked
+    # GiRadiance to gRadiance[probe*16 + dir] — bit-identical to the CPU gi::TraceProbeRays. The :csrq stage
+    # compiles it cs_6_5 + SPV_KHR_ray_query (HLSL RayQuery -> DXC SPIR-V RayQueryKHR). It is VULKAN-SPIR-V-ONLY
+    # (RayQuery + int64 -> glslc/spirv-cross can't lower to MSL) -> NOT in the Metal hf_gen_msl list; on Metal
+    # --gi1-probe runs the CPU gi::TraceProbeRays (byte-identical by construction). The Vulkan side carries the
+    # HW==CPU radiance memcmp proof.
+    "shaders/gi_probe_trace.comp.hlsl:csrq"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the
