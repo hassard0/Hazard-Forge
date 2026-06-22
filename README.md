@@ -215,9 +215,16 @@ ctest --preset windows-msvc-asan
 
 `metal_headless/` is a standalone CMake project that compiles the real Metal backend + engine, generates Metal
 shaders from the shared HLSL at build time, renders a showcase into an offscreen texture, and writes a PNG.
-Command Line Tools suffice.
+No Conan, no SDL, and no full Xcode.app are needed — but beyond Apple Command Line Tools (the Metal/clang toolchain)
+the build also needs **CMake, Ninja, and the shader toolchain** (`glslc` + `spirv-cross`, which cross-compile the
+shared HLSL to MSL). Command Line Tools ship none of these, so a CLT-only machine fails the configure with
+`Could not find GLSLC_EXECUTABLE`. Install them once (Homebrew arm64 bottles, or a no-sudo `~/homebrew` prefix):
 
 ```sh
+# In addition to Apple Command Line Tools:
+brew install cmake ninja shaderc spirv-cross    # shaderc provides glslc
+#   (or install the LunarG Vulkan SDK, which bundles both glslc and spirv-cross)
+
 cmake -S metal_headless -B build-metal -G Ninja
 cmake --build build-metal           # also generates the Metal shaders from the HLSL
 ./build-metal/visual_test out.png   # default scene; pass a showcase flag for others
