@@ -13,5 +13,5 @@
       { "op": "introspect", "capability": "observe", "args": [{ "name": "path", "type": "string?" }] },
       { "op": "query", "capability": "observe", "args": [{ "name": "select", "type": "string" }, { "name": "entity", "type": "int?" }, { "name": "fields", "type": "[string]?" }] }
     ],
-    "contentHash": "2cf3a8c185ed285a"
+    "contentHash": "e49619d760aad1e1"
   }
