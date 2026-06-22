@@ -556,6 +556,8 @@ int main() {
             bool sawHf3StepFeature = false;
             // Slice HF4: the hf4-joint capability is advertised (hull joints composed with friction, FLAGSHIP #30).
             bool sawHf4JointFeature = false;
+            // Slice HF5: the hf5-net capability is advertised (friction+joint hull lockstep+rollback, FLAGSHIP #30).
+            bool sawHf5NetFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -812,6 +814,7 @@ int main() {
                     if (AsString(el->value) == "hf2-warm") sawHf2WarmFeature = true;
                     if (AsString(el->value) == "hf3-step") sawHf3StepFeature = true;
                     if (AsString(el->value) == "hf4-joint") sawHf4JointFeature = true;
+                    if (AsString(el->value) == "hf5-net") sawHf5NetFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1043,6 +1046,7 @@ int main() {
             check(sawHf2WarmFeature, "engine.features includes hf2-warm");
             check(sawHf3StepFeature, "engine.features includes hf3-step");
             check(sawHf4JointFeature, "engine.features includes hf4-joint");
+            check(sawHf5NetFeature, "engine.features includes hf5-net");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1390,6 +1394,8 @@ int main() {
         bool sawHf3StepShot = false;
         // Slice HF4: the --hf4-joint-shot showcase flag is listed in the showcase manifest.
         bool sawHf4JointShot = false;
+        // Slice HF5: the --hf5-net-shot showcase flag is listed in the showcase manifest.
+        bool sawHf5NetShot = false;
         // Slice WH3: the --wh3-warm-shot showcase flag is listed in the showcase manifest.
         bool sawWh3WarmShot = false;
         // Slice WH4: the --wh4-stack-shot showcase flag is listed in the showcase manifest.
@@ -1682,6 +1688,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--hf2-warm-shot") sawHf2WarmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--hf3-step-shot") sawHf3StepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--hf4-joint-shot") sawHf4JointShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--hf5-net-shot") sawHf5NetShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh3-warm-shot") sawWh3WarmShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh4-stack-shot") sawWh4StackShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--wh5-lockstep-shot") sawWh5LockstepShot = true;
@@ -1910,6 +1917,7 @@ int main() {
         check(sawHf2WarmShot, "showcases manifest includes --hf2-warm-shot");
         check(sawHf3StepShot, "showcases manifest includes --hf3-step-shot");
         check(sawHf4JointShot, "showcases manifest includes --hf4-joint-shot");
+        check(sawHf5NetShot, "showcases manifest includes --hf5-net-shot");
         check(sawWh3WarmShot, "showcases manifest includes --wh3-warm-shot");
         check(sawWh4StackShot, "showcases manifest includes --wh4-stack-shot");
         check(sawWh5LockstepShot, "showcases manifest includes --wh5-lockstep-shot");

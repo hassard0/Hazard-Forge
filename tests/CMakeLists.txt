@@ -917,6 +917,15 @@ hf_add_pure_test(hullfric_step_test)
 # byte-for-byte — the joints are purely additive). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(hulljoint_test)
 
+# Hull Friction + Joints Slice 5 (Slice HF5, LOCKSTEP + ROLLBACK of FLAGSHIP #30: hf::sim::hulljoint): the PURE-CPU
+# in-process two-peer lockstep + rollback harness APPENDED to engine/sim/hulljoint.h over the HF4
+# StepJointedHullWorld (the WH5/JT5/FR5/VD5 mold). NO GPU, NO shader, NO RHI. Pins the (bodies, friction cache)
+# snapshot->restore round-trip bit-exact, two-peer lockstep convergence (the WHOLE PAIR byte-equal every tick from
+# inputs alone), rollback corrected==authority bit-exact, the mispredict diverging across the chain AND the door AND
+# the friction-resting hull then correcting, and THE CACHE-NECESSARY proof (omit the HullFrictionCache -> diverge,
+# include it -> converge — the warm-state-necessary lesson at the friction layer). Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(hulljoint_net_test)
+
 # Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
 # PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
 # over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h

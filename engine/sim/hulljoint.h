@@ -229,5 +229,188 @@ inline JointMeasure MeasureJointedHull(const JointedHullWorld& w) {
     return jm;
 }
 
+// =========================================================================================================
+// Slice HF5 — Hull Friction + Joints: LOCKSTEP + ROLLBACK over the friction+joint hull world (the netcode
+// headline; the FIFTH slice of FLAGSHIP #30). APPENDED after MeasureJointedHull (HF1-HF4's lines above are
+// BYTE-FROZEN). PURE CPU — NO GPU dispatch, NO new shader, NO new RHI; both the Vulkan --hf5-net-shot AND the
+// Metal --hf5-net run THIS IDENTICAL CPU harness so the converged authority world is bit-identical
+// cross-backend BY CONSTRUCTION (strict zero-differing-pixel). The WH5/JT5/FR5/VD5 lockstep+rollback mold
+// transplanted onto StepJointedHullWorld.
+//
+// THE HF-SPECIFIC SUBTLETY (the warm-state-necessary lesson, the WH5 "triple" at the friction layer):
+// StepJointedHullWorld carries warm state ACROSS ticks in JointedHullWorld.cache (the HF3 HullFrictionCache —
+// last tick's accumulated tangent/normal impulses keyed by contact). For two peers to converge bit-for-bit,
+// BOTH must re-derive that cache identically from inputs (they do — it's a pure function of the tick
+// sequence). For ROLLBACK to correct exactly, the snapshot MUST capture the cache too — restoring only the
+// bodies and dropping the warm cache re-seeds friction from cold and DIVERGES. So the replayable state is the
+// PAIR (bodies, cache); the joints/limits/config are CONST topology (NOT mutated by the step) carried as
+// RunJointedHull* params, NOT serialized in the snapshot (the VD5 const-topology pattern). PURE INTEGER, FIXED
+// order -> bit-identical on every peer/platform.
+
+// ----- HullFrictionCacheEqual(a, b): field equality of two friction caches (the cache half of the memcmp) ---
+// Equal iff the same number of entries AND each entry's HullContactKey (4 x uint32) + the THREE accumulated
+// impulses (fx) + the basisAxis (int32) match, in FIXED order. The cache is rewritten in a FIXED order each
+// tick (StepJointedHullWorld step 3a / UpdateHullFrictionCache), so two peers that ran the same inputs produce
+// the cache in the SAME order — a positional field-compare is exact. (The warmhull::HullCacheEntriesEqual twin
+// over the friction cache, comparing all THREE impulses + the basisAxis.)
+inline bool HullFrictionCacheEqual(const hullfric::HullFrictionCache& a,
+                                   const hullfric::HullFrictionCache& b) {
+    if (a.entries.size() != b.entries.size()) return false;
+    for (size_t i = 0; i < a.entries.size(); ++i) {
+        if (!hullfric::HullContactKeysEqual(a.entries[i].key, b.entries[i].key)) return false;
+        if (a.entries[i].normalImpulse   != b.entries[i].normalImpulse)   return false;
+        if (a.entries[i].tangentImpulse1 != b.entries[i].tangentImpulse1) return false;
+        if (a.entries[i].tangentImpulse2 != b.entries[i].tangentImpulse2) return false;
+        if (a.entries[i].basisAxis       != b.entries[i].basisAxis)       return false;
+    }
+    return true;
+}
+
+// ----- JointedHullSnapshot: the FULL replayable state at a tick (the rollback restore point) — the PAIR ------
+// Unlike gjk::HullSnapshot (bodies only), the friction+joint sim's replayable state is TWO things: the body
+// world AND the HF3 persistent friction cache (last tick's accumulated impulses the warm-start reads). A peer
+// that only restored the bodies would resume with the wrong warm-start impulses and DIVERGE (the WH5 lesson at
+// the friction layer). Both are deep-copied (std::vector copies). The joints/limits/config are CONST topology
+// (NOT mutated by the step) — re-supplied at restore, NOT serialized. Bit-exact round-trip with
+// RestoreJointedHull. (The warmhull::WarmHullSnapshot friction-analog — no warmhull cache/sleep.)
+struct JointedHullSnapshot {
+    int32_t                     tick = 0;   // the tick this snapshot was taken at (the rollback restore point)
+    std::vector<gjk::FxBody>    bodies;     // a deep-copy of the body world (vel/pos/orient/angVel/invMass/flags)
+    hullfric::HullFrictionCache cache;      // a deep-copy of the persistent friction cache (the warm-start inputs)
+};
+
+// ----- JointedHullParams: the CONST sim knobs RunJointedHull* carry (the VD5 VerdictParams pattern) ----------
+// The step config + the per-tick command/impulse source (the command stream). Bundled so the harness
+// signatures stay clean. The joints/limits are CONST topology carried ON the JointedHullWorld itself (the
+// scene), NOT here — Params is the per-run knobs.
+struct JointedHullParams {
+    JointedHullStepConfig                  cfg;       // the HF4 friction+joint step config
+    std::vector<convex::ConvexCommand>     commands;  // the per-tick external-impulse stream (FIXED array order)
+};
+
+// ----- SnapshotJointedHull(world, tick): deep-copy the (bodies, cache) PAIR (the rollback restore point) -----
+// Value copies -> deep-copies both the body vector and the cache.entries vector. Bit-exact round-trip with
+// RestoreJointedHull.
+inline JointedHullSnapshot SnapshotJointedHull(const JointedHullWorld& world, int32_t tick) {
+    JointedHullSnapshot snap;
+    snap.tick   = tick;
+    snap.bodies = world.hulls.bodies;   // deep copy
+    snap.cache  = world.cache;          // deep copy (the entries vector)
+    return snap;
+}
+
+// ----- RestoreJointedHull(world, snap): restore the (bodies, cache) PAIR (the rollback) ----------------------
+// Memberwise copies — restores the body world AND the friction cache exactly. The joints/limits/hulls are
+// CONST topology / immutable shared geometry, so they are left untouched. Bit-exact round-trip with
+// SnapshotJointedHull.
+inline void RestoreJointedHull(JointedHullWorld& world, const JointedHullSnapshot& snap) {
+    world.hulls.bodies = snap.bodies;   // restore the deep-copied body world (hulls/joints/limits untouched)
+    world.cache        = snap.cache;    // restore the deep-copied friction cache (the warm-start inputs)
+}
+
+// ----- JointedHullStatesEqual(a, b): the make-or-break PAIR memcmp (tick + bodies + cache) ------------------
+// Two jointed-hull states are equal ONLY if ALL match: the tick, the bodies (gjk::HullBodiesEqual — a flat-POD
+// memcmp), AND the persistent friction cache (HullFrictionCacheEqual). This is the comparison the lockstep +
+// rollback proofs build on — a peer that re-derived the bodies but diverged on the friction cache is NOT
+// equal. (The warmhull::WarmHullStatesEqual twin over the friction pair.)
+inline bool JointedHullStatesEqual(const JointedHullSnapshot& a, const JointedHullSnapshot& b) {
+    return a.tick == b.tick
+        && gjk::HullBodiesEqual(a.bodies, b.bodies)
+        && HullFrictionCacheEqual(a.cache, b.cache);
+}
+
+// ----- SimJointedHullTick(world, params, tick): ONE deterministic friction+joint tick with its inputs -------
+// (1) gjk::ApplyHullCommands(world.hulls, params.commands, tick) — this tick's external impulses/spins in
+// FIXED array order, BEFORE the step so they integrate this tick (a command on the chain end / door / resting
+// hull perturbs THIS tick's settle); (2) StepJointedHullWorld(world, params.cfg) — the HF4 friction+joint
+// tick. The warmhull::SimWarmHullTick shape with StepWarmSleepHullWorld swapped for StepJointedHullWorld; the
+// cache is the per-tick mutable replayable state carried in JointedHullWorld. Pure integer, fixed order ->
+// bit-identical on every peer/platform.
+inline void SimJointedHullTick(JointedHullWorld& world, const JointedHullParams& params, uint32_t tick) {
+    gjk::ApplyHullCommands(world.hulls, params.commands, tick);
+    StepJointedHullWorld(world, params.cfg);
+}
+
+// ----- RunJointedHullLockstep(scene, params, ticks, outIdentical): two peers converge from inputs alone -----
+// THE peer entry point (the gjk::RunHullLockstep control flow over SimJointedHullTick, with the friction cache
+// added to the replayable state). Two independent peers (authority + replica) BOTH start from a COPY of
+// `scene` (JointedHullWorld is copyable — a fresh deep copy each, NOT shared state), BOTH run
+// SimJointedHullTick for `ticks` with the SAME command stream (INPUTS ONLY — each peer carries its OWN
+// bodies+cache copies through the loop) -> BIT-IDENTICAL by determinism, each re-deriving the joint passes +
+// the FULL inertia + the warm friction cone every tick. Sets *outIdentical (if non-null) to whether the two
+// final (bodies, cache) PAIRS are byte-identical (JointedHullStatesEqual — the make-or-break lockstep proof) +
+// returns the converged AUTHORITY snapshot (for the golden render + the equality proofs). The peer step order
+// is PINNED.
+inline JointedHullSnapshot RunJointedHullLockstep(const JointedHullWorld& scene,
+                                                  const JointedHullParams& params, uint32_t ticks,
+                                                  bool* outIdentical = nullptr) {
+    JointedHullWorld authority = scene;   // a fresh deep copy
+    JointedHullWorld replica   = scene;   // the second peer fed the SAME inputs
+    for (uint32_t t = 0; t < ticks; ++t) {
+        SimJointedHullTick(authority, params, t);
+        SimJointedHullTick(replica,   params, t);
+    }
+    const JointedHullSnapshot authSnap = SnapshotJointedHull(authority, (int32_t)ticks);
+    if (outIdentical) {
+        const JointedHullSnapshot repSnap = SnapshotJointedHull(replica, (int32_t)ticks);
+        *outIdentical = JointedHullStatesEqual(authSnap, repSnap);
+    }
+    return authSnap;
+}
+
+// ----- RunJointedHullRollback(scene, authParams, mispredictParams, ticks, rollbackAt, ...) ------------------
+// The rollback harness (the gjk::RunHullRollback control flow over SimJointedHullTick, snapshotting the PAIR).
+// (1) advance ticks 0..rollbackAt from a copy of `scene` applying authParams; (2) SAVE a JointedHullSnapshot AT
+// rollbackAt (SnapshotJointedHull — the bodies + the friction cache); (2b) speculatively advance a few ticks
+// (<=3) with the MISPREDICTED params (a WRONG/extra impulse — the client prediction that diverges across the
+// chain AND the door AND the resting hull), capturing that diverged intermediate; (3) ROLLBACK —
+// RestoreJointedHull to the snapshot + RE-SIMULATE rollbackAt..ticks with the CORRECT authParams -> the
+// corrected final world. Returns the corrected snapshot; sets *outCorrectedEqAuthority (if non-null) to
+// whether it == RunJointedHullLockstep(scene, authParams, ticks) byte-for-byte over the PAIR, and
+// *outMispredictDiverged (if non-null) to whether the speculative pre-rollback state DIFFERED from the
+// authority at the same tick (proving a REAL divergence was corrected, not a no-op). The params (cfg + the
+// streams) + the joints/limits are CONSTANT topology, NOT snapshotted.
+inline JointedHullSnapshot RunJointedHullRollback(const JointedHullWorld& scene,
+                                                  const JointedHullParams& authParams,
+                                                  const JointedHullParams& mispredictParams,
+                                                  uint32_t ticks, uint32_t rollbackAt,
+                                                  bool* outCorrectedEqAuthority = nullptr,
+                                                  bool* outMispredictDiverged = nullptr) {
+    JointedHullWorld w = scene;   // a fresh deep copy
+    // (1) advance 0..rollbackAt with the authoritative stream.
+    for (uint32_t t = 0; t < rollbackAt; ++t)
+        SimJointedHullTick(w, authParams, t);
+    // (2) SAVE the snapshot at rollbackAt (the rollback restore point — the bodies + the friction cache).
+    const JointedHullSnapshot snap = SnapshotJointedHull(w, (int32_t)rollbackAt);
+    // (2b) speculatively advance a few ticks with the MISPREDICTED stream (the wrong/extra impulse — the
+    // client prediction that diverges). Bounded to the remaining ticks (<=3). Capture the diverged state.
+    uint32_t specTicks = ticks - rollbackAt;
+    if (specTicks > 3u) specTicks = 3u;
+    for (uint32_t s = 0; s < specTicks; ++s)
+        SimJointedHullTick(w, mispredictParams, rollbackAt + s);
+    const JointedHullSnapshot speculative = SnapshotJointedHull(w, (int32_t)(rollbackAt + specTicks));
+    // (3) ROLLBACK: restore the snapshot (the bodies + cache) + re-sim rollbackAt..ticks with the authStream.
+    RestoreJointedHull(w, snap);
+    for (uint32_t t = rollbackAt; t < ticks; ++t)
+        SimJointedHullTick(w, authParams, t);
+    const JointedHullSnapshot corrected = SnapshotJointedHull(w, (int32_t)ticks);
+
+    if (outCorrectedEqAuthority || outMispredictDiverged) {
+        // The authority advanced the SAME number of speculative ticks (rollbackAt + specTicks) with the
+        // CORRECT stream — the apples-to-apples comparison point for the misprediction-diverged proof.
+        JointedHullWorld authAtSpec = scene;
+        for (uint32_t t = 0; t < rollbackAt + specTicks; ++t)
+            SimJointedHullTick(authAtSpec, authParams, t);
+        const JointedHullSnapshot authAtSpecSnap = SnapshotJointedHull(authAtSpec, (int32_t)(rollbackAt + specTicks));
+        if (outMispredictDiverged)
+            *outMispredictDiverged = !JointedHullStatesEqual(speculative, authAtSpecSnap);
+        if (outCorrectedEqAuthority) {
+            const JointedHullSnapshot authFinal = RunJointedHullLockstep(scene, authParams, ticks, nullptr);
+            *outCorrectedEqAuthority = JointedHullStatesEqual(corrected, authFinal);
+        }
+    }
+    return corrected;
+}
+
 }  // namespace hulljoint
 }  // namespace hf::sim

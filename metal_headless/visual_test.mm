@@ -31495,6 +31495,244 @@ static int RunHf4JointShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice HF5 — Hull Friction + Joints LOCKSTEP + ROLLBACK showcase (--hf5-net) (the NETCODE HEADLINE of
+// FLAGSHIP #30, the WH5/JT5/FR5/VD5 twin). PURE CPU — NO GPU compute, NO new shader (hf_gen_msl unchanged); the
+// whole hulljoint.h lockstep+rollback harness is fixed-point integer math, so on Metal it runs the IDENTICAL CPU
+// harness the Vulkan --hf5-net-shot runs on Windows -> the converged authority world is byte-identical cross-
+// backend BY CONSTRUCTION (that cross-platform bit-identity IS the lockstep evidence). The replayable state is
+// the PAIR (bodies, HullFrictionCache); dropping the warm friction cache at restore diverges (the cache-necessary
+// proof). Builds the SAME HF4 chain+door+resting-hull scene + the SAME command stream as the Vulkan side, runs
+// RunJointedHullLockstep twice + RunJointedHullRollback once + the cache-necessary proof, and renders the
+// converged authority world via the HF4 2D side-view. Proof lines match the Vulkan side EXACTLY. New golden
+// tests/golden/metal/hf5_net.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunHf5NetShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex    = hf::sim::convex;
+    namespace gjk       = hf::sim::gjk;
+    namespace fpx       = hf::sim::fpx;
+    namespace joint     = hf::sim::joint;
+    namespace hulljoint = hf::sim::hulljoint;
+    using gjk::fx; using gjk::kOne;
+
+    auto fd = [&](double v) { return (fx)(v * (double)kOne); };
+    auto fi = [&](int v) { return (fx)((int64_t)v * (int64_t)kOne); };
+    const double kLinkGap = 2.2;
+    const uint32_t kTicks      = 240u;
+    const uint32_t kRollbackAt = 180u;   // the STABLE-RESTING window (non-empty warm cache → cache-necessary)
+    auto mkStatic = [&](double x, double y, double z) {
+        fpx::FxBody b; b.pos = {fd(x), fd(y), fd(z)}; b.orient = {0, 0, 0, kOne};
+        b.vel = {0,0,0}; b.angVel = {0,0,0}; b.invMass = 0; b.flags = 0u; b.radius = 0; return b;
+    };
+    auto mkDyn = [&](double x, double y, double z) {
+        fpx::FxBody b; b.pos = {fd(x), fd(y), fd(z)}; b.orient = {0, 0, 0, kOne};
+        b.vel = {0,0,0}; b.angVel = {0,0,0}; b.invMass = kOne; b.flags = fpx::kFlagDynamic; b.radius = 0; return b;
+    };
+    hulljoint::JointedHullWorld kScene;
+    {
+        const gjk::FxHull boxH = gjk::MakeBox(kOne, kOne, kOne);
+        const double aY = 6.0;
+        kScene.hulls.bodies = {
+            mkStatic(-4.0, aY, 0.0), mkDyn(-4.0, aY - kLinkGap, 0.0), mkDyn(-4.0, aY - 2 * kLinkGap, 0.0),
+            mkDyn(-4.0, aY - 3 * kLinkGap, 0.0), mkStatic(2.0, 0.0, 0.0), mkDyn(2.0, 2.0 - 0.0625, 0.0),
+            mkStatic(4.0, aY, 0.0), mkDyn(4.0, aY - kLinkGap, 0.0),
+        };
+        kScene.hulls.hulls = {boxH, boxH, boxH, boxH, boxH, boxH, boxH, boxH};
+        const gjk::FxVec3 bottomA{0, fd(-kLinkGap / 2.0), 0};
+        const gjk::FxVec3 topA{0, fd(kLinkGap / 2.0), 0};
+        auto mkBall = [&](uint32_t a, uint32_t b) {
+            joint::FxJoint j; j.bodyA = a; j.bodyB = b; j.anchorA = bottomA; j.anchorB = topA;
+            j.kind = joint::kJointBall; j.limit = 0; return j;
+        };
+        kScene.joints = { mkBall(0, 1), mkBall(1, 2), mkBall(2, 3), mkBall(6, 7) };
+        joint::FxAngularLimit hinge;
+        hinge.bodyA = 6; hinge.bodyB = 7; hinge.axis = {0, 0, kOne};
+        hinge.cosHalfLimit = kOne; hinge.sinHalfLimit = 0; hinge.kind = joint::kAngularHinge;
+        kScene.limits = { hinge };
+    }
+    const uint32_t kBodyCount  = (uint32_t)kScene.hulls.bodies.size();
+    const uint32_t kJointCount = (uint32_t)kScene.joints.size();
+    const uint32_t kLimitCount = (uint32_t)kScene.limits.size();
+
+    hulljoint::JointedHullParams authParams;
+    authParams.cfg.fric.mu = (fx)((int64_t)6 * kOne / 10); authParams.cfg.fric.solveIters = 12;
+    authParams.cfg.fric.posIters = 4; authParams.cfg.jointIters = 8;
+    authParams.commands = {
+        convex::ConvexCommand{20u, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(3), 0, 0}},
+        convex::ConvexCommand{40u, convex::kConvexCmdAddImpulse, 7u, convex::FxVec3{fi(2), 0, 0}},
+        convex::ConvexCommand{60u, convex::kConvexCmdAddImpulse, 5u, convex::FxVec3{fi(2), 0, 0}},
+    };
+    hulljoint::JointedHullParams mispParams = authParams;
+    mispParams.commands.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 3u, convex::FxVec3{fi(12), 0, 0}});
+    mispParams.commands.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 7u, convex::FxVec3{-fi(12), 0, 0}});
+    mispParams.commands.push_back(convex::ConvexCommand{kRollbackAt, convex::kConvexCmdAddImpulse, 5u, convex::FxVec3{fi(12), 0, 0}});
+
+    // === The harness (PURE CPU, NO GPU dispatch) ===
+    bool lockstepIdentical = false;
+    const hulljoint::JointedHullSnapshot authority =
+        hulljoint::RunJointedHullLockstep(kScene, authParams, kTicks, &lockstepIdentical);
+    bool rollbackCorrected = false, mispredictDiverged = false;
+    const hulljoint::JointedHullSnapshot rolledBack =
+        hulljoint::RunJointedHullRollback(kScene, authParams, mispParams, kTicks, kRollbackAt,
+                                          &rollbackCorrected, &mispredictDiverged);
+
+    // PROOF (1) LOCKSTEP: replica (inputs only, fresh cache) == authority over the PAIR.
+    const hulljoint::JointedHullSnapshot replica =
+        hulljoint::RunJointedHullLockstep(kScene, authParams, kTicks);
+    if (!lockstepIdentical || !hulljoint::JointedHullStatesEqual(authority, replica))
+        return fail("hf5-net: authority != replica (inputs-only re-sim diverged over the friction+joint PAIR)");
+    std::printf("hf5-net: {bodies:%u, joints:%u, limits:%u, ticks:%u} authority==replica BIT-IDENTICAL "
+                "(whole world)\n", kBodyCount, kJointCount, kLimitCount, kTicks);
+
+    // PROOF (2) DETERMINISM: two full runs byte-identical (+ a snapshot round-trip).
+    const hulljoint::JointedHullSnapshot authority2 =
+        hulljoint::RunJointedHullLockstep(kScene, authParams, kTicks);
+    if (!hulljoint::JointedHullStatesEqual(authority2, authority))
+        return fail("hf5-net: two runs differ (nondeterministic)");
+    {
+        hulljoint::JointedHullWorld mid = kScene;
+        for (uint32_t t = 0; t < kRollbackAt; ++t) hulljoint::SimJointedHullTick(mid, authParams, t);
+        const hulljoint::JointedHullSnapshot snap = hulljoint::SnapshotJointedHull(mid, (int32_t)kRollbackAt);
+        hulljoint::SimJointedHullTick(mid, authParams, kRollbackAt);
+        hulljoint::RestoreJointedHull(mid, snap);
+        if (!hulljoint::JointedHullStatesEqual(snap, hulljoint::SnapshotJointedHull(mid, (int32_t)kRollbackAt)))
+            return fail("hf5-net: (bodies, cache) snapshot round-trip != original");
+    }
+    std::printf("hf5-net determinism: two runs BYTE-IDENTICAL\n");
+
+    // PROOF (3) ROLLBACK: rolledBack == authority BIT-EXACT.
+    if (!rollbackCorrected || !hulljoint::JointedHullStatesEqual(rolledBack, authority))
+        return fail("hf5-net: rollback != authority (misprediction not corrected over the friction+joint PAIR)");
+    std::printf("hf5-net rollback: corrected==authority BIT-EXACT (whole world)\n");
+
+    // PROOF (4) the misprediction was REAL + HETEROGENEOUS: the speculative state differed from authority across
+    // the chain end (3) AND the door (7) AND the friction-resting hull (5).
+    hulljoint::JointedHullWorld spec = kScene, auth = kScene;
+    for (uint32_t t = 0; t < kRollbackAt; ++t) {
+        hulljoint::SimJointedHullTick(spec, authParams, t);
+        hulljoint::SimJointedHullTick(auth, authParams, t);
+    }
+    for (uint32_t s = 0; s < 3u; ++s) {
+        hulljoint::SimJointedHullTick(spec, mispParams, kRollbackAt + s);
+        hulljoint::SimJointedHullTick(auth, authParams, kRollbackAt + s);
+    }
+    auto differ = [&](uint32_t i) {
+        return std::memcmp(&spec.hulls.bodies[i], &auth.hulls.bodies[i], sizeof(fpx::FxBody)) != 0;
+    };
+    if (!mispredictDiverged || !(differ(3) && differ(7) && differ(5)))
+        return fail("hf5-net: mispredicted state did NOT diverge across chain+door+friction (vacuous rollback)");
+    std::printf("hf5-net mispredict: diverged (chain+door+friction), corrected\n");
+
+    // PROOF (5) THE CACHE IS NECESSARY: a restore that OMITS the HullFrictionCache diverges; including it converges.
+    bool omitDiverged = false, includeEqual = false;
+    {
+        hulljoint::JointedHullWorld w = kScene;
+        for (uint32_t t = 0; t < kRollbackAt; ++t) hulljoint::SimJointedHullTick(w, authParams, t);
+        const hulljoint::JointedHullSnapshot full = hulljoint::SnapshotJointedHull(w, (int32_t)kRollbackAt);
+        for (uint32_t s = 0; s < 3u; ++s) hulljoint::SimJointedHullTick(w, mispParams, kRollbackAt + s);
+        hulljoint::RestoreJointedHull(w, full);
+        for (uint32_t t = kRollbackAt; t < kTicks; ++t) hulljoint::SimJointedHullTick(w, authParams, t);
+        includeEqual = hulljoint::JointedHullStatesEqual(
+            hulljoint::SnapshotJointedHull(w, (int32_t)kTicks), authority);
+    }
+    {
+        hulljoint::JointedHullWorld w = kScene;
+        for (uint32_t t = 0; t < kRollbackAt; ++t) hulljoint::SimJointedHullTick(w, authParams, t);
+        hulljoint::JointedHullSnapshot bodiesOnly = hulljoint::SnapshotJointedHull(w, (int32_t)kRollbackAt);
+        bodiesOnly.cache.entries.clear();   // DROP the warm friction state (the cold-restore bug)
+        for (uint32_t s = 0; s < 3u; ++s) hulljoint::SimJointedHullTick(w, mispParams, kRollbackAt + s);
+        hulljoint::RestoreJointedHull(w, bodiesOnly);
+        for (uint32_t t = kRollbackAt; t < kTicks; ++t) hulljoint::SimJointedHullTick(w, authParams, t);
+        omitDiverged = !hulljoint::JointedHullStatesEqual(
+            hulljoint::SnapshotJointedHull(w, (int32_t)kTicks), authority);
+    }
+    if (!omitDiverged || !includeEqual)
+        return fail("hf5-net: cache-necessary proof failed (the friction cache is not load-bearing here?)");
+    std::printf("hf5-net cache necessary: omit->diverge, include->equal\n");
+
+    // --- Golden: the SAME PURE-INTEGER XY side-view as the Vulkan --hf5-net-shot (converged authority world). ---
+    const int kPxPerUnit = 20, kMargin = 24;
+    const int kWorldHalfX = 7, kWorldHalfY = 7;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfY * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f); dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f); dst[3] = 255;
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, const Vec3& col) {
+        int dx = x1 - x0, dy = y1 - y0;
+        int adx = dx < 0 ? -dx : dx, ady = dy < 0 ? -dy : dy;
+        int nn = adx > ady ? adx : ady;
+        if (nn == 0) { putPx(x0, y0, col); return; }
+        for (int s = 0; s <= nn; ++s) {
+            int ix = x0 + (int)((int64_t)dx * s / nn);
+            int iy = y0 + (int)((int64_t)dy * s / nn);
+            putPx(ix, iy, col);
+        }
+    };
+    auto worldToPx = [&](fx wx, fx wy, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gy = (int)(wy >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = (int)imgH - (kMargin + (gy + kWorldHalfY) * kPxPerUnit);
+    };
+    auto drawHullXY = [&](const fpx::FxBody& b, const gjk::FxHull& h, const Vec3& col) {
+        std::vector<std::pair<int,int>> pts;
+        for (uint32_t v = 0; v < h.count; ++v) {
+            const convex::FxVec3 wv = convex::FxAdd(fpx::FxRotate(b.orient, h.verts[v]), b.pos);
+            int ix, iy; worldToPx(wv.x, wv.y, ix, iy);
+            pts.push_back({ix, iy});
+        }
+        if (pts.size() < 2) return;
+        std::sort(pts.begin(), pts.end());
+        pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+        const size_t m = pts.size();
+        if (m < 2) return;
+        auto cross = [](const std::pair<int,int>& O, const std::pair<int,int>& A,
+                        const std::pair<int,int>& B) {
+            return (int64_t)(A.first - O.first) * (B.second - O.second) -
+                   (int64_t)(A.second - O.second) * (B.first - O.first);
+        };
+        std::vector<std::pair<int,int>> hull(2 * m);
+        size_t k = 0;
+        for (size_t i = 0; i < m; ++i) {
+            while (k >= 2 && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        size_t lower = k + 1;
+        for (size_t i = m - 1; i-- > 0; ) {
+            while (k >= lower && cross(hull[k-2], hull[k-1], pts[i]) <= 0) --k;
+            hull[k++] = pts[i];
+        }
+        hull.resize(k > 0 ? k - 1 : 0);
+        const size_t hn = hull.size();
+        if (hn < 2) { drawLine(pts[0].first, pts[0].second, pts[1].first, pts[1].second, col); return; }
+        for (size_t i = 0; i < hn; ++i)
+            drawLine(hull[i].first, hull[i].second, hull[(i+1)%hn].first, hull[(i+1)%hn].second, col);
+    };
+    const Vec3 kSlate{0.30f, 0.40f, 0.55f}, kAmber{0.88f, 0.62f, 0.28f};
+    const Vec3 kGreen{0.40f, 0.78f, 0.42f}, kCyan{0.32f, 0.72f, 0.84f};
+    const std::vector<fpx::FxBody>& cb = authority.bodies;
+    drawHullXY(cb[0], kScene.hulls.hulls[0], kSlate);
+    drawHullXY(cb[1], kScene.hulls.hulls[1], kAmber);
+    drawHullXY(cb[2], kScene.hulls.hulls[2], kAmber);
+    drawHullXY(cb[3], kScene.hulls.hulls[3], kAmber);
+    drawHullXY(cb[4], kScene.hulls.hulls[4], kSlate);
+    drawHullXY(cb[5], kScene.hulls.hulls[5], kGreen);
+    drawHullXY(cb[6], kScene.hulls.hulls[6], kSlate);
+    drawHullXY(cb[7], kScene.hulls.hulls[7], kCyan);
+
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — hf5 friction+joint lockstep+rollback converged side-view "
+                "(%u joints, %u limits, %u ticks)\n", outPath, imgW, imgH, kJointCount, kLimitCount, kTicks);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -59215,6 +59453,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--hf4-joint") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_hf4_joint.png";
             try { return RunHf4JointShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hf5-net <out.png>: render the Hull Friction + Joints LOCKSTEP + ROLLBACK showcase (Slice HF5, THE
+        // NETCODE HEADLINE of FLAGSHIP #30). PURE CPU — NO GPU compute, NO new shader (hf_gen_msl unchanged); Metal
+        // runs the IDENTICAL hulljoint.h RunJointedHullLockstep/RunJointedHullRollback harness the Vulkan
+        // --hf5-net-shot runs -> the converged authority world is byte-identical cross-backend by construction.
+        if (argc > 1 && std::strcmp(argv[1], "--hf5-net") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hf5_net.png";
+            try { return RunHf5NetShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER
