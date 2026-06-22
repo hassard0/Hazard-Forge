@@ -501,4 +501,207 @@ inline void GiSHToImage(const GiProbeGrid& grid, std::span<const FxProbeSH> sh, 
     }
 }
 
+// =====================================================================================================
+// ===== Slice GI3 — INTEGER TRILINEAR SH INTERPOLATION (the continuous irradiance field) ==============
+// =====================================================================================================
+// APPEND-ONLY (everything above this banner is GI1+GI2, BYTE-FROZEN). GI3 makes the discrete probe volume
+// CONTINUOUS: for any query point it trilinearly blends the 8 surrounding probes' integer SH (with
+// partition-of-unity weights, Σ == kOne EXACTLY) and evaluates the cosine-lobe irradiance for a surface
+// normal — a SMOOTH integer irradiance field, the piece a renderer samples for indirect light. The integer
+// twin of the float DDGI probe_gi.h::NearestProbes (172) + probe_sh.h::InterpolateSH (180). Pure integer ->
+// bit-exact GPU==CPU, strict-zero cross-vendor.
+//
+// THE PARTITION-OF-UNITY CRUX (a hard invariant the test pins, Σw == kOne EXACTLY): a query in the lattice
+// falls in a cell with a per-axis fractional offset frac in [0,kOne]. The per-axis weights are wlo = kOne -
+// frac and whi = frac — they sum to kOne EXACTLY by construction. The 8-corner weight is the triple product
+// wx*wy*wz. Each raw product P_c = wx*wy*wz is a Q48.48 int64 (wx,wy,wz ≤ kOne, three Q16.16 -> Q48.48); the
+// EXACT sum Σ_c P_c factorizes to (Σwx)(Σwy)(Σwz) = kOne^3 (each axis's lo+hi == kOne). We narrow the first
+// 7 corners by >> (2*kFrac) (a FLOOR truncation, so the partial sum is always ≤ kOne) and assign the LAST
+// corner the leftover (kOne - Σ_{c<7} w_c) — the remainder is provably ≥ 0 (each floor only LOSES bits) so
+// the 8 weights sum to kOne EXACTLY (no rounding drift). Lattice-point identity: at a probe (all frac==0)
+// corner 0 gets P=kOne^3 -> w=kOne, the rest P=0 -> w=0, remainder 0 -> corner 7 == 0; the blend is EXACTLY
+// that probe's SH (a falsifiable proof the index/weight math is right).
+//
+// THE SH BLEND CRUX (the GI2 stay-wide-narrow-once discipline): the blended coeff is Σ_c weight_c *
+// cornerSH_c. weight (≤kOne) * coeff (a Q16.16 in roughly [-2,2]) is a Q32.32 product that OVERFLOWS int32
+// (a single ~1.0*~1.0 product is 65536^2 = 4.29e9 > 2^31), so we accumulate the 8-corner blend in an int64
+// (Q32.32) and quantize to Q16.16 EXACTLY ONCE (>> kFrac) — NO per-corner re-quantize. This int64 product is
+// why gi_interp.comp is VULKAN-SPIR-V-ONLY (the GI2 gi_sh_encode.comp convention — glslc can't lower int64
+// to MSL); on Metal the --gi3-interp showcase runs the CPU InterpolateField (byte-identical by construction).
+//
+// OUT-OF-GRID queries CLAMP to the boundary cell (deterministic edge handling): the per-axis base is clamped
+// to [0, dim-2] and frac to [0, kOne] (a query below the grid saturates frac->0 onto the low corner, above
+// the grid frac->kOne onto the high corner). A dim==1 axis collapses to base 0, frac 0 (no second corner).
+
+// ----- FxProbeWeights — the 8 corner probe linear-indices + integer trilinear weights (Σ w == kOne). --
+struct FxProbeWeights {
+    int32_t idx[8];   // the 8 cell-corner flat indices (cx-major; corner bit0=+x, bit1=+y, bit2=+z)
+    fx      w[8];     // the 8 integer trilinear weights, Σ w == kOne EXACTLY (partition of unity)
+};
+
+// ----- FxNearestProbes — the floor-cell + 8-corner index + integer trilinear weights. ----------------
+// The integer twin of probe_gi.h::NearestProbes (172). Per axis: g = (point - origin)/spacing (Q16.16);
+// base = floor(g) = g >> kFrac (arithmetic shift, toward -inf), CLAMPED to [0, dim-2] so base & base+1 are
+// BOTH valid probe indices; frac = g - (base<<kFrac), CLAMPED to [0, kOne] (out-of-grid saturates to the
+// boundary). A dim==1 axis -> base 0, frac 0 (no second corner). The 8 corner weights are the wx*wy*wz
+// triple products narrowed >> (2*kFrac), with the last corner taking the exact leftover so Σ w == kOne.
+// PURE INTEGER, deterministic. A degenerate grid (spacing<=0 || any dim<=0) -> idx all 0, w[0]=kOne (the
+// documented disabled fallback; FxInterpolateSH guards probeCount<=0 separately).
+inline FxProbeWeights FxNearestProbes(const GiProbeGrid& grid, const FxVec3& point) {
+    FxProbeWeights t{};
+    if (grid.spacing <= 0 || grid.nx <= 0 || grid.ny <= 0 || grid.nz <= 0) {
+        for (int c = 0; c < 8; ++c) { t.idx[c] = 0; t.w[c] = 0; }
+        t.w[0] = kOne;
+        return t;
+    }
+    // Per-axis FLOOR cell base + the [0,kOne] fractional position (the integer NearestProbes::axis).
+    auto axis = [&](fx v, fx o, fx sp, int dim, int& base, fx& frac) {
+        if (dim <= 1) { base = 0; frac = 0; return; }
+        // g = (v - o) / sp in Q16.16 (the rtrace::fxdiv idiom, int64-widen + integer divide).
+        fx g = (fx)((((int64_t)(v - o)) << kFrac) / (int64_t)sp);
+        int b = (int)(g >> kFrac);                       // floor toward -inf (arithmetic shift)
+        if (b < 0) b = 0;
+        if (b > dim - 2) b = dim - 2;
+        fx fr = (fx)(g - ((int64_t)b << kFrac));          // g - base, the fractional remainder
+        if (fr < 0) fr = 0;
+        if (fr > kOne) fr = kOne;
+        base = b; frac = fr;
+    };
+    int bx, by, bz;
+    fx fxr, fyr, fzr;
+    axis(point.x, grid.origin.x, grid.spacing, grid.nx, bx, fxr);
+    axis(point.y, grid.origin.y, grid.spacing, grid.ny, by, fyr);
+    axis(point.z, grid.origin.z, grid.spacing, grid.nz, bz, fzr);
+
+    // Per-axis lo/hi weights — wlo + whi == kOne EXACTLY (the partition-of-unity factor).
+    const fx wlo[3] = {(fx)(kOne - fxr), (fx)(kOne - fyr), (fx)(kOne - fzr)};
+    const fx whi[3] = {fxr, fyr, fzr};
+
+    fx accum = 0;   // running sum of the first 7 corner weights (to take the exact leftover at corner 7)
+    for (int c = 0; c < 8; ++c) {
+        int sx = (c & 1), sy = ((c >> 1) & 1), sz = ((c >> 2) & 1);
+        // A dim==1 axis (frac 0, no second probe) clamps the +offset corner back onto the single valid
+        // index; its +offset weight is already 0 there (whi==0) so the blend is unchanged.
+        int cx = bx + sx; if (cx > grid.nx - 1) cx = grid.nx - 1;
+        int cy = by + sy; if (cy > grid.ny - 1) cy = grid.ny - 1;
+        int cz = bz + sz; if (cz > grid.nz - 1) cz = grid.nz - 1;
+        t.idx[c] = ProbeFlatIndex(grid, cx, cy, cz);
+        fx wx = sx ? whi[0] : wlo[0];
+        fx wy = sy ? whi[1] : wlo[1];
+        fx wz = sz ? whi[2] : wlo[2];
+        if (c < 7) {
+            // P_c = wx*wy*wz (Q48.48 int64); narrow >> (2*kFrac) -> Q16.16 (a FLOOR truncation so the
+            // partial sum never exceeds kOne — the leftover at corner 7 is provably >= 0).
+            int64_t p = (int64_t)wx * (int64_t)wy * (int64_t)wz;
+            fx wc = (fx)(p >> (2 * kFrac));
+            t.w[c] = wc;
+            accum += wc;
+        } else {
+            t.w[c] = (fx)(kOne - accum);   // the EXACT leftover -> Σ w == kOne (partition of unity)
+        }
+    }
+    return t;
+}
+
+// ----- FxInterpolateSH — the integer 8-corner SH blend (the probe_sh.h::InterpolateSH integer twin). --
+// out.coeff[i][c] = Σ_corner weight_corner * shBuffer[idx_corner].coeff[i][c]. SH projection is LINEAR, so
+// blend-then-evaluate == evaluate-then-blend; we blend the compact 9x3 SH once. weight(≤kOne, Q16.16) *
+// coeff(Q16.16) is a Q32.32 product that OVERFLOWS int32, so the 8-corner sum is accumulated in an int64
+// (STAY WIDE) and quantized to Q16.16 EXACTLY ONCE (>> kFrac) — the GI2 narrow-once discipline. The corner
+// indices are clamped in-range by FxNearestProbes so every read is valid for probeCount>0. The shader
+// copies this VERBATIM. A degenerate/empty buffer -> a zeroed SH (the disabled fallback).
+inline FxProbeSH FxInterpolateSH(const FxProbeWeights& wts, std::span<const FxProbeSH> shBuffer) {
+    FxProbeSH out{};
+    if (shBuffer.empty()) return out;
+    int64_t acc[9][3] = {};
+    for (int c = 0; c < 8; ++c) {
+        int64_t wc = (int64_t)wts.w[c];                 // Q16.16 weight
+        const FxProbeSH& src = shBuffer[(size_t)wts.idx[c]];
+        for (int i = 0; i < 9; ++i) {
+            acc[i][0] += wc * (int64_t)src.coeff[i][0];   // Q32.32 term — WIDE, no narrow yet
+            acc[i][1] += wc * (int64_t)src.coeff[i][1];
+            acc[i][2] += wc * (int64_t)src.coeff[i][2];
+        }
+    }
+    for (int i = 0; i < 9; ++i)
+        for (int c = 0; c < 3; ++c)
+            out.coeff[i][c] = (fx)(acc[i][c] >> kFrac);   // narrow ONCE: Q32.32 >> 16 -> Q16.16
+    return out;
+}
+
+// ----- FxInterpolateIrradiance — the continuous irradiance at `point` for `normal`. ------------------
+// = FxSHEvaluate(FxInterpolateSH(FxNearestProbes(grid,point), shBuffer), normal): trilinearly blend the 8
+// surrounding probes' SH, then reconstruct the cosine-lobe irradiance for the surface normal. The diffuse
+// indirect a renderer samples. `normal` is a Q16.16 direction (need not be exactly unit — FxSHEvaluate
+// evaluates the basis on it directly). Pure integer, deterministic.
+inline GiRadiance FxInterpolateIrradiance(const GiProbeGrid& grid, std::span<const FxProbeSH> shBuffer,
+                                          const FxVec3& point, const FxVec3& normal) {
+    return FxSHEvaluate(FxInterpolateSH(FxNearestProbes(grid, point), shBuffer), normal);
+}
+
+// ----- InterpolateField — evaluate the irradiance field at a set of query points/normals. ------------
+// One query per output element (matching the shader's one-thread-per-query). `points`/`normals`/`out` are
+// parallel spans; out[i] = FxInterpolateIrradiance(grid, shBuffer, points[i], normals[i]). An empty query
+// set writes nothing (the no-op — the shader's 0-dispatch). PURE INTEGER, deterministic.
+inline void InterpolateField(const GiProbeGrid& grid, std::span<const FxProbeSH> shBuffer,
+                             std::span<const FxVec3> points, std::span<const FxVec3> normals,
+                             std::span<GiRadiance> out) {
+    size_t n = points.size();
+    for (size_t i = 0; i < n; ++i)
+        out[i] = FxInterpolateIrradiance(grid, shBuffer, points[i], normals[i]);
+}
+
+// ----- GiInterpDispatchGroups — the dispatch-sizing / no-op path (one thread per query point). -------
+// kGiInterpThreads = the compute workgroup size. GiInterpDispatchGroups(n) = the number of workgroups to
+// cover `n` query points, or EXACTLY 0 when n<=0 (an empty query set -> 0 groups -> DispatchCompute(0) ->
+// the output buffer untouched == the cleared upload). The byte-identical no-op the GI3 determinism proof
+// rests on. Pure integer.
+inline constexpr int kGiInterpThreads = 64;
+inline int GiInterpDispatchGroups(int queryCount) {
+    return (queryCount <= 0) ? 0 : (queryCount + kGiInterpThreads - 1) / kGiInterpThreads;
+}
+
+// ----- GiFieldToImage — the SMOOTH interpolated-irradiance-field viz (the GI3 golden). ---------------
+// A 2D SLICE through the continuous probe volume: a horizontal plane at a fixed world y (the grid's vertical
+// midplane), sampled on a w x h lattice spanning the grid's XZ footprint. Each pixel = FxInterpolateIrradiance
+// at that world point for a fixed surface normal (+Y, the up-facing receiver) quantized to RGBA8 — a SMOOTH
+// irradiance field, MUCH smoother than the discrete GI1/GI2 probe-tile grids (the continuous blend the
+// renderer samples). PINNED slice + resolution (the cross-vendor golden rests on it). Strict integer ->
+// identical both backends. `img` is row-major RGBA8 (top row first), size == w*h. A 0-probe / empty-SH grid
+// -> the image is left as the background fill.
+inline void GiFieldToImage(const GiProbeGrid& grid, std::span<const FxProbeSH> shBuffer,
+                           std::span<uint32_t> img, uint32_t w, uint32_t h) {
+    const uint32_t kBg = PackRGBA8(18, 18, 22, 255);
+    for (uint32_t i = 0; i < w * h; ++i) img[i] = kBg;
+
+    int probes = ProbeCount(grid);
+    if (probes <= 0 || shBuffer.empty() || w == 0 || h == 0) return;
+
+    // The XZ footprint of the lattice: x in [origin.x, origin.x + (nx-1)*spacing], z analogous. The slice
+    // y is the vertical midplane: origin.y + ((ny-1)*spacing)/2 (integer halve). The receiver normal is +Y.
+    const fx spanX = fxmul((fx)((int64_t)(grid.nx - 1) * kOne), grid.spacing);
+    const fx spanZ = fxmul((fx)((int64_t)(grid.nz - 1) * kOne), grid.spacing);
+    const fx sliceY = (fx)(grid.origin.y + (fxmul((fx)((int64_t)(grid.ny - 1) * kOne), grid.spacing) >> 1));
+    const FxVec3 nrm{0, kOne, 0};
+
+    auto q = [](fx v) -> int32_t {
+        int64_t t = ((int64_t)v * 255) >> kFrac;   // Q16.16 [0,1+] -> [0,255]
+        if (t < 0) t = 0; if (t > 255) t = 255;     // clamp (irradiance can exceed 1 within the headroom)
+        return (int32_t)t;
+    };
+
+    for (uint32_t py = 0; py < h; ++py) {
+        // u,v in [0,kOne] across the image (integer: pixel center / (dim-1) so the corners hit the lattice
+        // bounds exactly; a 1px image collapses to u=0).
+        fx vfr = (h > 1) ? (fx)(((int64_t)py * kOne) / (int64_t)(h - 1)) : 0;
+        fx z = (fx)(grid.origin.z + (int64_t)(((int64_t)spanZ * vfr) >> kFrac));
+        for (uint32_t px = 0; px < w; ++px) {
+            fx ufr = (w > 1) ? (fx)(((int64_t)px * kOne) / (int64_t)(w - 1)) : 0;
+            fx x = (fx)(grid.origin.x + (int64_t)(((int64_t)spanX * ufr) >> kFrac));
+            GiRadiance irr = FxInterpolateIrradiance(grid, shBuffer, FxVec3{x, sliceY, z}, nrm);
+            img[(size_t)py * w + px] = PackRGBA8(q(irr.r), q(irr.g), q(irr.b), 255);
+        }
+    }
+}
+
 }  // namespace hf::render::gi

@@ -580,6 +580,19 @@ hf_compile_shaders(
     # showcase runs the CPU gi::EncodeAllProbes (byte-identical by construction, the grain_integrate.comp
     # convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU SH array + cross-backend.
     "shaders/gi_sh_encode.comp.hlsl:cs"
+    # Deterministic Lumen-class GI Slice 3 (Slice GI3, the CONTINUOUS IRRADIANCE FIELD of FLAGSHIP #29):
+    # gi_interp.comp is the DETERMINISTIC INTEGER TRILINEAR SH INTERPOLATION kernel — ONE thread per QUERY
+    # POINT runs FxInterpolateIrradiance VERBATIM: FxNearestProbes (floor-cell + 8-corner partition-of-unity
+    # trilinear weights, each axis wlo+whi == kOne EXACTLY, the triple products narrowed >> 2*kFrac with the
+    # LAST corner taking the exact leftover so Σw == kOne) -> FxInterpolateSH (the int64 8-corner SH blend,
+    # quantize ONCE >> kFrac) -> FxSHEvaluate (the int64 cosine-lobe reconstruction) — bit-identical to the
+    # CPU gi::InterpolateField (the GPU irradiance == CPU irradiance memcmp proof). NO RayQuery / NO accel
+    # structure (pure-integer compute over the GI2 SH buffer), so the :cs stage compiles it cs_6_x; but the
+    # int64 SH-blend accumulator (a single weight*coeff Q32.32 product overflows int32) makes it
+    # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal hf_gen_msl list; on Metal the
+    # --gi3-interp showcase runs the CPU gi::InterpolateField (byte-identical by construction, the
+    # gi_sh_encode.comp convention). Pure integer SSBO compute + ReadBuffer -> bit-exact GPU==CPU irradiance.
+    "shaders/gi_interp.comp.hlsl:cs"
     # Deterministic GPU Crowds Slice 1 (Slice BD1, the BEACHHEAD of FLAGSHIP #18: deterministic GPU crowds —
     # boids + steering + path-following): boids_steer.comp runs the Q16.16 Reynolds STEERING tick — ONE thread
     # per AGENT reads the FROZEN input buffer (gAgentsIn), computes SteerSeek (proportional pull toward the

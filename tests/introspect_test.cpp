@@ -540,6 +540,8 @@ int main() {
             bool sawGi1ProbeFeature = false;
             // Slice GI2: the gi2-shencode capability is advertised (the integer SH encode — the FLAGSHIP #29 crux).
             bool sawGi2ShencodeFeature = false;
+            // Slice GI3: the gi3-interp capability is advertised (the integer trilinear SH interpolation — FLAGSHIP #29).
+            bool sawGi3InterpFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -788,6 +790,7 @@ int main() {
                     if (AsString(el->value) == "rt6-hero") sawRt6HeroFeature = true;
                     if (AsString(el->value) == "gi1-probe") sawGi1ProbeFeature = true;
                     if (AsString(el->value) == "gi2-shencode") sawGi2ShencodeFeature = true;
+                    if (AsString(el->value) == "gi3-interp") sawGi3InterpFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1011,6 +1014,7 @@ int main() {
             check(sawRt6HeroFeature, "engine.features includes rt6-hero");
             check(sawGi1ProbeFeature, "engine.features includes gi1-probe");
             check(sawGi2ShencodeFeature, "engine.features includes gi2-shencode");
+            check(sawGi3InterpFeature, "engine.features includes gi3-interp");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1406,6 +1410,8 @@ int main() {
         bool sawGi1ProbeShot = false;
         // Slice GI2: the --gi2-shencode-shot showcase flag is listed in the showcase manifest.
         bool sawGi2ShencodeShot = false;
+        // Slice GI3: the --gi3-interp-shot showcase flag is listed in the showcase manifest.
+        bool sawGi3InterpShot = false;
         // Slice FL2: the --fluid-neighbors-shot showcase flag is listed in the showcase manifest.
         bool sawFluidNeighborsShot = false;
         // Slice FL3: the --fluid-density-shot showcase flag is listed in the showcase manifest.
@@ -1658,6 +1664,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--rt6-hero-shot") sawRt6HeroShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gi1-probe-shot") sawGi1ProbeShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--gi2-shencode-shot") sawGi2ShencodeShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--gi3-interp-shot") sawGi3InterpShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-points-shot") sawFricPointsShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-solve-shot") sawFricSolveShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--fric-ramp-shot") sawFricRampShot = true;
@@ -1878,6 +1885,7 @@ int main() {
         check(sawRt6HeroShot, "showcases manifest includes --rt6-hero-shot");
         check(sawGi1ProbeShot, "showcases manifest includes --gi1-probe-shot");
         check(sawGi2ShencodeShot, "showcases manifest includes --gi2-shencode-shot");
+        check(sawGi3InterpShot, "showcases manifest includes --gi3-interp-shot");
         check(sawFricPointsShot, "showcases manifest includes --fric-points-shot");
         check(sawFricSolveShot, "showcases manifest includes --fric-solve-shot");
         check(sawFricRampShot, "showcases manifest includes --fric-ramp-shot");

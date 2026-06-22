@@ -18366,6 +18366,115 @@ static int RunGi2ShencodeShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice GI3 — Deterministic Lumen-class GI INTEGER TRILINEAR SH INTERPOLATION showcase (--gi3-interp)
+// (the CONTINUOUS IRRADIANCE FIELD of FLAGSHIP #29). The Vulkan --gi3-interp-shot dispatches
+// shaders/gi_interp.comp (the int64 SH-blend, one thread per query point) and memcmp's the GPU GiRadiance
+// field == CPU gi::InterpolateField. gi_interp.comp uses an int64 SH-blend accumulator -> Vulkan-SPIR-V-ONLY
+// (glslc can't parse int64_t), so on Metal --gi3-interp runs the CPU gi::InterpolateField + GiFieldToImage
+// reference (the SAME bit-exact reference the Vulkan GPU==CPU memcmp compares against) -> the Metal image is
+// byte-identical to the Vulkan GPU image BY CONSTRUCTION. Builds the SAME gi::BuildGi1Scene enclosure + 4x4x4
+// GiProbeGrid, CPU-traces the GI1 radiance, encodes the GI2 SH, proves lattice-point identity (query@probe
+// == that probe's FxSHEvaluate, byte-exact) + partition of unity (Σw == kOne, maxErr 0) + determinism,
+// renders gi::GiFieldToImage (a SMOOTH irradiance field at the midplane, normal +Y) at 256x256, writes the
+// PNG. Because the interpolation is INTEGER, the gi3_interp golden is STRICT-ZERO cross-vendor. New golden
+// tests/golden/metal/gi3_interp.png (Mac-baked by the CONTROLLER).
+static int RunGi3InterpShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace gi = hf::render::gi;
+    using rt::fx; using rt::FxVec3; using rt::kOne;
+
+    const uint32_t kImgW = 256, kImgH = 256;
+
+    gi::GiScene1 sc = gi::BuildGi1Scene();
+    gi::GiProbeGrid grid;
+    grid.origin  = FxVec3{gi::GiF(-2,1), gi::GiF(1,1), gi::GiF(0,1)};
+    grid.spacing = gi::GiF(1,1);
+    grid.nx = 4; grid.ny = 4; grid.nz = 4;
+    const uint32_t kProbes = (uint32_t)gi::ProbeCount(grid);
+    const uint32_t kRays   = (uint32_t)gi::kGiRaysPerProbe;
+
+    // CPU radiance (GI1) -> SH (GI2) — the SAME bit-exact buffers the Vulkan GPU==CPU memcmp proves.
+    std::vector<gi::GiRadiance> rad((size_t)kProbes * kRays);
+    gi::TraceProbeRays(grid, sc.scene, std::span<gi::GiRadiance>(rad));
+    std::vector<gi::FxProbeSH> sh(kProbes);
+    gi::EncodeAllProbes(grid, std::span<const gi::GiRadiance>(rad), std::span<gi::FxProbeSH>(sh));
+    std::span<const gi::FxProbeSH> shSpan(sh);
+    std::printf("gi3-interp: {probes:%u} [Metal: CPU gi::InterpolateField, byte-identical to the Vulkan GPU "
+                "result by construction]\n", kProbes);
+
+    // Lattice-point identity (query@probe == that probe's FxSHEvaluate, byte-exact).
+    {
+        FxVec3 nY{0, kOne, 0};
+        for (uint32_t p = 0; p < kProbes; ++p) {
+            FxVec3 pos = gi::ProbePos(grid, (int)p);
+            gi::GiRadiance blended = gi::FxInterpolateIrradiance(grid, shSpan, pos, nY);
+            gi::GiRadiance direct  = gi::FxSHEvaluate(sh[p], nY);
+            if (std::memcmp(&blended, &direct, sizeof(gi::GiRadiance)) != 0)
+                return fail("gi3-interp: lattice identity FAILED (query@probe != probe SH)");
+        }
+        std::printf("gi3-interp: lattice identity (query@probe == probe SH irradiance, exact)\n");
+    }
+
+    // Partition of unity (Σw == kOne, maxErr 0) over a dense sweep including out-of-grid points.
+    {
+        int64_t maxErr = 0;
+        for (int iz = 0; iz <= 12; ++iz)
+            for (int iy = 0; iy <= 12; ++iy)
+                for (int ix = 0; ix <= 12; ++ix) {
+                    fx x = (fx)(grid.origin.x - grid.spacing + (fx)(((int64_t)ix * 5 * (int64_t)grid.spacing) / 12));
+                    fx y = (fx)(grid.origin.y - grid.spacing + (fx)(((int64_t)iy * 5 * (int64_t)grid.spacing) / 12));
+                    fx z = (fx)(grid.origin.z - grid.spacing + (fx)(((int64_t)iz * 5 * (int64_t)grid.spacing) / 12));
+                    gi::FxProbeWeights w = gi::FxNearestProbes(grid, FxVec3{x, y, z});
+                    int64_t s = 0; for (int c = 0; c < 8; ++c) s += (int64_t)w.w[c];
+                    int64_t err = s - (int64_t)kOne; if (err < 0) err = -err;
+                    if (err > maxErr) maxErr = err;
+                }
+        if (maxErr != 0) return fail("gi3-interp: weights do NOT sum to kOne");
+        std::printf("gi3-interp: weights sum kOne (maxErr:%lld)\n", (long long)maxErr);
+    }
+
+    // Two-run determinism (the CPU interp is a pure function) on a dense field.
+    {
+        const int QW = 64, QH = 64;
+        const fx spanX = rt::fxmul((fx)((int64_t)(grid.nx - 1) * kOne), grid.spacing);
+        const fx spanZ = rt::fxmul((fx)((int64_t)(grid.nz - 1) * kOne), grid.spacing);
+        const fx sliceY = (fx)(grid.origin.y + (rt::fxmul((fx)((int64_t)(grid.ny - 1) * kOne), grid.spacing) >> 1));
+        std::vector<FxVec3> pts((size_t)QW * QH), nrm((size_t)QW * QH, FxVec3{0, kOne, 0});
+        for (int qz = 0; qz < QH; ++qz)
+            for (int qx = 0; qx < QW; ++qx) {
+                fx u = (fx)(((int64_t)qx * kOne) / (QW - 1));
+                fx v = (fx)(((int64_t)qz * kOne) / (QH - 1));
+                fx x = (fx)(grid.origin.x + (((int64_t)spanX * u) >> 16));
+                fx z = (fx)(grid.origin.z + (((int64_t)spanZ * v) >> 16));
+                pts[(size_t)qz * QW + qx] = FxVec3{x, sliceY, z};
+            }
+        std::vector<gi::GiRadiance> o1((size_t)QW * QH), o2((size_t)QW * QH);
+        gi::InterpolateField(grid, shSpan, std::span<const FxVec3>(pts), std::span<const FxVec3>(nrm),
+                             std::span<gi::GiRadiance>(o1));
+        gi::InterpolateField(grid, shSpan, std::span<const FxVec3>(pts), std::span<const FxVec3>(nrm),
+                             std::span<gi::GiRadiance>(o2));
+        if (std::memcmp(o1.data(), o2.data(), o1.size() * sizeof(gi::GiRadiance)) != 0)
+            return fail("gi3-interp: two CPU runs differ (nondeterministic)");
+        std::printf("gi3-interp determinism: two runs BYTE-IDENTICAL\n");
+    }
+
+    // --- Render the SMOOTH interpolated-irradiance-field slice + write the image. ---
+    std::vector<uint32_t> img((size_t)kImgW * kImgH, 0);
+    gi::GiFieldToImage(grid, shSpan, std::span<uint32_t>(img), kImgW, kImgH);
+    std::vector<uint8_t> bgra((size_t)kImgW * kImgH * 4, 0);
+    for (size_t p = 0; p < (size_t)kImgW * kImgH; ++p) {
+        uint32_t px = img[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kImgW, kImgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic integer interpolated-irradiance field [CPU reference] "
+                "(%u probes)\n", outPath, kImgW, kImgH, kProbes);
+    return 0;
+}
+
 // ===== Slice RT3 — Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase (--rt3-shadow) (FLAGSHIP
 // #28). The Vulkan --rt3-shadow-shot wires REAL HW inline ray query: a PRIMARY RayQuery closest-hit THEN a
 // SECOND any-hit shadow ray (toward the directional light) whose order-independent occlusion OR GATES the
@@ -58184,6 +58293,16 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--gi2-shencode") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_gi2_shencode.png";
             try { return RunGi2ShencodeShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --gi3-interp <out.png>: render the Deterministic Lumen-class GI INTEGER TRILINEAR SH INTERPOLATION
+        // showcase (Slice GI3, the CONTINUOUS IRRADIANCE FIELD of FLAGSHIP #29). gi_interp.comp uses an int64
+        // SH-blend accumulator -> Vulkan-SPIR-V-ONLY (glslc can't parse int64_t), so Metal runs the CPU
+        // gi::InterpolateField + GiFieldToImage reference (byte-identical to the Vulkan GPU result by
+        // construction). New golden tests/golden/metal/gi3_interp.png.
+        if (argc > 1 && std::strcmp(argv[1], "--gi3-interp") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_gi3_interp.png";
+            try { return RunGi3InterpShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt3-shadow <out.png>: render the Hardware Ray Tracing DETERMINISTIC RT HARD SHADOWS showcase

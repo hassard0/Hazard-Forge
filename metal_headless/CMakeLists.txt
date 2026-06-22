@@ -354,6 +354,17 @@ hf_gen_msl(fract_reduce.comp     fract_reduce.comp.hlsl     comp fract_reduce_ma
 # grain_integrate.comp / fluid_integrate.comp convention). So gi_sh_encode.comp gets NO hf_gen_msl line; on
 # Metal the --gi2-shencode showcase runs the CPU gi::EncodeAllProbes (byte-identical by construction), while
 # the Vulkan side carries the GPU SH == CPU SH memcmp proof.
+# Deterministic Lumen-class GI Slice 3 (Slice GI3, the CONTINUOUS IRRADIANCE FIELD of FLAGSHIP #29):
+# gi_interp.comp is the DETERMINISTIC INTEGER TRILINEAR SH INTERPOLATION kernel — ONE thread per QUERY POINT
+# runs FxInterpolateIrradiance VERBATIM (FxNearestProbes partition-of-unity trilinear weights Σw==kOne ->
+# FxInterpolateSH int64 8-corner blend, quantize once -> FxSHEvaluate cosine-lobe reconstruction) —
+# bit-identical to gi::InterpolateField. It has NO RayQuery / NO accel structure (pure-integer compute over
+# the GI2 SH buffer), but the int64 SH-blend accumulator (a single weight*coeff Q32.32 product overflows
+# int32) keeps it VULKAN-SPIR-V-ONLY: DXC -spirv compiles int64_t, but glslc (the Metal HLSL->SPIR-V->MSL
+# frontend) cannot parse int64_t in HLSL (the gi_sh_encode.comp / grain_integrate.comp convention). So
+# gi_interp.comp gets NO hf_gen_msl line; on Metal the --gi3-interp showcase runs the CPU
+# gi::InterpolateField + GiFieldToImage (byte-identical by construction), while the Vulkan side carries the
+# GPU irradiance == CPU irradiance memcmp proof.
 # Deterministic GPU Cloth Slice 1 (Slice CL1, the BEACHHEAD of FLAGSHIP #8): cloth_integrate.comp runs the
 # Q16.16 semi-implicit-Euler PARTICLE LATTICE INTEGRATOR — ONE thread per particle runs `steps` iterations
 # of (vel += gravity*dt; prev = pos; pos += vel*dt; ground floor-clamp) on its OWN particle, the fxmul

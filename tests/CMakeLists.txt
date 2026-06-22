@@ -751,6 +751,17 @@ hf_add_pure_test(gi_probe_test)
 # #includes sim/fpx.h read-only. Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(gi_sh_test)
 
+# Deterministic Lumen-class GI Slice 3 (Slice GI3, the CONTINUOUS IRRADIANCE FIELD of FLAGSHIP #29): the
+# pure-CPU validation of the INTEGER TRILINEAR SH INTERPOLATION (engine/render/gi.h::FxNearestProbes /
+# FxInterpolateSH / FxInterpolateIrradiance / InterpolateField the gi_interp.comp shader runs VERBATIM). It
+# settles the integer trilinear blend before any GPU trust: the 8 corner weights sum to kOne EXACTLY
+# (partition of unity, maxErr 0); the 8 corner indices are the correct cell corners; lattice-point identity
+# (a query@probe reproduces that probe's FxSHEvaluate BYTE-exact); cell-center -> w == kOne/8 each;
+# out-of-grid clamps to the boundary; a point nearer a brighter probe reads brighter; two runs byte-identical.
+# gi.h #includes render/rtrace.h read-only (byte-frozen), rtrace.h #includes sim/fpx.h read-only. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(gi_interp_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/
