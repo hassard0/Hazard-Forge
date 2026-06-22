@@ -705,6 +705,18 @@ hf_add_pure_test(rt_shadow_test)
 # (rtrace.h is APPEND-ONLY/byte-frozen, #included read-only). Pure C++ (hf_core), ASan-eligible.
 hf_add_pure_test(rt_reflect_test)
 
+# Hardware Ray Tracing Slice 5 (Slice RT5, FLAGSHIP #28): the DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN — the
+# pure-CPU invariants the --rt5-simrender-shot / --rt5-simrender showcases rest on (the HW==CPU memcmp lives
+# in the Vulkan showcase, which needs a GPU). RT5 COMPOSES the determinism moat (fpx's deterministic Q16.16
+# rigid-body sim, lockstep-replayable) with the RT4 render. This test pins the joint invariant: fpx::RunLockstep
+# authority==replica BYTE-IDENTICAL (inputs-only re-sim); the shared rt5::BodiesToRtScene bridge is PURE (two
+# calls byte-equal; B bodies -> B+1 prims; ground primIndex 0 reflective; each FxBody -> RtSphere{pos,radius,1+i});
+# RenderSceneReflected(authScene) == RenderSceneReflected(replicaScene) (RT(authority)==RT(replica) — a deterministic
+# sim renders reproducibly); and the RT render does NOT mutate the fpx world (byte-identical pre==post — a pure
+# read). Uses the SAME converter (tests/rt5_simrender_scene.h) the showcases use; rtrace.h + fpx.h are byte-frozen,
+# #included read-only. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(rt_simrender_test)
+
 # Deterministic Convex Rigid-Body Contacts Slice 1 (Slice CX1, the BEACHHEAD of FLAGSHIP #19): the Q16.16
 # integer box-box SEPARATING-AXIS TEST core (engine/sim/convex.h) the GPU shaders/convex_sat.comp.hlsl
 # copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16 toolbox (fx/fxmul/fxdiv/FxVec3/FxRotate/

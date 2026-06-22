@@ -90,6 +90,7 @@
 #include "render/mc.h"              // Slice MC1: GPU isosurface meshing per-cell MARCHING-CUBES case classification (VoxelField/CaseIndex/ClassifyCells/MakeSphereField) — shared verbatim with mc_classify.comp + the Vulkan --mc-classify-shot
 #include "render/rtrace.h"          // Slice RT1: deterministic Q16.16 SW reference ray tracer (RtScene/RtRay/IntersectSphere/IntersectAabb/TraceClosest/ShadeHitInt/RenderScene/BuildRt1Scene) — Metal runs the CPU reference (rt_trace.comp is int64/Vulkan-only) + the Vulkan --rt1-trace-shot
 #include "sim/fpx.h"                // Slice FPX1: deterministic fixed-point physics Q16.16 integrator + integer broadphase (fx/fxmul/FxVec3/FxBody/FxWorld/IntegrateStep/BroadphaseCell/CellId/FloorDiv) — shared verbatim with fpx_integrate.comp + the Vulkan --fpx-shot
+#include "rt5_simrender_scene.h"    // Slice RT5: the SHARED sim->RT bridge (rt5::BuildRt5World/BuildRt5Stream/BodiesToRtScene) used by --rt5-simrender (here) + the Vulkan --rt5-simrender-shot + rt_simrender_test — lives under tests/ to keep rtrace.h sim-free + fpx.h render-free
 #include "sim/cloth.h"              // Slice CL1: deterministic GPU cloth Q16.16 particle-lattice integrator + grid build (ClothParticle/ClothGrid/InitGrid/IntegrateParticles) — shared verbatim with cloth_integrate.comp + the Vulkan --cloth-integrate-shot
 #include "sim/fluid.h"              // Slice FL1: deterministic GPU fluid Q16.16 particle-pool integrator + dam-break block (FluidParticle/FluidBlock/InitBlock/IntegrateFluid) — shared verbatim with fluid_integrate.comp + the Vulkan --fluid-integrate-shot
 #include "sim/grain.h"              // Slice GR1: deterministic GPU granular/sand Q16.16 grain-pool integrator + dropped block (GrainParticle/GrainBlock/InitGrainBlock/IntegrateGrains, radius-aware ground rest) — shared verbatim with grain_integrate.comp + the Vulkan --grain-integrate-shot
@@ -18369,6 +18370,90 @@ static int RunRt4ReflectShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
     std::printf("OK wrote %s (%ux%u) — deterministic HW-RT mirror reflections [CPU SW reference] (%u reflective)\n",
                 outPath, kRtW, kRtH, reflective);
+    return 0;
+}
+
+// ===== Slice RT5 — Hardware Ray Tracing DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN showcase (--rt5-simrender)
+// (FLAGSHIP #28). COMPOSES the determinism moat (fpx's deterministic Q16.16 rigid-body sim, lockstep-
+// replayable) with the RT4 render. Runs a fixed sphere-pile sim through fpx::RunLockstep TWICE (authority +
+// replica, same init+stream -> bit-identical), converts the settled AUTHORITY world -> an rtrace::RtScene via
+// the SHARED rt5::BodiesToRtScene bridge (a reflective ground AABB primIndex 0 + each FxBody -> an RtSphere),
+// and CPU-renders it via rtrace::RenderSceneReflected (the SAME bit-exact reference the Vulkan --rt5-simrender-
+// shot proves the HW rt_reflect.comp equal to) -> the Metal image is byte-identical to the Vulkan HW image BY
+// CONSTRUCTION. rt_reflect.comp is int64/RayQuery -> Vulkan-only (NOT in hf_gen_msl), so the HW-envelope line
+// notes Metal==CPU reference. Prints the 4 proofs. New golden tests/golden/metal/rt5_simrender.png (CONTROLLER-
+// baked). NO new shader, NO rtrace.h/fpx.h change.
+static int RunRt5SimrenderShowcase(const char* outPath) {
+    namespace rt = hf::render::rtrace;
+    namespace fpx = hf::sim::fpx;
+    namespace rt5 = hf::render::rt5;
+
+    const uint32_t kRtW = 320, kRtH = 240;
+    const size_t kPixels = (size_t)kRtW * kRtH;
+
+    auto worldBytes = [](const fpx::FxWorld& w) { return w.bodies.size() * sizeof(fpx::FxBody); };
+
+    // === (A) The deterministic sim: RunLockstep x2 (authority + replica) ===
+    const fpx::FxWorld init = rt5::BuildRt5World();
+    const std::vector<fpx::FxCommand> simStream = rt5::BuildRt5Stream();
+    const fpx::FxWorld authority =
+        fpx::RunLockstep(init, simStream, rt5::kRt5Ticks, rt5::kRt5Dt, rt5::kRt5Iters);
+    const fpx::FxWorld replica =
+        fpx::RunLockstep(init, simStream, rt5::kRt5Ticks, rt5::kRt5Dt, rt5::kRt5Iters);
+    const uint32_t kBodies = (uint32_t)authority.bodies.size();
+
+    // PROOF (1) sim lockstep: replica (fed inputs only) == authority BIT-IDENTICAL.
+    if (authority.bodies.size() != replica.bodies.size() ||
+        std::memcmp(authority.bodies.data(), replica.bodies.data(), worldBytes(authority)) != 0)
+        return fail("rt5-simrender: sim lockstep authority != replica (nondeterministic fixed-point sim?)");
+    std::printf("rt5-simrender: {bodies:%u, ticks:%d} sim lockstep authority==replica BIT-IDENTICAL\n",
+                kBodies, rt5::kRt5Ticks);
+
+    // === (B) Convert the settled worlds -> RtScene (the SHARED bridge) ===
+    const fpx::FxWorld authBefore = fpx::SnapshotWorld(authority);
+    rt5::Rt5Scene authS = rt5::BodiesToRtScene(authority);
+    rt5::Rt5Scene replS = rt5::BodiesToRtScene(replica);
+
+    // === (C) CPU renders (Metal = the CPU reference) ===
+    std::vector<uint32_t> image(kPixels, 0), replImage(kPixels, 0);
+    rt::RenderSceneReflected(authS.scene, authS.camera, kRtW, kRtH, std::span<uint32_t>(image));
+    rt::RenderSceneReflected(replS.scene, replS.camera, kRtW, kRtH, std::span<uint32_t>(replImage));
+
+    // PROOF (2) RT render closure: RT(authority) == RT(replica) image BYTE-EQUAL.
+    if (std::memcmp(image.data(), replImage.data(), kPixels * sizeof(uint32_t)) != 0)
+        return fail("rt5-simrender: RT(authority) != RT(replica) (the lockstep diverged?)");
+    std::printf("rt5-simrender: RT(authority)==RT(replica) image BYTE-EQUAL\n");
+
+    // PROOF (3) HW envelope: on Metal rt_reflect.comp is Vulkan-only, so this IS the CPU reference the Vulkan
+    // HW==CPU memcmp compares against -> byte-identical to the Vulkan HW image by construction (Metal=CPU ref).
+    {
+        std::vector<uint32_t> image2(kPixels, 0);
+        rt::RenderSceneReflected(authS.scene, authS.camera, kRtW, kRtH, std::span<uint32_t>(image2));
+        if (std::memcmp(image.data(), image2.data(), kPixels * sizeof(uint32_t)) != 0)
+            return fail("rt5-simrender: two CPU renders differ (nondeterministic)");
+    }
+    std::printf("rt5-simrender: HW==CPU image BYTE-EQUAL (eps_rt:0, hwRayQuery:false -> Metal=CPU reference)\n");
+
+    // PROOF (4) render is render-only: the fpx world is byte-identical before vs after the RT render.
+    const bool statesEqual = (authority.bodies.size() == authBefore.bodies.size() &&
+                              std::memcmp(authority.bodies.data(), authBefore.bodies.data(),
+                                          worldBytes(authority)) == 0 &&
+                              authority.groundY == authBefore.groundY);
+    if (!statesEqual) return fail("rt5-simrender: the RT render MUTATED the fpx world (not a pure read)");
+    std::printf("rt5-simrender: render-only (sim world byte-unmutated, statesEqual:true)\n");
+
+    // --- Write the image (RGBA8 row-major top-first -> BGRA for WritePNG). ---
+    std::vector<uint8_t> bgra(kPixels * 4, 0);
+    for (size_t p = 0; p < kPixels; ++p) {
+        uint32_t px = image[p];
+        bgra[p * 4 + 0] = (uint8_t)((px >> 16) & 0xFF);
+        bgra[p * 4 + 1] = (uint8_t)((px >> 8) & 0xFF);
+        bgra[p * 4 + 2] = (uint8_t)(px & 0xFF);
+        bgra[p * 4 + 3] = (uint8_t)((px >> 24) & 0xFF);
+    }
+    if (!WritePNG(outPath, bgra, kRtW, kRtH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — deterministic fpx pile, ray-traced [CPU SW reference] (%u bodies)\n",
+                outPath, kRtW, kRtH, kBodies);
     return 0;
 }
 
@@ -57823,6 +57908,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--rt4-reflect") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_rt4_reflect.png";
             try { return RunRt4ReflectShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --rt5-simrender <out.png>: render the Hardware Ray Tracing DETERMINISM-ENVELOPE + LOCKSTEP TIE-IN
+        // showcase (Slice RT5, FLAGSHIP #28) — a deterministic fpx sphere-pile sim (RunLockstep x2), the
+        // settled bodies -> an rtrace::RtScene, CPU-rendered (rt_reflect.comp is Vulkan-only -> Metal=CPU ref,
+        // byte-identical to the Vulkan HW result by construction). New golden tests/golden/metal/rt5_simrender.png.
+        if (argc > 1 && std::strcmp(argv[1], "--rt5-simrender") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_rt5_simrender.png";
+            try { return RunRt5SimrenderShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --rt2-query-hw <out.png>: render the Slice RT2b Metal HARDWARE ray query (intersection_query over an

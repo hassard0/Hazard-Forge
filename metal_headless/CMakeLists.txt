@@ -1091,6 +1091,10 @@ target_include_directories(visual_test PRIVATE
     ${HF_ROOT}/engine
     ${HF_ROOT}/third_party
     ${HF_ROOT}/third_party/imgui
+    # Slice RT5: the SHARED sim->RT bridge tests/rt5_simrender_scene.h (used by the Vulkan + Metal showcases
+    # AND rt_simrender_test) lives under tests/ to keep rtrace.h sim-free + fpx.h render-free; on the include
+    # path so --rt5-simrender (visual_test.mm) can #include it.
+    ${HF_ROOT}/tests
 )
 
 # Docked editor UI (Slice BT): force 32-bit ImDrawIdx (matches the engine's RHI index binding) via the

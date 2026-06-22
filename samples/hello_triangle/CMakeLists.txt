@@ -3,6 +3,10 @@ add_executable(hello_triangle main.cpp)
 # non-Apple in the root CMakeLists, so this link only happens on the Vulkan path.
 target_link_libraries(hello_triangle PRIVATE hf_engine hf_editor)
 target_compile_definitions(hello_triangle PRIVATE HF_HAS_EDITOR=1)
+# Slice RT5: the sim->RT bridge (tests/rt5_simrender_scene.h) is SHARED by the Vulkan + Metal showcases AND
+# the rt_simrender_test, so the converter is ONE source of truth. It lives under tests/ (NOT engine/) to keep
+# rtrace.h sim-free + fpx.h render-free; add that dir to the include path so main.cpp can #include it.
+target_include_directories(hello_triangle PRIVATE "${CMAKE_SOURCE_DIR}/tests")
 
 # main() is one monolithic function with ~190 inline `--*-shot` showcase blocks; their locals are all
 # reserved together in main()'s stack frame, which grew past the default 1 MB Windows stack under the
