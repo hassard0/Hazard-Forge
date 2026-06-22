@@ -1,6 +1,10 @@
+// Shared procedural sky (HFSkyColor): the IBL reflection below MUST match the sky pass, so both pull
+// the gradient/haze/sun from ONE source (issue #4). See shaders/procedural_sky.hlsli.
+#include "procedural_sky.hlsli"
 struct FrameData {
     float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
     float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
+    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5 time channel).
     float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
 };
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
@@ -44,28 +48,11 @@ float hfGeometrySmith(float NoV, float NoL, float roughness) {
 float3 hfFresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (float3(1.0, 1.0, 1.0) - F0) * pow(saturate(1.0 - cosTheta), 5.0);
 }
-// Procedural sky color for a world-space direction. Replicates the gradient + sun glow from
-// sky.frag.hlsl (same zenith/horizon/ground colors and the same sun term keyed off the directional
-// light). Used for image-based lighting: metals reflect this in the reflection direction.
-float3 SkyColor(float3 dir) {
-    float3 d = normalize(dir);
-    // Horizon -> zenith gradient.
-    float  h       = saturate(d.y * 0.5 + 0.5);
-    float3 zenith  = float3(0.18, 0.30, 0.62);
-    float3 horizon = float3(0.65, 0.72, 0.82);
-    float3 sky     = lerp(horizon, zenith, pow(h, 0.8));
-    // Dim ground haze for the lower hemisphere.
-    float3 ground = float3(0.12, 0.11, 0.10);
-    if (d.y < 0.0) {
-        float g = saturate(-d.y * 2.0);
-        sky = lerp(sky, ground, g);
-    }
-    // Sun glow toward the (incoming) directional light direction.
-    float3 sunDir = normalize(-f.lightDir.xyz);
-    float  s = pow(max(dot(d, sunDir), 0.0), 256.0);
-    sky += float3(1.0, 0.95, 0.8) * s * 2.0;
-    return sky;
-}
+// Procedural sky color for a world-space direction. Used for image-based lighting: metals reflect
+// this in the reflection direction. Thin wrapper over the SHARED HFSkyColor (procedural_sky.hlsli) so
+// this IBL and the sky pass cannot drift — change the look in ONE place (issue #4). The sun term keys
+// off the directional light (f.lightDir), so the wrapper forwards it.
+float3 SkyColor(float3 dir) { return HFSkyColor(dir, f.lightDir.xyz); }
 
 // Cook-Torrance contribution for a single light of given radiance.
 float3 hfCookTorrance(float3 N, float3 V, float3 L, float3 radiance,

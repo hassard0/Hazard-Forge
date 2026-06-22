@@ -125,6 +125,7 @@
 #include "debug/debug_draw.h"
 #include "debug/debug_emitters.h"
 #include "runtime/camera.h"  // Slice AA: backend-agnostic Camera for the scripted-pose --camera path
+#include "runtime/clock.h"   // Issue #5: FixedTimestep — the deterministic time source for the animated-sky --sky-animated showcase
 #include "runtime/parallel_record.h"  // Slice AU: deterministic parallel command-recording partition
 #include "editor/gizmo.h"    // Slice AB: transform gizmo emit (drawn through the debug-line layer)
 #include "editor/editor_panels.h"   // Slice BT: docked editor UI (Hierarchy/Inspector/Stats/Viewport)
@@ -11654,6 +11655,108 @@ static int RunCloudsShowcase(const char* outPath) {
     if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
     device->WaitIdle();
     std::printf("OK wrote %s (%ux%u) — clouds, %d objects\n", outPath, cw, ch, kNumObjs);
+    return 0;
+}
+
+// --- ANIMATED SKY showcase (ISSUE #5). Mirrors the Vulkan --sky-animated-shot path: the fullscreen
+// animated procedural sky (sky_animated.frag — the shared HFSkyColor base from procedural_sky.hlsli
+// plus a cloud band whose pan is driven by FrameData.skyParams.z = time) -> post -> PNG. The time is
+// the SAME deterministic 2.0 s the Vulkan side captures (240 fixed steps at 1/120 s), so the Metal
+// golden is reproducible AND byte-identical to the Vulkan render by construction (same MSL from the
+// same HLSL via hf_gen_msl). The proof that the per-frame TIME channel works cross-backend.
+static int RunSkyAnimatedShowcase(const char* outPath) {
+    using math::Mat4; using math::Vec3;
+    const uint32_t W = 1280, H = 720;
+    auto device = rhi::mtl::CreateMetalDeviceHeadless(W, H);
+    const float kFovY = 1.04719755f;
+    const float aspect = (float)W / (float)H;
+
+    auto loadMSL = [&](const char* file, const char* entry) {
+        std::string src = LoadText(std::string(HF_GEN_SHADER_DIR) + "/" + file);
+        return rhi::mtl::MakeShaderModuleFromMSL(*device, src, entry);
+    };
+    auto FlipProjY = [](Mat4 p) { p.m[1] = -p.m[1]; p.m[5] = -p.m[5];
+                                  p.m[9] = -p.m[9]; p.m[13] = -p.m[13]; return p; };
+
+    // DETERMINISTIC time: 240 fixed steps at 1/120 s == exactly 2.0 s (the golden's fixed capture).
+    runtime::FixedTimestep clock(1.0f / 120.0f, 1 << 30);
+    int totalSteps = 0;
+    for (int frame = 0; frame < 240; ++frame) totalSteps += clock.Tick(1.0f / 120.0f);
+    const float kTime = (float)totalSteps * clock.Step();   // = 2.0 s
+
+    auto skyVs = loadMSL("sky.vert.gen.metal", "sky_vertex");
+    auto skyFs = loadMSL("sky_animated.frag.gen.metal", "sky_animated_fragment");
+    rhi::GraphicsPipelineDesc skyD;
+    skyD.vertex = skyVs.get(); skyD.fragment = skyFs.get();
+    skyD.colorFormat = device->Swapchain().ColorFormat();
+    skyD.depthTest = false; skyD.usesFrameUniforms = true; skyD.fullscreen = true;
+    auto skyPipe = device->CreateGraphicsPipeline(skyD);
+
+    auto postVs = loadMSL("post.vert.gen.metal", "post_vertex");
+    auto postFs = loadMSL("post.frag.gen.metal", "post_fragment");
+    rhi::GraphicsPipelineDesc postD;
+    postD.vertex = postVs.get(); postD.fragment = postFs.get();
+    postD.colorFormat = device->Swapchain().ColorFormat();
+    postD.depthTest = false; postD.usesFrameUniforms = false;
+    postD.usesTexture = true; postD.fullscreen = true;
+    auto postPipe = device->CreateGraphicsPipeline(postD);
+
+    auto rt = device->CreateRenderTarget(W, H);
+
+    // SAME camera as the Vulkan --sky-animated-shot (so the reconstructed view ray matches).
+    const Vec3 eye{0.0f, 1.5f, 6.0f};
+    const Vec3 center{0.0f, 2.6f, 0.0f};
+    FrameData fd{};
+    {
+        Mat4 view = Mat4::LookAt(eye, center, {0, 1, 0});
+        Mat4 proj = FlipProjY(Mat4::Perspective(kFovY, aspect, 0.1f, 100.0f));  // Metal NDC +Y up
+        Mat4 vp = proj * view;
+        for (int k = 0; k < 16; ++k) fd.vp[k] = vp.m[k];
+        fd.lightDir[0] = -0.4f; fd.lightDir[1] = -0.55f; fd.lightDir[2] = -0.7f; fd.lightDir[3] = 0.0f;
+        fd.viewPos[0] = eye.x; fd.viewPos[1] = eye.y; fd.viewPos[2] = eye.z; fd.viewPos[3] = 1.0f;
+        Vec3 fwd = math::normalize(center - eye);
+        Vec3 right = math::normalize(math::cross(fwd, Vec3{0, 1, 0}));
+        Vec3 up = math::cross(right, fwd);
+        fd.camFwd[0]=fwd.x; fd.camFwd[1]=fwd.y; fd.camFwd[2]=fwd.z;
+        fd.camRight[0]=right.x; fd.camRight[1]=right.y; fd.camRight[2]=right.z;
+        fd.camUp[0]=up.x; fd.camUp[1]=up.y; fd.camUp[2]=up.z;
+        fd.skyParams[0] = std::tan(0.5f * kFovY);
+        fd.skyParams[1] = aspect;
+        fd.skyParams[2] = kTime;                 // <-- THE TIME CHANNEL (issue #5)
+        fd.skyParams[3] = (float)totalSteps;     // <-- frameIndex
+    }
+
+    render::RenderGraph graph;
+    render::RgResource rgScene = graph.ImportTarget(
+        "sceneColor", render::RgResourceKind::SceneColor, *rt);
+    render::RgResource rgSwap = graph.ImportSwapchain("swapchain");
+
+    graph.AddPass("sky", {}, {rgScene},
+        [&](rhi::IRHIDevice& dev, rhi::ICommandBuffer& cmd) {
+            dev.SetFrameUniforms(&fd, sizeof(FrameData));
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*skyPipe);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+    graph.AddPass("post", {rgScene}, {rgSwap},
+        [&](rhi::IRHIDevice&, rhi::ICommandBuffer& cmd) {
+            cmd.BeginRenderPass(rhi::ClearColor{0, 0, 0, 1});
+            cmd.BindPipeline(*postPipe);
+            cmd.BindTexture(*rt);
+            cmd.Draw(3);
+            cmd.EndRenderPass();
+        });
+
+    device->CaptureNextFrame();
+    graph.Execute(*device);
+
+    std::vector<uint8_t> bgra; uint32_t cw = 0, ch = 0;
+    if (!device->GetCapturedPixels(bgra, cw, ch)) return fail("no captured pixels");
+    if (!WritePNG(outPath, bgra, cw, ch)) return fail("PNG write failed");
+    device->WaitIdle();
+    std::printf("OK wrote %s (%ux%u) — animated sky @ time=%.3fs (frameIndex=%d)\n",
+                outPath, cw, ch, (double)kTime, totalSteps);
     return 0;
 }
 
@@ -63874,6 +63977,15 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--clouds") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clouds.png";
             try { return RunCloudsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --sky-animated <out.png>: the issue #5 TIME-CHANNEL showcase — the fullscreen animated
+        // procedural sky (sky_animated.frag, the shared HFSkyColor base + a cloud band panned by
+        // FrameData.skyParams.z = time). Mirrors the Vulkan --sky-animated-shot at the SAME deterministic
+        // 2.0 s (240 fixed steps @ 1/120 s). Renders the new sky_animated.png golden.
+        if (argc > 1 && std::strcmp(argv[1], "--sky-animated") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_sky_animated.png";
+            try { return RunSkyAnimatedShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --cloud-shadows <out.png>: cloud shadows on the ground showcase (Slice CK) — the SAME

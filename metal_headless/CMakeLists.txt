@@ -144,6 +144,11 @@ hf_gen_msl(bloom_composite.frag  bloom_composite.frag.hlsl  frag bloom_composite
 hf_gen_msl(shadow.vert shadow.vert.hlsl vert shadow_vertex)
 hf_gen_msl(sky.vert    sky.vert.hlsl    vert sky_vertex)
 hf_gen_msl(sky.frag    sky.frag.hlsl    frag sky_fragment)
+# Animated procedural sky (issue #5): the time-channel demo (reads FrameData.skyParams.z = time to
+# drift a cloud band). Pure float math (value-noise + the shared HFSkyColor, NO int64 / RayQuery) so
+# glslc lowers it natively — same HLSL->SPIR-V->MSL chain as sky.frag, no --msl-version needed. The
+# --sky-animated Metal showcase renders the new sky_animated.png golden (the CONTROLLER bakes it).
+hf_gen_msl(sky_animated.frag sky_animated.frag.hlsl frag sky_animated_fragment)
 # GPU-driven culling + indirect draw (Slice AR): compute kernel frustum-culls a 1024-instance grid
 # and ORDER-compacts the survivors + writes the indirect draw-args. Reuses lit_instanced.vert for the
 # indirect draw. Same HLSL->SPIR-V->MSL toolchain (one workgroup, groupshared prefix sum).

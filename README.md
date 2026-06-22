@@ -270,6 +270,15 @@ Layered, all above the seam:
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the seam design, descriptor model, frame structure, the
 shared HLSL→Metal toolchain, the deterministic-simulation conventions, and per-backend notes.
 
+**Shared shader includes + the time channel.** Shaders that share math pull it from a shared `.hlsli` include (no
+separate compile entry — both DXC and the `hf_gen_msl` Metal path preprocess it inline). `shaders/procedural_sky.hlsli`
+holds `HFSkyColor(dir, lightDir)`, the **single source of truth** for the procedural sky: the sky pass, the lit pass's
+IBL reflection (`SkyColor(R)` — what metals/glass reflect), and the material-graph IBL all call it, so retuning the sky
+updates every reflection in lock-step. For animation, `FrameData.skyParams` carries a per-frame **time channel** —
+`skyParams.z = time` (seconds, from `runtime::FixedTimestep`), `skyParams.w = frameIndex`. A shader animates by reading
+`float time = f.skyParams.z;`; existing showcases pass `time = 0` so their goldens stay byte-identical. The worked
+example is `shaders/sky_animated.frag.hlsl` (`--sky-animated-shot` / `--sky-animated`).
+
 ### Repo layout
 
 ```
@@ -287,6 +296,7 @@ hazard-forge/
 │   ├── scene/ terrain/ asset/ anim/ physics/ material/ ui/ audio/ vfx/ net/ game/ runtime/ editor/ debug/
 │   └── math/ hal/
 ├── shaders/                    Shared HLSL → SPIR-V & Metal (+ generated/ material-codegen output)
+│                               Shared includes: pbr_core.hlsli (PBR core), procedural_sky.hlsli (HFSkyColor — one sky for the sky pass AND IBL reflections)
 ├── tools/                      material_codegen: build-time HLSL generator from *.mat.json graphs
 ├── mac_window/                 Native Cocoa entry: windowed Metal viewport from a CAMetalLayer*
 ├── samples/hello_triangle/     Vulkan sample: every showcase via --*-shot capture + --fly + --introspect

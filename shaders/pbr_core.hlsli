@@ -13,9 +13,14 @@
 #ifndef HF_PBR_CORE_HLSLI
 #define HF_PBR_CORE_HLSLI
 
+// Shared procedural sky (HFSkyColor): the graph-material IBL below pulls the SAME sky as the sky pass
+// and lit.frag, so a sky retune updates every reflection too (issue #4). See procedural_sky.hlsli.
+#include "procedural_sky.hlsli"
+
 struct FrameData {
     float4x4 viewProj; float4 lightDir; float4 lightColor; float4 viewPos;
     float4 ptCount; float4 ptPos[3]; float4 ptColor[3]; float4x4 lightViewProj;
+    // skyParams: x=tanHalfFov, y=aspect, z=time(seconds), w=frameIndex (issue #5 time channel).
     float4 camFwd; float4 camRight; float4 camUp; float4 skyParams;
 };
 [[vk::binding(0, 0)]] cbuffer Frame { FrameData f; };
@@ -61,19 +66,9 @@ float hfGeometrySmith(float NoV, float NoL, float roughness) {
 float3 hfFresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (float3(1.0, 1.0, 1.0) - F0) * pow(saturate(1.0 - cosTheta), 5.0);
 }
-float3 hfSkyColor(float3 dir) {
-    float3 d = normalize(dir);
-    float  h       = saturate(d.y * 0.5 + 0.5);
-    float3 zenith  = float3(0.18, 0.30, 0.62);
-    float3 horizon = float3(0.65, 0.72, 0.82);
-    float3 sky     = lerp(horizon, zenith, pow(h, 0.8));
-    float3 ground = float3(0.12, 0.11, 0.10);
-    if (d.y < 0.0) { float g = saturate(-d.y * 2.0); sky = lerp(sky, ground, g); }
-    float3 sunDir = normalize(-f.lightDir.xyz);
-    float  s = pow(max(dot(d, sunDir), 0.0), 256.0);
-    sky += float3(1.0, 0.95, 0.8) * s * 2.0;
-    return sky;
-}
+// Thin wrapper over the SHARED HFSkyColor (procedural_sky.hlsli) so the graph IBL and the sky pass
+// cannot drift — the sun term keys off the directional light, so forward f.lightDir (issue #4).
+float3 hfSkyColor(float3 dir) { return HFSkyColor(dir, f.lightDir.xyz); }
 float3 hfCookTorrance(float3 N, float3 V, float3 L, float3 radiance,
                       float3 albedo, float metallic, float roughness, float3 F0) {
     float3 H   = normalize(L + V);

@@ -128,6 +128,9 @@ hf_compile_shaders(
     "shaders/bloom_composite.frag.hlsl:ps"
     "shaders/sky.vert.hlsl:vs"
     "shaders/sky.frag.hlsl:ps"
+    # Animated procedural sky (issue #5): the time-channel demo. Reads FrameData.skyParams.z = time to
+    # drift a cloud band; shares HFSkyColor (procedural_sky.hlsli, issue #4). Behind --sky-animated-shot.
+    "shaders/sky_animated.frag.hlsl:ps"
     "shaders/particles.comp.hlsl:cs"
     "shaders/particle.vert.hlsl:vs"
     "shaders/particle.frag.hlsl:ps"

@@ -96,6 +96,19 @@ The `FrameData` struct (352 bytes at the time of the skybox slice; `kFrameUboSiz
 
 The `kFrameUboSize` constant is bumped whenever the struct approaches the current allocation. The C++ `FrameData` struct (mirrored byte-for-byte in `metal_headless/visual_test.mm`) and the HLSL `cbuffer FrameData` in every shader that reads it must be kept in sync by hand — the Metal struct layout is asserted to match the Vulkan sample's. Pass-specific parameters that are NOT per-frame (bloom thresholds, SSAO kernel params, per-object material factors, glass tint/alpha) travel via **push constants**, not the UBO — the vertex push constant carries `mat4 model + float4 material`, and the bloom/SSAO fullscreen passes use the `fragmentPushConstants` flag to read their params in the fragment stage.
 
+### `skyParams` channels — and the per-frame TIME channel (issue #5)
+
+`skyParams` is a single `float4` with **per-pass conventions** (only ever read by the pass whose convention it is, so they never collide):
+
+- The sky / lit / animated-sky path reads `skyParams.x = tan(0.5·fovY)`, `skyParams.y = aspect` (the view-ray reconstruction), and now **`skyParams.z = time` (seconds), `skyParams.w = frameIndex`** — the per-frame **time channel** an animated shader reads. Before issue #5 there was nowhere in the per-frame UBO to read time, so animated sky / water / foliage / VFX shaders were stuck static or had to smuggle time through a per-draw push constant. To animate, a shader just reads:
+
+  ```hlsl
+  float time = f.skyParams.z;   // seconds since the sample started
+  ```
+
+  The CPU fills it from a `runtime::FixedTimestep` (the deterministic fixed-step clock in `engine/runtime/clock.h`): accumulated time = `steps · Step()`. **Golden-invariance:** every existing showcase fills `skyParams.z = 0` (the `FrameData fd{}` zero-init already gives this), so its render is byte-identical to before; only a sample that *wants* motion advances the clock. The worked example is `shaders/sky_animated.frag.hlsl` + the `--sky-animated-shot` (Vulkan) / `--sky-animated` (Metal) showcase, captured at a fixed `2.0 s` for a reproducible golden.
+- Other passes that do NOT render the procedural sky repurpose `skyParams.zw` for their own pass-local data (e.g. `planar.frag` and `lit_contactshadow.frag` use `.zw = (1/width, 1/height)`; `lit_pbr_ibl.frag` uses `.z = env maxLod`; the reflection probes pack a box into `.xyz/.w`). These passes never read the time convention, so there is no conflict.
+
 ---
 
 ## Multi-Pass Frame Structure
@@ -1044,6 +1057,15 @@ Alongside the image goldens there is one **non-image golden**: the engine-state 
 ### Shaders are generated, not hand-written
 
 The Metal shaders are **generated from the shared HLSL sources at build time** — there is no hand-written MSL to drift from the canonical shaders. For each shader the `metal_headless` build runs HLSL → SPIR-V (`glslc -x hlsl`) → MSL (`spirv-cross --msl --msl-decoration-binding`), emitting `*.gen.metal`, which `visual_test` compiles at runtime via `newLibraryWithSource:`. The `--msl-decoration-binding` flag maps each resource's SPIR-V binding directly to its Metal `[[buffer/texture/sampler(n)]]` index; the engine's Metal binding constants (`engine/rhi_metal/metal_common.h`) are chosen to match. The only Metal-specific shader adjustments are guarded by `#ifdef HF_MSL_GEN` (two texture-origin V-flips), so the Vulkan SPIR-V is byte-identical.
+
+#### Shared shader includes (`.hlsli`): one source of truth
+
+Shaders that share math pull it from a shared `.hlsli` **include** (a plain `#include "name.hlsli"` resolved relative to the including file). Both compile paths preprocess the include before lowering, so an `.hlsli` needs **no compile entry / no CMake registration** in either the DXC list (`samples/hello_triangle/CMakeLists.txt`) or the `hf_gen_msl` list (`metal_headless/CMakeLists.txt`) — it only has to sit next to the shaders that pull it in (`shaders/`). The two shared includes:
+
+- **`shaders/pbr_core.hlsli`** — the metallic-roughness PBR lighting core (`hfShadePBR` / `hfShadePBRN`, Cook-Torrance + IBL + PCF shadow), reused by the build-time-codegen'd material-graph shaders so the data-driven materials shade identically to `lit_pbr.frag`.
+- **`shaders/procedural_sky.hlsli`** (issue #4) — the procedural clear-day sky: **`HFSkyColor(dir, lightDir)`**, the horizon→zenith gradient + dim ground haze + directional sun glow. This is the **single source of truth** for the sky, pulled by **three** sites that previously each hand-duplicated it: the sky pass (`sky.frag`, the view ray), the lit pass's IBL reflection (`lit.frag`'s `SkyColor(R)` — what every metal/glass surface reflects), and the material-graph IBL (`pbr_core.hlsli`'s `hfSkyColor`). Because the sky dome and the IBL reflection now derive from one function, retuning the sky (a sunset palette, a different gradient) updates the reflections in lock-step — change it once. The animated-sky demo (`sky_animated.frag`) layers a time-driven cloud band on the same `HFSkyColor` base.
+
+There is now one more golden than the 264 above: **`sky_animated`** (the issue #5 time-channel demo — `--sky-animated-shot` on Vulkan / `--sky-animated` on Metal), captured at a fixed `2.0 s`.
 
 ---
 
