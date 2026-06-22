@@ -580,6 +580,14 @@ hf_gen_msl(warmhull_key.comp        warmhull_key.comp.hlsl        comp warmhull_
 # DELIBERATELY NOT MSL-gen'd here (NO hf_gen_msl line) — the Metal --hf1-points showcase runs the CPU
 # hullfric::BuildAllHullFrictionManifoldsPairs (byte-identical to the Vulkan GPU result by construction, the
 # warmhull_cache.comp convention), while the Vulkan --hf1-points-shot carries the GPU==CPU memcmp proof.
+# Hull Friction + Joints Slice 2 (Slice HF2, the friction SOLVER of FLAGSHIP #30): hullfric_warm.comp is THE WARM
+# CONE SOLVER — it runs the accumulated, warm-started, cone-clamped Coulomb friction solve over the HF1 hull
+# manifold (SolveHullFrictionWarm = the persist::SolveFrictionWarm body with the hull WorldInvInertiaFull tensor).
+# The warm-solve delta math (fxdiv/fxmul/FxDot Q16.16 products) is int64, so hullfric_warm.comp is
+# VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is DELIBERATELY NOT MSL-gen'd here (NO hf_gen_msl line)
+# — the Metal --hf2-warm showcase runs the CPU hullfric::StepHullFrictionSolveOnly (byte-identical to the Vulkan
+# GPU result by construction, the warmhull_warm.comp convention), while the Vulkan --hf2-warm-shot carries the
+# GPU==CPU memcmp proof.
 # Deterministic Rigid<->Fluid Coupling Slice 1 (Slice CP1, the BEACHHEAD of FLAGSHIP #11): the BODY->FLUID
 # grid-hash QUERY (the GR2 grain_neighbor twin, per BODY instead of per grain) OVER the reused FL2 fluid cell
 # table (fluid_cell_{count,scan,emit} above build the cellStart/cellParticles the query iterates — no new

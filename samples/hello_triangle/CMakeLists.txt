@@ -1613,6 +1613,22 @@ hf_compile_shaders(
     # memcmp proof. NO new RHI; warmhull.h/gjk.h/fric.h/persist.h + existing shaders + goldens UNTOUCHED. hullfric.h
     # is a brand-new additive header.
     "shaders/hullfric_points.comp.hlsl:cs"
+    # Hull Friction + Joints Slice 2 (Slice HF2): hullfric_warm.comp is THE WARM CONE SOLVER — ONE THREAD
+    # ([numthreads(1,1,1)]) runs the WHOLE hullfric.h::StepHullFrictionSolveOnly over the small pair set: per pair
+    # in the FIXED i<j order, warm-seed the HOST-BUILT keyed friction manifold from the cache, then run
+    # SolveHullFrictionWarm (the accumulated, warm-started, cone-clamped Coulomb friction solve — the
+    # persist::SolveFrictionWarm body with the hull manifold::WorldInvInertiaFull tensor: prime the seed once, then
+    # cfg.iters Gauss-Seidel sweeps doing the accumulated normal block clamped >= 0 + the two cone-clamped tangent
+    # blocks clamped to +/-mu*jn) mutating the bodies IN PLACE so later pairs see earlier updates. HF2 solves a
+    # FIXED manifold set in place — NO integrate, NO de-pen (that is HF3). The host builds the keyed friction
+    # manifold + the per-body FULL world inverse-inertia tensor (the int64 narrowphase + inertia run host-side); the
+    # shader does ONLY the solve. The warm-solve delta math (fxdiv/fxmul/FxDot Q16.16 products) is int64, so this
+    # shader is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT MSL-gen'd — the Metal --hf2-warm
+    # showcase runs the CPU hullfric::StepHullFrictionSolveOnly instead (byte-identical by construction, the
+    # warmhull_warm.comp convention). The GPU final gBodies + gManifolds (the solved accumulators) memcmp-equals the
+    # CPU reference. NO new RHI; hullfric.h is APPEND-only (HF1 byte-frozen); warmhull.h/gjk.h/fric.h/persist.h/
+    # manifold.h + existing shaders + goldens UNTOUCHED.
+    "shaders/hullfric_warm.comp.hlsl:cs"
     # Warm-Started Hull Contacts Slice 3 (Slice WH3): warmhull_warm.comp is THE ACCUMULATED WARM-STARTED SOLVER
     # — ONE THREAD ([numthreads(1,1,1)]) runs the WHOLE warmhull.h::StepWarmHullWorldN over the small hull set:
     # K ticks of predict-integrate -> FULL inertia -> build-keyed-manifold (the WH1 tagged-clip key derivation

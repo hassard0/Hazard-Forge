@@ -887,6 +887,16 @@ hf_add_pure_test(warmhull_test)
 # ASan-eligible.
 hf_add_pure_test(hullfric_test)
 
+# Hull Friction + Joints Slice 2 (Slice HF2, the friction SOLVER of FLAGSHIP #30: hf::sim::hullfric): the
+# accumulated, warm-started, cone-clamped Coulomb friction SOLVE over the HF1 hull manifold (engine/sim/hullfric.h
+# APPEND) the GPU shaders/hullfric_warm.comp copies VERBATIM — the persist::SolveFrictionWarm body with the hull
+# manifold::WorldInvInertiaFull tensor (exactly how warmhull::SolveHullManifoldWarm adapted the normal-only warm
+# solver). Pins SolveHullFrictionWarm convergence (residual non-increasing with iters), the warm-start lever
+# (warm-primed residual < cold at equal iters), the cone invariants (accumNormal>=0, |jt|<=mu*jn), the mu=0
+# frictionless control, friction biting (high-mu removes more tangential slip), and two-run determinism. Pure C++
+# (hf_core), ASan-eligible.
+hf_add_pure_test(hullfric_warm_test)
+
 # Deterministic Gameplay / Netcode Slice 1 (Slice VD1, the BEACHHEAD of FLAGSHIP #27: hf::game::verdict): the
 # PURE-CPU integer entity world + the unified tick-ordered input-command bus that layers a determinism contract
 # over the raw ecs::Registry (engine/game/verdict.h, a NEW additive sibling #including ecs/ecs.h + sim/warmhull.h

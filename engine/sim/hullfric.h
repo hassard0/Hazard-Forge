@@ -284,5 +284,223 @@ inline HullFrictionMeasure MeasureHullFriction(const std::vector<HullFrictionMan
     return m;
 }
 
+// ============================================================================================================
+// ===== Slice HF2 — THE WARM CONE SOLVER (APPEND; HF1 above is BYTE-FROZEN) ===================================
+// ============================================================================================================
+// HF2 adds the accumulated, warm-started, cone-clamped Coulomb friction SOLVE over the HF1 hull manifold — the
+// persist::SolveFrictionWarm machinery (proven bit-exact for boxes), with the box inverse-inertia swapped for the
+// hull's manifold::WorldInvInertiaFull tensor, EXACTLY how warmhull::SolveHullManifoldWarm adapted the normal-only
+// warm solver. The accumulators are HF1's HullFrictionManifold.pts[].normalImpulse/tangentImpulse1/2; the tangent
+// frame is HF1's per-pair m.t1/m.t2 on the sign-corrected EPA normal m.normal; the warm seed is HF1's
+// MatchHullFrictionCache (consumed here). STRICT INTEGER, FIXED order -> bit-identical CPU<->Vulkan<->Metal.
+
+// Pull the full-inertia helpers HF2's solver needs (REUSE, do NOT redefine).
+using convex::FxMat3;
+using convex::FxCross;
+using convex::FxMat3MulVec;
+using fpx::FxScale;
+using fpx::FxAdd;
+using fpx::fxmul;
+using fpx::fxdiv;
+using manifold::FxHullFaces;
+using manifold::BuildCanonicalFaces;
+using manifold::FxHullInertiaBodyFull;
+using manifold::WorldInvInertiaFull;
+
+// ----- HullFrictionConfig: the cone coefficient + the warm-solve knobs (the persist::FrictionStepConfig subset HF2
+// reads). mu = the Coulomb cone coefficient (0 = frictionless); restitution = the normal bounce factor; iters = the
+// accumulated Gauss-Seidel sweep count; slop/beta = the de-pen knobs (UNUSED by the SOLVE-ONLY HF2 — they belong to
+// the HF3 step — carried for the HF3 forward-compat). -----
+struct HullFrictionConfig {
+    fx       mu          = 0;          // Q16.16 Coulomb friction coefficient (0 = frictionless control)
+    fx       restitution = 0;          // Q16.16 bounce factor (0 = fully inelastic)
+    uint32_t iters       = 8;          // accumulated Gauss-Seidel sweeps
+    fx       slop        = kOne / 64;  // (HF3) allowed penetration before pushing apart
+    fx       beta        = (fx)((int64_t)8 * kOne / 10);   // (HF3) position-correction fraction
+};
+
+// ----- SolveHullFrictionWarm: the persist::SolveFrictionWarm body with the hull WorldInvInertiaFull tensor --------
+// Mutates a/b vel+angVel AND m.pts[] accumulators. The accumulators ARRIVE SEEDED (MatchHullFrictionCache for a
+// matched contact, or zero for a cold one). The tangent frame (m.t1, m.t2) + the A->B normal (m.normal) are HF1's
+// per-pair basis (one per manifold). The PINNED steps (the shader copies THIS body VERBATIM):
+//   (1) PRIME ONCE: per point apply the seeded TOTAL impulse J = n*jn + t1*jt1 + t2*jt2 to both bodies (re-inject
+//       last tick's converged impulse). A zero seed primes nothing (a cold contact).
+//   (2) cfg.iters Gauss-Seidel sweeps; per point in FIXED order, NORMAL then t1 then t2 (the persist order),
+//       ACCUMULATED:
+//       - NORMAL: vn = (vpB-vpA).n; kn = invMa+invMb + the angular terms (the full WorldInvInertiaFull tensor);
+//         djn = fxdiv(-(1+e)*vn, kn); newTotal = max(0, normalImpulse + djn); apply J = n*(newTotal-normalImpulse);
+//         normalImpulse = newTotal.
+//       - TANGENT t (t1 then t2): vt = (vpB-vpA).t; kt = the same effective-mass form on t; djt = fxdiv(-vt, kt);
+//         newTotal = clamp(tangentImpulse + djt, -mu*normalImpulse, +mu*normalImpulse) (the cone on the ACCUMULATED
+//         normal); apply Jt = t*(newTotal-tangentImpulse); tangentImpulse = newTotal.
+// PURE INTEGER, FIXED order -> bit-identical CPU<->Vulkan<->Metal. (Mirrors warmhull::SolveHullManifoldWarm's
+// inertia wiring + adds the persist::SolveFrictionWarm tangent blocks.)
+inline void SolveHullFrictionWarm(FxBody& a, FxBody& b, HullFrictionManifold& m,
+                                  const FxMat3& invIaW, const FxMat3& invIbW,
+                                  const HullFrictionConfig& cfg) {
+    if (m.count == 0) return;
+
+    const fx invMassA = a.invMass;
+    const fx invMassB = b.invMass;
+    const fx mu  = cfg.mu;
+    const fx rest = cfg.restitution;
+    const uint32_t cnt = m.count < 4u ? m.count : 4u;
+    const FxVec3 n  = m.normal;   // already A->B (HF1 sign-corrected it ONCE at build)
+    const FxVec3 t1 = m.t1;
+    const FxVec3 t2 = m.t2;
+
+    // ---- (1) PRIME ONCE: re-inject the seeded TOTAL impulse at every point (the warm-start kick). ----
+    for (uint32_t pi = 0; pi < cnt; ++pi) {
+        HullFrictionPoint& fp = m.pts[pi];
+        const FxVec3 p  = fp.point;
+        const FxVec3 rA = fpx::FxSub(p, a.pos);
+        const FxVec3 rB = fpx::FxSub(p, b.pos);
+        const FxVec3 J = FxAdd(FxScale(n, fp.normalImpulse),
+                               FxAdd(FxScale(t1, fp.tangentImpulse1),
+                                     FxScale(t2, fp.tangentImpulse2)));
+        a.vel    = fpx::FxSub(a.vel, FxScale(J, invMassA));
+        a.angVel = fpx::FxSub(a.angVel, FxMat3MulVec(invIaW, FxCross(rA, J)));
+        b.vel    = FxAdd(b.vel, FxScale(J, invMassB));
+        b.angVel = FxAdd(b.angVel, FxMat3MulVec(invIbW, FxCross(rB, J)));
+    }
+
+    // ---- (2) the accumulated Gauss-Seidel sweeps (apply only the DELTA each time). ----
+    for (uint32_t it = 0; it < cfg.iters; ++it) {
+        for (uint32_t pi = 0; pi < cnt; ++pi) {
+            HullFrictionPoint& fp = m.pts[pi];
+            const FxVec3 p  = fp.point;
+            const FxVec3 rA = fpx::FxSub(p, a.pos);
+            const FxVec3 rB = fpx::FxSub(p, b.pos);
+
+            // ---- NORMAL impulse (the effective-mass form, ACCUMULATED, clamp >= 0) ----
+            {
+                const FxVec3 vpA = FxAdd(a.vel, FxCross(a.angVel, rA));
+                const FxVec3 vpB = FxAdd(b.vel, FxCross(b.angVel, rB));
+                const fx vn = FxDot(fpx::FxSub(vpB, vpA), n);
+                const FxVec3 raxn = FxCross(rA, n);
+                const FxVec3 rbxn = FxCross(rB, n);
+                const fx angA = FxDot(n, FxCross(FxMat3MulVec(invIaW, raxn), rA));
+                const fx angB = FxDot(n, FxCross(FxMat3MulVec(invIbW, rbxn), rB));
+                const fx kn = invMassA + invMassB + angA + angB;
+                if (kn > 0) {
+                    const fx djn = fxdiv(-fxmul(kOne + rest, vn), kn);
+                    fx newTotal = fp.normalImpulse + djn;
+                    if (newTotal < 0) newTotal = 0;           // clamp the ACCUMULATED total >= 0
+                    const fx applied = newTotal - fp.normalImpulse;
+                    const FxVec3 J = FxScale(n, applied);
+                    a.vel    = fpx::FxSub(a.vel, FxScale(J, invMassA));
+                    a.angVel = fpx::FxSub(a.angVel, FxMat3MulVec(invIaW, FxCross(rA, J)));
+                    b.vel    = FxAdd(b.vel, FxScale(J, invMassB));
+                    b.angVel = FxAdd(b.angVel, FxMat3MulVec(invIbW, FxCross(rB, J)));
+                    fp.normalImpulse = newTotal;
+                }
+            }
+
+            // ---- TANGENT friction impulses (t1 then t2), the cone on the ACCUMULATED normal ----
+            const fx coneLo = -fxmul(mu, fp.normalImpulse);   // -mu * the accumulated jn
+            const fx coneHi =  fxmul(mu, fp.normalImpulse);   // +mu * the accumulated jn
+            const FxVec3 tangents[2] = {t1, t2};
+            fx* tacc[2] = {&fp.tangentImpulse1, &fp.tangentImpulse2};
+            for (int ti = 0; ti < 2; ++ti) {
+                const FxVec3 t = tangents[ti];
+                const FxVec3 vpA = FxAdd(a.vel, FxCross(a.angVel, rA));
+                const FxVec3 vpB = FxAdd(b.vel, FxCross(b.angVel, rB));
+                const fx vt = FxDot(fpx::FxSub(vpB, vpA), t);
+                const FxVec3 raxt = FxCross(rA, t);
+                const FxVec3 rbxt = FxCross(rB, t);
+                const fx angA = FxDot(t, FxCross(FxMat3MulVec(invIaW, raxt), rA));
+                const fx angB = FxDot(t, FxCross(FxMat3MulVec(invIbW, rbxt), rB));
+                const fx kt = invMassA + invMassB + angA + angB;
+                if (kt <= 0) continue;
+                const fx djt = fxdiv(-vt, kt);
+                fx newTotal = *tacc[ti] + djt;
+                if (newTotal < coneLo) newTotal = coneLo;          // CLAMP the ACCUMULATED tangent to the cone
+                else if (newTotal > coneHi) newTotal = coneHi;
+                const fx applied = newTotal - *tacc[ti];
+                const FxVec3 Jt = FxScale(t, applied);
+                a.vel    = fpx::FxSub(a.vel, FxScale(Jt, invMassA));
+                a.angVel = fpx::FxSub(a.angVel, FxMat3MulVec(invIaW, FxCross(rA, Jt)));
+                b.vel    = FxAdd(b.vel, FxScale(Jt, invMassB));
+                b.angVel = FxAdd(b.angVel, FxMat3MulVec(invIbW, FxCross(rB, Jt)));
+                *tacc[ti] = newTotal;
+            }
+        }
+    }
+}
+
+// ----- HullContactResidual(a, b, m): the post-solve constraint residual (the warm<cold lever metric) -------------
+// The max over the manifold's contact points of |a NORMAL velocity that should be >= 0 but is < 0| (a penetrating
+// approach the solve failed to remove) + |a TANGENT velocity beyond the friction cone| (a sticking violation). A
+// LOWER residual = a better-converged solve. The warm (cache-primed) solve reaches a STRICTLY lower residual than
+// the cold (zero-seeded) solve at equal iters — the warm-start lever the whole slice rests on. Evaluated from the
+// post-solve body velocities at the contact points (read-only). PURE INTEGER, FIXED order.
+inline fx HullContactResidual(const FxBody& a, const FxBody& b, const HullFrictionManifold& m) {
+    auto absfx = [](fx v) { return v < 0 ? -v : v; };
+    if (m.count == 0) return 0;
+    const FxVec3 n  = m.normal;
+    const FxVec3 t1 = m.t1;
+    const FxVec3 t2 = m.t2;
+    const uint32_t cnt = m.count < 4u ? m.count : 4u;
+    fx maxRes = 0;
+    for (uint32_t pi = 0; pi < cnt; ++pi) {
+        const HullFrictionPoint& fp = m.pts[pi];
+        const FxVec3 p  = fp.point;
+        const FxVec3 rA = fpx::FxSub(p, a.pos);
+        const FxVec3 rB = fpx::FxSub(p, b.pos);
+        const FxVec3 vpA = FxAdd(a.vel, FxCross(a.angVel, rA));
+        const FxVec3 vpB = FxAdd(b.vel, FxCross(b.angVel, rB));
+        const FxVec3 dv  = fpx::FxSub(vpB, vpA);
+        const fx vn = FxDot(dv, n);
+        if (vn < 0) { const fx r = -vn; if (r > maxRes) maxRes = r; }   // a residual approach (penetration)
+        const fx vt1 = FxDot(dv, t1);
+        const fx vt2 = FxDot(dv, t2);
+        const fx a1 = absfx(vt1);
+        const fx a2 = absfx(vt2);
+        if (a1 > maxRes) maxRes = a1;   // a residual tangential slip (un-arrested sliding)
+        if (a2 > maxRes) maxRes = a2;
+    }
+    return maxRes;
+}
+
+// ----- StepHullFrictionSolveOnly(world, cache, cfg, invIW): the HF3 step MINUS integrate/de-pen ------------------
+// Build the manifolds (HF1 BuildAllHullFrictionManifolds), warm-seed each from `cache` (MatchHullFrictionCache),
+// run SolveHullFrictionWarm per pair in the FIXED i<j order (mutation IN PLACE so later pairs see earlier updates),
+// then REWRITE `cache` to EXACTLY this tick's solved contacts (UpdateHullFrictionCache, absent keys evicted). The
+// per-body world inverse inertias (the FULL tensor) are precomputed ONCE (== warmhull::StepWarmHullWorld step 2);
+// HF2 solves a FIXED manifold set in place — NO integrate, NO de-pen (that is HF3). The solved manifolds are also
+// returned (the showcase/test read the converged accumulators). PURE INTEGER, FIXED order -> identical CPU/GPU.
+inline std::vector<HullFrictionManifold> StepHullFrictionSolveOnly(
+        HullWorld& world, HullFrictionCache& cache, const HullFrictionConfig& cfg) {
+    const size_t n = world.bodies.size();
+
+    // World inverse inertias once — the FULL tensor (== warmhull::StepWarmHullWorld step 2, VERBATIM).
+    std::vector<FxMat3> invIW(n);
+    for (size_t i = 0; i < n; ++i) {
+        const FxHullFaces faces = BuildCanonicalFaces(world.hulls[i]);
+        const FxMat3 invIbody = FxHullInertiaBodyFull(world.hulls[i], faces, world.bodies[i].invMass);
+        invIW[i] = WorldInvInertiaFull(world.bodies[i], invIbody);
+    }
+
+    // The FIXED i<j pair order: build the HF1 friction manifold -> warm-seed from the cache -> warm-solve in place.
+    std::vector<HullFrictionManifold> solved;
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = i + 1; j < n; ++j) {
+            if (world.bodies[i].invMass == 0 && world.bodies[j].invMass == 0) continue;   // static-static
+            HullFrictionManifold m = BuildHullFrictionManifold(
+                (uint32_t)i, world.bodies[i], world.hulls[i],
+                (uint32_t)j, world.bodies[j], world.hulls[j]);
+            if (m.count == 0) continue;
+            MatchHullFrictionCache(cache, m);   // warm-seed the accumulators from last tick (key + basis-axis)
+            SolveHullFrictionWarm(world.bodies[i], world.bodies[j], m, invIW[i], invIW[j], cfg);
+            solved.push_back(m);
+        }
+    }
+
+    // Rewrite the cache to EXACTLY this tick's solved contacts (absent keys evicted) — the accumulators persist.
+    cache.entries.clear();
+    for (const HullFrictionManifold& m : solved) UpdateHullFrictionCache(cache, m);
+    return solved;
+}
+
 }  // namespace hullfric
 }  // namespace hf::sim

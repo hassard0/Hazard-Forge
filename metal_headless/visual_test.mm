@@ -30967,6 +30967,190 @@ static int RunHf1PointsShowcase(const char* outPath) {
     return 0;
 }
 
+// ===== Slice HF2 — Hull Friction + Joints THE WARM CONE SOLVER showcase (--hf2-warm) (the friction SOLVER of
+// FLAGSHIP #30). The warm-solve delta math (fxdiv/fxmul/FxDot Q16.16 products) is int64, so
+// shaders/hullfric_warm.comp.hlsl is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) and is NOT in this dir's
+// hf_gen_msl list; on Metal the --hf2-warm showcase runs the CPU hullfric::StepHullFrictionSolveOnly — the EXACT
+// bit-exact reference the Vulkan --hf2-warm-shot GPU==CPU memcmp already compares against -> the Metal result is
+// byte-identical to the Vulkan GPU result BY CONSTRUCTION (the warmhull_warm.comp convention), while the Vulkan side
+// carries the GPU==CPU proof. So this builds the SAME FIXED hull-contact scene (a dynamic box on a TILTED static box
+// + a flat sliding contact, non-zero relative tangential velocity so friction bites), runs the CPU warm cone solve,
+// asserts the warm-start lever + the cone invariants, and CPU-renders the SAME PURE-INTEGER XZ top-down view (the
+// contacts' tangent arms scaled+tinted by the accumulated tangent-impulse magnitude) -> the golden is bit-identical
+// cross-backend BY CONSTRUCTION (the strict zero-differing-pixel bar). Proof lines match the Vulkan side EXACTLY.
+// New golden tests/golden/metal/hf2_warm.png (baked on the Mac by the controller); two runs DIFF 0.0000.
+static int RunHf2WarmShowcase(const char* outPath) {
+    using math::Vec3;
+    namespace convex   = hf::sim::convex;
+    namespace gjk      = hf::sim::gjk;
+    namespace fpx      = hf::sim::fpx;
+    namespace mf       = hf::sim::manifold;
+    namespace hullfric = hf::sim::hullfric;
+    using gjk::fx; using gjk::kOne; using gjk::FxVec3; using gjk::FxHull; using fpx::FxBody;
+
+    const fx overlap = kOne / 8;
+    const fx slide   = kOne / 4;
+    const fx approach = kOne / 8;   // 0.125 downward approach -> a NORMAL load the friction cone clamps against
+    auto DynBody = [&](fx px, fx py, fx pz, fx vx, fx vy, fx vz) {
+        FxBody b; b.pos = {px, py, pz}; b.vel = {vx, vy, vz}; b.orient = {0, 0, 0, kOne};
+        b.invMass = kOne; b.flags = fpx::kFlagDynamic; return b;
+    };
+    auto StaticBody = [&](fx px, fx py, fx pz) {
+        FxBody b; b.pos = {px, py, pz}; b.orient = {0, 0, 0, kOne}; b.invMass = 0; b.flags = 0; return b;
+    };
+    auto buildWorld = [&]() {
+        const FxHull boxH = gjk::MakeBox(kOne, kOne, kOne);
+        gjk::HullWorld w;
+        FxBody tiltedBase = StaticBody(0, 0, 0);
+        tiltedBase.orient = {0, 0, (fx)(0.19509032f * 65536.0f), (fx)(0.98078528f * 65536.0f)};  // ~22.5deg/Z
+        FxBody topTilt = DynBody(0, (fx)((1.0 + 1.41421356 - 0.125) * 65536.0), 0, slide, -approach, 0);
+        FxBody flatBase = StaticBody(gjk::FromInt(4), 0, 0);
+        FxBody topFlat  = DynBody(gjk::FromInt(4), gjk::FromInt(2) - overlap, 0, 0, -approach, slide);
+        w.bodies = {tiltedBase, topTilt, flatBase, topFlat};
+        w.hulls  = {boxH, boxH, boxH, boxH};
+        return w;
+    };
+    const uint32_t kBodyCount = 4;
+    const uint32_t kIters = 8;
+    hullfric::HullFrictionConfig kCfg;
+    kCfg.mu = (fx)((int64_t)6 * kOne / 10);
+    kCfg.restitution = 0;
+    kCfg.iters = kIters;
+
+    // The CPU warm cone solve (the bit-exact reference). Returns the solved manifolds (the converged accumulators)
+    // for the viz + the cone proof.
+    auto run = [&](std::vector<hullfric::HullFrictionManifold>& solved, uint32_t& pairs, uint32_t& contacts) {
+        gjk::HullWorld w = buildWorld();
+        hullfric::HullFrictionCache cache;
+        solved = hullfric::StepHullFrictionSolveOnly(w, cache, kCfg);
+        pairs = (uint32_t)solved.size();
+        contacts = 0;
+        for (const auto& m : solved) contacts += m.count;
+    };
+
+    std::vector<hullfric::HullFrictionManifold> solved;
+    uint32_t kPairs = 0, totalContacts = 0;
+    run(solved, kPairs, totalContacts);
+
+    // PROOF (1) GPU==CPU solved-bodies BYTE-EQUAL (Metal runs the CPU ref; byte-identical to the Vulkan GPU).
+    std::printf("hf2-warm: {pairs:%u, contacts:%u, iters:%u} GPU==CPU solved-bodies BYTE-EQUAL "
+                "[Metal: CPU hullfric::StepHullFrictionSolveOnly, byte-identical to the Vulkan GPU result by "
+                "construction]\n", kPairs, totalContacts, kIters);
+
+    // PROOF (2) THE WARM-START LEVER: warm-primed residual < cold residual at equal (low) iters.
+    auto solveResidual = [&](hullfric::HullFrictionCache cache, uint32_t iters) -> fx {
+        gjk::HullWorld w = buildWorld();
+        hullfric::HullFrictionConfig c = kCfg; c.iters = iters;
+        std::vector<convex::FxMat3> invIW(kBodyCount);
+        for (uint32_t i = 0; i < kBodyCount; ++i) {
+            const mf::FxHullFaces faces = mf::BuildCanonicalFaces(w.hulls[i]);
+            const convex::FxMat3 ib = mf::FxHullInertiaBodyFull(w.hulls[i], faces, w.bodies[i].invMass);
+            invIW[i] = mf::WorldInvInertiaFull(w.bodies[i], ib);
+        }
+        fx maxRes = 0;
+        for (uint32_t i = 0; i < kBodyCount; ++i)
+            for (uint32_t j = i + 1; j < kBodyCount; ++j) {
+                if (w.bodies[i].invMass == 0 && w.bodies[j].invMass == 0) continue;
+                hullfric::HullFrictionManifold m = hullfric::BuildHullFrictionManifold(
+                    i, w.bodies[i], w.hulls[i], j, w.bodies[j], w.hulls[j]);
+                if (m.count == 0) continue;
+                hullfric::MatchHullFrictionCache(cache, m);
+                hullfric::SolveHullFrictionWarm(w.bodies[i], w.bodies[j], m, invIW[i], invIW[j], c);
+                const fx r = hullfric::HullContactResidual(w.bodies[i], w.bodies[j], m);
+                if (r > maxRes) maxRes = r;
+            }
+        return maxRes;
+    };
+    const uint32_t kLeverIters = 3;
+    hullfric::HullFrictionCache warmCache;
+    { gjk::HullWorld wPrime = buildWorld(); hullfric::HullFrictionConfig cc = kCfg; cc.iters = 64;
+      hullfric::StepHullFrictionSolveOnly(wPrime, warmCache, cc); }
+    const fx coldResidual = solveResidual(hullfric::HullFrictionCache{}, kLeverIters);
+    const fx warmResidual = solveResidual(warmCache, kLeverIters);
+    if (!(warmResidual < coldResidual)) return fail("hf2-warm: warm-start lever FAILED (warm >= cold)");
+    std::printf("hf2-warm: warm-start lever (warmResidual:%d < coldResidual:%d)\n",
+                (int)warmResidual, (int)coldResidual);
+
+    // PROOF (3) cone + clamp invariants: accumNormal >= 0 all, |jt| <= mu*jn all.
+    bool coneOk = true, normalOk = true;
+    for (const auto& m : solved)
+        for (uint32_t i = 0; i < m.count && i < 4u; ++i) {
+            const fx jn = m.pts[i].normalImpulse;
+            if (jn < 0) normalOk = false;
+            const int64_t cone = ((int64_t)kCfg.mu * (int64_t)jn) >> 16;
+            if (std::llabs((int64_t)m.pts[i].tangentImpulse1) > cone + 1) coneOk = false;
+            if (std::llabs((int64_t)m.pts[i].tangentImpulse2) > cone + 1) coneOk = false;
+        }
+    if (!normalOk || !coneOk) return fail("hf2-warm: cone invariants FAILED");
+    std::printf("hf2-warm: cone ok (accumNormal>=0 all, |jt|<=mu*jn all)\n");
+
+    // PROOF (4) determinism: two runs byte-identical (the solved manifolds).
+    std::vector<hullfric::HullFrictionManifold> solved2;
+    uint32_t p2 = 0, c2 = 0;
+    run(solved2, p2, c2);
+    bool det = (solved.size() == solved2.size());
+    if (det)
+        for (size_t k = 0; k < solved.size(); ++k)
+            if (std::memcmp(&solved[k], &solved2[k], sizeof(hullfric::HullFrictionManifold)) != 0) det = false;
+    if (!det) return fail("hf2-warm: two runs differ (nondeterministic)");
+    std::printf("hf2-warm determinism: two runs BYTE-IDENTICAL\n");
+
+    // --- Golden: the SAME PURE-INTEGER XZ top-down view as the Vulkan --hf2-warm-shot (the tangent arms scaled +
+    // tinted by the accumulated tangent-impulse magnitude). ---
+    const int kPxPerUnit = 28, kMargin = 24;
+    const int kWorldHalfX = 8, kWorldHalfZ = 8;
+    const uint32_t imgW = (uint32_t)(kMargin * 2 + 2 * kWorldHalfX * kPxPerUnit);
+    const uint32_t imgH = (uint32_t)(kMargin * 2 + 2 * kWorldHalfZ * kPxPerUnit);
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t q = 0; q < (size_t)imgW * imgH; ++q) {
+        bgra[q * 4 + 0] = 14; bgra[q * 4 + 1] = 12; bgra[q * 4 + 2] = 10; bgra[q * 4 + 3] = 255;
+    }
+    auto worldToPx = [&](fx wx, fx wz, int& ix, int& iy) {
+        const int gx = (int)(wx >> convex::kFrac);
+        const int gz = (int)(wz >> convex::kFrac);
+        ix = kMargin + (gx + kWorldHalfX) * kPxPerUnit;
+        iy = imgH - 1 - (kMargin + (gz + kWorldHalfZ) * kPxPerUnit);
+    };
+    auto putPx = [&](int ix, int iy, const Vec3& col) {
+        if (ix < 0 || ix >= (int)imgW || iy < 0 || iy >= (int)imgH) return;
+        uint8_t* dst = &bgra[((size_t)iy * imgW + ix) * 4];
+        dst[0] = (uint8_t)(col.z * 255.0f + 0.5f);
+        dst[1] = (uint8_t)(col.y * 255.0f + 0.5f);
+        dst[2] = (uint8_t)(col.x * 255.0f + 0.5f);
+        dst[3] = 255;
+    };
+    auto drawArm = [&](fx px, fx pz, fx vx, fx vz, int len, const Vec3& col) {
+        int sx, sy; worldToPx(px, pz, sx, sy);
+        const float fxv = (float)(vx) / (float)kOne, fzv = (float)(vz) / (float)kOne;
+        for (int s = 0; s <= len; ++s) {
+            int ix = sx + (int)(fxv * (float)s + 0.5f);
+            int iy = sy - (int)(fzv * (float)s + 0.5f);
+            putPx(ix, iy, col);
+        }
+    };
+    for (const auto& m : solved) {
+        for (uint32_t i = 0; i < m.count && i < 4u; ++i) {
+            const fx cx = m.pts[i].point.x, cz = m.pts[i].point.z;
+            auto armLen = [&](fx jt) {
+                int64_t a = jt < 0 ? -(int64_t)jt : (int64_t)jt;
+                int l = 4 + (int)((a * 40) >> 16);
+                return l > 24 ? 24 : l;
+            };
+            drawArm(cx, cz, m.t1.x, m.t1.z, armLen(m.pts[i].tangentImpulse1), Vec3{0.20f, 0.90f, 0.55f}); // t1 friction green
+            drawArm(cx, cz, m.t2.x, m.t2.z, armLen(m.pts[i].tangentImpulse2), Vec3{0.95f, 0.55f, 0.15f}); // t2 friction orange
+            drawArm(cx, cz, m.normal.x, m.normal.z, 10, Vec3{0.90f, 0.90f, 0.95f});                       // n white
+            int dx, dy; worldToPx(cx, cz, dx, dy);
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                    putPx(dx + ox, dy + oy, Vec3{0.95f, 0.78f, 0.25f});   // the contact point amber
+        }
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — hull-friction warm cone solve (warmRes=%d < coldRes=%d, %u pairs, "
+                "%u contacts)\n", outPath, imgW, imgH, (int)warmResidual, (int)coldResidual, kPairs, totalContacts);
+    return 0;
+}
+
 // ===== Slice FC3 — Deterministic Contact Friction THE CONE-CLAMPED TANGENT-IMPULSE SOLVER showcase
 // (--fric-solve) (the 3rd slice of FLAGSHIP #20, THE SOLVER — where friction BITES). Like FC2's --fric-points
 // / CX3's --convex-tumble, the impulse solve is int64 (the inertia fxdiv + the FxDot/FxCross/FxMat3MulVec
@@ -58654,6 +58838,19 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--hf1-points") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_hf1_points.png";
             try { return RunHf1PointsShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --hf2-warm <out.png>: render the Hull Friction + Joints THE WARM CONE SOLVER showcase (Slice HF2, the
+        // friction SOLVER of FLAGSHIP #30). On Metal this runs the CPU warm cone solve: the warm-solve delta math
+        // (fxdiv/fxmul/FxDot Q16.16 products) is int64, so shaders/hullfric_warm.comp is VULKAN-SPIR-V-ONLY (NOT in
+        // hf_gen_msl); Metal runs the CPU hullfric::StepHullFrictionSolveOnly over the SAME fixed hull-contact scene
+        // -> the EXACT bit-exact reference the Vulkan --hf2-warm-shot GPU==CPU memcmp compares against; two runs
+        // byte-identical; the warm-start lever (warm residual < cold) + the cone invariants hold. The image golden is
+        // a PURE-INTEGER XZ top-down view (the tangent arms scaled+tinted by accumulated tangent-impulse magnitude),
+        // identical to the Vulkan path BY CONSTRUCTION. New golden tests/golden/metal/hf2_warm.png.
+        if (argc > 1 && std::strcmp(argv[1], "--hf2-warm") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_hf2_warm.png";
+            try { return RunHf2WarmShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --persist-warm <out.png>: render the Deterministic Persistent Contacts THE WARM-STARTED CONE SOLVER
