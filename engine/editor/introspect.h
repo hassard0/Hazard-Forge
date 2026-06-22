@@ -83,4 +83,39 @@ struct EngineState {
 std::string DescribeEngine(ecs::Registry& reg, const scene::SceneResources& resources,
                            const EngineState& extra);
 
+// --- Slice DX1: the versioned Agent-SDK contract (FLAGSHIP #31, THE AGENT EXPERIENCE). -----------
+//
+// DescribeAgentApi() builds the ADDITIVE top-level "agentApi" block that DescribeEngine folds in as
+// its trailing key, AND is exposed standalone via the `--agent-api` flag (the lightweight negotiation
+// call). It is the contract an agent codes against:
+//
+//   "agentApi": {
+//     "schemaVersion": 1,                                      // SHAPE-ONLY version (see below)
+//     "capabilities": ["observe","mutate","author","replay","hot-reload"],
+//     "commands": [ {"op":"...","capability":"...","args":[{"name":"...","type":"..."}]}, ... ],
+//     "contentHash": "<hex>"                                   // digest over the VOLATILE content
+//   }
+//
+// THE KEY DESIGN CALL: `schemaVersion` governs the SHAPE ONLY — the set/structure of keys and the
+// shape of a command entry. It bumps ONLY when that structure changes, NOT when a showcase/feature/
+// command is added. The volatile content (the showcase flags + feature names + command ops) is
+// summarized by `contentHash`, a deterministic 64-bit FNV-1a over the canonical concatenation of
+// those strings in their existing emit order. An agent pinned to schemaVersion:1 codes against the
+// fixed shape and watches contentHash to cheaply detect content drift — future slices append a
+// showcase -> contentHash changes + the golden rebakes -> schemaVersion HOLDS at 1. This is what
+// makes it a CONTRACT rather than a dump.
+//
+// Pure (no Registry/SceneResources) — reads only the static showcase/feature/command tables — so it
+// is deterministic + backend-agnostic (identical bytes on Vulkan and Metal). Returns the "agentApi"
+// object as a STANDALONE top-level JSON document (no leading/trailing keys); DescribeEngine emits the
+// IDENTICAL bytes (re-indented one level deeper) as its "agentApi" value.
+std::string DescribeAgentApi();
+
+// Counts over the static manifests, for the DX1 proof lines (showcases:<S>, features:<F>,
+// commands:<C>, capabilities). Pure, deterministic, no allocation of the JSON.
+size_t AgentApiShowcaseCount();
+size_t AgentApiFeatureCount();
+size_t AgentApiCommandCount();
+size_t AgentApiCapabilityCount();
+
 }  // namespace hf::editor

@@ -15,6 +15,7 @@
 #include "scene/components.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <iterator>
 #include <sstream>
@@ -604,7 +605,144 @@ const Command kCommands[] = {
     {"introspect",    "{\"path\": \"string?\"}"},
 };
 
+// --- Slice DX1: the versioned Agent-SDK contract (FLAGSHIP #31). --------------------------------
+//
+// The capability set an agent negotiates against (the 5 capabilities, in this FIXED order). For DX1
+// the existing scene-command ops map onto OBSERVE (read-only) / MUTATE (scene-changing); the other
+// three (AUTHOR / REPLAY / HOT-RELOAD) are ENUMERATED now so an agent can discover them, with their
+// commands landing in DX2–DX6 (a capability with zero commands yet is intended/forward-declared).
+const char* kAgentCapabilities[] = {"observe", "mutate", "author", "replay", "hot-reload"};
+
+// One scriptable command's agent contract: the op, the capability it needs, and its typed arg schema
+// (name -> type-hint). Mirrors engine/scene/commands.h ops; an agent reads this as the machine
+// MUTATE/OBSERVE protocol surface DX2+ extend (a new op = a new entry, NOT a schemaVersion bump).
+struct AgentArg { const char* name; const char* type; };
+struct AgentCommand {
+    const char* op;
+    const char* capability;       // one of kAgentCapabilities
+    const AgentArg* args;         // pointer into a per-command arg array (may be empty)
+    size_t argCount;
+};
+
+// Per-command arg schemas. "?" suffix on a type marks an optional field (matching the kCommands
+// argsJson hints). dump/list/introspect are OBSERVE (read-only); set_*/add/remove MUTATE the ECS;
+// capture/save_scene read the live state and emit an artifact without mutating it -> OBSERVE.
+const AgentArg kArgsSetTransform[] = {
+    {"entity", "int"}, {"position", "[x,y,z]?"}, {"euler", "[x,y,z]?"}, {"scale", "[x,y,z]?"}};
+const AgentArg kArgsSetMaterial[] = {
+    {"entity", "int"}, {"metallic", "float?"}, {"roughness", "float?"},
+    {"baseColor", "string|null?"}, {"normalMap", "string|null?"}};
+const AgentArg kArgsAdd[] = {
+    {"mesh", "string"}, {"baseColor", "string|null?"}, {"normalMap", "string|null?"},
+    {"metallic", "float?"}, {"roughness", "float?"},
+    {"position", "[x,y,z]?"}, {"euler", "[x,y,z]?"}, {"scale", "[x,y,z]?"}};
+const AgentArg kArgsRemove[]     = {{"entity", "int"}};
+const AgentArg kArgsCapture[]    = {{"path", "string"}};
+const AgentArg kArgsSaveScene[]  = {{"path", "string"}};
+const AgentArg kArgsIntrospect[] = {{"path", "string?"}};
+
+const AgentCommand kAgentCommands[] = {
+    {"dump",          "observe", nullptr,           0},
+    {"list",          "observe", nullptr,           0},
+    {"set_transform", "mutate",  kArgsSetTransform,  std::size(kArgsSetTransform)},
+    {"set_material",  "mutate",  kArgsSetMaterial,   std::size(kArgsSetMaterial)},
+    {"add",           "mutate",  kArgsAdd,           std::size(kArgsAdd)},
+    {"remove",        "mutate",  kArgsRemove,        std::size(kArgsRemove)},
+    {"capture",       "observe", kArgsCapture,       std::size(kArgsCapture)},
+    {"save_scene",    "observe", kArgsSaveScene,     std::size(kArgsSaveScene)},
+    {"introspect",    "observe", kArgsIntrospect,    std::size(kArgsIntrospect)},
+};
+
+// FNV-1a 64-bit — the fixed, integer/bit-exact digest the contentHash is built from (the same fixed-
+// hash discipline render/vsm.h uses for deterministic keys; a local byte-wise copy keeps introspect
+// free of any render-header include, preserving its no-render-symbols contract). Pure integer mixing
+// -> identical inputs always hash identically, cross-run + cross-backend.
+constexpr uint64_t kAgentFnvOffset = 1469598103934665603ull;
+constexpr uint64_t kAgentFnvPrime  = 1099511628211ull;
+void AgentFnvBytes(uint64_t& h, const char* s) {
+    for (const char* p = s; *p; ++p) {
+        h ^= static_cast<uint64_t>(static_cast<unsigned char>(*p));
+        h *= kAgentFnvPrime;
+    }
+    // A separator byte after each string so concatenation is unambiguous (["ab","c"] != ["a","bc"]).
+    h ^= 0x1Full;
+    h *= kAgentFnvPrime;
+}
+
+// The contentHash digest: FNV-1a over the canonical concatenation of the VOLATILE content — the
+// showcase flags, then the feature names, then the command ops, each in their existing emit order.
+// Returns the 16-hex-digit lowercase string. Deterministic + backend-agnostic.
+std::string AgentContentHash() {
+    uint64_t h = kAgentFnvOffset;
+    for (size_t i = 0; i < std::size(kShowcases); ++i) AgentFnvBytes(h, kShowcases[i].flag);
+    for (size_t i = 0; i < std::size(kFeatures); ++i)  AgentFnvBytes(h, kFeatures[i]);
+    for (size_t i = 0; i < std::size(kAgentCommands); ++i) AgentFnvBytes(h, kAgentCommands[i].op);
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+    return std::string(buf);
+}
+
+// Emit the "agentApi" OBJECT (the value, starting at '{' through '}', NO trailing newline) with its
+// lines indented as a key at `base` depth (so the object's keys sit at base+1). Both the standalone
+// DescribeAgentApi() and the folded DescribeEngine block call this with the SAME base, so the bytes
+// are identical — the contract: --agent-api == the folded sub-object, byte-for-byte.
+void AppendAgentApiObject(std::ostream& os, int base) {
+    const int k = base + 1;  // key depth inside the object
+    os << "{\n";
+    os << Indent(k) << "\"schemaVersion\": 1,\n";
+
+    // capabilities (the fixed 5, in order).
+    os << Indent(k) << "\"capabilities\": [";
+    for (size_t i = 0; i < std::size(kAgentCapabilities); ++i) {
+        if (i) os << ", ";
+        AppendString(os, kAgentCapabilities[i]);
+    }
+    os << "],\n";
+
+    // commands: {op, capability, args:[{name,type}]}.
+    os << Indent(k) << "\"commands\": [\n";
+    for (size_t i = 0; i < std::size(kAgentCommands); ++i) {
+        const AgentCommand& c = kAgentCommands[i];
+        os << Indent(k + 1) << "{ \"op\": ";
+        AppendString(os, c.op);
+        os << ", \"capability\": ";
+        AppendString(os, c.capability);
+        os << ", \"args\": [";
+        for (size_t a = 0; a < c.argCount; ++a) {
+            if (a) os << ", ";
+            os << "{ \"name\": ";
+            AppendString(os, c.args[a].name);
+            os << ", \"type\": ";
+            AppendString(os, c.args[a].type);
+            os << " }";
+        }
+        os << "] }";
+        os << (i + 1 < std::size(kAgentCommands) ? ",\n" : "\n");
+    }
+    os << Indent(k) << "],\n";
+
+    os << Indent(k) << "\"contentHash\": ";
+    AppendString(os, AgentContentHash());
+    os << "\n";
+    os << Indent(base) << "}";
+}
+
 }  // namespace
+
+size_t AgentApiShowcaseCount()    { return std::size(kShowcases); }
+size_t AgentApiFeatureCount()     { return std::size(kFeatures); }
+size_t AgentApiCommandCount()     { return std::size(kAgentCommands); }
+size_t AgentApiCapabilityCount()  { return std::size(kAgentCapabilities); }
+
+std::string DescribeAgentApi() {
+    // Emit the object at base=1 — the SAME base DescribeEngine uses for the folded "agentApi" value —
+    // so the standalone --agent-api document is byte-for-byte the folded sub-object (just without the
+    // leading `"agentApi": ` key), plus a trailing LF. This is the make-or-break contract identity.
+    std::ostringstream os;
+    AppendAgentApiObject(os, 1);
+    os << "\n";  // trailing newline (LF), matching the other golden documents.
+    return os.str();
+}
 
 std::string DescribeEngine(ecs::Registry& reg, const scene::SceneResources& resources,
                            const EngineState& extra) {
@@ -774,7 +912,15 @@ std::string DescribeEngine(ecs::Registry& reg, const scene::SceneResources& reso
     os << Indent(2) << "\"materialCount\": " << materialCount << ",\n";
     os << Indent(2) << "\"pointLightCount\": " << extra.points.size() << ",\n";
     os << Indent(2) << "\"spotLightCount\": " << extra.spots.size() << "\n";
-    os << Indent(1) << "}\n";
+    os << Indent(1) << "},\n";
+
+    // --- agentApi (Slice DX1): the additive, trailing top-level key — the versioned Agent-SDK -----
+    // contract. Folds in the SAME bytes DescribeAgentApi() emits standalone (base=1), so the
+    // --agent-api document equals this sub-object byte-for-byte. Appended LAST so the prior keys'
+    // bytes are unchanged.
+    os << Indent(1) << "\"agentApi\": ";
+    AppendAgentApiObject(os, 1);
+    os << "\n";
 
     os << "}\n";
     return os.str();

@@ -401,6 +401,30 @@ if (-not `$introOk) {
 }
 Write-Host 'introspection JSON golden: exact match'
 
+# --- Agent-API JSON golden (Slice DX1, FLAGSHIP #31): an EXACT byte-for-byte match of the live
+# --agent-api output (editor::DescribeAgentApi — the versioned Agent-SDK contract block) against the
+# committed text golden. Like the --introspect golden it is backend-AGNOSTIC (pure hf_core, no
+# vk*/Metal symbols — the bytes are identical on Vulkan and Metal), so it is verified once here on the
+# Windows/Vulkan build and is NOT in `$Goldens`/`$vkShots` (the Mac IMAGE set). The schemaVersion
+# governs SHAPE only; the contentHash digest covers the volatile showcase/feature/command content, so
+# this golden rebakes whenever a future slice adds a showcase while schemaVersion HOLDS at 1. ---
+Write-Host '--- agent-api JSON golden ---'
+`$agentExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$agentGolden = 'tests/golden/introspect/agent_api.json'
+`$agentLive = Join-Path `$env:TEMP 'hf_agent_api_live.json'
+& `$agentExe --agent-api `$agentLive 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'agent-api run failed (proofs or byte-golden mismatch)'; exit 28 }
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$agBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$agentGolden).Path)
+`$alBytes = [System.IO.File]::ReadAllBytes(`$agentLive)
+`$agentOk = (`$agBytes.Length -eq `$alBytes.Length)
+if (`$agentOk) { for (`$ai = 0; `$ai -lt `$agBytes.Length; `$ai++) { if (`$agBytes[`$ai] -ne `$alBytes[`$ai]) { `$agentOk = `$false; break } } }
+if (-not `$agentOk) {
+    Write-Host 'agent-api JSON golden MISMATCH (tests/golden/introspect/agent_api.json)'
+    exit 29
+}
+Write-Host 'agent-api JSON golden: exact match'
+
 # --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
 # fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
 # INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered

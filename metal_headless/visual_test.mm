@@ -35,6 +35,7 @@
 #include "scene/renderable.h"
 #include "scene/components.h"
 #include "scene/scene_io.h"
+#include "editor/introspect.h"     // Slice DX1: the versioned Agent-SDK contract (DescribeAgentApi)
 #include "scene/streaming.h"        // Slice BD: distance-based scene/asset streaming (pure CPU)
 #include "ecs/ecs.h"
 #include "asset/gltf_loader.h"
@@ -59276,6 +59277,24 @@ int main(int argc, char** argv) {
     // Headless operability (no-op on Apple/clang; present for call-site uniformity across exes).
     hf::platform::DisableCrashDialogs();
     @autoreleasepool {
+        // --agent-api [out.json] (Slice DX1, FLAGSHIP #31): emit ONLY the versioned Agent-SDK contract
+        // block (editor::DescribeAgentApi). Pure CPU (no Metal device), deterministic + backend-agnostic
+        // — the bytes are IDENTICAL to the Vulkan/Windows --agent-api by construction (the showcase set
+        // is symmetric across backends). The authoritative byte-golden compare is Windows-only; here we
+        // just emit the artifact so the Metal showcase set mirrors the Vulkan one.
+        if (argc > 1 && std::strcmp(argv[1], "--agent-api") == 0) {
+            const std::string text = hf::editor::DescribeAgentApi();
+            const char* out = (argc > 2 && std::strncmp(argv[2], "--", 2) != 0) ? argv[2] : nullptr;
+            if (out) {
+                std::ofstream f(out, std::ios::binary);  // LF-only, no BOM.
+                if (!f) { std::fprintf(stderr, "FATAL: cannot write agent-api output '%s'\n", out); return 1; }
+                f << text;
+                std::printf("agent-api: wrote %s\n", out);
+            } else {
+                std::fputs(text.c_str(), stdout);
+            }
+            return 0;
+        }
         // --clustered <out.png>: clustered / Forward+ lighting showcase (Slice AG).
         if (argc > 1 && std::strcmp(argv[1], "--clustered") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_clustered.png";

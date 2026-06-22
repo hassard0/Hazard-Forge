@@ -1081,6 +1081,92 @@ int main() {
         check(sawSetTransform, "commands manifest includes set_transform");
         check(sawIntrospect, "commands manifest includes introspect");
 
+        // --- Slice DX1: the versioned Agent-SDK contract (the additive trailing "agentApi" key). ---
+        const json_object_s* agentApi = AsObject(MemberOf(top, "agentApi"));
+        check(agentApi != nullptr, "has agentApi object");
+        if (agentApi) {
+            // schemaVersion == 1 (SHAPE-ONLY version).
+            check((int)AsNumber(MemberOf(agentApi, "schemaVersion")) == 1, "agentApi.schemaVersion == 1");
+
+            // capabilities == exactly the 5, in order.
+            const json_array_s* caps = AsArray(MemberOf(agentApi, "capabilities"));
+            check(caps != nullptr && caps->length == 5, "agentApi.capabilities has 5 entries");
+            if (caps && caps->length == 5) {
+                const char* expected[5] = {"observe", "mutate", "author", "replay", "hot-reload"};
+                const json_array_element_s* el = caps->start;
+                bool order = true;
+                for (int ci = 0; ci < 5 && el; ++ci, el = el->next)
+                    if (AsString(el->value) != expected[ci]) order = false;
+                check(order, "agentApi.capabilities is exactly [observe,mutate,author,replay,hot-reload] in order");
+            }
+
+            // commands: every entry has a non-empty op, a capability in the set, and an args array.
+            const json_array_s* acmds = AsArray(MemberOf(agentApi, "commands"));
+            check(acmds != nullptr && acmds->length > 0, "agentApi.commands is a non-empty array");
+            if (acmds) {
+                bool allOk = true;
+                for (const json_array_element_s* e = acmds->start; e; e = e->next) {
+                    const json_object_s* c = AsObject(e->value);
+                    if (!c) { allOk = false; continue; }
+                    std::string op = AsString(MemberOf(c, "op"));
+                    std::string cap = AsString(MemberOf(c, "capability"));
+                    const json_array_s* args = AsArray(MemberOf(c, "args"));
+                    bool capInSet = (cap == "observe" || cap == "mutate" || cap == "author" ||
+                                     cap == "replay" || cap == "hot-reload");
+                    if (op.empty() || !capInSet || args == nullptr) allOk = false;
+                    // Each arg (when present) is an object with a name + type.
+                    if (args)
+                        for (const json_array_element_s* ae = args->start; ae; ae = ae->next) {
+                            const json_object_s* a = AsObject(ae->value);
+                            if (!a) { allOk = false; continue; }
+                            if (AsString(MemberOf(a, "name")).empty() ||
+                                AsString(MemberOf(a, "type")).empty())
+                                allOk = false;
+                        }
+                }
+                check(allOk, "every agentApi.command has a non-empty op, a valid capability, and an args array");
+            }
+
+            // contentHash present + non-empty.
+            std::string contentHash = AsString(MemberOf(agentApi, "contentHash"));
+            check(!contentHash.empty(), "agentApi.contentHash present + non-empty");
+        }
+
+        // --- DescribeAgentApi() standalone == the folded "agentApi" sub-object, byte-for-byte. ------
+        // The standalone document is the SAME object text (base=1) plus a trailing newline. Locate the
+        // folded value in the full document and compare the object substrings exactly.
+        {
+            std::string standalone = editor::DescribeAgentApi();
+            // Standalone is byte-stable across two calls (contentHash deterministic).
+            std::string standalone2 = editor::DescribeAgentApi();
+            check(standalone == standalone2, "DescribeAgentApi() is deterministic (byte-identical across runs)");
+
+            // Strip the single trailing newline from the standalone to get the bare object text.
+            std::string bareStandalone = standalone;
+            if (!bareStandalone.empty() && bareStandalone.back() == '\n') bareStandalone.pop_back();
+
+            // Extract the folded value: from the '{' after "\"agentApi\": " to the matching close brace
+            // at the document's depth-1 indent ("  }"). Since the block is the LAST key, the object runs
+            // to just before the final "}\n".
+            const std::string keyMarker = "\"agentApi\": {";
+            size_t kp = json.find(keyMarker);
+            check(kp != std::string::npos, "full document contains the agentApi key");
+            if (kp != std::string::npos) {
+                size_t objStart = kp + std::string("\"agentApi\": ").size();  // points at '{'
+                // The folded object ends at "\n  }" (the depth-1 close), which is the LAST "  }" before
+                // the document's final "}\n". Find the last occurrence of "\n  }" in the document.
+                size_t objClose = json.rfind("\n  }");
+                check(objClose != std::string::npos, "found agentApi object close brace");
+                if (objClose != std::string::npos) {
+                    // The folded object text spans [objStart, objClose + len("\n  }")).
+                    size_t objEnd = objClose + std::string("\n  }").size();
+                    std::string folded = json.substr(objStart, objEnd - objStart);
+                    check(folded == bareStandalone,
+                          "DescribeAgentApi() == the folded agentApi sub-object (byte-for-byte)");
+                }
+            }
+        }
+
         // showcases present + non-trivial.
         const json_array_s* showcases = AsArray(MemberOf(top, "showcases"));
         check(showcases != nullptr && showcases->length > 10, "showcases is a non-trivial list");
