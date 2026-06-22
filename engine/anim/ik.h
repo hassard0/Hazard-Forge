@@ -1041,4 +1041,45 @@ inline IkSimState RunIkRollback(const IkSimState& initialState, const int* paren
     return state;
 }
 
+// ===================================================================================================
+// Slice IK6 — DETERMINISTIC IK CONTROL-RIG: LIT 3D SKINNED RENDER CAPSTONE (the money-shot, the 6th and
+// FINAL slice of FLAGSHIP #32). APPENDED to ik.h (the IK1 + IK2 + IK3 + IK4 + IK5 lines above are
+// BYTE-FROZEN — append-only). IK1-IK5 built + proved the deterministic IK solvers, the skeleton bridge,
+// and the lockstep moat. IK6 is the MONEY-SHOT: the bit-exact IK-corrected pose drives the EXISTING GPU
+// skinned character render — a Fox does a deterministic IK action (a leg IK-corrected to plant a foot on
+// a world target), rendered lit 3D through the SAME lit_skinned pipeline the animation FSM + the ragdoll
+// capstones use. This is the flagship's SINGLE FLOAT visresolve-bar slice (the IK solve is bit-exact
+// integer; the Fox base-pose sample + the palette read-back + the final raster/shade are float).
+//
+// IkToPalette is the JT6 joint::RagdollToPalette / AC6 active::ActiveToPalette twin — the corrected pose's
+// skinning palette is a PURE FUNCTION of the IkPose, == IkPoseToPalette (IK4) over the corrected pose. The
+// thin alias makes the capstone's intent legible: the rendered palette is the bit-exact IK pose, read back
+// to float ONCE (the documented float crossing). The render path is the EXISTING lit_skinned/shadow_skinned
+// pipeline REUSED VERBATIM — NO new shader, NO new RHI.
+
+// IkToPalette(skeleton, pose) -> the corrected IK pose's skinning palette (the thin JT6 RagdollToPalette
+// alias over IkPoseToPalette). A PURE deterministic function of the bit-exact corrected IkPose: two calls
+// over the same pose are byte-identical (the IK6 provenance proof). One math::Mat4 per joint, skeleton order.
+inline std::vector<math::Mat4> IkToPalette(const anim::Skeleton& skeleton, const IkPose& pose) {
+    return IkPoseToPalette(skeleton, pose);
+}
+
+// WriteCorrectedSubChain(pose, chainJoints, count, firstBone, fullLocalR): write the IK-corrected LOCAL
+// rotations of a solved SUB-CHAIN back into a FULL skeleton's local-rotation array (the showcase bridge —
+// the corrected leg rotations overlay the Fox's base local pose). The sub-chain solve produced corrected
+// local rotations in pose.localR[0..count-1] (sub-chain-local indices); chainJoints[i] is the FULL skeleton
+// joint index of sub-chain joint i. `firstBone` is the first sub-chain index whose corrected rotation is
+// written back (typically 1 — chain joint 0 is a VIRTUAL ROOT carrying the Fox world transform, NOT a real
+// Fox joint to overwrite). For each chain bone i in [firstBone, count-1) (NOT the end-effector i==count-1,
+// whose local rotation is the untouched base — the IK4 invariant), copy pose.localR[i] into
+// fullLocalR[chainJoints[i]]. Every full-skeleton joint NOT a written chain bone keeps its base local
+// rotation (the falsifiable un-IK'd-joints invariant carries up to the FULL pose). Pure copy; the corrected
+// FxQuat is bit-exact (snapped back to float only at the palette read-back). A written-back chain joint c's
+// Fox parent IS the previous chain joint (chainJoints[i-1]) BY CONSTRUCTION (the chain is a path down the
+// hierarchy), so the corrected sub-chain-local rotation is the correct Fox-local rotation for c.
+inline void WriteCorrectedSubChain(const IkPose& pose, const int* chainJoints, int count, int firstBone,
+                                   FxQuat* fullLocalR) {
+    for (int i = firstBone; i + 1 < count; ++i) fullLocalR[chainJoints[i]] = pose.localR[i];
+}
+
 } // namespace hf::anim::ik

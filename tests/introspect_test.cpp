@@ -570,6 +570,8 @@ int main() {
             bool sawIk4RigFeature = false;
             // Slice IK5: the ik5-lockstep capability is advertised (the IK-driven lockstep + rollback headline).
             bool sawIk5LockstepFeature = false;
+            // Slice IK6: the ik6-render capability is advertised (the IK-corrected lit_skinned render capstone).
+            bool sawIk6RenderFeature = false;
             // Slice GJ4: the deterministic-hull-step capability is advertised.
             bool sawHullStepFeature = false;
             // Slice GJ5: the deterministic-hull-lockstep capability is advertised.
@@ -833,6 +835,7 @@ int main() {
                     if (AsString(el->value) == "ik3-fabrik") sawIk3FabrikFeature = true;
                     if (AsString(el->value) == "ik4-rig") sawIk4RigFeature = true;
                     if (AsString(el->value) == "ik5-lockstep") sawIk5LockstepFeature = true;
+                    if (AsString(el->value) == "ik6-render") sawIk6RenderFeature = true;
                     if (AsString(el->value) == "deterministic-hull-step") sawHullStepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-lockstep") sawHullLockstepFeature = true;
                     if (AsString(el->value) == "deterministic-hull-render") sawHullRenderFeature = true;
@@ -1071,6 +1074,7 @@ int main() {
             check(sawIk3FabrikFeature, "engine.features includes ik3-fabrik");
             check(sawIk4RigFeature, "engine.features includes ik4-rig");
             check(sawIk5LockstepFeature, "engine.features includes ik5-lockstep");
+            check(sawIk6RenderFeature, "engine.features includes ik6-render");
             check(sawHullStepFeature, "engine.features includes deterministic-hull-step");
             check(sawHullLockstepFeature, "engine.features includes deterministic-hull-lockstep");
             check(sawHullRenderFeature, "engine.features includes deterministic-hull-render");
@@ -1458,6 +1462,8 @@ int main() {
         bool sawActiveLockstepShot = false;
         // Slice IK5: the --ik5-lockstep-shot showcase flag is listed in the showcase manifest.
         bool sawIk5LockstepShot = false;
+        // Slice IK6: the --ik6-render-shot showcase flag is listed in the showcase manifest.
+        bool sawIk6RenderShot = false;
         // Slice AC6: the --active-render-shot showcase flag is listed in the showcase manifest.
         bool sawActiveRenderShot = false;
         // Slice BD1: the --boids-steer-shot showcase flag is listed in the showcase manifest.
@@ -1788,6 +1794,7 @@ int main() {
                 if (s && AsString(MemberOf(s, "flag")) == "--active-recover-shot") sawActiveRecoverShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--active-lockstep-shot") sawActiveLockstepShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--ik5-lockstep-shot") sawIk5LockstepShot = true;
+                if (s && AsString(MemberOf(s, "flag")) == "--ik6-render-shot") sawIk6RenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--active-render-shot") sawActiveRenderShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--boids-steer-shot") sawBoidsSteerShot = true;
                 if (s && AsString(MemberOf(s, "flag")) == "--boids-neighbors-shot") sawBoidsNeighborsShot = true;
@@ -2022,6 +2029,7 @@ int main() {
         check(sawActiveRecoverShot, "showcases manifest includes --active-recover-shot");
         check(sawActiveLockstepShot, "showcases manifest includes --active-lockstep-shot");
         check(sawIk5LockstepShot, "showcases manifest includes --ik5-lockstep-shot");
+        check(sawIk6RenderShot, "showcases manifest includes --ik6-render-shot");
         check(sawActiveRenderShot, "showcases manifest includes --active-render-shot");
         check(sawBoidsSteerShot, "showcases manifest includes --boids-steer-shot");
         check(sawBoidsNeighborsShot, "showcases manifest includes --boids-neighbors-shot");

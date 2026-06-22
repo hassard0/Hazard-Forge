@@ -677,6 +677,16 @@ hf_add_pure_test(ik_rig_test)
 # target nudge -> bit-identical by construction). Pure C++ (hf_core), ASan-eligible. ik.h is APPEND-ONLY.
 hf_add_pure_test(ik_lockstep_test)
 
+# Deterministic IK Control-Rig Slice 6 (Slice IK6, the MONEY-SHOT COMPLETING FLAGSHIP #32): the LIT 3D SKINNED
+# RENDER-CAPSTONE bridge (engine/anim/ik.h::IkToPalette / WriteCorrectedSubChain) + the IK4 provenance the
+# --ik6-render-shot / --ik6-render showcases rest on. Pins: IkToPalette provenance (two calls byte-identical;
+# == IkPoseToPalette); the corrected palette's leg joints derive from the bit-exact SolveRigToTargets; the
+# un-IK'd joints' palette + LOCAL rotations == base (the IK4 invariant); the foot-plant residual within band;
+# WriteCorrectedSubChain writes ONLY the chain bones [1, count-1); and the compose-the-moat beat — the
+# IK-corrected pose seeds a deterministic ragdoll qTarget set (active.h WriteClipTargets, anim(IK) -> ragdoll).
+# PURE CPU (no device); ik.h is APPEND-ONLY. Pure C++ (hf_core), ASan-eligible.
+hf_add_pure_test(ik_render_test)
+
 # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
 # GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
 # shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16
