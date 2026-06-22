@@ -266,6 +266,13 @@ hf_gen_msl(ik_angle.comp         ik_angle.comp.hlsl         comp ik_angle_main)
 # VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot lower it to MSL) -> NO hf_gen_msl line here. The
 # Metal --ik2-twobone showcase runs the CPU TwoBoneSolve over the same targets (byte-identical to the
 # Vulkan GPU result by construction; the Vulkan side carries the GPU==CPU memcmp proof — the FPX3/JT1 split).
+# Deterministic IK Control-Rig Slice 3 (Slice IK3, the 3rd slice of FLAGSHIP #32): ik_fabrik.comp solves the
+# FABRIK n-bone chain IK (engine/anim/ik.h::FabrikSolve). LIKE ik_twobone.comp (and UNLIKE IK1's MSL-native
+# ik_angle.comp), FxNormalize/FxLength are int64, so ik_fabrik.comp is VULKAN-SPIR-V-ONLY (DXC compiles
+# int64; glslc cannot lower it to MSL) -> NO hf_gen_msl line here. The Metal --ik3-fabrik showcase runs the
+# CPU FabrikSolve over the same targets (byte-identical to the Vulkan GPU result by construction; the Vulkan
+# side carries the GPU==CPU memcmp proof — the IK2/FPX3 split). LookAtRotation (the shortest-arc aim) is
+# CPU-side in both showcases (acos+cross, host-only).
 # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — turns each non-empty FR1
 # Voronoi cell into a FRAGMENT RECORD (integer centroid, AABB, boundRadiusSq/boundRadius, volume, cellId,
 # invMass) via the GR2/FL2 count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment

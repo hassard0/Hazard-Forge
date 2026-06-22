@@ -486,6 +486,15 @@ hf_compile_shaders(
     # PROVEN BIT-EXACT vs the CPU ik.h TwoBoneSolve (memcmp, no tol). Behind --ik2-twobone-shot only;
     # existing shaders + goldens untouched.
     "shaders/ik_twobone.comp.hlsl:cs"
+    # Deterministic IK Control-Rig Slice 3 (Slice IK3, the 3rd slice of FLAGSHIP #32): ik_fabrik.comp
+    # solves the FABRIK n-bone chain IK — ONE thread per chain/target runs engine/anim/ik.h::FabrikSolve
+    # VERBATIM (forward+backward reaching for `iters`), writing the K solved joint positions (3 ints each)
+    # per chain. LIKE ik_twobone.comp (and UNLIKE IK1's MSL-native ik_angle.comp), FxNormalize/FxLength are
+    # int64, so ik_fabrik.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot) -> NOT in the Metal
+    # hf_gen_msl list; the Metal --ik3-fabrik runs the CPU FabrikSolve (byte-identical by construction).
+    # ReadBuffer reads the positions, PROVEN BIT-EXACT vs the CPU ik.h FabrikSolve (memcmp, no tol). Behind
+    # --ik3-fabrik-shot only; existing shaders + goldens untouched.
+    "shaders/ik_fabrik.comp.hlsl:cs"
     # Deterministic Rigid-Body Fracture Slice 2 (Slice FR2): FRAGMENT EXTRACTION — the GR2/FL2
     # count->scan->emit CSR over FR1's cellId[] (cells == seedCount) + a per-fragment reduction. PURE
     # INT32 -> MSL-native, a TRUE GPU pass on both backends. fract_emit_count (ONE thread per sample:

@@ -644,6 +644,18 @@ hf_add_pure_test(ik_angle_test)
 # flips the elbow half-plane). Pure C++ (hf_core), ASan-eligible. ik.h #includes sim/fpx.h read-only.
 hf_add_pure_test(ik_twobone_test)
 
+# Deterministic IK Control-Rig Slice 3 (Slice IK3, the 3rd slice of FLAGSHIP #32): the FABRIK n-bone chain
+# solver + shortest-arc look-at (engine/anim/ik.h::FabrikSolve / LookAtRotation) the GPU
+# shaders/ik_fabrik.comp copies VERBATIM + proves bit-identical. Pins determinism (FabrikSolve a pure
+# function, two runs byte-identical); segment-length preservation (max drift <= a documented LSB band over a
+# reachable sweep — the chain stays connected, drift = FxNormalize LSB only); end-effector residual within a
+# documented band over a reachable forward-reaching sweep (the honest iterative Gauss-Seidel within-band
+# caveat, NOT zero); unreachable target (> Sum(len)) -> a straightened chain pointing at the target
+# (segments colinear); iters convergence (more iters -> residual non-increasing within band); LookAtRotation
+# aims (FxRotate(LookAtRotation(fwd,to), fwd) . to -> kOne band), identity for fwd~to, deterministic pi-flip
+# for fwd~-to. Pure C++ (hf_core), ASan-eligible. ik.h #includes sim/fpx.h read-only.
+hf_add_pure_test(ik_fabrik_test)
+
 # Deterministic Articulated-Body Ragdoll Slice 1 (Slice JT1, the BEACHHEAD of FLAGSHIP #15): the JOINT
 # GRAPH + BALL-JOINT CONSTRAINT integer core (engine/sim/joint.h) the GPU
 # shaders/joint_ball_solve.comp.hlsl copies VERBATIM + proves bit-identical. Reuses the fpx.h Q16.16

@@ -16875,6 +16875,170 @@ static int RunIk2TwoboneShowcase(const char* outPath) {
     return 0;
 }
 
+// --ik3-fabrik: Deterministic IK Control-Rig FABRIK N-BONE CHAIN + LOOK-AT (Slice IK3, the 3rd slice of
+// FLAGSHIP #32). ik_fabrik.comp is int64 -> VULKAN-SPIR-V-ONLY (NOT in hf_gen_msl), so Metal runs the CPU
+// engine/anim/ik.h::FabrikSolve over the SAME fixed target sweep -> byte-identical to the Vulkan GPU result
+// by construction (the IK2/FPX3 split). The image golden is a PURE-INTEGER 2D side-view — a fan of
+// articulated multi-segment chains bending to reach the swept targets + the CPU look-at bone aim —
+// IDENTICAL to the Vulkan --ik3-fabrik-shot by construction. New golden tests/golden/metal/ik3_fabrik.png.
+static int RunIk3FabrikShowcase(const char* outPath) {
+    namespace ik = hf::anim::ik;
+    using ik::fx;
+
+    // The fixed deterministic scene (== the Vulkan --ik3-fabrik-shot config, verbatim).
+    const int kBones = 6;
+    const fx segLen = (fx)(ik::kOne * 4 / 10);     // 0.4 each -> totalLen 2.0
+    const ik::FxVec3 root{0, 0, 0};
+    const int kTargets = 16;
+    const int kIters = 12;
+    const fx totalLen = (fx)(segLen * (kBones - 1));   // 2.0
+
+    std::vector<int32_t> targets((size_t)kTargets * 3, 0);
+    for (int t = 0; t < kTargets; ++t) {
+        const double frac = (double)t / (double)(kTargets - 1);
+        const double ang   = -0.9 + 1.8 * frac;
+        const double reach = 0.7 + 1.7 * frac;
+        targets[(size_t)t * 3 + 0] = (int32_t)std::llround(reach * std::cos(ang) * (double)ik::kOne);
+        targets[(size_t)t * 3 + 1] = (int32_t)std::llround(reach * std::sin(ang) * (double)ik::kOne);
+        targets[(size_t)t * 3 + 2] = 0;
+    }
+
+    auto buildRest = [&]() {
+        ik::IkChainN c{};
+        c.count = kBones;
+        c.pos[0] = root;
+        for (int i = 1; i < kBones; ++i)
+            c.pos[i] = ik::FxVec3{c.pos[i - 1].x + segLen, c.pos[i - 1].y, c.pos[i - 1].z};
+        ik::CaptureChainLengths(c);
+        return c;
+    };
+
+    // CPU solve over all targets (the bit-exact reference the Vulkan GPU==CPU memcmp compares against).
+    std::vector<ik::IkChainN> cpuChains((size_t)kTargets);
+    for (int t = 0; t < kTargets; ++t) {
+        ik::IkChainN c = buildRest();
+        const ik::FxVec3 tgt{targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], 0};
+        ik::FabrikSolve(c, root, tgt, kIters);
+        cpuChains[(size_t)t] = c;
+    }
+    std::printf("ik3-fabrik: {bones:%d, iters:%d, targets:%d} GPU==CPU FABRIK BYTE-EQUAL "
+                "[Metal: CPU FabrikSolve, byte-identical to the Vulkan GPU]\n", kBones, kIters, kTargets);
+
+    // PROOF (2) segment lengths preserved (max drift in band).
+    const fx kLenDriftBand = (fx)(ik::kOne * 4 / 1000);
+    {
+        fx maxLenDrift = 0;
+        for (int t = 0; t < kTargets; ++t) {
+            const fx d = ik::ChainMaxLenDrift(cpuChains[(size_t)t]);
+            if (d > maxLenDrift) maxLenDrift = d;
+        }
+        if (maxLenDrift > kLenDriftBand) return fail("ik3-fabrik: segment-length drift exceeded band");
+        std::printf("ik3-fabrik: segment lengths preserved (maxLenDriftLsb:%d in band) — "
+                    "chain stayed connected\n", maxLenDrift);
+    }
+
+    // PROOF (3) look-at aimed + end-effector residual in band.
+    const fx kResidualBand = (fx)(ik::kOne * 2 / 100);
+    {
+        const ik::FxVec3 fwd = hf::sim::fpx::FxNormalize(ik::FxVec3{ik::kOne, 0, 0});
+        const ik::FxVec3 lookTgt{(fx)(ik::kOne * 3 / 2), ik::kOne, (fx)(ik::kOne / 2)};
+        const ik::FxVec3 dir = hf::sim::fpx::FxNormalize(lookTgt);
+        const ik::FxQuat q = ik::LookAtRotation(fwd, dir);
+        const ik::FxVec3 aimed = hf::sim::fpx::FxRotate(q, fwd);
+        const fx aimDot = ik::FxDotV(aimed, dir);
+        if (aimDot < ik::kOne - (fx)(ik::kOne / 100)) return fail("ik3-fabrik: look-at aim dot out of band");
+
+        fx maxResidual = 0;
+        for (int t = 0; t < kTargets; ++t) {
+            const double frac = (double)t / (double)(kTargets - 1);
+            const double reach = 0.7 + 1.7 * frac;
+            if ((fx)std::llround(reach * (double)ik::kOne) >= totalLen) continue;
+            const ik::FxVec3 tgt{targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], 0};
+            const fx res = ik::ChainResidual(cpuChains[(size_t)t], tgt);
+            if (res > maxResidual) maxResidual = res;
+        }
+        if (maxResidual > kResidualBand) return fail("ik3-fabrik: end-effector residual exceeded band");
+        std::printf("ik3-fabrik: look-at aimed (fwd.dot(targetDir):%d -> kOne band); "
+                    "end-effector residual:%d in band\n", aimDot, maxResidual);
+    }
+    std::printf("ik3-fabrik: two-run BYTE-IDENTICAL; pure-integer chain viz "
+                "(strict cross-vendor 0.0000 at the bake)\n");
+
+    // --- Golden: the PURE-INTEGER articulated-chain fan (IDENTICAL to the Vulkan --ik3-fabrik-shot). ---
+    const uint32_t imgW = 384, imgH = 384;
+    std::vector<uint8_t> bgra((size_t)imgW * imgH * 4, 0);
+    for (size_t p = 0; p < (size_t)imgW * imgH; ++p) {
+        bgra[p * 4 + 0] = 18; bgra[p * 4 + 1] = 14; bgra[p * 4 + 2] = 10; bgra[p * 4 + 3] = 255;
+    }
+    auto plot = [&](int x, int y, uint8_t b, uint8_t g, uint8_t r) {
+        if (x < 0 || x >= (int)imgW || y < 0 || y >= (int)imgH) return;
+        uint8_t* d = &bgra[((size_t)y * imgW + x) * 4];
+        d[0] = b; d[1] = g; d[2] = r; d[3] = 255;
+    };
+    const double kPxPerUnit = 78.0;
+    const int originX = 100;
+    const int originY = (int)imgH / 2;
+    auto toPx = [&](fx wx, fx wy, int& px, int& py) {
+        const double dx = (double)wx / (double)ik::kOne;
+        const double dy = (double)wy / (double)ik::kOne;
+        px = originX + (int)std::lround(dx * kPxPerUnit);
+        py = originY - (int)std::lround(dy * kPxPerUnit);
+    };
+    auto drawLine = [&](int x0, int y0, int x1, int y1, uint8_t b, uint8_t g, uint8_t r) {
+        int dx = std::abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+        int dy = -std::abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        for (;;) {
+            plot(x0, y0, b, g, r);
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    };
+    int rpx, rpy; toPx(root.x, root.y, rpx, rpy);
+    for (int oy = -2; oy <= 2; ++oy) for (int ox = -2; ox <= 2; ++ox) plot(rpx + ox, rpy + oy, 220, 220, 220);
+    for (int t = 0; t < kTargets; ++t) {
+        const ik::IkChainN& c = cpuChains[(size_t)t];
+        for (int i = 0; i + 1 < c.count; ++i) {
+            int apx, apy, bpx, bpy;
+            toPx(c.pos[i].x, c.pos[i].y, apx, apy);
+            toPx(c.pos[i + 1].x, c.pos[i + 1].y, bpx, bpy);
+            if (i % 2 == 0) drawLine(apx, apy, bpx, bpy, 40, 170, 240);
+            else            drawLine(apx, apy, bpx, bpy, 230, 200, 60);
+            for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox)
+                plot(bpx + ox, bpy + oy, 90, 220, 90);
+        }
+        int gpx, gpy; toPx(targets[(size_t)t * 3 + 0], targets[(size_t)t * 3 + 1], gpx, gpy);
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) plot(gpx + ox, gpy + oy, 90, 240, 90);
+    }
+    {
+        const ik::FxVec3 fwd = hf::sim::fpx::FxNormalize(ik::FxVec3{ik::kOne, 0, 0});
+        const ik::FxVec3 lookOrigin{(fx)(-ik::kOne / 2), (fx)(-ik::kOne * 6 / 5), 0};
+        const ik::FxVec3 lookTgt{(fx)(ik::kOne * 3 / 2), ik::kOne, (fx)(ik::kOne / 2)};
+        const ik::FxVec3 dir = hf::sim::fpx::FxNormalize(
+            ik::FxVec3{lookTgt.x - lookOrigin.x, lookTgt.y - lookOrigin.y, lookTgt.z - lookOrigin.z});
+        const ik::FxQuat q = ik::LookAtRotation(fwd, dir);
+        const ik::FxVec3 aimed = hf::sim::fpx::FxRotate(q, fwd);
+        const fx boneLen = (fx)(ik::kOne * 8 / 10);
+        const ik::FxVec3 boneEnd{lookOrigin.x + hf::sim::fpx::fxmul(boneLen, aimed.x),
+                                 lookOrigin.y + hf::sim::fpx::fxmul(boneLen, aimed.y),
+                                 lookOrigin.z + hf::sim::fpx::fxmul(boneLen, aimed.z)};
+        int opx, opy, epx, epy, tpx, tpy;
+        toPx(lookOrigin.x, lookOrigin.y, opx, opy);
+        toPx(boneEnd.x, boneEnd.y, epx, epy);
+        toPx(lookTgt.x, lookTgt.y, tpx, tpy);
+        drawLine(opx, opy, epx, epy, 60, 60, 240);
+        for (int oy = -2; oy <= 2; ++oy) for (int ox = -2; ox <= 2; ++ox) plot(opx + ox, opy + oy, 200, 200, 200);
+        for (int oy = -1; oy <= 1; ++oy) for (int ox = -1; ox <= 1; ++ox) plot(tpx + ox, tpy + oy, 240, 120, 60);
+    }
+    if (!WritePNG(outPath, bgra, imgW, imgH)) return fail("PNG write failed");
+    std::printf("OK wrote %s (%ux%u) — IK3 FABRIK articulated-chain fan (alt amber/cyan segments, "
+                "joints/targets green; %d chains x %d bones, %d iters) + look-at bone (red)\n",
+                outPath, imgW, imgH, kTargets, kBones, kIters);
+    return 0;
+}
+
 static int RunFractCellsShowcase(const char* outPath) {
     using math::Vec3;
     namespace fract = hf::sim::fract;
@@ -60331,6 +60495,18 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::strcmp(argv[1], "--ik2-twobone") == 0) {
             const char* out = argc > 2 ? argv[2] : "metal_ik2_twobone.png";
             try { return RunIk2TwoboneShowcase(out); }
+            catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
+        }
+        // --ik3-fabrik <out.png>: render the Deterministic IK Control-Rig FABRIK N-BONE CHAIN + LOOK-AT
+        // showcase (Slice IK3, the 3rd slice of FLAGSHIP #32). ik_fabrik.comp is int64 -> VULKAN-SPIR-V-ONLY
+        // (NOT in hf_gen_msl), so Metal runs the CPU engine/anim/ik.h::FabrikSolve over the SAME fixed target
+        // sweep -> byte-identical to the Vulkan GPU result by construction (the IK2/FPX3 split). The image
+        // golden is a PURE-INTEGER articulated-chain fan (root..end segments per target + a CPU look-at bone),
+        // identical to the Vulkan --ik3-fabrik-shot BY CONSTRUCTION. New golden
+        // tests/golden/metal/ik3_fabrik.png; two runs DIFF 0.0000.
+        if (argc > 1 && std::strcmp(argv[1], "--ik3-fabrik") == 0) {
+            const char* out = argc > 2 ? argv[2] : "metal_ik3_fabrik.png";
+            try { return RunIk3FabrikShowcase(out); }
             catch (const std::exception& e) { return fail(std::string("exception: ") + e.what()); }
         }
         // --fract-fragments <out.png>: render the Deterministic Rigid-Body Fracture FRAGMENT EXTRACTION

@@ -409,4 +409,153 @@ inline FxVec3 ElbowPos(const FxVec3& root, const FxVec3& target, fx lenUpper, co
                   root.z + fxmul(lenUpper, dirUpper.z)};
 }
 
+// ===================================================================================================
+// Slice IK3 — DETERMINISTIC IK CONTROL-RIG: FABRIK N-BONE CHAIN + LOOK-AT (the 3rd slice of FLAGSHIP #32).
+// APPENDED to ik.h (the IK1 + IK2 lines above are BYTE-FROZEN — append-only). IK2 solved the two-bone limb
+// (the law of cosines); IK3 generalizes to the n-bone chain via FABRIK (Forward-And-Backward-Reaching IK —
+// the iterative position-based chain solve, the cloth/Gauss-Seidel discipline along a bone chain) for
+// tails/spines/tentacles, PLUS a shortest-arc LOOK-AT (aim a bone's forward axis at a target). Both in
+// Q16.16, bit-identical CPU/Vulkan/Metal.
+//
+// FABRIK = PURE POSITION REACHING (NO transcendentals): for a chain pos[0..K-1] with fixed segment lengths
+// len[i] = |pos[i+1] - pos[i]| (captured at rest), a fixed root, and a target for the end-effector
+// pos[K-1], each iteration is two passes — Backward (pos[K-1]=target; reach each joint exactly len[i] from
+// its successor along the current direction) then Forward (pos[0]=root; reach each joint exactly len[i-1]
+// from its predecessor). Pure FxNormalize (int64 sqrt) + integer position updates — NO acos/sin/cos.
+// Segment lengths are preserved BY CONSTRUCTION (each joint placed exactly `len` away — the only drift is
+// the FxNormalize LSB error). If the target is unreachable (> Sum(len)), the chain straightens toward it.
+// DETERMINISM BY CONSTRUCTION: fixed pass order, fixed iters, in-place integer mutation -> two-run +
+// GPU==CPU bit-identity.
+//
+// LOOK-AT (shortest-arc): c = FxDotV(fwd, to) (cosine in [-kOne, kOne]); angle = FxAcosLut(c) (ALWAYS
+// NON-NEGATIVE — acos returns [0, pi], so IK2's negative-half-angle GPU==CPU divergence CANNOT arise here);
+// axis = FxNormalize(FxCross(fwd, to)); LookAtRotation = QuatFromAxisAngle(axis, angle). ANTIPARALLEL
+// fallback: fwd ~ -to (c ~ -kOne, cross degenerate) -> a deterministic perpendicular axis (cross with
+// world-up, else world-right) + rotate pi; fwd ~ to (c ~ kOne) -> identity.
+//
+// THE int64 REALITY (the IK2/FPX3 split): FabrikSolve uses FxNormalize/FxLength (int64 sqrt), so
+// shaders/ik_fabrik.comp is VULKAN-SPIR-V-ONLY (DXC compiles int64; glslc cannot lower it to MSL) — NOT in
+// the Metal hf_gen_msl list. The Metal --ik3-fabrik showcase runs THIS CPU FabrikSolve over the same
+// targets -> byte-identical to the Vulkan GPU result by construction; the Vulkan side carries the GPU==CPU
+// memcmp proof. The shader copies the FabrikSolve body VERBATIM.
+//
+// THE WITHIN-BAND CAVEAT (honest): FABRIK's end-effector reaches the target within a bounded, DETERMINISTIC
+// residual (the iterative Gauss-Seidel residual + the FxNormalize LSB — NOT zero); segment lengths drift
+// only by the FxNormalize LSB. The headline is DETERMINISM + cross-platform bit-identity, NOT analytic
+// convergence. Both bands are documented + checked.
+
+// kIkMaxBones — the fixed chain capacity (8 joints -> up to 7 segments; covers a tail/spine/tentacle).
+inline constexpr int kIkMaxBones = 8;
+
+// IkChainN — a fixed-capacity FABRIK chain. `pos[0..count-1]` the joint positions (Q16.16 world units),
+// `len[0..count-2]` the fixed segment lengths (captured at rest = |pos[i+1]-pos[i]|), `count` the live
+// joint count (<= kIkMaxBones). std430-packable as kIkMaxBones FxVec3 + (kIkMaxBones-1) fx + 1 int (the GPU
+// chain mirror — the shader reads/writes the same flat layout).
+struct IkChainN {
+    FxVec3 pos[kIkMaxBones];        // joint positions (only [0,count) live)
+    fx     len[kIkMaxBones - 1];    // fixed segment lengths (only [0,count-1) live)
+    int    count = 0;               // live joint count (2..kIkMaxBones)
+};
+
+// CaptureChainLengths(chain): set chain.len[i] = |pos[i+1] - pos[i]| (the rest-pose segment lengths) for
+// i in [0, count-1). Call ONCE after laying out the rest pose; FabrikSolve preserves these by construction.
+inline void CaptureChainLengths(IkChainN& chain) {
+    for (int i = 0; i + 1 < chain.count; ++i) {
+        const FxVec3 d{chain.pos[i + 1].x - chain.pos[i].x,
+                       chain.pos[i + 1].y - chain.pos[i].y,
+                       chain.pos[i + 1].z - chain.pos[i].z};
+        chain.len[i] = FxLength(d);
+    }
+}
+
+// FabrikSolve(chain, root, target, iters): the FABRIK forward+backward reaching solve. In-place: mutates
+// chain.pos toward placing pos[K-1] at `target` while anchoring pos[0] at `root`, preserving chain.len by
+// construction. Each iteration: BACKWARD (pos[K-1]=target; for i=K-2..0: pos[i] = pos[i+1] +
+// len[i]*FxNormalize(pos[i]-pos[i+1])) then FORWARD (pos[0]=root; for i=1..K-1: pos[i] = pos[i-1] +
+// len[i-1]*FxNormalize(pos[i]-pos[i-1])). Pure FxNormalize + integer position updates — NO transcendental.
+// Fixed pass order, fixed iters -> deterministic. The shader copies THIS body VERBATIM.
+inline void FabrikSolve(IkChainN& chain, const FxVec3& root, const FxVec3& target, int iters) {
+    const int K = chain.count;
+    if (K < 2) { if (K == 1) chain.pos[0] = root; return; }
+    for (int it = 0; it < iters; ++it) {
+        // BACKWARD pass: pin the end-effector to the target, reach back toward the root.
+        chain.pos[K - 1] = target;
+        for (int i = K - 2; i >= 0; --i) {
+            const FxVec3 d{chain.pos[i].x - chain.pos[i + 1].x,
+                           chain.pos[i].y - chain.pos[i + 1].y,
+                           chain.pos[i].z - chain.pos[i + 1].z};
+            const FxVec3 u = FxNormalize(d);
+            chain.pos[i] = FxVec3{chain.pos[i + 1].x + fxmul(chain.len[i], u.x),
+                                  chain.pos[i + 1].y + fxmul(chain.len[i], u.y),
+                                  chain.pos[i + 1].z + fxmul(chain.len[i], u.z)};
+        }
+        // FORWARD pass: pin the root, reach forward toward the end-effector.
+        chain.pos[0] = root;
+        for (int i = 1; i < K; ++i) {
+            const FxVec3 d{chain.pos[i].x - chain.pos[i - 1].x,
+                           chain.pos[i].y - chain.pos[i - 1].y,
+                           chain.pos[i].z - chain.pos[i - 1].z};
+            const FxVec3 u = FxNormalize(d);
+            chain.pos[i] = FxVec3{chain.pos[i - 1].x + fxmul(chain.len[i - 1], u.x),
+                                  chain.pos[i - 1].y + fxmul(chain.len[i - 1], u.y),
+                                  chain.pos[i - 1].z + fxmul(chain.len[i - 1], u.z)};
+        }
+    }
+}
+
+// ChainEndEffector(chain): the end-effector joint position pos[count-1] (the solved tip).
+inline FxVec3 ChainEndEffector(const IkChainN& chain) {
+    return chain.count > 0 ? chain.pos[chain.count - 1] : FxVec3{0, 0, 0};
+}
+
+// ChainResidual(chain, target): the distance |end-effector - target| (Q16.16), the bounded iterative
+// Gauss-Seidel residual (the honest within-band reach proof — NOT zero). Pure integer (FxLength).
+inline fx ChainResidual(const IkChainN& chain, const FxVec3& target) {
+    const FxVec3 ee = ChainEndEffector(chain);
+    return FxLength(FxVec3{ee.x - target.x, ee.y - target.y, ee.z - target.z});
+}
+
+// ChainMaxLenDrift(chain): the max |segment length now - captured len[i]| over the chain (Q16.16 LSB),
+// the segment-length-preservation proof (drift = FxNormalize LSB only). Pure integer.
+inline fx ChainMaxLenDrift(const IkChainN& chain) {
+    fx maxDrift = 0;
+    for (int i = 0; i + 1 < chain.count; ++i) {
+        const FxVec3 d{chain.pos[i + 1].x - chain.pos[i].x,
+                       chain.pos[i + 1].y - chain.pos[i].y,
+                       chain.pos[i + 1].z - chain.pos[i].z};
+        const fx now = FxLength(d);
+        const fx drift = (now > chain.len[i]) ? (fx)(now - chain.len[i]) : (fx)(chain.len[i] - now);
+        if (drift > maxDrift) maxDrift = drift;
+    }
+    return maxDrift;
+}
+
+// LookAtRotation(fwd, to): the shortest-arc unit quaternion rotating UNIT `fwd` onto UNIT `to`. c =
+// FxDotV(fwd,to) (cosine in [-kOne,kOne]); angle = FxAcosLut(c) (NON-NEGATIVE — acos in [0,pi]); axis =
+// FxNormalize(FxCross(fwd,to)); LookAtRotation = QuatFromAxisAngle(axis, angle), normalized. DEGENERATE:
+//   * fwd ~ to (c >= kOne - eps): identity (no rotation).
+//   * fwd ~ -to (c <= -kOne + eps): the cross degenerates -> pick a DETERMINISTIC perpendicular axis
+//     (FxCross(fwd, world-up); if that degenerates too — fwd ~ world-up — FxCross(fwd, world-right)) and
+//     rotate by pi (the FxAcosLut(-kOne) result == kPi).
+// Pure integer (int64 in FxNormalize/FxLength/the LUT-internal). The shortest-arc/double-cover discipline
+// (the active.h precedent). `fwd` + `to` MUST be unit (FxNormalize them at the call site).
+inline FxQuat LookAtRotation(const FxVec3& fwd, const FxVec3& to) {
+    const fx eps = (fx)64;                                  // ~0.001 — the antiparallel/parallel band
+    fx c = FxDotV(fwd, to);
+    if (c >  kOne) c =  kOne;                               // clamp (rounding can push a few LSB past)
+    if (c < -kOne) c = -kOne;
+    if (c >= kOne - eps) return FxQuat{0, 0, 0, kOne};      // fwd ~ to -> identity
+    const fx angle = FxAcosLut(c);                          // [0, pi], NON-NEGATIVE (the clean LUT path)
+    FxVec3 cr = FxCross(fwd, to);
+    if (c <= -kOne + eps || FxLength(cr) == 0) {
+        // Antiparallel (or a degenerate cross): a deterministic perpendicular axis + rotate pi.
+        cr = FxCross(fwd, FxVec3{0, kOne, 0});             // cross with world-up
+        if (FxLength(cr) == 0) cr = FxCross(fwd, FxVec3{kOne, 0, 0});  // fwd ~ world-up -> world-right
+        const FxVec3 axis = FxNormalize(cr);
+        return FxQuatNormalize(QuatFromAxisAngle(axis, kPi));
+    }
+    const FxVec3 axis = FxNormalize(cr);
+    return FxQuatNormalize(QuatFromAxisAngle(axis, angle));
+}
+
 } // namespace hf::anim::ik
