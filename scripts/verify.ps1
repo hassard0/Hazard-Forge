@@ -480,6 +480,39 @@ if (-not `$asOk) {
 }
 Write-Host 'authored-scene canonical JSON golden: exact match'
 
+# --- Hot-reload trace JSON golden (Slice DX4, FLAGSHIP #31): an EXACT byte-for-byte match of a fresh
+# --hot-reload (load scene A, observe the watched path "change" to B via a FileWatcher with an INJECTED
+# stat — NO real-filesystem mtime — Poll() the change, runtime::ApplyReload(B) = clear+LoadScene, then
+# the reload==cold-load + no-residue checks) against the committed reload_trace.json. This is the
+# agent HOT-RELOAD artifact (the load-equivalence guarantee: a reload is byte-indistinguishable from a
+# cold load of the new scene, no residue). Like the --agent-api / --author-scene goldens it is
+# backend-AGNOSTIC (pure hf_core, scene_io + the FileWatcher are render-symbol-free, the bytes are
+# identical on Vulkan and Metal), so it is verified once here on the Windows/Vulkan build and is NOT in
+# `$Goldens`/`$vkShots` (the Mac IMAGE set). The injected StatFn makes the trace bit-reproducible
+# run-to-run. The --hot-reload exe ALSO runs the 4 DX4 proofs internally (counts / equiv / no-residue /
+# determinism+byte-golden) and fails loudly. ---
+Write-Host '--- hot-reload trace JSON golden ---'
+`$hrExe = 'build/windows-msvc-debug/samples/hello_triangle/hello_triangle.exe'
+`$hrA = 'assets/scenes/dx4_a.json'
+`$hrB = 'assets/scenes/dx4_b.json'
+`$hrGolden = 'tests/golden/agent/reload_trace.json'
+`$hrLive = Join-Path `$env:TEMP 'hf_reload_trace_live.json'
+& `$hrExe --hot-reload `$hrA `$hrB 2>`$null | Out-Null
+if (`$LASTEXITCODE -ne 0) { Write-Host 'hot-reload run failed (proofs or byte-golden mismatch)'; exit 34 }
+# The exe writes reload_trace.json into the CWD (repo root); copy it to the temp compare path.
+Copy-Item 'reload_trace.json' `$hrLive -Force
+Remove-Item 'reload_trace.json' -Force -ErrorAction SilentlyContinue
+# Compare RAW bytes (the program writes LF-only, no BOM); any difference is a failure.
+`$hrgBytes = [System.IO.File]::ReadAllBytes((Resolve-Path `$hrGolden).Path)
+`$hrlBytes = [System.IO.File]::ReadAllBytes(`$hrLive)
+`$hrOk = (`$hrgBytes.Length -eq `$hrlBytes.Length)
+if (`$hrOk) { for (`$hi = 0; `$hi -lt `$hrgBytes.Length; `$hi++) { if (`$hrgBytes[`$hi] -ne `$hrlBytes[`$hi]) { `$hrOk = `$false; break } } }
+if (-not `$hrOk) {
+    Write-Host 'hot-reload trace JSON golden MISMATCH (tests/golden/agent/reload_trace.json)'
+    exit 35
+}
+Write-Host 'hot-reload trace JSON golden: exact match'
+
 # --- Audio mixer WAV golden (Slice BB): an EXACT byte-for-byte match of a fresh --audio-render of the
 # fixed deterministic audio scene against the committed tests/golden/audio/scene.wav. The mixer is
 # INTEGER / fixed-point end to end (Q15 gains, int32 accumulate, int16 hard-clamp), so the rendered

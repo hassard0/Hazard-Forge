@@ -1,0 +1,9 @@
+{
+  "watched": "assets/scenes/dx4_a.json",
+  "changed": ["assets/scenes/dx4_b.json"],
+  "beforeCount": 3,
+  "afterCount": 2,
+  "equalToColdLoad": true,
+  "noResidue": true,
+  "dumpAfter": "[\n  {\n    \"mesh\": \"plane\",\n    \"baseColor\": \"checker\",\n    \"normalMap\": null,\n    \"metallic\": 0,\n    \"roughness\": 0.7,\n    \"position\": [0, -0.5, 0],\n    \"euler\": [0, 0, 0],\n    \"scale\": [6, 1, 6]\n  },\n  {\n    \"mesh\": \"cube\",\n    \"baseColor\": \"checker\",\n    \"normalMap\": \"normalmap\",\n    \"metallic\": 0,\n    \"roughness\": 0.4,\n    \"position\": [0.5, 0.5, -0.5],\n    \"euler\": [0, 0.3, 0],\n    \"scale\": [1, 1, 1]\n  }\n]\n"
+}

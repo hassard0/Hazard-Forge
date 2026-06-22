@@ -37,6 +37,11 @@ hf_add_pure_test(agent_query_test)
 # DumpScene). Pure CPU JSON — round-trip to the canonical text, idempotence/fixed-point, two-call
 # determinism, and the unknown-mesh std::runtime_error reject. ASan-eligible like the others.
 hf_add_pure_test(agent_author_test)
+# DX4: the deterministic headless scene hot-reload (runtime::FileWatcher + runtime::ApplyReload).
+# Pure CPU — the FileWatcher driven by an in-memory fake StatFn (change detection: bumped mtime,
+# missing->present, disappearance, re-baseline) + ApplyReload (reload == cold-load, no residue, a
+# failed reload leaves the registry cleared). ASan-eligible like the others.
+hf_add_pure_test(hot_reload_test)
 # Skeletal-animation math + sampling (Quat/Slerp/FromTRS + SampleAnimation). Pure C++ (hf_core),
 # ASan-eligible like the others.
 hf_add_pure_test(anim_test)
